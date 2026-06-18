@@ -3131,6 +3131,8 @@ func TestReconcileHAFencingLeaseSkipsWhenAdminExecutionDisabled(t *testing.T) {
 
 func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.Identity.ShardID = 10
+	cluster.Spec.HighAvailability.Identity.TableID = 20
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
 		Mode:         antflyv1.HADurabilityModeRemoteApply,
 		Required:     1,
@@ -3164,7 +3166,10 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 	if lease.Labels["antfly.io/ha-fence"] != "kubernetes-lease" {
 		t.Fatalf("expected HA fence label, got %#v", lease.Labels)
 	}
-	if lease.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] != "primary-a" ||
+	if lease.Annotations[haFencingLeaseAnnotationClusterID] != "100" ||
+		lease.Annotations[haFencingLeaseAnnotationShardID] != "10" ||
+		lease.Annotations[haFencingLeaseAnnotationTableID] != "20" ||
+		lease.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] != "primary-a" ||
 		lease.Annotations[haFencingLeaseAnnotationTimelineID] != "4" ||
 		lease.Annotations[haFencingLeaseAnnotationEpoch] != "6" ||
 		lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "12" {
@@ -3421,6 +3426,61 @@ func TestObserveHAFencingStatusRejectsStaleTimelineLeaseScope(t *testing.T) {
 	}
 	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
 		t.Fatal("expected stale timeline lease scope to block automatic promotion")
+	}
+}
+
+func TestObserveHAFencingStatusRejectsStaleIdentityLeaseScope(t *testing.T) {
+	cases := []struct {
+		name       string
+		annotation string
+		value      string
+	}{{
+		name:       "cluster",
+		annotation: haFencingLeaseAnnotationClusterID,
+		value:      "99",
+	}, {
+		name:       "shard",
+		annotation: haFencingLeaseAnnotationShardID,
+		value:      "11",
+	}, {
+		name:       "table",
+		annotation: haFencingLeaseAnnotationTableID,
+		value:      "21",
+	}, {
+		name:       "epoch",
+		annotation: haFencingLeaseAnnotationEpoch,
+		value:      "5",
+	}, {
+		name:       "current primary",
+		annotation: haFencingLeaseAnnotationCurrentPrimaryID,
+		value:      "primary-b",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+			cluster.Spec.HighAvailability.Identity.ShardID = 10
+			cluster.Spec.HighAvailability.Identity.TableID = 20
+			cluster.Status.HAStatus = caughtUpHAStatus()
+			lease := haFenceLease(cluster, time.Now(), 30, 3, "standby-a")
+			lease.Annotations[tc.annotation] = tc.value
+			reconciler := testHAReconciler(t, lease)
+
+			if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+				t.Fatalf("observe fencing status: %v", err)
+			}
+			cluster.Status.HAStatus.PrimaryAdminReachable = false
+			cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+			reconciler.updateHAStatusAndConditions(cluster)
+
+			fencing := cluster.Status.HAStatus.Fencing
+			if fencing.Ready || fencing.Reason != "LeaseScopeMismatch" {
+				t.Fatalf("expected stale %s lease scope to be rejected, got %#v", tc.name, fencing)
+			}
+			if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+				t.Fatalf("expected stale %s lease scope to block automatic promotion", tc.name)
+			}
+		})
 	}
 }
 
