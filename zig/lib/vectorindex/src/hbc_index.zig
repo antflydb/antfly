@@ -1037,8 +1037,22 @@ fn saveCentroidDirectoryForLeafWithRadius(self: anytype, txn: anytype, node: *co
     });
 }
 
-fn shadowSavePostingBaseWithRadius(self: anytype, txn: anytype, node: *const types.Node, bounds_radius: f32) !void {
+fn shadowSavePostingBaseWithRadiusOptions(
+    self: anytype,
+    txn: anytype,
+    node: *const types.Node,
+    bounds_radius: f32,
+    publish_centroid_directory: bool,
+) !void {
     if (!node.is_leaf or !shouldWritePostingBaseDelta(self)) return;
+    if (!publish_centroid_directory and shouldUseBaseDeltaAsCanonicalPosting(self)) {
+        try posting.PostingStore.saveBase(self, txn, .{
+            .posting_id = node.id,
+            .generation = node.posting_state.mutation_version,
+            .members = node.members,
+        });
+        return;
+    }
     try posting.PostingStore.saveBaseAndCentroidDirectoryRecord(self, txn, .{
         .posting_id = node.id,
         .generation = node.posting_state.mutation_version,
@@ -1055,6 +1069,10 @@ fn shadowSavePostingBaseWithRadius(self: anytype, txn: anytype, node: *const typ
         .bounds_radius = bounds_radius,
         .centroid = node.centroid,
     });
+}
+
+fn shadowSavePostingBaseWithRadius(self: anytype, txn: anytype, node: *const types.Node, bounds_radius: f32) !void {
+    try shadowSavePostingBaseWithRadiusOptions(self, txn, node, bounds_radius, true);
 }
 
 fn shadowSavePostingBase(self: anytype, txn: anytype, node: *const types.Node) !void {
@@ -1319,6 +1337,7 @@ fn saveLeafNodeBodyWithKnownVectors(
     node: *const types.Node,
     vectors: []const f32,
     vectors_owned: ?*bool,
+    publish_centroid_directory: bool,
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
 ) !void {
@@ -1333,7 +1352,7 @@ fn saveLeafNodeBodyWithKnownVectors(
     if (node.is_leaf and shouldUseBaseDeltaAsCanonicalPosting(self)) {
         const bounds_radius = try leafBoundsRadiusFromKnownVectors(self, node, vectors);
         try savePackedNodeValueWithLeafMembers(self, txn, node, false);
-        try shadowSavePostingBaseWithRadius(self, txn, node, bounds_radius);
+        try shadowSavePostingBaseWithRadiusOptions(self, txn, node, bounds_radius, publish_centroid_directory);
     } else {
         try saveDeltaBackedLeafNodeValue(self, txn, node);
     }
@@ -1359,7 +1378,7 @@ fn saveLeafNodeWithKnownVectors(
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
 ) !void {
-    try saveLeafNodeBodyWithKnownVectors(self, txn, node, vectors, null, now_fn, elapsed_fn);
+    try saveLeafNodeBodyWithKnownVectors(self, txn, node, vectors, null, true, now_fn, elapsed_fn);
     const range_start = now_fn();
     try saveNodeSplitRange(self, txn, node, isNotFoundGeneric);
     self.write_profile.save_split_range_ns += elapsed_fn(range_start);
@@ -8231,7 +8250,7 @@ pub fn bulkBuildExternalSequentialTxnOptions(
                         .metadata = "",
                     };
                 }
-                current[current_count] = try buildBulkLeaf(self, txn, self.nextNodeId(), inputs[0..group_size], 0, 0);
+                current[current_count] = try buildBulkLeaf(self, txn, self.nextNodeId(), inputs[0..group_size], 0, 0, count <= target_leaf_size);
                 current_count += 1;
                 entry_offset += group_size;
             }
@@ -8253,7 +8272,7 @@ pub fn bulkBuildExternalSequentialTxnOptions(
                         .metadata = "",
                     };
                 }
-                current[current_count] = try buildBulkLeaf(self, txn, self.nextNodeId(), inputs[0..group_size], 0, 0);
+                current[current_count] = try buildBulkLeaf(self, txn, self.nextNodeId(), inputs[0..group_size], 0, 0, count <= target_leaf_size);
                 current_count += 1;
                 offset += group_size;
             }
@@ -8412,7 +8431,7 @@ pub fn buildBulkHilbertSeeded(
         for (0..group_size) |i| {
             group_inputs[i] = inputs[entries[entry_cursor + i].input_index];
         }
-        current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
+        current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0, leaf_groups.len == 1);
         current_count += 1;
         entry_cursor += group_size;
     }
@@ -8544,7 +8563,7 @@ pub fn buildBulkDocKeySeeded(
         for (0..group_size) |i| {
             group_inputs[i] = inputs[entries[entry_cursor + i].input_index];
         }
-        current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
+        current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0, leaf_groups.len == 1);
         current_count += 1;
         entry_cursor += group_size;
     }
@@ -8559,7 +8578,7 @@ pub fn buildBulkKmeansFromInputs(
 ) !BuiltBulkNode {
     if (inputs.len == 0) return error.TooFewVectors;
     if (inputs.len <= self.config.leaf_size) {
-        return try buildBulkLeaf(self, txn, self.nextNodeId(), inputs, 0, 0);
+        return try buildBulkLeaf(self, txn, self.nextNodeId(), inputs, 0, 0, true);
     }
 
     const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
@@ -8639,7 +8658,7 @@ pub fn buildBulkKmeansFromInputs(
             for (0..group_size) |i| {
                 group_inputs[i] = inputs[entries[entry_cursor + i].point_index];
             }
-            current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
+            current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0, leaf_group_count == 1);
             current_count += 1;
             entry_cursor += group_size;
         }
@@ -9431,7 +9450,7 @@ fn buildBulkLeafIndexed(
         const transformed = inputs[input_idx].transformed;
         @memcpy(leaf_vectors[i * self.config.dims ..][0..self.config.dims], transformed);
     }
-    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, &leaf_vectors_owned, nowNsI128Fixed, elapsedSinceNsFixed);
+    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, &leaf_vectors_owned, true, nowNsI128Fixed, elapsedSinceNsFixed);
     try self.putNodeSplitRange(txn, node_id, &range);
     self.alloc.free(members);
 
@@ -9783,6 +9802,7 @@ fn buildBulkLeaf(
     inputs: []const bulk_build.PreparedBulkBuildInput,
     parent_id: u64,
     level: u16,
+    publish_centroid_directory: bool,
 ) !BuiltBulkNode {
     const centroid = try self.alloc.alloc(f32, self.config.dims);
     errdefer self.alloc.free(centroid);
@@ -9820,7 +9840,7 @@ fn buildBulkLeaf(
     for (inputs, 0..) |input, i| {
         @memcpy(leaf_vectors[i * self.config.dims ..][0..self.config.dims], input.transformed);
     }
-    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, &leaf_vectors_owned, nowNsI128Fixed, elapsedSinceNsFixed);
+    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, &leaf_vectors_owned, publish_centroid_directory, nowNsI128Fixed, elapsedSinceNsFixed);
     try self.putNodeSplitRange(txn, node_id, &range);
     self.alloc.free(members);
 

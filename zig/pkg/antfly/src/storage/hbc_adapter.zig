@@ -8988,6 +8988,43 @@ test "bulk build refreshes quantized payload after internal reparenting" {
     try std.testing.expect(results.getHits().len > 0);
 }
 
+test "base delta bulk build defers transient centroid directory records" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+
+    var idx = try HBCIndex.open(alloc, tmp_path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = true,
+        .posting_storage_mode = .base_delta,
+    });
+    defer idx.close();
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 0.0 }, .metadata = "doc:3" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 10.1, 0.0 }, .metadata = "doc:4" },
+        .{ .vector_id = 5, .vector = &[_]f32{ 20.0, 0.0 }, .metadata = "doc:5" },
+        .{ .vector_id = 6, .vector = &[_]f32{ 20.1, 0.0 }, .metadata = "doc:6" },
+    };
+
+    idx.resetWriteProfile();
+    try idx.bulkBuildWithMetadata(&items);
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expect(profile.posting_base_put_calls > 1);
+    try std.testing.expectEqual(profile.posting_base_put_calls, profile.centroid_directory_put_calls);
+
+    var results = try idx.search(&[_]f32{ 20.0, 0.0 }, 2);
+    defer results.deinit();
+    try std.testing.expect(results.getHits().len > 0);
+}
+
 test "hilbert-seeded bulk build creates searchable index" {
     var path: TestPath = .{};
     const tmp_path = path.init();
