@@ -37,6 +37,8 @@ const manifest_checksum_size: usize = 4;
 const overlay_plan_min_delta_records: usize = 8;
 const compact_sorted_delta_max_records: usize = 64;
 const compact_sorted_delta_scratch_max_records: usize = 512;
+const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
+const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
 
 pub const segment_directory = "postings";
 pub const default_manifest_path = "postings/manifest.afpm";
@@ -2636,6 +2638,12 @@ const DeltaIndexRange = struct {
     past_index: usize,
 };
 
+const ValueIndexRange = struct {
+    offset: usize,
+    end: usize,
+    past_index: usize,
+};
+
 pub const ValueLocation = struct {
     offset: usize,
     len: usize,
@@ -3768,30 +3776,81 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
     defer file.close(io);
 
     var reader = file.reader(io, &.{});
-    var value_scratch = std.ArrayListUnmanaged(u8).empty;
-    defer value_scratch.deinit(alloc);
+    var range_scratch = std.ArrayListUnmanaged(u8).empty;
+    defer range_scratch.deinit(alloc);
 
     var index: usize = 0;
-    while (index < entry.meta.entry_count) : (index += 1) {
+    while (index < entry.meta.entry_count) {
         const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
-        if (found.kind != .centroid_directory) continue;
-        if (found.sequence != 0) return error.CorruptedPostingSegment;
+        if (found.kind != .centroid_directory) {
+            index += 1;
+            continue;
+        }
 
-        const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
-        if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
-
-        try value_scratch.resize(alloc, found.len);
-        const value = value_scratch.items;
-        try reader.seekTo(@intCast(found.offset));
-        reader.interface.readSliceAll(value) catch |err| switch (err) {
+        const range = try centroidDirectoryIndexRange(index_data, entry.meta, index);
+        const range_len = range.end - range.offset;
+        try range_scratch.resize(alloc, range_len);
+        const bytes = range_scratch.items;
+        try reader.seekTo(@intCast(range.offset));
+        reader.interface.readSliceAll(bytes) catch |err| switch (err) {
             error.EndOfStream => return error.CorruptedPostingSegment,
             else => return err,
         };
-        try found.location().verifyValue(value);
 
-        var record = try posting.CentroidDirectoryFormat.decode(alloc, value);
-        try putCentroidRecordCandidate(alloc, candidates, entry.meta.segment_id, &record);
+        var record_index = index;
+        while (record_index < range.past_index) : (record_index += 1) {
+            const record_entry = try indexEntryFromBytes(index_data[record_index * index_entry_size ..][0..index_entry_size]);
+            if (record_entry.kind != .centroid_directory) continue;
+            const value = try valueFromBufferedRange(bytes, range.offset, record_entry);
+            var record = try posting.CentroidDirectoryFormat.decode(alloc, value);
+            try putCentroidRecordCandidate(alloc, candidates, entry.meta.segment_id, &record);
+        }
+
+        index = range.past_index;
     }
+}
+
+fn centroidDirectoryIndexRange(index_data: []const u8, meta: SegmentMeta, first_index: usize) !ValueIndexRange {
+    const first_entry = try indexEntryFromBytes(index_data[first_index * index_entry_size ..][0..index_entry_size]);
+    if (first_entry.kind != .centroid_directory or first_entry.sequence != 0) return error.CorruptedPostingSegment;
+    var range_offset = first_entry.offset;
+    var range_end = try checkedSegmentValueEnd(meta, first_entry);
+    var past_index = first_index + 1;
+
+    while (past_index < meta.entry_count) : (past_index += 1) {
+        const found = try indexEntryFromBytes(index_data[past_index * index_entry_size ..][0..index_entry_size]);
+        if (found.kind != .centroid_directory) continue;
+        if (found.sequence != 0) return error.CorruptedPostingSegment;
+        const value_end = try checkedSegmentValueEnd(meta, found);
+        const candidate_offset = @min(range_offset, found.offset);
+        const candidate_end = @max(range_end, value_end);
+        const candidate_len = candidate_end - candidate_offset;
+        const gap = if (found.offset > range_end) found.offset - range_end else 0;
+        if (candidate_len > centroid_directory_bulk_read_max_bytes or gap > centroid_directory_bulk_read_max_gap_bytes) break;
+        range_offset = candidate_offset;
+        range_end = candidate_end;
+    }
+
+    return .{
+        .offset = range_offset,
+        .end = range_end,
+        .past_index = past_index,
+    };
+}
+
+fn checkedSegmentValueEnd(meta: SegmentMeta, found: IndexEntry) !usize {
+    const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
+    if (found.offset > meta.index_offset or value_end > meta.index_offset) return error.CorruptedPostingSegment;
+    return value_end;
+}
+
+fn valueFromBufferedRange(bytes: []const u8, base_offset: usize, found: IndexEntry) ![]const u8 {
+    const relative_offset = std.math.sub(usize, found.offset, base_offset) catch return error.CorruptedPostingSegment;
+    const relative_end = std.math.add(usize, relative_offset, found.len) catch return error.CorruptedPostingSegment;
+    if (relative_end > bytes.len) return error.CorruptedPostingSegment;
+    const value = bytes[relative_offset..relative_end];
+    try found.location().verifyValue(value);
+    return value;
 }
 
 fn readSegmentDeltaValueRangeAlloc(
@@ -6626,6 +6685,12 @@ pub fn testLazyDirectoryStoreBulkLoadsCentroidsWithPartialReads() !void {
         .members = &.{ 10, 20 },
     });
     defer alloc.free(base);
+    const base_8 = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 8,
+        .generation = 1,
+        .members = &.{ 30, 40 },
+    });
+    defer alloc.free(base_8);
     const centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
         .posting_id = 7,
         .generation = 1,
@@ -6639,18 +6704,33 @@ pub fn testLazyDirectoryStoreBulkLoadsCentroidsWithPartialReads() !void {
         .centroid = &.{ 3.0, 4.0 },
     });
     defer alloc.free(centroid);
+    const centroid_8 = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 8,
+        .generation = 1,
+        .mutation_version = 6,
+        .payload_version = 7,
+        .flags = 0,
+        .parent = 2,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 3.0,
+        .centroid = &.{ 5.0, 6.0 },
+    });
+    defer alloc.free(centroid_8);
 
     var writer = Writer.init(alloc);
     defer writer.deinit();
     try writer.appendBase(7, base);
     try writer.appendCentroidDirectory(7, centroid);
+    try writer.appendBase(8, base_8);
+    try writer.appendCentroidDirectory(8, centroid_8);
     var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
     defer committed.deinit(alloc);
 
     const original = try tmp.dir.readFileAlloc(std.testing.io, committed.entry.path, alloc, .limited(committed.entry.meta.byte_len + 1));
     defer alloc.free(original);
     const reader = try Reader.init(original);
-    const base_location = (try reader.getBaseLocation(7)).?;
+    const base_location = (try reader.getBaseLocation(8)).?;
     var corrupt_base = try alloc.dupe(u8, original);
     defer alloc.free(corrupt_base);
     corrupt_base[base_location.offset] ^= 0xff;
@@ -6667,11 +6747,14 @@ pub fn testLazyDirectoryStoreBulkLoadsCentroidsWithPartialReads() !void {
         alloc.free(records);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
     try std.testing.expectEqual(@as(PostingId, 7), records[0].posting_id);
     try std.testing.expectEqual(@as(u64, 4), records[0].mutation_version);
     try std.testing.expectEqual(@as(usize, 2), records[0].member_count);
-    try std.testing.expectError(error.BadPostingSegmentChecksum, lazy.snapshot().loadBaseData(alloc, 7));
+    try std.testing.expectEqual(@as(PostingId, 8), records[1].posting_id);
+    try std.testing.expectEqual(@as(u64, 6), records[1].mutation_version);
+    try std.testing.expectEqual(@as(usize, 2), records[1].member_count);
+    try std.testing.expectError(error.BadPostingSegmentChecksum, lazy.snapshot().loadBaseData(alloc, 8));
 }
 
 pub fn testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore() !void {
