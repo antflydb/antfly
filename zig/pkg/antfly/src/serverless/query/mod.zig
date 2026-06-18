@@ -30,6 +30,7 @@ pub const lake_parquet_metadata = @import("lake_parquet_metadata.zig");
 pub const lake_parquet_page = @import("lake_parquet_page.zig");
 pub const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 pub const lake_scan_plan = @import("lake_scan_plan.zig");
+pub const lake_object_reader = @import("lake_object_reader.zig");
 
 pub const QueryRuntime = runtime.QueryRuntime;
 pub const QuerySession = runtime.QuerySession;
@@ -94,6 +95,7 @@ pub const LakeParquetNullableI64Values = lake_parquet_page.NullableI64Values;
 pub const LakeParquetColumnChunkInput = lake_parquet_rowgroup.ColumnChunkInput;
 pub const LakeParquetRowGroupInput = lake_parquet_rowgroup.RowGroupInput;
 pub const LakeParquetObjectRangeReader = lake_parquet_rowgroup.ObjectRangeReader;
+pub const LakeObjectStorageRangeReader = lake_object_reader.ObjectStorageRangeReader;
 pub const LakeParquetObjectRangeCache = lake_parquet_rowgroup.ObjectRangeCache;
 pub const LakeParquetObjectRangeCacheStats = lake_parquet_rowgroup.ObjectRangeCacheStats;
 pub const LakeParquetObjectRangeRowGroupInput = lake_parquet_rowgroup.ObjectRangeRowGroupInput;
@@ -185,6 +187,7 @@ test "serverless query module compiles" {
     _ = lake_parquet_page;
     _ = lake_parquet_rowgroup;
     _ = lake_scan_plan;
+    _ = lake_object_reader;
     _ = QueryRuntime;
     _ = QuerySession;
     _ = QueryRequest;
@@ -248,6 +251,7 @@ test "serverless query module compiles" {
     _ = LakeParquetColumnChunkInput;
     _ = LakeParquetRowGroupInput;
     _ = LakeParquetObjectRangeReader;
+    _ = LakeObjectStorageRangeReader;
     _ = LakeParquetObjectRangeCache;
     _ = LakeParquetObjectRangeCacheStats;
     _ = LakeParquetObjectRangeRowGroupInput;
