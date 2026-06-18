@@ -6599,11 +6599,8 @@ func haValidateObservedStatusIdentity(observed haObservedIdentity, ha *antflyv1.
 }
 
 func haPromotionAdvancesIdentity(status *antflyv1.HAStatus, identity *antflyv1.HAReplicationIdentitySpec) bool {
-	if status == nil || status.LastPromotion == nil || identity == nil {
-		return false
-	}
-	promotion := status.LastPromotion
-	if promotion.NewTimelineID == 0 || promotion.NewEpoch == 0 {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil || identity == nil {
 		return false
 	}
 	if promotion.ParentTimelineID != identity.TimelineID || promotion.ParentEpoch != identity.Epoch {
