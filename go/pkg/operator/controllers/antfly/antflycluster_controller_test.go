@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"maps"
@@ -13,6 +14,7 @@ import (
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
+	adminsdk "github.com/antflydb/antfly/go/pkg/sdk/admin"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gstruct"
@@ -586,6 +588,33 @@ func TestReconcileHAAdminJobsUsesConfiguredAdminTokenEnvVar(t *testing.T) {
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+}
+
+func TestHAAdminSDKResponseHelpersPreserveTypedErrors(t *testing.T) {
+	g := NewWithT(t)
+
+	apiErr := &adminsdk.HAAPIError{
+		Operation:  "create HA replication slot",
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       "primary unavailable",
+	}
+	_, err := haAdminSDKResponseRaw[adminsdk.HAReplicationSlotActionResponse](nil, apiErr)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("HA admin API returned status 503"))
+	var observedAPIError *adminsdk.HAAPIError
+	g.Expect(stderrors.As(err, &observedAPIError)).To(BeTrue())
+	g.Expect(adminsdk.HAIsRetryable(err)).To(BeTrue())
+
+	validationErr := &adminsdk.HAResponseValidationError{
+		Operation: "create HA replication slot",
+		Err:       fmt.Errorf("missing action receipt"),
+	}
+	_, err = haAdminSDKResponseValue[adminsdk.HAReplicationSlotActionResponse](nil, validationErr)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("typed result evidence"))
+	var observedValidationError *adminsdk.HAResponseValidationError
+	g.Expect(stderrors.As(err, &observedValidationError)).To(BeTrue())
+	g.Expect(adminsdk.HAIsRetryable(err)).To(BeFalse())
 }
 
 func TestReconcileHAAdminJobsUsesDefaultAdminTokenEnvVar(t *testing.T) {

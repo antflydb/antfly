@@ -1497,6 +1497,57 @@ func TestHAClientReturnsStatusError(t *testing.T) {
 	}
 }
 
+func TestHAErrorRetryability(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{{
+		name: "nil",
+		err:  nil,
+		want: false,
+	}, {
+		name: "service unavailable",
+		err:  &HAAPIError{Operation: "get HA primary status", StatusCode: http.StatusServiceUnavailable},
+		want: true,
+	}, {
+		name: "too many requests",
+		err:  &HAAPIError{Operation: "get HA primary status", StatusCode: http.StatusTooManyRequests},
+		want: true,
+	}, {
+		name: "conflict",
+		err:  &HAAPIError{Operation: "get current HA fence", StatusCode: http.StatusConflict},
+		want: false,
+	}, {
+		name: "bad request",
+		err:  &HAAPIError{Operation: "create HA replication slot", StatusCode: http.StatusBadRequest},
+		want: false,
+	}, {
+		name: "validation",
+		err:  &HAResponseValidationError{Operation: "create HA replication slot", Err: errors.New("missing action receipt")},
+		want: false,
+	}, {
+		name: "deadline",
+		err:  context.DeadlineExceeded,
+		want: true,
+	}, {
+		name: "canceled",
+		err:  context.Canceled,
+		want: false,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := HAIsRetryable(tt.err); got != tt.want {
+				t.Fatalf("HAIsRetryable(%T) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func haCommitAppendResponseJSON() string {
 	return `{
 		"schema_version":1,

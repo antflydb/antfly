@@ -3,7 +3,9 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -1890,6 +1892,19 @@ func (e *HAAPIError) Error() string {
 	return fmt.Sprintf("%s returned status %d: %s", e.Operation, e.StatusCode, e.Body)
 }
 
+// Retryable reports whether the status is a transient admin API failure.
+func (e *HAAPIError) Retryable() bool {
+	if e == nil {
+		return false
+	}
+	switch e.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
 // HAResponseValidationError describes a 2xx HA admin response that decoded but
 // did not satisfy the wrapper's typed response contract.
 type HAResponseValidationError struct {
@@ -1903,6 +1918,34 @@ func (e *HAResponseValidationError) Error() string {
 
 func (e *HAResponseValidationError) Unwrap() error {
 	return e.Err
+}
+
+// HAIsRetryable reports whether an error from the HA admin SDK is safe to
+// retry without the caller reimplementing HTTP and transport classification.
+func HAIsRetryable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var apiErr *HAAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Retryable()
+	}
+	var validationErr *HAResponseValidationError
+	if errors.As(err, &validationErr) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var temporary interface{ Temporary() bool }
+	if errors.As(err, &temporary) && temporary.Temporary() {
+		return true
+	}
+	return false
 }
 
 // NewHAClient creates a typed HA admin client. The base URL may be either the
