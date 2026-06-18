@@ -1724,7 +1724,7 @@ func HAPromotionHandoffEmpty(handoff HAPromotionHandoff) bool {
 }
 
 func HAPromotionAssessmentComplete(assessment HAPromotionAssessment) bool {
-	return assessment.RequiredLsn > 0
+	return assessment.RequiredLsn <= assessment.ReceivedLsn || !assessment.HasRequiredLsn
 }
 
 func HAPromotionResultComplete(result HAPromotionResult) bool {

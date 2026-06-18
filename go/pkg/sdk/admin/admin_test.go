@@ -1238,6 +1238,14 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	if err := ValidateHAPromotionAssessResponse(assess); err != nil {
 		t.Fatalf("ValidateHAPromotionAssessResponse returned error: %v", err)
 	}
+	emptyStandbyAssess := assess
+	emptyStandbyAssess.Assessment.RequiredLsn = 0
+	emptyStandbyAssess.Assessment.ReceivedLsn = 0
+	emptyStandbyAssess.Assessment.AppliedLsn = 0
+	emptyStandbyAssess.Assessment.HasRequiredLsn = true
+	if err := ValidateHAPromotionAssessResponse(emptyStandbyAssess); err != nil {
+		t.Fatalf("ValidateHAPromotionAssessResponse with zero required_lsn returned error: %v", err)
+	}
 	wrongAssessNode := assess
 	wrongAssessNode.Action.NodeId = "standby-b"
 	if err := ValidateHAPromotionAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
@@ -1253,7 +1261,7 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	if err := ValidateHAPromotionAssessResponse(wrongMode); err == nil || !strings.Contains(err.Error(), "mode") {
 		t.Fatalf("wrong promotion assessment mode error = %v, want mode mismatch", err)
 	}
-	assess.Assessment.RequiredLsn = 0
+	assess.Assessment.RequiredLsn = 9
 	if err := ValidateHAPromotionAssessResponse(assess); err == nil || !strings.Contains(err.Error(), "assessment fields") {
 		t.Fatalf("missing assessment error = %v, want assessment fields error", err)
 	}

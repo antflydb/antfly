@@ -876,7 +876,7 @@ fn validateOwnerJobCheckResponse(response: admin_api.HAOwnerJobCheckResponse) !v
 fn validatePromotionAssessResponse(response: admin_api.HAPromotionAssessResponse, request: admin_api.PromotionAssessRequest) !void {
     try validateSchemaVersion(response.schema_version, error.AdminPromotionResponseMismatch);
     try validateActionReceipt(response.action, "promotion_assess", "assessed", null, error.AdminPromotionResponseMismatch);
-    if (response.assessment.required_lsn <= 0 or response.assessment.received_lsn < 0 or response.assessment.applied_lsn < 0) {
+    if (response.assessment.required_lsn < 0 or response.assessment.received_lsn < 0 or response.assessment.applied_lsn < 0) {
         return error.AdminPromotionResponseMismatch;
     }
     if (request.required_lsn) |required_lsn| {
@@ -1279,6 +1279,28 @@ fn writeTestFile(path: []const u8, bytes: []const u8) !void {
         .sub_path = path,
         .data = bytes,
     });
+}
+
+test "storage.ha http client accepts zero LSN promotion assessment" {
+    const alloc = std.testing.allocator;
+    var executor = StaticJsonExecutor{
+        .body =
+        \\{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":0,"received_lsn":0,"applied_lsn":0,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}
+        ,
+    };
+    var client = Client.init(alloc, executor.executor());
+
+    var assessment = try client.assessPromotion("http://ha-admin.test", .{
+        .required_lsn = 0,
+        .fencing_confirmed = true,
+        .force = false,
+        .use_current_fence = false,
+    });
+    defer assessment.deinit(alloc);
+
+    try std.testing.expectEqual(@as(i64, 0), assessment.parsed.value.assessment.required_lsn);
+    try std.testing.expect(assessment.parsed.value.assessment.has_required_lsn);
+    try std.testing.expect(assessment.parsed.value.assessment.safe);
 }
 
 test "storage.ha http client round trips admin commands" {
