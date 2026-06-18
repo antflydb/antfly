@@ -32,6 +32,7 @@ const rabitq = @import("antfly_vector").rabitq;
 const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
+const flat_centroid_search_probe_stack_capacity = 128;
 
 fn debugHitFromApprox(item: search_results.ApproxSearchResult) search_types.DebugHit {
     return .{
@@ -2559,8 +2560,13 @@ pub fn searchProfiledRequest(
         else
             @as(usize, @intCast(search_width));
         const probe_limit = @max(configured_probe_count, @as(usize, 1));
-        var probes = try self.alloc.alloc(spfresh_index.FlatCentroidProbe, probe_limit);
-        defer self.alloc.free(probes);
+        var probes_stack: [flat_centroid_search_probe_stack_capacity]spfresh_index.FlatCentroidProbe = undefined;
+        const use_probes_stack = probe_limit <= probes_stack.len;
+        var probes = if (use_probes_stack)
+            probes_stack[0..probe_limit]
+        else
+            try self.alloc.alloc(spfresh_index.FlatCentroidProbe, probe_limit);
+        defer if (!use_probes_stack) self.alloc.free(probes);
 
         const probe_count = try spfresh_index.selectFlatRabitqPostings(
             self,
