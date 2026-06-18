@@ -40,6 +40,7 @@ const compact_sorted_delta_scratch_max_records: usize = 512;
 const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
 const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const stack_index_max_bytes: usize = 64 * 1024;
+const stack_delta_value_range_max_bytes: usize = 64 * 1024;
 
 pub const segment_directory = "postings";
 pub const default_manifest_path = "postings/manifest.afpm";
@@ -1029,8 +1030,9 @@ pub const LazyDirectorySnapshot = struct {
             var stack_index: [stack_index_max_bytes]u8 = undefined;
             const index_data = try readSegmentIndexWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, &stack_index);
             defer index_data.deinit(alloc);
+            var stack_values: [stack_delta_value_range_max_bytes]u8 = undefined;
 
-            const range = (try readSegmentDeltaValueRangeAlloc(alloc, self.io, self.dir, manifest_entry, index_data.data, posting_id)) orelse continue;
+            const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, index_data.data, posting_id, &stack_values)) orelse continue;
             defer range.deinit(alloc);
             var delta_index = range.past_index;
             while (delta_index > range.first_index) {
@@ -2051,11 +2053,12 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
+    var stack_values: [stack_delta_value_range_max_bytes]u8 = undefined;
 
     var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
     errdefer records.deinit(alloc);
 
-    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data.data, posting_id)) orelse return try records.toOwnedSlice(alloc);
+    const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, io, dir, entry, index_data.data, posting_id, &stack_values)) orelse return try records.toOwnedSlice(alloc);
     defer range.deinit(alloc);
 
     var index = range.first_index;
@@ -2098,8 +2101,9 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
+    var stack_values: [stack_delta_value_range_max_bytes]u8 = undefined;
 
-    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data.data, posting_id)) orelse return;
+    const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, io, dir, entry, index_data.data, posting_id, &stack_values)) orelse return;
     defer range.deinit(alloc);
 
     const base_generation = min_generation orelse 0;
@@ -2143,8 +2147,9 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
+    var stack_values: [stack_delta_value_range_max_bytes]u8 = undefined;
 
-    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data.data, posting_id)) orelse return;
+    const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, io, dir, entry, index_data.data, posting_id, &stack_values)) orelse return;
     defer range.deinit(alloc);
 
     var index = range.first_index;
@@ -2178,9 +2183,10 @@ pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
+    var stack_values: [stack_delta_value_range_max_bytes]u8 = undefined;
 
     var out = posting.PostingDeltaTailStats{};
-    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data.data, posting_id)) orelse return out;
+    const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, io, dir, entry, index_data.data, posting_id, &stack_values)) orelse return out;
     defer range.deinit(alloc);
 
     var index = range.first_index;
@@ -2638,14 +2644,15 @@ const IndexEntry = struct {
     }
 };
 
-const OwnedDeltaValueRange = struct {
+const DeltaValueRange = struct {
     data: []u8,
+    owned: bool,
     base_offset: usize,
     first_index: usize,
     past_index: usize,
 
-    fn deinit(self: OwnedDeltaValueRange, alloc: Allocator) void {
-        alloc.free(self.data);
+    fn deinit(self: DeltaValueRange, alloc: Allocator) void {
+        if (self.owned) alloc.free(self.data);
     }
 };
 
@@ -3924,7 +3931,19 @@ fn readSegmentDeltaValueRangeAlloc(
     entry: ManifestEntry,
     index_data: []const u8,
     posting_id: PostingId,
-) !?OwnedDeltaValueRange {
+) !?DeltaValueRange {
+    return try readSegmentDeltaValueRangeWithScratchAlloc(alloc, io, dir, entry, index_data, posting_id, &.{});
+}
+
+fn readSegmentDeltaValueRangeWithScratchAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    index_data: []const u8,
+    posting_id: PostingId,
+    value_scratch: []u8,
+) !?DeltaValueRange {
     const first_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
     if (first_index >= entry.meta.entry_count) return null;
 
@@ -3946,21 +3965,30 @@ fn readSegmentDeltaValueRangeAlloc(
     }
 
     const range_len = range_end - range_offset;
-    const data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(range_offset), range_len);
+    var data: []u8 = undefined;
+    var owned = false;
+    if (range_len <= value_scratch.len) {
+        data = value_scratch[0..range_len];
+        try readFileRangeInto(io, dir, entry.path, @intCast(range_offset), data);
+    } else {
+        data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(range_offset), range_len);
+        owned = true;
+    }
     return .{
         .data = data,
+        .owned = owned,
         .base_offset = range_offset,
         .first_index = first_index,
         .past_index = past_index,
     };
 }
 
-fn deltaValueFromRange(index_data: []const u8, range: OwnedDeltaValueRange, index: usize) ![]const u8 {
+fn deltaValueFromRange(index_data: []const u8, range: DeltaValueRange, index: usize) ![]const u8 {
     const found = try deltaIndexEntryFromRange(index_data, range, index);
     return try deltaValueFromEntryRange(range, found);
 }
 
-fn deltaIndexEntryFromRange(index_data: []const u8, range: OwnedDeltaValueRange, index: usize) !IndexEntry {
+fn deltaIndexEntryFromRange(index_data: []const u8, range: DeltaValueRange, index: usize) !IndexEntry {
     if (index < range.first_index or index >= range.past_index) return error.CorruptedPostingSegment;
     return try deltaIndexEntryFromIndexData(index_data, index);
 }
@@ -3991,7 +4019,7 @@ fn deltaIndexEntryFromIndexData(index_data: []const u8, index: usize) !IndexEntr
     return try indexEntryFromBytes(index_data[index_offset..index_end]);
 }
 
-fn deltaValueFromEntryRange(range: OwnedDeltaValueRange, found: IndexEntry) ![]const u8 {
+fn deltaValueFromEntryRange(range: DeltaValueRange, found: IndexEntry) ![]const u8 {
     const relative_offset = std.math.sub(usize, found.offset, range.base_offset) catch return error.CorruptedPostingSegment;
     const relative_end = std.math.add(usize, relative_offset, found.len) catch return error.CorruptedPostingSegment;
     if (relative_end > range.data.len) return error.CorruptedPostingSegment;
