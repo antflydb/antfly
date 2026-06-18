@@ -4115,6 +4115,9 @@ pub const AppParityCorpusCoverage = struct {
     adapter_noop_session_probe: bool = false,
     adapter_noop_schema_namespace: bool = false,
     adapter_noop_extension: bool = false,
+    session_set_search_path: bool = false,
+    session_reset_search_path: bool = false,
+    session_show_search_path: bool = false,
     session_discard: bool = false,
     query_distinct_on: bool = false,
     query_cte_chain: bool = false,
@@ -5093,7 +5096,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_advisory_lock = self.ddl_advisory_lock or sql_adapter.planHasExactStringToken(entry.plan, ":action=", "lock");
                     self.ddl_advisory_unlock = self.ddl_advisory_unlock or sql_adapter.planHasExactStringToken(entry.plan, ":action=", "unlock");
                 },
-                .set_search_path, .reset_search_path, .show_search_path => {},
+                .set_search_path => self.session_set_search_path = true,
+                .reset_search_path => self.session_reset_search_path = true,
+                .show_search_path => self.session_show_search_path = true,
                 .discard_all => self.session_discard = true,
                 .create_index => {
                     self.ddl_create_index = true;
@@ -6097,6 +6102,9 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_comment_column);
         try std.testing.expect(self.ddl_comment_index);
         try std.testing.expect(self.ddl_comment_constraint);
+        try std.testing.expect(self.session_set_search_path);
+        try std.testing.expect(self.session_reset_search_path);
+        try std.testing.expect(self.session_show_search_path);
         try std.testing.expect(self.session_discard);
         try std.testing.expect(self.query_distinct_on);
         try std.testing.expect(self.query_cte_chain);
