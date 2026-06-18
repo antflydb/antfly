@@ -2009,6 +2009,48 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsAdminURLsWithHiddenWhitespace(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL: "http://primary-ha.default.svc:8081/\tadmin",
+		},
+		Standbys: []HAStandbySpec{{
+			Name:     "standby-a",
+			AdminURL: "http://standby-a-ha.default.svc:8081/\vadmin",
+		}},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRoleStandby,
+			NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{
+				SlotName:    "standby-a",
+				UpstreamURL: "http://primary-ha.default.svc:8081/\fadmin",
+			},
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA admin URLs with hidden whitespace to be rejected")
+	}
+	for _, want := range []string{
+		"admin.primaryURL must not contain whitespace",
+		"standbys[0].adminURL must not contain whitespace",
+		"runtime.standby.upstreamURL must not contain whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected hidden whitespace admin URL error %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

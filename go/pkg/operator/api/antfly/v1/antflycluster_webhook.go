@@ -1357,6 +1357,9 @@ func validateHAAdminURL(raw string, fieldPath string) []string {
 	if raw != trimmed {
 		return []string{fmt.Sprintf("%s must not have leading or trailing whitespace", fieldPath)}
 	}
+	if containsASCIIWhitespace(raw) {
+		return []string{fmt.Sprintf("%s must not contain whitespace", fieldPath)}
+	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return []string{fmt.Sprintf("%s must be an absolute http or https URL", fieldPath)}
@@ -1365,6 +1368,16 @@ func validateHAAdminURL(raw string, fieldPath string) []string {
 		return []string{fmt.Sprintf("%s must use http or https", fieldPath)}
 	}
 	return nil
+}
+
+func containsASCIIWhitespace(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			return true
+		}
+	}
+	return false
 }
 
 func validateHARuntime(ha *HighAvailabilitySpec) []string {
