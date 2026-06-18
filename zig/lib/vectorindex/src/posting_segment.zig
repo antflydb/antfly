@@ -1253,16 +1253,11 @@ pub const LazyDirectorySnapshot = struct {
         candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
     ) !void {
         for (self.manifest.segments) |entry| {
-            const segment_data = try self.readSegmentAlloc(alloc, entry);
-            defer alloc.free(segment_data);
-
-            var reader = try Reader.init(segment_data);
-            var iter = reader.entries();
-            while (try iter.next()) |segment_entry| {
-                if (segment_entry.kind != .centroid_directory) continue;
-                var record = try posting.CentroidDirectoryFormat.decode(alloc, segment_entry.value);
-                try putCentroidRecordCandidate(alloc, candidates, entry.meta.segment_id, &record);
-            }
+            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+            try appendSegmentCentroidDirectoryRecordCandidatesAlloc(alloc, self.io, self.dir, .{
+                .meta = entry.meta,
+                .path = entry.path,
+            }, candidates);
         }
     }
 };
@@ -3757,6 +3752,46 @@ fn readSegmentEntryValuePrefixInto(io: std.Io, dir: std.Io.Dir, entry: ManifestE
     const prefix_end = std.math.add(usize, found.offset, out.len) catch return error.CorruptedPostingSegment;
     if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset or prefix_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
     try readFileRangeInto(io, dir, entry.path, @intCast(found.offset), out);
+}
+
+fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+) !void {
+    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
+    defer alloc.free(index_data);
+
+    const file = try dir.openFile(io, entry.path, .{});
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    var value_scratch = std.ArrayListUnmanaged(u8).empty;
+    defer value_scratch.deinit(alloc);
+
+    var index: usize = 0;
+    while (index < entry.meta.entry_count) : (index += 1) {
+        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+        if (found.kind != .centroid_directory) continue;
+        if (found.sequence != 0) return error.CorruptedPostingSegment;
+
+        const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
+        if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
+
+        try value_scratch.resize(alloc, found.len);
+        const value = value_scratch.items;
+        try reader.seekTo(@intCast(found.offset));
+        reader.interface.readSliceAll(value) catch |err| switch (err) {
+            error.EndOfStream => return error.CorruptedPostingSegment,
+            else => return err,
+        };
+        try found.location().verifyValue(value);
+
+        var record = try posting.CentroidDirectoryFormat.decode(alloc, value);
+        try putCentroidRecordCandidate(alloc, candidates, entry.meta.segment_id, &record);
+    }
 }
 
 fn readSegmentDeltaValueRangeAlloc(
@@ -6580,6 +6615,65 @@ pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
     try std.testing.expectEqualSlices(posting.VectorId, &.{ 20, 30, 40 }, scratch.member_ids[0..scratch_count]);
 }
 
+pub fn testLazyDirectoryStoreBulkLoadsCentroidsWithPartialReads() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base);
+    const centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .mutation_version = 4,
+        .payload_version = 5,
+        .flags = 0,
+        .parent = 2,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 2.0,
+        .centroid = &.{ 3.0, 4.0 },
+    });
+    defer alloc.free(centroid);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(7, base);
+    try writer.appendCentroidDirectory(7, centroid);
+    var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
+    defer committed.deinit(alloc);
+
+    const original = try tmp.dir.readFileAlloc(std.testing.io, committed.entry.path, alloc, .limited(committed.entry.meta.byte_len + 1));
+    defer alloc.free(original);
+    const reader = try Reader.init(original);
+    const base_location = (try reader.getBaseLocation(7)).?;
+    var corrupt_base = try alloc.dupe(u8, original);
+    defer alloc.free(corrupt_base);
+    corrupt_base[base_location.offset] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed.entry.path,
+        .data = corrupt_base,
+    });
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    const records = try lazy.snapshot().loadCentroidDirectoryRecordsAlloc(alloc);
+    defer {
+        for (records) |*record| record.deinit(alloc);
+        alloc.free(records);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(PostingId, 7), records[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 4), records[0].mutation_version);
+    try std.testing.expectEqual(@as(usize, 2), records[0].member_count);
+    try std.testing.expectError(error.BadPostingSegmentChecksum, lazy.snapshot().loadBaseData(alloc, 7));
+}
+
 pub fn testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7303,6 +7397,10 @@ test "posting segment eager snapshot uses adaptive overlay replay for large tail
 
 test "posting segment lazy directory store uses newest point records by segment id" {
     try testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId();
+}
+
+test "posting segment lazy directory store bulk loads centroids with partial reads" {
+    try testLazyDirectoryStoreBulkLoadsCentroidsWithPartialReads();
 }
 
 test "posting segment typed base delta facade round trips through directory store" {
