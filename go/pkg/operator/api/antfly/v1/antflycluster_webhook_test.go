@@ -2444,6 +2444,35 @@ func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDesired(t *testing.T) 
 	}
 }
 
+func TestValidateCreate_HighAvailabilitySyncAllRequiresNoExplicitRequiredCount(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-b"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteApply,
+			Selection:    HAStandbySelectionAll,
+			StandbyNames: []string{"standby-a", "standby-b"},
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected ALL sync policy without required count to be accepted, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.SyncPolicy.Required = 1
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected ALL sync policy with required count to be rejected")
+	}
+	if !strings.Contains(err.Error(), "syncPolicy.required must be omitted when selection is All") {
+		t.Fatalf("expected ALL sync required-count validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsDuplicateSlotIdentities(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
