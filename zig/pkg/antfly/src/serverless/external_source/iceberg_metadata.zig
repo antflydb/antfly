@@ -104,12 +104,23 @@ pub fn parseMetadataPlanAlloc(
     const location = try requiredString(root, "location");
     const current_snapshot_id_int = try requiredI64(root, "current-snapshot-id");
     if (current_snapshot_id_int < 0) return error.InvalidIcebergMetadata;
-    const current_snapshot_id = try snapshotIdStringAlloc(alloc, current_snapshot_id_int);
-    errdefer alloc.free(current_snapshot_id);
-    if (requested_snapshot_id) |requested| {
+    var table_current_snapshot_id: ?[]u8 = try snapshotIdStringAlloc(alloc, current_snapshot_id_int);
+    errdefer if (table_current_snapshot_id) |id| alloc.free(id);
+
+    var target_is_table_current = true;
+    var target_snapshot_id: ?[]u8 = if (requested_snapshot_id) |requested| blk: {
         if (requested.len == 0) return error.InvalidIcebergMetadata;
-        if (!std.mem.eql(u8, requested, current_snapshot_id)) return error.IcebergSnapshotMismatch;
-    }
+        target_is_table_current = std.mem.eql(u8, requested, table_current_snapshot_id.?);
+        const requested_copy = try alloc.dupe(u8, requested);
+        alloc.free(table_current_snapshot_id.?);
+        table_current_snapshot_id = null;
+        break :blk requested_copy;
+    } else blk: {
+        const current = table_current_snapshot_id.?;
+        table_current_snapshot_id = null;
+        break :blk current;
+    };
+    errdefer if (target_snapshot_id) |id| alloc.free(id);
 
     const snapshots_value = root.get("snapshots") orelse return error.InvalidIcebergMetadata;
     const snapshots_array = switch (snapshots_value) {
@@ -125,8 +136,9 @@ pub fn parseMetadataPlanAlloc(
         for (snapshots[0..initialized]) |*snapshot| snapshot.deinit(alloc);
     }
 
-    var current_snapshot_index: ?usize = null;
-    var current_schema_id: ?i64 = optionalI64(root, "current-schema-id") catch null;
+    var target_snapshot_index: ?usize = null;
+    const table_current_schema_id: ?i64 = optionalI64(root, "current-schema-id") catch null;
+    var target_schema_id: ?i64 = null;
     for (snapshots_array.items, 0..) |snapshot_value, idx| {
         const snapshot_object = switch (snapshot_value) {
             .object => |object| object,
@@ -149,14 +161,20 @@ pub fn parseMetadataPlanAlloc(
             .schema_id = schema_id,
         };
         initialized += 1;
-        if (std.mem.eql(u8, snapshot_id, current_snapshot_id)) {
-            current_snapshot_index = idx;
-            if (current_schema_id == null) current_schema_id = schema_id;
+        if (std.mem.eql(u8, snapshot_id, target_snapshot_id.?)) {
+            target_snapshot_index = idx;
+            target_schema_id = schema_id;
         }
     }
 
-    const got_current_index = current_snapshot_index orelse return error.InvalidIcebergMetadata;
-    const got_schema_id = current_schema_id orelse return error.InvalidIcebergMetadata;
+    const got_target_index = target_snapshot_index orelse {
+        if (requested_snapshot_id != null) return error.IcebergSnapshotMismatch;
+        return error.InvalidIcebergMetadata;
+    };
+    const got_schema_id = target_schema_id orelse if (target_is_table_current)
+        table_current_schema_id orelse return error.InvalidIcebergMetadata
+    else
+        return error.InvalidIcebergMetadata;
     const metadata_uri_copy = try alloc.dupe(u8, metadata_uri);
     errdefer alloc.free(metadata_uri_copy);
     const table_uuid_copy = try alloc.dupe(u8, table_uuid);
@@ -165,15 +183,17 @@ pub fn parseMetadataPlanAlloc(
     errdefer alloc.free(location_copy);
     const schema_fingerprint = try schemaFingerprintAlloc(alloc, root, got_schema_id);
     errdefer alloc.free(schema_fingerprint);
+    const owned_target_snapshot_id = target_snapshot_id.?;
+    target_snapshot_id = null;
 
     var plan = Plan{
         .metadata_uri = metadata_uri_copy,
         .table_uuid = table_uuid_copy,
         .location = location_copy,
-        .current_snapshot_id = current_snapshot_id,
+        .current_snapshot_id = owned_target_snapshot_id,
         .schema_fingerprint = schema_fingerprint,
         .snapshots = snapshots,
-        .current_snapshot_index = got_current_index,
+        .current_snapshot_index = got_target_index,
     };
     errdefer plan.deinit(alloc);
     try plan.validate();
@@ -413,12 +433,73 @@ test "iceberg metadata plan resolves current snapshot manifest list" {
 
     try std.testing.expectEqualStrings("uuid-events", plan.table_uuid);
     try std.testing.expectEqualStrings("123", plan.current_snapshot_id);
-    try std.testing.expect(std.mem.startsWith(u8, plan.schema_fingerprint, "iceberg-schema:7:hash="));
+    try std.testing.expect(std.mem.startsWith(u8, plan.schema_fingerprint, "iceberg-schema:8:hash="));
     try std.testing.expectEqual(@as(usize, 1), plan.current_snapshot_index);
     try std.testing.expectEqualStrings(
         "s3://bucket/warehouse/events/metadata/snap-123.avro",
         plan.currentSnapshot().manifest_list_uri,
     );
+}
+
+test "iceberg metadata plan resolves requested historical snapshot" {
+    const alloc = std.testing.allocator;
+    const metadata_json =
+        \\{
+        \\  "format-version": 2,
+        \\  "table-uuid": "uuid-events",
+        \\  "location": "s3://bucket/warehouse/events",
+        \\  "current-schema-id": 8,
+        \\  "schemas": [
+        \\    {
+        \\      "schema-id": 7,
+        \\      "fields": [
+        \\        {"id": 1, "name": "tenant_id", "required": true, "type": "string"},
+        \\        {"id": 2, "name": "amount", "required": false, "type": "long"}
+        \\      ]
+        \\    },
+        \\    {
+        \\      "schema-id": 8,
+        \\      "fields": [
+        \\        {"id": 1, "name": "tenant_id", "required": true, "type": "string"},
+        \\        {"id": 2, "name": "amount", "required": false, "type": "double"}
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "current-snapshot-id": 123,
+        \\  "snapshots": [
+        \\    {
+        \\      "snapshot-id": 100,
+        \\      "sequence-number": 10,
+        \\      "schema-id": 7,
+        \\      "timestamp-ms": 1700000000000,
+        \\      "manifest-list": "s3://bucket/warehouse/events/metadata/snap-100.avro"
+        \\    },
+        \\    {
+        \\      "snapshot-id": 123,
+        \\      "sequence-number": 11,
+        \\      "schema-id": 8,
+        \\      "timestamp-ms": 1700000001000,
+        \\      "manifest-list": "s3://bucket/warehouse/events/metadata/snap-123.avro"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var plan = try parseMetadataPlanAlloc(
+        alloc,
+        "s3://bucket/warehouse/events/metadata/v2.metadata.json",
+        metadata_json,
+        "100",
+    );
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqualStrings("100", plan.current_snapshot_id);
+    try std.testing.expectEqual(@as(usize, 0), plan.current_snapshot_index);
+    try std.testing.expectEqualStrings(
+        "s3://bucket/warehouse/events/metadata/snap-100.avro",
+        plan.currentSnapshot().manifest_list_uri,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, plan.schema_fingerprint, "iceberg-schema:7:hash="));
 }
 
 test "iceberg metadata plan can use current snapshot schema id" {
@@ -448,6 +529,36 @@ test "iceberg metadata plan can use current snapshot schema id" {
     defer plan.deinit(alloc);
 
     try std.testing.expectEqualStrings("iceberg-schema:8", plan.schema_fingerprint);
+}
+
+test "iceberg metadata plan requires schema id for requested historical snapshot" {
+    const alloc = std.testing.allocator;
+    const metadata_json =
+        \\{
+        \\  "format-version": 2,
+        \\  "table-uuid": "uuid-events",
+        \\  "location": "s3://bucket/warehouse/events",
+        \\  "current-schema-id": 8,
+        \\  "current-snapshot-id": 123,
+        \\  "snapshots": [
+        \\    {
+        \\      "snapshot-id": 100,
+        \\      "manifest-list": "s3://bucket/warehouse/events/metadata/snap-100.avro"
+        \\    },
+        \\    {
+        \\      "snapshot-id": 123,
+        \\      "manifest-list": "s3://bucket/warehouse/events/metadata/snap-123.avro"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try std.testing.expectError(error.InvalidIcebergMetadata, parseMetadataPlanAlloc(
+        alloc,
+        "s3://bucket/warehouse/events/metadata/v2.metadata.json",
+        metadata_json,
+        "100",
+    ));
 }
 
 test "iceberg metadata plan fingerprints and validates schema definitions when present" {
