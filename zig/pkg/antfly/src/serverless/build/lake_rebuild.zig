@@ -31,6 +31,10 @@ const lake_sidecar_sparse = @import("lake_sidecar_sparse.zig");
 const lake_sidecar_text = @import("lake_sidecar_text.zig");
 const lake_sidecar_vector = @import("lake_sidecar_vector.zig");
 
+const default_full_text_index_name = "full_text_index_v0";
+const default_chunk_embedding_index_name = "serverless_chunk";
+const default_sparse_embedding_index_name = "serverless_sparse";
+
 pub const Action = enum {
     reuse,
     rebuild,
@@ -43,6 +47,48 @@ pub const DesiredArtifact = struct {
     kind: manifest_artifact.ArtifactKind,
     builder_kind: ?BuilderKind = null,
     build_spec: ?BuildSpec = null,
+};
+
+pub const LakeSourceSnapshot = struct {
+    source_kind: rowsource.SourceKind,
+    source_id: []const u8,
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+
+    pub fn validate(self: LakeSourceSnapshot) !void {
+        if (self.snapshot_id.len == 0) return error.InvalidLakeRebuildDesiredArtifacts;
+        if (self.schema_fingerprint.len == 0) return error.InvalidLakeRebuildDesiredArtifacts;
+        switch (self.source_kind) {
+            .external_parquet, .external_iceberg, .external_lance => {
+                if (self.source_id.len == 0) return error.InvalidLakeRebuildDesiredArtifacts;
+            },
+            .serverless_fragment, .relational_store, .json_materialized => {},
+        }
+    }
+};
+
+pub const TableIndexDefinition = struct {
+    table_name: []const u8,
+    schema_json: []const u8 = &.{},
+    read_schema_json: []const u8 = &.{},
+    indexes_json: []const u8 = &.{},
+};
+
+pub const DesiredArtifactSet = struct {
+    artifacts: []DesiredArtifact,
+
+    pub fn deinit(self: *DesiredArtifactSet, alloc: Allocator) void {
+        for (self.artifacts) |*artifact| freeOwnedDesiredArtifact(alloc, artifact);
+        alloc.free(self.artifacts);
+        self.* = undefined;
+    }
+
+    pub fn find(self: DesiredArtifactSet, name: []const u8) ?DesiredArtifact {
+        for (self.artifacts) |artifact| {
+            if (std.mem.eql(u8, artifact.name, name)) return artifact;
+        }
+        return null;
+    }
 };
 
 pub const PublishedArtifact = struct {
@@ -300,6 +346,117 @@ pub fn planAlloc(
     return .{ .decisions = try decisions.toOwnedSlice(alloc) };
 }
 
+pub fn desiredArtifactsFromTableDefinitionAlloc(
+    alloc: Allocator,
+    source: LakeSourceSnapshot,
+    table: TableIndexDefinition,
+) !DesiredArtifactSet {
+    try source.validate();
+
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
+    defer parsed_indexes.deinit();
+    const index_root = switch (parsed_indexes.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+
+    var artifacts = std.ArrayListUnmanaged(DesiredArtifact).empty;
+    errdefer {
+        for (artifacts.items) |*artifact| freeOwnedDesiredArtifact(alloc, artifact);
+        artifacts.deinit(alloc);
+    }
+
+    const text_specs = try lakeTextIndexSpecsAlloc(alloc, index_root, table.indexes_json.len != 0);
+    defer freeLakeTextIndexSpecs(alloc, text_specs);
+    for (text_specs) |spec| {
+        const text_column = try textColumnFromIndexConfigAlloc(alloc, spec.config_json);
+        defer alloc.free(text_column);
+        const index_hash = try indexConfigHashAlloc(alloc, "text", spec.name, spec.config_json, &[_][]const u8{text_column});
+        defer alloc.free(index_hash);
+        try appendDesiredArtifactAlloc(alloc, &artifacts, source, .{
+            .name = spec.name,
+            .sidecar_kind = .text,
+            .artifact_kind = .text_segment,
+            .column_bindings = &[_][]const u8{text_column},
+            .index_config_hash = index_hash,
+            .build_spec = .{ .text = .{ .text_column = text_column, .config_json = spec.config_json } },
+        });
+    }
+
+    const embedding_indexes = try listEmbeddingIndexesAlloc(alloc, index_root);
+    defer freeEmbeddingIndexes(alloc, embedding_indexes);
+    for (embedding_indexes) |source_descriptor| {
+        if (source_descriptor.sparse) continue;
+        const config_json = try indexConfigJsonAlloc(alloc, index_root, source_descriptor.name);
+        defer alloc.free(config_json);
+        const vector_column = try configuredColumnOrDefaultAlloc(
+            alloc,
+            index_root,
+            source_descriptor.name,
+            if (std.mem.eql(u8, source_descriptor.name, default_chunk_embedding_index_name)) "embedding" else source_descriptor.name,
+        );
+        defer alloc.free(vector_column);
+        const index_hash = try indexConfigHashAlloc(alloc, "vector", source_descriptor.name, config_json, &[_][]const u8{vector_column});
+        defer alloc.free(index_hash);
+        try appendDesiredArtifactAlloc(alloc, &artifacts, source, .{
+            .name = source_descriptor.name,
+            .sidecar_kind = .vector,
+            .artifact_kind = .vector_segment,
+            .column_bindings = &[_][]const u8{vector_column},
+            .index_config_hash = index_hash,
+            .build_spec = .{ .vector = .{
+                .vector_column = vector_column,
+                .embedding_name = if (std.mem.eql(u8, source_descriptor.name, default_chunk_embedding_index_name)) null else source_descriptor.name,
+            } },
+        });
+    }
+
+    for (embedding_indexes) |source_descriptor| {
+        if (!source_descriptor.sparse) continue;
+        const config_json = try indexConfigJsonAlloc(alloc, index_root, source_descriptor.name);
+        defer alloc.free(config_json);
+        const sparse_column = try configuredColumnOrDefaultAlloc(
+            alloc,
+            index_root,
+            source_descriptor.name,
+            if (std.mem.eql(u8, source_descriptor.name, default_sparse_embedding_index_name)) "sparse_embedding" else source_descriptor.name,
+        );
+        defer alloc.free(sparse_column);
+        const index_hash = try indexConfigHashAlloc(alloc, "sparse", source_descriptor.name, config_json, &[_][]const u8{sparse_column});
+        defer alloc.free(index_hash);
+        try appendDesiredArtifactAlloc(alloc, &artifacts, source, .{
+            .name = source_descriptor.name,
+            .sidecar_kind = .sparse,
+            .artifact_kind = .sparse_segment,
+            .column_bindings = &[_][]const u8{sparse_column},
+            .index_config_hash = index_hash,
+            .build_spec = .{ .sparse = .{ .sparse_column = sparse_column } },
+        });
+    }
+
+    const graph_names = try listGraphIndexNamesAlloc(alloc, index_root);
+    defer freeOwnedStrings(alloc, graph_names);
+    for (graph_names) |graph_name| {
+        const config_json = try indexConfigJsonAlloc(alloc, index_root, graph_name);
+        defer alloc.free(config_json);
+        const graph_column = try configuredColumnOrDefaultAlloc(alloc, index_root, graph_name, "graph_edges");
+        defer alloc.free(graph_column);
+        const index_hash = try indexConfigHashAlloc(alloc, "graph", graph_name, config_json, &[_][]const u8{graph_column});
+        defer alloc.free(index_hash);
+        try appendDesiredArtifactAlloc(alloc, &artifacts, source, .{
+            .name = graph_name,
+            .sidecar_kind = .graph,
+            .artifact_kind = .graph_segment,
+            .column_bindings = &[_][]const u8{graph_column},
+            .index_config_hash = index_hash,
+            .build_spec = .{ .graph = .{ .graph_column = graph_column } },
+        });
+    }
+
+    std.mem.sort(DesiredArtifact, artifacts.items, {}, compareDesiredArtifact);
+    return .{ .artifacts = try artifacts.toOwnedSlice(alloc) };
+}
+
 pub fn planOperationsAlloc(
     alloc: Allocator,
     desired: []const DesiredArtifact,
@@ -454,6 +611,257 @@ fn findDesired(desired: []const DesiredArtifact, name: []const u8) ?DesiredArtif
         if (std.mem.eql(u8, artifact.name, name)) return artifact;
     }
     return null;
+}
+
+const DesiredArtifactInput = struct {
+    name: []const u8,
+    sidecar_kind: source_binding.SidecarKind,
+    artifact_kind: manifest_artifact.ArtifactKind,
+    column_bindings: []const []const u8,
+    index_config_hash: []const u8,
+    build_spec: BuildSpec,
+};
+
+const LakeTextIndexSpec = struct {
+    name: []u8,
+    config_json: []u8,
+
+    fn deinit(self: *LakeTextIndexSpec, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.config_json);
+        self.* = undefined;
+    }
+};
+
+const EmbeddingIndexSpec = struct {
+    name: []u8,
+    sparse: bool = false,
+
+    fn deinit(self: *EmbeddingIndexSpec, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn appendDesiredArtifactAlloc(
+    alloc: Allocator,
+    artifacts: *std.ArrayListUnmanaged(DesiredArtifact),
+    source: LakeSourceSnapshot,
+    input: DesiredArtifactInput,
+) !void {
+    if (input.name.len == 0) return error.InvalidLakeRebuildDesiredArtifacts;
+    const name = try alloc.dupe(u8, input.name);
+    errdefer alloc.free(name);
+    const binding = try bindingForDesiredArtifactAlloc(alloc, source, input.sidecar_kind, input.column_bindings, input.index_config_hash);
+    errdefer freeOwnedBinding(alloc, binding);
+    var build_spec = try cloneBuildSpecAlloc(alloc, input.build_spec);
+    errdefer freeOwnedBuildSpec(alloc, &build_spec);
+    const artifact = DesiredArtifact{
+        .name = name,
+        .binding = binding,
+        .kind = input.artifact_kind,
+        .builder_kind = std.meta.activeTag(build_spec),
+        .build_spec = build_spec,
+    };
+    try validateDesiredArtifact(artifact);
+    try artifacts.append(alloc, artifact);
+}
+
+fn bindingForDesiredArtifactAlloc(
+    alloc: Allocator,
+    source: LakeSourceSnapshot,
+    sidecar_kind: source_binding.SidecarKind,
+    column_bindings: []const []const u8,
+    index_config_hash: []const u8,
+) !source_binding.Binding {
+    const owned_columns = try alloc.alloc([]const u8, column_bindings.len);
+    errdefer alloc.free(owned_columns);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned_columns[0..initialized]) |column| alloc.free(column);
+    }
+    for (column_bindings, 0..) |column, idx| {
+        if (column.len == 0) return error.InvalidLakeRebuildDesiredArtifacts;
+        owned_columns[idx] = try alloc.dupe(u8, column);
+        initialized += 1;
+    }
+
+    const source_id = try alloc.dupe(u8, source.source_id);
+    errdefer alloc.free(source_id);
+    const snapshot_id = try alloc.dupe(u8, source.snapshot_id);
+    errdefer alloc.free(snapshot_id);
+    const schema_fingerprint = try alloc.dupe(u8, source.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+    const owned_index_config_hash = try alloc.dupe(u8, index_config_hash);
+    errdefer alloc.free(owned_index_config_hash);
+
+    const binding = source_binding.Binding{
+        .sidecar_kind = sidecar_kind,
+        .source_kind = source.source_kind,
+        .row_ref_kind = source_binding.rowRefKindForSourceKind(source.source_kind),
+        .source_id = source_id,
+        .snapshot_id = snapshot_id,
+        .schema_fingerprint = schema_fingerprint,
+        .column_bindings = owned_columns,
+        .index_config_hash = owned_index_config_hash,
+    };
+    errdefer freeOwnedBinding(alloc, binding);
+    try binding.validate();
+    return binding;
+}
+
+fn lakeTextIndexSpecsAlloc(alloc: Allocator, index_root: std.json.ObjectMap, allow_default: bool) ![]LakeTextIndexSpec {
+    var specs = std.ArrayListUnmanaged(LakeTextIndexSpec).empty;
+    errdefer {
+        for (specs.items) |*spec| spec.deinit(alloc);
+        specs.deinit(alloc);
+    }
+
+    var it = index_root.iterator();
+    while (it.next()) |entry| {
+        if (!isFullTextIndexConfig(entry.value_ptr.*)) continue;
+        const config_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+        errdefer alloc.free(config_json);
+        try specs.append(alloc, .{
+            .name = try alloc.dupe(u8, entry.key_ptr.*),
+            .config_json = config_json,
+        });
+    }
+    if (specs.items.len == 0 and allow_default) {
+        try specs.append(alloc, .{
+            .name = try alloc.dupe(u8, default_full_text_index_name),
+            .config_json = try alloc.dupe(u8, "{\"type\":\"full_text\"}"),
+        });
+    }
+    std.mem.sort(LakeTextIndexSpec, specs.items, {}, compareLakeTextIndexSpec);
+    return try specs.toOwnedSlice(alloc);
+}
+
+fn freeLakeTextIndexSpecs(alloc: Allocator, specs: []LakeTextIndexSpec) void {
+    for (specs) |*spec| spec.deinit(alloc);
+    alloc.free(specs);
+}
+
+fn isFullTextIndexConfig(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const type_value = value.object.get("type") orelse return true;
+    return type_value == .string and std.mem.eql(u8, type_value.string, "full_text");
+}
+
+fn compareLakeTextIndexSpec(_: void, lhs: LakeTextIndexSpec, rhs: LakeTextIndexSpec) bool {
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+fn listEmbeddingIndexesAlloc(alloc: Allocator, index_root: std.json.ObjectMap) ![]EmbeddingIndexSpec {
+    var specs = std.ArrayListUnmanaged(EmbeddingIndexSpec).empty;
+    errdefer {
+        for (specs.items) |*spec| spec.deinit(alloc);
+        specs.deinit(alloc);
+    }
+    var it = index_root.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const type_value = entry.value_ptr.object.get("type") orelse continue;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) continue;
+        const sparse = if (entry.value_ptr.object.get("sparse")) |value| switch (value) {
+            .bool => |flag| flag,
+            else => return error.InvalidTableIndexMetadata,
+        } else false;
+        try specs.append(alloc, .{
+            .name = try alloc.dupe(u8, entry.key_ptr.*),
+            .sparse = sparse,
+        });
+    }
+    std.mem.sort(EmbeddingIndexSpec, specs.items, {}, compareEmbeddingIndexSpec);
+    return try specs.toOwnedSlice(alloc);
+}
+
+fn compareEmbeddingIndexSpec(_: void, lhs: EmbeddingIndexSpec, rhs: EmbeddingIndexSpec) bool {
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+fn freeEmbeddingIndexes(alloc: Allocator, specs: []EmbeddingIndexSpec) void {
+    for (specs) |*spec| spec.deinit(alloc);
+    alloc.free(specs);
+}
+
+fn textColumnFromIndexConfigAlloc(alloc: Allocator, config_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed.deinit();
+    if (jsonStringField(parsed.value, "field")) |field| return try alloc.dupe(u8, field);
+    return try alloc.dupe(u8, "text");
+}
+
+fn configuredColumnOrDefaultAlloc(
+    alloc: Allocator,
+    index_root: std.json.ObjectMap,
+    index_name: []const u8,
+    default_column: []const u8,
+) ![]u8 {
+    if (index_root.get(index_name)) |config| {
+        if (jsonStringField(config, "field")) |field| return try alloc.dupe(u8, field);
+        if (jsonStringField(config, "column")) |column| return try alloc.dupe(u8, column);
+    }
+    return try alloc.dupe(u8, default_column);
+}
+
+fn indexConfigJsonAlloc(
+    alloc: Allocator,
+    index_root: std.json.ObjectMap,
+    index_name: []const u8,
+) ![]u8 {
+    const value = index_root.get(index_name) orelse return try alloc.dupe(u8, "{}");
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+}
+
+fn indexConfigHashAlloc(
+    alloc: Allocator,
+    kind: []const u8,
+    name: []const u8,
+    config_json: []const u8,
+    columns: []const []const u8,
+) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0x1a6e_2026_51de_ca12);
+    hasher.update(kind);
+    hasher.update(&[_]u8{0});
+    hasher.update(name);
+    hasher.update(&[_]u8{0});
+    hasher.update(config_json);
+    for (columns) |column| {
+        hasher.update(&[_]u8{0});
+        hasher.update(column);
+    }
+    return try std.fmt.allocPrint(alloc, "wyhash64:{x}", .{hasher.final()});
+}
+
+fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const raw = value.object.get(field) orelse return null;
+    return switch (raw) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn listGraphIndexNamesAlloc(alloc: Allocator, index_root: std.json.ObjectMap) ![][]u8 {
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+
+    var it = index_root.iterator();
+    while (it.next()) |entry| {
+        const type_value = if (entry.value_ptr.* == .object) entry.value_ptr.object.get("type") else null;
+        const is_graph = if (type_value) |value|
+            value == .string and std.mem.eql(u8, value.string, "graph")
+        else
+            false;
+        if (!is_graph) continue;
+        try names.append(alloc, try alloc.dupe(u8, entry.key_ptr.*));
+    }
+    std.mem.sort([]u8, names.items, {}, lessString);
+    return try names.toOwnedSlice(alloc);
 }
 
 fn validateDesiredArtifact(want: DesiredArtifact) !void {
@@ -690,6 +1098,14 @@ fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
+fn compareDesiredArtifact(_: void, lhs: DesiredArtifact, rhs: DesiredArtifact) bool {
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+fn lessString(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
 fn cloneBindingAlloc(alloc: Allocator, binding: source_binding.Binding) !source_binding.Binding {
     const source_id = try alloc.dupe(u8, binding.source_id);
     errdefer alloc.free(source_id);
@@ -773,6 +1189,18 @@ fn freeOwnedBinding(alloc: Allocator, binding: source_binding.Binding) void {
     for (binding.column_bindings) |column| alloc.free(column);
     alloc.free(binding.column_bindings);
     alloc.free(binding.index_config_hash);
+}
+
+fn freeOwnedDesiredArtifact(alloc: Allocator, artifact: *DesiredArtifact) void {
+    alloc.free(artifact.name);
+    freeOwnedBinding(alloc, artifact.binding);
+    if (artifact.build_spec) |*build_spec| freeOwnedBuildSpec(alloc, build_spec);
+    artifact.* = undefined;
+}
+
+fn freeOwnedStrings(alloc: Allocator, items: []const []u8) void {
+    for (items) |item| alloc.free(item);
+    alloc.free(items);
 }
 
 fn freeOwnedBuildSpec(alloc: Allocator, build_spec: *BuildSpec) void {
@@ -1048,6 +1476,79 @@ test "lake rebuild planner reuses matching source bindings" {
     try std.testing.expect(!plan.anyRebuild());
     try std.testing.expectEqual(Action.reuse, plan.find("orders.embedding").?.action);
     try std.testing.expectEqualStrings("vec-1", plan.find("orders.embedding").?.artifact_id);
+}
+
+test "lake rebuild desired artifacts derive from table index metadata" {
+    const alloc = std.testing.allocator;
+    var desired = try desiredArtifactsFromTableDefinitionAlloc(alloc, .{
+        .source_kind = .external_parquet,
+        .source_id = "events",
+        .snapshot_id = "parquet-21",
+        .schema_fingerprint = "schema-v4",
+    }, .{
+        .table_name = "events",
+        .schema_json = "{\"version\":1}",
+        .indexes_json =
+        \\{
+        \\  "body_text":{"type":"full_text","field":"body"},
+        \\  "semantic_idx":{"type":"embeddings","field":"embedding","dimension":3},
+        \\  "sparse_idx":{"type":"embeddings","field":"sparse_terms","sparse":true},
+        \\  "graph_idx":{"type":"graph","field":"edges"}
+        \\}
+        ,
+    });
+    defer desired.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 4), desired.artifacts.len);
+    const text = desired.find("body_text").?;
+    try std.testing.expectEqual(source_binding.SidecarKind.text, text.binding.sidecar_kind);
+    try std.testing.expectEqualStrings("body", text.binding.column_bindings[0]);
+    try std.testing.expectEqual(BuilderKind.text, std.meta.activeTag(text.build_spec.?));
+    try std.testing.expectEqualStrings("body", text.build_spec.?.text.text_column);
+
+    const vector = desired.find("semantic_idx").?;
+    try std.testing.expectEqual(source_binding.SidecarKind.vector, vector.binding.sidecar_kind);
+    try std.testing.expectEqualStrings("embedding", vector.binding.column_bindings[0]);
+    try std.testing.expectEqual(BuilderKind.vector, std.meta.activeTag(vector.build_spec.?));
+    try std.testing.expectEqualStrings("embedding", vector.build_spec.?.vector.vector_column);
+    try std.testing.expectEqualStrings("semantic_idx", vector.build_spec.?.vector.embedding_name.?);
+
+    const sparse = desired.find("sparse_idx").?;
+    try std.testing.expectEqual(source_binding.SidecarKind.sparse, sparse.binding.sidecar_kind);
+    try std.testing.expectEqualStrings("sparse_terms", sparse.build_spec.?.sparse.sparse_column);
+
+    const graph = desired.find("graph_idx").?;
+    try std.testing.expectEqual(source_binding.SidecarKind.graph, graph.binding.sidecar_kind);
+    try std.testing.expectEqualStrings("edges", graph.build_spec.?.graph.graph_column);
+    try std.testing.expectEqualStrings("parquet-21", graph.binding.snapshot_id);
+
+    var operations = try planOperationsAlloc(alloc, desired.artifacts, &.{});
+    defer operations.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), operations.operations.len);
+    try std.testing.expectEqual(BuilderKind.text, operations.find("body_text").?.builder_kind.?);
+    try std.testing.expectEqual(BuilderKind.vector, operations.find("semantic_idx").?.builder_kind.?);
+    try std.testing.expectEqual(BuilderKind.sparse, operations.find("sparse_idx").?.builder_kind.?);
+    try std.testing.expectEqual(BuilderKind.graph, operations.find("graph_idx").?.builder_kind.?);
+}
+
+test "lake rebuild desired artifacts use default lake columns for named indexes" {
+    const alloc = std.testing.allocator;
+    var desired = try desiredArtifactsFromTableDefinitionAlloc(alloc, .{
+        .source_kind = .external_iceberg,
+        .source_id = "events",
+        .snapshot_id = "iceberg-42",
+        .schema_fingerprint = "schema-v5",
+    }, .{
+        .table_name = "events",
+        .schema_json = "{\"version\":1}",
+        .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"graph_idx\":{\"type\":\"graph\"}}",
+    });
+    defer desired.deinit(alloc);
+
+    try std.testing.expectEqualStrings("semantic_idx", desired.find("semantic_idx").?.binding.column_bindings[0]);
+    try std.testing.expectEqualStrings("sparse_idx", desired.find("sparse_idx").?.binding.column_bindings[0]);
+    try std.testing.expectEqualStrings("graph_edges", desired.find("graph_idx").?.binding.column_bindings[0]);
+    try std.testing.expect(desired.find("semantic_idx").?.binding.index_config_hash.len > "wyhash64:".len);
 }
 
 test "lake rebuild planner rebuilds stale source snapshots and missing folds" {
