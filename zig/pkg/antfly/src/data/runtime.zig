@@ -7970,13 +7970,7 @@ fn resolvePaths(
     defer alloc.free(local_base);
     const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
     defer alloc.free(metadata_base);
-    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
-        try normalizeResolvedPathAlloc(alloc, path)
-    else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
-        defer alloc.free(raw);
-        break :blk try normalizeResolvedPathAlloc(alloc, raw);
-    };
+    const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
     errdefer alloc.free(extension_package_store_dir);
 
     if (cli.replica_root_dir != null and cli.replica_catalog_path != null) {
@@ -8057,6 +8051,39 @@ fn ensureDirAndParent(io: std.Io, replica_root_dir: []const u8, replica_catalog_
     }
 }
 
+fn resolveExtensionPackageStoreDir(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+) ![]u8 {
+    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    defer alloc.free(env_var_z);
+    return try resolveExtensionPackageStoreDirWithEnv(
+        alloc,
+        cli_path,
+        local_base,
+        platform.env.getenvSlice(env_var_z),
+    );
+}
+
+fn resolveExtensionPackageStoreDirWithEnv(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+    env_path: ?[]const u8,
+) ![]u8 {
+    if (cli_path) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    if (env_path) |path| {
+        if (std.mem.trim(u8, path, " \t\r\n").len > 0) {
+            return try normalizeResolvedPathAlloc(alloc, path);
+        }
+    }
+
+    const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+    defer alloc.free(raw);
+    return try normalizeResolvedPathAlloc(alloc, raw);
+}
+
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
@@ -8070,14 +8097,13 @@ fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 
             else => return err,
         };
         if (resolved_z) |resolved| {
+            defer alloc.free(resolved);
             const resolved_prefix = resolved[0..resolved.len];
-            if (probe.len == path.len) return resolved_prefix;
+            if (probe.len == path.len) return try alloc.dupe(u8, resolved_prefix);
 
             const suffix_start: usize = if (probe.len == 1) 1 else probe.len + 1;
             const suffix = path[suffix_start..];
-            const joined = try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
-            alloc.free(resolved_prefix);
-            return joined;
+            return try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
         }
 
         const parent = std.fs.path.dirname(probe) orelse return try alloc.dupe(u8, path);
@@ -8321,6 +8347,18 @@ test "data runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/data/snapshots", resolved.snapshot_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
+}
+
+test "data runtime resolves extension package store env before local default" {
+    const alloc = std.testing.allocator;
+
+    const env_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, null, "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(env_resolved);
+    try std.testing.expectEqualStrings("/antfly-extension-env", env_resolved);
+
+    const cli_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, "/antfly-cli-extensions", "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(cli_resolved);
+    try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
 }
 
 test "data runtime parses optional split store registration flags" {

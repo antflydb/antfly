@@ -934,13 +934,7 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
-    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
-        try normalizeResolvedPathAlloc(alloc, path)
-    else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
-        defer alloc.free(raw);
-        break :blk try normalizeResolvedPathAlloc(alloc, raw);
-    };
+    const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
     errdefer alloc.free(extension_package_store_dir);
 
     return .{
@@ -949,6 +943,39 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
         .snapshot_root_dir = snapshot_root_dir,
         .extension_package_store_dir = extension_package_store_dir,
     };
+}
+
+fn resolveExtensionPackageStoreDir(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+) ![]u8 {
+    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    defer alloc.free(env_var_z);
+    return try resolveExtensionPackageStoreDirWithEnv(
+        alloc,
+        cli_path,
+        local_base,
+        platform.env.getenvSlice(env_var_z),
+    );
+}
+
+fn resolveExtensionPackageStoreDirWithEnv(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+    env_path: ?[]const u8,
+) ![]u8 {
+    if (cli_path) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    if (env_path) |path| {
+        if (std.mem.trim(u8, path, " \t\r\n").len > 0) {
+            return try normalizeResolvedPathAlloc(alloc, path);
+        }
+    }
+
+    const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+    defer alloc.free(raw);
+    return try normalizeResolvedPathAlloc(alloc, raw);
 }
 
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -1559,6 +1586,18 @@ test "metadata runtime resolves explicit extension package store path" {
     }, null);
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/opt/antfly/extension-store", resolved.extension_package_store_dir);
+}
+
+test "metadata runtime resolves extension package store env before local default" {
+    const alloc = std.testing.allocator;
+
+    const env_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, null, "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(env_resolved);
+    try std.testing.expectEqualStrings("/antfly-extension-env", env_resolved);
+
+    const cli_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, "/antfly-cli-extensions", "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(cli_resolved);
+    try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
 }
 
 test "metadata runtime derives reconciler config from common shard allocation settings" {
