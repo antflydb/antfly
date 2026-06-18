@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1640,6 +1641,207 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 	})
 	if ok {
 		t.Fatal("expected rejoin request body to require a concrete fence authority")
+	}
+}
+
+func TestExecuteHAPlannedActionTypedUsesAdminSDKForReplicationSlotCreate(t *testing.T) {
+	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
+
+	var requestBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != haAdminReplicationSlotsPath {
+			t.Errorf("expected %s, got %s", haAdminReplicationSlotsPath, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer operator-token" {
+			t.Errorf("expected bearer token header, got %q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"schema_version": uint32(1),
+			"action": map[string]any{
+				"action_id":   "replication_slot_create:standby-a",
+				"action_kind": "replication_slot_create",
+				"target":      "standby-a",
+				"state":       "applied",
+				"node_id":     "primary-a",
+			},
+			"slot_action": "create",
+			"slot": map[string]any{
+				"slot_name":       "standby-a",
+				"timeline_id":     uint64(4),
+				"restart_lsn":     uint64(12),
+				"received_lsn":    uint64(12),
+				"applied_lsn":     uint64(12),
+				"safe_read_lsn":   uint64(12),
+				"active":          true,
+				"reseed_required": false,
+				"current_lsn":     uint64(12),
+			},
+		})
+	}))
+	defer server.Close()
+
+	cluster := haCluster()
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionCreateSlot),
+		Executor:    string(haActionExecutorAdminAPI),
+		StandbyName: "standby-a",
+		SlotName:    "standby-a",
+		TargetLSN:   12,
+		AdminURL:    server.URL,
+		AdminNodeID: "primary-a",
+		AdminMethod: http.MethodPost,
+		AdminPath:   haAdminReplicationSlotsPath,
+	}
+
+	handled, err := (&AntflyClusterReconciler{}).executeHAPlannedActionTyped(context.Background(), cluster, &action)
+	if err != nil {
+		t.Fatalf("executeHAPlannedActionTyped returned error: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected direct admin action to be handled")
+	}
+	if requestBody["slot_name"] != "standby-a" || requestBody["initial_lsn"] != float64(12) {
+		t.Fatalf("unexpected slot create request body: %#v", requestBody)
+	}
+	if action.AdminResult == nil {
+		t.Fatal("expected typed admin result evidence")
+	}
+	if action.AdminResult.ActionNodeID != "primary-a" ||
+		action.AdminResult.ActionKind != "replication_slot_create" ||
+		action.AdminResult.ActionState != "applied" ||
+		action.AdminResult.SlotName != "standby-a" ||
+		action.AdminResult.SlotAction != "create" {
+		t.Fatalf("unexpected admin result: %#v", action.AdminResult)
+	}
+}
+
+func TestExecuteHAPlannedActionTypedAppliesAdminSDKPromotionReceipt(t *testing.T) {
+	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != haAdminPromotionCurrentFencePath {
+			t.Errorf("expected %s, got %s", haAdminPromotionCurrentFencePath, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer operator-token" {
+			t.Errorf("expected bearer token header, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"schema_version": uint32(1),
+			"action": map[string]any{
+				"action_id":   "promotion:standby-a",
+				"action_kind": "promotion",
+				"target":      "standby-a",
+				"state":       "applied",
+				"node_id":     "standby-a",
+			},
+			"assessment": map[string]any{
+				"required_lsn":          uint64(12),
+				"received_lsn":          uint64(12),
+				"applied_lsn":           uint64(12),
+				"has_required_lsn":      true,
+				"caught_up_to_received": true,
+				"fencing_confirmed":     true,
+				"force":                 false,
+				"mode":                  "safe",
+				"data_loss_possible":    false,
+				"safe":                  true,
+				"requires_fencing":      false,
+				"requires_force":        false,
+				"can_promote":           true,
+			},
+			"promotion": map[string]any{
+				"node_id": "standby-a",
+				"old_identity": map[string]any{
+					"cluster_id":  uint64(100),
+					"shard_id":    uint64(10),
+					"table_id":    uint64(20),
+					"timeline_id": uint64(4),
+					"epoch":       uint64(6),
+				},
+				"new_identity": map[string]any{
+					"cluster_id":  uint64(100),
+					"shard_id":    uint64(10),
+					"table_id":    uint64(20),
+					"timeline_id": uint64(5),
+					"epoch":       uint64(7),
+				},
+				"switch_lsn":         uint64(13),
+				"forced":             false,
+				"data_loss_possible": false,
+			},
+			"fence_generation": uint64(3),
+			"fence_token":      "ha-fence-token",
+			"forced":           false,
+		})
+	}))
+	defer server.Close()
+
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionPromoteStandby),
+		Executor:        string(haActionExecutorAdminAPI),
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 3,
+		FenceReason:     "LeaseAcquired",
+		AdminURL:        server.URL,
+		AdminNodeID:     "standby-a",
+		AdminMethod:     http.MethodPost,
+		AdminPath:       haAdminPromotionCurrentFencePath,
+	}
+
+	handled, err := (&AntflyClusterReconciler{}).executeHAPlannedActionTyped(context.Background(), cluster, &action)
+	if err != nil {
+		t.Fatalf("executeHAPlannedActionTyped returned error: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected direct admin promotion action to be handled")
+	}
+	if action.AdminResult == nil {
+		t.Fatal("expected typed promotion result evidence")
+	}
+	if action.AdminResult.ActionNodeID != "standby-a" ||
+		action.AdminResult.ActionKind != "promotion" ||
+		action.AdminResult.FenceGeneration != 3 ||
+		action.AdminResult.FenceToken != "ha-fence-token" ||
+		action.AdminResult.FenceNewTimelineID != 5 ||
+		action.AdminResult.FenceObservedLSN != 12 {
+		t.Fatalf("unexpected promotion admin result: %#v", action.AdminResult)
+	}
+	if cluster.Status.HAStatus.LastPromotion == nil {
+		t.Fatal("expected promotion receipt to update HA status")
+	}
+	promotion := cluster.Status.HAStatus.LastPromotion
+	if promotion.OldPrimaryID != "primary-a" ||
+		promotion.PromotedStandbyID != "standby-a" ||
+		promotion.ParentTimelineID != 4 ||
+		promotion.NewTimelineID != 5 ||
+		promotion.SwitchLSN != 13 ||
+		promotion.FenceGeneration != 3 ||
+		promotion.FenceToken != "ha-fence-token" {
+		t.Fatalf("unexpected HA promotion status: %#v", promotion)
 	}
 }
 

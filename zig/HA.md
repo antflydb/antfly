@@ -578,6 +578,39 @@ for explicitly local file-transfer or recovery steps.
 
 ### Implementation Guardrails
 
+#### Review Decisions
+
+The review outcome is to keep the HA helpers reusable without hiding
+configuration mistakes. `paddedHAString` should not become a broad
+`validateHAString` function that tries to validate every HA string in one place.
+Use a shared missing/padded classifier, then let field-specific validators
+return precise errors and layer type-specific rules for paths, node ids, slot
+names, token environment variables, and URLs. Validators must reject padded
+input; they must not trim and continue.
+
+Add `test_standby.py` as a black-box Zig e2e test once the admin API and
+runtime wiring are usable through real processes. The test should exercise the
+supported Postgres-style path: primary start, slot creation, seed/bootstrap,
+standby start, primary writes, standby catch-up and read-only behavior, standby
+restart with replay resume, and later fenced promotion with old-primary write
+rejection.
+
+Add Zig simulation coverage for the correctness cases that process e2e cannot
+explore exhaustively: receive-before-apply crashes, apply-before-ack crashes,
+primary crashes before and after synchronous acknowledgement, duplicate/gap or
+out-of-order WAL, promotion with and without valid fencing, old-primary
+rejoin/rewind/reseed, retained-WAL expiry, and timeline switch propagation.
+
+Treat production readiness as Postgres-style operational parity, not merely
+successful streaming. Before this mode is production grade, Antfly needs runtime
+primary/standby wiring, stable generated admin clients, operator integration
+through the Go SDK wrapper, base backup, sync commit, fencing, promotion and
+timeline repair, standby freshness controls, WAL retention pressure handling,
+auth/audit/metrics/runbooks, format compatibility, crash/e2e/operator tests,
+and the remaining parity work such as `pg_rewind`-style repair, synchronous
+commit policy depth, WAL archive or PITR-style recovery, observability, optional
+cascading or relay replication, and ergonomic operator workflows.
+
 The first runtime implementation should keep validation reusable without making
 it vague. `paddedHAString` should become a shared classifier, not a single
 generic validator that tries to do every check. The intended shape is:
