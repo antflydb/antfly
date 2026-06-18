@@ -479,6 +479,28 @@ pub const DropMaterializedViewSyntax = struct {
     }
 };
 
+pub const RefreshMaterializedViewSyntax = struct {
+    view_name: []const u8,
+    concurrently: bool = false,
+    populate: bool = true,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.view_name));
+        self.* = undefined;
+    }
+};
+
+pub const RenameViewSyntax = struct {
+    view_name: []const u8,
+    new_view_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.view_name));
+        alloc.free(@constCast(self.new_view_name));
+        self.* = undefined;
+    }
+};
+
 pub const PrivilegeChangeActionSyntax = enum {
     grant,
     revoke,
@@ -2158,6 +2180,54 @@ pub fn parseDropMaterializedViewCatalogTailAlloc(
     try parseAdapterNoopStatementEnd(cursor);
     view_transferred = true;
     return .{ .view_name = view_name, .if_exists = if_exists, .cascade = cascade };
+}
+
+pub fn parseRefreshMaterializedViewCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !RefreshMaterializedViewSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("materialized");
+    try cursor.expectKeyword("view");
+    const concurrently = cursor.matchKeyword("concurrently");
+    const view_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var view_transferred = false;
+    errdefer if (!view_transferred) alloc.free(view_name);
+    var populate = true;
+    if (cursor.matchKeyword("with")) {
+        if (cursor.matchKeyword("no")) {
+            try cursor.expectKeyword("data");
+            populate = false;
+        } else {
+            try cursor.expectKeyword("data");
+            populate = true;
+        }
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    view_transferred = true;
+    return .{ .view_name = view_name, .concurrently = concurrently, .populate = populate };
+}
+
+pub fn parseRenameViewCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !RenameViewSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("view");
+    const view_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var view_transferred = false;
+    errdefer if (!view_transferred) alloc.free(view_name);
+    try cursor.expectKeyword("rename");
+    try cursor.expectKeyword("to");
+    const new_view_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var new_transferred = false;
+    errdefer if (!new_transferred) alloc.free(new_view_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    view_transferred = true;
+    new_transferred = true;
+    return .{ .view_name = view_name, .new_view_name = new_view_name };
 }
 
 pub fn parseCreateRoleCatalogTailAlloc(
@@ -4091,7 +4161,7 @@ test "sql adapter grammar parses drop table and index catalog tails" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseDropTableCatalogTailAlloc(alloc, multi_table_tokens.items, &multi_table_pos));
 }
 
-test "sql adapter grammar parses view drop catalog tails" {
+test "sql adapter grammar parses view catalog tails" {
     const alloc = std.testing.allocator;
 
     var drop_view_tokens = try lexer.tokenizeAlloc(alloc, "VIEW IF EXISTS public.active_accounts CASCADE;");
@@ -4118,6 +4188,25 @@ test "sql adapter grammar parses view drop catalog tails" {
     defer lexer.freeTokens(alloc, &multi_view_tokens);
     var multi_view_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseDropViewCatalogTailAlloc(alloc, multi_view_tokens.items, &multi_view_pos));
+
+    var refresh_tokens = try lexer.tokenizeAlloc(alloc, "MATERIALIZED VIEW CONCURRENTLY public.account_rollups WITH NO DATA;");
+    defer lexer.freeTokens(alloc, &refresh_tokens);
+    var refresh_pos: usize = 0;
+    var refresh = try parseRefreshMaterializedViewCatalogTailAlloc(alloc, refresh_tokens.items, &refresh_pos);
+    defer refresh.deinit(alloc);
+    try std.testing.expectEqual(refresh_tokens.items.len, refresh_pos);
+    try std.testing.expectEqualStrings("account_rollups", refresh.view_name);
+    try std.testing.expect(refresh.concurrently);
+    try std.testing.expect(!refresh.populate);
+
+    var rename_tokens = try lexer.tokenizeAlloc(alloc, "VIEW public.active_accounts RENAME TO current_accounts;");
+    defer lexer.freeTokens(alloc, &rename_tokens);
+    var rename_pos: usize = 0;
+    var rename = try parseRenameViewCatalogTailAlloc(alloc, rename_tokens.items, &rename_pos);
+    defer rename.deinit(alloc);
+    try std.testing.expectEqual(rename_tokens.items.len, rename_pos);
+    try std.testing.expectEqualStrings("active_accounts", rename.view_name);
+    try std.testing.expectEqualStrings("current_accounts", rename.new_view_name);
 }
 
 test "sql adapter grammar parses authorization catalog tails" {

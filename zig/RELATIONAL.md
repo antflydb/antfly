@@ -1102,6 +1102,8 @@ comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
 `COMMENT ON INDEX`, and `COMMENT ON CONSTRAINT`,
 drop-catalog grammar for `DROP TABLE`, `DROP TABLE IF EXISTS`, `DROP INDEX`,
 `DROP INDEX CONCURRENTLY`, `DROP VIEW`, and `DROP MATERIALIZED VIEW`,
+view catalog grammar for `ALTER VIEW ... RENAME TO` and `REFRESH MATERIALIZED
+VIEW`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and

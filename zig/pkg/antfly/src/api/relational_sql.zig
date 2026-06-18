@@ -4001,26 +4001,15 @@ const Parser = struct {
     }
 
     fn parseRefreshMaterializedViewDdl(self: *@This()) !RefreshMaterializedViewPlan {
-        try self.expectKeyword("materialized");
-        try self.expectKeyword("view");
-        const concurrently = self.matchKeyword("concurrently");
-        const view_name = try self.parseSqlObjectIdentifierOwned();
-        var view_transferred = false;
-        errdefer if (!view_transferred) self.alloc.free(view_name);
-        var populate = true;
-        if (self.matchKeyword("with")) {
-            if (self.matchKeyword("no")) {
-                try self.expectKeyword("data");
-                populate = false;
-            } else {
-                try self.expectKeyword("data");
-                populate = true;
-            }
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        view_transferred = true;
-        return .{ .view_name = view_name, .concurrently = concurrently, .populate = populate };
+        var syntax = try sql_adapter.parseRefreshMaterializedViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .view_name = syntax.view_name,
+            .concurrently = syntax.concurrently,
+            .populate = syntax.populate,
+        };
     }
 
     fn parseDropMaterializedViewDdl(self: *@This()) !DropMaterializedViewPlan {
@@ -4152,20 +4141,14 @@ const Parser = struct {
     }
 
     fn parseRenameViewDdl(self: *@This()) !RenameViewPlan {
-        try self.expectKeyword("view");
-        const view_name = try self.parseSqlObjectIdentifierOwned();
-        var view_transferred = false;
-        errdefer if (!view_transferred) self.alloc.free(view_name);
-        try self.expectKeyword("rename");
-        try self.expectKeyword("to");
-        const new_view_name = try self.parseSqlObjectIdentifierOwned();
-        var new_transferred = false;
-        errdefer if (!new_transferred) self.alloc.free(new_view_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        view_transferred = true;
-        new_transferred = true;
-        return .{ .view_name = view_name, .new_view_name = new_view_name };
+        var syntax = try sql_adapter.parseRenameViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .view_name = syntax.view_name,
+            .new_view_name = syntax.new_view_name,
+        };
     }
 
     fn parseDropViewDdl(self: *@This()) !DropViewPlan {
