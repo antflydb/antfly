@@ -1584,25 +1584,27 @@ pub fn verifyDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, 
 
     for (manifest.segments) |entry| {
         if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
-        const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
-        defer alloc.free(data);
-        try validateSegmentDataMatchesMeta(data, entry.meta);
+        {
+            const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
+            defer alloc.free(data);
+            try validateSegmentDataMatchesMeta(data, entry.meta);
 
-        stats.segment_files += 1;
-        stats.segment_bytes += data.len;
-        stats.entries += entry.meta.entry_count;
+            stats.segment_files += 1;
+            stats.segment_bytes += data.len;
+            stats.entries += entry.meta.entry_count;
 
-        var reader = try Reader.init(data);
-        var iter = reader.entries();
-        while (try iter.next()) |logical_entry| {
-            switch (logical_entry.kind) {
-                .base => stats.base_records += 1,
-                .centroid_directory => stats.centroid_records += 1,
-                .delta => {
-                    stats.delta_values += 1;
-                    var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(logical_entry.value);
-                    while (try delta_iter.next()) |_| stats.delta_records += 1;
-                },
+            var reader = try Reader.init(data);
+            var iter = reader.entries();
+            while (try iter.next()) |logical_entry| {
+                switch (logical_entry.kind) {
+                    .base => stats.base_records += 1,
+                    .centroid_directory => stats.centroid_records += 1,
+                    .delta => {
+                        stats.delta_values += 1;
+                        var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(logical_entry.value);
+                        while (try delta_iter.next()) |_| stats.delta_records += 1;
+                    },
+                }
             }
         }
     }
@@ -1640,14 +1642,16 @@ pub fn copyDirectoryStoreManifestDataAlloc(
 
     for (manifest.segments) |entry| {
         if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
-        const data = try readSegmentFileAlloc(alloc, io, source_dir, entry.path, entry.meta.byte_len);
-        defer alloc.free(data);
-        try validateSegmentDataMatchesMeta(data, entry.meta);
-        try writeFileAtomicallyAlloc(alloc, io, destination_dir, entry.path, data);
+        {
+            const data = try readSegmentFileAlloc(alloc, io, source_dir, entry.path, entry.meta.byte_len);
+            defer alloc.free(data);
+            try validateSegmentDataMatchesMeta(data, entry.meta);
+            try writeFileAtomicallyAlloc(alloc, io, destination_dir, entry.path, data);
 
-        stats.segment_files += 1;
-        stats.segment_bytes += data.len;
-        stats.entries += entry.meta.entry_count;
+            stats.segment_files += 1;
+            stats.segment_bytes += data.len;
+            stats.entries += entry.meta.entry_count;
+        }
     }
 
     try writeManifestFileAlloc(alloc, io, destination_dir, options.manifest_path, manifest_data);
