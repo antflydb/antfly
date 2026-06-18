@@ -9940,8 +9940,14 @@ fn splitVectorSetHilbert(
 ) !SplitResult {
     const dims = self.config.dims;
     const count = ids.len;
-    const assignments = try self.alloc.alloc(u64, count);
-    defer self.alloc.free(assignments);
+    var left_flags_stack: [1024]bool = undefined;
+    const use_left_flags_stack = count <= left_flags_stack.len;
+    const left_flags = if (use_left_flags_stack)
+        left_flags_stack[0..count]
+    else
+        try self.alloc.alloc(bool, count);
+    defer if (!use_left_flags_stack) self.alloc.free(left_flags);
+    @memset(left_flags, false);
 
     const Entry = struct {
         index: usize,
@@ -9973,36 +9979,49 @@ fn splitVectorSetHilbert(
     }.lessThan);
 
     const split_point = count / 2;
-    for (entries, 0..) |entry, i| {
-        assignments[entry.index] = if (i < split_point) 0 else 1;
+    for (entries[0..split_point]) |entry| {
+        left_flags[entry.index] = true;
     }
 
     const left_centroid = try self.alloc.alloc(f32, dims);
     errdefer self.alloc.free(left_centroid);
     const right_centroid = try self.alloc.alloc(f32, dims);
     errdefer self.alloc.free(right_centroid);
-    calcPartitionCentroids(vectors, count, assignments, left_centroid, right_centroid);
+    @memset(left_centroid, 0);
+    @memset(right_centroid, 0);
+
+    const out_g1 = try self.alloc.alloc(u64, split_point);
+    errdefer self.alloc.free(out_g1);
+    const out_g2 = try self.alloc.alloc(u64, count - split_point);
+    errdefer self.alloc.free(out_g2);
+
+    var left_pos: usize = 0;
+    var right_pos: usize = 0;
+    for (left_flags, 0..) |is_left, i| {
+        if (is_left) {
+            out_g1[left_pos] = ids[i];
+            left_pos += 1;
+            vec.add(left_centroid, vectors.atConst(i));
+        } else {
+            out_g2[right_pos] = ids[i];
+            right_pos += 1;
+            vec.add(right_centroid, vectors.atConst(i));
+        }
+    }
+
+    vec.scale(1.0 / @as(f32, @floatFromInt(out_g1.len)), left_centroid);
+    vec.scale(1.0 / @as(f32, @floatFromInt(out_g2.len)), right_centroid);
 
     if (self.config.metric == .cosine) {
         _ = vec.normalize(left_centroid);
         _ = vec.normalize(right_centroid);
     }
 
-    var g1 = std.ArrayListUnmanaged(u64).empty;
-    var g2 = std.ArrayListUnmanaged(u64).empty;
-    for (assignments, 0..) |a, i| {
-        if (a == 0) {
-            try g1.append(self.alloc, ids[i]);
-        } else {
-            try g2.append(self.alloc, ids[i]);
-        }
-    }
-
     return .{
         .c1 = left_centroid,
-        .g1 = try g1.toOwnedSlice(self.alloc),
+        .g1 = out_g1,
         .c2 = right_centroid,
-        .g2 = try g2.toOwnedSlice(self.alloc),
+        .g2 = out_g2,
     };
 }
 
