@@ -71,7 +71,13 @@ pub fn classifyWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
 }
 
 pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize) ?SqlPreparedStatementSubjectKind {
-    if (statementStartsAt(tokens, start, "select") or statementStartsAt(tokens, start, "with")) return .read;
+    if (statementStartsAt(tokens, start, "select")) return .read;
+    if (statementStartsAt(tokens, start, "with")) {
+        const final_index = withFinalStatementIndex(tokens[start..]) orelse return null;
+        if (std.ascii.eqlIgnoreCase(tokens[start + final_index].text, "select")) return .read;
+        if (withFinalStatementWriteKind(tokens[start + final_index].text) != null) return .write;
+        return null;
+    }
     if (statementStartsAt(tokens, start, "insert") or
         statementStartsAt(tokens, start, "update") or
         statementStartsAt(tokens, start, "delete") or
@@ -90,6 +96,11 @@ pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize)
 }
 
 fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
+    const index = withFinalStatementIndex(tokens) orelse return null;
+    return withFinalStatementWriteKind(tokens[index].text);
+}
+
+fn withFinalStatementIndex(tokens: []const Token) ?usize {
     var index: usize = 1;
     if (parser.matchKeyword(tokens, &index, "recursive")) return null;
 
@@ -111,11 +122,15 @@ fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
     }
 
     if (index >= tokens.len or tokens[index].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens[index].text, "insert")) return .insert_source;
-    if (std.ascii.eqlIgnoreCase(tokens[index].text, "update")) return .update;
-    if (std.ascii.eqlIgnoreCase(tokens[index].text, "delete")) return .delete;
-    if (std.ascii.eqlIgnoreCase(tokens[index].text, "merge")) return .merge;
-    if (std.ascii.eqlIgnoreCase(tokens[index].text, "truncate")) return .truncate;
+    return index;
+}
+
+fn withFinalStatementWriteKind(keyword: []const u8) ?SqlWriteStatementKind {
+    if (std.ascii.eqlIgnoreCase(keyword, "insert")) return .insert_source;
+    if (std.ascii.eqlIgnoreCase(keyword, "update")) return .update;
+    if (std.ascii.eqlIgnoreCase(keyword, "delete")) return .delete;
+    if (std.ascii.eqlIgnoreCase(keyword, "merge")) return .merge;
+    if (std.ascii.eqlIgnoreCase(keyword, "truncate")) return .truncate;
     return null;
 }
 
@@ -186,6 +201,10 @@ test "sql adapter classifier identifies prepared statement subject families" {
     }{
         .{ .sql = "PREPARE usage_plan AS SELECT id FROM usage_records", .start_keyword = "select", .expected = .read },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .start_keyword = "with", .expected = .read },
+        .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archived_records(id) SELECT id FROM source_rows", .start_keyword = "with", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)", .start_keyword = "with", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)", .start_keyword = "with", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status", .start_keyword = "with", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS INSERT INTO usage_records(id) VALUES ($1)", .start_keyword = "insert", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS UPDATE usage_records SET status = $1", .start_keyword = "update", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS DELETE FROM usage_records", .start_keyword = "delete", .expected = .write },
@@ -206,4 +225,9 @@ test "sql adapter classifier identifies prepared statement subject families" {
     defer lexer.freeTokens(alloc, &explain_tokens);
     const explain_start = parser.findTopLevelKeyword(explain_tokens.items, "explain").?;
     try std.testing.expect(classifyPreparedStatementSubjectKind(explain_tokens.items, explain_start) == null);
+
+    var recursive_tokens = try lexer.tokenizeAlloc(alloc, "PREPARE usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done'");
+    defer lexer.freeTokens(alloc, &recursive_tokens);
+    const recursive_start = parser.findTopLevelKeyword(recursive_tokens.items, "with").?;
+    try std.testing.expect(classifyPreparedStatementSubjectKind(recursive_tokens.items, recursive_start) == null);
 }

@@ -8172,6 +8172,15 @@ test "sql adapter grammar parses prepared statement syntax" {
     try std.testing.expectEqual(PreparedStatementSubjectSyntax.write, prepare_merge.statement_kind);
     try std.testing.expectEqual(prepare_merge_tokens.items.len, prepare_merge_pos);
 
+    var prepare_cte_write_tokens = try lexer.tokenizeAlloc(alloc, "usage_cte_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);");
+    defer lexer.freeTokens(alloc, &prepare_cte_write_tokens);
+    var prepare_cte_write_pos: usize = 0;
+    const prepare_cte_write = try parsePrepareStatementTail(prepare_cte_write_tokens.items, &prepare_cte_write_pos);
+    try std.testing.expectEqualStrings("usage_cte_plan", prepare_cte_write.statement_name);
+    try std.testing.expectEqual(@as(usize, 0), prepare_cte_write.parameter_count);
+    try std.testing.expectEqual(PreparedStatementSubjectSyntax.write, prepare_cte_write.statement_kind);
+    try std.testing.expectEqual(prepare_cte_write_tokens.items.len, prepare_cte_write_pos);
+
     var execute_tokens = try lexer.tokenizeAlloc(alloc, "usage_plan('open', -3, true, null);");
     defer lexer.freeTokens(alloc, &execute_tokens);
     var execute_pos: usize = 0;

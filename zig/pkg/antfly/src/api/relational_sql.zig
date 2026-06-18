@@ -45156,6 +45156,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:prepare_statement:name=merge_plan:params=0:subject=write", prepare_merge_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_merge_statement));
 
+    var prepare_cte_write_statement = try lowerDdlPlanAlloc(alloc, "PREPARE cte_write_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);");
+    defer prepare_cte_write_statement.deinit(alloc);
+    const prepare_cte_write_statement_fingerprint = try ddlFingerprintAlloc(alloc, prepare_cte_write_statement);
+    defer alloc.free(prepare_cte_write_statement_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepare_statement:name=cte_write_plan:params=0:subject=write", prepare_cte_write_statement_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_cte_write_statement));
+
     var execute_statement = try lowerDdlPlanAlloc(alloc, "EXECUTE usage_plan('open');");
     defer execute_statement.deinit(alloc);
     const execute_statement_fingerprint = try ddlFingerprintAlloc(alloc, execute_statement);
@@ -54419,6 +54426,53 @@ const AppParityDdlTag = sql_adapter.AppParityDdlTag;
 const AppParityPlanSummary = sql_adapter.AppParityPlanSummary;
 const AppParityCorpusEntry = sql_adapter.AppParityCorpusEntry;
 
+const AppParityExternalSourceCorpus = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: sql_adapter.AppParitySourceCorpusRoot,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        sql_adapter.freeSourceCorpusRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityExternalSourceCorpus {
+    const source_json = @embedFile("fixtures/sql_api_parity_source_corpus.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try sql_adapter.parseSourceCorpusRootAlloc(alloc, parsed.value);
+    errdefer sql_adapter.freeSourceCorpusRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+fn appParityCombinedCorpusAlloc(
+    alloc: std.mem.Allocator,
+    seed_corpus: []const AppParityCorpusEntry,
+    source_corpus: []const AppParityCorpusEntry,
+) ![]const AppParityCorpusEntry {
+    var seen_names = std.StringHashMapUnmanaged(void){};
+    defer seen_names.deinit(alloc);
+
+    var combined = try std.ArrayListUnmanaged(AppParityCorpusEntry).initCapacity(alloc, seed_corpus.len + source_corpus.len);
+    errdefer combined.deinit(alloc);
+    for (seed_corpus) |entry| {
+        if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
+        try seen_names.put(alloc, entry.name, {});
+        combined.appendAssumeCapacity(entry);
+    }
+    for (source_corpus) |entry| {
+        if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
+        try seen_names.put(alloc, entry.name, {});
+        combined.appendAssumeCapacity(entry);
+    }
+    return try combined.toOwnedSlice(alloc);
+}
+
 fn expectOptionalUsize(expected: ?usize, actual: usize) !void {
     if (expected) |value| try std.testing.expectEqual(value, actual);
 }
@@ -58354,6 +58408,26 @@ fn validateAppParityFixtureMetadata(
     return validateAppParityFixtureMetadataWithBaseSchema(entry, "", seen_names, alloc);
 }
 
+test "app parity combined source corpus rejects duplicate names" {
+    const alloc = std.testing.allocator;
+    const seed = [_]AppParityCorpusEntry{.{
+        .name = "duplicate source entry",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .show_search_path },
+        .plan = "ddl:session:show_search_path",
+        .sql = "SHOW search_path",
+    }};
+    const source = [_]AppParityCorpusEntry{.{
+        .name = "duplicate source entry",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .discard_all },
+        .plan = "ddl:session:discard_all",
+        .sql = "DISCARD ALL",
+    }};
+
+    try std.testing.expectError(error.TestUnexpectedResult, appParityCombinedCorpusAlloc(alloc, &seed, &source));
+}
+
 test "app parity fixture metadata requires typed summary anchors" {
     const alloc = std.testing.allocator;
     var seen = std.StringHashMapUnmanaged(void){};
@@ -59821,52 +59895,6 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc);
 }
 
-test "app parity structured side-access coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .join,
-        .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1:left_json_contains=1x:right_json_exists=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .lateral,
-        .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1x",
-    });
-
-    try std.testing.expect(!coverage.join_structured_side_access);
-    try std.testing.expect(!coverage.lateral_structured_side_access);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .join,
-        .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1:left_json_contains=1:right_json_exists=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .lateral,
-        .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1",
-    });
-
-    try std.testing.expect(coverage.join_structured_side_access);
-    try std.testing.expect(coverage.lateral_structured_side_access);
-}
-
-test "app parity insert-source assignment expression coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert_source,
-        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=0:returning_expr=0:returning_all=0:assignment_expr=1x",
-    });
-
-    try std.testing.expect(!coverage.insert_source_expression_assignment);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert_source,
-        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=0:returning_expr=0:returning_all=0:assignment_expr=1",
-    });
-
-    try std.testing.expect(coverage.insert_source_expression_assignment);
-}
-
 test "app parity cte coverage tokens are exact" {
     const malformed = "query:table=usage_records:ctes=1:cte0_expr_pred=2x";
     try std.testing.expect(!sql_adapter.planHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_"));
@@ -59888,100 +59916,6 @@ test "app parity cte coverage tokens are exact" {
     });
     try std.testing.expect(coverage.query_cte_structured_access);
     try std.testing.expect(coverage.query_cte_expression_access);
-}
-
-test "app parity merge mutation coverage requires typed-plan prefix" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .merge_mutation,
-        .plan = "write_wrapper:merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(!coverage.merge_mutation_typed_plan);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .merge_mutation,
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(coverage.merge_mutation_typed_plan);
-}
-
-test "app parity conflict write count coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO usage_records (id) VALUES ('a'), ('b') ON CONFLICT DO NOTHING",
-        .plan = "insert:table=usage_records:writes=10:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
-        .resolver_exists = false,
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO NOTHING RETURNING *",
-        .plan = "insert:table=usage_records:writes=0:transforms=10:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
-        .plan = "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=00x:returning_expr=0:conflict_where=1",
-    });
-
-    try std.testing.expect(!coverage.multi_row_conflict_do_nothing_duplicate_target);
-    try std.testing.expect(!coverage.conflict_do_nothing_returning_all);
-    try std.testing.expect(!coverage.conflict_guard_where_skip);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO usage_records (id) VALUES ('a'), ('b') ON CONFLICT DO NOTHING",
-        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
-        .resolver_exists = false,
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO NOTHING RETURNING *",
-        .plan = "insert:table=usage_records:writes=0:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
-        .plan = "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0:conflict_where=1",
-    });
-
-    try std.testing.expect(coverage.multi_row_conflict_do_nothing_duplicate_target);
-    try std.testing.expect(coverage.conflict_do_nothing_returning_all);
-    try std.testing.expect(coverage.conflict_guard_where_skip);
-}
-
-test "app parity temporal conflict transform count coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
-        .plan = "insert:table=prices:writes=0:transforms=10:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
-        .apply_setup_sql = &.{
-            "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));",
-        },
-        .resolver_row_json = "{\"id\":\"p1\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}",
-        .resolver_version = 45,
-    });
-
-    try std.testing.expect(!coverage.schema_temporal_unique_conflict_upsert);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
-        .plan = "insert:table=prices:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
-        .apply_setup_sql = &.{
-            "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));",
-        },
-        .resolver_row_json = "{\"id\":\"p1\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}",
-        .resolver_version = 45,
-    });
-
-    try std.testing.expect(coverage.schema_temporal_unique_conflict_upsert);
 }
 
 const AppParityCorpusCoverage = sql_adapter.AppParityCorpusCoverage;
@@ -60934,1081 +60868,12 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "DISCARD ALL;",
         },
         .{
-            .name = "prepare statement protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .prepare_statement, .table_name = "usage_plan", .operations = 1 },
-            .plan = "ddl:prepare_statement:name=usage_plan:params=1:subject=read",
-            .sql = "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1",
-        },
-        .{
-            .name = "execute prepared statement protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .execute_statement, .table_name = "usage_plan", .operations = 1 },
-            .plan = "ddl:execute_statement:name=usage_plan:args=1",
-            .sql = "EXECUTE usage_plan('open')",
-        },
-        .{
-            .name = "deallocate prepared statement protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .deallocate_statement, .table_name = "usage_plan" },
-            .plan = "ddl:deallocate_statement:name=usage_plan",
-            .sql = "DEALLOCATE usage_plan",
-        },
-        .{
-            .name = "deallocate all prepared statements protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .deallocate_statement },
-            .plan = "ddl:deallocate_statement:all=true",
-            .sql = "DEALLOCATE ALL",
-        },
-        .{
-            .name = "declare cursor portal protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .declare_cursor, .table_name = "usage_cursor" },
-            .plan = "ddl:declare_cursor:portal=usage_cursor:scroll=default:binary=false:hold=false:subject=read",
-            .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id",
-        },
-        .{
-            .name = "declare scroll hold binary cursor portal protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .declare_cursor, .table_name = "usage_scroll_cursor" },
-            .plan = "ddl:declare_cursor:portal=usage_scroll_cursor:scroll=scroll:binary=true:hold=true:subject=read",
-            .sql = "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id",
-        },
-        .{
-            .name = "fetch cursor portal protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor" },
-            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=next",
-            .sql = "FETCH NEXT FROM usage_cursor",
-        },
-        .{
-            .name = "fetch cursor portal count in-alias protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor", .operations = 10 },
-            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
-            .sql = "FETCH FORWARD 10 IN usage_cursor",
-        },
-        .{
-            .name = "fetch cursor portal default shorthand protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor" },
-            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=next",
-            .sql = "FETCH usage_cursor",
-        },
-        .{
-            .name = "fetch cursor portal bare count protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor", .operations = 10 },
-            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
-            .sql = "FETCH 10 usage_cursor",
-        },
-        .{
-            .name = "fetch cursor portal forward no-connector protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor" },
-            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=forward",
-            .sql = "FETCH FORWARD usage_cursor",
-        },
-        .{
-            .name = "close cursor portal protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .close_cursor, .table_name = "usage_cursor" },
-            .plan = "ddl:close_cursor:portal=usage_cursor",
-            .sql = "CLOSE usage_cursor",
-        },
-        .{
-            .name = "close all cursors protocol plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .close_cursor },
-            .plan = "ddl:close_cursor:all=true",
-            .sql = "CLOSE ALL",
-        },
-        .{
-            .name = "explain read plan",
-            .family = .explain,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
-            .plan = "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "EXPLAIN SELECT id FROM usage_records WHERE status = 'open'",
-        },
-        .{
-            .name = "explain json verbose read plan",
-            .family = .explain,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
-            .plan = "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:format=json:verbose=1:costs=0",
-            .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF) SELECT id FROM usage_records WHERE status = 'open'",
-        },
-        .{
-            .name = "explain insert write plan",
-            .family = .explain,
-            .summary = .{ .table_name = "usage_records", .returning = 1 },
-            .plan = "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
-            .sql = "EXPLAIN INSERT INTO usage_records (id, status) VALUES ('u_explain', 'pending') RETURNING id",
-        },
-        .{
-            .name = "explain claimed update write plan",
-            .family = .explain,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .returning = 1 },
-            .plan = "explain:kind=write:analyze=false:inner=update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
-            .sql = "EXPLAIN UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR UPDATE RETURNING id",
-        },
-        .{
-            .name = "explain joined update write plan",
-            .family = .explain,
-            .summary = .{ .table_name = "usage_records", .join_on = 1, .returning = 1 },
-            .plan = "explain:kind=write:analyze=false:inner=update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
-            .sql = "EXPLAIN UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id",
-        },
-        .{
-            .name = "explain analyze read plan",
-            .family = .explain,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
-            .plan = "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "EXPLAIN ANALYZE SELECT id FROM usage_records WHERE status = 'open'",
-        },
-        .{
-            .name = "vacuum maintenance job",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .vacuum_maintenance, .table_name = "usage_records", .operations = 0 },
-            .plan = "ddl:maintenance:kind=vacuum:table=usage_records:full=false:freeze=false:verbose=false:analyze=false",
-            .sql = "VACUUM usage_records",
-        },
-        .{
-            .name = "analyze maintenance job",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .analyze_maintenance, .table_name = "usage_records", .operations = 0 },
-            .plan = "ddl:maintenance:kind=analyze:table=usage_records:verbose=false:columns=0",
-            .sql = "ANALYZE usage_records",
-        },
-        .{
-            .name = "reindex maintenance job",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .reindex_maintenance, .table_name = "usage_records", .operations = 0 },
-            .plan = "ddl:maintenance:kind=reindex:target=table:name=usage_records:concurrently=false",
-            .sql = "REINDEX TABLE usage_records",
-        },
-        .{
-            .name = "cluster maintenance job",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .cluster_maintenance, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=false",
-            .sql = "CLUSTER usage_records USING usage_records_status_idx",
-        },
-        .{
-            .name = "explicit table lock transaction control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .table_lock, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:transaction_control:kind=table_lock:tables=1:mode=access_exclusive",
-            .sql = "LOCK TABLE usage_records IN ACCESS EXCLUSIVE MODE",
-        },
-        .{
-            .name = "deferred constraint mode transaction control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .constraint_mode, .operations = 1 },
-            .plan = "ddl:transaction_control:kind=constraint_mode:all=true:constraints=0:mode=deferred",
-            .sql = "SET CONSTRAINTS ALL DEFERRED",
-        },
-        .{
-            .name = "set transaction mode control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .transaction_mode, .operations = 2 },
-            .plan = "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=serializable:access=read_only:deferrable=none",
-            .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY",
-        },
-        .{
-            .name = "start transaction mode control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .transaction_mode, .operations = 1 },
-            .plan = "ddl:transaction_control:kind=transaction_mode:starter=start_transaction:isolation=repeatable_read:access=none:deferrable=none",
-            .sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-        },
-        .{
-            .name = "begin transaction mode control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .transaction_mode, .operations = 2 },
-            .plan = "ddl:transaction_control:kind=transaction_mode:starter=begin:isolation=serializable:access=read_write:deferrable=none",
-            .sql = "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-        },
-        .{
-            .name = "advisory lock transaction control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .advisory_lock, .operations = 1 },
-            .plan = "ddl:transaction_control:kind=advisory_lock:action=lock:keys=1",
-            .sql = "SELECT pg_advisory_lock(42);",
-        },
-        .{
-            .name = "advisory unlock transaction control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .advisory_lock, .operations = 1 },
-            .plan = "ddl:transaction_control:kind=advisory_lock:action=unlock:keys=1",
-            .sql = "SELECT pg_advisory_unlock(42);",
-        },
-        .{
-            .name = "adapter-only schema namespace syntax",
-            .family = .adapter_noop_ddl,
-            .plan = "adapter_noop:ddl:reason=schema_namespace",
-            .classification_reason = "schema_namespace",
-            .sql = "CREATE SCHEMA IF NOT EXISTS public;",
-        },
-        .{
-            .name = "create schema namespace catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_schema_namespace, .table_name = "tenant_ops" },
-            .plan = "ddl:create_schema_namespace:schema=tenant_ops:if_not_exists=false",
-            .sql = "CREATE SCHEMA tenant_ops",
-        },
-        .{
-            .name = "rename schema namespace catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .rename_schema_namespace, .table_name = "tenant_ops" },
-            .plan = "ddl:rename_schema_namespace:schema=tenant_ops:new=tenant_ops_archive",
-            .sql = "ALTER SCHEMA tenant_ops RENAME TO tenant_ops_archive",
-        },
-        .{
-            .name = "drop schema namespace catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_schema_namespace, .table_name = "tenant_ops" },
-            .plan = "ddl:drop_schema_namespace:schema=tenant_ops:if_exists=false",
-            .sql = "DROP SCHEMA tenant_ops",
-        },
-        .{
-            .name = "create database catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_database, .table_name = "tenant_ops" },
-            .plan = "ddl:create_database:database=tenant_ops",
-            .sql = "CREATE DATABASE tenant_ops",
-        },
-        .{
-            .name = "alter database catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .alter_database, .table_name = "tenant_ops", .operations = 1 },
-            .plan = "ddl:alter_database:database=tenant_ops:ops=1",
-            .sql = "ALTER DATABASE tenant_ops SET timezone TO 'UTC'",
-        },
-        .{
-            .name = "drop database catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_database, .table_name = "tenant_ops" },
-            .plan = "ddl:drop_database:database=tenant_ops:if_exists=false",
-            .sql = "DROP DATABASE tenant_ops",
-        },
-        .{
-            .name = "create tablespace catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_tablespace, .table_name = "fastspace" },
-            .plan = "ddl:create_tablespace:tablespace=fastspace:location=true",
-            .sql = "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'",
-        },
-        .{
-            .name = "rename tablespace catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .rename_tablespace, .table_name = "fastspace" },
-            .plan = "ddl:rename_tablespace:tablespace=fastspace:new=fastspace_archive",
-            .sql = "ALTER TABLESPACE fastspace RENAME TO fastspace_archive",
-        },
-        .{
-            .name = "drop tablespace catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_tablespace, .table_name = "fastspace_archive" },
-            .plan = "ddl:drop_tablespace:tablespace=fastspace_archive:if_exists=false",
-            .sql = "DROP TABLESPACE fastspace_archive",
-        },
-        .{
-            .name = "create publication catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_publication, .table_name = "usage_pub", .operations = 1 },
-            .plan = "ddl:create_publication:publication=usage_pub:tables=1:all=false",
-            .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records",
-        },
-        .{
-            .name = "alter publication catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .alter_publication, .table_name = "usage_pub", .operations = 1 },
-            .plan = "ddl:alter_publication:publication=usage_pub:add_tables=1",
-            .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_events",
-        },
-        .{
-            .name = "drop publication catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_publication, .table_name = "usage_pub" },
-            .plan = "ddl:drop_publication:publication=usage_pub:if_exists=false",
-            .sql = "DROP PUBLICATION usage_pub",
-        },
-        .{
-            .name = "create subscription catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_subscription, .table_name = "usage_sub", .operations = 1 },
-            .plan = "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1",
-            .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub",
-        },
-        .{
-            .name = "alter subscription catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .alter_subscription, .table_name = "usage_sub" },
-            .plan = "ddl:alter_subscription:subscription=usage_sub:enabled=false",
-            .sql = "ALTER SUBSCRIPTION usage_sub DISABLE",
-        },
-        .{
-            .name = "drop subscription catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_subscription, .table_name = "usage_sub" },
-            .plan = "ddl:drop_subscription:subscription=usage_sub:if_exists=false",
-            .sql = "DROP SUBSCRIPTION usage_sub",
-        },
-        .{
-            .name = "listen notification channel catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .listen_notification, .table_name = "usage_events" },
-            .plan = "ddl:listen_notification:channel=usage_events",
-            .sql = "LISTEN usage_events",
-        },
-        .{
-            .name = "notify notification channel catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .notify_notification, .table_name = "usage_events", .operations = 1 },
-            .plan = "ddl:notify_notification:channel=usage_events:payload=true",
-            .sql = "NOTIFY usage_events, 'updated'",
-        },
-        .{
-            .name = "unlisten notification channel catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .unlisten_notification, .table_name = "usage_events" },
-            .plan = "ddl:unlisten_notification:channel=usage_events",
-            .sql = "UNLISTEN usage_events",
-        },
-        .{
-            .name = "create collation catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_collation, .table_name = "case_insensitive", .operations = 2 },
-            .plan = "ddl:create_collation:collation=case_insensitive:options=2",
-            .sql = "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2')",
-        },
-        .{
-            .name = "rename collation catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .rename_collation, .table_name = "case_insensitive" },
-            .plan = "ddl:rename_collation:collation=case_insensitive:new=ci_text",
-            .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text",
-        },
-        .{
-            .name = "drop collation catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_collation, .table_name = "ci_text" },
-            .plan = "ddl:drop_collation:collation=ci_text:if_exists=false",
-            .sql = "DROP COLLATION ci_text",
-        },
-        .{
-            .name = "create operator catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_operator, .table_name = "===", .operations = 3 },
-            .plan = "ddl:create_operator:operator====:options=3",
-            .sql = "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)",
-        },
-        .{
-            .name = "drop operator catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_operator, .table_name = "===", .operations = 2 },
-            .plan = "ddl:drop_operator:operator====:args=2",
-            .sql = "DROP OPERATOR === (text, text)",
-        },
-        .{
-            .name = "create aggregate catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_aggregate, .table_name = "first_value_text", .select = 1, .operations = 2 },
-            .plan = "ddl:create_aggregate:aggregate=first_value_text:args=1:options=2",
-            .sql = "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)",
-        },
-        .{
-            .name = "drop aggregate catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_aggregate, .table_name = "first_value_text", .operations = 1 },
-            .plan = "ddl:drop_aggregate:aggregate=first_value_text:args=1",
-            .sql = "DROP AGGREGATE first_value_text(text)",
-        },
-        .{
-            .name = "create cast catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_cast, .table_name = "jsonb" },
-            .plan = "ddl:create_cast:source=jsonb:target=text:function=jsonb_to_text:assignment=true",
-            .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
-        },
-        .{
-            .name = "drop cast catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_cast, .table_name = "jsonb" },
-            .plan = "ddl:drop_cast:source=jsonb:target=text",
-            .sql = "DROP CAST (jsonb AS text)",
-        },
-        .{
-            .name = "table comment metadata ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .comment_metadata, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:comment:kind=table:object=usage_records:comment=true",
-            .apply_setup_sql = &.{
-                "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));",
-            },
-            .sql = "COMMENT ON TABLE usage_records IS 'metered usage rows';",
-        },
-        .{
-            .name = "column comment metadata ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .comment_metadata, .table_name = "usage_records.status", .operations = 1 },
-            .plan = "ddl:comment:kind=column:object=usage_records.status:comment=true",
-            .apply_setup_sql = &.{
-                "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));",
-            },
-            .sql = "COMMENT ON COLUMN usage_records.status IS 'application state';",
-        },
-        .{
-            .name = "index comment metadata ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .comment_metadata, .table_name = "usage_records_status_idx", .operations = 1 },
-            .plan = "ddl:comment:kind=index:object=usage_records_status_idx:comment=true",
-            .apply_setup_sql = &.{
-                "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));",
-                "CREATE INDEX usage_records_status_idx ON usage_records (status);",
-            },
-            .sql = "COMMENT ON INDEX usage_records_status_idx IS 'status lookup';",
-        },
-        .{
-            .name = "constraint comment metadata ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .comment_metadata, .table_name = "usage_records_status_check", .operations = 1 },
-            .plan = "ddl:comment:kind=constraint:object=usage_records_status_check:table=usage_records:comment=true",
-            .apply_setup_sql = &.{
-                "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));",
-            },
-            .sql = "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';",
-        },
-        .{
-            .name = "replace updated-at function catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_function, .table_name = "touch_updated_at", .operations = 0 },
-            .plan = "ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql",
-            .sql = "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql;",
-        },
-        .{
-            .name = "schema drop table catalog plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_table, .table_name = "usage_records" },
-            .plan = "ddl:drop_table:table=usage_records:if_exists=false",
-            .sql = "DROP TABLE usage_records;",
-        },
-        .{
-            .name = "schema drop table cascade catalog plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_table, .table_name = "usage_records" },
-            .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=true",
-            .sql = "DROP TABLE usage_records CASCADE;",
-        },
-        .{
-            .name = "schema drop table idempotent catalog plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_table, .table_name = "usage_records" },
-            .plan = "ddl:drop_table:table=usage_records:if_exists=true",
-            .sql = "DROP TABLE IF EXISTS usage_records;",
-        },
-        .{
-            .name = "schema truncate table mutation-source plan",
-            .family = .truncate_source,
-            .summary = .{ .table_name = "usage_records", .row_claim_skip_locked = false },
-            .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
-            .sql = "TRUNCATE TABLE usage_records;",
-        },
-        .{
-            .name = "only-qualified truncate table mutation-source plan",
-            .family = .truncate_source,
-            .summary = .{ .table_name = "usage_records", .row_claim_skip_locked = false },
-            .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
-            .sql = "TRUNCATE ONLY public.usage_records;",
-        },
-        .{
-            .name = "truncate table continue identity mutation-source plan",
-            .family = .truncate_source,
-            .summary = .{ .table_name = "usage_records", .row_claim_skip_locked = false },
-            .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
-            .sql = "TRUNCATE TABLE usage_records CONTINUE IDENTITY RESTRICT;",
-        },
-        .{
-            .name = "truncate table restart identity mutation-source plan",
-            .family = .truncate_source,
-            .summary = .{ .table_name = "usage_records", .row_claim_skip_locked = false },
-            .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0:restart_identity=1",
-            .sql = "TRUNCATE TABLE usage_records RESTART IDENTITY;",
-        },
-        .{
-            .name = "unsupported truncate multi-table generation barrier",
-            .family = .unsupported_write,
-            .plan = "unsupported:write:requires=multi_table_generation_barrier",
-            .classification_reason = "multi_table_generation_barrier",
-            .sql = "TRUNCATE TABLE usage_records, archived_records;",
-        },
-        .{
-            .name = "unsupported truncate cascade generation barrier",
-            .family = .unsupported_write,
-            .plan = "unsupported:write:requires=multi_table_generation_barrier",
-            .classification_reason = "multi_table_generation_barrier",
-            .sql = "TRUNCATE TABLE usage_records CASCADE;",
-        },
-        .{
             .name = "schema drop column rewrite work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
             .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_col=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "ALTER TABLE usage_records DROP COLUMN metadata;",
-        },
-        .{
-            .name = "single table json query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .json_path_eq = 2, .select = 1, .order_by = 1, .limit = 10, .offset = 3 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=2:or=0:not=0:select=1:expr=2:alias=0:order=1:order_expr=0:limit=10:claim=none:offset=3",
-            .sql = "SELECT id, metadata->>'source' AS source, metadata->'flags' AS flags FROM usage_records WHERE organization_id = $1 AND metadata->>'source' = $2 AND metadata->'flags' = $3::jsonb ORDER BY created_at DESC LIMIT 10 OFFSET 3",
-            .params = &.{ .{ .string = "org_1" }, .{ .string = "meter" }, .{ .json = "[\"rated\"]" } },
-        },
-        .{
-            .name = "single table structured access or query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:access_or=2",
-            .sql = "SELECT id FROM usage_records WHERE (status = 'active' AND metadata @> '{\"source\":\"api\"}'::jsonb) OR tags @> ARRAY['hot'] ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table structured access not query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .access_not_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:access_not=1",
-            .sql = "SELECT id FROM usage_records WHERE NOT (metadata ? 'flags' AND tags @> ARRAY['cold']) ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "schema-qualified single table query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM public.usage_records WHERE status = $1 ORDER BY created_at DESC LIMIT 5",
-            .params = &.{.{ .string = "ready" }},
-        },
-        .{
-            .name = "only-qualified single table query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM ONLY public.usage_records WHERE status = $1 ORDER BY created_at DESC LIMIT 5",
-            .params = &.{.{ .string = "ready" }},
-        },
-        .{
-            .name = "single table generated alias qualified query",
-            .family = .query,
-            .summary = .{ .table_name = "users", .predicates = 1, .select = 1, .order_by = 1, .limit = 2 },
-            .plan = "query:table=users:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
-            .sql = "SELECT id FROM users AS u WHERE lower(u.email) = $1 ORDER BY concat(u.tenant_id, ':', u.status) DESC LIMIT 2",
-            .params = &.{.{ .string = "ada@example.test" }},
-            .apply_setup_sql = &.{
-                "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text NOT NULL, status text NOT NULL, email_key text GENERATED ALWAYS AS (lower(email)) STORED, tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED);",
-            },
-        },
-        .{
-            .name = "single table alias qualified select outputs",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=2:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT u.id, u.metadata->>'source' AS source, lower(u.status) AS status_key FROM usage_records AS u WHERE u.status = $1 ORDER BY u.created_at DESC LIMIT 5",
-            .params = &.{.{ .string = "open" }},
-        },
-        .{
-            .name = "target-qualified claimed single table query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1, .order_by = 1, .limit = 1, .row_claim_skip_locked = true },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=1:claim=skip_locked",
-            .sql = "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' ORDER BY u.id ASC LIMIT 1 FOR UPDATE OF u SKIP LOCKED",
-        },
-        .{
-            .name = "now projection",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT now() AS planned_at_ns FROM usage_records WHERE id = $1",
-            .params = &.{.{ .string = "u1" }},
-        },
-        .{
-            .name = "current timestamp projection",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT CURRENT_TIMESTAMP AS planned_at_ns FROM usage_records WHERE id = $1",
-            .params = &.{.{ .string = "u1" }},
-        },
-        .{
-            .name = "current timestamp precision projection",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT CURRENT_TIMESTAMP(6) AS planned_at_ns FROM usage_records WHERE id = $1",
-            .params = &.{.{ .string = "u1" }},
-        },
-        .{
-            .name = "uuid generation projection",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT gen_random_uuid() AS request_id FROM usage_records WHERE id = $1",
-            .params = &.{.{ .string = "u1" }},
-        },
-        .{
-            .name = "uuid_generate_v4 projection",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT uuid_generate_v4() AS request_id FROM usage_records WHERE id = $1",
-            .params = &.{.{ .string = "u1" }},
-        },
-        .{
-            .name = "current date projection",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT CURRENT_DATE AS planned_day_ns FROM usage_records WHERE id = $1",
-            .params = &.{.{ .string = "u1" }},
-        },
-        .{
-            .name = "single table boolean false query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE false ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table boolean true no-op query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE true ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table boolean or query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE false OR status = 'ready' ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table select all with named extras query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 0, .select_all = true, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=0:limit=5:claim=none:select_all=1",
-            .sql = "SELECT *, lower(status) AS status_key, metadata->>'source' AS source FROM usage_records ORDER BY id ASC LIMIT 5",
-        },
-        .{
-            .name = "single table scalar membership query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .in_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:in=1",
-            .sql = "SELECT id FROM usage_records WHERE status IN ('active', 'pending') ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table array membership query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .array_any = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=1:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE 'hot' = ANY(tags) ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table array overlap query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:access_or=2",
-            .sql = "SELECT id FROM usage_records WHERE tags && ARRAY['hot','new'] ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table array contains query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .array_contains = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:array_contains=1",
-            .sql = "SELECT id FROM usage_records WHERE tags @> ARRAY['hot'] ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table scalar between symmetric query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE amount BETWEEN SYMMETRIC $1 AND $2 ORDER BY created_at DESC LIMIT 5",
-            .params = &.{ .{ .integer = 20 }, .{ .integer = 10 } },
-        },
-        .{
-            .name = "single table scalar between asymmetric query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=2:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE amount BETWEEN ASYMMETRIC $1 AND $2 ORDER BY created_at DESC LIMIT 5",
-            .params = &.{ .{ .integer = 10 }, .{ .integer = 20 } },
-        },
-        .{
-            .name = "single table json extraction membership query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE metadata->>'source' = ANY($1::text[]) ORDER BY created_at DESC LIMIT 5",
-            .params = &.{.{ .json = "[\"autoscale_delta\",\"manual\"]" }},
-        },
-        .{
-            .name = "single table json extraction or query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE metadata->>'source' = 'autoscale_delta' OR metadata->>'source' = 'manual' AND metadata->>'kind' != 'internal' ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table parenthesized json extraction or query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE (metadata->>'source' = 'autoscale_delta') OR (metadata->>'source' = 'manual' AND metadata->>'kind' != 'internal') ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table mixed scalar json extraction or query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE id = 'u1' OR metadata->>'source' = 'manual' ORDER BY created_at DESC LIMIT 5",
-        },
-        .{
-            .name = "single table json extraction all or query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE metadata->>'source' = ALL($1::text[]) OR metadata->>'kind' <> ALL($2::text[]) ORDER BY created_at DESC LIMIT 5",
-            .params = &.{ .{ .json = "[\"autoscale_delta\",\"autoscale_delta\"]" }, .{ .json = "[\"internal\",\"system\"]" } },
-        },
-        .{
-            .name = "single table json array length expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id, jsonb_array_length(metadata->'flags') AS flag_count FROM usage_records WHERE jsonb_array_length(metadata->'flags') > 0 ORDER BY jsonb_array_length(metadata->'flags') DESC LIMIT 5",
-        },
-        .{
-            .name = "single table json typeof expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id, jsonb_typeof(metadata->'flags') AS flags_type FROM usage_records WHERE jsonb_typeof(metadata->'flags') = 'array' ORDER BY jsonb_typeof(metadata->'flags') ASC LIMIT 5",
-        },
-        .{
-            .name = "single table json path exists expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id, metadata ? 'flags' AS has_flags FROM usage_records WHERE (metadata ? 'flags') IS TRUE ORDER BY id ASC LIMIT 5",
-        },
-        .{
-            .name = "single table json key set exists expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id, metadata ?| ARRAY['flags','billing'] AS has_any_key FROM usage_records WHERE (metadata ?& ARRAY['flags','billing']) IS TRUE ORDER BY id ASC LIMIT 5",
-        },
-        .{
-            .name = "single table json extract path expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id, jsonb_extract_path_text(metadata, 'billing', 'plan') AS plan FROM usage_records WHERE jsonb_extract_path_text(metadata, 'billing', 'plan') = 'pro' ORDER BY jsonb_extract_path_text(metadata, 'billing', 'plan') ASC LIMIT 5",
-        },
-        .{
-            .name = "single table expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 0, .order_by = 5, .limit = 20 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=8:alias=0:order=5:order_expr=4:limit=20:claim=none",
-            .sql = "SELECT id AS usage_id, CASE WHEN status = 'blocked' THEN 'needs_review' ELSE lower(status) END AS status_label, CAST(amount AS text) AS amount_text, amount + quantity AS total_amount, amount % quantity AS amount_remainder, MOD(amount + quantity, quantity) AS total_remainder, array_length(tags, 1) AS tag_count, (status IS NULL) AS status_missing FROM usage_records WHERE status = $1 ORDER BY lower(status) ASC, coalesce(status, 'pending') ASC, MOD(amount + quantity, quantity) ASC, array_length(tags, 1) DESC, created_at DESC LIMIT 20",
-            .params = &.{.{ .string = "ready" }},
-        },
-        .{
-            .name = "single table datetime cast expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id, CAST(created_at AS timestamptz) AS created_at_ts FROM usage_records WHERE CAST(created_at AS timestamptz) >= $1 ORDER BY CAST(created_at AS timestamptz) DESC LIMIT 5",
-            .params = &.{.{ .integer = 1735689600000000000 }},
-        },
-        .{
-            .name = "single table rich text expression query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 2, .limit = 10 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=11:alias=0:order=2:order_expr=2:limit=10:claim=none",
-            .sql = "SELECT id, substring(status FROM 1 FOR 3) AS status_prefix, split_part(status, '-', 2) AS status_bucket, overlay(status placing 'X' from 2 for 1) AS status_overlay, translate(status, 'abc', 'xyz') AS status_translated, strpos(status, '-') AS dash_pos, left(status, 4) AS status_left, right(status, 4) AS status_right, lpad(status, 10, '0') AS status_lpad, rpad(status, 10, '_') AS status_rpad, repeat(status, 2) AS status_repeat, reverse(status) AS status_reverse FROM usage_records WHERE starts_with(lower(status), $1) = true ORDER BY split_part(status, '-', 1) ASC, reverse(status) DESC LIMIT 10",
-            .params = &.{.{ .string = "op" }},
-        },
-        .{
-            .name = "single table explicit null placement order query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 4, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=4:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records ORDER BY expires_at DESC NULLS LAST, id ASC NULLS FIRST LIMIT 5",
-        },
-        .{
-            .name = "single table using operator order query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 3, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=3:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records ORDER BY expires_at USING > NULLS LAST, id USING < LIMIT 5",
-        },
-        .{
-            .name = "single table limit all query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .offset = 2 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none:offset=2",
-            .sql = "SELECT id FROM usage_records ORDER BY created_at DESC LIMIT ALL OFFSET 2",
-        },
-        .{
-            .name = "single table nullable pagination query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT id FROM usage_records ORDER BY created_at DESC LIMIT NULL OFFSET NULL",
-        },
-        .{
-            .name = "single table fetch pagination query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 3, .offset = 2 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=3:claim=none:offset=2",
-            .sql = "SELECT id FROM usage_records ORDER BY created_at DESC OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY",
-        },
-        .{
-            .name = "single table output ordinal order query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 2, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id, status FROM usage_records ORDER BY 2 DESC LIMIT 5",
-        },
-        .{
-            .name = "single table output alias order query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 0, .order_by = 2, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=2:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT lower(email) AS email_key, id AS usage_id FROM usage_records ORDER BY email_key ASC, usage_id DESC LIMIT 5",
-        },
-        .{
-            .name = "single table escaped text pattern query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .text_patterns = 1, .select = 1, .order_by = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:text_pattern=1:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE status LIKE 'op!_%' ESCAPE '!' ORDER BY id",
-        },
-        .{
-            .name = "single table text pattern any query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE status ILIKE ANY($1::text[]) ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .json = "[\"op%\",\"ready%\"]" }},
-        },
-        .{
-            .name = "single table text pattern some query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE status ILIKE SOME($1::text[]) ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .json = "[\"op%\",\"ready%\"]" }},
-        },
-        .{
-            .name = "single table text pattern all query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE status ILIKE ALL($1::text[]) ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .json = "[\"op%\",\"%en\"]" }},
-        },
-        .{
-            .name = "single table regexp match predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE status ~ $1 AND email !~* 'internal' ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .string = "^(open|ready)" }},
-        },
-        .{
-            .name = "single table regexp like predicate and projection query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id, regexp_like(status, $2, true) AS matches_status FROM usage_records WHERE regexp_like(status, $1) ORDER BY id ASC LIMIT 5",
-            .params = &.{ .{ .string = "^op" }, .{ .string = "_EN$" } },
-        },
-        .{
-            .name = "single table regexp count predicate projection and order query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id, regexp_count(status, '[0-9]+') AS status_digits FROM usage_records WHERE regexp_count(status, $1) > 0 ORDER BY regexp_count(status, '[A-Z]+') DESC LIMIT 5",
-            .params = &.{.{ .string = "[0-9]+" }},
-        },
-        .{
-            .name = "single table regexp substr predicate projection and order query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id, regexp_substr(status, '[A-Z]+') AS status_token FROM usage_records WHERE regexp_substr(status, $1) = 'ACTIVE' ORDER BY regexp_substr(status, '[0-9]+') ASC LIMIT 5",
-            .params = &.{.{ .string = "[A-Z]+" }},
-        },
-        .{
-            .name = "single table regexp instr predicate projection and order query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id, regexp_instr(status, '[0-9]+') AS status_digit_pos FROM usage_records WHERE regexp_instr(status, $1) > 0 ORDER BY regexp_instr(status, '[A-Z]+') DESC LIMIT 5",
-            .params = &.{.{ .string = "[0-9]+" }},
-        },
-        .{
-            .name = "single table computed prefix like query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE lower(status) LIKE 'op!%%' ESCAPE '!' ORDER BY id",
-        },
-        .{
-            .name = "single table computed pattern any query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%']) ORDER BY id ASC LIMIT 5",
-        },
-        .{
-            .name = "single table computed pattern some query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%']) ORDER BY id ASC LIMIT 5",
-        },
-        .{
-            .name = "single table computed pattern all query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE lower(status) NOT ILIKE ALL(ARRAY['blocked%', 'archived%']) ORDER BY id ASC LIMIT 5",
-        },
-        .{
-            .name = "single table boolean is predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1, .order_by = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none",
-            .apply_setup_sql = &.{
-                "CREATE TABLE usage_records (id uuid PRIMARY KEY, enabled boolean);",
-            },
-            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE ORDER BY id",
-        },
-        .{
-            .name = "single table boolean is not predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none",
-            .apply_setup_sql = &.{
-                "CREATE TABLE usage_records (id uuid PRIMARY KEY, enabled boolean);",
-            },
-            .sql = "SELECT id FROM usage_records WHERE enabled IS NOT TRUE ORDER BY id",
-        },
-        .{
-            .name = "single table boolean unknown predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1, .order_by = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none",
-            .apply_setup_sql = &.{
-                "CREATE TABLE usage_records (id uuid PRIMARY KEY, enabled boolean);",
-            },
-            .sql = "SELECT id FROM usage_records WHERE enabled IS NOT UNKNOWN ORDER BY id",
-        },
-        .{
-            .name = "single table postfix null test predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 2, .select = 1, .order_by = 1 },
-            .plan = "query:table=usage_records:ctes=0:pred=2:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=none:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE status ISNULL AND email NOTNULL ORDER BY id",
-        },
-        .{
-            .name = "single table expression predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE lower(email) = $1 ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .string = "ada@example.test" }},
-        },
-        .{
-            .name = "single table expression postfix null test predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE lower(email) NOTNULL ORDER BY id ASC LIMIT 5",
-        },
-        .{
-            .name = "single table arithmetic predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE amount * quantity > $1 ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .integer = 10 }},
-        },
-        .{
-            .name = "single table expression between symmetric query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE amount + quantity BETWEEN SYMMETRIC $1 AND $2 ORDER BY id ASC LIMIT 5",
-            .params = &.{ .{ .integer = 20 }, .{ .integer = 10 } },
-        },
-        .{
-            .name = "single table expression between asymmetric query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE amount + quantity BETWEEN ASYMMETRIC $1 AND $2 ORDER BY id ASC LIMIT 5",
-            .params = &.{ .{ .integer = 10 }, .{ .integer = 20 } },
-        },
-        .{
-            .name = "single table coalesce predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE coalesce(status, 'pending') = $1 ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .string = "active" }},
-        },
-        .{
-            .name = "single table scalar numeric function predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE floor(round(abs(amount - quantity))) > $1 ORDER BY ceil(least(amount, quantity, 100)) ASC LIMIT 5",
-            .params = &.{.{ .integer = 10 }},
-        },
-        .{
-            .name = "single table trunc predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE trunc(amount) > $1 ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .integer = 10 }},
-        },
-        .{
-            .name = "single table sqrt predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE sqrt(amount) > $1 ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .integer = 3 }},
-        },
-        .{
-            .name = "single table sign predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE sign(amount - quantity) > $1 ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .integer = 0 }},
-        },
-        .{
-            .name = "single table power predicate query",
-            .family = .query,
-            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
-            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records WHERE power(amount, 2) > $1 ORDER BY id ASC LIMIT 5",
-            .params = &.{.{ .integer = 9 }},
         },
         .{
             .name = "single table extremum expression query",
@@ -67082,10 +65947,15 @@ test "postgres sql adapter classifies application parity corpus" {
         },
     };
 
-    try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, &corpus);
+    var external_source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer external_source.deinit(alloc);
+    const combined_corpus = try appParityCombinedCorpusAlloc(alloc, &corpus, external_source.root.entries);
+    defer alloc.free(combined_corpus);
+
+    try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, combined_corpus);
 
     var coverage = AppParityCorpusCoverage{};
-    for (corpus) |entry| {
+    for (combined_corpus) |entry| {
         errdefer std.debug.print("application parity corpus entry failed: {s}\n", .{entry.name});
         try coverage.observe(alloc, entry);
         try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);

@@ -2806,8 +2806,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const lake_scaffold_transcribing_stub_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lake_scaffold_transcribing_stub_mod.addImport("httpx", httpx_mod);
     lake_scaffold_test_mod.addImport("objectstore", objectstore_mod);
     lake_scaffold_test_mod.addImport("antfly_vector", vector_mod);
+    lake_scaffold_test_mod.addImport("raft_engine", raft_engine_mod);
+    lake_scaffold_test_mod.addImport("antfly_pdf", pdf_mod);
+    lake_scaffold_test_mod.addImport("antfly_scraping", scraping_mod);
+    lake_scaffold_test_mod.addImport("antfly_platform", platform_mod);
+    lake_scaffold_test_mod.addImport("handlebars", handlebars_mod);
+    lake_scaffold_test_mod.addImport("antfly_transcribing", lake_scaffold_transcribing_stub_mod);
     const lake_scaffold_tests = b.addTest(.{
         .root_module = lake_scaffold_test_mod,
     });

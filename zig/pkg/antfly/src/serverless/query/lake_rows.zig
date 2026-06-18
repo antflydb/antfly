@@ -122,6 +122,7 @@ pub const HydrateResult = struct {
 pub const PredicateOp = enum {
     eq_bytes,
     eq_i64,
+    eq_f64,
     eq_bool,
 };
 
@@ -130,6 +131,7 @@ pub const Predicate = struct {
     op: PredicateOp,
     bytes_value: []const u8 = &.{},
     i64_value: i64 = 0,
+    f64_value: f64 = 0,
     bool_value: bool = false,
 };
 
@@ -409,6 +411,10 @@ fn predicateMatches(predicate: Predicate, column: rowsource.ColumnVector, row_id
         },
         .eq_i64 => switch (column.values) {
             .i64 => |items| items[row_idx] == predicate.i64_value,
+            else => error.UnsupportedLakeRowsPredicateColumnKind,
+        },
+        .eq_f64 => switch (column.values) {
+            .f64 => |items| items[row_idx] == predicate.f64_value,
             else => error.UnsupportedLakeRowsPredicateColumnKind,
         },
         .eq_bool => switch (column.values) {

@@ -1495,6 +1495,10 @@ fn partitionMayMatchPredicate(partition: external_source.PartitionValue, predica
             const value = std.fmt.parseInt(i64, partition.string_value, 10) catch return true;
             return value == predicate.i64_value;
         },
+        .eq_f64 => {
+            const value = std.fmt.parseFloat(f64, partition.string_value) catch return true;
+            return value == predicate.f64_value;
+        },
         .eq_bool => {
             if (std.mem.eql(u8, partition.string_value, "true")) return predicate.bool_value;
             if (std.mem.eql(u8, partition.string_value, "false")) return !predicate.bool_value;
@@ -1511,6 +1515,11 @@ fn rowGroupMayMatchPredicate(row_group: external_source.RowGroup, predicate: ?la
             const min = chunk.stats_min_i64 orelse return true;
             const max = chunk.stats_max_i64 orelse return true;
             break :blk pred.i64_value >= min and pred.i64_value <= max;
+        },
+        .eq_f64 => blk: {
+            const min = chunk.stats_min_f64 orelse return true;
+            const max = chunk.stats_max_f64 orelse return true;
+            break :blk pred.f64_value >= min and pred.f64_value <= max;
         },
         .eq_bytes => blk: {
             const min = chunk.stats_min_bytes orelse return true;
@@ -5966,6 +5975,140 @@ test "parquet object range rows query prunes row groups with boolean statistics"
     try std.testing.expectEqual(@as(usize, 1), range_reader.read_count);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqual(true, result.rows[0].cells[0].value.?.bool);
+    try std.testing.expectEqual(@as(u32, 1), result.rows[0].row_ref.external.row_group_ordinal);
+}
+
+test "parquet object range rows query prunes row groups with f64 statistics" {
+    const alloc = std.testing.allocator;
+
+    var first_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer first_chunk.deinit(alloc);
+    try appendPlainF64DataPage(&first_chunk, alloc, &[_]f64{ 1.25, 1.5 });
+    var second_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer second_chunk.deinit(alloc);
+    try appendPlainF64DataPage(&second_chunk, alloc, &[_]f64{ 2.5, 3.5 });
+
+    const first_offset: usize = 192;
+    const second_offset = first_offset + first_chunk.items.len + 64;
+    const object_len = second_offset + second_chunk.items.len;
+    const object_bytes = try alloc.alloc(u8, object_len);
+    defer alloc.free(object_bytes);
+    @memset(object_bytes, 0);
+    @memcpy(object_bytes[first_offset..][0..first_chunk.items.len], first_chunk.items);
+    @memcpy(object_bytes[second_offset..][0..second_chunk.items.len], second_chunk.items);
+
+    const CountingRangeReader = struct {
+        bucket: []const u8,
+        key: []const u8,
+        body: []const u8,
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, self.bucket, bucket)) return error.ObjectNotFound;
+            if (!std.mem.eql(u8, self.key, key)) return error.ObjectNotFound;
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            self.read_count += 1;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var range_reader = CountingRangeReader{
+        .bucket = "bucket",
+        .key = "events/part-a.parquet",
+        .body = object_bytes,
+    };
+
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = object_len,
+        .row_count = 4,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
+            .{
+                .ordinal = 0,
+                .row_count = 2,
+                .file_offset = first_offset,
+                .total_byte_len = first_chunk.items.len,
+                .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                    .column_id = try alloc.dupe(u8, "score"),
+                    .file_offset = first_offset,
+                    .compressed_len = first_chunk.items.len,
+                    .uncompressed_len = first_chunk.items.len,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "double"),
+                    .stats_min_f64 = 1.25,
+                    .stats_max_f64 = 1.5,
+                }}),
+            },
+            .{
+                .ordinal = 1,
+                .row_count = 2,
+                .file_offset = second_offset,
+                .total_byte_len = second_chunk.items.len,
+                .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                    .column_id = try alloc.dupe(u8, "score"),
+                    .file_offset = second_offset,
+                    .compressed_len = second_chunk.items.len,
+                    .uncompressed_len = second_chunk.items.len,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "double"),
+                    .stats_min_f64 = 2.5,
+                    .stats_max_f64 = 3.5,
+                }}),
+            },
+        }),
+    };
+    try inventory.validate();
+
+    const projection = [_][]const u8{"score"};
+    var result = try querySupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .binding = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:objects" },
+            .schema_fingerprint = "schema-v1",
+        },
+        .reader = range_reader.reader(),
+        .inventory = inventory,
+        .projected_columns = &projection,
+        .predicate = .{
+            .column = "score",
+            .op = .eq_f64,
+            .f64_value = 2.5,
+        },
+        .coalesce_options = .{},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), range_reader.read_count);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(f64, 2.5), result.rows[0].cells[0].value.?.f64);
     try std.testing.expectEqual(@as(u32, 1), result.rows[0].row_ref.external.row_group_ordinal);
 }
 

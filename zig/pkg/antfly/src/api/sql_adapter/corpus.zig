@@ -307,6 +307,7 @@ pub const AppParityCorpusEntry = struct {
 
 pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;
+pub const app_parity_source_corpus_format: u64 = 1;
 
 pub const AppParityFixtureRoot = struct {
     fixture_format: u64,
@@ -315,6 +316,11 @@ pub const AppParityFixtureRoot = struct {
     skipped_entries: []const []const u8,
     schema_json: []const u8,
     entries: []const std.json.Value,
+};
+
+pub const AppParitySourceCorpusRoot = struct {
+    source_format: u64,
+    entries: []const AppParityCorpusEntry,
 };
 
 pub const AppParityFixtureEncodedEntry = struct {
@@ -660,6 +666,38 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
     };
 }
 
+pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Value) !AppParitySourceCorpusRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "source_format", "entries" });
+    const source_format = try fixtureJsonOptionalU64(root, "source_format", 0);
+    if (source_format != app_parity_source_corpus_format) return error.TestUnexpectedResult;
+
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |array| array.items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(AppParityCorpusEntry).empty;
+    errdefer {
+        for (entries.items) |entry| freeFixtureEntry(alloc, entry);
+        entries.deinit(alloc);
+    }
+    for (entry_values) |entry_value| {
+        try entries.append(alloc, try parseFixtureEntryAlloc(alloc, entry_value));
+    }
+
+    return .{
+        .source_format = source_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeSourceCorpusRoot(alloc: std.mem.Allocator, root: AppParitySourceCorpusRoot) void {
+    for (root.entries) |entry| freeFixtureEntry(alloc, entry);
+    alloc.free(root.entries);
+}
+
 fn normalizeFixtureSummary(
     family: AppParityCorpusPlanFamily,
     plan: []const u8,
@@ -685,14 +723,12 @@ pub fn freeFixtureEntry(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) v
 }
 
 fn appParityCoverageFlag(coverage: AppParityCorpusCoverage, name: []const u8) !bool {
-    if (std.mem.eql(u8, name, "schema_temporal_open_daterange_insert")) return coverage.schema_temporal_open_daterange_insert;
-    if (std.mem.eql(u8, name, "insert_source_cross_table_source_schema")) return coverage.insert_source_cross_table_source_schema;
-    if (std.mem.eql(u8, name, "query_set_operation_order_limit")) return coverage.query_set_operation_order_limit;
-    if (std.mem.eql(u8, name, "set_operation_fetch_tail")) return coverage.set_operation_fetch_tail;
-    if (std.mem.eql(u8, name, "update_source_nullable_pagination")) return coverage.update_source_nullable_pagination;
-    if (std.mem.eql(u8, name, "update_joined_source_non_primary_semijoin")) return coverage.update_joined_source_non_primary_semijoin;
-    if (std.mem.eql(u8, name, "delete_joined_source_correlated_semijoin")) return coverage.delete_joined_source_correlated_semijoin;
-    if (std.mem.eql(u8, name, "query_cte_chain")) return coverage.query_cte_chain;
+    inline for (std.meta.fields(AppParityCorpusCoverage)) |field| {
+        if (std.mem.eql(u8, name, field.name)) {
+            if (field.type != bool) return error.TestUnexpectedResult;
+            return @field(coverage, field.name);
+        }
+    }
     return error.TestUnexpectedResult;
 }
 
@@ -2980,6 +3016,22 @@ test "sql adapter corpus parses fixture root metadata and owns skipped list" {
     try std.testing.expectEqual(@as(usize, 1), root.entries.len);
 }
 
+test "sql adapter corpus parses source corpus root entries" {
+    const alloc = std.testing.allocator;
+    const source_json = @embedFile("../fixtures/sql_api_parity_source_corpus.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
+    defer parsed.deinit();
+
+    const root = try parseSourceCorpusRootAlloc(alloc, parsed.value);
+    defer freeSourceCorpusRoot(alloc, root);
+
+    try std.testing.expectEqual(app_parity_source_corpus_format, root.source_format);
+    try std.testing.expect(root.entries.len > 0);
+    try std.testing.expectEqualStrings("prepare statement protocol plan", root.entries[0].name);
+    try std.testing.expectEqual(AppParityCorpusPlanFamily.ddl, root.entries[0].family);
+    try std.testing.expectEqual(AppParityDdlTag.prepare_statement, root.entries[0].summary.ddl_tag.?);
+}
+
 test "sql adapter corpus encodes fixture roots and entries" {
     const alloc = std.testing.allocator;
     const entries = [_]AppParityFixtureEncodedEntry{.{
@@ -3352,134 +3404,6 @@ test "sql adapter corpus explain wrapper predicates are exact" {
     try std.testing.expect(planUsizeTokenValue(options, ":costs=") != null);
 }
 
-test "sql adapter corpus coverage rejects malformed ddl boolean tokens" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true_extra",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_function },
-        .plan = "ddl:create_function:name=touch_updated_at:args=0:replace=true_extra:returns=trigger:language=plpgsql",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .drop_table },
-        .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=true_extra",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=10",
-        .sql = "TRUNCATE usage_records RESTART IDENTITY",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records_extra:source_pred=0:source_order=0:source_limit=-1:claim=locked",
-        .sql = "TRUNCATE usage_records CONTINUE IDENTITY",
-    });
-
-    try std.testing.expect(!coverage.ddl_replace_table);
-    try std.testing.expect(!coverage.ddl_function_replace);
-    try std.testing.expect(!coverage.ddl_drop_table_cascade);
-    try std.testing.expect(!coverage.truncate_restart_identity);
-    try std.testing.expect(!coverage.truncate_continue_identity);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_function },
-        .plan = "ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .drop_table },
-        .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=true",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=1",
-        .sql = "TRUNCATE usage_records RESTART IDENTITY",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked",
-        .sql = "TRUNCATE usage_records CONTINUE IDENTITY",
-    });
-
-    try std.testing.expect(coverage.ddl_replace_table);
-    try std.testing.expect(coverage.ddl_function_replace);
-    try std.testing.expect(coverage.ddl_drop_table_cascade);
-    try std.testing.expect(coverage.truncate_restart_identity);
-    try std.testing.expect(coverage.truncate_continue_identity);
-}
-
-test "sql adapter corpus coverage rejects malformed count tokens" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .aggregate,
-        .plan = "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0x:agg_expr=0:filter_expr=0:having=0:order=0:limit=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
-        .plan = "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1x",
-    });
-
-    try std.testing.expect(!coverage.aggregate_distinct_group_projection);
-    try std.testing.expect(!coverage.ddl_temporal_fk_delete_set_null_action);
-    try std.testing.expect(!coverage.ddl_temporal_fk_delete_cascade_action);
-    try std.testing.expect(!coverage.ddl_temporal_table);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .aggregate,
-        .plan = "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0:agg_expr=0:filter_expr=0:having=0:order=0:limit=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
-        .plan = "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1",
-    });
-
-    try std.testing.expect(coverage.aggregate_distinct_group_projection);
-    try std.testing.expect(coverage.ddl_temporal_fk_delete_set_null_action);
-    try std.testing.expect(coverage.ddl_temporal_fk_delete_cascade_action);
-    try std.testing.expect(coverage.ddl_temporal_table);
-}
-
 test "sql adapter corpus data-driven coverage regressions" {
     const alloc = std.testing.allocator;
     const fixture_json = @embedFile("../fixtures/sql_api_coverage_regressions.json");
@@ -3498,100 +3422,6 @@ test "sql adapter corpus data-driven coverage regressions" {
     for (cases) |regression_case| {
         try checkCoverageRegressionCase(alloc, regression_case);
     }
-}
-
-test "sql adapter corpus coverage rejects stale cross-table source schema tokens" {
-    const source_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_joined_source,
-        .source_schema_json = source_schema,
-        .plan = "update_joined_source:target=usage_records:source=source_records_extra:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .join,
-        .source_schema_json = source_schema,
-        .plan = "join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .lateral,
-        .source_schema_json = source_schema,
-        .plan = "lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .merge_mutation,
-        .source_schema_json = source_schema,
-        .plan = "merge_mutation:target=usage_records:source=archived_records_extra:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(!coverage.joined_source_cross_table_source_schema);
-    try std.testing.expect(!coverage.read_join_cross_table_source_schema);
-    try std.testing.expect(!coverage.read_lateral_cross_table_source_schema);
-    try std.testing.expect(!coverage.merge_cross_table_source_schema);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_joined_source,
-        .source_schema_json = source_schema,
-        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .join,
-        .source_schema_json = source_schema,
-        .plan = "join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .lateral,
-        .source_schema_json = source_schema,
-        .plan = "lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .merge_mutation,
-        .source_schema_json = source_schema,
-        .plan = "merge_mutation:target=usage_records:source=archived_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(coverage.joined_source_cross_table_source_schema);
-    try std.testing.expect(coverage.read_join_cross_table_source_schema);
-    try std.testing.expect(coverage.read_lateral_cross_table_source_schema);
-    try std.testing.expect(coverage.merge_cross_table_source_schema);
-}
-
-test "sql adapter corpus coverage rejects stale read cross-table source schema tokens" {
-    const source_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:join:join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:lateral:lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-
-    try std.testing.expect(!coverage.read_join_cross_table_source_schema_classifier);
-    try std.testing.expect(!coverage.read_lateral_cross_table_source_schema_classifier);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:join:join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:lateral:lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-
-    try std.testing.expect(coverage.read_join_cross_table_source_schema_classifier);
-    try std.testing.expect(coverage.read_lateral_cross_table_source_schema_classifier);
 }
 
 test "sql adapter corpus validates fixture mutation and aggregate summaries" {
@@ -3895,6 +3725,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_reindex_maintenance: bool = false,
     ddl_cluster_maintenance: bool = false,
     ddl_prepare_statement: bool = false,
+    ddl_prepare_cte_write_statement: bool = false,
     ddl_execute_statement: bool = false,
     ddl_deallocate_statement: bool = false,
     ddl_declare_cursor: bool = false,
@@ -3964,6 +3795,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
+    unsupported_ddl_prepare_recursive_cte_statement: bool = false,
     unsupported_write: bool = false,
     unsupported_insert: bool = false,
     unsupported_update: bool = false,
@@ -5080,6 +4912,10 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
                 (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
                     std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
+            self.unsupported_ddl_prepare_recursive_cte_statement = self.unsupported_ddl_prepare_recursive_cte_statement or
+                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
+                    std.mem.startsWith(u8, entry.sql, "PREPARE ") and
+                    std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null);
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
@@ -5225,7 +5061,13 @@ pub const AppParityCorpusCoverage = struct {
                 .analyze_maintenance => self.ddl_analyze_maintenance = true,
                 .reindex_maintenance => self.ddl_reindex_maintenance = true,
                 .cluster_maintenance => self.ddl_cluster_maintenance = true,
-                .prepare_statement => self.ddl_prepare_statement = true,
+                .prepare_statement => {
+                    self.ddl_prepare_statement = true;
+                    self.ddl_prepare_cte_write_statement = self.ddl_prepare_cte_write_statement or
+                        std.mem.startsWith(u8, entry.sql, "PREPARE ") and
+                            std.mem.indexOf(u8, entry.sql, " AS WITH ") != null and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
+                },
                 .execute_statement => self.ddl_execute_statement = true,
                 .deallocate_statement => self.ddl_deallocate_statement = true,
                 .declare_cursor => self.ddl_declare_cursor = true,
@@ -5986,6 +5828,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_reindex_maintenance);
         try std.testing.expect(self.ddl_cluster_maintenance);
         try std.testing.expect(self.ddl_prepare_statement);
+        try std.testing.expect(self.ddl_prepare_cte_write_statement);
         try std.testing.expect(self.ddl_execute_statement);
         try std.testing.expect(self.ddl_deallocate_statement);
         try std.testing.expect(self.ddl_declare_cursor);
@@ -6016,6 +5859,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
+        try std.testing.expect(self.unsupported_ddl_prepare_recursive_cte_statement);
         try std.testing.expect(self.read_row_lock_nowait);
         try std.testing.expect(self.read_row_lock_share);
         try std.testing.expect(self.read_row_lock_key_share);

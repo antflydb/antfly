@@ -61,6 +61,7 @@ const vectorindex_mod = @import("antfly_vectorindex");
 const regex_mod = @import("antfly_regex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
+const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
@@ -322,6 +323,46 @@ pub const ReplayProgress = struct {
     replay_scan_batches: u64 = 0,
     replay_hint_filter_skips: u64 = 0,
     active: bool = false,
+};
+
+pub const DocumentArtifactChildRangeApplyBatch = struct {
+    artifact_writes: []const types.BatchWrite = &.{},
+    artifact_delete_keys: []const []const u8 = &.{},
+    documents: []const derived_types.DerivedDocument = &.{},
+    dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
+    sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
+    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
+    sync_level: types.SyncLevel = .full_index,
+};
+
+pub const DocumentArtifactChildRangeDispatch = struct {
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: DocumentArtifactChildRangeApplyBatch,
+};
+
+pub const DocumentArtifactChildRangeOutboxDrainResult = struct {
+    scanned: usize = 0,
+    dispatched: usize = 0,
+    deleted: usize = 0,
+};
+
+const DocumentArtifactChildRangeOutboxRecord = struct {
+    version: u16 = 1,
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: DocumentArtifactChildRangeApplyBatch,
+};
+
+pub const DocumentArtifactChildRangeDispatcher = struct {
+    ptr: *anyopaque,
+    apply: *const fn (ptr: *anyopaque, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) anyerror!void,
+
+    fn applyDispatch(self: DocumentArtifactChildRangeDispatcher, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+        return try self.apply(self.ptr, alloc, dispatch);
+    }
 };
 
 pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u8, progress: ReplayProgress) anyerror!void;
@@ -1130,6 +1171,8 @@ const BatchExecutionOptions = struct {
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
     wait_for_sync_level: bool = true,
+    force_generated_artifact_names: []const []const u8 = &.{},
+    document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
 };
 
 pub const OpenProfile = struct {
@@ -3916,6 +3959,67 @@ pub const DB = struct {
         try self.batchInternal(req, profile, .{});
     }
 
+    pub fn batchWithDocumentArtifactChildRangeDispatcher(
+        self: *DB,
+        req: types.BatchRequest,
+        dispatcher: DocumentArtifactChildRangeDispatcher,
+    ) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .document_child_range_dispatcher = dispatcher });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .document_child_range_dispatcher = dispatcher });
+        }
+    }
+
+    pub fn drainDocumentArtifactChildRangeOutbox(
+        self: *DB,
+        dispatcher: DocumentArtifactChildRangeDispatcher,
+        limit: usize,
+    ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
+        defer self.alloc.free(prefix);
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+        const scanned = try self.core.scanStorePrefix(self.alloc, prefix);
+        self.core.unlockApply();
+        apply_mutex_held = false;
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var result = DocumentArtifactChildRangeOutboxDrainResult{};
+        const max_entries = if (limit == 0 or limit > scanned.len) scanned.len else limit;
+        for (scanned[0..max_entries]) |entry| {
+            result.scanned += 1;
+            var parsed = try std.json.parseFromSlice(DocumentArtifactChildRangeOutboxRecord, self.alloc, entry.value, .{
+                .allocate = .alloc_always,
+            });
+            defer parsed.deinit();
+            if (parsed.value.version != 1) return error.InvalidDocumentChildRangeOutboxRecord;
+            try dispatcher.applyDispatch(self.alloc, .{
+                .owner_group_id = parsed.value.owner_group_id,
+                .doc_key = parsed.value.doc_key,
+                .artifact_name = parsed.value.artifact_name,
+                .child_batch = parsed.value.child_batch,
+            });
+            result.dispatched += 1;
+            try self.deleteDocumentArtifactChildRangeOutboxEntry(entry.key);
+            result.deleted += 1;
+        }
+        return result;
+    }
+
+    fn deleteDocumentArtifactChildRangeOutboxEntry(self: *DB, key: []const u8) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        const deletes = [_][]const u8{key};
+        try self.core.store.putBatch(&.{}, deletes[0..]);
+    }
+
     pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });
     }
@@ -3927,6 +4031,152 @@ pub const DB = struct {
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
         });
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (child_batch.artifact_writes.len == 0 and
+            child_batch.artifact_delete_keys.len == 0 and
+            child_batch.documents.len == 0 and
+            child_batch.dense_embeddings.len == 0 and
+            child_batch.sparse_embeddings.len == 0 and
+            child_batch.generated_enrichment_refs.len == 0)
+        {
+            return 0;
+        }
+
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer store_writes.deinit(self.alloc);
+        var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer delete_keys.deinit(self.alloc);
+        var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_keys.items) |key| self.alloc.free(key);
+            owned_store_keys.deinit(self.alloc);
+        }
+        var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_values.items) |value| self.alloc.free(value);
+            owned_store_values.deinit(self.alloc);
+        }
+        var owned_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_delete_keys.items) |key| self.alloc.free(key);
+            owned_delete_keys.deinit(self.alloc);
+        }
+        var changed_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (changed_artifact_keys.items) |key| self.alloc.free(key);
+            changed_artifact_keys.deinit(self.alloc);
+        }
+        var materialized_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (materialized_graph_artifact_writes.items) |write| {
+                self.alloc.free(@constCast(write.key));
+                self.alloc.free(@constCast(write.value));
+            }
+            materialized_graph_artifact_writes.deinit(self.alloc);
+        }
+
+        for (child_batch.artifact_writes) |write| {
+            try store_writes.append(self.alloc, .{
+                .key = write.key,
+                .value = write.value,
+            });
+            try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, write.key);
+        }
+        for (child_batch.artifact_delete_keys) |key| {
+            try delete_keys.append(self.alloc, key);
+            if (internal_keys.isAssetArtifactKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
+                try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, key);
+            }
+        }
+
+        try appendPrecomputedGraphSourceArtifacts(
+            self,
+            child_batch.artifact_writes,
+            child_batch.artifact_delete_keys,
+            &materialized_graph_artifact_writes,
+            &store_writes,
+            &delete_keys,
+            &owned_delete_keys,
+            &changed_artifact_keys,
+        );
+
+        if (child_batch.artifact_writes.len > 0 or materialized_graph_artifact_writes.items.len > 0) {
+            try self.core.appendArtifactPresenceMarker(&store_writes);
+        }
+        try appendAssetArtifactSourceIndexMutations(
+            self.alloc,
+            &store_writes,
+            child_batch.artifact_delete_keys,
+            &delete_keys,
+            &owned_store_keys,
+            &owned_store_values,
+            &owned_delete_keys,
+        );
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const derived_seed = derived_types.DerivedBatch{
+            .sequence = sequence,
+            .documents = child_batch.documents,
+            .deleted_keys = child_batch.artifact_delete_keys,
+            .changed_artifact_keys = changed_artifact_keys.items,
+            .dense_embeddings = child_batch.dense_embeddings,
+            .sparse_embeddings = child_batch.sparse_embeddings,
+            .generated_enrichment_refs = child_batch.generated_enrichment_refs,
+        };
+        var derived_batch = try derived_types.cloneBatch(self.alloc, derived_seed);
+        defer derived_types.deinitDerivedBatch(self.alloc, &derived_batch);
+        derived_batch.sequence = sequence;
+
+        var sync_targets = try collectManagedSyncTargets(self.alloc, self.core.index_manager, derived_batch);
+        defer sync_targets.deinit(self.alloc);
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
+        defer self.alloc.free(replay_payload);
+
+        try self.core.store.putBatchWithReplay(
+            self.backend_runtime.io(),
+            store_writes.items,
+            delete_keys.items,
+            .{
+                .sequence = sequence,
+                .payload = replay_payload,
+            },
+        );
+        if (shouldAppendSplitDelta(self)) {
+            try self.core.appendSplitDelta(currentTimeNs(), store_writes.items, delete_keys.items);
+        }
+
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        var pressure_ctx = self.batchContext();
+        try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
+        try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, child_batch.sync_level, sync_targets);
+        if (self.executor.hasWorkers()) {
+            notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, child_batch.sync_level, sequence, sync_targets);
+            try self.waitForSyncLevel(child_batch.sync_level, sequence, sync_targets);
+        } else {
+            if (syncLevelRequiresDerivedVisibility(child_batch.sync_level)) {
+                if (child_batch.sync_level == .full_text) {
+                    try applyDerivedBatchTargetsProfiled(self, derived_batch, sync_targets.full_text_indexes, null);
+                } else {
+                    try applyDerivedBatchProfiled(self, derived_batch, null);
+                }
+            }
+            try self.waitForSyncLevel(child_batch.sync_level, sequence, sync_targets);
+        }
+        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
+        return sequence;
     }
 
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
@@ -4407,6 +4657,21 @@ pub const DB = struct {
 
         var precomputed_generated: PrecomputedGeneratedBatch = .{};
         defer precomputed_generated.deinit(self.alloc);
+        var remote_child_range_dispatches = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
+        defer {
+            for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(self.alloc);
+            remote_child_range_dispatches.deinit(self.alloc);
+        }
+        var owned_child_range_outbox_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_child_range_outbox_keys.items) |key| self.alloc.free(key);
+            owned_child_range_outbox_keys.deinit(self.alloc);
+        }
+        var owned_child_range_outbox_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_child_range_outbox_values.items) |value| self.alloc.free(value);
+            owned_child_range_outbox_values.deinit(self.alloc);
+        }
         var materialized_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
         defer {
             for (materialized_graph_artifact_writes.items) |write| {
@@ -4422,8 +4687,12 @@ pub const DB = struct {
                 effective_req,
                 extracted[0..extracted_initialized],
                 generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
+                opts.force_generated_artifact_names,
             );
 
+            if (opts.document_child_range_dispatcher != null) {
+                try partitionRemoteDocumentChildRangeGeneratedBatch(self, &precomputed_generated, &remote_child_range_dispatches);
+            }
             for (precomputed_generated.artifact_writes) |write| {
                 try store_writes.append(self.alloc, .{
                     .key = write.key,
@@ -4508,6 +4777,15 @@ pub const DB = struct {
         }
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
         try store_writes.appendSlice(self.alloc, identity_writes.items);
+        try appendDocumentChildRangeOutboxWrites(
+            self.alloc,
+            sequence,
+            remote_child_range_dispatches.items,
+            effective_req.sync_level,
+            &store_writes,
+            &owned_child_range_outbox_keys,
+            &owned_child_range_outbox_values,
+        );
         const build_derived_start_ns = monotonicTimeNs();
         const replay_payload = if (use_thin_replay_fast_path)
             try encodeThinReplayRecordPayload(
@@ -4589,6 +4867,9 @@ pub const DB = struct {
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
         self.core.unlockApply();
         apply_mutex_held = false;
+        if (opts.document_child_range_dispatcher) |dispatcher| {
+            _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
+        }
         var pressure_ctx = self.batchContext();
         const backlog_pressure_start_ns = monotonicTimeNs();
         try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
@@ -5249,6 +5530,188 @@ pub const DB = struct {
             .value = value,
             .artifact_ref = artifact_ref,
         };
+    }
+
+    pub fn updateDocumentArtifactChildRangePlacement(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: types.DocumentArtifactChildRangePlacementUpdate,
+    ) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+        defer alloc.free(manifest_key);
+        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse {
+            self.core.unlockApply();
+            apply_mutex_held = false;
+            return false;
+        };
+        defer alloc.free(manifest);
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        var manifest_value = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, manifest, .{ .allocate = .alloc_always });
+        if (manifest_value != .object) return error.InvalidArgument;
+        const child_ranges = manifest_value.object.getPtr("child_ranges") orelse return error.InvalidArgument;
+        if (child_ranges.* != .array) return error.InvalidArgument;
+
+        var changed = false;
+        for (child_ranges.array.items) |*item| {
+            if (item.* != .object) return error.InvalidArgument;
+            const range_id = item.object.get("range_id") orelse return error.InvalidArgument;
+            if (range_id != .string) return error.InvalidArgument;
+            if (!std.mem.eql(u8, range_id.string, update.range_id)) continue;
+
+            try putLeakyJsonStringField(arena_alloc, &item.object, "placement", update.placement);
+            if (update.owner_group_id) |owner_group_id| try putLeakyJsonU64Field(arena_alloc, &item.object, "owner_group_id", owner_group_id);
+            if (update.placement_generation) |placement_generation| try putLeakyJsonU64Field(arena_alloc, &item.object, "placement_generation", placement_generation);
+            if (update.route_status) |route_status| try putLeakyJsonStringField(arena_alloc, &item.object, "route_status", route_status);
+            if (update.split_eligible) |split_eligible| try item.object.put(arena_alloc, "split_eligible", .{ .bool = split_eligible });
+            changed = true;
+            break;
+        }
+
+        if (!changed) {
+            self.core.unlockApply();
+            apply_mutex_held = false;
+            return false;
+        }
+
+        const updated_manifest = try std.json.Stringify.valueAlloc(alloc, manifest_value, .{});
+        defer alloc.free(updated_manifest);
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const changed_artifact_keys = [_][]const u8{manifest_key};
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        }, sequence);
+        defer alloc.free(replay_payload);
+
+        const writes = [_]docstore_mod.KVPair{.{
+            .key = manifest_key,
+            .value = updated_manifest,
+        }};
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        if (self.executor.hasWorkers()) {
+            self.executor.forceSequence(sequence);
+        } else {
+            self.executor.notifySequence(sequence);
+        }
+        self.notifyResolverReplayRuntimes(sequence);
+        return true;
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !bool {
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
+        defer cfg.deinit(alloc);
+        var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer_cfg.deinit(alloc);
+        if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
+
+        const value = try self.get(alloc, doc_key) orelse return false;
+        defer alloc.free(value);
+
+        const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
+        const force_artifacts = [_][]const u8{artifact_name};
+        try self.batchInternal(.{
+            .writes = &writes,
+            .sync_level = .full_index,
+        }, null, .{
+            .force_generated_artifact_names = &force_artifacts,
+        });
+        return true;
+    }
+
+    pub fn reprocessDocumentArtifactRange(
+        self: *DB,
+        alloc: Allocator,
+        artifact_name: []const u8,
+        req: types.DocumentArtifactTableReprocessRequest,
+    ) !types.DocumentArtifactTableReprocessResult {
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return error.NotFound;
+        defer cfg.deinit(alloc);
+        var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer_cfg.deinit(alloc);
+        if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
+
+        var effective_req = req;
+        if (req.shard_cursors.len > 0) {
+            if (req.shard_cursors.len != 1) return error.InvalidArgument;
+            const cursor = req.shard_cursors[0];
+            if (cursor.group_id != null) return error.InvalidArgument;
+            effective_req = .{
+                .from_key = cursor.next_key,
+                .to_key = req.to_key,
+                .limit = if (cursor.limit != 0) cursor.limit else req.limit,
+            };
+        }
+
+        const limit = if (effective_req.limit == 0) @as(u32, 100) else effective_req.limit;
+        const scan_limit = if (limit == std.math.maxInt(u32)) limit else limit + 1;
+        var scanned = try self.scan(alloc, effective_req.from_key, effective_req.to_key, .{
+            .include_documents = true,
+            .limit = scan_limit,
+        });
+        defer scanned.deinit(alloc);
+
+        var failures = std.ArrayListUnmanaged(types.DocumentArtifactReprocessFailure).empty;
+        errdefer {
+            for (failures.items) |*failure| failure.deinit(alloc);
+            failures.deinit(alloc);
+        }
+
+        var result = types.DocumentArtifactTableReprocessResult{
+            .limit = limit,
+        };
+        errdefer result.deinit(alloc);
+
+        const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
+        for (scanned.documents[0..process_len]) |doc| {
+            result.scanned += 1;
+            const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    result.failed += 1;
+                    try failures.append(alloc, .{
+                        .key = try alloc.dupe(u8, doc.id),
+                        .error_code = try alloc.dupe(u8, @errorName(err)),
+                    });
+                    continue;
+                },
+            };
+            if (handled) {
+                result.reprocessed += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+
+        if (scanned.documents.len > process_len and process_len > 0) {
+            result.next_key = try alloc.dupe(u8, scanned.documents[process_len - 1].id);
+        }
+        result.failures = try failures.toOwnedSlice(alloc);
+        return result;
     }
 
     pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
@@ -30451,6 +30914,15 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     db_query_projection.freeJsonValue(alloc, value);
 }
 
+fn putLeakyJsonStringField(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try obj.put(alloc, key, .{ .string = try alloc.dupe(u8, value) });
+}
+
+fn putLeakyJsonU64Field(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: u64) !void {
+    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidArgument;
+    try obj.put(alloc, key, .{ .integer = @intCast(value) });
+}
+
 fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
     return try db_query_projection.cloneJsonValue(alloc, value);
 }
@@ -31300,6 +31772,13 @@ fn resolveGraphSelector(alloc: Allocator, selector: graph_query_mod.NodeSelector
 fn freeOwnedKeySlice(alloc: Allocator, keys: [][]u8) void {
     for (keys) |key| alloc.free(key);
     alloc.free(keys);
+}
+
+fn decodeArtifactRefIfKnownAlloc(alloc: Allocator, key: []const u8) !?types.ArtifactRef {
+    return artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    };
 }
 
 fn buildOverwrittenDocKeys(
@@ -32661,7 +33140,9 @@ fn prepareGeneratedEnrichments(
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
     precompute_mode: GeneratedPrecomputeMode,
+    force_generated_artifact_names: []const []const u8,
 ) !PrecomputedGeneratedBatch {
+    _ = force_generated_artifact_names;
     if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
 
     var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -32841,6 +33322,858 @@ fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: [
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+fn appendJsonFieldName(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+    try appendJsonString(alloc, out, name);
+    try out.append(alloc, ':');
+}
+
+fn appendJsonFieldString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: []const u8) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try appendJsonString(alloc, out, value);
+}
+
+fn appendJsonFieldU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: u64) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldUsize(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldBool(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: bool) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try out.appendSlice(alloc, if (value) "true" else "false");
+}
+
+const DocumentExtractionUnitDescriptor = struct {
+    key: []const u8,
+    fingerprint: []const u8,
+};
+
+const DocumentExtractionRangeRoute = struct {
+    range_id: []const u8,
+    route_status: []const u8 = "local_committed",
+    owner_group_id: u64 = 0,
+};
+
+fn freeDocumentArtifactChildRanges(alloc: Allocator, child_ranges: []types.DocumentArtifactChildRange) void {
+    for (child_ranges) |*child_range| child_range.deinit(alloc);
+    if (child_ranges.len > 0) alloc.free(child_ranges);
+}
+
+fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
+    const value = object.get(field_name) orelse return error.InvalidDocumentExtractionManifest;
+    if (value != .string) return error.InvalidDocumentExtractionManifest;
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectOptionalStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) !?[]u8 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .string) return error.InvalidDocumentExtractionManifest;
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectUsize(object: std.json.ObjectMap, field_name: []const u8) !usize {
+    const value = object.get(field_name) orelse return error.InvalidDocumentExtractionManifest;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(usize, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalUsize(object: std.json.ObjectMap, field_name: []const u8) !?usize {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(usize, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalU64(object: std.json.ObjectMap, field_name: []const u8) !?u64 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalBool(object: std.json.ObjectMap, field_name: []const u8) !?bool {
+    const value = object.get(field_name) orelse return null;
+    if (value != .bool) return error.InvalidDocumentExtractionManifest;
+    return value.bool;
+}
+
+fn documentArtifactChildRangesFromManifestJsonAlloc(alloc: Allocator, manifest_json: []const u8) ![]types.DocumentArtifactChildRange {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    const value = parsed.value.object.get("child_ranges") orelse return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    if (value != .array) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+
+    const out = try alloc.alloc(types.DocumentArtifactChildRange, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*range| range.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionManifest;
+        out[i] = .{
+            .range_id = try jsonObjectStringDup(alloc, item.object, "range_id"),
+            .range_kind = try jsonObjectStringDup(alloc, item.object, "range_kind"),
+            .artifact_name = try jsonObjectStringDup(alloc, item.object, "artifact_name"),
+            .split_boundary = try jsonObjectStringDup(alloc, item.object, "split_boundary"),
+            .placement = try jsonObjectStringDup(alloc, item.object, "placement"),
+            .owner_group_id = try jsonObjectOptionalU64(item.object, "owner_group_id"),
+            .placement_generation = try jsonObjectOptionalU64(item.object, "placement_generation"),
+            .route_status = try jsonObjectOptionalStringDup(alloc, item.object, "route_status"),
+            .split_eligible = try jsonObjectOptionalBool(item.object, "split_eligible"),
+            .start_key = try jsonObjectStringDup(alloc, item.object, "start_key"),
+            .end_key_exclusive = try jsonObjectStringDup(alloc, item.object, "end_key_exclusive"),
+            .last_key = try jsonObjectStringDup(alloc, item.object, "last_key"),
+            .child_count = try jsonObjectUsize(item.object, "child_count"),
+            .text_bytes = try jsonObjectOptionalUsize(item.object, "text_bytes"),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentUnitConfidence(unit: document_extraction_mod.Unit) ?f64 {
+    return unit.ocr_confidence orelse unit.transcript_confidence;
+}
+
+fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(unit.unit_id);
+    hasher.update(unit.unit_type);
+    hasher.update(unit.text);
+    hasher.update(unit.method);
+    if (unit.source_path) |source_path| hasher.update(source_path);
+    if (unit.extraction_status) |extraction_status| hasher.update(extraction_status);
+    if (unit.source_sha256) |source_sha256| hasher.update(source_sha256);
+    if (unit.byte_length) |byte_length| {
+        var buf: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &buf, byte_length, .big);
+        hasher.update(&buf);
+    }
+    hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    if (unit.ocr_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    if (unit.ocr_bbox) |bbox| {
+        for (bbox) |coord| {
+            var value = coord;
+            hasher.update(std.mem.asBytes(&value));
+        }
+    }
+    hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
+    if (unit.transcript_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    if (unit.extraction_warning) |warning| hasher.update(warning);
+    if (unit.page_number) |page_number| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, page_number, .big);
+        hasher.update(&buf);
+    }
+    if (unit.page_label) |page_label| hasher.update(page_label);
+    if (unit.page_bbox) |bbox| {
+        for (bbox) |coord| {
+            var value = coord;
+            hasher.update(std.mem.asBytes(&value));
+        }
+    }
+    if (unit.page_rotation) |rotation| {
+        var buf: [@sizeOf(i32)]u8 = undefined;
+        std.mem.writeInt(i32, &buf, rotation, .big);
+        hasher.update(&buf);
+    }
+    for (unit.text_regions) |region| {
+        for (region.span) |span| {
+            var buf: [@sizeOf(u32)]u8 = undefined;
+            std.mem.writeInt(u32, &buf, span, .big);
+            hasher.update(&buf);
+        }
+        for (region.bbox) |coord| {
+            var value = coord;
+            hasher.update(std.mem.asBytes(&value));
+        }
+    }
+    if (unit.char_start) |char_start| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_start, .big);
+        hasher.update(&buf);
+    }
+    if (unit.char_end) |char_end| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_end, .big);
+        hasher.update(&buf);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn documentUnitPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    unit: document_extraction_mod.Unit,
+    source_url: []const u8,
+    content_type: []const u8,
+    route: DocumentExtractionRangeRoute,
+) ![]u8 {
+    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._parent_doc_key = doc_key,
+        ._artifact_name = artifact_name,
+        ._artifact_range_id = route.range_id,
+        ._artifact_range_kind = "unit",
+        ._artifact_route_status = route.route_status,
+        ._artifact_owner_group_id = owner_group_id,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .text = unit.text,
+        .content_type = "text/plain",
+        .source_path = unit.source_path,
+        .extraction_status = unit.extraction_status,
+        .source_sha256 = unit.source_sha256,
+        .byte_length = unit.byte_length,
+        .confidence = documentUnitConfidence(unit),
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
+        .provenance = .{
+            .source_url = source_url,
+            .source_path = unit.source_path,
+            .method = unit.method,
+            .extraction_status = unit.extraction_status,
+            .source_sha256 = unit.source_sha256,
+            .byte_length = unit.byte_length,
+            .confidence = documentUnitConfidence(unit),
+            .ocr_used = unit.ocr_used,
+            .ocr_confidence = unit.ocr_confidence,
+            .ocr_bbox = unit.ocr_bbox,
+            .transcript_used = unit.transcript_used,
+            .transcript_confidence = unit.transcript_confidence,
+            .extraction_warning = unit.extraction_warning,
+            .page_number = unit.page_number,
+            .page_label = unit.page_label,
+            .page_bbox = unit.page_bbox,
+            .page_rotation = unit.page_rotation,
+            .text_regions = unit.text_regions,
+            .char_start = unit.char_start,
+            .char_end = unit.char_end,
+            .source_content_type = content_type,
+            .format_provenance = .{
+                .schema = "antfly.document_format_provenance.v1",
+                .source_content_type = content_type,
+                .source_path = unit.source_path,
+                .coordinate_system = "source_page_points",
+                .extraction_method = unit.method,
+                .extraction_status = unit.extraction_status,
+                .source_sha256 = unit.source_sha256,
+                .byte_length = unit.byte_length,
+                .confidence = documentUnitConfidence(unit),
+                .ocr_used = unit.ocr_used,
+                .ocr_confidence = unit.ocr_confidence,
+                .ocr_bbox = unit.ocr_bbox,
+                .transcript_used = unit.transcript_used,
+                .transcript_confidence = unit.transcript_confidence,
+                .extraction_warning = unit.extraction_warning,
+                .page_number = unit.page_number,
+                .page_label = unit.page_label,
+                .page_bbox = unit.page_bbox,
+                .page_rotation = unit.page_rotation,
+                .text_regions = unit.text_regions,
+            },
+        },
+    }, .{});
+}
+
+const document_extraction_range_target_children = 256;
+const document_extraction_range_target_text_bytes = 1024 * 1024;
+
+fn documentExtractionRangeEnd(key_count: usize, units: []const document_extraction_mod.Unit, start: usize) usize {
+    var end = start;
+    var text_bytes: usize = 0;
+    const use_text_limit = units.len == key_count;
+    while (end < key_count and end - start < document_extraction_range_target_children) {
+        if (use_text_limit) {
+            const unit_bytes = units[end].text.len;
+            if (end > start and text_bytes + unit_bytes > document_extraction_range_target_text_bytes) break;
+            text_bytes += unit_bytes;
+        }
+        end += 1;
+    }
+    return end;
+}
+
+fn documentExtractionUnitRangeCount(units: []const document_extraction_mod.Unit) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) {
+        count += 1;
+        start = documentExtractionRangeEnd(units.len, units, start);
+    }
+    return count;
+}
+
+fn documentExtractionUnitRangeIndex(units: []const document_extraction_mod.Unit, unit_index: usize) usize {
+    var range_index: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) : (range_index += 1) {
+        const end = documentExtractionRangeEnd(units.len, units, start);
+        if (unit_index < end) return range_index;
+        start = end;
+    }
+    return range_index;
+}
+
+fn findDocumentArtifactChildRange(
+    ranges: []const types.DocumentArtifactChildRange,
+    range_id: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+) ?*const types.DocumentArtifactChildRange {
+    for (ranges) |*range| {
+        if (std.mem.eql(u8, range.range_id, range_id) and
+            std.mem.eql(u8, range.range_kind, range_kind) and
+            std.mem.eql(u8, range.artifact_name, artifact_name))
+        {
+            return range;
+        }
+    }
+    return null;
+}
+
+fn documentExtractionSplitBoundary(range_kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, range_kind, "chunk")) return "chunk";
+    return "unit";
+}
+
+fn appendDocumentExtractionKeyRanges(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_range: *bool,
+    range_index: *usize,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+) !void {
+    var start: usize = 0;
+    while (start < keys.len) {
+        const end = documentExtractionRangeEnd(keys.len, units, start);
+        if (first_range.*) {
+            first_range.* = false;
+        } else {
+            try out.append(alloc, ',');
+        }
+        var first = true;
+        try out.append(alloc, '{');
+        const range_id = try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index.*});
+        defer alloc.free(range_id);
+        const previous_range = findDocumentArtifactChildRange(previous_child_ranges, range_id, range_kind, artifact_name);
+        try appendJsonFieldString(alloc, out, &first, "range_id", range_id);
+        try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+        try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+        try appendJsonFieldString(alloc, out, &first, "split_boundary", documentExtractionSplitBoundary(range_kind));
+        try appendJsonFieldString(alloc, out, &first, "placement", if (previous_range) |range| range.placement else "parent");
+        try appendJsonFieldU64(alloc, out, &first, "owner_group_id", if (previous_range) |range| range.owner_group_id orelse 0 else 0);
+        try appendJsonFieldU64(alloc, out, &first, "placement_generation", if (previous_range) |range| range.placement_generation orelse 0 else 0);
+        try appendJsonFieldString(alloc, out, &first, "route_status", if (previous_range) |range| range.route_status orelse "local_committed" else "local_committed");
+        try appendJsonFieldBool(alloc, out, &first, "split_eligible", if (previous_range) |range| range.split_eligible orelse (end - start > 1) else end - start > 1);
+        try appendJsonFieldString(alloc, out, &first, "start_key", keys[start]);
+        try appendJsonFieldString(alloc, out, &first, "end_key_exclusive", if (end < keys.len) keys[end] else "");
+        try appendJsonFieldString(alloc, out, &first, "last_key", keys[end - 1]);
+        try appendJsonFieldUsize(alloc, out, &first, "child_count", end - start);
+        if (units.len >= end) {
+            var text_bytes: usize = 0;
+            for (units[start..end]) |unit| text_bytes += unit.text.len;
+            try appendJsonFieldUsize(alloc, out, &first, "text_bytes", text_bytes);
+        }
+        try out.append(alloc, '}');
+        range_index.* += 1;
+        start = end;
+    }
+}
+
+fn appendDocumentExtractionRangeDescriptors(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    artifact_name: []const u8,
+    unit_keys: []const []const u8,
+    chunk_keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+) !void {
+    var first_range = true;
+    var range_index: usize = 0;
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "unit", artifact_name, unit_keys, units, previous_child_ranges);
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{}, previous_child_ranges);
+}
+
+fn appendDocumentExtractionRangePolicy(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldU64(alloc, out, &first, "policy_version", 1);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_children", document_extraction_range_target_children);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_text_bytes", document_extraction_range_target_text_bytes);
+    try appendJsonFieldUsize(alloc, out, &first, "chunk_target_children", document_extraction_range_target_children);
+    try appendJsonFieldString(alloc, out, &first, "oversized_unit_policy", "single_unit_range");
+    try out.append(alloc, '}');
+}
+
+fn unitDescriptorFingerprintMatches(descriptors: []const DocumentExtractionUnitDescriptor, key: []const u8, fingerprint: []const u8) bool {
+    if (fingerprint.len == 0) return false;
+    for (descriptors) |descriptor| {
+        if (std.mem.eql(u8, descriptor.key, key) and std.mem.eql(u8, descriptor.fingerprint, fingerprint)) return true;
+    }
+    return false;
+}
+
+fn countUnitDescriptorsByFingerprintMatch(
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_match: bool,
+) usize {
+    var count: usize = 0;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched == want_match) count += 1;
+    }
+    return count;
+}
+
+fn appendDocumentExtractionUnitMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    artifact_name: []const u8,
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_fingerprint_match: bool,
+) !void {
+    const count = countUnitDescriptorsByFingerprintMatch(descriptors, comparison, want_fingerprint_match);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched != want_fingerprint_match) continue;
+        if (first_key == null) first_key = descriptor.key;
+        last_key = descriptor.key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", "unit");
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try appendJsonFieldBool(alloc, out, &first, "fingerprint_match", want_fingerprint_match);
+    try out.append(alloc, '}');
+}
+
+fn countKeysNotIn(keys: []const []const u8, exclude_keys: []const []const u8) usize {
+    var count: usize = 0;
+    for (keys) |key| {
+        if (!containsDeleteKey(exclude_keys, key)) count += 1;
+    }
+    return count;
+}
+
+fn appendDocumentExtractionMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    exclude_keys: []const []const u8,
+) !void {
+    const count = countKeysNotIn(keys, exclude_keys);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (keys) |key| {
+        if (containsDeleteKey(exclude_keys, key)) continue;
+        if (first_key == null) first_key = key;
+        last_key = key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try out.append(alloc, '}');
+}
+
+fn documentExtractionManifestPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    fingerprint: []const u8,
+    extraction: document_extraction_mod.Result,
+    unit_keys: []const []const u8,
+    unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    chunk_keys: []const []const u8,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+    previous_unit_keys: []const []const u8,
+    previous_unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    previous_chunk_keys: []const []const u8,
+    manifest_generation: u64,
+    from_generation: u64,
+    to_generation: u64,
+    merge_status: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, &out, &first, "_parent_doc_key", doc_key);
+    try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
+    try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", manifest_generation);
+    try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
+    try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
+    try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
+    try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+    if (extraction.unsupported_reason.len > 0) {
+        try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
+    }
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", extraction.units.len);
+    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
+    try appendJsonFieldName(alloc, &out, &first, "child_ranges");
+    try out.append(alloc, '[');
+    try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
+    try out.append(alloc, ']');
+    try appendJsonFieldName(alloc, &out, &first, "range_policy");
+    try appendDocumentExtractionRangePolicy(alloc, &out);
+    try appendJsonFieldName(alloc, &out, &first, "merge_plan");
+    try out.append(alloc, '{');
+    var merge_first = true;
+    try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", merge_status);
+    try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
+    try appendJsonFieldName(alloc, &out, &merge_first, "operations");
+    try out.append(alloc, '[');
+    var first_operation = true;
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "keep", artifact_name, unit_descriptors, previous_unit_descriptors, true);
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "upsert", artifact_name, unit_descriptors, previous_unit_descriptors, false);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "upsert", "chunk", "derived_chunks", chunk_keys, &.{});
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "unit", artifact_name, previous_unit_keys, unit_keys);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "chunk", "derived_chunks", previous_chunk_keys, chunk_keys);
+    try out.append(alloc, ']');
+    try out.append(alloc, '}');
+    try appendJsonFieldName(alloc, &out, &first, "coverage_plan");
+    try out.append(alloc, '{');
+    var coverage_first = true;
+    try appendJsonFieldU64(alloc, &out, &coverage_first, "plan_version", 1);
+    try appendJsonFieldString(alloc, &out, &coverage_first, "full_text_replay", "stored_artifact_required");
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "full_text_replay_suppressed", false);
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "watermark_required_before_suppression", true);
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+const DocumentChildRangeRoutingSnapshot = struct {
+    doc_key: []u8,
+    manifest_artifact_name: []u8,
+    child_ranges: []types.DocumentArtifactChildRange,
+
+    fn deinit(self: *DocumentChildRangeRoutingSnapshot, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.manifest_artifact_name);
+        freeDocumentArtifactChildRanges(alloc, self.child_ranges);
+        self.* = undefined;
+    }
+};
+
+const DocumentChildRangeDispatchGroup = struct {
+    owner_group_id: u64,
+    doc_key: []u8,
+    artifact_name: []u8,
+    artifact_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    artifact_delete_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
+    dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
+    sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
+    generated_enrichment_refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+
+    fn deinit(self: *DocumentChildRangeDispatchGroup, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.artifact_name);
+        for (self.artifact_writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        self.artifact_writes.deinit(alloc);
+        for (self.artifact_delete_keys.items) |key| alloc.free(@constCast(key));
+        self.artifact_delete_keys.deinit(alloc);
+        var derived_batch = derived_types.DerivedBatch{
+            .documents = self.documents.items,
+            .dense_embeddings = self.dense_embeddings.items,
+            .sparse_embeddings = self.sparse_embeddings.items,
+            .generated_enrichment_refs = self.generated_enrichment_refs.items,
+        };
+        derived_types.deinitDerivedBatch(alloc, &derived_batch);
+        self.documents = .empty;
+        self.dense_embeddings = .empty;
+        self.sparse_embeddings = .empty;
+        self.generated_enrichment_refs = .empty;
+        self.* = undefined;
+    }
+
+    fn dispatch(self: DocumentChildRangeDispatchGroup, sync_level: types.SyncLevel) DocumentArtifactChildRangeDispatch {
+        return .{
+            .owner_group_id = self.owner_group_id,
+            .doc_key = self.doc_key,
+            .artifact_name = self.artifact_name,
+            .child_batch = .{
+                .artifact_writes = self.artifact_writes.items,
+                .artifact_delete_keys = self.artifact_delete_keys.items,
+                .documents = self.documents.items,
+                .dense_embeddings = self.dense_embeddings.items,
+                .sparse_embeddings = self.sparse_embeddings.items,
+                .generated_enrichment_refs = self.generated_enrichment_refs.items,
+                .sync_level = sync_level,
+            },
+        };
+    }
+};
+
+fn appendDocumentChildRangeOutboxWrites(alloc: Allocator, sequence: u64, groups: []const DocumentChildRangeDispatchGroup, sync_level: types.SyncLevel, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), owned_keys: *std.ArrayListUnmanaged([]u8), owned_values: *std.ArrayListUnmanaged([]u8)) !void {
+    for (groups, 0..) |group, i| {
+        const key = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, sequence, @intCast(i));
+        errdefer alloc.free(key);
+        const value = try std.json.Stringify.valueAlloc(alloc, DocumentArtifactChildRangeOutboxRecord{
+            .owner_group_id = group.owner_group_id,
+            .doc_key = group.doc_key,
+            .artifact_name = group.artifact_name,
+            .child_batch = group.dispatch(sync_level).child_batch,
+        }, .{});
+        errdefer alloc.free(value);
+        try owned_keys.append(alloc, key);
+        try owned_values.append(alloc, value);
+        try writes.append(alloc, .{ .key = key, .value = value });
+    }
+}
+
+const DocumentChildRangeRoute = struct {
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+};
+
+fn partitionRemoteDocumentChildRangeGeneratedBatch(self: *DB, generated: *PrecomputedGeneratedBatch, out: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup)) !void {
+    var snapshots = std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot).empty;
+    defer {
+        for (snapshots.items) |*snapshot| snapshot.deinit(self.alloc);
+        snapshots.deinit(self.alloc);
+    }
+    try collectDocumentChildRangeRoutingSnapshots(self, generated.*, &snapshots);
+    if (snapshots.items.len == 0) return;
+
+    var local_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    errdefer local_writes.deinit(self.alloc);
+    for (generated.artifact_writes) |write| {
+        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, write.key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
+            try group.artifact_writes.append(self.alloc, write);
+        } else {
+            try local_writes.append(self.alloc, write);
+        }
+    }
+    if (generated.artifact_writes.len > 0) self.alloc.free(generated.artifact_writes);
+    generated.artifact_writes = try local_writes.toOwnedSlice(self.alloc);
+
+    var local_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer local_deletes.deinit(self.alloc);
+    for (generated.artifact_delete_keys) |key| {
+        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
+            try group.artifact_delete_keys.append(self.alloc, key);
+        } else {
+            try local_deletes.append(self.alloc, key);
+        }
+    }
+    if (generated.artifact_delete_keys.len > 0) self.alloc.free(generated.artifact_delete_keys);
+    generated.artifact_delete_keys = try local_deletes.toOwnedSlice(self.alloc);
+
+    try partitionRemoteDerivedDocuments(self.alloc, snapshots.items, &generated.documents, out);
+    try partitionRemoteDenseEmbeddings(self.alloc, snapshots.items, &generated.dense_embeddings, out);
+    try partitionRemoteSparseEmbeddings(self.alloc, snapshots.items, &generated.sparse_embeddings, out);
+}
+
+fn collectDocumentChildRangeRoutingSnapshots(self: *DB, generated: PrecomputedGeneratedBatch, out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot)) !void {
+    for (generated.artifact_writes) |write| try appendDocumentChildRangeRoutingSnapshotFromValue(self, write.key, write.value, out);
+    for (generated.artifact_delete_keys) |key| {
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse continue;
+        defer artifact_ref.deinit(self.alloc);
+        if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
+        const existing = self.core.getStoreValue(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        defer if (existing) |value| self.alloc.free(value);
+        if (existing) |value| try appendDocumentChildRangeRoutingSnapshotFromValue(self, key, value, out);
+    }
+}
+
+fn appendDocumentChildRangeRoutingSnapshotFromValue(self: *DB, key: []const u8, value: []const u8, out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot)) !void {
+    if (std.mem.indexOf(u8, value, "\"child_ranges\"") == null) return;
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse return;
+    defer artifact_ref.deinit(self.alloc);
+    if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) return;
+    const ranges = documentArtifactChildRangesFromManifestJsonAlloc(self.alloc, value) catch |err| switch (err) {
+        error.InvalidDocumentExtractionManifest => return,
+        else => return err,
+    };
+    errdefer freeDocumentArtifactChildRanges(self.alloc, ranges);
+    if (ranges.len == 0) {
+        freeDocumentArtifactChildRanges(self.alloc, ranges);
+        return;
+    }
+    const doc_key = try self.alloc.dupe(u8, artifact_ref.document_id);
+    errdefer self.alloc.free(doc_key);
+    const manifest_artifact_name = try self.alloc.dupe(u8, artifact_ref.name);
+    errdefer self.alloc.free(manifest_artifact_name);
+    try out.append(self.alloc, .{ .doc_key = doc_key, .manifest_artifact_name = manifest_artifact_name, .child_ranges = ranges });
+}
+
+fn documentChildRangeRouteForKey(alloc: Allocator, snapshots: []const DocumentChildRangeRoutingSnapshot, key: []const u8) !?DocumentChildRangeRoute {
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+    const route_kind, const route_artifact_name = switch (artifact_ref.kind) {
+        .asset => blk: {
+            if (artifact_ref.unit_id == null) return null;
+            break :blk .{ "unit", artifact_ref.name };
+        },
+        .chunk => .{ "chunk", artifact_ref.name },
+        .embedding => blk: {
+            const source = artifact_ref.source orelse return null;
+            break :blk .{ if (source.kind == .chunk) "chunk" else "unit", source.name };
+        },
+    };
+    for (snapshots) |snapshot| {
+        if (!std.mem.eql(u8, snapshot.doc_key, artifact_ref.document_id)) continue;
+        for (snapshot.child_ranges) |range| {
+            if (!std.mem.eql(u8, range.range_kind, route_kind)) continue;
+            if (!std.mem.eql(u8, range.artifact_name, route_artifact_name)) continue;
+            const owner_group_id = range.owner_group_id orelse 0;
+            if (owner_group_id == 0) continue;
+            const route_status = range.route_status orelse "local_committed";
+            if (!std.mem.eql(u8, route_status, "remote_committed")) continue;
+            if (std.mem.order(u8, key, range.start_key) == .lt) continue;
+            if (range.end_key_exclusive.len > 0 and std.mem.order(u8, key, range.end_key_exclusive) != .lt) continue;
+            return .{ .owner_group_id = owner_group_id, .doc_key = snapshot.doc_key, .artifact_name = range.artifact_name };
+        }
+    }
+    return null;
+}
+
+fn ensureDocumentChildRangeDispatchGroup(alloc: Allocator, groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup), route: DocumentChildRangeRoute) !*DocumentChildRangeDispatchGroup {
+    for (groups.items) |*group| {
+        if (group.owner_group_id == route.owner_group_id and std.mem.eql(u8, group.doc_key, route.doc_key) and std.mem.eql(u8, group.artifact_name, route.artifact_name)) return group;
+    }
+    const doc_key = try alloc.dupe(u8, route.doc_key);
+    errdefer alloc.free(doc_key);
+    const artifact_name = try alloc.dupe(u8, route.artifact_name);
+    errdefer alloc.free(artifact_name);
+    try groups.append(alloc, .{ .owner_group_id = route.owner_group_id, .doc_key = doc_key, .artifact_name = artifact_name });
+    return &groups.items[groups.items.len - 1];
+}
+
+fn partitionRemoteDerivedDocuments(alloc: Allocator, snapshots: []const DocumentChildRangeRoutingSnapshot, documents: *[]const derived_types.DerivedDocument, groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup)) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+    errdefer local.deinit(alloc);
+    for (documents.*) |doc| {
+        if (try documentChildRangeRouteForKey(alloc, snapshots, doc.key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.documents.append(alloc, doc);
+        } else try local.append(alloc, doc);
+    }
+    if (documents.*.len > 0) alloc.free(documents.*);
+    documents.* = try local.toOwnedSlice(alloc);
+}
+
+fn partitionRemoteDenseEmbeddings(alloc: Allocator, snapshots: []const DocumentChildRangeRoutingSnapshot, embeddings: *[]const derived_types.DerivedDenseEmbeddingWrite, groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup)) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
+    errdefer local.deinit(alloc);
+    for (embeddings.*) |embedding| {
+        const route_key = embedding.artifact_key orelse embedding.doc_key;
+        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.dense_embeddings.append(alloc, embedding);
+        } else try local.append(alloc, embedding);
+    }
+    if (embeddings.*.len > 0) alloc.free(embeddings.*);
+    embeddings.* = try local.toOwnedSlice(alloc);
+}
+
+fn partitionRemoteSparseEmbeddings(alloc: Allocator, snapshots: []const DocumentChildRangeRoutingSnapshot, embeddings: *[]const derived_types.DerivedSparseEmbeddingWrite, groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup)) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
+    errdefer local.deinit(alloc);
+    for (embeddings.*) |embedding| {
+        const route_key = embedding.artifact_key orelse embedding.doc_key;
+        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.sparse_embeddings.append(alloc, embedding);
+        } else try local.append(alloc, embedding);
+    }
+    if (embeddings.*.len > 0) alloc.free(embeddings.*);
+    embeddings.* = try local.toOwnedSlice(alloc);
 }
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
@@ -47722,6 +49055,14 @@ test "db enrichments precomputed watermark advances across replay entries withou
     });
 
     try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
+}
+
+fn jsonTestNumber(value: std.json.Value) f64 {
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => 0,
+    };
 }
 
 const TestAssetProducer = struct {
