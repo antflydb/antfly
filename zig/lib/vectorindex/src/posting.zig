@@ -3832,7 +3832,10 @@ pub const PostingStore = struct {
         defer scratch.deinit(index.alloc);
         const base_header = try PostingFormat.decodeBaseIntoScratch(index.alloc, &scratch, base_data);
         var materialized_len = base_header.member_count;
-        _ = try applyDeltaTailIntoScratchAdaptive(index, txn, posting_id, index.alloc, &scratch, &materialized_len, base_header.generation);
+        if (baseDeltaIsCanonical(index))
+            _ = try applyDeltaTailIntoScratchAdaptiveSorted(index, txn, posting_id, index.alloc, &scratch, &materialized_len, base_header.generation)
+        else
+            _ = try applyDeltaTailIntoScratchAdaptive(index, txn, posting_id, index.alloc, &scratch, &materialized_len, base_header.generation);
         return try index.alloc.dupe(VectorId, scratch.member_ids[0..materialized_len]);
     }
 
@@ -6316,6 +6319,32 @@ test "posting store chunks grouped delta records by encoded value target" {
         try std.testing.expectEqual(record.op, deltas[i].op);
         try std.testing.expectEqual(record.vector_id, deltas[i].vector_id);
     }
+}
+
+test "posting store canonical lsm materialization replays deltas in sorted order" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{
+        .alloc = alloc,
+        .config = .{ .dims = 2, .posting_storage_mode = .base_delta },
+    };
+    defer index.deinit();
+    var txn = struct {}{};
+
+    try PostingStore.saveBase(&index, &txn, .{
+        .posting_id = 9,
+        .generation = 4,
+        .members = &[_]VectorId{ 20, 10 },
+    });
+
+    try PostingStore.appendDeltaRecords(&index, &txn, 9, &.{
+        .{ .sequence = (@as(u64, 5) << 32) | 1, .op = .insert, .vector_id = 15 },
+        .{ .sequence = (@as(u64, 5) << 32) | 2, .op = .insert, .vector_id = 5 },
+        .{ .sequence = (@as(u64, 5) << 32) | 3, .op = .tombstone, .vector_id = 20 },
+    });
+
+    const materialized = try PostingStore.materializeBaseDeltaMembers(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    defer alloc.free(materialized);
+    try std.testing.expectEqualSlices(VectorId, &.{ 5, 10, 15 }, materialized);
 }
 
 test "assignment map shadow record increments version while preserving legacy mapping" {
