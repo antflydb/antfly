@@ -64,6 +64,7 @@ pub const Plan = struct {
     decisions: []Decision,
     selected_count: u32 = 0,
     stale_ignored_count: u32 = 0,
+    not_requested_count: u32 = 0,
 
     pub fn deinit(self: *Plan, alloc: Allocator) void {
         for (self.decisions) |*decision| decision.deinit(alloc);
@@ -79,6 +80,12 @@ pub const Plan = struct {
     }
 };
 
+pub const Summary = struct {
+    selected_count: u32 = 0,
+    stale_ignored_count: u32 = 0,
+    not_requested_count: u32 = 0,
+};
+
 pub fn planAlloc(
     alloc: Allocator,
     descriptor: base_source.BaseSourceDescriptor,
@@ -86,9 +93,7 @@ pub fn planAlloc(
     desired: []const DesiredSidecar,
     policy: Policy,
 ) !Plan {
-    try descriptor.validate();
-    try (sidecar_manifest.Manifest{ .artifacts = declarations }).validate();
-    try validateDesired(desired);
+    const summary = try summarize(descriptor, declarations, desired, policy);
 
     var decisions = std.ArrayListUnmanaged(Decision).empty;
     errdefer {
@@ -96,8 +101,6 @@ pub fn planAlloc(
         decisions.deinit(alloc);
     }
 
-    var selected_count: u32 = 0;
-    var stale_ignored_count: u32 = 0;
     for (declarations) |decl| {
         const selected = desired.len == 0 or matchesDesired(decl, desired);
         if (!selected) {
@@ -114,7 +117,6 @@ pub fn planAlloc(
             switch (policy.stale) {
                 .reject => return error.StaleLakeSidecar,
                 .ignore => {
-                    stale_ignored_count += 1;
                     try decisions.append(alloc, try makeDecision(
                         alloc,
                         decl,
@@ -126,7 +128,6 @@ pub fn planAlloc(
             }
         }
 
-        selected_count += 1;
         try decisions.append(alloc, try makeDecision(
             alloc,
             decl,
@@ -135,18 +136,53 @@ pub fn planAlloc(
         ));
     }
 
-    if (policy.require_requested) {
-        for (desired) |want| {
-            if (!hasUsableDecision(decisions.items, want)) return error.MissingRequiredLakeSidecar;
-        }
-    }
-
     std.mem.sort(Decision, decisions.items, {}, compareDecision);
     return .{
         .decisions = try decisions.toOwnedSlice(alloc),
-        .selected_count = selected_count,
-        .stale_ignored_count = stale_ignored_count,
+        .selected_count = summary.selected_count,
+        .stale_ignored_count = summary.stale_ignored_count,
+        .not_requested_count = summary.not_requested_count,
     };
+}
+
+pub fn summarize(
+    descriptor: base_source.BaseSourceDescriptor,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    desired: []const DesiredSidecar,
+    policy: Policy,
+) !Summary {
+    try descriptor.validate();
+    try (sidecar_manifest.Manifest{ .artifacts = declarations }).validate();
+    try validateDesired(desired);
+
+    var summary = Summary{};
+    for (declarations) |decl| {
+        const selected = desired.len == 0 or matchesDesired(decl, desired);
+        if (!selected) {
+            summary.not_requested_count += 1;
+            continue;
+        }
+
+        if (!try matchesBaseSource(descriptor, decl.binding)) {
+            switch (policy.stale) {
+                .reject => return error.StaleLakeSidecar,
+                .ignore => {
+                    summary.stale_ignored_count += 1;
+                    continue;
+                },
+            }
+        }
+
+        summary.selected_count += 1;
+    }
+
+    if (policy.require_requested) {
+        for (desired) |want| {
+            if (!(try hasUsableDeclaration(descriptor, declarations, want))) return error.MissingRequiredLakeSidecar;
+        }
+    }
+
+    return summary;
 }
 
 fn validateDesired(desired: []const DesiredSidecar) !void {
@@ -169,14 +205,14 @@ fn matchesDesired(
     return false;
 }
 
-fn hasUsableDecision(decisions: []const Decision, desired: DesiredSidecar) bool {
-    for (decisions) |decision| {
-        if (decision.action != .use) continue;
-        if (desired.name.len != 0 and !std.mem.eql(u8, desired.name, decision.name)) continue;
-        if (desired.kind) |kind| {
-            if (decision.sidecar_kind != kind) continue;
-        }
-        return true;
+fn hasUsableDeclaration(
+    descriptor: base_source.BaseSourceDescriptor,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    desired: DesiredSidecar,
+) !bool {
+    for (declarations) |decl| {
+        if (!matchesDesired(decl, &[_]DesiredSidecar{desired})) continue;
+        if (try matchesBaseSource(descriptor, decl.binding)) return true;
     }
     return false;
 }
@@ -267,6 +303,7 @@ test "lake sidecar selection uses requested fresh sidecars" {
     defer plan.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 1), plan.selected_count);
+    try std.testing.expectEqual(@as(u32, 1), plan.not_requested_count);
     try std.testing.expectEqual(Action.use, plan.find("events.embedding.vector").?.action);
     try std.testing.expectEqual(Action.ignore_not_requested, plan.find("events.body.text").?.action);
 }
@@ -304,6 +341,15 @@ test "lake sidecar selection rejects or ignores stale requested sidecars" {
     try std.testing.expectEqual(@as(u32, 0), ignored.selected_count);
     try std.testing.expectEqual(@as(u32, 1), ignored.stale_ignored_count);
     try std.testing.expectEqual(Action.ignore_stale, ignored.find("events.embedding.vector").?.action);
+
+    const summary = try summarize(
+        descriptor,
+        &declarations,
+        &desired,
+        .{ .stale = .ignore },
+    );
+    try std.testing.expectEqual(@as(u32, 0), summary.selected_count);
+    try std.testing.expectEqual(@as(u32, 1), summary.stale_ignored_count);
 }
 
 test "lake sidecar selection can require requested sidecars" {

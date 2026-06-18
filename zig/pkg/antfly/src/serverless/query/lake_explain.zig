@@ -23,6 +23,7 @@ const artifact_ref = @import("../manifest/artifact_ref.zig");
 const base_source = @import("../manifest/base_source.zig");
 const lake_promotion = @import("../build/lake_promotion.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
+const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
 
 pub const Operation = enum {
     scan,
@@ -42,6 +43,8 @@ pub const Request = struct {
     base_source: base_source.BaseSourceDescriptor,
     artifacts: []const artifact_ref.ArtifactRef,
     sidecars: []const sidecar_manifest.DeclaredArtifact = &.{},
+    desired_sidecars: []const lake_sidecar_selection.DesiredSidecar = &.{},
+    sidecar_policy: lake_sidecar_selection.Policy = .{},
     operation: Operation,
     projected_column_count: u16 = 0,
     observation: ?lake_promotion.Observation = null,
@@ -57,6 +60,13 @@ pub const ArtifactAccounting = struct {
     manifest_accounted_bytes: u64 = 0,
 };
 
+pub const SidecarSelectionAccounting = struct {
+    declared_count: u32 = 0,
+    selected_count: u32 = 0,
+    stale_ignored_count: u32 = 0,
+    not_requested_count: u32 = 0,
+};
+
 pub const Plan = struct {
     operation: Operation,
     source_kind: base_source.BaseSourceKind,
@@ -65,6 +75,7 @@ pub const Plan = struct {
     projected_column_count: u16 = 0,
     cache_class: CacheClass,
     accounting: ArtifactAccounting,
+    sidecar_selection: SidecarSelectionAccounting = .{},
     recommendation: lake_promotion.Recommendation = .{ .kind = .none },
 };
 
@@ -75,7 +86,13 @@ pub fn explain(request: Request) !Plan {
         try accountArtifact(&accounting, artifact);
     }
     try validateBaseSourceArtifacts(request.base_source, request.artifacts);
-    try validateSidecarDeclarations(request.base_source, request.artifacts, request.sidecars);
+    try validateSidecarDeclarations(request.artifacts, request.sidecars);
+    const sidecar_selection = try summarizeSidecarSelection(
+        request.base_source,
+        request.sidecars,
+        request.desired_sidecars,
+        request.sidecar_policy,
+    );
 
     const source_info = sourceInfo(request.base_source);
     return .{
@@ -86,6 +103,7 @@ pub fn explain(request: Request) !Plan {
         .projected_column_count = request.projected_column_count,
         .cache_class = chooseCacheClass(request.operation, request.base_source, accounting),
         .accounting = accounting,
+        .sidecar_selection = sidecar_selection,
         .recommendation = if (request.observation) |observation|
             lake_promotion.recommend(observation, request.thresholds)
         else
@@ -94,18 +112,33 @@ pub fn explain(request: Request) !Plan {
 }
 
 fn validateSidecarDeclarations(
-    descriptor: base_source.BaseSourceDescriptor,
     artifacts: []const artifact_ref.ArtifactRef,
     sidecars: []const sidecar_manifest.DeclaredArtifact,
 ) !void {
     if (sidecars.len == 0) return;
     const manifest = sidecar_manifest.Manifest{ .artifacts = sidecars };
-    try sidecar_manifest.validateManifestAgainstBaseSource(manifest, descriptor);
+    try manifest.validate();
     for (sidecars) |declaration| {
         if (!hasArtifact(artifacts, declaration.artifact.artifact_id, declaration.artifact.kind)) {
             return error.LakeExplainMissingArtifact;
         }
     }
+}
+
+fn summarizeSidecarSelection(
+    descriptor: base_source.BaseSourceDescriptor,
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+    desired: []const lake_sidecar_selection.DesiredSidecar,
+    policy: lake_sidecar_selection.Policy,
+) !SidecarSelectionAccounting {
+    if (sidecars.len == 0) return .{};
+    const summary = try lake_sidecar_selection.summarize(descriptor, sidecars, desired, policy);
+    return .{
+        .declared_count = @intCast(sidecars.len),
+        .selected_count = summary.selected_count,
+        .stale_ignored_count = summary.stale_ignored_count,
+        .not_requested_count = summary.not_requested_count,
+    };
 }
 
 fn accountArtifact(accounting: *ArtifactAccounting, artifact: artifact_ref.ArtifactRef) !void {
@@ -328,10 +361,81 @@ test "lake explain rejects stale declared sidecars" {
         },
     };
 
-    try std.testing.expectError(error.SidecarSourceBindingMismatch, explain(.{
+    try std.testing.expectError(error.StaleLakeSidecar, explain(.{
         .base_source = descriptor,
         .artifacts = &artifacts,
         .sidecars = &[_]sidecar_manifest.DeclaredArtifact{stale_sidecar},
         .operation = .scan,
     }));
+}
+
+test "lake explain reports sidecar selection fallback" {
+    const descriptor = base_source.BaseSourceDescriptor{ .external_iceberg = .{
+        .format = .iceberg,
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+        .file_inventory_artifact = "files-1",
+    } };
+    const artifacts = [_]artifact_ref.ArtifactRef{
+        .{ .kind = .external_base_source, .artifact_id = "files-1", .byte_len = 4096, .checksum = "len:4096" },
+        .{ .kind = .vector_segment, .name = "events.embedding.vector", .artifact_id = "vector-1", .byte_len = 512, .checksum = "len:512" },
+        .{ .kind = .text_segment, .name = "events.body.text", .artifact_id = "text-1", .byte_len = 256, .checksum = "len:256" },
+    };
+    const sidecars = [_]sidecar_manifest.DeclaredArtifact{
+        .{
+            .name = "events.embedding.vector",
+            .binding = .{
+                .sidecar_kind = .vector,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-8",
+                .schema_fingerprint = "schema-v2",
+                .column_bindings = &[_][]const u8{"embedding"},
+                .index_config_hash = "sha256:vector",
+            },
+            .artifact = .{
+                .kind = .vector_segment,
+                .name = "events.embedding.vector",
+                .artifact_id = "vector-1",
+                .byte_len = 512,
+                .checksum = "len:512",
+            },
+        },
+        .{
+            .name = "events.body.text",
+            .binding = .{
+                .sidecar_kind = .text,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-9",
+                .schema_fingerprint = "schema-v2",
+                .column_bindings = &[_][]const u8{"body"},
+                .index_config_hash = "sha256:text",
+            },
+            .artifact = .{
+                .kind = .text_segment,
+                .name = "events.body.text",
+                .artifact_id = "text-1",
+                .byte_len = 256,
+                .checksum = "len:256",
+            },
+        },
+    };
+
+    const plan = try explain(.{
+        .base_source = descriptor,
+        .artifacts = &artifacts,
+        .sidecars = &sidecars,
+        .desired_sidecars = &[_]lake_sidecar_selection.DesiredSidecar{.{ .kind = .vector }},
+        .sidecar_policy = .{ .stale = .ignore },
+        .operation = .scan,
+    });
+
+    try std.testing.expectEqual(@as(u32, 2), plan.sidecar_selection.declared_count);
+    try std.testing.expectEqual(@as(u32, 0), plan.sidecar_selection.selected_count);
+    try std.testing.expectEqual(@as(u32, 1), plan.sidecar_selection.stale_ignored_count);
+    try std.testing.expectEqual(@as(u32, 1), plan.sidecar_selection.not_requested_count);
 }
