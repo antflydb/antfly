@@ -175,6 +175,46 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != HAPromotionCurrentFencePath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPromotionCurrentFencePath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haPromotionResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.WithToken("test-token").PromoteWithCurrentFence(context.Background())
+	if err != nil {
+		t.Fatalf("PromoteWithCurrentFence returned error: %v", err)
+	}
+	if resp.Action.ActionKind != HAActionKindPromotion || resp.Action.NodeId != "standby-a" {
+		t.Fatalf("promotion action = %#v, want standby promotion receipt", resp.Action)
+	}
+	if resp.Promotion.NewIdentity.TimelineId != 5 || resp.Promotion.SwitchLsn != 13 {
+		t.Fatalf("promotion result = %#v, want new timeline 5 and switch LSN 13", resp.Promotion)
+	}
+	if resp.FenceGeneration != 3 || resp.FenceToken != "ha-fence-token" {
+		t.Fatalf("fence evidence = generation %d token %q, want generation 3 token ha-fence-token", resp.FenceGeneration, resp.FenceToken)
+	}
+}
+
 func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
 	t.Parallel()
 
@@ -1879,6 +1919,57 @@ func TestHAStatusHelpersClassifyWrappedErrors(t *testing.T) {
 	if HAIsUnauthorized(validation) || HAIsConflict(validation) {
 		t.Fatal("status helpers classified validation error as HTTP API error")
 	}
+}
+
+func haPromotionResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"promotion:standby-a",
+			"action_kind":"promotion",
+			"target":"standby-a",
+			"state":"applied",
+			"node_id":"standby-a"
+		},
+		"assessment":{
+			"required_lsn":12,
+			"received_lsn":12,
+			"applied_lsn":12,
+			"has_required_lsn":true,
+			"caught_up_to_received":true,
+			"fencing_confirmed":true,
+			"force":false,
+			"mode":"safe",
+			"data_loss_possible":false,
+			"safe":true,
+			"requires_fencing":false,
+			"requires_force":false,
+			"can_promote":true
+		},
+		"promotion":{
+			"node_id":"standby-a",
+			"old_identity":{
+				"cluster_id":100,
+				"shard_id":10,
+				"table_id":20,
+				"timeline_id":4,
+				"epoch":6
+			},
+			"new_identity":{
+				"cluster_id":100,
+				"shard_id":10,
+				"table_id":20,
+				"timeline_id":5,
+				"epoch":7
+			},
+			"switch_lsn":13,
+			"forced":false,
+			"data_loss_possible":false
+		},
+		"fence_generation":3,
+		"fence_token":"ha-fence-token",
+		"forced":false
+	}`
 }
 
 func haCommitAppendResponseJSON() string {
