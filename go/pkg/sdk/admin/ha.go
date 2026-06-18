@@ -38,6 +38,8 @@ const (
 	HARejoinAssessPath                = HAPath + "/rejoin/assess"
 	HARejoinRewindPath                = HAPath + "/rejoin/rewind"
 	HARejoinReseedPath                = HAPath + "/rejoin/reseed"
+
+	maxHAIdentifierBytes = 128
 )
 
 const adminV1Path = AdminV1Path
@@ -1887,11 +1889,35 @@ func HAReseedRejoinOperation() HAOperation {
 }
 
 func HAReplicationSlotPath(slotName string) (string, bool) {
-	slotName = strings.TrimSpace(slotName)
-	if slotName == "" {
+	if !validHAIdentifier(slotName) {
 		return "", false
 	}
 	return HAReplicationSlotPathPrefix + url.PathEscape(slotName), true
+}
+
+func validHAIdentifier(value string) bool {
+	if len(value) == 0 || len(value) > maxHAIdentifierBytes {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c >= 'A' && c <= 'Z' {
+			continue
+		}
+		if c >= 'a' && c <= 'z' {
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		switch c {
+		case '_', '-', '.', ':':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func HAReplicationSlotCreateReceiptExpectation() HAReceiptExpectation {
@@ -2352,6 +2378,9 @@ func (c *HAClient) ListReplicationSlots(ctx context.Context) (*HAReplicationSlot
 }
 
 func (c *HAClient) CreateReplicationSlotResponse(ctx context.Context, body ReplicationSlotCreateRequest) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	if err := validateHAReplicationSlotNameForRequest("create HA replication slot", body.SlotName); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.CreateHAReplicationSlotWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2364,6 +2393,9 @@ func (c *HAClient) CreateReplicationSlot(ctx context.Context, body ReplicationSl
 }
 
 func (c *HAClient) PauseReplicationSlotResponse(ctx context.Context, slotName string) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	if err := validateHAReplicationSlotNameForRequest("pause HA replication slot", slotName); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.PauseHAReplicationSlotWithResponse(ctx, slotName, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2376,6 +2408,9 @@ func (c *HAClient) PauseReplicationSlot(ctx context.Context, slotName string) (*
 }
 
 func (c *HAClient) ResumeReplicationSlotResponse(ctx context.Context, slotName string) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	if err := validateHAReplicationSlotNameForRequest("resume HA replication slot", slotName); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.ResumeHAReplicationSlotWithResponse(ctx, slotName, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2388,6 +2423,9 @@ func (c *HAClient) ResumeReplicationSlot(ctx context.Context, slotName string) (
 }
 
 func (c *HAClient) DropReplicationSlotResponse(ctx context.Context, slotName string) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	if err := validateHAReplicationSlotNameForRequest("drop HA replication slot", slotName); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.DropHAReplicationSlotWithResponse(ctx, slotName, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2397,6 +2435,13 @@ func (c *HAClient) DropReplicationSlotResponse(ctx context.Context, slotName str
 
 func (c *HAClient) DropReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
 	return haResponseValue(c.DropReplicationSlotResponse(ctx, slotName))
+}
+
+func validateHAReplicationSlotNameForRequest(operation string, slotName string) error {
+	if validHAIdentifier(slotName) {
+		return nil
+	}
+	return fmt.Errorf("%s: invalid HA replication slot name %q", operation, slotName)
 }
 
 func (c *HAClient) BeginBaseBackupResponse(ctx context.Context, body BaseBackupStartRequest) (*HAResponse[HABaseBackupBeginResponse], error) {

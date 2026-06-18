@@ -502,6 +502,17 @@ Recommended split:
   consumers, and OpenAPI compatibility checks on one reviewed contract instead
   of creating a second admin API surface inside `go/pkg/operator`.
 
+The Go SDK wrapper should enforce the same HA identifier policy as the Zig
+runtime and operator admission layer before it builds operation metadata or
+executes requests. Generated OpenAPI path helpers prove method/path compatibility
+but they do not prove semantic validity: a replication slot name or node id is
+not acceptable merely because `url.PathEscape` can encode it into a path
+segment. Wrapper helpers for slot paths, node-scoped actions, promotion targets,
+and former-primary repair should reject missing, padded, overlong, or
+out-of-charset identifiers and should not silently trim operator input. This
+keeps local CLI use, Go SDK consumers, and `go/pkg/operator` automation aligned
+with the durable HA identity rules.
+
 Runtime HA validation should be shared but still field-aware. Helpers such as
 `paddedHAString` should evolve into a small classifier, for example
 
@@ -932,6 +943,12 @@ and either rewind or reseed.
   operations following the style of the other SDK APIs. This SDK package is the
   single Go generation target for the admin contract; operator code must not
   own another generated admin client.
+- Make the Go SDK HA wrapper validate slot names, node ids, and other durable
+  HA identifiers before constructing operation metadata or issuing generated
+  requests. Path escaping is not validation; padded, whitespace-containing,
+  overlong, or out-of-charset identifiers should return a typed local error or
+  `ok=false` from metadata helpers instead of being normalized into a different
+  path.
 - Make `go/pkg/operator` consume the `go/pkg/sdk/admin` HA wrapper for remote
   admin operations. The operator should not import generated `oapi` internals
   directly except in wrapper tests, and it should not maintain separate method

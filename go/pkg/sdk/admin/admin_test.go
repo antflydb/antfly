@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
@@ -172,6 +173,69 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 	if resp.Action.NodeId != "primary-a" {
 		t.Fatalf("Action.NodeId = %q, want primary-a", resp.Action.NodeId)
+	}
+}
+
+func TestHAClientRejectsInvalidReplicationSlotNamesLocally(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "create whitespace",
+			call: func() error {
+				_, err := client.CreateReplicationSlot(context.Background(), ReplicationSlotCreateRequest{
+					SlotName:   " standby-a",
+					InitialLsn: 7,
+				})
+				return err
+			},
+		},
+		{
+			name: "pause hidden path separator",
+			call: func() error {
+				_, err := client.PauseReplicationSlot(context.Background(), "standby/a")
+				return err
+			},
+		},
+		{
+			name: "resume hidden whitespace",
+			call: func() error {
+				_, err := client.ResumeReplicationSlot(context.Background(), "standby a")
+				return err
+			},
+		},
+		{
+			name: "drop too long",
+			call: func() error {
+				_, err := client.DropReplicationSlot(context.Background(), strings.Repeat("a", 129))
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err == nil || !strings.Contains(err.Error(), "invalid HA replication slot name") {
+				t.Fatalf("error = %v, want local invalid slot name error", err)
+			}
+		})
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("server received %d requests for locally invalid slot names", got)
 	}
 }
 
@@ -1283,46 +1347,70 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 		})
 	}
 
-	slotPath, ok := HAReplicationSlotPath("standby a/%")
+	const slotName = "standby-a.1:zone_9"
+
+	slotPath, ok := HAReplicationSlotPath(slotName)
 	if !ok {
-		t.Fatal("HAReplicationSlotPath returned ok=false for non-empty slot")
+		t.Fatal("HAReplicationSlotPath returned ok=false for valid slot")
 	}
-	if slotPath != "/admin/v1/ha/replication-slots/standby%20a%2F%25" {
-		t.Fatalf("slot path = %q", slotPath)
-	}
-	if _, ok := HAReplicationSlotPath(" "); ok {
-		t.Fatal("HAReplicationSlotPath returned ok=true for empty slot")
+	if slotPath != HAReplicationSlotPathPrefix+url.PathEscape(slotName) {
+		t.Fatalf("slot path = %q, want escaped valid slot path", slotPath)
 	}
 	generatedDrop := generatedHAOperation(func(server string) (*http.Request, error) {
-		return oapi.NewDropHAReplicationSlotRequest(server, "standby a/%")
+		return oapi.NewDropHAReplicationSlotRequest(server, slotName)
 	})(t)
 	if dropPath := (HAOperation{Method: http.MethodDelete, Path: slotPath}); dropPath != generatedDrop {
 		t.Fatalf("drop slot path operation = %#v, want generated OpenAPI operation %#v", dropPath, generatedDrop)
 	}
-	resume, ok := HAResumeReplicationSlotOperation("standby a/%")
+	resume, ok := HAResumeReplicationSlotOperation(slotName)
 	if !ok {
 		t.Fatal("HAResumeReplicationSlotOperation returned ok=false")
 	}
 	if want := generatedHAOperation(func(server string) (*http.Request, error) {
-		return oapi.NewResumeHAReplicationSlotRequest(server, "standby a/%")
+		return oapi.NewResumeHAReplicationSlotRequest(server, slotName)
 	})(t); resume != want {
 		t.Fatalf("resume operation = %#v, want generated OpenAPI operation %#v", resume, want)
 	}
-	pause, ok := HAPauseReplicationSlotOperation("standby a/%")
+	pause, ok := HAPauseReplicationSlotOperation(slotName)
 	if !ok {
 		t.Fatal("HAPauseReplicationSlotOperation returned ok=false")
 	}
 	if want := generatedHAOperation(func(server string) (*http.Request, error) {
-		return oapi.NewPauseHAReplicationSlotRequest(server, "standby a/%")
+		return oapi.NewPauseHAReplicationSlotRequest(server, slotName)
 	})(t); pause != want {
 		t.Fatalf("pause operation = %#v, want generated OpenAPI operation %#v", pause, want)
 	}
-	drop, ok := HADropReplicationSlotOperation("standby a/%")
+	drop, ok := HADropReplicationSlotOperation(slotName)
 	if !ok {
 		t.Fatal("HADropReplicationSlotOperation returned ok=false")
 	}
 	if drop != generatedDrop {
 		t.Fatalf("drop operation = %#v, want generated OpenAPI operation %#v", drop, generatedDrop)
+	}
+
+	invalidSlots := []string{
+		"",
+		" ",
+		" standby-a",
+		"standby-a ",
+		"standby a",
+		"standby/a",
+		"standby%",
+		strings.Repeat("a", 129),
+	}
+	for _, invalid := range invalidSlots {
+		if path, ok := HAReplicationSlotPath(invalid); ok {
+			t.Fatalf("HAReplicationSlotPath(%q) = %q, true; want false", invalid, path)
+		}
+		if operation, ok := HAResumeReplicationSlotOperation(invalid); ok {
+			t.Fatalf("HAResumeReplicationSlotOperation(%q) = %#v, true; want false", invalid, operation)
+		}
+		if operation, ok := HAPauseReplicationSlotOperation(invalid); ok {
+			t.Fatalf("HAPauseReplicationSlotOperation(%q) = %#v, true; want false", invalid, operation)
+		}
+		if operation, ok := HADropReplicationSlotOperation(invalid); ok {
+			t.Fatalf("HADropReplicationSlotOperation(%q) = %#v, true; want false", invalid, operation)
+		}
 	}
 }
 
