@@ -6253,6 +6253,7 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 		}
 		status, err := r.observeHAStandbyStatusTyped(ctx, cluster, standby.AdminURL, standby.Name, standbySlotName(standby), cluster.Status.HAStatus.PrimaryLSN, ha)
 		if err != nil {
+			markHAStandbyAdminError(cluster.Status.HAStatus, standby.Name, standbySlotName(standby), err)
 			if observedErr == nil {
 				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
 			}
@@ -6643,7 +6644,7 @@ func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandby
 	}
 	for i := range status.Standbys {
 		existing := &status.Standbys[i]
-		if existing.Name != observed.Name && existing.SlotName != observed.SlotName {
+		if !haStandbyStatusMatches(*existing, observed.Name, observed.SlotName) {
 			continue
 		}
 		if observed.TimelineID != 0 {
@@ -6671,9 +6672,53 @@ func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandby
 		if observed.Status != "" {
 			existing.Status = observed.Status
 		}
+		existing.LastError = observed.LastError
 		return
 	}
 	status.Standbys = append(status.Standbys, observed)
+}
+
+func markHAStandbyAdminError(status *antflyv1.HAStatus, standbyName string, slotName string, err error) {
+	if status == nil || err == nil {
+		return
+	}
+	standbyName = strings.TrimSpace(standbyName)
+	slotName = strings.TrimSpace(slotName)
+	if standbyName == "" && slotName == "" {
+		return
+	}
+	lastError := strings.TrimSpace(err.Error())
+	if lastError == "" {
+		lastError = "standby admin status unavailable"
+	}
+	for i := range status.Standbys {
+		existing := &status.Standbys[i]
+		if !haStandbyStatusMatches(*existing, standbyName, slotName) {
+			continue
+		}
+		if existing.Name == "" {
+			existing.Name = standbyName
+		}
+		if existing.SlotName == "" {
+			existing.SlotName = slotName
+		}
+		existing.Status = "unreachable"
+		existing.LastError = lastError
+		existing.CaughtUpToReceived = false
+		existing.CanServeSafeReads = false
+		return
+	}
+	status.Standbys = append(status.Standbys, antflyv1.HAStandbyStatus{
+		Name:      standbyName,
+		SlotName:  slotName,
+		Status:    "unreachable",
+		LastError: lastError,
+	})
+}
+
+func haStandbyStatusMatches(existing antflyv1.HAStandbyStatus, standbyName string, slotName string) bool {
+	return (standbyName != "" && existing.Name == standbyName) ||
+		(slotName != "" && existing.SlotName == slotName)
 }
 
 func parseHATableLines(body string) map[string]string {

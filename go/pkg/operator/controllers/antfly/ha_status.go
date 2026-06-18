@@ -1588,7 +1588,7 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 		if standby.Name != fenceHolder && standby.SlotName != fenceHolder {
 			continue
 		}
-		if !standby.Active || standby.ReseedRequired {
+		if !standbyPromotionEligible(standby) {
 			continue
 		}
 		if standby.ReceivedLSN+maxLag < status.PrimaryLSN {
@@ -1636,7 +1636,7 @@ func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *
 		if !ok {
 			standby, ok = standbys[standbySlotName(desired)]
 		}
-		if !ok || !standby.Active || standby.ReseedRequired {
+		if !ok || !standbyPromotionEligible(standby) {
 			continue
 		}
 		if standby.ReceivedLSN+maxLag < status.PrimaryLSN {
@@ -1654,10 +1654,14 @@ func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *
 }
 
 func standbyReadSafe(status *antflyv1.HAStatus, standby antflyv1.HAStandbyStatus) bool {
-	if !standby.Active || standby.ReseedRequired {
+	if !standbyPromotionEligible(standby) {
 		return false
 	}
 	return standbySafeReadLSN(standby) >= status.PrimaryLSN
+}
+
+func standbyPromotionEligible(standby antflyv1.HAStandbyStatus) bool {
+	return standby.Active && !standby.ReseedRequired && strings.TrimSpace(standby.LastError) == ""
 }
 
 func standbySafeReadLSN(standby antflyv1.HAStandbyStatus) uint64 {
@@ -2175,7 +2179,7 @@ func standbySatisfiesSync(primaryLSN uint64, mode antflyv1.HADurabilityMode, sta
 }
 
 func standbySyncEligible(standby antflyv1.HAStandbyStatus) bool {
-	return standby.Active && !standby.ReseedRequired
+	return standbyPromotionEligible(standby)
 }
 
 func standbyLagging(standby antflyv1.HAStandbyStatus) bool {

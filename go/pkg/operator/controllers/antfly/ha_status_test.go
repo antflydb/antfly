@@ -2003,6 +2003,21 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		plan.Actions[3].RouteTo != "standby-a" {
 		t.Fatalf("expected promotion and route actions to target standby-a, got %#v", plan.Actions)
 	}
+
+	cluster.Status.HAStatus.Standbys[0].LastError = "standby admin timeout"
+	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = false
+	reconciler.updateHAStatusAndConditions(cluster)
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked while standby admin status is failed")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHASyncPolicyUnsatisfied {
+		t.Fatalf("expected sync-policy-unsatisfied condition after standby admin failure, got %#v", failover)
+	}
+
+	cluster.Status.HAStatus.Standbys[0].LastError = ""
+	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = true
+	reconciler.updateHAStatusAndConditions(cluster)
 	if len(cluster.Status.HAStatus.PlannedActions) != 5 {
 		t.Fatalf("expected fenced promotion action chain in status, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}

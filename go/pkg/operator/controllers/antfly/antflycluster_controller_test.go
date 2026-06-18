@@ -5631,6 +5631,83 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	g.Expect(standby.Status).To(Equal("lagging"))
 }
 
+func TestObserveHAStandbyAdminStatusesMarksFailedProbeUnhealthy(t *testing.T) {
+	g := NewWithT(t)
+
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
+			return nil, fmt.Errorf("standby admin timeout")
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					SlotName: "slot-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode:       antflyv1.HAModeHotStandby,
+				PrimaryLSN: 13,
+				Standbys: []antflyv1.HAStandbyStatus{{
+					Name:               "standby-a",
+					SlotName:           "slot-a",
+					Active:             true,
+					ReceivedLSN:        13,
+					AppliedLSN:         13,
+					SafeReadLSN:        13,
+					CaughtUpToReceived: true,
+					CanServeSafeReads:  true,
+					Status:             "healthy",
+				}},
+			},
+		},
+	}
+
+	err := reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("standby-a"))
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	standby := cluster.Status.HAStatus.Standbys[0]
+	g.Expect(standby.Status).To(Equal("unreachable"))
+	g.Expect(standby.LastError).To(ContainSubstring("standby admin timeout"))
+	g.Expect(standby.CaughtUpToReceived).To(BeFalse())
+	g.Expect(standby.CanServeSafeReads).To(BeFalse())
+
+	reconciler.updateHAStatusAndConditions(cluster)
+	g.Expect(cluster.Status.HAStatus.UnhealthyStandbyCount).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.ReadSafeStandbyCount).To(Equal(int32(0)))
+}
+
+func TestMarkHAStandbyAdminErrorDoesNotMatchEmptySlotName(t *testing.T) {
+	status := &antflyv1.HAStatus{
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:   "standby-a",
+			Status: "healthy",
+		}},
+	}
+
+	markHAStandbyAdminError(status, "standby-b", "", fmt.Errorf("standby admin timeout"))
+
+	if len(status.Standbys) != 2 {
+		t.Fatalf("expected distinct standby entry, got %#v", status.Standbys)
+	}
+	if status.Standbys[0].Name != "standby-a" || status.Standbys[0].Status != "healthy" || status.Standbys[0].LastError != "" {
+		t.Fatalf("expected standby-a to remain unchanged, got %#v", status.Standbys[0])
+	}
+	if status.Standbys[1].Name != "standby-b" || status.Standbys[1].Status != "unreachable" ||
+		!strings.Contains(status.Standbys[1].LastError, "standby admin timeout") {
+		t.Fatalf("expected standby-b error status, got %#v", status.Standbys[1])
+	}
+}
+
 func TestObserveHAStandbyAdminStatusesSkipsPromotedPrimary(t *testing.T) {
 	g := NewWithT(t)
 
@@ -5725,7 +5802,9 @@ func TestObserveHAStandbyAdminStatusesRejectsMismatchedIdentityScope(t *testing.
 	err := reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("identity scope mismatch"))
-	g.Expect(cluster.Status.HAStatus.Standbys).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	g.Expect(cluster.Status.HAStatus.Standbys[0].Status).To(Equal("unreachable"))
+	g.Expect(cluster.Status.HAStatus.Standbys[0].LastError).To(ContainSubstring("identity scope mismatch"))
 }
 
 func TestObserveHAStandbyAdminStatusesRejectsStaleTimeline(t *testing.T) {
@@ -5773,7 +5852,9 @@ func TestObserveHAStandbyAdminStatusesRejectsStaleTimeline(t *testing.T) {
 	err := reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("identity timeline mismatch"))
-	g.Expect(cluster.Status.HAStatus.Standbys).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	g.Expect(cluster.Status.HAStatus.Standbys[0].Status).To(Equal("unreachable"))
+	g.Expect(cluster.Status.HAStatus.Standbys[0].LastError).To(ContainSubstring("identity timeline mismatch"))
 }
 
 func TestParseHAStatusJSONAcceptsLegacyCommandShape(t *testing.T) {
