@@ -304,6 +304,39 @@ pub const DropExtensionSyntax = struct {
     }
 };
 
+pub const RoutineKindSyntax = enum {
+    function,
+    procedure,
+};
+
+pub const CreateRoutineSyntax = struct {
+    kind: RoutineKindSyntax,
+    routine_name: []const u8,
+    argument_count: usize = 0,
+    returns_type: ?[]const u8 = null,
+    language: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.routine_name));
+        if (self.returns_type) |returns_type| alloc.free(@constCast(returns_type));
+        if (self.language) |language| alloc.free(@constCast(language));
+        self.* = undefined;
+    }
+};
+
+pub const DropRoutineSyntax = struct {
+    kind: RoutineKindSyntax,
+    routine_name: []const u8,
+    if_exists: bool = false,
+    argument_count: usize = 0,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.routine_name));
+        self.* = undefined;
+    }
+};
+
 pub const PrivilegeChangeActionSyntax = enum {
     grant,
     revoke,
@@ -1530,6 +1563,92 @@ pub fn parseDropExtensionCatalogTailAlloc(
     return .{ .extension_name = extension_name, .if_exists = if_exists, .cascade = cascade };
 }
 
+pub fn parseCreateRoutineCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateRoutineSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const kind = try parseRoutineKindKeyword(cursor);
+    const routine_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var routine_transferred = false;
+    errdefer if (!routine_transferred) alloc.free(routine_name);
+    const argument_count = try parseRoutineSignatureArgumentCount(cursor);
+    var returns_type: ?[]const u8 = null;
+    errdefer if (returns_type) |value| alloc.free(@constCast(value));
+    var language: ?[]const u8 = null;
+    errdefer if (language) |value| alloc.free(@constCast(value));
+    var body_seen = false;
+    while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
+        if (cursor.matchKeyword("returns")) {
+            if (kind != .function or returns_type != null) return error.UnsupportedSqlShape;
+            returns_type = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+            continue;
+        }
+        if (cursor.matchKeyword("language")) {
+            if (language != null) return error.UnsupportedSqlShape;
+            language = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            continue;
+        }
+        if (cursor.matchKeyword("as")) {
+            if (body_seen) return error.UnsupportedSqlShape;
+            if (cursor.matchToken(.string) == null) return error.UnsupportedSqlShape;
+            body_seen = true;
+            continue;
+        }
+        return error.UnsupportedSqlShape;
+    }
+    if (kind == .function and returns_type == null) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    routine_transferred = true;
+    const out = CreateRoutineSyntax{
+        .kind = kind,
+        .routine_name = routine_name,
+        .argument_count = argument_count,
+        .returns_type = returns_type,
+        .language = language,
+    };
+    returns_type = null;
+    language = null;
+    return out;
+}
+
+pub fn parseDropRoutineCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropRoutineSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const kind = try parseRoutineKindKeyword(cursor);
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const routine_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var routine_transferred = false;
+    errdefer if (!routine_transferred) alloc.free(routine_name);
+    const argument_count = if (cursor.peekKind(.lparen))
+        try parseRoutineSignatureArgumentCount(cursor)
+    else
+        0;
+    var cascade = false;
+    if (cursor.matchKeyword("cascade")) {
+        cascade = true;
+    } else if (cursor.matchKeyword("restrict")) {
+        cascade = false;
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    routine_transferred = true;
+    return .{
+        .kind = kind,
+        .routine_name = routine_name,
+        .if_exists = if_exists,
+        .argument_count = argument_count,
+        .cascade = cascade,
+    };
+}
+
 pub fn parseCreateRoleCatalogTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2341,6 +2460,31 @@ fn countParenthesizedTypeList(cursor: parser.Cursor) !usize {
     return count;
 }
 
+fn parseRoutineKindKeyword(cursor: parser.Cursor) !RoutineKindSyntax {
+    if (cursor.matchKeyword("function")) return .function;
+    try cursor.expectKeyword("procedure");
+    return .procedure;
+}
+
+fn parseRoutineSignatureArgumentCount(cursor: parser.Cursor) !usize {
+    try cursor.expectToken(.lparen);
+    if (cursor.matchToken(.rparen) != null) return 0;
+    var count: usize = 0;
+    while (true) {
+        var saw_argument_token = false;
+        while (!cursor.peekKind(.comma) and !cursor.peekKind(.rparen)) {
+            if (cursor.atEnd() or cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
+            try cursor.advance(1);
+            saw_argument_token = true;
+        }
+        if (!saw_argument_token) return error.UnsupportedSqlShape;
+        count += 1;
+        if (cursor.matchToken(.comma) != null) continue;
+        try cursor.expectToken(.rparen);
+        return count;
+    }
+}
+
 fn parseSqlOperatorNameOwnedAlloc(alloc: std.mem.Allocator, cursor: parser.Cursor) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -3020,6 +3164,62 @@ test "sql adapter grammar parses extension catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateExtensionCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses routine catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION public.normalize_status(input text) RETURNS text LANGUAGE sql AS 'select lower(input)';");
+    defer lexer.freeTokens(alloc, &create_function_tokens);
+    var create_function_pos: usize = 0;
+    var create_function = try parseCreateRoutineCatalogTailAlloc(alloc, create_function_tokens.items, &create_function_pos);
+    defer create_function.deinit(alloc);
+    try std.testing.expectEqual(create_function_tokens.items.len, create_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, create_function.kind);
+    try std.testing.expectEqualStrings("normalize_status", create_function.routine_name);
+    try std.testing.expectEqual(@as(usize, 1), create_function.argument_count);
+    try std.testing.expectEqualStrings("text", create_function.returns_type.?);
+    try std.testing.expectEqualStrings("sql", create_function.language.?);
+
+    var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql AS 'select 1';");
+    defer lexer.freeTokens(alloc, &create_procedure_tokens);
+    var create_procedure_pos: usize = 0;
+    var create_procedure = try parseCreateRoutineCatalogTailAlloc(alloc, create_procedure_tokens.items, &create_procedure_pos);
+    defer create_procedure.deinit(alloc);
+    try std.testing.expectEqual(create_procedure_tokens.items.len, create_procedure_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.procedure, create_procedure.kind);
+    try std.testing.expectEqualStrings("touch_usage", create_procedure.routine_name);
+    try std.testing.expectEqual(@as(usize, 1), create_procedure.argument_count);
+    try std.testing.expect(create_procedure.returns_type == null);
+    try std.testing.expectEqualStrings("sql", create_procedure.language.?);
+
+    var drop_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION IF EXISTS public.normalize_status(text) CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_function_tokens);
+    var drop_function_pos: usize = 0;
+    var drop_function = try parseDropRoutineCatalogTailAlloc(alloc, drop_function_tokens.items, &drop_function_pos);
+    defer drop_function.deinit(alloc);
+    try std.testing.expectEqual(drop_function_tokens.items.len, drop_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, drop_function.kind);
+    try std.testing.expectEqualStrings("normalize_status", drop_function.routine_name);
+    try std.testing.expect(drop_function.if_exists);
+    try std.testing.expectEqual(@as(usize, 1), drop_function.argument_count);
+    try std.testing.expect(drop_function.cascade);
+
+    var drop_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage RESTRICT;");
+    defer lexer.freeTokens(alloc, &drop_procedure_tokens);
+    var drop_procedure_pos: usize = 0;
+    var drop_procedure = try parseDropRoutineCatalogTailAlloc(alloc, drop_procedure_tokens.items, &drop_procedure_pos);
+    defer drop_procedure.deinit(alloc);
+    try std.testing.expectEqual(drop_procedure_tokens.items.len, drop_procedure_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.procedure, drop_procedure.kind);
+    try std.testing.expectEqualStrings("touch_usage", drop_procedure.routine_name);
+    try std.testing.expectEqual(@as(usize, 0), drop_procedure.argument_count);
+    try std.testing.expect(!drop_procedure.cascade);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage() RETURNS text LANGUAGE sql AS 'select 1';");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
 test "sql adapter grammar parses authorization catalog tails" {

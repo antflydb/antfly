@@ -2728,6 +2728,13 @@ fn bulkIoDirectionFromSyntax(syntax: sql_adapter.BulkIoDirectionSyntax) BulkIoDi
     };
 }
 
+fn routineKindFromSyntax(syntax: sql_adapter.RoutineKindSyntax) RoutineKind {
+    return switch (syntax) {
+        .function => .function,
+        .procedure => .procedure,
+    };
+}
+
 fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) sql_adapter.PrivilegeChangeActionSyntax {
     return switch (action) {
         .grant => .grant,
@@ -3195,100 +3202,36 @@ const Parser = struct {
             std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp");
     }
 
-    fn parseRoutineKindKeyword(self: *@This()) !RoutineKind {
-        if (self.matchKeyword("function")) return .function;
-        try self.expectKeyword("procedure");
-        return .procedure;
-    }
-
-    fn parseRoutineSignatureArgumentCount(self: *@This()) !usize {
-        try self.expect(.lparen);
-        if (self.match(.rparen) != null) return 0;
-        var count: usize = 0;
-        while (true) {
-            var saw_argument_token = false;
-            while (!self.peekKind(.comma) and !self.peekKind(.rparen)) {
-                if (self.atEnd() or self.peekKind(.semicolon)) return error.UnsupportedSqlShape;
-                self.pos += 1;
-                saw_argument_token = true;
-            }
-            if (!saw_argument_token) return error.UnsupportedSqlShape;
-            count += 1;
-            if (self.match(.comma) != null) continue;
-            try self.expect(.rparen);
-            return count;
-        }
-    }
-
     fn parseCreateRoutineDdl(self: *@This(), replace_existing: bool) !CreateRoutinePlan {
-        const kind = try self.parseRoutineKindKeyword();
-        const routine_name = try self.parseSqlObjectIdentifierOwned();
-        errdefer self.alloc.free(routine_name);
-        const argument_count = try self.parseRoutineSignatureArgumentCount();
-        var returns_type: ?[]const u8 = null;
-        errdefer if (returns_type) |value| self.alloc.free(value);
-        var language: ?[]const u8 = null;
-        errdefer if (language) |value| self.alloc.free(value);
-        var body_seen = false;
-        while (!self.atEnd() and !self.peekKind(.semicolon)) {
-            if (self.matchKeyword("returns")) {
-                if (kind != .function or returns_type != null) return error.UnsupportedSqlShape;
-                returns_type = try self.parseSqlObjectIdentifierOwned();
-                continue;
-            }
-            if (self.matchKeyword("language")) {
-                if (language != null) return error.UnsupportedSqlShape;
-                language = try self.parseIdentifierOwned();
-                continue;
-            }
-            if (self.matchKeyword("as")) {
-                if (body_seen) return error.UnsupportedSqlShape;
-                if (self.match(.string) == null) return error.UnsupportedSqlShape;
-                body_seen = true;
-                continue;
-            }
-            return error.UnsupportedSqlShape;
-        }
-        if (kind == .function and returns_type == null) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseCreateRoutineCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const routine_name = syntax.routine_name;
+        const returns_type = syntax.returns_type;
+        const language = syntax.language;
+        syntax.routine_name = "";
+        syntax.returns_type = null;
+        syntax.language = null;
         return .{
-            .kind = kind,
+            .kind = routineKindFromSyntax(syntax.kind),
             .routine_name = routine_name,
             .replace_existing = replace_existing,
-            .argument_count = argument_count,
+            .argument_count = syntax.argument_count,
             .returns_type = returns_type,
             .language = language,
         };
     }
 
     fn parseDropRoutineDdl(self: *@This()) !DropRoutinePlan {
-        const kind = try self.parseRoutineKindKeyword();
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const routine_name = try self.parseSqlObjectIdentifierOwned();
-        errdefer self.alloc.free(routine_name);
-        const argument_count = if (self.peekKind(.lparen))
-            try self.parseRoutineSignatureArgumentCount()
-        else
-            0;
-        var cascade = false;
-        if (self.matchKeyword("cascade")) {
-            cascade = true;
-        } else if (self.matchKeyword("restrict")) {
-            cascade = false;
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseDropRoutineCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const routine_name = syntax.routine_name;
+        syntax.routine_name = "";
         return .{
-            .kind = kind,
+            .kind = routineKindFromSyntax(syntax.kind),
             .routine_name = routine_name,
-            .if_exists = if_exists,
-            .argument_count = argument_count,
-            .cascade = cascade,
+            .if_exists = syntax.if_exists,
+            .argument_count = syntax.argument_count,
+            .cascade = syntax.cascade,
         };
     }
 

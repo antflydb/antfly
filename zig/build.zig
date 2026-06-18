@@ -3820,6 +3820,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter grammar parses authorization catalog tails",
             "sql adapter grammar parses logical replication catalog tails",
             "sql adapter grammar parses type system catalog tails",
+            "sql adapter grammar parses routine catalog tails",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.
