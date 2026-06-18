@@ -966,10 +966,13 @@ pub const LazyDirectorySnapshot = struct {
     ) !?posting.PostingDeltaRecord {
         var best_sequence: u64 = 0;
         var best_record: ?posting.PostingDeltaRecord = null;
-        for (self.manifest.segments) |entry| {
+        var segment_index = self.manifest.segments.len;
+        while (segment_index > 0) {
+            segment_index -= 1;
+            const entry = self.manifest.segments[segment_index];
             if (!entry.meta.mayContainPosting(posting_id)) continue;
             if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
-            if (best_record != null and entry.meta.max_delta_sequence < best_sequence) continue;
+            if (best_record != null and entry.meta.max_delta_sequence <= best_sequence) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             const manifest_entry = ManifestEntry{
@@ -982,18 +985,11 @@ pub const LazyDirectorySnapshot = struct {
             const range = (try readSegmentDeltaValueRangeAlloc(alloc, self.io, self.dir, manifest_entry, index_data, posting_id)) orelse continue;
             defer range.deinit(alloc);
 
-            var delta_index = range.first_index;
-            while (delta_index < range.past_index) : (delta_index += 1) {
+            var delta_index = range.past_index;
+            while (delta_index > range.first_index) {
+                delta_index -= 1;
                 const value = try deltaValueFromRange(index_data, range, delta_index);
-                var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-                while (try iterator.next()) |record| {
-                    if (record.vector_id != vector_id) continue;
-                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                    if (best_record == null or record.sequence >= best_sequence) {
-                        best_sequence = record.sequence;
-                        best_record = record;
-                    }
-                }
+                try latestDeltaValueRecordAfterGenerationForMember(value, vector_id, base_generation, &best_sequence, &best_record);
             }
         }
         return best_record;
@@ -3693,6 +3689,32 @@ fn deltaValueFromEntryRange(range: OwnedDeltaValueRange, found: IndexEntry) ![]c
     return value;
 }
 
+fn latestDeltaValueRecordAfterGenerationForMember(
+    value: []const u8,
+    vector_id: posting.VectorId,
+    base_generation: u64,
+    best_sequence: *u64,
+    best_record: *?posting.PostingDeltaRecord,
+) !void {
+    var value_best_sequence = best_sequence.*;
+    var value_best_record: ?posting.PostingDeltaRecord = null;
+
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    while (try iterator.next()) |record| {
+        if (record.vector_id != vector_id) continue;
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+        if (record.sequence > value_best_sequence or (value_best_record != null and record.sequence == value_best_sequence)) {
+            value_best_sequence = record.sequence;
+            value_best_record = record;
+        }
+    }
+
+    if (value_best_record) |record| {
+        best_sequence.* = value_best_sequence;
+        best_record.* = record;
+    }
+}
+
 fn appendDeltaValueAllRecordsAlloc(
     alloc: Allocator,
     value: []const u8,
@@ -6131,6 +6153,41 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
     try std.testing.expectEqualSlices(posting.VectorId, materialized, scratch.member_ids[0..scratch_count]);
     const sorted_scratch_count = (try snapshot.materializeSortedMembersIntoScratch(alloc, 7, &scratch)).?;
     try std.testing.expectEqualSlices(posting.VectorId, materialized, scratch.member_ids[0..sorted_scratch_count]);
+}
+
+test "posting lazy latest member scan prefers newer equal-sequence segment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const sequence = (@as(u64, 10) << 32) | 7;
+    const older_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = sequence, .op = .insert, .vector_id = 42 },
+    });
+    defer alloc.free(older_delta);
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendDelta(7, sequence, older_delta);
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const newer_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = sequence, .op = .insert, .vector_id = 42 },
+        .{ .sequence = sequence, .op = .tombstone, .vector_id = 42 },
+    });
+    defer alloc.free(newer_delta);
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendDelta(7, sequence, newer_delta);
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+
+    const latest = (try lazy.snapshot().latestDeltaRecordAfterGenerationForMember(alloc, 7, 42, 0)).?;
+    try std.testing.expectEqual(sequence, latest.sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, latest.op);
 }
 
 pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
