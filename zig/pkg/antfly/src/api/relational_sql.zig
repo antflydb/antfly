@@ -2629,6 +2629,28 @@ fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpu
     }
 }
 
+fn cursorScrollModeFromSyntax(syntax: sql_adapter.CursorScrollSyntax) CursorScrollMode {
+    return switch (syntax) {
+        .default => .default,
+        .scroll => .scroll,
+        .no_scroll => .no_scroll,
+    };
+}
+
+fn cursorFetchDirectionFromSyntax(syntax: sql_adapter.CursorFetchDirectionSyntax) CursorFetchDirection {
+    return switch (syntax) {
+        .next => .next,
+        .prior => .prior,
+        .first => .first,
+        .last => .last,
+        .absolute => .absolute,
+        .relative => .relative,
+        .forward => .forward,
+        .backward => .backward,
+        .all => .all,
+    };
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3863,101 +3885,33 @@ const Parser = struct {
     }
 
     fn parseDeclareCursorPortalDdl(self: *@This()) !DeclareCursorPortalPlan {
-        const portal_name = try self.parseIdentifierOwned();
+        const syntax = try sql_adapter.parseDeclareCursorPortalPrefix(self.tokens, &self.pos);
+        const portal_name = try self.alloc.dupe(u8, syntax.portal_name);
         var portal_transferred = false;
         errdefer if (!portal_transferred) self.alloc.free(portal_name);
-        var binary = false;
-        var scroll: CursorScrollMode = .default;
-        var hold = false;
-        while (true) {
-            if (self.matchKeyword("binary")) {
-                binary = true;
-            } else if (self.matchKeyword("scroll")) {
-                scroll = .scroll;
-            } else if (self.matchKeyword("no")) {
-                try self.expectKeyword("scroll");
-                scroll = .no_scroll;
-            } else {
-                break;
-            }
-        }
-        try self.expectKeyword("cursor");
-        if (self.matchKeyword("with")) {
-            try self.expectKeyword("hold");
-            hold = true;
-        } else if (self.matchKeyword("without")) {
-            try self.expectKeyword("hold");
-            hold = false;
-        }
-        try self.expectKeyword("for");
         const statement_kind = try self.parsePreparedStatementSubjectKind();
         try self.consumePreparedStatementSubjectTail();
         portal_transferred = true;
         return .{
             .portal_name = portal_name,
-            .scroll = scroll,
-            .binary = binary,
-            .hold = hold,
+            .scroll = cursorScrollModeFromSyntax(syntax.scroll),
+            .binary = syntax.binary,
+            .hold = syntax.hold,
             .statement_kind = statement_kind,
         };
     }
 
     fn parseFetchCursorPortalDdl(self: *@This()) !FetchCursorPortalPlan {
-        var direction: CursorFetchDirection = .next;
-        var count: ?i64 = null;
-        if (self.matchKeyword("next")) {
-            direction = .next;
-        } else if (self.matchKeyword("prior")) {
-            direction = .prior;
-        } else if (self.matchKeyword("first")) {
-            direction = .first;
-        } else if (self.matchKeyword("last")) {
-            direction = .last;
-        } else if (self.matchKeyword("all")) {
-            direction = .all;
-        } else if (self.matchKeyword("forward")) {
-            direction = .forward;
-            count = try self.parseOptionalCursorFetchCount();
-        } else if (self.matchKeyword("backward")) {
-            direction = .backward;
-            count = try self.parseOptionalCursorFetchCount();
-        } else if (self.matchKeyword("absolute")) {
-            direction = .absolute;
-            count = try self.parseCursorFetchCount();
-        } else if (self.matchKeyword("relative")) {
-            direction = .relative;
-            count = try self.parseCursorFetchCount();
-        } else if (self.peekCursorFetchCount()) {
-            direction = .forward;
-            count = try self.parseCursorFetchCount();
-        }
-        _ = self.matchKeyword("from") or self.matchKeyword("in");
-        const portal_name = try self.parseIdentifierOwned();
+        const syntax = try sql_adapter.parseFetchCursorPortalTail(self.tokens, &self.pos);
+        const portal_name = try self.alloc.dupe(u8, syntax.portal_name);
         var portal_transferred = false;
         errdefer if (!portal_transferred) self.alloc.free(portal_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
         portal_transferred = true;
-        return .{ .portal_name = portal_name, .direction = direction, .count = count };
-    }
-
-    fn parseOptionalCursorFetchCount(self: *@This()) !?i64 {
-        if (self.peekKeyword("from") or self.peekKeyword("in")) return null;
-        if (self.peekKeyword("all")) {
-            try self.expectKeyword("all");
-            return null;
-        }
-        if (!self.peekCursorFetchCount()) return null;
-        return try self.parseCursorFetchCount();
-    }
-
-    fn peekCursorFetchCount(self: *@This()) bool {
-        return self.peekKind(.number) or
-            (self.peekKind(.minus) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .number);
-    }
-
-    fn parseCursorFetchCount(self: *@This()) !i64 {
-        return try self.parseSequenceInteger();
+        return .{
+            .portal_name = portal_name,
+            .direction = cursorFetchDirectionFromSyntax(syntax.direction),
+            .count = syntax.count,
+        };
     }
 
     fn parseCloseCursorPortalDdl(self: *@This()) !CloseCursorPortalPlan {

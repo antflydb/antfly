@@ -55,6 +55,37 @@ pub const NamedOrAllSyntax = struct {
     all: bool = false,
 };
 
+pub const CursorScrollSyntax = enum {
+    default,
+    scroll,
+    no_scroll,
+};
+
+pub const DeclareCursorPortalSyntax = struct {
+    portal_name: []const u8,
+    scroll: CursorScrollSyntax = .default,
+    binary: bool = false,
+    hold: bool = false,
+};
+
+pub const CursorFetchDirectionSyntax = enum {
+    next,
+    prior,
+    first,
+    last,
+    absolute,
+    relative,
+    forward,
+    backward,
+    all,
+};
+
+pub const FetchCursorPortalSyntax = struct {
+    portal_name: []const u8,
+    direction: CursorFetchDirectionSyntax = .next,
+    count: ?i64 = null,
+};
+
 pub const RelationPopulationMode = enum {
     create_table_as,
     select_into,
@@ -334,6 +365,81 @@ pub fn parseDeallocatePreparedStatementTail(tokens: []const Token, pos: *usize) 
     return try parseNamedOrAllTail(cursor);
 }
 
+pub fn parseDeclareCursorPortalPrefix(tokens: []const Token, pos: *usize) !DeclareCursorPortalSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const portal_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    var binary = false;
+    var scroll: CursorScrollSyntax = .default;
+    var hold = false;
+    while (true) {
+        if (cursor.matchKeyword("binary")) {
+            binary = true;
+        } else if (cursor.matchKeyword("scroll")) {
+            scroll = .scroll;
+        } else if (cursor.matchKeyword("no")) {
+            try cursor.expectKeyword("scroll");
+            scroll = .no_scroll;
+        } else {
+            break;
+        }
+    }
+    try cursor.expectKeyword("cursor");
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("hold");
+        hold = true;
+    } else if (cursor.matchKeyword("without")) {
+        try cursor.expectKeyword("hold");
+        hold = false;
+    }
+    try cursor.expectKeyword("for");
+    return .{
+        .portal_name = portal_token.text,
+        .scroll = scroll,
+        .binary = binary,
+        .hold = hold,
+    };
+}
+
+pub fn parseFetchCursorPortalTail(tokens: []const Token, pos: *usize) !FetchCursorPortalSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    var direction: CursorFetchDirectionSyntax = .next;
+    var count: ?i64 = null;
+    if (cursor.matchKeyword("next")) {
+        direction = .next;
+    } else if (cursor.matchKeyword("prior")) {
+        direction = .prior;
+    } else if (cursor.matchKeyword("first")) {
+        direction = .first;
+    } else if (cursor.matchKeyword("last")) {
+        direction = .last;
+    } else if (cursor.matchKeyword("all")) {
+        direction = .all;
+    } else if (cursor.matchKeyword("forward")) {
+        direction = .forward;
+        count = try parseOptionalCursorFetchCount(cursor);
+    } else if (cursor.matchKeyword("backward")) {
+        direction = .backward;
+        count = try parseOptionalCursorFetchCount(cursor);
+    } else if (cursor.matchKeyword("absolute")) {
+        direction = .absolute;
+        count = try parseCursorFetchCount(cursor);
+    } else if (cursor.matchKeyword("relative")) {
+        direction = .relative;
+        count = try parseCursorFetchCount(cursor);
+    } else if (peekCursorFetchCount(cursor)) {
+        direction = .forward;
+        count = try parseCursorFetchCount(cursor);
+    }
+    _ = cursor.matchKeyword("from") or cursor.matchKeyword("in");
+    const portal_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{
+        .portal_name = portal_token.text,
+        .direction = direction,
+        .count = count,
+    };
+}
+
 pub fn parseCloseCursorPortalTail(tokens: []const Token, pos: *usize) !NamedOrAllSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     return try parseNamedOrAllTail(cursor);
@@ -455,6 +561,29 @@ fn parseNamedOrAllTail(cursor: parser.Cursor) !NamedOrAllSyntax {
     const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     try parseAdapterNoopStatementEnd(cursor);
     return .{ .name = name.text };
+}
+
+fn parseOptionalCursorFetchCount(cursor: parser.Cursor) !?i64 {
+    if (cursor.peekKeyword("from") or cursor.peekKeyword("in")) return null;
+    if (cursor.matchKeyword("all")) return null;
+    if (!peekCursorFetchCount(cursor)) return null;
+    return try parseCursorFetchCount(cursor);
+}
+
+fn peekCursorFetchCount(cursor: parser.Cursor) bool {
+    if (cursor.peekKind(.number)) return true;
+    const checkpoint = cursor.checkpoint();
+    defer cursor.restore(checkpoint);
+    if (cursor.matchToken(.minus) == null) return false;
+    return cursor.peekKind(.number);
+}
+
+fn parseCursorFetchCount(cursor: parser.Cursor) !i64 {
+    const negative = cursor.matchToken(.minus) != null;
+    const count_token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    var count = std.fmt.parseInt(i64, count_token.text, 10) catch return error.UnsupportedSqlShape;
+    if (negative) count = -count;
+    return count;
 }
 
 pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
@@ -833,6 +962,43 @@ test "sql adapter grammar parses protocol cleanup tails" {
     defer lexer.freeTokens(alloc, &extra_tokens);
     var extra_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCloseCursorPortalTail(extra_tokens.items, &extra_pos));
+}
+
+test "sql adapter grammar parses cursor portal syntax" {
+    const alloc = std.testing.allocator;
+
+    var declare_tokens = try lexer.tokenizeAlloc(alloc, "usage_cursor BINARY NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records;");
+    defer lexer.freeTokens(alloc, &declare_tokens);
+    var declare_pos: usize = 0;
+    const declare = try parseDeclareCursorPortalPrefix(declare_tokens.items, &declare_pos);
+    try std.testing.expectEqualStrings("usage_cursor", declare.portal_name);
+    try std.testing.expectEqual(CursorScrollSyntax.no_scroll, declare.scroll);
+    try std.testing.expect(declare.binary);
+    try std.testing.expect(declare.hold);
+    try std.testing.expect(parser.peekKeyword(declare_tokens.items, declare_pos, "select"));
+
+    var fetch_tokens = try lexer.tokenizeAlloc(alloc, "BACKWARD -5 FROM usage_cursor;");
+    defer lexer.freeTokens(alloc, &fetch_tokens);
+    var fetch_pos: usize = 0;
+    const fetch = try parseFetchCursorPortalTail(fetch_tokens.items, &fetch_pos);
+    try std.testing.expectEqualStrings("usage_cursor", fetch.portal_name);
+    try std.testing.expectEqual(CursorFetchDirectionSyntax.backward, fetch.direction);
+    try std.testing.expectEqual(@as(?i64, -5), fetch.count);
+    try std.testing.expectEqual(fetch_tokens.items.len, fetch_pos);
+
+    var fetch_all_tokens = try lexer.tokenizeAlloc(alloc, "FORWARD ALL IN usage_cursor;");
+    defer lexer.freeTokens(alloc, &fetch_all_tokens);
+    var fetch_all_pos: usize = 0;
+    const fetch_all = try parseFetchCursorPortalTail(fetch_all_tokens.items, &fetch_all_pos);
+    try std.testing.expectEqualStrings("usage_cursor", fetch_all.portal_name);
+    try std.testing.expectEqual(CursorFetchDirectionSyntax.forward, fetch_all.direction);
+    try std.testing.expect(fetch_all.count == null);
+    try std.testing.expectEqual(fetch_all_tokens.items.len, fetch_all_pos);
+
+    var extra_tokens = try lexer.tokenizeAlloc(alloc, "NEXT FROM usage_cursor; FETCH NEXT FROM other_cursor;");
+    defer lexer.freeTokens(alloc, &extra_tokens);
+    var extra_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseFetchCursorPortalTail(extra_tokens.items, &extra_pos));
 }
 
 test "sql adapter grammar parses explain prefixes and options" {

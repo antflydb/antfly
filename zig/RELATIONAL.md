@@ -1072,7 +1072,8 @@ normalization, owned identifier/list parsing, adapter-noop grammar tails,
 `EXPLAIN` prefix and option grammar, row-security grammar
 syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 `FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
-tails, prepared-statement subject classification for read, write, and DDL
+tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
+direction/count tails, prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
