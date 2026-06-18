@@ -112,123 +112,23 @@ pub const LoweredWindowPlan = sql_adapter.LoweredWindowPlan;
 pub const LoweredInsert = sql_adapter.LoweredInsert;
 pub const LoweredInsertSource = sql_adapter.LoweredInsertSource;
 pub const LoweredMutation = sql_adapter.LoweredMutation;
-
-const ReturningProjection = struct {
-    fields: []const []const u8 = &.{},
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection = &.{},
-
-    fn hasProjection(self: ReturningProjection) bool {
-        return self.fields.len > 0 or self.expressions.len > 0;
-    }
-
-    fn returnsAll(self: ReturningProjection) bool {
-        return self.fields.len == 1 and std.mem.eql(u8, self.fields[0], "*");
-    }
-
-    fn deinit(self: ReturningProjection, alloc: std.mem.Allocator) void {
-        freeStringSlice(alloc, self.fields);
-        freeExpressionProjections(alloc, self.expressions);
-    }
-};
-
+const ReturningProjection = sql_adapter.ReturningProjection;
 pub const LoweredMutationSource = sql_adapter.LoweredMutationSource;
 pub const LoweredJoinedMutationSource = sql_adapter.LoweredJoinedMutationSource;
-
-pub const MergeFieldMapping = struct {
-    target_field: []const u8,
-    source_field: []const u8,
-};
-
-pub const MergeExpressionAssignment = struct {
-    target_field: []const u8,
-    expression: db_mod.types.RelationalRowsExpression,
-};
+pub const MergeFieldMapping = sql_adapter.MergeFieldMapping;
+pub const MergeExpressionAssignment = sql_adapter.MergeExpressionAssignment;
 
 const MergeParsedAssignment = union(enum) {
     mapping: MergeFieldMapping,
     expression: MergeExpressionAssignment,
 };
 
-pub const MergePredicateSide = enum {
-    target,
-    source,
-};
-
-pub const MergeArmPredicate = struct {
-    side: MergePredicateSide,
-    field: []const u8,
-    op: runtime_schema.RelationalCheckOp,
-    value_json: ?[]const u8 = null,
-};
-
-pub const MergeMatchedArm = struct {
-    predicates: []const MergeArmPredicate = &.{},
-    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
-    expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
-    expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
-    update: []const MergeFieldMapping = &.{},
-    update_expressions: []const MergeExpressionAssignment = &.{},
-    delete: bool = false,
-    do_nothing: bool = false,
-};
-
-pub const MergeNotMatchedArm = struct {
-    predicates: []const MergeArmPredicate = &.{},
-    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
-    expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
-    expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
-    insert: []const MergeFieldMapping = &.{},
-    insert_expressions: []const MergeExpressionAssignment = &.{},
-    do_nothing: bool = false,
-};
-
-pub const LoweredMergeMutationPlan = struct {
-    target_table_name: []const u8,
-    source_table_name: []const u8,
-    match_fields: []const MergeFieldMapping = &.{},
-    matched_arms: []const MergeMatchedArm = &.{},
-    not_matched_arms: []const MergeNotMatchedArm = &.{},
-    returning: ReturningProjection = .{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.target_table_name);
-        alloc.free(self.source_table_name);
-        freeMergeFieldMappings(alloc, self.match_fields);
-        freeMergeMatchedArms(alloc, self.matched_arms);
-        freeMergeNotMatchedArms(alloc, self.not_matched_arms);
-        self.returning.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredWritePlan = union(enum) {
-    insert: LoweredInsert,
-    insert_source: LoweredInsertSource,
-    update: LoweredMutation,
-    delete: LoweredMutation,
-    update_source: LoweredMutationSource,
-    delete_source: LoweredMutationSource,
-    truncate_source: LoweredMutationSource,
-    update_joined_source: LoweredJoinedMutationSource,
-    delete_joined_source: LoweredJoinedMutationSource,
-    merge_mutation: LoweredMergeMutationPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .insert => |*insert| insert.deinit(alloc),
-            .insert_source => |*insert_source| insert_source.deinit(alloc),
-            .update => |*update| update.deinit(alloc),
-            .delete => |*delete| delete.deinit(alloc),
-            .update_source => |*update_source| update_source.deinit(alloc),
-            .delete_source => |*delete_source| delete_source.deinit(alloc),
-            .truncate_source => |*truncate_source| truncate_source.deinit(alloc),
-            .update_joined_source => |*update_joined_source| update_joined_source.deinit(alloc),
-            .delete_joined_source => |*delete_joined_source| delete_joined_source.deinit(alloc),
-            .merge_mutation => |*merge_mutation| merge_mutation.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
+pub const MergePredicateSide = sql_adapter.MergePredicateSide;
+pub const MergeArmPredicate = sql_adapter.MergeArmPredicate;
+pub const MergeMatchedArm = sql_adapter.MergeMatchedArm;
+pub const MergeNotMatchedArm = sql_adapter.MergeNotMatchedArm;
+pub const LoweredMergeMutationPlan = sql_adapter.LoweredMergeMutationPlan;
+pub const LoweredWritePlan = sql_adapter.LoweredWritePlan;
 
 pub const LowerWritePlanOptions = sql_adapter.LowerWritePlanOptions;
 
@@ -238,33 +138,9 @@ pub const LoweredJoin = sql_adapter.LoweredJoin;
 pub const LoweredLateralPlan = sql_adapter.LoweredLateralPlan;
 pub const LoweredReadPlan = sql_adapter.LoweredReadPlan;
 
-pub const LoweredExplainPlan = struct {
-    analyze: bool = false,
-    format: ExplainFormat = .text,
-    verbose: bool = false,
-    costs: bool = true,
-    subject: LoweredExplainSubject,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.subject.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredExplainSubject = union(enum) {
-    read: LoweredReadPlan,
-    write: LoweredWritePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .read => |*read| read.deinit(alloc),
-            .write => |*write| write.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const ExplainFormat = sql_adapter.SqlExplainFormat;
+pub const LoweredExplainPlan = sql_adapter.LoweredExplainPlan;
+pub const LoweredExplainSubject = sql_adapter.LoweredExplainSubject;
+pub const ExplainFormat = sql_adapter.ExplainFormat;
 
 pub const LoweredRelationPopulationPlan = sql_adapter.LoweredRelationPopulationPlan;
 pub const RelationPopulationMode = sql_adapter.RelationPopulationMode;
@@ -41828,10 +41704,7 @@ fn freeJoinedMutationSourceAssignments(
 }
 
 fn freeMergeFieldMappingValues(alloc: std.mem.Allocator, values: []const MergeFieldMapping) void {
-    for (values) |value| {
-        alloc.free(value.target_field);
-        alloc.free(value.source_field);
-    }
+    sql_adapter.freeMergeFieldMappingValues(alloc, values);
 }
 
 fn freeMergeFieldMappings(alloc: std.mem.Allocator, values: []const MergeFieldMapping) void {
@@ -41840,10 +41713,7 @@ fn freeMergeFieldMappings(alloc: std.mem.Allocator, values: []const MergeFieldMa
 }
 
 fn freeMergeExpressionAssignmentValues(alloc: std.mem.Allocator, values: []const MergeExpressionAssignment) void {
-    for (values) |value| {
-        alloc.free(value.target_field);
-        freeExpression(alloc, value.expression);
-    }
+    sql_adapter.freeMergeExpressionAssignmentValues(alloc, values);
 }
 
 fn freeMergeExpressionAssignments(alloc: std.mem.Allocator, values: []const MergeExpressionAssignment) void {
@@ -41852,19 +41722,11 @@ fn freeMergeExpressionAssignments(alloc: std.mem.Allocator, values: []const Merg
 }
 
 fn freeMergeMatchedArmValue(alloc: std.mem.Allocator, value: MergeMatchedArm) void {
-    freeMergeArmPredicates(alloc, value.predicates);
-    freeExpressionConditions(alloc, value.expression_predicates);
-    if (value.expression_predicates.len > 0) alloc.free(value.expression_predicates);
-    freeExpressionPredicateGroups(alloc, value.expression_or_predicates);
-    if (value.expression_or_predicates.len > 0) alloc.free(value.expression_or_predicates);
-    freeExpressionPredicateGroups(alloc, value.expression_not_predicates);
-    if (value.expression_not_predicates.len > 0) alloc.free(value.expression_not_predicates);
-    freeMergeFieldMappings(alloc, value.update);
-    freeMergeExpressionAssignments(alloc, value.update_expressions);
+    sql_adapter.freeMergeMatchedArmValue(alloc, value);
 }
 
 fn freeMergeMatchedArmValues(alloc: std.mem.Allocator, values: []const MergeMatchedArm) void {
-    for (values) |value| freeMergeMatchedArmValue(alloc, value);
+    sql_adapter.freeMergeMatchedArmValues(alloc, values);
 }
 
 fn freeMergeMatchedArms(alloc: std.mem.Allocator, values: []const MergeMatchedArm) void {
@@ -41873,19 +41735,11 @@ fn freeMergeMatchedArms(alloc: std.mem.Allocator, values: []const MergeMatchedAr
 }
 
 fn freeMergeNotMatchedArmValue(alloc: std.mem.Allocator, value: MergeNotMatchedArm) void {
-    freeMergeArmPredicates(alloc, value.predicates);
-    freeExpressionConditions(alloc, value.expression_predicates);
-    if (value.expression_predicates.len > 0) alloc.free(value.expression_predicates);
-    freeExpressionPredicateGroups(alloc, value.expression_or_predicates);
-    if (value.expression_or_predicates.len > 0) alloc.free(value.expression_or_predicates);
-    freeExpressionPredicateGroups(alloc, value.expression_not_predicates);
-    if (value.expression_not_predicates.len > 0) alloc.free(value.expression_not_predicates);
-    freeMergeFieldMappings(alloc, value.insert);
-    freeMergeExpressionAssignments(alloc, value.insert_expressions);
+    sql_adapter.freeMergeNotMatchedArmValue(alloc, value);
 }
 
 fn freeMergeNotMatchedArmValues(alloc: std.mem.Allocator, values: []const MergeNotMatchedArm) void {
-    for (values) |value| freeMergeNotMatchedArmValue(alloc, value);
+    sql_adapter.freeMergeNotMatchedArmValues(alloc, values);
 }
 
 fn freeMergeNotMatchedArms(alloc: std.mem.Allocator, values: []const MergeNotMatchedArm) void {
@@ -41894,14 +41748,11 @@ fn freeMergeNotMatchedArms(alloc: std.mem.Allocator, values: []const MergeNotMat
 }
 
 fn freeMergeArmPredicateValues(alloc: std.mem.Allocator, values: []const MergeArmPredicate) void {
-    for (values) |value| {
-        freeMergeArmPredicateValue(alloc, value);
-    }
+    sql_adapter.freeMergeArmPredicateValues(alloc, values);
 }
 
 fn freeMergeArmPredicateValue(alloc: std.mem.Allocator, value: MergeArmPredicate) void {
-    alloc.free(value.field);
-    if (value.value_json) |json| alloc.free(json);
+    sql_adapter.freeMergeArmPredicateValue(alloc, value);
 }
 
 fn freeMergeArmPredicates(alloc: std.mem.Allocator, values: []const MergeArmPredicate) void {

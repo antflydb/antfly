@@ -149,6 +149,115 @@ pub const LowerWritePlanOptions = struct {
     insert_source_schema: ?runtime_schema.TableSchema = null,
 };
 
+pub const ReturningProjection = struct {
+    fields: []const []const u8 = &.{},
+    expressions: []const db_mod.types.RelationalRowsExpressionProjection = &.{},
+
+    pub fn hasProjection(self: ReturningProjection) bool {
+        return self.fields.len > 0 or self.expressions.len > 0;
+    }
+
+    pub fn returnsAll(self: ReturningProjection) bool {
+        return self.fields.len == 1 and std.mem.eql(u8, self.fields[0], "*");
+    }
+
+    pub fn deinit(self: ReturningProjection, alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.fields);
+        freeExpressionProjections(alloc, self.expressions);
+    }
+};
+
+pub const MergeFieldMapping = struct {
+    target_field: []const u8,
+    source_field: []const u8,
+};
+
+pub const MergeExpressionAssignment = struct {
+    target_field: []const u8,
+    expression: db_mod.types.RelationalRowsExpression,
+};
+
+pub const MergePredicateSide = enum {
+    target,
+    source,
+};
+
+pub const MergeArmPredicate = struct {
+    side: MergePredicateSide,
+    field: []const u8,
+    op: runtime_schema.RelationalCheckOp,
+    value_json: ?[]const u8 = null,
+};
+
+pub const MergeMatchedArm = struct {
+    predicates: []const MergeArmPredicate = &.{},
+    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    update: []const MergeFieldMapping = &.{},
+    update_expressions: []const MergeExpressionAssignment = &.{},
+    delete: bool = false,
+    do_nothing: bool = false,
+};
+
+pub const MergeNotMatchedArm = struct {
+    predicates: []const MergeArmPredicate = &.{},
+    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    insert: []const MergeFieldMapping = &.{},
+    insert_expressions: []const MergeExpressionAssignment = &.{},
+    do_nothing: bool = false,
+};
+
+pub const LoweredMergeMutationPlan = struct {
+    target_table_name: []const u8,
+    source_table_name: []const u8,
+    match_fields: []const MergeFieldMapping = &.{},
+    matched_arms: []const MergeMatchedArm = &.{},
+    not_matched_arms: []const MergeNotMatchedArm = &.{},
+    returning: ReturningProjection = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.target_table_name);
+        alloc.free(self.source_table_name);
+        freeMergeFieldMappings(alloc, self.match_fields);
+        freeMergeMatchedArms(alloc, self.matched_arms);
+        freeMergeNotMatchedArms(alloc, self.not_matched_arms);
+        self.returning.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredWritePlan = union(enum) {
+    insert: LoweredInsert,
+    insert_source: LoweredInsertSource,
+    update: LoweredMutation,
+    delete: LoweredMutation,
+    update_source: LoweredMutationSource,
+    delete_source: LoweredMutationSource,
+    truncate_source: LoweredMutationSource,
+    update_joined_source: LoweredJoinedMutationSource,
+    delete_joined_source: LoweredJoinedMutationSource,
+    merge_mutation: LoweredMergeMutationPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .insert => |*insert| insert.deinit(alloc),
+            .insert_source => |*insert_source| insert_source.deinit(alloc),
+            .update => |*update| update.deinit(alloc),
+            .delete => |*delete| delete.deinit(alloc),
+            .update_source => |*update_source| update_source.deinit(alloc),
+            .delete_source => |*delete_source| delete_source.deinit(alloc),
+            .truncate_source => |*truncate_source| truncate_source.deinit(alloc),
+            .update_joined_source => |*update_joined_source| update_joined_source.deinit(alloc),
+            .delete_joined_source => |*delete_joined_source| delete_joined_source.deinit(alloc),
+            .merge_mutation => |*merge_mutation| merge_mutation.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const LoweredAggregate = struct {
     table_name: []const u8,
     aggregate: db_mod.types.RelationalRowsAggregateRequest,
@@ -243,6 +352,165 @@ pub const LoweredRelationPopulationPlan = struct {
     }
 };
 
+pub const ExplainFormat = ast.SqlExplainFormat;
+
+pub const LoweredExplainPlan = struct {
+    analyze: bool = false,
+    format: ExplainFormat = .text,
+    verbose: bool = false,
+    costs: bool = true,
+    subject: LoweredExplainSubject,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.subject.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredExplainSubject = union(enum) {
+    read: LoweredReadPlan,
+    write: LoweredWritePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .read => |*read| read.deinit(alloc),
+            .write => |*write| write.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
+}
+
+fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpression) void {
+    if (value.field.len > 0) alloc.free(value.field);
+    if (value.value_json.len > 0) alloc.free(value.value_json);
+    if (value.json_path.len > 0) alloc.free(value.json_path);
+    for (value.operands) |operand| freeExpression(alloc, operand);
+    if (value.operands.len > 0) alloc.free(value.operands);
+    for (value.case_branches) |branch| freeExpressionCaseBranch(alloc, branch);
+    if (value.case_branches.len > 0) alloc.free(value.case_branches);
+    for (value.case_else) |fallback| freeExpression(alloc, fallback);
+    if (value.case_else.len > 0) alloc.free(value.case_else);
+}
+
+fn freeExpressionCaseBranch(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCaseBranch) void {
+    freeExpressionCondition(alloc, value.when);
+    freeExpression(alloc, value.then);
+}
+
+fn freeExpressionCondition(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCondition) void {
+    freeExpression(alloc, value.lhs);
+    for (value.rhs) |rhs| freeExpression(alloc, rhs);
+    if (value.rhs.len > 0) alloc.free(value.rhs);
+}
+
+fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionCondition) void {
+    for (values) |value| freeExpressionCondition(alloc, value);
+}
+
+fn freeExpressionPredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionPredicateGroup) void {
+    freeExpressionConditions(alloc, value.conditions);
+    if (value.conditions.len > 0) alloc.free(value.conditions);
+}
+
+fn freeExpressionPredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
+    for (values) |group| freeExpressionPredicateGroup(alloc, group);
+}
+
+fn freeExpressionProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionProjection) void {
+    alloc.free(value.output);
+    freeExpression(alloc, value.expression);
+}
+
+fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionProjection) void {
+    for (values) |value| freeExpressionProjection(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeMergeFieldMappingValues(alloc: std.mem.Allocator, values: []const MergeFieldMapping) void {
+    for (values) |value| {
+        alloc.free(value.target_field);
+        alloc.free(value.source_field);
+    }
+}
+
+fn freeMergeFieldMappings(alloc: std.mem.Allocator, values: []const MergeFieldMapping) void {
+    freeMergeFieldMappingValues(alloc, values);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeMergeExpressionAssignmentValues(alloc: std.mem.Allocator, values: []const MergeExpressionAssignment) void {
+    for (values) |value| {
+        alloc.free(value.target_field);
+        freeExpression(alloc, value.expression);
+    }
+}
+
+fn freeMergeExpressionAssignments(alloc: std.mem.Allocator, values: []const MergeExpressionAssignment) void {
+    freeMergeExpressionAssignmentValues(alloc, values);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeMergeMatchedArmValue(alloc: std.mem.Allocator, value: MergeMatchedArm) void {
+    freeMergeArmPredicates(alloc, value.predicates);
+    freeExpressionConditions(alloc, value.expression_predicates);
+    if (value.expression_predicates.len > 0) alloc.free(value.expression_predicates);
+    freeExpressionPredicateGroups(alloc, value.expression_or_predicates);
+    if (value.expression_or_predicates.len > 0) alloc.free(value.expression_or_predicates);
+    freeExpressionPredicateGroups(alloc, value.expression_not_predicates);
+    if (value.expression_not_predicates.len > 0) alloc.free(value.expression_not_predicates);
+    freeMergeFieldMappings(alloc, value.update);
+    freeMergeExpressionAssignments(alloc, value.update_expressions);
+}
+
+pub fn freeMergeMatchedArmValues(alloc: std.mem.Allocator, values: []const MergeMatchedArm) void {
+    for (values) |value| freeMergeMatchedArmValue(alloc, value);
+}
+
+fn freeMergeMatchedArms(alloc: std.mem.Allocator, values: []const MergeMatchedArm) void {
+    freeMergeMatchedArmValues(alloc, values);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeMergeNotMatchedArmValue(alloc: std.mem.Allocator, value: MergeNotMatchedArm) void {
+    freeMergeArmPredicates(alloc, value.predicates);
+    freeExpressionConditions(alloc, value.expression_predicates);
+    if (value.expression_predicates.len > 0) alloc.free(value.expression_predicates);
+    freeExpressionPredicateGroups(alloc, value.expression_or_predicates);
+    if (value.expression_or_predicates.len > 0) alloc.free(value.expression_or_predicates);
+    freeExpressionPredicateGroups(alloc, value.expression_not_predicates);
+    if (value.expression_not_predicates.len > 0) alloc.free(value.expression_not_predicates);
+    freeMergeFieldMappings(alloc, value.insert);
+    freeMergeExpressionAssignments(alloc, value.insert_expressions);
+}
+
+pub fn freeMergeNotMatchedArmValues(alloc: std.mem.Allocator, values: []const MergeNotMatchedArm) void {
+    for (values) |value| freeMergeNotMatchedArmValue(alloc, value);
+}
+
+fn freeMergeNotMatchedArms(alloc: std.mem.Allocator, values: []const MergeNotMatchedArm) void {
+    freeMergeNotMatchedArmValues(alloc, values);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeMergeArmPredicateValues(alloc: std.mem.Allocator, values: []const MergeArmPredicate) void {
+    for (values) |value| freeMergeArmPredicateValue(alloc, value);
+}
+
+pub fn freeMergeArmPredicateValue(alloc: std.mem.Allocator, value: MergeArmPredicate) void {
+    alloc.free(value.field);
+    if (value.value_json) |json| alloc.free(json);
+}
+
+fn freeMergeArmPredicates(alloc: std.mem.Allocator, values: []const MergeArmPredicate) void {
+    freeMergeArmPredicateValues(alloc, values);
+    if (values.len > 0) alloc.free(values);
+}
+
 test "sql adapter lowered read plans own nested storage plan memory" {
     const alloc = std.testing.allocator;
 
@@ -280,4 +548,55 @@ test "sql adapter lowered write containers own nested request memory" {
         .mutation = .{ .req = .{ .kind = .delete } },
     };
     mutation_source.deinit(alloc);
+}
+
+test "sql adapter lowered merge and explain plans own nested memory" {
+    const alloc = std.testing.allocator;
+
+    var merge = LoweredWritePlan{
+        .merge_mutation = .{
+            .target_table_name = try alloc.dupe(u8, "target_records"),
+            .source_table_name = try alloc.dupe(u8, "source_records"),
+            .match_fields = try alloc.dupe(MergeFieldMapping, &[_]MergeFieldMapping{.{
+                .target_field = try alloc.dupe(u8, "id"),
+                .source_field = try alloc.dupe(u8, "id"),
+            }}),
+            .matched_arms = try alloc.dupe(MergeMatchedArm, &[_]MergeMatchedArm{.{
+                .update = try alloc.dupe(MergeFieldMapping, &[_]MergeFieldMapping{.{
+                    .target_field = try alloc.dupe(u8, "status"),
+                    .source_field = try alloc.dupe(u8, "status"),
+                }}),
+                .update_expressions = try alloc.dupe(MergeExpressionAssignment, &[_]MergeExpressionAssignment{.{
+                    .target_field = try alloc.dupe(u8, "amount"),
+                    .expression = .{
+                        .kind = .value,
+                        .value_json = try alloc.dupe(u8, "1"),
+                    },
+                }}),
+            }}),
+            .returning = .{
+                .fields = try alloc.dupe([]const u8, &[_][]const u8{try alloc.dupe(u8, "id")}),
+                .expressions = try alloc.dupe(db_mod.types.RelationalRowsExpressionProjection, &[_]db_mod.types.RelationalRowsExpressionProjection{.{
+                    .output = try alloc.dupe(u8, "one"),
+                    .expression = .{
+                        .kind = .value,
+                        .value_json = try alloc.dupe(u8, "1"),
+                    },
+                }}),
+            },
+        },
+    };
+    merge.deinit(alloc);
+
+    var explain = LoweredExplainPlan{
+        .subject = .{
+            .read = .{
+                .query = .{
+                    .table_name = try alloc.dupe(u8, "usage_records"),
+                    .plan = .{},
+                },
+            },
+        },
+    };
+    explain.deinit(alloc);
 }
