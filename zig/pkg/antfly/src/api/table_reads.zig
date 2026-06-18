@@ -5019,6 +5019,7 @@ pub const PinnedExternalObjectStorageLakeRowsSource = struct {
 
 pub const ExternalObjectStorageLakeRowsSourceOptions = struct {
     cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
+    serving_cache_max_bytes: ?usize = null,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
     file_bucket: []const u8 = "external-lake",
     object_uri_base: ?[]const u8 = null,
@@ -5060,6 +5061,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     alloc: std.mem.Allocator,
     inventory: external_source_api.Inventory,
     pinned_source: PinnedExternalObjectStorageLakeRowsSource,
+    owned_cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
 
     pub fn initExternalLakeAlloc(
         alloc: std.mem.Allocator,
@@ -5072,6 +5074,13 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
         const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
         const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        var source_options = options;
+        const owned_cache = try initOwnedServingCacheAlloc(alloc, source_options);
+        errdefer if (owned_cache) |cache| {
+            cache.deinit(alloc);
+            alloc.destroy(cache);
+        };
+        if (source_options.cache == null) source_options.cache = owned_cache;
 
         var inventory = switch (binding.format) {
             .parquet => try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
@@ -5080,18 +5089,18 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
                 .prefix = prefix,
                 .source_id = binding.table_id,
                 .source_uri = binding.source_uri,
-                .object_uri_base = options.object_uri_base,
+                .object_uri_base = source_options.object_uri_base,
                 .schema_fingerprint = binding.schema_fingerprint,
             }),
             .iceberg => blk: {
-                const metadata_uri = try icebergMetadataUriForOpenedStoreAlloc(alloc, client, bucket, prefix, binding.source_uri, options.object_uri_base);
+                const metadata_uri = try icebergMetadataUriForOpenedStoreAlloc(alloc, client, bucket, prefix, binding.source_uri, source_options.object_uri_base);
                 defer alloc.free(metadata_uri);
                 break :blk try serverless_query.readLakeIcebergSnapshotInventoryAlloc(alloc, .{
                     .client = client,
                     .source_id = binding.table_id,
                     .metadata_uri = metadata_uri,
                     .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
-                    .cache = options.cache,
+                    .cache = source_options.cache,
                 });
             },
             .lance => return error.UnsupportedRowsQuery,
@@ -5100,12 +5109,13 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         try serverless_query.validateLakeBindingInventory(binding, inventory);
 
         var pinned_source = PinnedExternalObjectStorageLakeRowsSource.init(inventory, client);
-        pinned_source.scanner.cache = options.cache;
-        pinned_source.scanner.coalesce_options = options.coalesce_options;
+        pinned_source.scanner.cache = source_options.cache;
+        pinned_source.scanner.coalesce_options = source_options.coalesce_options;
         return .{
             .alloc = alloc,
             .inventory = inventory,
             .pinned_source = pinned_source,
+            .owned_cache = owned_cache,
         };
     }
 
@@ -5133,8 +5143,24 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        if (self.owned_cache) |cache| {
+            cache.deinit(self.alloc);
+            self.alloc.destroy(cache);
+        }
         self.inventory.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    fn initOwnedServingCacheAlloc(
+        alloc: std.mem.Allocator,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !?*serverless_query.LakeParquetObjectRangeCache {
+        if (options.cache != null and options.serving_cache_max_bytes != null) return error.InvalidRowsRequest;
+        const max_bytes = options.serving_cache_max_bytes orelse return null;
+        if (max_bytes == 0) return error.InvalidRowsRequest;
+        const cache = try alloc.create(serverless_query.LakeParquetObjectRangeCache);
+        cache.* = serverless_query.initLakeParquetServingObjectRangeCache(max_bytes);
+        return cache;
     }
 
     fn icebergMetadataUriForOpenedStoreAlloc(
@@ -17509,6 +17535,73 @@ test "opened object storage lake source owns store and pins parquet prefix inven
     try std.testing.expectEqual(@as(u64, 0), pinned_state.row_count);
     try std.testing.expectEqual(@as(u64, "not-a-real-parquet-file".len * 2), pinned_state.byte_len);
     _ = opened_source.source();
+}
+
+test "opened object storage lake source can own serving object range cache" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put_a = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put_a.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{ .serving_cache_max_bytes = 1024 },
+    );
+    defer opened_source.deinit();
+
+    const owned_cache = opened_source.owned_source.owned_cache orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(owned_cache, opened_source.owned_source.pinned_source.scanner.cache.?);
+    try std.testing.expectEqual(@as(?usize, 1024), owned_cache.policy.max_total_bytes);
+    try std.testing.expect(owned_cache.policy.isProtected(.metadata));
+    try std.testing.expect(owned_cache.policy.isProtected(.serving_sidecar));
+    try std.testing.expectEqual(@as(?usize, 128), owned_cache.policy.laneLimit(.broad_scan_scratch));
+
+    var external_cache = serverless_query.initLakeParquetServingObjectRangeCache(2048);
+    defer external_cache.deinit(alloc);
+    const invalid_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+            alloc,
+            schema,
+            invalid_store,
+            .{
+                .cache = &external_cache,
+                .serving_cache_max_bytes = 1024,
+            },
+        ),
+    );
 }
 
 test "opened object storage lake source resolves iceberg table root inventory" {
