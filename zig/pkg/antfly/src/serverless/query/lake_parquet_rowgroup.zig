@@ -432,6 +432,7 @@ const SupportedColumnMode = union(enum) {
     i64: PlainI64Mode,
     i32: PlainI32Mode,
     f64: PlainF64Mode,
+    decimal: DecimalMode,
     bool: PlainBoolMode,
     bytes: ByteArrayMode,
 };
@@ -459,6 +460,18 @@ const PlainF64Mode = enum {
     float_optional,
     float_dictionary_required,
     float_dictionary_optional,
+};
+
+const DecimalPhysical = enum {
+    int32,
+    int64,
+};
+
+const DecimalMode = struct {
+    physical: DecimalPhysical,
+    nullable: bool = false,
+    dictionary: bool = false,
+    scale: i32 = 0,
 };
 
 const PlainBoolMode = enum {
@@ -652,6 +665,12 @@ fn buildPlainI64RowGroupBatchAlloc(
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
                 },
+            },
+            .decimal => |decimal_mode| {
+                var decoded = try scanDecimalAsF64ColumnChunkAlloc(alloc, input.bytes, compression, decimal_mode);
+                decoded_columns[idx] = .{ .f64 = decoded.values };
+                null_bitmaps[idx] = decoded.nulls;
+                decoded = undefined;
             },
             .bool => |bool_mode| switch (bool_mode) {
                 .required => {
@@ -1253,6 +1272,9 @@ fn timestampI64ModeForColumnChunk(chunk: external_source.ColumnChunk, unit: Time
 }
 
 fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !SupportedColumnMode {
+    if (std.ascii.eqlIgnoreCase(chunk.logical_type, "decimal")) {
+        return .{ .decimal = try decimalModeForColumnChunk(chunk) };
+    }
     if (chunk.physical_type.len == 0 or std.ascii.eqlIgnoreCase(chunk.physical_type, "int64")) {
         if (timestampUnitForLogicalType(chunk.logical_type)) |unit| {
             return .{ .i64 = try timestampI64ModeForColumnChunk(chunk, unit) };
@@ -1300,6 +1322,36 @@ fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !Suppor
     return error.UnsupportedParquetPage;
 }
 
+fn decimalModeForColumnChunk(chunk: external_source.ColumnChunk) !DecimalMode {
+    if (chunk.decimal_precision <= 0) return error.UnsupportedParquetPage;
+    if (chunk.decimal_scale < 0 or chunk.decimal_scale > chunk.decimal_precision) return error.UnsupportedParquetPage;
+    const physical: DecimalPhysical = if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32"))
+        .int32
+    else if (chunk.physical_type.len == 0 or std.ascii.eqlIgnoreCase(chunk.physical_type, "int64"))
+        .int64
+    else
+        return error.UnsupportedParquetPage;
+    if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) {
+        return .{
+            .physical = physical,
+            .nullable = chunk.nullable,
+            .dictionary = false,
+            .scale = chunk.decimal_scale,
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
+        std.ascii.eqlIgnoreCase(chunk.encoding, "plain_dictionary"))
+    {
+        return .{
+            .physical = physical,
+            .nullable = chunk.nullable,
+            .dictionary = true,
+            .scale = chunk.decimal_scale,
+        };
+    }
+    return error.UnsupportedParquetPage;
+}
+
 const TimestampUnit = enum {
     millis,
     micros,
@@ -1339,6 +1391,83 @@ fn scaleTimestampNsValues(values: []i64, scale_factor: i64) !void {
     for (values) |*value| {
         value.* = std.math.mul(i64, value.*, scale_factor) catch return error.InvalidParquetPage;
     }
+}
+
+fn scanDecimalAsF64ColumnChunkAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    compression: parquet_page.CompressionCodec,
+    mode: DecimalMode,
+) !parquet_page.NullableF64Values {
+    const unscaled = switch (mode.physical) {
+        .int32 => try scanDecimalInt32UnscaledAlloc(alloc, bytes, compression, mode),
+        .int64 => try scanDecimalInt64UnscaledAlloc(alloc, bytes, compression, mode),
+    };
+    errdefer {
+        alloc.free(unscaled.values);
+        if (unscaled.nulls.len > 0) alloc.free(unscaled.nulls);
+    }
+
+    const values = try alloc.alloc(f64, unscaled.values.len);
+    errdefer alloc.free(values);
+    const divisor = try decimalScaleDivisor(mode.scale);
+    for (unscaled.values, values) |value, *out| {
+        out.* = @as(f64, @floatFromInt(value)) / divisor;
+    }
+
+    alloc.free(unscaled.values);
+    return .{
+        .values = values,
+        .nulls = unscaled.nulls,
+    };
+}
+
+fn scanDecimalInt32UnscaledAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    compression: parquet_page.CompressionCodec,
+    mode: DecimalMode,
+) !parquet_page.NullableI64Values {
+    if (mode.dictionary) {
+        if (mode.nullable) return try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAlloc(alloc, bytes, compression);
+        return .{
+            .values = try parquet_page.scanDictionaryI32AsI64ColumnChunkAlloc(alloc, bytes, compression),
+            .nulls = &.{},
+        };
+    }
+    if (mode.nullable) return try parquet_page.scanOptionalPlainI32AsI64ColumnChunkAlloc(alloc, bytes, compression);
+    return .{
+        .values = try parquet_page.scanPlainI32AsI64ColumnChunkAlloc(alloc, bytes, compression),
+        .nulls = &.{},
+    };
+}
+
+fn scanDecimalInt64UnscaledAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    compression: parquet_page.CompressionCodec,
+    mode: DecimalMode,
+) !parquet_page.NullableI64Values {
+    if (mode.dictionary) {
+        if (mode.nullable) return try parquet_page.scanOptionalDictionaryI64ColumnChunkAlloc(alloc, bytes, compression);
+        return .{
+            .values = try parquet_page.scanDictionaryI64ColumnChunkAlloc(alloc, bytes, compression),
+            .nulls = &.{},
+        };
+    }
+    if (mode.nullable) return try parquet_page.scanOptionalPlainI64ColumnChunkAlloc(alloc, bytes, compression);
+    return .{
+        .values = try parquet_page.scanPlainI64ColumnChunkAlloc(alloc, bytes, compression),
+        .nulls = &.{},
+    };
+}
+
+fn decimalScaleDivisor(scale: i32) !f64 {
+    if (scale < 0) return error.UnsupportedParquetPage;
+    var divisor: f64 = 1;
+    const scale_count: usize = @intCast(scale);
+    for (0..scale_count) |_| divisor *= 10;
+    return divisor;
 }
 
 fn compressionCodecForColumnChunk(chunk: external_source.ColumnChunk) !parquet_page.CompressionCodec {
@@ -3366,6 +3495,99 @@ test "parquet row group batch dispatches logical int64 timestamp columns from in
     try std.testing.expectEqualSlices(i64, &[_]i64{ 6, 7, 7 }, owned.batch.columns[2].values.i64);
 
     var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "created_ms", "processed_us", "event_ns" });
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
+}
+
+test "parquet row group batch dispatches decimal columns from inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2048,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 3,
+            .file_offset = 100,
+            .total_byte_len = 288,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "price"),
+                    .file_offset = 100,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int32"),
+                    .logical_type = try alloc.dupe(u8, "decimal"),
+                    .decimal_precision = 9,
+                    .decimal_scale = 2,
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "discount"),
+                    .file_offset = 196,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int64"),
+                    .logical_type = try alloc.dupe(u8, "decimal"),
+                    .decimal_precision = 12,
+                    .decimal_scale = 3,
+                    .nullable = true,
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "tax"),
+                    .file_offset = 292,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
+                    .physical_type = try alloc.dupe(u8, "int64"),
+                    .logical_type = try alloc.dupe(u8, "decimal"),
+                    .decimal_precision = 9,
+                    .decimal_scale = 2,
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    var price_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer price_chunk.deinit(alloc);
+    try appendPlainI32DataPage(&price_chunk, alloc, &[_]i32{ 1234, -250, 0 });
+
+    var discount_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer discount_chunk.deinit(alloc);
+    try appendOptionalPlainI64DataPageV2(&discount_chunk, alloc, &[_]?i64{ 1250, null, -500 });
+
+    var tax_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer tax_chunk.deinit(alloc);
+    try appendPlainI64DictionaryPage(&tax_chunk, alloc, &[_]i64{ 75, 125 });
+    try appendDictionaryI64DataPage(&tax_chunk, alloc, 3, 1, &[_]u8{ 3, 0b00000110 });
+
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{ .column_id = "price", .bytes = price_chunk.items },
+        .{ .column_id = "discount", .bytes = discount_chunk.items },
+        .{ .column_id = "tax", .bytes = tax_chunk.items },
+    });
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 12.34, -2.5, 0 }, owned.batch.columns[0].values.f64);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 1.25, 0, -0.5 }, owned.batch.columns[1].values.f64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[1].nulls.bytes);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 0.75, 1.25, 1.25 }, owned.batch.columns[2].values.f64);
+
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "price", "discount", "tax" });
     defer plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
 }

@@ -1190,6 +1190,17 @@ test "parquet metadata parser derives logical timestamp columns from schema anno
     try std.testing.expectEqualStrings("timestamp_nanos", logical_footer.row_groups[0].column_chunks[0].logical_type);
 }
 
+test "parquet metadata parser derives decimal columns from schema annotations" {
+    const alloc = std.testing.allocator;
+    var bytes = try buildSingleColumnDecimalConvertedTypeMetadataFixture(alloc);
+    defer bytes.deinit(alloc);
+    var footer = try parseFooterMetadataAlloc(alloc, bytes.items, 1024);
+    defer footer.deinit(alloc);
+    try std.testing.expectEqualStrings("decimal", footer.row_groups[0].column_chunks[0].logical_type);
+    try std.testing.expectEqual(@as(i32, 9), footer.row_groups[0].column_chunks[0].decimal_precision);
+    try std.testing.expectEqual(@as(i32, 2), footer.row_groups[0].column_chunks[0].decimal_scale);
+}
+
 test "parquet metadata parser rejects inconsistent row counts and ranges" {
     const alloc = std.testing.allocator;
     var bytes = try buildSingleColumnMetadataFixture(alloc);
@@ -1454,6 +1465,10 @@ fn buildSingleColumnTimestampConvertedTypeMetadataFixture(alloc: Allocator, conv
     return try buildSingleColumnTimestampMetadataFixture(alloc, converted_type, false);
 }
 
+fn buildSingleColumnDecimalConvertedTypeMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
+    return try buildSingleColumnTimestampMetadataFixture(alloc, 5, false);
+}
+
 fn buildSingleColumnTimestampLogicalTypeMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
     return try buildSingleColumnTimestampMetadataFixture(alloc, null, true);
 }
@@ -1485,6 +1500,12 @@ fn buildSingleColumnTimestampMetadataFixture(alloc: Allocator, converted_type: ?
     if (converted_type) |value| {
         try appendField(&out, alloc, &leaf_prev, 6, .i32);
         try appendI32(&out, alloc, value);
+        if (value == 5) {
+            try appendField(&out, alloc, &leaf_prev, 7, .i32);
+            try appendI32(&out, alloc, 2);
+            try appendField(&out, alloc, &leaf_prev, 8, .i32);
+            try appendI32(&out, alloc, 9);
+        }
     }
     if (logical_nanos) {
         try appendField(&out, alloc, &leaf_prev, 10, .struct_);
