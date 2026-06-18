@@ -1508,6 +1508,24 @@ func TestValidateHAGateResponses(t *testing.T) {
 	if err := ValidateHAWriteCheckResponse(promotedWrite); err != nil {
 		t.Fatalf("ValidateHAWriteCheckResponse promoted returned error: %v", err)
 	}
+	fencedWrite := HAWriteCheckResponse{
+		SchemaVersion: 1,
+		Decision: HAWriteDecision{
+			Action:     HAWriteDecisionActionRejectFencedPrimary,
+			Role:       HAWriteDecisionRoleFencedPrimary,
+			Identity:   identity,
+			DurableLsn: 9,
+			NextLsn:    10,
+		},
+	}
+	if err := ValidateHAWriteCheckResponse(fencedWrite); err != nil {
+		t.Fatalf("ValidateHAWriteCheckResponse fenced primary returned error: %v", err)
+	}
+	badFencedWrite := fencedWrite
+	badFencedWrite.Decision.Action = HAWriteDecisionActionAllowWrite
+	if err := ValidateHAWriteCheckResponse(badFencedWrite); err == nil || !strings.Contains(err.Error(), "fenced_primary role action") {
+		t.Fatalf("invalid fenced write action error = %v, want fenced_primary role action error", err)
+	}
 	badWriteHandoff := promotedWrite
 	badWriteHandoff.Decision.PromotionHandoff.Identity.Epoch = 6
 	if err := ValidateHAWriteCheckResponse(badWriteHandoff); err == nil || !strings.Contains(err.Error(), "promotion_handoff identity") {

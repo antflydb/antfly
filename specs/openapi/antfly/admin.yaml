@@ -1900,10 +1900,10 @@ components:
       properties:
         role:
           type: string
-          enum: [primary, standby, promoted_standby]
+          enum: [primary, standby, promoted_standby, fenced_primary]
         action:
           type: string
-          enum: [allow_write, reject_read_only_standby, open_promoted_primary]
+          enum: [allow_write, reject_read_only_standby, open_promoted_primary, reject_fenced_primary]
         identity:
           $ref: "#/components/schemas/HAIdentity"
         durable_lsn:

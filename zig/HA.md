@@ -498,7 +498,9 @@ Recommended split:
   of duplicating an HTTP client, hard-coding paths, importing generated `oapi`
   internals directly, or parsing CLI output. The wrapper is the compatibility
   boundary for Go control-plane code; generated `oapi` symbols are a transport
-  detail hidden inside the SDK package.
+  detail hidden inside the SDK package. This keeps operator behavior, SDK
+  consumers, and OpenAPI compatibility checks on one reviewed contract instead
+  of creating a second admin API surface inside `go/pkg/operator`.
 
 Admin authentication should be explicit but operationally simple. The Antfly
 runtime may be started with `--ha-admin-token-env <name>`; when set, the Zig

@@ -659,10 +659,19 @@ pub const ProvisionedTableWriteCache = struct {
         return switch (a.?) {
             .primary => |left| switch (b.?) {
                 .primary => |right| left == right,
+                .fenced_primary => false,
+                .standby => false,
+            },
+            .fenced_primary => |left| switch (b.?) {
+                .primary => false,
+                .fenced_primary => |right| left.primary == right.primary and
+                    left.fence_store == right.fence_store and
+                    std.mem.eql(u8, left.node_id, right.node_id),
                 .standby => false,
             },
             .standby => |left| switch (b.?) {
                 .primary => false,
+                .fenced_primary => false,
                 .standby => |right| left == right,
             },
         };
@@ -7630,12 +7639,14 @@ fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
     const configured = gate orelse return;
     const decision = switch (configured) {
         .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+        .fenced_primary => |gate_value| try ha_write_gate_mod.evaluateFencedPrimary(gate_value, .{}),
         .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
     };
     switch (decision.action) {
         .allow_write => return,
         .reject_read_only_standby => return error.HAReadOnlyStandby,
         .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+        .reject_fenced_primary => return error.HAFencedPrimary,
     }
 }
 

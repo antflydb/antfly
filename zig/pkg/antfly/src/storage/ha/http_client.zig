@@ -932,13 +932,15 @@ fn isReadConsistency(value: []const u8) bool {
 fn isWriteRole(value: []const u8) bool {
     return std.mem.eql(u8, value, "primary") or
         std.mem.eql(u8, value, "standby") or
-        std.mem.eql(u8, value, "promoted_standby");
+        std.mem.eql(u8, value, "promoted_standby") or
+        std.mem.eql(u8, value, "fenced_primary");
 }
 
 fn isWriteAction(value: []const u8) bool {
     return std.mem.eql(u8, value, "allow_write") or
         std.mem.eql(u8, value, "reject_read_only_standby") or
-        std.mem.eql(u8, value, "open_promoted_primary");
+        std.mem.eql(u8, value, "open_promoted_primary") or
+        std.mem.eql(u8, value, "reject_fenced_primary");
 }
 
 fn isOwnerJobKind(value: []const u8) bool {
@@ -949,7 +951,9 @@ fn isOwnerJobKind(value: []const u8) bool {
 }
 
 fn isOwnerJobRole(value: []const u8) bool {
-    return isWriteRole(value);
+    return std.mem.eql(u8, value, "primary") or
+        std.mem.eql(u8, value, "standby") or
+        std.mem.eql(u8, value, "promoted_standby");
 }
 
 fn isOwnerJobAction(value: []const u8) bool {

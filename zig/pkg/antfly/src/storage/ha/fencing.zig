@@ -149,6 +149,11 @@ pub const Store = struct {
         return cloned.receipt;
     }
 
+    pub fn currentBorrowed(self: *const Store) ?Receipt {
+        const current_receipt = self.current_receipt orelse return null;
+        return current_receipt.receipt;
+    }
+
     pub fn acquirePromotionFence(self: *Store, request: FenceRequest) !Receipt {
         try validateFenceRequest(request);
         if (request.observed_lsn < request.required_lsn and !request.force) return error.FenceRequiresForce;

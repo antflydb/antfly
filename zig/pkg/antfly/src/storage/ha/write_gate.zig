@@ -20,6 +20,7 @@
 //! instead of writing through the standby receive/apply object.
 
 const std = @import("std");
+const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
@@ -30,12 +31,14 @@ pub const Role = enum {
     primary,
     standby,
     promoted_standby,
+    fenced_primary,
 };
 
 pub const Action = enum {
     allow_write,
     reject_read_only_standby,
     open_promoted_primary,
+    reject_fenced_primary,
 };
 
 pub const Request = struct {
@@ -55,6 +58,12 @@ pub const Decision = struct {
     }
 };
 
+pub const FencedPrimary = struct {
+    primary: *const primary_mod.Primary,
+    fence_store: *const fencing.Store,
+    node_id: []const u8,
+};
+
 pub fn evaluatePrimary(primary: *const primary_mod.Primary, request: Request) !Decision {
     if (request.expected_identity) |expected| try validateIdentity(primary.identity, expected);
     return .{
@@ -64,6 +73,34 @@ pub fn evaluatePrimary(primary: *const primary_mod.Primary, request: Request) !D
         .durable_lsn = primary.lastLsn(),
         .next_lsn = primary.nextLsn(),
     };
+}
+
+pub fn evaluateFencedPrimary(gate: FencedPrimary, request: Request) !Decision {
+    const primary = gate.primary;
+    if (request.expected_identity) |expected| try validateIdentity(primary.identity, expected);
+    if (gate.fence_store.currentBorrowed()) |receipt| {
+        if (primaryFencedByReceipt(primary.identity, gate.node_id, receipt)) {
+            return .{
+                .role = .fenced_primary,
+                .action = .reject_fenced_primary,
+                .identity = primary.identity,
+                .durable_lsn = primary.lastLsn(),
+                .next_lsn = primary.nextLsn(),
+            };
+        }
+    }
+    return try evaluatePrimary(primary, request);
+}
+
+pub fn primaryFencedByReceipt(identity: standby_mod.Identity, node_id: []const u8, receipt: fencing.Receipt) bool {
+    return identity.cluster_id == receipt.identity.cluster_id and
+        identity.shard_id == receipt.identity.shard_id and
+        identity.table_id == receipt.identity.table_id and
+        identity.timeline_id == receipt.parent_timeline_id and
+        identity.epoch == receipt.parent_epoch and
+        receipt.new_timeline_id > identity.timeline_id and
+        receipt.new_epoch > identity.epoch and
+        std.mem.eql(u8, node_id, receipt.old_primary_id);
 }
 
 pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decision {
@@ -190,6 +227,50 @@ test "storage.ha write gate allows current primary writes" {
     var wrong = identity;
     wrong.timeline_id = 2;
     try std.testing.expectError(error.WrongTimeline, evaluatePrimary(&primary, .{ .expected_identity = wrong }));
+}
+
+test "storage.ha write gate rejects primary writes after matching promotion fence" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "fenced-primary");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+
+    var fence_store = try fencing.Store.open(alloc, paths.progress.ptr, .{});
+    defer fence_store.close();
+    const receipt = try fence_store.acquirePromotionFence(.{
+        .identity = identity,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "write-gate-test",
+    });
+    defer fencing.freeReceipt(alloc, receipt);
+
+    const decision = try evaluateFencedPrimary(.{
+        .primary = &primary,
+        .fence_store = &fence_store,
+        .node_id = "primary-a",
+    }, .{ .expected_identity = identity });
+    try std.testing.expect(!decision.canWrite());
+    try std.testing.expectEqual(Role.fenced_primary, decision.role);
+    try std.testing.expectEqual(Action.reject_fenced_primary, decision.action);
+    try std.testing.expectEqual(@as(u64, 1), decision.durable_lsn);
+    try std.testing.expectEqual(@as(u64, 2), decision.next_lsn);
+
+    const wrong_node = try evaluateFencedPrimary(.{
+        .primary = &primary,
+        .fence_store = &fence_store,
+        .node_id = "other-primary",
+    }, .{});
+    try std.testing.expect(wrong_node.canWrite());
+    try std.testing.expectEqual(Role.primary, wrong_node.role);
 }
 
 test "storage.ha write gate rejects standby until promotion handoff is opened" {

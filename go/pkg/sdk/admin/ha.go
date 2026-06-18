@@ -209,8 +209,10 @@ const (
 
 	HAWriteDecisionActionAllowWrite          = oapi.HAWriteDecisionActionAllowWrite
 	HAWriteDecisionActionOpenPromotedPrimary = oapi.HAWriteDecisionActionOpenPromotedPrimary
+	HAWriteDecisionActionRejectFencedPrimary = oapi.HAWriteDecisionActionRejectFencedPrimary
 	HAWriteDecisionActionRejectReadOnly      = oapi.HAWriteDecisionActionRejectReadOnlyStandby
 
+	HAWriteDecisionRoleFencedPrimary   = oapi.HAWriteDecisionRoleFencedPrimary
 	HAWriteDecisionRolePrimary         = oapi.HAWriteDecisionRolePrimary
 	HAWriteDecisionRolePromotedStandby = oapi.HAWriteDecisionRolePromotedStandby
 	HAWriteDecisionRoleStandby         = oapi.HAWriteDecisionRoleStandby
@@ -1578,13 +1580,20 @@ func validateHAWriteDecision(decision HAWriteDecision) error {
 			return fmt.Errorf("write decision inconsistent: promoted_standby role action=%q", decision.Action)
 		}
 		promoted = true
+	case HAWriteDecisionRoleFencedPrimary:
+		if decision.Action != HAWriteDecisionActionRejectFencedPrimary {
+			return fmt.Errorf("write decision inconsistent: fenced_primary role action=%q", decision.Action)
+		}
 	}
 	return validateHAPromotionHandoffForGate("write decision", promoted, decision.Identity, decision.DurableLsn, decision.NextLsn, decision.PromotionHandoff)
 }
 
 func HAWriteDecisionRoleValid(role HAWriteDecisionRole) bool {
 	switch role {
-	case HAWriteDecisionRolePrimary, HAWriteDecisionRoleStandby, HAWriteDecisionRolePromotedStandby:
+	case HAWriteDecisionRolePrimary,
+		HAWriteDecisionRoleStandby,
+		HAWriteDecisionRolePromotedStandby,
+		HAWriteDecisionRoleFencedPrimary:
 		return true
 	default:
 		return false
@@ -1595,7 +1604,8 @@ func HAWriteDecisionActionValid(action HAWriteDecisionAction) bool {
 	switch action {
 	case HAWriteDecisionActionAllowWrite,
 		HAWriteDecisionActionRejectReadOnly,
-		HAWriteDecisionActionOpenPromotedPrimary:
+		HAWriteDecisionActionOpenPromotedPrimary,
+		HAWriteDecisionActionRejectFencedPrimary:
 		return true
 	default:
 		return false

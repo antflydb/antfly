@@ -1079,9 +1079,23 @@ fn executeOperatorPlan(
 
 fn executeWriteCheck(ctx: Context, command: admin_cli.WriteCheckCommand) !write_gate.Decision {
     return switch (command.role) {
-        .primary => try admin.evaluatePrimaryWrite(try requirePrimary(ctx), command.request),
+        .primary => try evaluatePrimaryWriteWithContext(ctx, command.request),
         .standby => try admin.evaluateStandbyWrite(try requireStandby(ctx), command.request),
     };
+}
+
+fn evaluatePrimaryWriteWithContext(ctx: Context, request: write_gate.Request) !write_gate.Decision {
+    const primary = try requirePrimary(ctx);
+    if (ctx.fence_store) |fence_store| {
+        if (ctx.primary_node_id) |node_id| {
+            return try write_gate.evaluateFencedPrimary(.{
+                .primary = primary,
+                .fence_store = fence_store,
+                .node_id = node_id,
+            }, request);
+        }
+    }
+    return try admin.evaluatePrimaryWrite(primary, request);
 }
 
 fn executeOwnerJobCheck(ctx: Context, command: admin_cli.OwnerJobCheckCommand) !owner_job_gate.Decision {

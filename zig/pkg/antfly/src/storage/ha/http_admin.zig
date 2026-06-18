@@ -468,7 +468,18 @@ pub const Server = struct {
         const decision = switch (request.role) {
             .primary => blk: {
                 const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
-                break :blk ha_admin.evaluatePrimaryWrite(primary, request.request) catch |err| {
+                const decision = if (self.ctx.fence_store) |fence_store|
+                    if (self.ctx.primary_node_id) |node_id|
+                        write_gate.evaluateFencedPrimary(.{
+                            .primary = primary,
+                            .fence_store = fence_store,
+                            .node_id = node_id,
+                        }, request.request)
+                    else
+                        ha_admin.evaluatePrimaryWrite(primary, request.request)
+                else
+                    ha_admin.evaluatePrimaryWrite(primary, request.request);
+                break :blk decision catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
             },

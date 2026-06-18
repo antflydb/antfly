@@ -2212,7 +2212,18 @@ pub const DataServer = struct {
     fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby) |standby| return .{ .standby = standby };
-        if (ctx.primary) |primary| return .{ .primary = primary };
+        if (ctx.primary) |primary| {
+            if (ctx.fence_store) |fence_store| {
+                if (ctx.primary_node_id) |node_id| {
+                    return .{ .fenced_primary = .{
+                        .primary = primary,
+                        .fence_store = fence_store,
+                        .node_id = node_id,
+                    } };
+                }
+            }
+            return .{ .primary = primary };
+        }
         return null;
     }
 
@@ -2251,6 +2262,13 @@ pub const DataServer = struct {
     ) bool {
         const ctx = self.ha_cfg.admin_context orelse return true;
         if (ctx.primary) |primary| {
+            if (ctx.fence_store) |fence_store| {
+                if (ctx.primary_node_id) |node_id| {
+                    if (fence_store.currentBorrowed()) |receipt| {
+                        if (antfly.ha.write_gate.primaryFencedByReceipt(primary.identity, node_id, receipt)) return false;
+                    }
+                }
+            }
             const decision = antfly.ha.owner_job_gate.evaluatePrimary(primary, .{ .kind = kind }) catch return false;
             return decision.canRun();
         }
@@ -14120,13 +14138,13 @@ test "data server propagates standby HA write gate into provisioned write source
     const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     switch (source_gate) {
         .standby => |handle| try std.testing.expect(handle == &standby),
-        .primary => return error.TestExpectedEqual,
+        .fenced_primary, .primary => return error.TestExpectedEqual,
     }
 
     const cache_gate = server.provisioned_storage.write_cache.ha_write_gate orelse return error.TestExpectedEqual;
     switch (cache_gate) {
         .standby => |handle| try std.testing.expect(handle == &standby),
-        .primary => return error.TestExpectedEqual,
+        .fenced_primary, .primary => return error.TestExpectedEqual,
     }
 
     const read_gate = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
@@ -14159,6 +14177,136 @@ test "data server propagates standby HA write gate into provisioned write source
     try server.runLsmMaintenanceForegroundRound();
     try server.requestLsmMaintenanceBackground();
     try std.testing.expect(server.lsm_maintenance_thread == null);
+}
+
+test "storage.ha data server rejects writes and owner jobs after primary promotion fence" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+    const fence_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-fence-{d}", .{nonce});
+    defer alloc.free(fence_raw);
+    const fence_path = try alloc.dupeZ(u8, fence_raw);
+    defer alloc.free(fence_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_path) catch {};
+
+    const identity = antfly.ha.primary.Identity{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "before-fence" });
+
+    var fence_store = try antfly.ha.fencing.Store.open(alloc, fence_path.ptr, .{});
+    defer fence_store.close();
+    const receipt = try fence_store.acquirePromotionFence(.{
+        .identity = identity,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "data-server-test",
+    });
+    defer antfly.ha.fencing.freeReceipt(alloc, receipt);
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = ".",
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+                .fence_store = &fence_store,
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (source_gate) {
+        .fenced_primary => |gate| {
+            try std.testing.expect(gate.primary == &primary);
+            try std.testing.expect(gate.fence_store == &fence_store);
+            try std.testing.expectEqualStrings("primary-a", gate.node_id);
+        },
+        .primary, .standby => return error.TestExpectedEqual,
+    }
+
+    try std.testing.expectError(error.HAFencedPrimary, server.write_source.source().batchGroupLocal(alloc, 10, "docs", .{
+        .writes = &.{.{ .key = "doc:local", .value = "{\"title\":\"local-write\"}" }},
+        .timestamp_ns = 1,
+        .sync_level = .write,
+    }));
+    try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
 }
 
 test "data server applies routed HA replication records through standby write gate" {

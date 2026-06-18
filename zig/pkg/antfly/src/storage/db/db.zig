@@ -46,6 +46,7 @@ const apply_state = @import("derived/apply_state.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
+const ha_fencing_mod = @import("../ha/fencing.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const ha_session_mod = @import("../ha/session.zig");
@@ -343,6 +344,7 @@ pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
 
 pub const HAWriteGate = union(enum) {
     primary: *ha_primary_mod.Primary,
+    fenced_primary: ha_write_gate_mod.FencedPrimary,
     standby: *ha_standby_mod.Standby,
 };
 
@@ -350,6 +352,7 @@ fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
     const configured = gate orelse return false;
     return switch (configured) {
         .primary => false,
+        .fenced_primary => false,
         .standby => true,
     };
 }
@@ -18460,12 +18463,14 @@ fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
     const configured = gate orelse return;
     const decision = switch (configured) {
         .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+        .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
         .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
     };
     switch (decision.action) {
         .allow_write => return,
         .reject_read_only_standby => return error.HAReadOnlyStandby,
         .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+        .reject_fenced_primary => return error.HAFencedPrimary,
     }
 }
 
@@ -38126,6 +38131,71 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     var found = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
+}
+
+test "storage.ha db write gate rejects fenced former primary writes" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var primary_log_path_buf: [256]u8 = undefined;
+    const primary_log_path = tempPath(&primary_log_path_buf);
+    defer cleanupTempDir(primary_log_path);
+    var primary_slots_path_buf: [256]u8 = undefined;
+    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    defer cleanupTempDir(primary_slots_path);
+    var fence_path_buf: [256]u8 = undefined;
+    const fence_path = tempPath(&fence_path_buf);
+    defer cleanupTempDir(fence_path);
+
+    const identity = ha_primary_mod.Identity{
+        .cluster_id = 301,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "before-fence" });
+
+    var fence_store = try ha_fencing_mod.Store.open(alloc, fence_path, .{});
+    defer fence_store.close();
+    const receipt = try fence_store.acquirePromotionFence(.{
+        .identity = identity,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "db-write-gate-test",
+    });
+    defer ha_fencing_mod.freeReceipt(alloc, receipt);
+
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_write_gate = .{ .fenced_primary = .{
+            .primary = &primary,
+            .fence_store = &fence_store,
+            .node_id = "primary-a",
+        } },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.HAFencedPrimary, db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"blocked\"}" }},
+    }));
+
+    const gate = db.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (gate) {
+        .fenced_primary => |fenced| {
+            const decision = try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{});
+            try std.testing.expectEqual(ha_write_gate_mod.Action.reject_fenced_primary, decision.action);
+        },
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "storage.ha db standby role suppresses mutating background runtimes" {

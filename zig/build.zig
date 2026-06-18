@@ -2883,6 +2883,7 @@ pub fn build(b: *std.Build) void {
         "data server mirrors managed primary writes into HA replication log",
         "data server fail-closed sync policy rejects primary writes before local commit",
         "data server propagates standby HA write gate into provisioned write sources",
+        "storage.ha data server rejects writes and owner jobs after primary promotion fence",
         "data server applies routed HA replication records through standby write gate",
         "data server pulls and applies HA standby replication through internal HTTP client",
     };
