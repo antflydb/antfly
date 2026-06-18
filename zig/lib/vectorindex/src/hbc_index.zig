@@ -6761,8 +6761,6 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
     defer self.alloc.free(dense_vectors);
     const points = try self.alloc.alloc(kmeans.Point, leaf.members.len);
     defer self.alloc.free(points);
-    const inputs = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, leaf.members.len);
-    defer self.alloc.free(inputs);
     const scratch_len = try std.math.mul(usize, dims, 2);
     var stack_scratch: [4096]f32 = undefined;
     const use_stack_scratch = scratch_len <= stack_scratch.len;
@@ -6802,12 +6800,6 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
             .stable_id = member_id,
             .vector = vector_slot,
             .weight = 1,
-        };
-        inputs[i] = .{
-            .vector_id = member_id,
-            .vector = vector_slot,
-            .transformed = vector_slot,
-            .metadata = "",
         };
     }
     self.write_profile.split_leaf_vector_load_ns += elapsed_fn(vector_load_start);
@@ -6875,11 +6867,11 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
             defer self.alloc.free(group_vectors);
 
             for (0..group_size) |i| {
-                const input = inputs[entries[entry_cursor + i].point_index];
-                members[i] = input.vector_id;
-                vec.add(centroid, input.transformed);
-                @memcpy(group_vectors[i * dims ..][0..dims], input.transformed);
-                try self.putVecLeaf(txn, input.vector_id, node_id);
+                const point = points[entries[entry_cursor + i].point_index];
+                members[i] = point.stable_id;
+                vec.add(centroid, point.vector);
+                @memcpy(group_vectors[i * dims ..][0..dims], point.vector);
+                try self.putVecLeaf(txn, point.stable_id, node_id);
             }
             vec.scale(1.0 / @as(f32, @floatFromInt(group_size)), centroid);
             normalizeCentroidForMetric(self, centroid);
@@ -6912,7 +6904,7 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
         const centroid = try self.alloc.alloc(f32, dims);
         errdefer self.alloc.free(centroid);
         @memset(centroid, 0);
-        for (inputs) |input| vec.add(centroid, input.transformed);
+        for (points) |point| vec.add(centroid, point.vector);
         vec.scale(1.0 / @as(f32, @floatFromInt(leaf.members.len)), centroid);
         normalizeCentroidForMetric(self, centroid);
 
