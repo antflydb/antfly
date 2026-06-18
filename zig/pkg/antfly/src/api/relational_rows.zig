@@ -3071,12 +3071,16 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
         if (output_type == .embedding) return error.UnsupportedRowsQuery;
     }
     for (request.order_by) |order| {
-        if (order.expression != null) return error.UnsupportedRowsQuery;
-        if (order.field.len == 0) return error.InvalidRowsRequest;
-        const column = findRelationalColumn(schema.relational_columns, order.field) orelse return error.InvalidRowsRequest;
-        switch (column.field_type) {
-            .embedding => return error.UnsupportedRowsQuery,
-            else => {},
+        if (order.expression) |expression| {
+            const output_type = try rowsExpressionOutputType(alloc, schema, expression);
+            if (output_type == .embedding) return error.UnsupportedRowsQuery;
+        } else {
+            if (order.field.len == 0) return error.InvalidRowsRequest;
+            const column = findRelationalColumn(schema.relational_columns, order.field) orelse return error.InvalidRowsRequest;
+            switch (column.field_type) {
+                .embedding => return error.UnsupportedRowsQuery,
+                else => {},
+            }
         }
     }
 
@@ -3128,26 +3132,51 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
     }
     defer if (owns_filtered_rows) alloc.free(filtered_rows);
 
-    var ordered_rows = filtered_rows;
-    if (request.order_by.len > 0) {
-        std.sort.pdq(lake_rows.ProjectedRow, ordered_rows, LakeRowsQuerySortContext{ .order_by = request.order_by }, lakeProjectedRowLessThan);
-    }
-
-    const limited_len: usize = if (request.limit) |limit|
-        @min(@as(usize, limit), ordered_rows.len)
-    else
-        ordered_rows.len;
-
     var rows = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (rows.items) |row| alloc.free(@constCast(row));
         rows.deinit(alloc);
     }
 
-    try rows.ensureUnusedCapacity(alloc, limited_len);
-    for (ordered_rows[0..limited_len]) |row| {
-        const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, row);
-        rows.appendAssumeCapacity(encoded);
+    if (request.order_by.len > 0) {
+        var ordered = std.ArrayListUnmanaged(LakeRowsQueryOrderCandidate).empty;
+        defer {
+            for (ordered.items) |candidate| freeQueryOrderKeySlice(alloc, candidate.order_keys);
+            ordered.deinit(alloc);
+        }
+        try ordered.ensureUnusedCapacity(alloc, filtered_rows.len);
+        for (filtered_rows, 0..) |row, ordinal| {
+            const keys = try lakeRowsQueryOrderKeysAlloc(alloc, row, request.order_by);
+            var keys_transferred = false;
+            errdefer if (!keys_transferred) freeQueryOrderKeySlice(alloc, keys);
+            ordered.appendAssumeCapacity(.{
+                .row = row,
+                .order_keys = keys,
+                .ordinal = ordinal,
+            });
+            keys_transferred = true;
+        }
+        std.sort.pdq(LakeRowsQueryOrderCandidate, ordered.items, QuerySortContext{ .order_by = request.order_by }, lakeRowsQueryOrderCandidateLessThan);
+
+        const limited_len: usize = if (request.limit) |limit|
+            @min(@as(usize, limit), ordered.items.len)
+        else
+            ordered.items.len;
+        try rows.ensureUnusedCapacity(alloc, limited_len);
+        for (ordered.items[0..limited_len]) |candidate| {
+            const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, candidate.row);
+            rows.appendAssumeCapacity(encoded);
+        }
+    } else {
+        const limited_len: usize = if (request.limit) |limit|
+            @min(@as(usize, limit), filtered_rows.len)
+        else
+            filtered_rows.len;
+        try rows.ensureUnusedCapacity(alloc, limited_len);
+        for (filtered_rows[0..limited_len]) |row| {
+            const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, row);
+            rows.appendAssumeCapacity(encoded);
+        }
     }
 
     return .{
@@ -3352,8 +3381,12 @@ fn lakeRowsProjectedColumnsAlloc(
         try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
     }
     for (request.order_by) |order| {
-        const column = findRelationalColumn(schema.relational_columns, order.field) orelse return error.InvalidRowsRequest;
-        try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
+        if (order.expression) |expression| {
+            try appendLakeRowsExpressionProjectedColumnsAlloc(alloc, &columns, expression);
+        } else {
+            const column = findRelationalColumn(schema.relational_columns, order.field) orelse return error.InvalidRowsRequest;
+            try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
+        }
     }
     if (lakeRowsQueryHasResidualPredicates(request)) {
         for (request.predicates) |predicate| {
@@ -3900,28 +3933,27 @@ fn writeLakeRowsExpressionProjectionValueJsonAlloc(
     row: lake_rows.ProjectedRow,
     expression: db_mod.types.RelationalRowsExpression,
 ) !void {
+    const value_json = try lakeRowsExpressionValueJsonAlloc(alloc, row, expression);
+    defer alloc.free(value_json);
+    try writer.writeAll(value_json);
+}
+
+fn lakeRowsExpressionValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    expression: db_mod.types.RelationalRowsExpression,
+) ![]u8 {
     switch (try lakeRowsTypedNumericExpressionAlloc(alloc, row, expression)) {
         .unsupported => {},
-        .null => {
-            try writer.writeAll("null");
-            return;
-        },
-        .i64 => |number| {
-            try writer.print("{d}", .{number});
-            return;
-        },
-        .f64 => |number| {
-            try std.json.Stringify.value(number, .{}, writer);
-            return;
-        },
+        .null => return try alloc.dupe(u8, "null"),
+        .i64 => |number| return try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .f64 => |number| return try std.json.Stringify.valueAlloc(alloc, number, .{}),
     }
     const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
     defer alloc.free(row_json);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
-    const value_json = try expressionValueJsonAlloc(alloc, parsed.value, expression);
-    defer alloc.free(value_json);
-    try writer.writeAll(value_json);
+    return try expressionValueJsonAlloc(alloc, parsed.value, expression);
 }
 
 fn writeLakeRowsCellJson(
@@ -3949,35 +3981,64 @@ fn writeLakeRowsCellJson(
     }
 }
 
-const LakeRowsQuerySortContext = struct {
-    order_by: []const RowsQueryOrder,
+const LakeRowsQueryOrderCandidate = struct {
+    row: lake_rows.ProjectedRow,
+    order_keys: []QueryOrderKey,
+    ordinal: usize,
 };
 
-fn lakeProjectedRowLessThan(ctx: LakeRowsQuerySortContext, lhs: lake_rows.ProjectedRow, rhs: lake_rows.ProjectedRow) bool {
-    for (ctx.order_by) |order| {
-        const comparison = compareLakeRowsOrderKeys(lakeProjectedRowOrderKey(lhs, order), lakeProjectedRowOrderKey(rhs, order));
-        if (comparison == .eq) continue;
-        return switch (order.direction) {
-            .asc => comparison == .lt,
-            .desc => comparison == .gt,
-        };
+fn lakeRowsQueryOrderKeysAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    order_by: []const RowsQueryOrder,
+) ![]QueryOrderKey {
+    if (order_by.len == 0) return &.{};
+    const keys = try alloc.alloc(QueryOrderKey, order_by.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeQueryOrderKeys(alloc, keys[0..initialized]);
+        alloc.free(keys);
     }
-    return lakeRowRefOrdinal(lhs.row_ref) < lakeRowRefOrdinal(rhs.row_ref);
+    for (order_by) |order| {
+        keys[initialized] = try lakeRowsQueryOrderKeyAlloc(alloc, row, order);
+        initialized += 1;
+    }
+    return keys;
 }
 
-fn lakeProjectedRowOrderKey(row: lake_rows.ProjectedRow, order: RowsQueryOrder) QueryOrderKey {
-    if (order.null_test) |test_value| {
-        const is_null = if (row.find(order.field)) |cell| cell.value == null else true;
+fn lakeRowsQueryOrderKeyAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    order: RowsQueryOrder,
+) !QueryOrderKey {
+    if (order.expression) |expression| {
+        const value_json = try lakeRowsExpressionValueJsonAlloc(alloc, row, expression);
+        defer alloc.free(value_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        return try queryOrderKeyFromJsonValueAlloc(alloc, parsed.value, order.null_test);
+    }
+    if (order.field.len == 0) return error.InvalidRowsRequest;
+    return try lakeRowsQueryOrderKeyFromCellAlloc(alloc, row.find(order.field), order.null_test);
+}
+
+fn lakeRowsQueryOrderKeyFromCellAlloc(
+    alloc: std.mem.Allocator,
+    maybe_cell: ?lake_rows.ProjectedCell,
+    null_test: ?RowsQueryOrderNullTest,
+) !QueryOrderKey {
+    if (null_test) |test_value| {
+        const is_null = if (maybe_cell) |cell| cell.value == null else true;
         return .{ .bool = switch (test_value) {
             .is_null => is_null,
             .is_not_null => !is_null,
         } };
     }
-    const cell = row.find(order.field) orelse return .missing;
+    const cell = maybe_cell orelse return .missing;
     const value = cell.value orelse return .null;
     return switch (value) {
-        .bytes => |bytes| .{ .string = bytes },
-        .json => |json| .{ .json = json },
+        .bytes => |bytes| .{ .string = try alloc.dupe(u8, bytes) },
+        .json => |json| .{ .json = try alloc.dupe(u8, json) },
         .i64 => |number| .{ .number = @floatFromInt(number) },
         .f64 => |number| .{ .number = number },
         .bool => |value_bool| .{ .bool = value_bool },
@@ -3985,15 +4046,16 @@ fn lakeProjectedRowOrderKey(row: lake_rows.ProjectedRow, order: RowsQueryOrder) 
     };
 }
 
-fn compareLakeRowsOrderKeys(lhs: QueryOrderKey, rhs: QueryOrderKey) ScalarComparison {
-    return compareQueryOrderKeys(lhs, rhs);
-}
-
-fn lakeRowRefOrdinal(row_ref: rowsource.RowRef) u64 {
-    return switch (row_ref) {
-        .external => |external| external.row_ordinal,
-        else => 0,
-    };
+fn lakeRowsQueryOrderCandidateLessThan(ctx: QuerySortContext, lhs: LakeRowsQueryOrderCandidate, rhs: LakeRowsQueryOrderCandidate) bool {
+    for (ctx.order_by, 0..) |order, i| {
+        const comparison = compareQueryOrderKeys(lhs.order_keys[i], rhs.order_keys[i]);
+        if (comparison == .eq) continue;
+        return switch (order.direction) {
+            .asc => comparison == .lt,
+            .desc => comparison == .gt,
+        };
+    }
+    return lhs.ordinal < rhs.ordinal;
 }
 
 const LakeNumericFold = struct {
@@ -19004,10 +19066,15 @@ test "relational rows lake bridge projects numeric query expressions" {
         .output = "net_amount",
         .expression = .{ .kind = .sub, .operands = &net_amount_operands },
     }};
+    const order_by = [_]RowsQueryOrder{.{
+        .expression = .{ .kind = .sub, .operands = &net_amount_operands },
+        .direction = .desc,
+    }};
     const request = OwnedRowsQueryRequest{
         .select_all = false,
         .select = &select,
         .expressions = &expressions,
+        .order_by = &order_by,
     };
 
     var lake_request = try buildLakeRowsScanRequestForRowsQueryAlloc(alloc, schema, request);
@@ -19017,30 +19084,54 @@ test "relational rows lake bridge projects numeric query expressions" {
     try std.testing.expectEqualStrings("amount", lake_request.request.projected_columns[0]);
     try std.testing.expectEqualStrings("discount", lake_request.request.projected_columns[1]);
 
-    const amount_name = @constCast("amount"[0..]);
-    const discount_name = @constCast("discount"[0..]);
-    var cells = [_]lake_rows.ProjectedCell{
-        .{ .name = amount_name, .value = .{ .i64 = 20 } },
-        .{ .name = discount_name, .value = .{ .i64 = 3 } },
+    const amount_name_0 = @constCast("amount"[0..]);
+    const discount_name_0 = @constCast("discount"[0..]);
+    const amount_name_1 = @constCast("amount"[0..]);
+    const discount_name_1 = @constCast("discount"[0..]);
+    const amount_name_2 = @constCast("amount"[0..]);
+    const discount_name_2 = @constCast("discount"[0..]);
+    var cells_0 = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_name_0, .value = .{ .i64 = 20 } },
+        .{ .name = discount_name_0, .value = .{ .i64 = 3 } },
     };
-    var projected = [_]lake_rows.ProjectedRow{.{
-        .row_ref = .{ .relational_key = "row:1" },
-        .cells = &cells,
-    }};
+    var cells_1 = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_name_1, .value = .{ .i64 = 30 } },
+        .{ .name = discount_name_1, .value = .{ .i64 = 10 } },
+    };
+    var cells_2 = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_name_2, .value = .{ .i64 = 12 } },
+        .{ .name = discount_name_2, .value = .{ .i64 = 1 } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{
+        .{
+            .row_ref = .{ .relational_key = "row:1" },
+            .cells = &cells_0,
+        },
+        .{
+            .row_ref = .{ .relational_key = "row:2" },
+            .cells = &cells_1,
+        },
+        .{
+            .row_ref = .{ .relational_key = "row:3" },
+            .cells = &cells_2,
+        },
+    };
 
     var result = try buildRowsQueryResultFromLakeRowsAlloc(
         alloc,
         request,
         .{
             .rows = &projected,
-            .total = 1,
+            .total = 3,
         },
     );
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 1), result.total);
-    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
-    try std.testing.expectEqualStrings("{\"amount\":20,\"net_amount\":17}", result.rows[0]);
+    try std.testing.expectEqual(@as(u32, 3), result.total);
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30,\"net_amount\":20}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"amount\":20,\"net_amount\":17}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"amount\":12,\"net_amount\":11}", result.rows[2]);
 }
 
 test "relational rows lake bridge lowers supported aggregate to scan request" {

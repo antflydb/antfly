@@ -288,6 +288,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
     errdefer if (compression_codec.len > 0) alloc.free(compression_codec);
     const encoding: []u8 = if (chunk.encoding.len == 0) &.{} else try alloc.dupe(u8, chunk.encoding);
     errdefer if (encoding.len > 0) alloc.free(encoding);
+    const physical_type: []u8 = if (chunk.physical_type.len == 0) &.{} else try alloc.dupe(u8, chunk.physical_type);
+    errdefer if (physical_type.len > 0) alloc.free(physical_type);
     return .{
         .column_id = column_id,
         .file_offset = chunk.file_offset,
@@ -295,6 +297,7 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .uncompressed_len = chunk.uncompressed_len,
         .compression_codec = compression_codec,
         .encoding = encoding,
+        .physical_type = physical_type,
     };
 }
 
@@ -444,6 +447,7 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .uncompressed_len = meta.total_uncompressed_size,
         .compression_codec = meta.compression_codec,
         .encoding = meta.encoding,
+        .physical_type = meta.physical_type,
     };
     chunk.validate(file_len) catch return error.InvalidParquetMetadata;
     meta.disown();
@@ -454,6 +458,7 @@ const ColumnMetadata = struct {
     column_id: []u8,
     compression_codec: []u8,
     encoding: []u8,
+    physical_type: []u8,
     total_compressed_size: u64,
     total_uncompressed_size: u64,
     data_page_offset: ?u64 = null,
@@ -463,6 +468,7 @@ const ColumnMetadata = struct {
         if (self.column_id.len > 0) alloc.free(self.column_id);
         if (self.compression_codec.len > 0) alloc.free(self.compression_codec);
         if (self.encoding.len > 0) alloc.free(self.encoding);
+        if (self.physical_type.len > 0) alloc.free(self.physical_type);
         self.* = undefined;
     }
 
@@ -470,6 +476,7 @@ const ColumnMetadata = struct {
         self.column_id = &.{};
         self.compression_codec = &.{};
         self.encoding = &.{};
+        self.physical_type = &.{};
     }
 };
 
@@ -478,6 +485,7 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
     var column_id: ?[]u8 = null;
     var compression_codec: ?[]u8 = null;
     var encoding: []u8 = &.{};
+    var physical_type: ?[]u8 = null;
     var total_compressed_size: ?u64 = null;
     var total_uncompressed_size: ?u64 = null;
     var data_page_offset: ?u64 = null;
@@ -485,9 +493,11 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
     errdefer if (column_id) |value| alloc.free(value);
     errdefer if (compression_codec) |value| alloc.free(value);
     errdefer if (encoding.len > 0) alloc.free(encoding);
+    errdefer if (physical_type) |value| alloc.free(value);
 
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
+            1 => physical_type = try physicalTypeNameAlloc(alloc, try reader.readRequiredI32(field.type)),
             2 => encoding = try parseFirstEncodingAlloc(alloc, reader, field.type),
             3 => column_id = try parsePathInSchemaAlloc(alloc, reader, field.type),
             4 => compression_codec = try compressionCodecNameAlloc(alloc, try reader.readRequiredI32(field.type)),
@@ -503,6 +513,7 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
         .column_id = column_id orelse return error.InvalidParquetMetadata,
         .compression_codec = compression_codec orelse try alloc.dupe(u8, "unknown"),
         .encoding = encoding,
+        .physical_type = physical_type orelse try alloc.dupe(u8, "unknown"),
         .total_compressed_size = total_compressed_size orelse return error.InvalidParquetMetadata,
         .total_uncompressed_size = total_uncompressed_size orelse 0,
         .data_page_offset = data_page_offset,
@@ -565,6 +576,20 @@ fn compressionCodecNameAlloc(alloc: Allocator, codec: i32) ![]u8 {
         5 => "lz4",
         6 => "zstd",
         7 => "lz4_raw",
+        else => "unknown",
+    });
+}
+
+fn physicalTypeNameAlloc(alloc: Allocator, physical_type: i32) ![]u8 {
+    return try alloc.dupe(u8, switch (physical_type) {
+        0 => "boolean",
+        1 => "int32",
+        2 => "int64",
+        3 => "int96",
+        4 => "float",
+        5 => "double",
+        6 => "byte_array",
+        7 => "fixed_len_byte_array",
         else => "unknown",
     });
 }

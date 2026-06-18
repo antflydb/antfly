@@ -31,11 +31,13 @@ pub const ColumnChunk = struct {
     uncompressed_len: u64 = 0,
     compression_codec: []u8 = &.{},
     encoding: []u8 = &.{},
+    physical_type: []u8 = &.{},
 
     pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
         alloc.free(self.column_id);
         if (self.compression_codec.len > 0) alloc.free(self.compression_codec);
         if (self.encoding.len > 0) alloc.free(self.encoding);
+        if (self.physical_type.len > 0) alloc.free(self.physical_type);
         self.* = undefined;
     }
 
