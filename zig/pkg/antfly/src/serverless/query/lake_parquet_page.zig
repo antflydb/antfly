@@ -132,6 +132,49 @@ pub fn scanUncompressedPlainI64ColumnChunkAlloc(alloc: Allocator, column_chunk_b
     return try values.toOwnedSlice(alloc);
 }
 
+pub fn decodeHybridLevelsAlloc(
+    alloc: Allocator,
+    encoded: []const u8,
+    bit_width: u4,
+    expected_count: usize,
+) ![]u8 {
+    if (expected_count == 0) return try alloc.alloc(u8, 0);
+    if (bit_width > 8) return error.UnsupportedParquetPage;
+    const levels = try alloc.alloc(u8, expected_count);
+    errdefer alloc.free(levels);
+
+    var reader = LevelReader{ .bytes = encoded };
+    var out_idx: usize = 0;
+    while (out_idx < expected_count) {
+        const header = try reader.readVarintU64();
+        if (header == 0) return error.InvalidParquetPage;
+        if ((header & 1) == 0) {
+            const run_len: usize = std.math.cast(usize, header >> 1) orelse return error.InvalidParquetPage;
+            if (run_len == 0) return error.InvalidParquetPage;
+            const value = try reader.readFixedWidthValue(bit_width);
+            if (run_len > expected_count - out_idx) return error.InvalidParquetPage;
+            @memset(levels[out_idx..][0..run_len], value);
+            out_idx += run_len;
+        } else {
+            const group_count: usize = std.math.cast(usize, header >> 1) orelse return error.InvalidParquetPage;
+            if (group_count == 0) return error.InvalidParquetPage;
+            const value_count = group_count * 8;
+            const byte_count = try packedByteCount(value_count, bit_width);
+            if (byte_count > reader.bytes.len - reader.cursor) return error.InvalidParquetPage;
+            const packed_bytes = reader.bytes[reader.cursor..][0..byte_count];
+            reader.cursor += byte_count;
+            const to_copy = @min(value_count, expected_count - out_idx);
+            for (0..to_copy) |idx| {
+                const value = try readPackedValue(packed_bytes, idx, bit_width);
+                levels[out_idx + idx] = value;
+            }
+            out_idx += to_copy;
+        }
+    }
+    if (reader.cursor != reader.bytes.len) return error.InvalidParquetPage;
+    return levels;
+}
+
 pub fn decodeOptionalPlainI64V2ByteLevelsAlloc(
     alloc: Allocator,
     header: Header,
@@ -173,6 +216,51 @@ pub fn decodeOptionalPlainI64V2ByteLevelsAlloc(
     };
 }
 
+pub fn decodeOptionalPlainI64V2HybridLevelsAlloc(
+    alloc: Allocator,
+    header: Header,
+    page_payload: []const u8,
+) !NullableI64Values {
+    try header.validatePlainRequired();
+    if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
+    if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
+    const row_count: usize = @intCast(header.value_count);
+    if (header.definition_level_bytes == 0) return error.UnsupportedParquetPage;
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    if (header.definition_level_bytes > page_payload.len) return error.InvalidParquetPage;
+
+    const definition_levels = try decodeHybridLevelsAlloc(alloc, page_payload[0..header.definition_level_bytes], 1, row_count);
+    defer alloc.free(definition_levels);
+
+    const values = try alloc.alloc(i64, row_count);
+    errdefer alloc.free(values);
+    const nulls = try alloc.alloc(u8, row_count);
+    errdefer alloc.free(nulls);
+
+    var data_cursor = header.data_payload_offset;
+    for (definition_levels, 0..) |definition_level, idx| {
+        if (definition_level > 1) return error.InvalidParquetPage;
+        switch (definition_level) {
+            0 => {
+                values[idx] = 0;
+                nulls[idx] = 1;
+            },
+            1 => {
+                if (data_cursor + 8 > page_payload.len) return error.InvalidParquetPage;
+                values[idx] = std.mem.readInt(i64, page_payload[data_cursor..][0..8], .little);
+                data_cursor += 8;
+                nulls[idx] = 0;
+            },
+            else => return error.InvalidParquetPage,
+        }
+    }
+
+    return .{
+        .values = values,
+        .nulls = nulls,
+    };
+}
+
 pub fn scanUncompressedOptionalPlainI64ColumnChunkAlloc(
     alloc: Allocator,
     column_chunk_bytes: []const u8,
@@ -191,7 +279,7 @@ pub fn scanUncompressedOptionalPlainI64ColumnChunkAlloc(
         const payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
         cursor += parsed.header.compressed_page_size;
 
-        var page_values = try decodeOptionalPlainI64V2ByteLevelsAlloc(alloc, parsed.header, payload);
+        var page_values = try decodeOptionalPlainI64V2HybridLevelsAlloc(alloc, parsed.header, payload);
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -491,6 +579,63 @@ const Reader = struct {
     }
 };
 
+const LevelReader = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+
+    fn readVarintU64(self: *LevelReader) !u64 {
+        var shift: u6 = 0;
+        var result: u64 = 0;
+        while (true) {
+            if (self.cursor >= self.bytes.len) return error.InvalidParquetPage;
+            const byte = self.bytes[self.cursor];
+            self.cursor += 1;
+            result |= (@as(u64, byte & 0x7f) << shift);
+            if ((byte & 0x80) == 0) return result;
+            if (shift >= 63) return error.InvalidParquetPage;
+            shift += 7;
+        }
+    }
+
+    fn readFixedWidthValue(self: *LevelReader, bit_width: u4) !u8 {
+        if (bit_width == 0) return 0;
+        const byte_count = fixedWidthByteCount(bit_width);
+        if (byte_count > self.bytes.len - self.cursor) return error.InvalidParquetPage;
+        var value: u16 = 0;
+        for (self.bytes[self.cursor..][0..byte_count], 0..) |byte, idx| {
+            value |= @as(u16, byte) << @intCast(idx * 8);
+        }
+        self.cursor += byte_count;
+        if (value > std.math.maxInt(u8)) return error.InvalidParquetPage;
+        return @intCast(value);
+    }
+};
+
+fn fixedWidthByteCount(bit_width: u4) usize {
+    return (@as(usize, bit_width) + 7) / 8;
+}
+
+fn packedByteCount(value_count: usize, bit_width: u4) !usize {
+    const bits = std.math.mul(usize, value_count, bit_width) catch return error.InvalidParquetPage;
+    return (bits + 7) / 8;
+}
+
+fn readPackedValue(packed_bytes: []const u8, value_idx: usize, bit_width: u4) !u8 {
+    if (bit_width == 0) return 0;
+    var value: u16 = 0;
+    const start_bit = value_idx * @as(usize, bit_width);
+    for (0..@as(usize, bit_width)) |bit_offset| {
+        const absolute_bit = start_bit + bit_offset;
+        const byte_idx = absolute_bit / 8;
+        if (byte_idx >= packed_bytes.len) return error.InvalidParquetPage;
+        const bit_idx: u3 = @intCast(absolute_bit % 8);
+        const bit = (packed_bytes[byte_idx] >> bit_idx) & 1;
+        value |= @as(u16, bit) << @intCast(bit_offset);
+    }
+    if (value > std.math.maxInt(u8)) return error.InvalidParquetPage;
+    return @intCast(value);
+}
+
 fn zigzagDecode(raw: u64) i64 {
     return @as(i64, @bitCast(raw >> 1)) ^ -@as(i64, @intCast(raw & 1));
 }
@@ -664,6 +809,32 @@ test "parquet page parser handles v2 level prefix before plain values" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8 }, values);
 }
 
+test "parquet page parser decodes hybrid rle and bit-packed levels" {
+    const alloc = std.testing.allocator;
+    const rle = [_]u8{
+        6, 1,
+        4, 0,
+    };
+    const rle_levels = try decodeHybridLevelsAlloc(alloc, &rle, 1, 5);
+    defer alloc.free(rle_levels);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 1, 1, 0, 0 }, rle_levels);
+
+    const two_bit_rle = [_]u8{ 6, 2 };
+    const two_bit_rle_levels = try decodeHybridLevelsAlloc(alloc, &two_bit_rle, 2, 3);
+    defer alloc.free(two_bit_rle_levels);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 2, 2 }, two_bit_rle_levels);
+
+    const bit_packed = [_]u8{
+        3, 0b00010101,
+    };
+    const packed_levels = try decodeHybridLevelsAlloc(alloc, &bit_packed, 1, 5);
+    defer alloc.free(packed_levels);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1, 0, 1 }, packed_levels);
+
+    try std.testing.expectError(error.InvalidParquetPage, decodeHybridLevelsAlloc(alloc, &[_]u8{3}, 1, 3));
+    try std.testing.expectError(error.InvalidParquetPage, decodeHybridLevelsAlloc(alloc, &[_]u8{ 2, 1, 0 }, 1, 1));
+}
+
 test "parquet page parser decodes optional plain i64 v2 byte definition levels" {
     const alloc = std.testing.allocator;
     var header_bytes = try buildDataPageV2HeaderFixtureWithLevels(alloc, 3, 19, 3, 0);
@@ -684,6 +855,29 @@ test "parquet page parser decodes optional plain i64 v2 byte definition levels" 
         0,
     };
     var decoded = try decodeOptionalPlainI64V2ByteLevelsAlloc(alloc, parsed.header, &payload);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 0, 9 }, decoded.values);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, decoded.nulls);
+}
+
+test "parquet page parser decodes optional plain i64 v2 hybrid definition levels" {
+    const alloc = std.testing.allocator;
+    var header_bytes = try buildDataPageV2HeaderFixtureWithLevels(alloc, 3, 18, 2, 0);
+    defer header_bytes.deinit(alloc);
+    const parsed = try parsePageHeader(header_bytes.items);
+
+    const payload = [_]u8{
+        3, 0b00000101,
+        7, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        9, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+    };
+    var decoded = try decodeOptionalPlainI64V2HybridLevelsAlloc(alloc, parsed.header, &payload);
     defer decoded.deinit(alloc);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 0, 9 }, decoded.values);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, decoded.nulls);
@@ -724,7 +918,7 @@ test "parquet page scanner concatenates optional plain i64 pages" {
     defer chunk.deinit(alloc);
     try chunk.appendSlice(alloc, header_a.items);
     try chunk.appendSlice(alloc, &[_]u8{
-        1,  0,
+        3,  1,
         10, 0,
         0,  0,
         0,  0,
@@ -732,7 +926,7 @@ test "parquet page scanner concatenates optional plain i64 pages" {
     });
     try chunk.appendSlice(alloc, header_b.items);
     try chunk.appendSlice(alloc, &[_]u8{
-        1,  1,
+        3,  3,
         30, 0,
         0,  0,
         0,  0,

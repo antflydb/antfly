@@ -547,7 +547,9 @@ fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: All
     for (values) |maybe| {
         if (maybe != null) present_count += 1;
     }
-    const byte_len: i32 = @intCast(values.len + present_count * 8);
+    const level_group_count = (values.len + 7) / 8;
+    const definition_level_bytes: i32 = @intCast(1 + level_group_count);
+    const byte_len: i32 = @intCast(@as(usize, @intCast(definition_level_bytes)) + present_count * 8);
     const null_count: i32 = @intCast(values.len - present_count);
     var page_prev: i16 = 0;
     try appendField(out, alloc, &page_prev, 1, .i32);
@@ -568,13 +570,20 @@ fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: All
     try appendField(out, alloc, &data_prev, 4, .i32);
     try appendI32(out, alloc, 0);
     try appendField(out, alloc, &data_prev, 5, .i32);
-    try appendI32(out, alloc, @intCast(values.len));
+    try appendI32(out, alloc, definition_level_bytes);
     try appendField(out, alloc, &data_prev, 6, .i32);
     try appendI32(out, alloc, 0);
     try appendStop(out, alloc);
     try appendStop(out, alloc);
 
-    for (values) |maybe| try out.append(alloc, if (maybe == null) 0 else 1);
+    try appendVarint(out, alloc, (@as(u64, @intCast(level_group_count)) << 1) | 1);
+    var packed_levels = try alloc.alloc(u8, level_group_count);
+    defer alloc.free(packed_levels);
+    @memset(packed_levels, 0);
+    for (values, 0..) |maybe, idx| {
+        if (maybe != null) packed_levels[idx / 8] |= @as(u8, 1) << @intCast(idx % 8);
+    }
+    try out.appendSlice(alloc, packed_levels);
     for (values) |maybe| {
         const value = maybe orelse continue;
         var buf: [8]u8 = undefined;
