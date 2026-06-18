@@ -1079,7 +1079,8 @@ row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
 direction/count tails, transaction-control grammar for `LOCK TABLE`,
 `SET CONSTRAINTS`, `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN`
-mode clauses, maintenance-job grammar for `VACUUM`, `ANALYZE`, `REINDEX`, and
+mode clauses plus advisory-lock function-call tails, maintenance-job grammar for
+`VACUUM`, `ANALYZE`, `REINDEX`, and
 `CLUSTER`, notification-channel grammar for `LISTEN`, `NOTIFY`, and
 `UNLISTEN`, database/tablespace catalog grammar for `CREATE DATABASE`, `ALTER
 DATABASE ... SET`, `DROP DATABASE`, `CREATE TABLESPACE`, `ALTER TABLESPACE ...
@@ -4391,8 +4392,9 @@ clauses parse in `api/sql_adapter/grammar.zig` before the lowerer allocates
 typed transaction-control intents that capture normalized table and constraint
 names, table-lock mode, constraint scope/check mode, transaction starter,
 isolation level, read-only/read-write mode, and deferrability. `pg_advisory_lock`
-and `pg_advisory_unlock` calls also lower to typed transaction-control intents
-with advisory-lock action and advisory key values. All of these fail closed when
+and `pg_advisory_unlock` call tails parse in `api/sql_adapter/grammar.zig` and
+lower to typed transaction-control intents with advisory-lock action and
+advisory key values. All of these fail closed when
 applied to table schema or runtime storage. The production shape is
 a native table/range/advisory lock barrier that composes with row claims,
 catalog epochs, range movement, and 2PC, plus transaction-scoped deferrable

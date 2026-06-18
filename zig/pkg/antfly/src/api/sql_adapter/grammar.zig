@@ -154,6 +154,17 @@ pub const TransactionModeSyntax = struct {
     deferrable: ?bool = null,
 };
 
+pub const AdvisoryLockActionSyntax = enum {
+    lock,
+    unlock,
+};
+
+pub const AdvisoryLockSyntax = struct {
+    action: AdvisoryLockActionSyntax,
+    key1: i64,
+    key2: ?i64 = null,
+};
+
 pub const VacuumMaintenanceSyntax = struct {
     table_name: []const u8,
     full: bool = false,
@@ -1475,6 +1486,26 @@ pub fn parseTransactionModeTail(
     }
     if (!saw_mode) return error.UnsupportedSqlShape;
     return syntax;
+}
+
+pub fn parseAdvisoryLockTail(tokens: []const Token, pos: *usize) !AdvisoryLockSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const action: AdvisoryLockActionSyntax = if (cursor.matchKeyword("pg_advisory_lock"))
+        .lock
+    else if (cursor.matchKeyword("pg_advisory_unlock"))
+        .unlock
+    else
+        return error.UnsupportedSqlShape;
+    try cursor.expectToken(.lparen);
+    const key1 = try parseSequenceInteger(cursor);
+    const key2 = if (cursor.matchToken(.comma) != null) try parseSequenceInteger(cursor) else null;
+    try cursor.expectToken(.rparen);
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{
+        .action = action,
+        .key1 = key1,
+        .key2 = key2,
+    };
 }
 
 pub fn parseVacuumMaintenanceTailAlloc(
@@ -3893,6 +3924,29 @@ test "sql adapter grammar parses transaction control tails" {
     defer lexer.freeTokens(alloc, &duplicate_tokens);
     var duplicate_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseTransactionModeTail(duplicate_tokens.items, &duplicate_pos, .start_transaction));
+
+    var advisory_tokens = try lexer.tokenizeAlloc(alloc, "pg_advisory_lock(-42, 7);");
+    defer lexer.freeTokens(alloc, &advisory_tokens);
+    var advisory_pos: usize = 0;
+    const advisory = try parseAdvisoryLockTail(advisory_tokens.items, &advisory_pos);
+    try std.testing.expectEqual(advisory_tokens.items.len, advisory_pos);
+    try std.testing.expectEqual(AdvisoryLockActionSyntax.lock, advisory.action);
+    try std.testing.expectEqual(@as(i64, -42), advisory.key1);
+    try std.testing.expectEqual(@as(i64, 7), advisory.key2.?);
+
+    var advisory_unlock_tokens = try lexer.tokenizeAlloc(alloc, "pg_advisory_unlock(42);");
+    defer lexer.freeTokens(alloc, &advisory_unlock_tokens);
+    var advisory_unlock_pos: usize = 0;
+    const advisory_unlock = try parseAdvisoryLockTail(advisory_unlock_tokens.items, &advisory_unlock_pos);
+    try std.testing.expectEqual(advisory_unlock_tokens.items.len, advisory_unlock_pos);
+    try std.testing.expectEqual(AdvisoryLockActionSyntax.unlock, advisory_unlock.action);
+    try std.testing.expectEqual(@as(i64, 42), advisory_unlock.key1);
+    try std.testing.expect(advisory_unlock.key2 == null);
+
+    var fractional_key_tokens = try lexer.tokenizeAlloc(alloc, "pg_advisory_lock(4.2);");
+    defer lexer.freeTokens(alloc, &fractional_key_tokens);
+    var fractional_key_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdvisoryLockTail(fractional_key_tokens.items, &fractional_key_pos));
 }
 
 test "sql adapter grammar parses maintenance job tails" {

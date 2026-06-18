@@ -2711,6 +2711,13 @@ fn transactionAccessModeFromSyntax(syntax: ?sql_adapter.TransactionAccessModeSyn
     };
 }
 
+fn advisoryLockActionFromSyntax(syntax: sql_adapter.AdvisoryLockActionSyntax) AdvisoryLockAction {
+    return switch (syntax) {
+        .lock => .lock,
+        .unlock => .unlock,
+    };
+}
+
 fn reindexMaintenanceTargetFromSyntax(syntax: sql_adapter.ReindexMaintenanceTargetSyntax) ReindexMaintenanceTarget {
     return switch (syntax) {
         .index => .index,
@@ -3644,31 +3651,12 @@ const Parser = struct {
     }
 
     fn parseAdvisoryLockDdl(self: *@This()) !AdvisoryLockPlan {
-        const action: AdvisoryLockAction = if (self.matchKeyword("pg_advisory_lock"))
-            .lock
-        else if (self.matchKeyword("pg_advisory_unlock"))
-            .unlock
-        else
-            return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        const key1 = try self.parseSequenceInteger();
-        const key2 = if (self.match(.comma) != null) try self.parseSequenceInteger() else null;
-        try self.expect(.rparen);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        const syntax = try sql_adapter.parseAdvisoryLockTail(self.tokens, &self.pos);
         return .{
-            .action = action,
-            .key1 = key1,
-            .key2 = key2,
+            .action = advisoryLockActionFromSyntax(syntax.action),
+            .key1 = syntax.key1,
+            .key2 = syntax.key2,
         };
-    }
-
-    fn parseSequenceInteger(self: *@This()) !i64 {
-        const negative = self.match(.minus) != null;
-        const token = self.match(.number) orelse return error.UnsupportedSqlShape;
-        if (std.mem.indexOfScalar(u8, token.text, '.') != null) return error.UnsupportedSqlShape;
-        const value = std.fmt.parseInt(i64, token.text, 10) catch return error.UnsupportedSqlShape;
-        return if (negative) -value else value;
     }
 
     fn parseCreateCollationDdl(self: *@This()) !CreateCollationPlan {
