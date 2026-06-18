@@ -337,7 +337,10 @@ Current status:
   file-format substrate for the segment-backed base/delta mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
-  is stored as a backward-compatible node side record.
+  is stored as a backward-compatible node side record. Record-backed flat and
+  two-level centroid directories read freshness from that small posting-state
+  record when available, so payload-only maintenance can skip rewriting the full
+  centroid-directory point value.
 - A bounded posting maintenance pass now exists. It scans leaf postings,
   repairs dirty centroids/payloads, persists clean posting state, refreshes HBC
   ancestor centroids when needed, and reports repair counters.

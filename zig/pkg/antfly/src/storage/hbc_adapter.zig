@@ -9025,6 +9025,61 @@ test "base delta bulk build defers transient centroid directory records" {
     try std.testing.expect(results.getHits().len > 0);
 }
 
+test "base delta payload-only repair skips centroid directory rewrite" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+
+    var idx = try HBCIndex.open(alloc, tmp_path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = true,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 2,
+        .flat_centroid_probe_count = 4,
+    });
+    defer idx.close();
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 0.0 }, .metadata = "doc:3" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 10.1, 0.0 }, .metadata = "doc:4" },
+        .{ .vector_id = 5, .vector = &[_]f32{ 20.0, 0.0 }, .metadata = "doc:5" },
+        .{ .vector_id = 6, .vector = &[_]f32{ 20.1, 0.0 }, .metadata = "doc:6" },
+    };
+
+    try idx.bulkBuildWithMetadata(&items);
+    const dirty_stats = try idx.postingBacklogStats();
+    try std.testing.expect(dirty_stats.payload_dirty_postings > 0);
+
+    idx.resetWriteProfile();
+    const repaired = try idx.repairDirtyPostingsWithOptions(.{ .max_postings = 16 });
+    try std.testing.expect(repaired.payload_refreshed > 0);
+    try std.testing.expectEqual(@as(u64, 0), repaired.centroid_refreshed);
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 0), profile.centroid_directory_put_calls);
+
+    const clean_stats = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), clean_stats.payload_dirty_postings);
+
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &[_]f32{ 20.0, 0.0 },
+        .k = 2,
+        .search_width = 4,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+    try std.testing.expect(profiled.results.getHits().len > 0);
+    try std.testing.expect(profiled.profile.centroid_directory_posting_centroids_scored > 0);
+}
+
 test "hilbert-seeded bulk build creates searchable index" {
     var path: TestPath = .{};
     const tmp_path = path.init();

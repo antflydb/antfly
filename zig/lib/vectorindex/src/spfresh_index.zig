@@ -146,6 +146,13 @@ fn postingStateFromCentroidDirectoryRecord(record: *const posting.OwnedCentroidD
     };
 }
 
+fn postingStateForCentroidDirectoryRecord(self: anytype, txn: anytype, record: *const posting.OwnedCentroidDirectoryRecord) !types.PostingState {
+    return posting.PostingStore.loadState(self, txn, record.posting_id, isNotFoundGeneric) catch |err| {
+        if (isNotFoundGeneric(err)) return postingStateFromCentroidDirectoryRecord(record);
+        return err;
+    };
+}
+
 fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !void {
     const header = hbc.NodeHeader{
         .is_leaf = node.is_leaf,
@@ -632,7 +639,8 @@ fn buildFlatCentroidDirectoryFromRecords(self: anytype, txn: anytype, root_node:
 
     for (records) |*record| {
         if (record.member_count == 0 or record.centroid.len != dims) continue;
-        try appendFlatCentroidEntry(self, &entries, record.posting_id, record.parent, record.level, postingStateFromCentroidDirectoryRecord(record), record.bounds_radius, record.centroid);
+        const state = try postingStateForCentroidDirectoryRecord(self, txn, record);
+        try appendFlatCentroidEntry(self, &entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
     }
     const posting_count = try appendFlatCentroidBlocksFromEntries(self, &blocks, &entries, dims, block_size);
 
@@ -658,7 +666,8 @@ fn buildFlatCentroidDirectoryFromRecordProbes(self: anytype, txn: anytype, root_
         };
         defer record.deinit(self.alloc);
         if (record.member_count == 0 or record.centroid.len != dims) continue;
-        try appendFlatCentroidEntry(self, &entries, record.posting_id, record.parent, record.level, postingStateFromCentroidDirectoryRecord(&record), record.bounds_radius, record.centroid);
+        const state = try postingStateForCentroidDirectoryRecord(self, txn, &record);
+        try appendFlatCentroidEntry(self, &entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
     }
     const posting_count = try appendFlatCentroidBlocksFromEntries(self, &blocks, &entries, dims, block_size);
 
@@ -1738,7 +1747,7 @@ pub fn repairDirtyPostingsTxnWithOptions(
             }
             if ((self.config.posting_storage_mode == .shadow_base_delta or
                 self.config.posting_storage_mode == .base_delta) and
-                (refreshed_centroid or refreshed_payload))
+                refreshed_centroid)
             {
                 try posting.PostingStore.saveCentroidDirectoryRecord(self, txn, .{
                     .posting_id = node.id,
