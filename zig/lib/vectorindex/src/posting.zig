@@ -2668,20 +2668,88 @@ pub const PostingStore = struct {
 
         const start = now_fn();
         const canonical_base_delta = baseDeltaIsCanonical(index);
-        var owned_base_data: ?[]u8 = null;
-        defer if (owned_base_data) |data| index.alloc.free(data);
-        const base_data = if (useSegmentPostingBackend(index)) base_data: {
+        if (useSegmentPostingBackend(index)) {
+            if (canonical_base_delta) {
+                if (copyCachedCurrentPostingMembersIfAvailable(scratch, posting_view, 0, profile)) |cached_member_ids| {
+                    notePostingOverlay(profile, elapsed_fn(start), cached_member_ids.len, 0, cached_member_ids.len);
+                    return cached_member_ids;
+                }
+            }
+
             const Index = IndexType(@TypeOf(index));
-            if (comptime !@hasDecl(Index, "loadPostingBackendBaseData")) return error.UnsupportedPostingBackend;
-            owned_base_data = index.loadPostingBackendBaseData(txn, posting_view.id, isNotFound) catch |err| {
+            if (comptime !@hasDecl(Index, "loadPostingBackendBaseHeader") or
+                !@hasDecl(Index, "loadPostingBackendBaseData"))
+            {
+                return error.UnsupportedPostingBackend;
+            }
+
+            const base_header = index.loadPostingBackendBaseHeader(txn, posting_view.id, isNotFound) catch |err| {
                 if (isNotFound(err)) {
                     notePostingOverlayFallback(profile);
                     return try copyMemberIds(alloc, scratch, posting_view);
                 }
                 return err;
             };
-            break :base_data owned_base_data.?;
-        } else loadBaseData(index, txn, posting_view.id, isNotFound) catch |err| {
+            if (!canonical_base_delta and base_header.generation < posting_view.state.mutation_version) {
+                notePostingOverlayFallback(profile);
+                return try copyMemberIds(alloc, scratch, posting_view);
+            }
+            if (canonical_base_delta and base_header.generation >= posting_view.state.mutation_version) {
+                if (copyCachedPostingMembersIfAvailable(scratch, posting_view, base_header.generation, 0, profile)) |cached_member_ids| {
+                    notePostingOverlay(profile, elapsed_fn(start), cached_member_ids.len, 0, cached_member_ids.len);
+                    return cached_member_ids;
+                }
+                notePostingOverlayCacheMiss(profile);
+                try notePostingMemberCacheMissIfAvailable(scratch, alloc, posting_view.id);
+            }
+
+            const base_data = index.loadPostingBackendBaseData(txn, posting_view.id, isNotFound) catch |err| {
+                if (isNotFound(err)) {
+                    notePostingOverlayFallback(profile);
+                    return try copyMemberIds(alloc, scratch, posting_view);
+                }
+                return err;
+            };
+            defer index.alloc.free(base_data);
+
+            if (canonical_base_delta and base_header.generation >= posting_view.state.mutation_version) {
+                const decode_start = now_fn();
+                _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
+                notePostingBaseDecode(profile, elapsed_fn(decode_start), base_header.member_count);
+                const member_ids = scratch.member_ids[0..base_header.member_count];
+                try cachePostingMembersIfAvailable(scratch, alloc, posting_view, base_header.generation, 0, member_ids, profile);
+                notePostingOverlayDeltaScanSkip(profile);
+                notePostingOverlay(profile, elapsed_fn(start), base_header.member_count, 0, base_header.member_count);
+                return member_ids;
+            }
+
+            const decode_start = now_fn();
+            _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
+            notePostingBaseDecode(profile, elapsed_fn(decode_start), base_header.member_count);
+            var materialized_len = base_header.member_count;
+            const delta_replay_start = now_fn();
+            const delta_replay = if (canUsePostingOverlayPlan(@TypeOf(scratch)))
+                if (canonical_base_delta)
+                    try applyDeltaTailIntoScratchAdaptiveSorted(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation)
+                else
+                    try applyDeltaTailIntoScratchAdaptive(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation)
+            else
+                try applyDeltaTailIntoScratch(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation);
+            notePostingDeltaReplay(profile, elapsed_fn(delta_replay_start), delta_replay.records);
+            const materialized = scratch.member_ids[0..materialized_len];
+            if (!canonical_base_delta and !std.mem.eql(VectorId, materialized, posting_view.members)) {
+                notePostingOverlayFallback(profile);
+                return try copyMemberIds(alloc, scratch, posting_view);
+            }
+
+            if (canonical_base_delta) {
+                try cachePostingMembersIfAvailable(scratch, alloc, posting_view, base_header.generation, delta_replay.max_sequence, materialized, profile);
+            }
+            notePostingOverlay(profile, elapsed_fn(start), base_header.member_count, delta_replay.records, materialized.len);
+            return materialized;
+        }
+
+        const base_data = loadBaseData(index, txn, posting_view.id, isNotFound) catch |err| {
             if (isNotFound(err)) {
                 notePostingOverlayFallback(profile);
                 return try copyMemberIds(alloc, scratch, posting_view);
@@ -4852,6 +4920,22 @@ fn copyCachedPostingMembersIfAvailable(
     return cached;
 }
 
+fn copyCachedCurrentPostingMembersIfAvailable(
+    scratch: anytype,
+    posting_view: PostingView,
+    max_delta_sequence: u64,
+    profile: anytype,
+) ?[]const VectorId {
+    const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(scratch),
+    };
+    if (comptime !@hasDecl(Scratch, "cachedCurrentPostingMembers")) return null;
+    const cached = scratch.cachedCurrentPostingMembers(posting_view.id, posting_view.state.mutation_version, max_delta_sequence) orelse return null;
+    notePostingOverlayCacheHit(profile);
+    return cached;
+}
+
 fn cachePostingMembersIfAvailable(
     scratch: anytype,
     alloc: std.mem.Allocator,
@@ -6282,6 +6366,11 @@ const PostingQueryMaterializeTestScratch = struct {
     posting_overlay_appended_ids: []VectorId = &.{},
     posting_overlay_appended_live: []bool = &.{},
     posting_overlay_appended_count: usize = 0,
+    cached_posting_id: PostingId = 0,
+    cached_base_generation: u64 = 0,
+    cached_mutation_version: u64 = 0,
+    cached_max_delta_sequence: u64 = 0,
+    cached_members: []VectorId = &.{},
 
     fn deinit(self: *PostingQueryMaterializeTestScratch, alloc: std.mem.Allocator) void {
         alloc.free(self.member_ids);
@@ -6290,6 +6379,7 @@ const PostingQueryMaterializeTestScratch = struct {
         self.posting_overlay_appended_positions.deinit(alloc);
         alloc.free(self.posting_overlay_appended_ids);
         alloc.free(self.posting_overlay_appended_live);
+        alloc.free(self.cached_members);
         self.* = .{};
     }
 
@@ -6331,6 +6421,65 @@ const PostingQueryMaterializeTestScratch = struct {
         self.posting_overlay_removed_members.clearRetainingCapacity();
         self.posting_overlay_appended_positions.clearRetainingCapacity();
         self.posting_overlay_appended_count = 0;
+    }
+
+    pub fn cachedPostingMembers(
+        self: *PostingQueryMaterializeTestScratch,
+        posting_id: PostingId,
+        base_generation: u64,
+        mutation_version: u64,
+        max_delta_sequence: u64,
+    ) ?[]const VectorId {
+        if (self.cached_members.len == 0) return null;
+        if (self.cached_posting_id != posting_id or
+            self.cached_base_generation != base_generation or
+            self.cached_mutation_version != mutation_version or
+            self.cached_max_delta_sequence != max_delta_sequence)
+        {
+            return null;
+        }
+        return self.cached_members;
+    }
+
+    pub fn cachedCurrentPostingMembers(
+        self: *PostingQueryMaterializeTestScratch,
+        posting_id: PostingId,
+        mutation_version: u64,
+        max_delta_sequence: u64,
+    ) ?[]const VectorId {
+        if (self.cached_members.len == 0) return null;
+        if (self.cached_posting_id != posting_id or
+            self.cached_base_generation < mutation_version or
+            self.cached_mutation_version != mutation_version or
+            self.cached_max_delta_sequence != max_delta_sequence)
+        {
+            return null;
+        }
+        return self.cached_members;
+    }
+
+    pub fn cachePostingMembers(
+        self: *PostingQueryMaterializeTestScratch,
+        alloc: std.mem.Allocator,
+        posting_id: PostingId,
+        base_generation: u64,
+        mutation_version: u64,
+        max_delta_sequence: u64,
+        members: []const VectorId,
+    ) !struct { evictions: u64, admission_skips: u64, member_bytes: u64 } {
+        if (self.cached_members.len != members.len) {
+            self.cached_members = try alloc.realloc(self.cached_members, members.len);
+        }
+        @memcpy(self.cached_members, members);
+        self.cached_posting_id = posting_id;
+        self.cached_base_generation = base_generation;
+        self.cached_mutation_version = mutation_version;
+        self.cached_max_delta_sequence = max_delta_sequence;
+        return .{
+            .evictions = 0,
+            .admission_skips = 0,
+            .member_bytes = members.len * @sizeOf(VectorId),
+        };
     }
 };
 
@@ -7212,6 +7361,78 @@ test "posting store query member copy skips delta scan when canonical base is cu
     try std.testing.expectEqual(@as(u64, 0), profile.posting_overlay_delta_records);
     try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_delta_scan_skips);
     try std.testing.expectEqual(@as(u64, 3), profile.posting_overlay_materialized_members);
+}
+
+test "posting store segment query member cache hit skips full base load" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{
+        .alloc = alloc,
+        .config = .{
+            .dims = 2,
+            .posting_storage_mode = .base_delta,
+            .posting_backend = .segments,
+        },
+    };
+    defer index.deinit();
+    var txn = struct {}{};
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+    var profile = PostingQueryMaterializeTestProfile{};
+
+    const centroid = [_]f32{ 1.0, 2.0 };
+    const base_members = [_]VectorId{ 10, 20, 30 };
+    try PostingStore.saveBase(&index, &txn, .{
+        .posting_id = 9,
+        .generation = 4,
+        .members = base_members[0..],
+    });
+    index.posting_backend_base_loads = 0;
+
+    const first = try PostingStore.copyQueryMemberIds(
+        &index,
+        &txn,
+        alloc,
+        &scratch,
+        .{
+            .id = 9,
+            .parent = 1,
+            .level = 0,
+            .centroid = centroid[0..],
+            .members = &.{},
+            .state = .{ .mutation_version = 4 },
+        },
+        &profile,
+        postingQueryTestNow,
+        postingQueryTestElapsed,
+    );
+    try std.testing.expectEqualSlices(VectorId, base_members[0..], first);
+    try std.testing.expectEqual(@as(u64, 2), index.posting_backend_base_loads);
+    try std.testing.expectEqual(@as(u64, 3), profile.posting_base_decode_members);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_cache_misses);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_overlay_cache_hits);
+
+    const second = try PostingStore.copyQueryMemberIds(
+        &index,
+        &txn,
+        alloc,
+        &scratch,
+        .{
+            .id = 9,
+            .parent = 1,
+            .level = 0,
+            .centroid = centroid[0..],
+            .members = &.{},
+            .state = .{ .mutation_version = 4 },
+        },
+        &profile,
+        postingQueryTestNow,
+        postingQueryTestElapsed,
+    );
+    try std.testing.expectEqualSlices(VectorId, base_members[0..], second);
+    try std.testing.expectEqual(@as(u64, 2), index.posting_backend_base_loads);
+    try std.testing.expectEqual(@as(u64, 3), profile.posting_base_decode_members);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_cache_misses);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_cache_hits);
 }
 
 test "posting store canonical query replay uses sorted scratch records for medium tails" {

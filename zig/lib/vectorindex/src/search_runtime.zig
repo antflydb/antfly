@@ -523,6 +523,19 @@ pub const SearchScratch = struct {
         if (self.posting_member_cache.items[slot].base_generation != base_generation) return null;
         if (self.posting_member_cache.items[slot].mutation_version != mutation_version) return null;
         if (self.posting_member_cache.items[slot].max_delta_sequence != max_delta_sequence) return null;
+        return self.promotePostingMemberCacheHit(slot);
+    }
+
+    pub fn cachedCurrentPostingMembers(self: *SearchScratch, posting_id: u64, mutation_version: u64, max_delta_sequence: u64) ?[]const u64 {
+        const slot = self.posting_member_cache_slots.get(posting_id) orelse return null;
+        if (slot >= self.posting_member_cache.items.len) return null;
+        if (self.posting_member_cache.items[slot].base_generation < mutation_version) return null;
+        if (self.posting_member_cache.items[slot].mutation_version != mutation_version) return null;
+        if (self.posting_member_cache.items[slot].max_delta_sequence != max_delta_sequence) return null;
+        return self.promotePostingMemberCacheHit(slot);
+    }
+
+    fn promotePostingMemberCacheHit(self: *SearchScratch, slot: usize) []const u64 {
         self.posting_member_cache.items[slot].score = self.posting_member_cache.items[slot].score +| 4;
         const last = self.posting_member_cache.items.len - 1;
         if (slot != last) {
@@ -1141,6 +1154,21 @@ test "SearchScratch posting member cache key includes base mutation and delta se
     try std.testing.expect(scratch.cachedPostingMembers(1, 11, 5, 20) == null);
     try std.testing.expect(scratch.cachedPostingMembers(1, 10, 6, 20) == null);
     try std.testing.expect(scratch.cachedPostingMembers(1, 10, 5, 21) == null);
+}
+
+test "SearchScratch posting member cache supports current-generation lookup" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 8 * @sizeOf(u64), 8 * @sizeOf(u64));
+    defer scratch.deinit(alloc);
+
+    const members = [_]u64{ 1, 2, 3 };
+    _ = try scratch.cachePostingMembers(alloc, 1, 10, 5, 0, members[0..]);
+
+    try std.testing.expect(scratch.cachedCurrentPostingMembers(1, 5, 0) != null);
+    try std.testing.expect(scratch.cachedCurrentPostingMembers(1, 10, 0) != null);
+    try std.testing.expect(scratch.cachedCurrentPostingMembers(1, 11, 0) == null);
+    try std.testing.expect(scratch.cachedCurrentPostingMembers(1, 5, 1) == null);
+    try std.testing.expect(scratch.cachedCurrentPostingMembers(1, 6, 0) == null);
 }
 
 test "SearchScratch disables posting member cache when byte cap is zero" {
