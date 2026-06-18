@@ -98,21 +98,100 @@ const v1_timeline_switch_encoded = [_]u8{
     0x22, 0x3a, 0x31, 0x32, 0x7d,
 };
 
+const v1_backup_start_payload =
+    \\{"slot_name":"standby-a","manifest_id":"base-0001","backup_lsn":2}
+;
+
+const v1_backup_start_record = replication_record.Record{
+    .kind = .backup_start,
+    .payload_codec = .json,
+    .flags = 0,
+    .cluster_id = 100,
+    .shard_id = 10,
+    .table_id = 20,
+    .timeline_id = 1,
+    .epoch = 1,
+    .lsn = 2,
+    .previous_lsn = 1,
+    .commit_timestamp_ns = 1700000000123456790,
+    .payload = v1_backup_start_payload,
+};
+
+const v1_backup_start_encoded = [_]u8{
+    0x41, 0x46, 0x48, 0x41, 0x57, 0x41, 0x4c, 0x0a,
+    0x01, 0x00, 0x64, 0x00, 0x10, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x16, 0xcd, 0x85, 0x3d,
+    0xfe, 0x9c, 0x97, 0x17, 0x42, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x41, 0x86, 0x7a, 0x45,
+    0xb3, 0x82, 0x10, 0x87, 0x7b, 0x22, 0x73, 0x6c,
+    0x6f, 0x74, 0x5f, 0x6e, 0x61, 0x6d, 0x65, 0x22,
+    0x3a, 0x22, 0x73, 0x74, 0x61, 0x6e, 0x64, 0x62,
+    0x79, 0x2d, 0x61, 0x22, 0x2c, 0x22, 0x6d, 0x61,
+    0x6e, 0x69, 0x66, 0x65, 0x73, 0x74, 0x5f, 0x69,
+    0x64, 0x22, 0x3a, 0x22, 0x62, 0x61, 0x73, 0x65,
+    0x2d, 0x30, 0x30, 0x30, 0x31, 0x22, 0x2c, 0x22,
+    0x62, 0x61, 0x63, 0x6b, 0x75, 0x70, 0x5f, 0x6c,
+    0x73, 0x6e, 0x22, 0x3a, 0x32, 0x7d,
+};
+
+const v1_checkpoint_payload =
+    \\{"manifest_id":"base-0001","backup_lsn":2,"checkpoint_lsn":5,"file_count":2,"total_bytes":15}
+;
+
+const v1_checkpoint_record = replication_record.Record{
+    .kind = .checkpoint,
+    .payload_codec = .json,
+    .flags = 0,
+    .cluster_id = 100,
+    .shard_id = 10,
+    .table_id = 20,
+    .timeline_id = 1,
+    .epoch = 1,
+    .lsn = 5,
+    .previous_lsn = 4,
+    .commit_timestamp_ns = 1700000000123456791,
+    .payload = v1_checkpoint_payload,
+};
+
+const v1_checkpoint_encoded = [_]u8{
+    0x41, 0x46, 0x48, 0x41, 0x57, 0x41, 0x4c, 0x0a,
+    0x01, 0x00, 0x64, 0x00, 0x12, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x17, 0xcd, 0x85, 0x3d,
+    0xfe, 0x9c, 0x97, 0x17, 0x5d, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x7c, 0x05, 0x10, 0x29,
+    0x1d, 0x8b, 0x0a, 0x49, 0x7b, 0x22, 0x6d, 0x61,
+    0x6e, 0x69, 0x66, 0x65, 0x73, 0x74, 0x5f, 0x69,
+    0x64, 0x22, 0x3a, 0x22, 0x62, 0x61, 0x73, 0x65,
+    0x2d, 0x30, 0x30, 0x30, 0x31, 0x22, 0x2c, 0x22,
+    0x62, 0x61, 0x63, 0x6b, 0x75, 0x70, 0x5f, 0x6c,
+    0x73, 0x6e, 0x22, 0x3a, 0x32, 0x2c, 0x22, 0x63,
+    0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e,
+    0x74, 0x5f, 0x6c, 0x73, 0x6e, 0x22, 0x3a, 0x35,
+    0x2c, 0x22, 0x66, 0x69, 0x6c, 0x65, 0x5f, 0x63,
+    0x6f, 0x75, 0x6e, 0x74, 0x22, 0x3a, 0x32, 0x2c,
+    0x22, 0x74, 0x6f, 0x74, 0x61, 0x6c, 0x5f, 0x62,
+    0x79, 0x74, 0x65, 0x73, 0x22, 0x3a, 0x31, 0x35,
+    0x7d,
+};
+
 test "storage.ha compat decodes v1 replication record fixture" {
     const decoded = try replication_record.decode(&v1_encoded);
 
-    try std.testing.expectEqual(v1_record.kind, decoded.kind);
-    try std.testing.expectEqual(v1_record.payload_codec, decoded.payload_codec);
-    try std.testing.expectEqual(v1_record.flags, decoded.flags);
-    try std.testing.expectEqual(v1_record.cluster_id, decoded.cluster_id);
-    try std.testing.expectEqual(v1_record.shard_id, decoded.shard_id);
-    try std.testing.expectEqual(v1_record.table_id, decoded.table_id);
-    try std.testing.expectEqual(v1_record.timeline_id, decoded.timeline_id);
-    try std.testing.expectEqual(v1_record.epoch, decoded.epoch);
-    try std.testing.expectEqual(v1_record.lsn, decoded.lsn);
-    try std.testing.expectEqual(v1_record.previous_lsn, decoded.previous_lsn);
-    try std.testing.expectEqual(v1_record.commit_timestamp_ns, decoded.commit_timestamp_ns);
-    try std.testing.expectEqualStrings(v1_payload, decoded.payload);
+    try expectRecordEqual(v1_record, decoded);
 }
 
 test "storage.ha compat keeps v1 replication record encoding stable" {
@@ -126,18 +205,7 @@ test "storage.ha compat keeps v1 replication record encoding stable" {
 test "storage.ha compat decodes v1 timeline switch record fixture" {
     const decoded = try replication_record.decode(&v1_timeline_switch_encoded);
 
-    try std.testing.expectEqual(v1_timeline_switch_record.kind, decoded.kind);
-    try std.testing.expectEqual(v1_timeline_switch_record.payload_codec, decoded.payload_codec);
-    try std.testing.expectEqual(v1_timeline_switch_record.flags, decoded.flags);
-    try std.testing.expectEqual(v1_timeline_switch_record.cluster_id, decoded.cluster_id);
-    try std.testing.expectEqual(v1_timeline_switch_record.shard_id, decoded.shard_id);
-    try std.testing.expectEqual(v1_timeline_switch_record.table_id, decoded.table_id);
-    try std.testing.expectEqual(v1_timeline_switch_record.timeline_id, decoded.timeline_id);
-    try std.testing.expectEqual(v1_timeline_switch_record.epoch, decoded.epoch);
-    try std.testing.expectEqual(v1_timeline_switch_record.lsn, decoded.lsn);
-    try std.testing.expectEqual(v1_timeline_switch_record.previous_lsn, decoded.previous_lsn);
-    try std.testing.expectEqual(v1_timeline_switch_record.commit_timestamp_ns, decoded.commit_timestamp_ns);
-    try std.testing.expectEqualStrings(v1_timeline_switch_payload, decoded.payload);
+    try expectRecordEqual(v1_timeline_switch_record, decoded);
 }
 
 test "storage.ha compat keeps v1 timeline switch encoding stable" {
@@ -149,4 +217,46 @@ test "storage.ha compat keeps v1 timeline switch encoding stable" {
         encoded.len,
     );
     try std.testing.expectEqualSlices(u8, &v1_timeline_switch_encoded, encoded);
+}
+
+test "storage.ha compat decodes v1 base backup and checkpoint record fixtures" {
+    try expectRecordEqual(v1_backup_start_record, try replication_record.decode(&v1_backup_start_encoded));
+    try expectRecordEqual(v1_checkpoint_record, try replication_record.decode(&v1_checkpoint_encoded));
+}
+
+test "storage.ha compat keeps v1 base backup and checkpoint encodings stable" {
+    const backup_start_encoded = try replication_record.encodeAlloc(std.testing.allocator, v1_backup_start_record);
+    defer std.testing.allocator.free(backup_start_encoded);
+    try std.testing.expectEqualSlices(u8, &v1_backup_start_encoded, backup_start_encoded);
+
+    const checkpoint_encoded = try replication_record.encodeAlloc(std.testing.allocator, v1_checkpoint_record);
+    defer std.testing.allocator.free(checkpoint_encoded);
+    try std.testing.expectEqualSlices(u8, &v1_checkpoint_encoded, checkpoint_encoded);
+}
+
+test "storage.ha compat keeps v1 record kind tags stable" {
+    try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(replication_record.RecordKind.batch_mutation));
+    try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(replication_record.RecordKind.metadata_mutation));
+    try std.testing.expectEqual(@as(u16, 0x0003), @intFromEnum(replication_record.RecordKind.derived_effect));
+    try std.testing.expectEqual(@as(u16, 0x0010), @intFromEnum(replication_record.RecordKind.backup_start));
+    try std.testing.expectEqual(@as(u16, 0x0011), @intFromEnum(replication_record.RecordKind.backup_end));
+    try std.testing.expectEqual(@as(u16, 0x0012), @intFromEnum(replication_record.RecordKind.checkpoint));
+    try std.testing.expectEqual(@as(u16, 0x0013), @intFromEnum(replication_record.RecordKind.manifest));
+    try std.testing.expectEqual(@as(u16, 0x0014), @intFromEnum(replication_record.RecordKind.truncate));
+    try std.testing.expectEqual(@as(u16, 0x0020), @intFromEnum(replication_record.RecordKind.timeline_switch));
+}
+
+fn expectRecordEqual(expected: replication_record.Record, actual: replication_record.RecordView) !void {
+    try std.testing.expectEqual(expected.kind, actual.kind);
+    try std.testing.expectEqual(expected.payload_codec, actual.payload_codec);
+    try std.testing.expectEqual(expected.flags, actual.flags);
+    try std.testing.expectEqual(expected.cluster_id, actual.cluster_id);
+    try std.testing.expectEqual(expected.shard_id, actual.shard_id);
+    try std.testing.expectEqual(expected.table_id, actual.table_id);
+    try std.testing.expectEqual(expected.timeline_id, actual.timeline_id);
+    try std.testing.expectEqual(expected.epoch, actual.epoch);
+    try std.testing.expectEqual(expected.lsn, actual.lsn);
+    try std.testing.expectEqual(expected.previous_lsn, actual.previous_lsn);
+    try std.testing.expectEqual(expected.commit_timestamp_ns, actual.commit_timestamp_ns);
+    try std.testing.expectEqualStrings(expected.payload, actual.payload);
 }
