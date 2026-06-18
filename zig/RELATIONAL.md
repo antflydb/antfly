@@ -1073,8 +1073,9 @@ mutation-source, joined-mutation-source, and merge mutation plans while
 preserving the existing public entrypoints through facade aliases;
 `api/sql_adapter/ddl_plan.zig` owns the adapter-noop DDL, enum-type catalog,
 schema-namespace catalog, extension catalog, function/routine catalog, and
-authorization catalog plan containers, with the remaining DDL families
-scheduled to move through the same facade as their lowerers are extracted;
+authorization catalog, prepared-statement, and cursor/portal plan containers,
+with the remaining DDL families scheduled to move through the same facade as
+their lowerers are extracted;
 `api/sql_adapter/lower_expr.zig` owns the expression keyword, function-name, and
 tail-boundary predicates that the shared expression lowerer uses;
 `api/relational_sql.zig` keeps the public lowering entrypoints and maps adapter

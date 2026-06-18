@@ -447,6 +447,9 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     };
     const ExtensionToolContext = struct {
         server: Server,
+        authorization: ?[]const u8,
+        trusted_principal: ?[]const u8,
+        authenticated_identity: ?DelegatedIdentity,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
 
@@ -456,7 +459,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
-            return try callExtensionMcpTool(alloc, ctx.server, ctx.installed, ctx.tool.*, args);
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.authorization, ctx.trusted_principal, ctx.authenticated_identity, ctx.installed, ctx.tool.*, args);
         }
     };
 
@@ -499,7 +502,21 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
     for (extension_contexts, 0..) |*ctx, i| {
         const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try textResponse(server_ptr.alloc, 404, "extension not found");
-        ctx.* = .{ .server = server_ptr, .installed = installed, .tool = &extension_tools.items[i] };
+        ctx.* = .{
+            .server = server_ptr,
+            .authorization = req.authorization,
+            .trusted_principal = req.header(trusted_principal_header),
+            .authenticated_identity = if (authenticated_identity) |identity| .{
+                .username = identity.username,
+                .permissions = identity.permissions,
+                .row_filter = identity.row_filter,
+                .metadata_json = identity.metadata_json,
+                .roles = identity.roles,
+                .role_settings = identity.role_settings,
+            } else null,
+            .installed = installed,
+            .tool = &extension_tools.items[i],
+        };
     }
 
     var input_schemas: [mcp_tool_specs.len][]u8 = undefined;
@@ -844,7 +861,16 @@ fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+fn callExtensionMcpTool(
+    alloc: std.mem.Allocator,
+    server: anytype,
+    authorization: ?[]const u8,
+    trusted_principal: ?[]const u8,
+    authenticated_identity: ?DelegatedIdentity,
+    installed: *const extension_domain.InstalledExtension,
+    tool: ExtensionMcpTool,
+    args: std.json.Value,
+) !mcp.CallToolResult {
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
         if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
@@ -855,6 +881,9 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *c
         defer alloc.free(request_json);
         var host_context = ExtensionHostContext(@TypeOf(server)){
             .server = server,
+            .authorization = authorization,
+            .trusted_principal = trusted_principal,
+            .authenticated_identity = authenticated_identity,
             .installed = installed,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
@@ -885,24 +914,27 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *c
 fn ExtensionHostContext(comptime Server: type) type {
     return struct {
         server: Server,
+        authorization: ?[]const u8,
+        trusted_principal: ?[]const u8,
+        authenticated_identity: ?DelegatedIdentity,
         installed: *const extension_domain.InstalledExtension,
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
-            try ctx.requireCapability("db:read");
-            const table_name = try ctx.resolveTableName(table);
+            const table_target = try ctx.resolveTableTarget(table);
+            try requireExtensionTableAuthority(alloc, ctx.installed, ctx.authenticated_identity, table_target, "db:read", .read);
             const body = try extensionQueryBodyAlloc(alloc, query_json);
             defer alloc.free(body);
-            return try ctx.dispatchJson(alloc, .POST, table_name, "query", body);
+            return try ctx.dispatchJson(alloc, .POST, table_target, "query", body);
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
-            try ctx.requireCapability("db:write");
-            const table_name = try ctx.resolveTableName(table);
+            const table_target = try ctx.resolveTableTarget(table);
+            try requireExtensionTableAuthority(alloc, ctx.installed, ctx.authenticated_identity, table_target, "db:write", .write);
             const body = try extensionBatchBodyAlloc(alloc, writes_json);
             defer alloc.free(body);
-            return try ctx.dispatchJson(alloc, .POST, table_name, "batch", body);
+            return try ctx.dispatchJson(alloc, .POST, table_target, "batch", body);
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
@@ -937,20 +969,29 @@ fn ExtensionHostContext(comptime Server: type) type {
             return error.ExtensionCapabilityDenied;
         }
 
-        fn resolveTableName(ctx: *@This(), requested: []const u8) ![]const u8 {
-            return switch (ctx.installed.scope.kind) {
+        fn resolveTableTarget(ctx: *@This(), requested: []const u8) !catalog_resources.TableTarget {
+            const table_name = switch (ctx.installed.scope.kind) {
                 .table => ctx.installed.scope.table_name,
                 .cluster => requested,
-                .embedded_db => error.UnsupportedExtensionScope,
+                .embedded_db => return error.UnsupportedExtensionScope,
             };
+            return try extensionHostTableTarget(table_name);
         }
 
-        fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_name: []const u8, route: []const u8, body: []const u8) ![]u8 {
-            const uri = try std.fmt.allocPrint(alloc, "/tables/{s}/{s}", .{ table_name, route });
+        fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_target: catalog_resources.TableTarget, route: []const u8, body: []const u8) ![]u8 {
+            const table_uri = try catalogTableRouteAlloc(alloc, table_target.database_name, table_target.namespace_name, table_target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ table_uri, route });
             defer alloc.free(uri);
+            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |trusted_principal|
+                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = trusted_principal }}
+            else
+                &.{};
             var resp = try ctx.server.handle(.{
                 .method = method,
                 .uri = uri,
+                .headers = headers,
+                .authorization = ctx.authorization,
                 .content_type = "application/json",
                 .body = body,
             });
@@ -959,6 +1000,53 @@ fn ExtensionHostContext(comptime Server: type) type {
             return try alloc.dupe(u8, resp.body);
         }
     };
+}
+
+fn extensionHostTableTarget(table_name: []const u8) !catalog_resources.TableTarget {
+    const first_dot = std.mem.indexOfScalar(u8, table_name, '.');
+    if (first_dot == null) return try catalog_resources.tableTargetFromOptional(null, null, table_name);
+    const first = first_dot.?;
+    const rest = table_name[first + 1 ..];
+    const second_rel = std.mem.indexOfScalar(u8, rest, '.') orelse return error.UnsupportedExtensionTableTarget;
+    const second = first + 1 + second_rel;
+    if (std.mem.indexOfScalar(u8, table_name[second + 1 ..], '.') != null) return error.UnsupportedExtensionTableTarget;
+    return try catalog_resources.tableTargetFromOptional(table_name[0..first], table_name[first + 1 .. second], table_name[second + 1 ..]);
+}
+
+fn requireExtensionTableAuthority(
+    alloc: std.mem.Allocator,
+    installed: *const extension_domain.InstalledExtension,
+    authenticated_identity: ?DelegatedIdentity,
+    table_target: catalog_resources.TableTarget,
+    capability_name: []const u8,
+    permission_type: usermgr.PermissionType,
+) !void {
+    if (!try extensionInstallAllowsTableCapability(alloc, installed, capability_name, table_target)) {
+        return error.ExtensionCapabilityDenied;
+    }
+    const identity = authenticated_identity orelse return;
+    const resource = try catalog_resources.tableResourceNameAlloc(alloc, table_target.database_name, table_target.namespace_name, table_target.table_name);
+    defer alloc.free(resource);
+    if (!identityHasPermission(identity.permissions, .table, resource, permission_type)) {
+        return error.PermissionDenied;
+    }
+}
+
+fn extensionInstallAllowsTableCapability(
+    alloc: std.mem.Allocator,
+    installed: *const extension_domain.InstalledExtension,
+    capability_name: []const u8,
+    table_target: catalog_resources.TableTarget,
+) !bool {
+    const resource = try catalog_resources.tableResourceNameAlloc(alloc, table_target.database_name, table_target.namespace_name, table_target.table_name);
+    defer alloc.free(resource);
+    for (installed.granted_capabilities) |capability| {
+        if (!std.mem.eql(u8, capability.name, capability_name)) continue;
+        if (capability.scope.len == 0 or std.mem.eql(u8, capability.scope, installed.package_name)) return true;
+        if (std.mem.eql(u8, capability.scope, "*")) return true;
+        if (catalog_resources.tableResourceMatches(capability.scope, resource)) return true;
+    }
+    return false;
 }
 
 fn extensionBatchBodyAlloc(alloc: std.mem.Allocator, writes_json: []const u8) ![]u8 {
@@ -1489,4 +1577,44 @@ test "mcp table tools expose catalog fields and route supported catalog lifecycl
     var unrelated_table_read = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
     defer unrelated_table_read.deinit(alloc);
     try std.testing.expect(!identityCanListTables(&.{unrelated_table_read}));
+}
+
+test "extension table host imports require install capability and caller table permission" {
+    const alloc = std.testing.allocator;
+    const target = try extensionHostTableTarget("default.public.docs");
+    try std.testing.expectEqualStrings("default", target.database_name);
+    try std.testing.expectEqualStrings("public", target.namespace_name);
+    try std.testing.expectEqualStrings("docs", target.table_name);
+    try std.testing.expectError(error.UnsupportedExtensionTableTarget, extensionHostTableTarget("analytics.docs"));
+
+    const granted = [_]extension_domain.Capability{
+        .{ .name = "db:read", .scope = "default.public.docs" },
+    };
+    const installed = extension_domain.InstalledExtension{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:abc",
+        .scope = .{ .kind = .table, .table_name = "default.public.docs" },
+        .granted_capabilities = &granted,
+        .status = .ready,
+    };
+
+    var read_docs = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer read_docs.deinit(alloc);
+    var read_other = try usermgr.Permission.initOwned(alloc, .table, "other", .read);
+    defer read_other.deinit(alloc);
+
+    const allowed_identity = DelegatedIdentity{
+        .username = "alice",
+        .permissions = &.{read_docs},
+    };
+    const denied_identity = DelegatedIdentity{
+        .username = "alice",
+        .permissions = &.{read_other},
+    };
+
+    try requireExtensionTableAuthority(alloc, &installed, allowed_identity, target, "db:read", .read);
+    try std.testing.expectError(error.PermissionDenied, requireExtensionTableAuthority(alloc, &installed, denied_identity, target, "db:read", .read));
+    try std.testing.expectError(error.ExtensionCapabilityDenied, requireExtensionTableAuthority(alloc, &installed, allowed_identity, target, "db:write", .write));
 }

@@ -170,6 +170,17 @@ pub const CreateRolePlan = sql_adapter.CreateRolePlan;
 pub const AlterRolePlan = sql_adapter.AlterRolePlan;
 pub const DropRolePlan = sql_adapter.DropRolePlan;
 pub const PrivilegeChangePlan = sql_adapter.PrivilegeChangePlan;
+pub const PreparedStatementPlan = sql_adapter.PreparedStatementPlan;
+pub const PrepareStatementPlan = sql_adapter.PrepareStatementPlan;
+pub const PreparedStatementSubjectKind = sql_adapter.PreparedStatementSubjectKind;
+pub const ExecutePreparedStatementPlan = sql_adapter.ExecutePreparedStatementPlan;
+pub const DeallocatePreparedStatementPlan = sql_adapter.DeallocatePreparedStatementPlan;
+pub const CursorPortalPlan = sql_adapter.CursorPortalPlan;
+pub const DeclareCursorPortalPlan = sql_adapter.DeclareCursorPortalPlan;
+pub const CursorScrollMode = sql_adapter.CursorScrollMode;
+pub const FetchCursorPortalPlan = sql_adapter.FetchCursorPortalPlan;
+pub const CursorFetchDirection = sql_adapter.CursorFetchDirection;
+pub const CloseCursorPortalPlan = sql_adapter.CloseCursorPortalPlan;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -1148,125 +1159,6 @@ pub const ClusterMaintenancePlan = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         if (self.index_name) |index_name| alloc.free(index_name);
-        self.* = undefined;
-    }
-};
-
-pub const PreparedStatementPlan = union(enum) {
-    prepare: PrepareStatementPlan,
-    execute: ExecutePreparedStatementPlan,
-    deallocate: DeallocatePreparedStatementPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .prepare => |*plan| plan.deinit(alloc),
-            .execute => |*plan| plan.deinit(alloc),
-            .deallocate => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const PrepareStatementPlan = struct {
-    statement_name: []const u8,
-    parameter_count: usize = 0,
-    statement_kind: PreparedStatementSubjectKind,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.statement_name);
-        self.* = undefined;
-    }
-};
-
-pub const PreparedStatementSubjectKind = enum {
-    read,
-    write,
-    ddl,
-};
-
-pub const ExecutePreparedStatementPlan = struct {
-    statement_name: []const u8,
-    argument_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.statement_name);
-        self.* = undefined;
-    }
-};
-
-pub const DeallocatePreparedStatementPlan = struct {
-    statement_name: ?[]const u8 = null,
-    all: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.statement_name) |name| alloc.free(name);
-        self.* = undefined;
-    }
-};
-
-pub const CursorPortalPlan = union(enum) {
-    declare: DeclareCursorPortalPlan,
-    fetch: FetchCursorPortalPlan,
-    close: CloseCursorPortalPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .declare => |*plan| plan.deinit(alloc),
-            .fetch => |*plan| plan.deinit(alloc),
-            .close => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const DeclareCursorPortalPlan = struct {
-    portal_name: []const u8,
-    scroll: CursorScrollMode = .default,
-    binary: bool = false,
-    hold: bool = false,
-    statement_kind: PreparedStatementSubjectKind,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.portal_name);
-        self.* = undefined;
-    }
-};
-
-pub const CursorScrollMode = enum {
-    default,
-    scroll,
-    no_scroll,
-};
-
-pub const FetchCursorPortalPlan = struct {
-    portal_name: []const u8,
-    direction: CursorFetchDirection = .next,
-    count: ?i64 = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.portal_name);
-        self.* = undefined;
-    }
-};
-
-pub const CursorFetchDirection = enum {
-    next,
-    prior,
-    first,
-    last,
-    absolute,
-    relative,
-    forward,
-    backward,
-    all,
-};
-
-pub const CloseCursorPortalPlan = struct {
-    portal_name: ?[]const u8 = null,
-    all: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.portal_name) |portal| alloc.free(portal);
         self.* = undefined;
     }
 };

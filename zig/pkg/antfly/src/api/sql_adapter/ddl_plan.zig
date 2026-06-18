@@ -292,6 +292,125 @@ pub const PrivilegeChangePlan = struct {
     }
 };
 
+pub const PreparedStatementPlan = union(enum) {
+    prepare: PrepareStatementPlan,
+    execute: ExecutePreparedStatementPlan,
+    deallocate: DeallocatePreparedStatementPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .prepare => |*plan| plan.deinit(alloc),
+            .execute => |*plan| plan.deinit(alloc),
+            .deallocate => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const PrepareStatementPlan = struct {
+    statement_name: []const u8,
+    parameter_count: usize = 0,
+    statement_kind: PreparedStatementSubjectKind,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.statement_name);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedStatementSubjectKind = enum {
+    read,
+    write,
+    ddl,
+};
+
+pub const ExecutePreparedStatementPlan = struct {
+    statement_name: []const u8,
+    argument_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.statement_name);
+        self.* = undefined;
+    }
+};
+
+pub const DeallocatePreparedStatementPlan = struct {
+    statement_name: ?[]const u8 = null,
+    all: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.statement_name) |name| alloc.free(name);
+        self.* = undefined;
+    }
+};
+
+pub const CursorPortalPlan = union(enum) {
+    declare: DeclareCursorPortalPlan,
+    fetch: FetchCursorPortalPlan,
+    close: CloseCursorPortalPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .declare => |*plan| plan.deinit(alloc),
+            .fetch => |*plan| plan.deinit(alloc),
+            .close => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const DeclareCursorPortalPlan = struct {
+    portal_name: []const u8,
+    scroll: CursorScrollMode = .default,
+    binary: bool = false,
+    hold: bool = false,
+    statement_kind: PreparedStatementSubjectKind,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.portal_name);
+        self.* = undefined;
+    }
+};
+
+pub const CursorScrollMode = enum {
+    default,
+    scroll,
+    no_scroll,
+};
+
+pub const FetchCursorPortalPlan = struct {
+    portal_name: []const u8,
+    direction: CursorFetchDirection = .next,
+    count: ?i64 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.portal_name);
+        self.* = undefined;
+    }
+};
+
+pub const CursorFetchDirection = enum {
+    next,
+    prior,
+    first,
+    last,
+    absolute,
+    relative,
+    forward,
+    backward,
+    all,
+};
+
+pub const CloseCursorPortalPlan = struct {
+    portal_name: ?[]const u8 = null,
+    all: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.portal_name) |portal| alloc.free(portal);
+        self.* = undefined;
+    }
+};
+
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
@@ -377,4 +496,47 @@ test "SQL adapter DDL function and authorization plans own strings" {
         .principal_name = try alloc.dupe(u8, "app_user"),
     } };
     grant.deinit(alloc);
+}
+
+test "SQL adapter DDL prepared statement and cursor plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var prepare: PreparedStatementPlan = .{ .prepare = .{
+        .statement_name = try alloc.dupe(u8, "usage_plan"),
+        .parameter_count = 2,
+        .statement_kind = .write,
+    } };
+    prepare.deinit(alloc);
+
+    var execute: PreparedStatementPlan = .{ .execute = .{
+        .statement_name = try alloc.dupe(u8, "usage_plan"),
+        .argument_count = 2,
+    } };
+    execute.deinit(alloc);
+
+    var deallocate: PreparedStatementPlan = .{ .deallocate = .{
+        .statement_name = try alloc.dupe(u8, "usage_plan"),
+    } };
+    deallocate.deinit(alloc);
+
+    var declare: CursorPortalPlan = .{ .declare = .{
+        .portal_name = try alloc.dupe(u8, "usage_cursor"),
+        .scroll = .scroll,
+        .binary = true,
+        .hold = true,
+        .statement_kind = .read,
+    } };
+    declare.deinit(alloc);
+
+    var fetch: CursorPortalPlan = .{ .fetch = .{
+        .portal_name = try alloc.dupe(u8, "usage_cursor"),
+        .direction = .forward,
+        .count = 10,
+    } };
+    fetch.deinit(alloc);
+
+    var close: CursorPortalPlan = .{ .close = .{
+        .portal_name = try alloc.dupe(u8, "usage_cursor"),
+    } };
+    close.deinit(alloc);
 }

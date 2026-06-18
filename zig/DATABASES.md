@@ -218,7 +218,7 @@ A2A agent cards should advertise catalog-scoped skills, such as:
 ```json
 {
   "skill": "query_table",
-  "scopes": ["database:tenant_ops", "namespace:analytics", "table:events"]
+  "scopes": ["database:tenant_ops", "namespace:tenant_ops.analytics", "table:tenant_ops.analytics.events"]
 }
 ```
 
@@ -268,6 +268,7 @@ table:tenant_ops.analytics.events
 SQL authorization should map onto those resource names:
 
 ```sql
+-- Execute with current database tenant_ops.
 GRANT USAGE ON DATABASE tenant_ops TO app_reader;
 GRANT USAGE ON SCHEMA analytics TO app_reader;
 GRANT SELECT ON TABLE analytics.events TO app_reader;
@@ -311,6 +312,13 @@ A2A delegated query_table tasks use the same principal and target.
 CLI table commands emit the same OpenAPI requests as hand-written HTTP calls.
 Qualified table grants do not leak across databases or namespaces.
 ```
+
+Until table query/write/storage APIs accept native catalog targets, A2A
+non-default table execution remains fail-closed. Agent cards may advertise the
+default catalog scope, and task handlers must reject explicit non-default
+database or namespace targets rather than silently resolving them against
+`default.public`. Enabling non-default A2A execution requires the same
+catalog-aware table I/O path used by explicit REST subroutes.
 
 ### Integration Contract by Surface
 

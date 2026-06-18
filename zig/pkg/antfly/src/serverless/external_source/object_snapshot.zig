@@ -23,6 +23,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const external_source = @import("types.zig");
+const object_storage = @import("../../storage/object_storage.zig");
 
 pub const ListedObject = struct {
     key: []const u8,
@@ -37,8 +38,94 @@ pub const ListedObject = struct {
     }
 };
 
+pub const ObjectStorageSnapshotRequest = struct {
+    client: object_storage.ObjectStorage,
+    bucket: []const u8,
+    prefix: []const u8 = &.{},
+    source_id: []const u8,
+    source_uri: []const u8,
+    schema_fingerprint: []const u8,
+    max_keys: u32 = 1000,
+
+    pub fn validate(self: ObjectStorageSnapshotRequest) !void {
+        if (self.bucket.len == 0) return error.InvalidExternalSourceSnapshot;
+        if (self.source_id.len == 0) return error.InvalidExternalSourceSnapshot;
+        if (self.source_uri.len == 0) return error.InvalidExternalSourceSnapshot;
+        if (self.schema_fingerprint.len == 0) return error.InvalidExternalSourceSnapshot;
+        if (self.max_keys == 0) return error.InvalidExternalSourceSnapshot;
+    }
+};
+
 pub fn isParquetDataObject(key: []const u8) bool {
     return std.mem.endsWith(u8, key, ".parquet");
+}
+
+pub fn planParquetPrefixInventoryFromObjectStorageAlloc(
+    alloc: Allocator,
+    request: ObjectStorageSnapshotRequest,
+) !external_source.Inventory {
+    try request.validate();
+
+    const list_prefix = try normalizedListPrefixAlloc(alloc, request.prefix);
+    defer alloc.free(list_prefix);
+
+    var listed_objects = std.ArrayListUnmanaged(ListedObject).empty;
+    defer {
+        for (listed_objects.items) |object| {
+            alloc.free(@constCast(object.key));
+            if (object.etag.len != 0) alloc.free(@constCast(object.etag));
+            if (object.version_id.len != 0) alloc.free(@constCast(object.version_id));
+        }
+        listed_objects.deinit(alloc);
+    }
+
+    var client = request.client;
+    client.allocator = alloc;
+    var next_token: ?[]u8 = null;
+    defer if (next_token) |token| alloc.free(token);
+
+    while (true) {
+        var page = try client.listObjects(request.bucket, .{
+            .prefix = list_prefix,
+            .recursive = true,
+            .continuation_token = next_token,
+            .max_keys = request.max_keys,
+        });
+        defer page.deinit(alloc);
+
+        for (page.entries) |entry| {
+            if (!isParquetDataObject(entry.key)) continue;
+            const relative_key = try relativeKeyForPrefixAlloc(alloc, list_prefix, entry.key);
+            errdefer alloc.free(relative_key);
+
+            const version = try objectVersionForListEntryAlloc(alloc, &client, request.bucket, entry);
+            errdefer {
+                if (version.etag.len != 0) alloc.free(@constCast(version.etag));
+                if (version.version_id.len != 0) alloc.free(@constCast(version.version_id));
+            }
+
+            try listed_objects.append(alloc, .{
+                .key = relative_key,
+                .byte_len = entry.size,
+                .etag = version.etag,
+                .version_id = version.version_id,
+            });
+        }
+
+        if (page.next_continuation_token) |token| {
+            const owned_next = try alloc.dupe(u8, token);
+            if (next_token) |old| alloc.free(old);
+            next_token = owned_next;
+        } else break;
+    }
+
+    return try planParquetPrefixInventoryAlloc(
+        alloc,
+        request.source_id,
+        request.source_uri,
+        request.schema_fingerprint,
+        listed_objects.items,
+    );
 }
 
 pub fn planParquetPrefixInventoryAlloc(
@@ -195,6 +282,57 @@ fn objectUriAlloc(alloc: Allocator, source_uri: []const u8, key: []const u8) ![]
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_uri, key });
 }
 
+fn normalizedListPrefixAlloc(alloc: Allocator, prefix: []const u8) ![]u8 {
+    const trimmed = trimSlashes(prefix);
+    if (trimmed.len == 0) return try alloc.alloc(u8, 0);
+    if (std.mem.endsWith(u8, trimmed, "/")) return try alloc.dupe(u8, trimmed);
+    return try std.fmt.allocPrint(alloc, "{s}/", .{trimmed});
+}
+
+fn trimSlashes(value: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < value.len and value[start] == '/') : (start += 1) {}
+    var end = value.len;
+    while (end > start and value[end - 1] == '/') : (end -= 1) {}
+    return value[start..end];
+}
+
+fn relativeKeyForPrefixAlloc(alloc: Allocator, list_prefix: []const u8, key: []const u8) ![]u8 {
+    const relative = if (list_prefix.len == 0) key else blk: {
+        if (!std.mem.startsWith(u8, key, list_prefix)) return error.InvalidExternalSourceSnapshot;
+        break :blk key[list_prefix.len..];
+    };
+    if (relative.len == 0) return error.InvalidExternalSourceSnapshot;
+    return try alloc.dupe(u8, relative);
+}
+
+const ObjectVersionIdentity = struct {
+    etag: []const u8 = &.{},
+    version_id: []const u8 = &.{},
+};
+
+fn objectVersionForListEntryAlloc(
+    alloc: Allocator,
+    client: *object_storage.ObjectStorage,
+    bucket: []const u8,
+    entry: object_storage.ListEntry,
+) !ObjectVersionIdentity {
+    if (entry.etag) |etag| {
+        if (etag.len != 0) {
+            return .{ .etag = try alloc.dupe(u8, etag) };
+        }
+    }
+
+    var attrs = try client.getObjectAttributes(bucket, entry.key);
+    defer attrs.deinit(alloc);
+    const etag: []const u8 = if (attrs.etag) |etag| try alloc.dupe(u8, etag) else &.{};
+    errdefer if (etag.len != 0) alloc.free(@constCast(etag));
+    const version_id: []const u8 = if (attrs.version_id) |version| try alloc.dupe(u8, version) else &.{};
+    errdefer if (version_id.len != 0) alloc.free(@constCast(version_id));
+    if (etag.len == 0 and version_id.len == 0) return error.InvalidExternalSourceSnapshot;
+    return .{ .etag = etag, .version_id = version_id };
+}
+
 test "raw parquet prefix snapshot is deterministic across listing order" {
     const alloc = std.testing.allocator;
     const listing_a = [_]ListedObject{
@@ -255,4 +393,54 @@ test "raw parquet prefix snapshot rejects empty and unversioned listings" {
         error.InvalidExternalSourceSnapshot,
         planParquetPrefixInventoryAlloc(alloc, "logs", "s3://bucket/logs", "schema-v1", &unversioned),
     );
+}
+
+test "raw parquet prefix snapshot plans from object storage listing" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put_a = try client.putObject("bucket", "events/part-b.parquet", "bbbb", .{});
+    defer put_a.deinit(alloc);
+    var put_b = try client.putObject("bucket", "events/_SUCCESS", "ok", .{});
+    defer put_b.deinit(alloc);
+    var put_c = try client.putObject("bucket", "events/nested/part-a.parquet", "aaaaaa", .{});
+    defer put_c.deinit(alloc);
+    var put_d = try client.putObject("bucket", "other/part-c.parquet", "cccc", .{});
+    defer put_d.deinit(alloc);
+
+    var inventory = try planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
+        .client = client,
+        .bucket = "bucket",
+        .prefix = "events",
+        .source_id = "events",
+        .source_uri = "s3://bucket/events",
+        .schema_fingerprint = "schema-v1",
+    });
+    defer inventory.deinit(alloc);
+
+    try std.testing.expectEqual(external_source.Format.parquet, inventory.format);
+    try std.testing.expectEqualStrings("events", inventory.source_id);
+    try std.testing.expectEqualStrings("s3://bucket/events", inventory.source_uri);
+    try std.testing.expect(std.mem.startsWith(u8, inventory.snapshot_id, "sha256:"));
+    try std.testing.expectEqual(@as(usize, 2), inventory.files.len);
+    try std.testing.expectEqualStrings("nested/part-a.parquet", inventory.files[0].file_id);
+    try std.testing.expectEqualStrings("s3://bucket/events/nested/part-a.parquet", inventory.files[0].object_uri);
+    try std.testing.expectEqual(@as(u64, 6), inventory.files[0].byte_len);
+    try std.testing.expect(inventory.files[0].etag.len != 0);
+    try std.testing.expectEqualStrings("part-b.parquet", inventory.files[1].file_id);
+    try std.testing.expectEqualStrings("s3://bucket/events/part-b.parquet", inventory.files[1].object_uri);
+
+    var inventory_again = try planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
+        .client = client,
+        .bucket = "bucket",
+        .prefix = "/events/",
+        .source_id = "events",
+        .source_uri = "s3://bucket/events",
+        .schema_fingerprint = "schema-v1",
+    });
+    defer inventory_again.deinit(alloc);
+    try std.testing.expectEqualStrings(inventory.snapshot_id, inventory_again.snapshot_id);
 }
