@@ -832,6 +832,22 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert promoted["fence_generation"] == fence["receipt"]["generation"]
     assert promoted["fence_token"] == fence["receipt"]["token"]
 
+    promoted_write_check = ha_cluster.standby.admin_post(
+        "/write/check",
+        {
+            "role": "standby",
+            "expected_identity": {
+                **_identity(ha_cluster),
+                "timeline_id": 2,
+                "epoch": 2,
+            },
+        },
+    )
+    assert promoted_write_check["decision"]["role"] == "promoted_standby"
+    assert promoted_write_check["decision"]["action"] == "open_promoted_primary"
+    assert promoted_write_check["decision"]["durable_lsn"] == promoted["promotion"]["switch_lsn"]
+    assert promoted_write_check["decision"]["next_lsn"] == promoted["promotion"]["switch_lsn"] + 1
+
     primary_fence = ha_cluster.primary.admin_post("/fence", fence_request)
     _assert_action_receipt(
         primary_fence,
