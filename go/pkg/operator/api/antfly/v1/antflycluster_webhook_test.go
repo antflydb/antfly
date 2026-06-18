@@ -1913,6 +1913,15 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testin
 	if !strings.Contains(err.Error(), "admin.tokenEnvVar") {
 		t.Fatalf("expected admin.tokenEnvVar validation error, got: %v", err)
 	}
+
+	cluster.Spec.HighAvailability.Admin.TokenEnvVar = "   "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected whitespace HA admin token environment variable to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.tokenEnvVar must not be whitespace") {
+		t.Fatalf("expected admin.tokenEnvVar whitespace validation error, got: %v", err)
+	}
 }
 
 func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *testing.T) {
