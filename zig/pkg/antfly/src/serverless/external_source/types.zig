@@ -38,6 +38,8 @@ pub const ColumnChunk = struct {
     decimal_scale: i32 = 0,
     stats_min_i64: ?i64 = null,
     stats_max_i64: ?i64 = null,
+    stats_min_bytes: ?[]u8 = null,
+    stats_max_bytes: ?[]u8 = null,
     nullable: bool = false,
 
     pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
@@ -46,6 +48,8 @@ pub const ColumnChunk = struct {
         if (self.encoding.len > 0) alloc.free(self.encoding);
         if (self.physical_type.len > 0) alloc.free(self.physical_type);
         if (self.logical_type.len > 0) alloc.free(self.logical_type);
+        if (self.stats_min_bytes) |value| alloc.free(value);
+        if (self.stats_max_bytes) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -55,6 +59,11 @@ pub const ColumnChunk = struct {
         if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
         if (self.compressed_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
         if (self.stats_min_i64 != null and self.stats_max_i64 != null and self.stats_min_i64.? > self.stats_max_i64.?) return error.InvalidExternalSourceInventory;
+        if ((self.stats_min_bytes == null) != (self.stats_max_bytes == null)) return error.InvalidExternalSourceInventory;
+        if (self.stats_min_bytes) |min| {
+            const max = self.stats_max_bytes.?;
+            if (std.mem.order(u8, min, max) == .gt) return error.InvalidExternalSourceInventory;
+        }
     }
 };
 
