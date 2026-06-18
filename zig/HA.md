@@ -646,6 +646,14 @@ comparable to `pg_rewind`, deeper synchronous commit policy support, WAL archive
 or PITR-like recovery options, robust observability, optional cascading or relay
 replication, and operator workflows that make the common cases boring.
 
+Treat those review points as acceptance gates, not follow-up polish:
+`classifyHAString` can land before the full HA runtime, but it must preserve
+field-specific errors; `test_standby.py` must prove a real primary/standby
+process path, not just argument validation; simulation coverage must own
+crash/replay/promotion correctness; and production readiness requires the
+failure cases to be first-class before automatic promotion or synchronous commit
+is advertised as supported.
+
 ## Test Strategy
 
 HA needs both black-box e2e coverage and deterministic simulation coverage. The
