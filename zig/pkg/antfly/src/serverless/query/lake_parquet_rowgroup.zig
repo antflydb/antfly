@@ -32,6 +32,18 @@ pub const ColumnChunkInput = struct {
     }
 };
 
+pub const RowGroupInput = struct {
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    chunks: []const ColumnChunkInput,
+
+    pub fn validate(self: RowGroupInput) !void {
+        if (self.file_id.len == 0) return error.InvalidParquetRowGroupBatch;
+        if (self.chunks.len == 0) return error.InvalidParquetRowGroupBatch;
+        for (self.chunks) |chunk| try chunk.validate();
+    }
+};
+
 pub const OwnedBatch = struct {
     batch: rowsource.ColumnBatch,
     row_refs: []rowsource.RowRef,
@@ -47,6 +59,67 @@ pub const OwnedBatch = struct {
         alloc.free(self.columns);
         alloc.free(self.row_refs);
         self.* = undefined;
+    }
+};
+
+pub const RowGroupSource = struct {
+    inventory: external_source.Inventory,
+    row_groups: []const RowGroupInput,
+    next_index: usize = 0,
+    current: ?OwnedBatch = null,
+
+    pub fn init(inventory: external_source.Inventory, row_groups: []const RowGroupInput) !RowGroupSource {
+        try inventory.validate();
+        if (inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+        if (row_groups.len == 0) return error.InvalidParquetRowGroupBatch;
+        for (row_groups) |row_group| try row_group.validate();
+        return .{
+            .inventory = inventory,
+            .row_groups = row_groups,
+        };
+    }
+
+    pub fn deinit(self: *RowGroupSource, alloc: Allocator) void {
+        self.clearCurrent(alloc);
+        self.* = undefined;
+    }
+
+    pub fn rowSource(self: *RowGroupSource) rowsource.Source {
+        return .{
+            .kind = .external_parquet,
+            .ctx = self,
+            .next_batch = nextBatch,
+            .deinit_fn = deinitSource,
+        };
+    }
+
+    fn nextBatch(ctx: *anyopaque, alloc: Allocator) !?rowsource.ColumnBatch {
+        const self: *RowGroupSource = @ptrCast(@alignCast(ctx));
+        self.clearCurrent(alloc);
+        if (self.next_index >= self.row_groups.len) return null;
+
+        const input = self.row_groups[self.next_index];
+        self.next_index += 1;
+        self.current = try buildRequiredPlainI64RowGroupBatchAlloc(
+            alloc,
+            self.inventory,
+            input.file_id,
+            input.row_group_ordinal,
+            input.chunks,
+        );
+        return self.current.?.batch;
+    }
+
+    fn deinitSource(ctx: *anyopaque, alloc: Allocator) void {
+        const self: *RowGroupSource = @ptrCast(@alignCast(ctx));
+        self.clearCurrent(alloc);
+    }
+
+    fn clearCurrent(self: *RowGroupSource, alloc: Allocator) void {
+        if (self.current) |*current| {
+            current.deinit(alloc);
+            self.current = null;
+        }
     }
 };
 
@@ -261,6 +334,91 @@ test "parquet row group batch assembles decoded i64 columns with external row re
     try std.testing.expectEqualStrings("part-a.parquet", first_ref.file_id);
     try std.testing.expectEqual(@as(u32, 0), first_ref.row_group_ordinal);
     try std.testing.expectEqual(@as(u64, 0), first_ref.row_ordinal);
+}
+
+test "parquet row group source scans through lake rows" {
+    const alloc = std.testing.allocator;
+    const lake_rows = @import("lake_rows.zig");
+
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2048,
+        .row_count = 4,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
+            .{
+                .ordinal = 0,
+                .row_count = 2,
+                .file_offset = 100,
+                .total_byte_len = 64,
+                .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 100,
+                    .compressed_len = 64,
+                    .uncompressed_len = 64,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                }}),
+            },
+            .{
+                .ordinal = 1,
+                .row_count = 2,
+                .file_offset = 200,
+                .total_byte_len = 64,
+                .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 200,
+                    .compressed_len = 64,
+                    .uncompressed_len = 64,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                }}),
+            },
+        }),
+    };
+    try inventory.validate();
+
+    var first_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer first_chunk.deinit(alloc);
+    try appendPlainI64DataPage(&first_chunk, alloc, &[_]i64{ 10, 20 });
+    var second_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer second_chunk.deinit(alloc);
+    try appendPlainI64DataPage(&second_chunk, alloc, &[_]i64{ 30, 40 });
+
+    const first_chunks = [_]ColumnChunkInput{.{ .column_id = "amount", .bytes = first_chunk.items }};
+    const second_chunks = [_]ColumnChunkInput{.{ .column_id = "amount", .bytes = second_chunk.items }};
+    const row_groups = [_]RowGroupInput{
+        .{ .file_id = "part-a.parquet", .row_group_ordinal = 0, .chunks = &first_chunks },
+        .{ .file_id = "part-a.parquet", .row_group_ordinal = 1, .chunks = &second_chunks },
+    };
+    var source = try RowGroupSource.init(inventory, &row_groups);
+    defer source.deinit(alloc);
+
+    const projection = [_][]const u8{"amount"};
+    var result = try lake_rows.scanRowsAlloc(alloc, source.rowSource(), .{
+        .projected_columns = &projection,
+        .predicate = .{
+            .column = "amount",
+            .op = .eq_i64,
+            .i64_value = 30,
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 30), result.rows[0].find("amount").?.value.?.i64);
+    const row_ref = result.rows[0].row_ref.external;
+    try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
+    try std.testing.expectEqual(@as(u32, 1), row_ref.row_group_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), row_ref.row_ordinal);
 }
 
 test "parquet row group batch rejects mismatched decoded row counts" {
