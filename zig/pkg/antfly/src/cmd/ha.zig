@@ -996,7 +996,7 @@ fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
         },
         .padded => return haPathInvalidError(field),
     }
-    if (!ha_validation.isNormalizedPath(path)) return haPathInvalidError(field);
+    if (!ha_validation.isAbsoluteNormalizedPath(path)) return haPathInvalidError(field);
     return path;
 }
 
@@ -1081,10 +1081,10 @@ fn printUsage(argv0: []const u8) void {
         \\
         \\examples:
         \\  {s} ha --ha-url http://127.0.0.1:8081 --ha-token-env ANTFLY_HA_ADMIN_TOKEN -- status primary
-        \\  {s} ha --primary-log primary.wal --primary-slots slots.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
-        \\  {s} ha --standby-log standby.wal --standby-progress progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
-        \\  {s} ha --primary-log primary.wal --primary-slots slots.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
-        \\  {s} ha --standby-log standby.wal --standby-progress progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
+        \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
+        \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
+        \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
+        \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
         \\
     , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
 }
@@ -1092,8 +1092,8 @@ fn printUsage(argv0: []const u8) void {
 test "ha cmd parses local handles before admin command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
-        "--primary-log",     "p.wal",
-        "--primary-slots",   "slots.wal",
+        "--primary-log",     "/tmp/p.wal",
+        "--primary-slots",   "/tmp/slots.wal",
         "--primary-node-id", "primary-a",
         "--ha-cluster-id",   "10",
         "--ha-shard-id",     "20",
@@ -1105,7 +1105,7 @@ test "ha cmd parses local handles before admin command" {
     });
     defer parsed.deinit(alloc);
 
-    try std.testing.expectEqualStrings("p.wal", parsed.options.primary_log.?);
+    try std.testing.expectEqualStrings("/tmp/p.wal", parsed.options.primary_log.?);
     try std.testing.expectEqualStrings("primary-a", parsed.options.primary_node_id.?);
     try std.testing.expectEqual(@as(u64, 10), parsed.options.identity.cluster_id.?);
     try std.testing.expectEqual(@as(usize, 3), parsed.command_args.len);
@@ -1120,8 +1120,8 @@ test "ha cmd parses local handles before admin command" {
 test "ha cmd local handles default shard and table identity to whole instance" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
-        "--primary-log",    "p.wal",
-        "--primary-slots",  "slots.wal",
+        "--primary-log",    "/tmp/p.wal",
+        "--primary-slots",  "/tmp/slots.wal",
         "--ha-cluster-id",  "10",
         "--ha-timeline-id", "1",
         "--ha-epoch",       "2",
@@ -1139,8 +1139,8 @@ test "ha cmd local handles default shard and table identity to whole instance" {
 
     parsed.options.primary_log = null;
     parsed.options.primary_slots = null;
-    parsed.options.standby_log = "standby.wal";
-    parsed.options.standby_progress = "progress.wal";
+    parsed.options.standby_log = "/tmp/standby.wal";
+    parsed.options.standby_progress = "/tmp/progress.wal";
     const standby_identity = try parsed.options.standbyIdentity();
     try std.testing.expectEqual(@as(u64, 10), standby_identity.cluster_id);
     try std.testing.expectEqual(@as(u64, 0), standby_identity.shard_id);
@@ -1199,6 +1199,7 @@ test "ha cmd rejects padded or invalid HA local option strings" {
     try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", " http://127.0.0.1:8081", "--", "status", "primary" }));
     try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", "not-a-url", "--", "status", "primary" }));
     try std.testing.expectError(error.HAPrimaryLogInvalid, parseLocalArgs(alloc, &.{ "--primary-log", " p.wal", "--", "slot", "list" }));
+    try std.testing.expectError(error.HAPrimaryLogInvalid, parseLocalArgs(alloc, &.{ "--primary-log", "p.wal", "--", "slot", "list" }));
     try std.testing.expectError(error.HAPrimarySlotsInvalid, parseLocalArgs(alloc, &.{ "--primary-slots", "slots//wal", "--", "slot", "list" }));
     try std.testing.expectError(error.HAStandbyLogInvalid, parseLocalArgs(alloc, &.{ "--standby-log", "../standby.wal", "--", "status", "standby" }));
     try std.testing.expectError(error.HAStandbyProgressInvalid, parseLocalArgs(alloc, &.{ "--standby-progress", "progress.wal\n", "--", "status", "standby" }));
@@ -1729,7 +1730,7 @@ test "ha cmd renders typed JSON responses as dotted table fields" {
 test "ha cmd keeps promotion identity flags in admin command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
-        "--fence-wal", "fence.wal",
+        "--fence-wal", "/tmp/fence.wal",
         "promote",     "--cluster-id",
         "10",          "--shard-id",
         "20",          "--table-id",
@@ -1737,7 +1738,7 @@ test "ha cmd keeps promotion identity flags in admin command" {
     });
     defer parsed.deinit(alloc);
 
-    try std.testing.expectEqualStrings("fence.wal", parsed.options.fence_wal.?);
+    try std.testing.expectEqualStrings("/tmp/fence.wal", parsed.options.fence_wal.?);
     try std.testing.expectEqualStrings("promote", parsed.command_args[0]);
     try std.testing.expectEqualStrings("--cluster-id", parsed.command_args[1]);
 }
@@ -1871,7 +1872,7 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
 fn allocPrintPath(alloc: std.mem.Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
     return try std.fmt.allocPrint(
         alloc,
-        ".zig-cache/tmp/ha-cmd-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
+        "/tmp/antfly-ha-cmd-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
         .{ std.testing.random_seed, nonce },
     );
 }

@@ -76,6 +76,10 @@ pub fn isNormalizedPath(path: []const u8) bool {
     return true;
 }
 
+pub fn isAbsoluteNormalizedPath(path: []const u8) bool {
+    return std.fs.path.isAbsolute(path) and isNormalizedPath(path);
+}
+
 test "storage.ha validation classifies missing padded and valid strings" {
     try std.testing.expectEqual(StringValidation.missing, classifyString(null));
     try std.testing.expectEqual(StringValidation.missing, classifyString(""));
@@ -95,9 +99,11 @@ test "storage.ha validation checks identifiers env names and normalized paths" {
     try std.testing.expect(!isEnvVarName("9ANTFLY"));
     try std.testing.expect(!isEnvVarName("ANTFLY-HA"));
 
-    try std.testing.expect(isNormalizedPath("/tmp/ha-primary.wal"));
+    try std.testing.expect(isAbsoluteNormalizedPath("/tmp/ha-primary.wal"));
+    try std.testing.expect(!isAbsoluteNormalizedPath("ha/primary.wal"));
     try std.testing.expect(isNormalizedPath("ha/primary.wal"));
     try std.testing.expect(!isNormalizedPath("../ha-primary.wal"));
     try std.testing.expect(!isNormalizedPath("ha//primary.wal"));
     try std.testing.expect(!isNormalizedPath("."));
+    try std.testing.expect(!isAbsoluteNormalizedPath("/tmp/../ha-primary.wal"));
 }

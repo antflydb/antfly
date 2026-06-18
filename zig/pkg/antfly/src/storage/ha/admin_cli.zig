@@ -1378,7 +1378,7 @@ fn validateHAPath(raw: []const u8, field: HAPathField) ![]const u8 {
         },
         .padded => return haPathInvalidError(field),
     }
-    if (!validation.isNormalizedPath(raw)) return haPathInvalidError(field);
+    if (!validation.isAbsoluteNormalizedPath(raw)) return haPathInvalidError(field);
     return raw;
 }
 
@@ -1550,6 +1550,7 @@ test "storage.ha admin cli rejects padded and invalid HA strings" {
     try std.testing.expectError(error.InvalidSlotName, parse(alloc, &.{ "stream", "start", "--slot", "standby a", "--from-lsn", "1" }));
     try std.testing.expectError(error.InvalidSlotName, parse(alloc, &.{ "standby", "ack", "--slot", "standby-a\n", "--timeline-id", "1", "--received-lsn", "1", "--applied-lsn", "1" }));
     try std.testing.expectError(error.InvalidNodeId, parse(alloc, &.{ "status", "primary", "--sync-mode", "remote-write", "--sync-standby", " standby-a" }));
+    try std.testing.expectError(error.ManifestPathInvalid, parse(alloc, &.{ "seed", "finish", "--manifest", "base.afha" }));
     try std.testing.expectError(error.ManifestPathInvalid, parse(alloc, &.{ "seed", "finish", "--manifest", "/tmp/../base.afha" }));
     try std.testing.expectError(error.ContentRootInvalid, parse(alloc, &.{ "seed", "bootstrap", "--manifest", "/tmp/base.afha", "--content-root", "/tmp//base" }));
     try std.testing.expectError(error.InvalidHAAdminURL, parse(alloc, &.{ "operator", "plan", "--primary-admin-url", " http://primary-ha.default.svc:8081" }));

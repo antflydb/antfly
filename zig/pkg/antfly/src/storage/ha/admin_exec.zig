@@ -1939,7 +1939,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
 fn allocPrintPath(alloc: Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
     return try std.fmt.allocPrint(
         alloc,
-        ".zig-cache/tmp/ha-admin-exec-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
+        "/tmp/antfly-ha-admin-exec-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
         .{ std.testing.random_seed, nonce },
     );
 }
