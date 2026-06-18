@@ -8356,17 +8356,17 @@ pub fn buildBulkHilbertSeeded(
 
     const leaf_groups = try bulk_build.planBalancedGroupSizes(self.alloc, entries.len, @max(@as(usize, 1), self.config.leaf_size));
     defer self.alloc.free(leaf_groups);
+    const group_inputs_scratch = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, @max(@as(usize, 1), self.config.leaf_size));
+    defer self.alloc.free(group_inputs_scratch);
 
     var entry_cursor: usize = 0;
     for (leaf_groups) |group_size| {
         const node_id = self.nextNodeId();
-        var group_inputs = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, group_size);
-        errdefer self.alloc.free(group_inputs);
+        const group_inputs = group_inputs_scratch[0..group_size];
         for (0..group_size) |i| {
             group_inputs[i] = entries[entry_cursor + i].input;
         }
         current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
-        self.alloc.free(group_inputs);
         current_count += 1;
         entry_cursor += group_size;
     }
@@ -8480,17 +8480,17 @@ pub fn buildBulkDocKeySeeded(
 
     const leaf_groups = try bulk_build.planBalancedGroupSizes(self.alloc, entries.len, @max(@as(usize, 1), self.config.leaf_size));
     defer self.alloc.free(leaf_groups);
+    const group_inputs_scratch = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, @max(@as(usize, 1), self.config.leaf_size));
+    defer self.alloc.free(group_inputs_scratch);
 
     var entry_cursor: usize = 0;
     for (leaf_groups) |group_size| {
         const node_id = self.nextNodeId();
-        var group_inputs = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, group_size);
-        errdefer self.alloc.free(group_inputs);
+        const group_inputs = group_inputs_scratch[0..group_size];
         for (0..group_size) |i| {
             group_inputs[i] = entries[entry_cursor + i].input;
         }
         current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
-        self.alloc.free(group_inputs);
         current_count += 1;
         entry_cursor += group_size;
     }
@@ -8555,6 +8555,8 @@ pub fn buildBulkKmeansFromInputs(
         for (current[0..current_count]) |*node| node.deinit(self.alloc);
         self.alloc.free(current);
     }
+    const group_inputs_scratch = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, leaf_size);
+    defer self.alloc.free(group_inputs_scratch);
 
     var cluster_start: usize = 0;
     while (cluster_start < entries.len) {
@@ -8569,13 +8571,11 @@ pub fn buildBulkKmeansFromInputs(
         var entry_cursor = cluster_start;
         for (leaf_groups) |group_size| {
             const node_id = self.nextNodeId();
-            var group_inputs = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, group_size);
-            errdefer self.alloc.free(group_inputs);
+            const group_inputs = group_inputs_scratch[0..group_size];
             for (0..group_size) |i| {
                 group_inputs[i] = inputs[entries[entry_cursor + i].point_index];
             }
             current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
-            self.alloc.free(group_inputs);
             current_count += 1;
             entry_cursor += group_size;
         }
@@ -9565,6 +9565,8 @@ fn buildBulkKmeansParentLevel(
         for (out[0..out_count]) |*node| node.deinit(self.alloc);
         self.alloc.free(out);
     }
+    const group_scratch = try self.alloc.alloc(usize, max_group_size);
+    defer self.alloc.free(group_scratch);
 
     var cluster_start: usize = 0;
     while (cluster_start < entries.len) {
@@ -9578,13 +9580,11 @@ fn buildBulkKmeansParentLevel(
 
         var entry_cursor = cluster_start;
         for (groups) |group_size| {
-            const group = try self.alloc.alloc(usize, group_size);
-            errdefer self.alloc.free(group);
+            const group = group_scratch[0..group_size];
             for (0..group_size) |i| {
                 group[i] = entries[entry_cursor + i].point_index;
             }
             out[out_count] = try buildBulkParentFromNodeIndexes(self, txn, nodes, group, level);
-            self.alloc.free(group);
             out_count += 1;
             entry_cursor += group_size;
         }
