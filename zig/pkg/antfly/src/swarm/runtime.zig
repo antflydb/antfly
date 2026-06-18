@@ -2206,6 +2206,8 @@ fn validateHARole(cli: CliConfig) !void {
     }
     if ((primary_requested or standby_requested) and cli.ha_fence_wal == null) return error.HAFenceWalMissing;
     if (primary_requested or standby_requested) try validateHAIdentity(cli);
+    if (primary_requested) try validateHAPrimaryRoleComplete(cli);
+    if (standby_requested) try validateHAStandbyRoleComplete(cli);
     if (haRetentionPolicyRequested(cli) and !primary_requested) return error.HARetentionPolicyRequiresPrimary;
     if (haSyncPolicyRequested(cli) and !primary_requested) return error.HASyncPolicyRequiresPrimary;
 }
@@ -2214,6 +2216,23 @@ fn validateHAIdentity(cli: CliConfig) !void {
     if (cli.ha_cluster_id == null) return error.HAClusterIdMissing;
     if (cli.ha_timeline_id == null) return error.HATimelineIdMissing;
     if (cli.ha_epoch == null) return error.HAEpochMissing;
+}
+
+fn missingHAString(value: ?[]const u8) bool {
+    const raw = value orelse return true;
+    return std.mem.trim(u8, raw, " \t\r\n").len == 0;
+}
+
+fn validateHAPrimaryRoleComplete(cli: CliConfig) !void {
+    if (missingHAString(cli.ha_primary_log)) return error.HAPrimaryLogMissing;
+    if (missingHAString(cli.ha_primary_slots)) return error.HAPrimarySlotsMissing;
+    if (missingHAString(cli.ha_primary_node_id)) return error.HAPrimaryNodeIdMissing;
+}
+
+fn validateHAStandbyRoleComplete(cli: CliConfig) !void {
+    if (missingHAString(cli.ha_standby_log)) return error.HAStandbyLogMissing;
+    if (missingHAString(cli.ha_standby_progress)) return error.HAStandbyProgressMissing;
+    if (missingHAString(cli.ha_standby_node_id)) return error.HAStandbyNodeIdMissing;
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
@@ -2913,6 +2932,8 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
         "/tmp/ha-primary.log",
         "--ha-primary-slots",
         "/tmp/ha-primary.slots",
+        "--ha-primary-node-id",
+        "primary-a",
         "--ha-fence-wal",
         "/tmp/ha-fence.wal",
         "--ha-cluster-id",
@@ -3134,9 +3155,57 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_cluster_id = 100,
         .ha_timeline_id = 3,
     }));
+    try std.testing.expectError(error.HAPrimaryLogMissing, validateHARole(.{
+        .ha_primary_slots = "/tmp/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAPrimarySlotsMissing, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAPrimaryNodeIdMissing, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_primary_slots = "/tmp/slots.wal",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
     try std.testing.expectError(error.HAClusterIdMissing, validateHARole(.{
         .ha_standby_log = "/tmp/standby.log",
         .ha_fence_wal = "/tmp/fence.wal",
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAStandbyLogMissing, validateHARole(.{
+        .ha_standby_progress = "/tmp/progress.wal",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAStandbyProgressMissing, validateHARole(.{
+        .ha_standby_log = "/tmp/standby.log",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAStandbyNodeIdMissing, validateHARole(.{
+        .ha_standby_log = "/tmp/standby.log",
+        .ha_standby_progress = "/tmp/progress.wal",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
         .ha_timeline_id = 3,
         .ha_epoch = 4,
     }));
