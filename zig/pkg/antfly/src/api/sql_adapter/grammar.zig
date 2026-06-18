@@ -33,6 +33,19 @@ pub const RowSecurityAlterSyntax = struct {
     enabled: bool,
 };
 
+pub const CreateRowSecurityPolicySyntax = struct {
+    policy_name: []const u8,
+    table_name: []const u8,
+    predicate: ddl_plan.RowSecurityPolicyPredicate,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.policy_name));
+        alloc.free(@constCast(self.table_name));
+        self.predicate.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const DropRowSecurityPolicySyntax = struct {
     policy_name: []const u8,
     table_name: []const u8,
@@ -1049,6 +1062,36 @@ pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAl
     return .{ .table_identifier = table_token.text, .enabled = enabled };
 }
 
+pub fn parseCreateRowSecurityPolicyCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateRowSecurityPolicySyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("policy");
+    const policy_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var policy_transferred = false;
+    errdefer if (!policy_transferred) alloc.free(policy_name);
+    try cursor.expectKeyword("on");
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    try cursor.expectKeyword("using");
+    var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
+    var predicate_transferred = false;
+    errdefer if (!predicate_transferred) predicate.deinit(alloc);
+    try parseAdapterNoopStatementEnd(cursor);
+
+    policy_transferred = true;
+    table_transferred = true;
+    predicate_transferred = true;
+    return .{
+        .policy_name = policy_name,
+        .table_name = table_name,
+        .predicate = predicate,
+    };
+}
+
 pub fn parseDropRowSecurityPolicyCatalogTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1073,6 +1116,35 @@ pub fn parseDropRowSecurityPolicyCatalogTailAlloc(
     policy_transferred = true;
     table_transferred = true;
     return .{ .policy_name = policy_name, .table_name = table_name, .if_exists = if_exists };
+}
+
+fn parseRowSecurityPolicyPredicateAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.RowSecurityPolicyPredicate {
+    try cursor.expectToken(.lparen);
+    const field = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    try cursor.expectToken(.eq);
+    try cursor.expectKeyword("current_setting");
+    try cursor.expectToken(.lparen);
+    const setting_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+    if (setting_token.text.len == 0) return error.UnsupportedSqlShape;
+    const setting_name = try alloc.dupe(u8, setting_token.text);
+    var setting_transferred = false;
+    errdefer if (!setting_transferred) alloc.free(setting_name);
+    try cursor.expectToken(.rparen);
+    try cursor.expectToken(.rparen);
+
+    field_transferred = true;
+    setting_transferred = true;
+    return .{ .current_setting_equals = .{
+        .field = field,
+        .setting_name = setting_name,
+    } };
 }
 
 pub fn parseDropUpdatePolicyTriggerCatalogTailAlloc(
@@ -3931,6 +4003,25 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expect(!syntax.enabled);
     try std.testing.expectEqualStrings("public.usage_records", syntax.table_identifier);
     try std.testing.expectEqual(tokens.items.len, pos);
+
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON public.usage_records USING (tenant_id = current_setting('app.tenant_id'));");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(create_tokens.items.len, create_pos);
+    try std.testing.expectEqualStrings("tenant_policy", create.policy_name);
+    try std.testing.expectEqualStrings("usage_records", create.table_name);
+    const predicate = switch (create.predicate) {
+        .current_setting_equals => |predicate| predicate,
+    };
+    try std.testing.expectEqualStrings("tenant_id", predicate.field);
+    try std.testing.expectEqualStrings("app.tenant_id", predicate.setting_name);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a');");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 
     var drop_tokens = try lexer.tokenizeAlloc(alloc, "POLICY IF EXISTS tenant_policy ON public.usage_records CASCADE;");
     defer lexer.freeTokens(alloc, &drop_tokens);

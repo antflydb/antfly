@@ -1070,7 +1070,8 @@ helpers, statement classification, diagnostics, parity-corpus fingerprints,
 catalog/source-name prebinding, catalog-independent object identifier
 normalization, owned identifier/list parsing, adapter-noop grammar tails,
 `EXPLAIN` prefix and option grammar, row-security grammar syntax for
-`ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` and `DROP POLICY ... ON`,
+`ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`,
+`CREATE POLICY ... USING (...)`, and `DROP POLICY ... ON`,
 trigger-policy grammar syntax for
 `CREATE TRIGGER ... BEFORE UPDATE ... EXECUTE FUNCTION/PROCEDURE` and
 `DROP TRIGGER ... ON`,
@@ -4675,7 +4676,9 @@ lower to typed row-security catalog plans. The current runtime subset preserves
 table identity, policy identity, enable intent, and request-setting equality
 predicates such as
 `tenant_id = current_setting('app.tenant_id')` as native policy metadata rather
-than raw SQL. Public API execution maps each supported policy to a hidden native
+than raw SQL. `CREATE POLICY` tails parse in `api/sql_adapter/grammar.zig`, so
+the SQL lowerer only transfers owned grammar syntax into typed row-security
+catalog plans. Public API execution maps each supported policy to a hidden native
 row-filter policy subject, converts `current_setting('app.<key>')` to
 `{"$auth":"settings.app.<key>"}`, and merges enabled-table filters into every
 user's effective row filters before row-query, aggregate, join, lateral, window,

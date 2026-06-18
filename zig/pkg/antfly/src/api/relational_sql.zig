@@ -4071,31 +4071,14 @@ const Parser = struct {
     }
 
     fn parseCreateRowSecurityPolicyDdl(self: *@This()) !CreateRowSecurityPolicyPlan {
-        try self.expectKeyword("policy");
-        const policy_name = try self.parseIdentifierOwned();
-        var policy_transferred = false;
-        errdefer if (!policy_transferred) self.alloc.free(policy_name);
-        try self.expectKeyword("on");
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_transferred = false;
-        errdefer if (!table_transferred) self.alloc.free(table_name);
-        try self.expectKeyword("using");
-        const predicate = try self.parseRowSecurityPolicyPredicate();
-        var predicate_transferred = false;
-        errdefer if (!predicate_transferred) {
-            var mutable_predicate = predicate;
-            mutable_predicate.deinit(self.alloc);
-        };
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-
-        policy_transferred = true;
-        table_transferred = true;
-        predicate_transferred = true;
+        var syntax = try sql_adapter.parseCreateRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .policy_name = policy_name,
-            .table_name = table_name,
-            .predicate = predicate,
+            .policy_name = syntax.policy_name,
+            .table_name = syntax.table_name,
+            .predicate = syntax.predicate,
         };
     }
 
@@ -4109,30 +4092,6 @@ const Parser = struct {
             .table_name = syntax.table_name,
             .if_exists = syntax.if_exists,
         };
-    }
-
-    fn parseRowSecurityPolicyPredicate(self: *@This()) !RowSecurityPolicyPredicate {
-        try self.expect(.lparen);
-        const field = try self.parseSqlObjectIdentifierOwned();
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(field);
-        try self.expect(.eq);
-        try self.expectKeyword("current_setting");
-        try self.expect(.lparen);
-        const setting_token = self.match(.string) orelse return error.UnsupportedSqlShape;
-        if (setting_token.text.len == 0) return error.UnsupportedSqlShape;
-        const setting_name = try self.alloc.dupe(u8, setting_token.text);
-        var setting_transferred = false;
-        errdefer if (!setting_transferred) self.alloc.free(setting_name);
-        try self.expect(.rparen);
-        try self.expect(.rparen);
-
-        field_transferred = true;
-        setting_transferred = true;
-        return .{ .current_setting_equals = .{
-            .field = field,
-            .setting_name = setting_name,
-        } };
     }
 
     fn parseAlterTableDdl(self: *@This()) !AlterTablePlan {
