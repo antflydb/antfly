@@ -33,6 +33,7 @@ const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
+const validation = @import("validation.zig");
 const write_gate = @import("write_gate.zig");
 
 pub const OutputFormat = enum {
@@ -1344,46 +1345,32 @@ const Cursor = struct {
     }
 };
 
-const HAStringValidation = enum {
-    ok,
-    missing,
-    padded,
-};
-
 const HAPathField = enum {
     manifest,
     content_root,
 };
 
-fn classifyHAString(value_or_null: ?[]const u8) HAStringValidation {
-    const raw = value_or_null orelse return .missing;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return .missing;
-    if (trimmed.len != raw.len) return .padded;
-    return .ok;
-}
-
 fn validateHASlotName(raw: []const u8) ![]const u8 {
-    switch (classifyHAString(raw)) {
+    switch (validation.classifyString(raw)) {
         .ok => {},
         .missing => return error.SlotNameMissing,
         .padded => return error.InvalidSlotName,
     }
-    if (!isHAIdentifier(raw)) return error.InvalidSlotName;
+    if (!validation.isIdentifier(raw)) return error.InvalidSlotName;
     return raw;
 }
 
 fn validateHANodeID(raw: []const u8) ![]const u8 {
-    switch (classifyHAString(raw)) {
+    switch (validation.classifyString(raw)) {
         .ok => {},
         .missing, .padded => return error.InvalidNodeId,
     }
-    if (!isHAIdentifier(raw)) return error.InvalidNodeId;
+    if (!validation.isIdentifier(raw)) return error.InvalidNodeId;
     return raw;
 }
 
 fn validateHAPath(raw: []const u8, field: HAPathField) ![]const u8 {
-    switch (classifyHAString(raw)) {
+    switch (validation.classifyString(raw)) {
         .ok => {},
         .missing => return switch (field) {
             .manifest => error.ManifestPathMissing,
@@ -1391,7 +1378,7 @@ fn validateHAPath(raw: []const u8, field: HAPathField) ![]const u8 {
         },
         .padded => return haPathInvalidError(field),
     }
-    if (!isNormalizedHAPath(raw)) return haPathInvalidError(field);
+    if (!validation.isNormalizedPath(raw)) return haPathInvalidError(field);
     return raw;
 }
 
@@ -1403,7 +1390,7 @@ fn haPathInvalidError(field: HAPathField) anyerror {
 }
 
 fn validateHAAdminURL(raw: []const u8) ![]const u8 {
-    switch (classifyHAString(raw)) {
+    switch (validation.classifyString(raw)) {
         .ok => {},
         .missing, .padded => return error.InvalidHAAdminURL,
     }
@@ -1411,37 +1398,6 @@ fn validateHAAdminURL(raw: []const u8) ![]const u8 {
     if (uri.scheme.len == 0) return error.InvalidHAAdminURL;
     if (uri.host == null) return error.InvalidHAAdminURL;
     return raw;
-}
-
-fn isHAIdentifier(raw: []const u8) bool {
-    if (raw.len == 0 or raw.len > 128) return false;
-    for (raw) |byte| {
-        if (!isHAIdentifierByte(byte)) return false;
-    }
-    return true;
-}
-
-fn isHAIdentifierByte(byte: u8) bool {
-    return (byte >= 'A' and byte <= 'Z') or
-        (byte >= 'a' and byte <= 'z') or
-        (byte >= '0' and byte <= '9') or
-        byte == '_' or
-        byte == '-' or
-        byte == '.' or
-        byte == ':';
-}
-
-fn isNormalizedHAPath(path: []const u8) bool {
-    if (path.len == 0) return false;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    if (std.mem.eql(u8, path, ".") or std.mem.eql(u8, path, "..")) return false;
-    if (std.mem.indexOf(u8, path, "//") != null) return false;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |part| {
-        if (part.len == 0) continue;
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-    }
-    return true;
 }
 
 fn parseOutputFormat(raw: []const u8) !OutputFormat {

@@ -17,6 +17,7 @@ const antfly = @import("antfly-zig");
 
 const admin_api = antfly.admin;
 const ha = antfly.ha;
+const ha_validation = ha.validation;
 const http_common = antfly.common.http.http_common;
 
 var test_path_counter: u64 = 0;
@@ -85,12 +86,6 @@ const ParsedArgs = struct {
 
 const RemoteOptions = struct {
     bearer_token: ?[]const u8 = null,
-};
-
-const HAStringValidation = enum {
-    ok,
-    missing,
-    padded,
 };
 
 pub fn run(init: std.process.Init) !void {
@@ -979,14 +974,6 @@ fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[
     return try alloc.dupe(u8, token);
 }
 
-fn classifyHAString(value_or_null: ?[]const u8) HAStringValidation {
-    const raw = value_or_null orelse return .missing;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return .missing;
-    if (trimmed.len != raw.len) return .padded;
-    return .ok;
-}
-
 const HAPathField = enum {
     primary_log,
     primary_slots,
@@ -997,7 +984,7 @@ const HAPathField = enum {
 };
 
 fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
-    switch (classifyHAString(path)) {
+    switch (ha_validation.classifyString(path)) {
         .ok => {},
         .missing => return switch (field) {
             .primary_log => error.PrimaryLogMissing,
@@ -1009,7 +996,7 @@ fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
         },
         .padded => return haPathInvalidError(field),
     }
-    if (!isNormalizedHAPath(path)) return haPathInvalidError(field);
+    if (!ha_validation.isNormalizedPath(path)) return haPathInvalidError(field);
     return path;
 }
 
@@ -1024,30 +1011,17 @@ fn haPathInvalidError(field: HAPathField) anyerror {
     };
 }
 
-fn isNormalizedHAPath(path: []const u8) bool {
-    if (path.len == 0) return false;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    if (std.mem.eql(u8, path, ".") or std.mem.eql(u8, path, "..")) return false;
-    if (std.mem.indexOf(u8, path, "//") != null) return false;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |part| {
-        if (part.len == 0) continue;
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-    }
-    return true;
-}
-
 const HANodeIDField = enum {
     primary,
     standby,
 };
 
 fn validateHANodeID(node_id: []const u8, field: HANodeIDField) ![]const u8 {
-    switch (classifyHAString(node_id)) {
+    switch (ha_validation.classifyString(node_id)) {
         .ok => {},
         .missing, .padded => return haNodeIDInvalidError(field),
     }
-    if (!isHANodeID(node_id)) return haNodeIDInvalidError(field);
+    if (!ha_validation.isIdentifier(node_id)) return haNodeIDInvalidError(field);
     return node_id;
 }
 
@@ -1058,16 +1032,8 @@ fn haNodeIDInvalidError(field: HANodeIDField) anyerror {
     };
 }
 
-fn isHANodeID(node_id: []const u8) bool {
-    if (node_id.len == 0 or node_id.len > 128) return false;
-    for (node_id) |byte| {
-        if (!isHANameByte(byte)) return false;
-    }
-    return true;
-}
-
 fn validateHAAdminURL(raw_url: []const u8) ![]const u8 {
-    switch (classifyHAString(raw_url)) {
+    switch (ha_validation.classifyString(raw_url)) {
         .ok => {},
         .missing => return error.HAAdminURLMissing,
         .padded => return error.HAAdminURLInvalid,
@@ -1079,34 +1045,13 @@ fn validateHAAdminURL(raw_url: []const u8) ![]const u8 {
 }
 
 fn validateHAAdminTokenEnvName(raw_env_var: []const u8) ![]const u8 {
-    switch (classifyHAString(raw_env_var)) {
+    switch (ha_validation.classifyString(raw_env_var)) {
         .ok => {},
         .missing => return error.HAAdminTokenEnvMissing,
         .padded => return error.HAAdminTokenEnvInvalid,
     }
-    if (!isHAAdminTokenEnvName(raw_env_var)) return error.HAAdminTokenEnvInvalid;
+    if (!ha_validation.isEnvVarName(raw_env_var)) return error.HAAdminTokenEnvInvalid;
     return raw_env_var;
-}
-
-fn isHAAdminTokenEnvName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (!isEnvNameFirstByte(name[0])) return false;
-    for (name[1..]) |byte| {
-        if (!isEnvNameByte(byte)) return false;
-    }
-    return true;
-}
-
-fn isEnvNameFirstByte(byte: u8) bool {
-    return byte == '_' or (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z');
-}
-
-fn isEnvNameByte(byte: u8) bool {
-    return isEnvNameFirstByte(byte) or (byte >= '0' and byte <= '9');
-}
-
-fn isHANameByte(byte: u8) bool {
-    return isEnvNameByte(byte) or byte == '-' or byte == '.' or byte == ':';
 }
 
 fn parseU64(raw: []const u8) !u64 {
@@ -1240,12 +1185,12 @@ test "ha cmd validates remote bearer token env name" {
 }
 
 test "ha cmd classifies HA strings before field-specific validation" {
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(" \t\r\n"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString(" primary-a"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("primary-a\n"));
-    try std.testing.expectEqual(HAStringValidation.ok, classifyHAString("primary-a"));
+    try std.testing.expectEqual(ha_validation.StringValidation.missing, ha_validation.classifyString(null));
+    try std.testing.expectEqual(ha_validation.StringValidation.missing, ha_validation.classifyString(""));
+    try std.testing.expectEqual(ha_validation.StringValidation.missing, ha_validation.classifyString(" \t\r\n"));
+    try std.testing.expectEqual(ha_validation.StringValidation.padded, ha_validation.classifyString(" primary-a"));
+    try std.testing.expectEqual(ha_validation.StringValidation.padded, ha_validation.classifyString("primary-a\n"));
+    try std.testing.expectEqual(ha_validation.StringValidation.ok, ha_validation.classifyString("primary-a"));
 }
 
 test "ha cmd rejects padded or invalid HA local option strings" {

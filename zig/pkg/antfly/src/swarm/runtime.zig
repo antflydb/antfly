@@ -2203,12 +2203,12 @@ fn validateHARole(cli: CliConfig) !void {
         _ = try requireHAString(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
     if (cli.ha_admin_token_env) |env_var| {
-        switch (classifyHAString(env_var)) {
+        switch (antfly.ha.validation.classifyString(env_var)) {
             .ok => {},
             .missing => return error.HAAdminTokenEnvMissing,
             .padded => return error.HAAdminTokenEnvInvalid,
         }
-        if (!isHAAdminTokenEnvName(env_var)) return error.HAAdminTokenEnvInvalid;
+        if (!antfly.ha.validation.isEnvVarName(env_var)) return error.HAAdminTokenEnvInvalid;
     }
     if (primary_requested or standby_requested) {
         _ = try requireHAString(cli.ha_fence_wal, error.HAFenceWalMissing, error.HAFenceWalInvalid);
@@ -2226,22 +2226,8 @@ fn validateHAIdentity(cli: CliConfig) !void {
     if (cli.ha_epoch == null) return error.HAEpochMissing;
 }
 
-const HAStringValidation = enum {
-    ok,
-    missing,
-    padded,
-};
-
-fn classifyHAString(value: ?[]const u8) HAStringValidation {
-    const raw = value orelse return .missing;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return .missing;
-    if (trimmed.len != raw.len) return .padded;
-    return .ok;
-}
-
 fn requireHAString(value: ?[]const u8, comptime missing_err: anyerror, comptime padded_err: anyerror) ![]const u8 {
-    switch (classifyHAString(value)) {
+    switch (antfly.ha.validation.classifyString(value)) {
         .ok => return value.?,
         .missing => return missing_err,
         .padded => return padded_err,
@@ -2412,7 +2398,7 @@ fn resolveHAAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?
     const raw_env_var = cli.ha_admin_token_env orelse return null;
     const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
     if (env_var.len == 0) return error.HAAdminTokenEnvMissing;
-    if (!isHAAdminTokenEnvName(env_var)) return error.HAAdminTokenEnvInvalid;
+    if (!antfly.ha.validation.isEnvVarName(env_var)) return error.HAAdminTokenEnvInvalid;
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -2421,23 +2407,6 @@ fn resolveHAAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?
     const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
     if (token.len == 0) return error.HAAdminTokenMissing;
     return try alloc.dupe(u8, token);
-}
-
-fn isHAAdminTokenEnvName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (!isEnvNameFirstByte(name[0])) return false;
-    for (name[1..]) |byte| {
-        if (!isEnvNameByte(byte)) return false;
-    }
-    return true;
-}
-
-fn isEnvNameFirstByte(byte: u8) bool {
-    return byte == '_' or (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z');
-}
-
-fn isEnvNameByte(byte: u8) bool {
-    return isEnvNameFirstByte(byte) or (byte >= '0' and byte <= '9');
 }
 
 fn ensureDirPath(io: std.Io, dir_path: []const u8) !void {
@@ -3119,12 +3088,12 @@ test "swarm HA standby replication flags require upstream and slot" {
 }
 
 test "swarm HA string classifier distinguishes missing padded and valid values" {
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
-    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(" \t\r\n"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString(" standby-a"));
-    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("standby-a\n"));
-    try std.testing.expectEqual(HAStringValidation.ok, classifyHAString("standby-a"));
+    try std.testing.expectEqual(antfly.ha.validation.StringValidation.missing, antfly.ha.validation.classifyString(null));
+    try std.testing.expectEqual(antfly.ha.validation.StringValidation.missing, antfly.ha.validation.classifyString(""));
+    try std.testing.expectEqual(antfly.ha.validation.StringValidation.missing, antfly.ha.validation.classifyString(" \t\r\n"));
+    try std.testing.expectEqual(antfly.ha.validation.StringValidation.padded, antfly.ha.validation.classifyString(" standby-a"));
+    try std.testing.expectEqual(antfly.ha.validation.StringValidation.padded, antfly.ha.validation.classifyString("standby-a\n"));
+    try std.testing.expectEqual(antfly.ha.validation.StringValidation.ok, antfly.ha.validation.classifyString("standby-a"));
 
     try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(null, error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
     try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(" \t", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
