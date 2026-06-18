@@ -350,6 +350,59 @@ test "storage.ha chaos crash during apply preserves remote write and blocks remo
     try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
 }
 
+test "storage.ha chaos crash after apply before ack reports durable progress on resume" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "apply-before-ack-crash");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+    const names = [_][]const u8{"standby-a"};
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+
+    {
+        var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+        defer standby.close();
+        try std.testing.expectEqual(@as(u64, 1), try standby.receive(baseRecord(identity, 1, "one")));
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&capture, ApplyCapture.apply));
+        try std.testing.expectEqualStrings("one", capture.payloads.items[0]);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().applied_lsn);
+        // Simulate a process crash before the standby status update reaches
+        // the primary. The primary must not infer remote_apply durability yet.
+    }
+
+    var decision = try primary.evaluateDurability(1, .{
+        .mode = .remote_apply,
+        .standby_names = &names,
+    });
+    try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, decision.status);
+
+    {
+        var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+        defer standby.close();
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().applied_lsn);
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const resumed = try session.replicateAvailable(alloc, &primary, "standby-a", &standby, &capture, ApplyCapture.apply);
+        try std.testing.expectEqual(@as(usize, 0), resumed.received_count);
+        try std.testing.expectEqual(@as(usize, 0), resumed.applied_count);
+        try std.testing.expectEqual(@as(u64, 1), resumed.progress.applied_lsn);
+    }
+
+    decision = try primary.evaluateDurability(1, .{
+        .mode = .remote_apply,
+        .standby_names = &names,
+    });
+    try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+}
+
 test "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "primary-sync-ack-crash");

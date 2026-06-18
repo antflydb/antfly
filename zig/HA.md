@@ -641,7 +641,9 @@ they can explore interleavings that are expensive or flaky in process e2e. Add
 model or harness coverage for:
 
 - crash after WAL receive before apply;
-- crash after apply before acknowledgement;
+- crash after apply before acknowledgement, including the window where the
+  standby has durable applied progress but the primary has not received the
+  status update yet;
 - primary crash before and after synchronous acknowledgement;
 - duplicate, missing, out-of-order, or divergent WAL records;
 - delayed status updates and stale slot progress;
@@ -735,7 +737,9 @@ and either rewind or reseed.
   - crash during WAL receive,
   - crash during apply,
   - crash after receive before apply,
-  - crash after apply before acknowledgement,
+  - crash after apply before acknowledgement, proving the primary does not
+    treat `remote_apply` as satisfied until the resumed standby reports durable
+    applied progress,
   - primary crash before and after synchronous acknowledgement,
   - duplicate, missing, divergent, or out-of-order WAL records,
   - network partition,
