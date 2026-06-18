@@ -2362,9 +2362,9 @@ const PendingDeltaBatch = struct {
     ) void {
         out.encoded_value_bytes += self.encoded_value_bytes;
         out.records += self.records.items.len;
-        if (self.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(self.max_sequence) <= base_generation) return;
+        if (self.allRecordsAtOrBeforeGeneration(base_generation)) return;
 
-        if (self.min_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(self.min_sequence) > base_generation) {
+        if (self.allRecordsAfterGeneration(base_generation)) {
             out.records_after_generation += self.records.items.len;
             out.tombstones_after_generation += self.tombstone_records;
             out.max_sequence_after_generation = @max(out.max_sequence_after_generation, self.max_sequence);
@@ -2403,6 +2403,24 @@ const PendingDeltaBatch = struct {
             best_record.* = record;
             found_in_batch = true;
         }
+    }
+
+    fn allRecordsAtOrBeforeGeneration(self: PendingDeltaBatch, generation: u64) bool {
+        return self.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(self.max_sequence) <= generation;
+    }
+
+    fn allRecordsAfterGeneration(self: PendingDeltaBatch, generation: u64) bool {
+        return self.min_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(self.min_sequence) > generation;
+    }
+
+    fn accumulateAllRecordsAfterGenerationStats(
+        self: PendingDeltaBatch,
+        stats: *posting.PostingDeltaTailStats,
+    ) void {
+        stats.records += self.records.items.len;
+        stats.records_after_generation += self.records.items.len;
+        stats.tombstones_after_generation += self.tombstone_records;
+        stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, self.max_sequence);
     }
 };
 
@@ -2752,7 +2770,13 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntries(alloc, &records, posting_id, min_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             if (min_generation) |generation| {
-                if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= generation) {
+                if (batch.allRecordsAtOrBeforeGeneration(generation)) {
+                    sortPostingDeltaRecordsIfNeeded(records.items);
+                    return try records.toOwnedSlice(alloc);
+                }
+                if (batch.allRecordsAfterGeneration(generation)) {
+                    try records.ensureUnusedCapacity(alloc, batch.records.items.len);
+                    for (batch.records.items) |record| records.appendAssumeCapacity(record);
                     sortPostingDeltaRecordsIfNeeded(records.items);
                     return try records.toOwnedSlice(alloc);
                 }
@@ -2783,8 +2807,18 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntriesWithStats(alloc, &records, &stats, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             stats.encoded_value_bytes += batch.encoded_value_bytes;
-            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) {
+            if (batch.allRecordsAtOrBeforeGeneration(base_generation)) {
                 stats.records += batch.records.items.len;
+                sortPostingDeltaRecordsIfNeeded(records.items);
+                return .{
+                    .records = try records.toOwnedSlice(alloc),
+                    .stats = stats,
+                };
+            }
+            if (batch.allRecordsAfterGeneration(base_generation)) {
+                try records.ensureUnusedCapacity(alloc, batch.records.items.len);
+                for (batch.records.items) |record| records.appendAssumeCapacity(record);
+                batch.accumulateAllRecordsAfterGenerationStats(&stats);
                 sortPostingDeltaRecordsIfNeeded(records.items);
                 return .{
                     .records = try records.toOwnedSlice(alloc),
@@ -2825,8 +2859,14 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntriesIntoScratchWithStats(alloc, scratch, &stats, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             stats.encoded_value_bytes += batch.encoded_value_bytes;
-            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) {
+            if (batch.allRecordsAtOrBeforeGeneration(base_generation)) {
                 stats.records += batch.records.items.len;
+                return stats;
+            }
+            if (batch.allRecordsAfterGeneration(base_generation)) {
+                try ensureDeltaRecordAppendCapacity(alloc, scratch, batch.records.items.len);
+                for (batch.records.items) |record| scratch.appendDeltaRecordAssumeCapacity(record);
+                batch.accumulateAllRecordsAfterGenerationStats(&stats);
                 return stats;
             }
             var reserved = false;
