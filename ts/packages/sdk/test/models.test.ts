@@ -1,0 +1,45 @@
+import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { describe, expect, it } from "vitest";
+import { baseModelName, modelDir, pullHuggingFaceModel } from "../src/models.js";
+
+describe("model helpers", () => {
+  it("uses the Antfly inference model layout", () => {
+    expect(modelDir("/tmp/models", "antflydb/clipclap:gguf:Q4_K")).toBe("/tmp/models/antflydb/clipclap");
+  });
+
+  it("returns base names for tagged model refs", () => {
+    expect(baseModelName("antflydb/gliner2-base-v1:gguf:Q4_K")).toBe("antflydb/gliner2-base-v1");
+  });
+
+  it("pulls the default clipclap Q4_K file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
+    const fetchMock = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/api/models/antflydb/clipclap/tree/main?recursive=1")) {
+        return Response.json([
+          { path: "config.json", type: "file", size: 2 },
+          { path: "clipclap-Q4_K.gguf", type: "file", size: 4 },
+          { path: "clipclap-F16.gguf", type: "file", size: 4 },
+        ]);
+      }
+      if (url.endsWith("/antflydb/clipclap/resolve/main/config.json")) return new Response("{}");
+      if (url.endsWith("/antflydb/clipclap/resolve/main/clipclap-Q4_K.gguf")) return new Response("q4_k");
+      return new Response("missing", { status: 404 });
+    };
+
+    const dir = await pullHuggingFaceModel("antflydb/clipclap:gguf:Q4_K", {
+      modelsDir: root,
+      huggingFaceBaseUrl: "https://hf.test",
+      fetch: fetchMock as typeof fetch,
+    });
+
+    expect(dir).toBe(join(root, "antflydb", "clipclap"));
+    await expect(stat(join(dir, "clipclap-Q4_K.gguf"))).resolves.toBeTruthy();
+    await expect(stat(join(dir, "clipclap-F16.gguf"))).rejects.toThrow();
+    const manifest = await readFile(join(dir, "model_manifest.json"), "utf8");
+    expect(manifest).toContain('"variant": "Q4_K"');
+    expect(manifest).toContain('"source": "antflydb/clipclap:gguf:Q4_K"');
+  });
+});
