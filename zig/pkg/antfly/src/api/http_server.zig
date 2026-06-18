@@ -414,6 +414,18 @@ pub const AuthenticatedIdentity = struct {
     }
 };
 
+fn delegatedIdentityView(identity: ?AuthenticatedIdentity) ?protocol_adapters.DelegatedIdentity {
+    const value = identity orelse return null;
+    return .{
+        .username = value.username,
+        .permissions = value.permissions,
+        .row_filter = value.row_filter,
+        .metadata_json = value.metadata_json,
+        .roles = value.roles,
+        .role_settings = value.role_settings,
+    };
+}
+
 pub const StatusSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -3447,7 +3459,7 @@ pub const ApiHttpServer = struct {
         task_id: []const u8,
         context_id: []const u8,
         queue: *a2a.EventQueue,
-        authenticated_identity: ?AuthenticatedIdentity,
+        authenticated_identity: ?protocol_adapters.DelegatedIdentity,
     ) !void {
         const source = self.table_reads orelse {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
@@ -3457,7 +3469,7 @@ pub const ApiHttpServer = struct {
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
-            authenticated_identity: ?AuthenticatedIdentity,
+            authenticated_identity: ?protocol_adapters.DelegatedIdentity,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -9981,7 +9993,7 @@ fn applyAuthenticatedIdentityToJoinRequest(
 ) !void {
     if (!permissionsAllow(identity.permissions, .table, join.right_table, .read)) return error.InvalidQueryRequest;
 
-    const row_filter_json = try resolveEffectiveRowFilterJson(alloc, identity, join.right_table);
+    const row_filter_json = try resolveEffectiveRowFilterJson(alloc, @as(?AuthenticatedIdentity, identity), join.right_table);
     defer if (row_filter_json) |value| alloc.free(value);
     if (row_filter_json) |value| {
         try distributed_join.applyRightTableRowFilterJson(alloc, join, value);
@@ -10480,7 +10492,7 @@ pub fn authSubjectsToResponse(
     return out;
 }
 
-pub fn effectiveRowFilterJson(identity: ?AuthenticatedIdentity, table_name: []const u8) ?[]const u8 {
+pub fn effectiveRowFilterJson(identity: anytype, table_name: []const u8) ?[]const u8 {
     const row_filters = if (identity) |value| value.row_filter else return null;
     for (row_filters) |entry| {
         if (std.mem.eql(u8, entry.table, table_name)) {
@@ -10499,7 +10511,7 @@ pub fn effectiveRowFilterJson(identity: ?AuthenticatedIdentity, table_name: []co
 
 pub fn resolveEffectiveRowFilterJson(
     alloc: std.mem.Allocator,
-    identity: ?AuthenticatedIdentity,
+    identity: anytype,
     table_name: []const u8,
 ) !?[]u8 {
     const raw = effectiveRowFilterJson(identity, table_name) orelse return null;
@@ -10509,7 +10521,7 @@ pub fn resolveEffectiveRowFilterJson(
 
 pub fn resolveAuthRowFilterJson(
     alloc: std.mem.Allocator,
-    identity: AuthenticatedIdentity,
+    identity: anytype,
     filter_json: []const u8,
 ) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{}) catch return error.InvalidQueryRequest;
@@ -10555,7 +10567,7 @@ fn validateAuthRowFilterValue(value: std.json.Value) !void {
 
 fn resolveAuthRowFilterValue(
     alloc: std.mem.Allocator,
-    identity: AuthenticatedIdentity,
+    identity: anytype,
     value: std.json.Value,
 ) !std.json.Value {
     return switch (value) {
@@ -10610,7 +10622,7 @@ fn resolveAuthRowFilterValue(
 
 fn authContextJsonValue(
     alloc: std.mem.Allocator,
-    identity: AuthenticatedIdentity,
+    identity: anytype,
     path: []const u8,
 ) !std.json.Value {
     if (isSupportedAuthPath(path)) {
@@ -10827,7 +10839,7 @@ test "effective resolved row filter prefers table filter before wildcard" {
     };
     defer alloc.free(identity.username);
 
-    const resolved = (try resolveEffectiveRowFilterJson(alloc, identity, "docs")) orelse return error.TestExpectedEqual;
+    const resolved = (try resolveEffectiveRowFilterJson(alloc, @as(?AuthenticatedIdentity, identity), "docs")) orelse return error.TestExpectedEqual;
     defer alloc.free(resolved);
 
     try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
@@ -12433,7 +12445,7 @@ test "api http server hydrates trusted principal role settings from antfly user 
     try std.testing.expectEqualStrings("app.tenant_id", identity.role_settings[0].name);
     try std.testing.expectEqualStrings("acme", identity.role_settings[0].value);
 
-    const resolved = try resolveEffectiveRowFilterJson(std.testing.allocator, identity, "docs");
+    const resolved = try resolveEffectiveRowFilterJson(std.testing.allocator, @as(?AuthenticatedIdentity, identity), "docs");
     defer std.testing.allocator.free(resolved.?);
     try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"acme\"}}", resolved.?);
 }
@@ -12936,6 +12948,7 @@ test "api http server query builder requires table read permission when auth is 
         .auth_enabled = true,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
@@ -12977,6 +12990,8 @@ test "api http server query builder requires table read permission when auth is 
     try std.testing.expectEqual(@as(u16, 200), a2a_allowed.status);
     try std.testing.expect(std.mem.indexOf(u8, a2a_allowed.body, "\"state\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, a2a_allowed.body, "\"name\":\"query\"") != null);
+    server.a2a_tasks.deinit(alloc);
+    server.a2a_tasks = a2a.InMemoryTaskStore.init(alloc);
 }
 
 test "api http server a2a retrieval enforces delegated table read permission" {
@@ -13052,6 +13067,8 @@ test "api http server a2a retrieval enforces delegated table read permission" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "forbidden") != null);
+    server.a2a_tasks.deinit(alloc);
+    server.a2a_tasks = a2a.InMemoryTaskStore.init(alloc);
 }
 
 test "api http server restricts runtime schema debug to admins when auth is enabled" {
