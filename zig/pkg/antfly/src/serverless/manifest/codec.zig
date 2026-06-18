@@ -15,11 +15,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("../catalog/types.zig");
+const manifest_base_source = @import("base_source.zig");
 const manifest_types = @import("types.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
-pub const wire_version: u16 = 11;
+pub const wire_version: u16 = 12;
 
 const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const header_size_v3 = header_size_v2 + 1 + 1;
@@ -30,6 +31,7 @@ const policy_size = 98;
 const header_size_v8 = header_size_v7 + policy_size;
 const header_size_v10 = header_size_v8 + 8;
 const header_size_v11 = header_size_v10 + 1;
+const header_size_v12 = header_size_v11 + 4;
 
 fn encodePolicy(buf: []u8, policy: catalog_types.NamespacePolicy) void {
     var pos: usize = 0;
@@ -161,14 +163,51 @@ fn derivedOutputEncodedSize(output: ?search_sources.DerivedOutputDescriptor) usi
     return 0;
 }
 
+fn stringEncodedSize(value: []const u8) usize {
+    return 4 + value.len;
+}
+
+fn optionalStringEncodedSize(value: ?[]const u8) usize {
+    return stringEncodedSize(value orelse &.{});
+}
+
+fn stringListEncodedSize(values: []const []const u8) usize {
+    var size: usize = 4;
+    for (values) |value| size += stringEncodedSize(value);
+    return size;
+}
+
+fn baseSourceEncodedSize(base_source: manifest_types.BaseSourceDescriptor) usize {
+    return switch (base_source) {
+        .antfly_document_segments, .antfly_lsm_overlay => 1,
+        .antfly_row_fragments => |source| 1 +
+            stringEncodedSize(source.snapshot_id) +
+            stringEncodedSize(source.schema_fingerprint) +
+            stringListEncodedSize(source.row_fragment_artifacts) +
+            stringListEncodedSize(source.row_fragment_stats_artifacts),
+        .external_parquet, .external_iceberg, .external_lance => |source| 1 + 1 +
+            stringEncodedSize(source.source_uri) +
+            stringEncodedSize(source.snapshot_id) +
+            stringEncodedSize(source.schema_fingerprint) +
+            optionalStringEncodedSize(source.file_inventory_artifact) +
+            optionalStringEncodedSize(source.row_group_metadata_artifact) +
+            optionalStringEncodedSize(source.delete_metadata_artifact),
+    };
+}
+
 pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
     const derived_output_items: []const search_sources.DerivedOutputDescriptor = manifest.stats.derived_outputs.items orelse &.{};
     const published_source_items: []const search_sources.SearchSourceDescriptor = manifest.stats.published_search_sources.items orelse &.{};
-    var size: usize = header_size_v11 + manifest.namespace.len +
+    const base_source_len: u32 = if (manifest.base_source) |base_source|
+        @intCast(baseSourceEncodedSize(base_source))
+    else
+        0;
+    var size: usize = header_size_v12 + manifest.namespace.len +
         manifest.stats.schema_json.len +
         manifest.stats.read_schema_json.len +
         manifest.stats.indexes_json.len +
-        publishedSearchSourcesEncodedSize(manifest.stats.published_search_sources);
+        publishedSearchSourcesEncodedSize(manifest.stats.published_search_sources) +
+        base_source_len;
     for (derived_output_items) |output| size += derivedOutputEncodedSize(output);
     for (manifest.artifacts) |artifact| size += artifactEncodedSize(artifact);
 
@@ -218,6 +257,8 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
     pos += 4;
     encodePolicy(buf[pos .. pos + policy_size], manifest.stats.policy);
     pos += policy_size;
+    std.mem.writeInt(u32, buf[pos..][0..4], base_source_len, .little);
+    pos += 4;
 
     @memcpy(buf[pos..][0..manifest.namespace.len], manifest.namespace);
     pos += manifest.namespace.len;
@@ -301,8 +342,62 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
         pos += artifact.checksum.len;
     }
 
+    if (manifest.base_source) |base_source| {
+        encodeBaseSource(buf[pos .. pos + base_source_len], base_source);
+        pos += base_source_len;
+    }
+
     std.debug.assert(pos == buf.len);
     return buf;
+}
+
+fn encodeString(buf: []u8, pos_ptr: *usize, value: []const u8) void {
+    var pos = pos_ptr.*;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(value.len), .little);
+    pos += 4;
+    @memcpy(buf[pos..][0..value.len], value);
+    pos += value.len;
+    pos_ptr.* = pos;
+}
+
+fn encodeOptionalString(buf: []u8, pos_ptr: *usize, value: ?[]const u8) void {
+    encodeString(buf, pos_ptr, value orelse &.{});
+}
+
+fn encodeStringList(buf: []u8, pos_ptr: *usize, values: []const []const u8) void {
+    var pos = pos_ptr.*;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(values.len), .little);
+    pos += 4;
+    pos_ptr.* = pos;
+    for (values) |value| encodeString(buf, pos_ptr, value);
+}
+
+fn encodeBaseSource(buf: []u8, descriptor: manifest_types.BaseSourceDescriptor) void {
+    var pos: usize = 0;
+    buf[pos] = @intFromEnum(std.meta.activeTag(descriptor));
+    pos += 1;
+
+    switch (descriptor) {
+        .antfly_document_segments, .antfly_lsm_overlay => {},
+        .antfly_row_fragments => |source| {
+            encodeString(buf, &pos, source.snapshot_id);
+            encodeString(buf, &pos, source.schema_fingerprint);
+            encodeStringList(buf, &pos, source.row_fragment_artifacts);
+            encodeStringList(buf, &pos, source.row_fragment_stats_artifacts);
+        },
+        .external_parquet, .external_iceberg, .external_lance => |source| {
+            buf[pos] = @intFromEnum(source.format);
+            pos += 1;
+            encodeString(buf, &pos, source.source_uri);
+            encodeString(buf, &pos, source.snapshot_id);
+            encodeString(buf, &pos, source.schema_fingerprint);
+            encodeOptionalString(buf, &pos, source.file_inventory_artifact);
+            encodeOptionalString(buf, &pos, source.row_group_metadata_artifact);
+            encodeOptionalString(buf, &pos, source.delete_metadata_artifact);
+        },
+    }
+
+    std.debug.assert(pos == buf.len);
 }
 
 pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest {
@@ -314,7 +409,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
 
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += 2;
-    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != wire_version) return error.UnsupportedManifestVersion;
+    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != wire_version) return error.UnsupportedManifestVersion;
 
     const namespace_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
@@ -402,6 +497,12 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         break :blk value;
     } else 0;
     const policy = if (version >= 8) try decodePolicy(data, &pos) else catalog_types.NamespacePolicy{};
+    const base_source_len = if (version >= 12) blk: {
+        if (pos + 4 > data.len) return error.InvalidManifest;
+        const value = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4;
+        break :blk value;
+    } else 0;
 
     if (pos + namespace_len > data.len) return error.InvalidManifest;
     const namespace = try alloc.dupe(u8, data[pos .. pos + namespace_len]);
@@ -676,6 +777,16 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         initialized += 1;
     }
 
+    var base_source: ?manifest_types.BaseSourceDescriptor = null;
+    errdefer if (base_source) |*descriptor| manifest_base_source.freeOwnedDescriptor(alloc, descriptor);
+    if (version >= 12) {
+        if (pos + base_source_len > data.len) return error.InvalidManifest;
+        if (base_source_len > 0) {
+            base_source = try decodeBaseSourceAlloc(alloc, data[pos .. pos + base_source_len]);
+        }
+        pos += base_source_len;
+    }
+
     if (pos != data.len) return error.InvalidManifest;
 
     return .{
@@ -684,6 +795,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         .built_at_ns = built_at_ns,
         .wal_start_lsn = wal_start_lsn,
         .wal_end_lsn = wal_end_lsn,
+        .base_source = base_source,
         .stats = .{
             .document_count = document_count,
             .document_base_version = document_base_version,
@@ -701,6 +813,134 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         },
         .artifacts = artifacts,
     };
+}
+
+fn decodeStringAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize) ![]const u8 {
+    var pos = pos_ptr.*;
+    if (pos + 4 > data.len) return error.InvalidManifest;
+    const len = std.mem.readInt(u32, data[pos..][0..4], .little);
+    pos += 4;
+    if (pos + len > data.len) return error.InvalidManifest;
+    const value = try alloc.dupe(u8, data[pos .. pos + len]);
+    pos += len;
+    pos_ptr.* = pos;
+    return value;
+}
+
+fn decodeOptionalStringAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize) !?[]const u8 {
+    const value = try decodeStringAlloc(alloc, data, pos_ptr);
+    if (value.len == 0) {
+        alloc.free(value);
+        return null;
+    }
+    return value;
+}
+
+fn decodeStringListAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize) ![]const []const u8 {
+    var pos = pos_ptr.*;
+    if (pos + 4 > data.len) return error.InvalidManifest;
+    const count = std.mem.readInt(u32, data[pos..][0..4], .little);
+    pos += 4;
+    pos_ptr.* = pos;
+    if (count == 0) return &.{};
+
+    const out = try alloc.alloc([]const u8, count);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+    }
+    for (0..count) |idx| {
+        out[idx] = try decodeStringAlloc(alloc, data, pos_ptr);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStringList(alloc: Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len != 0) alloc.free(values);
+}
+
+fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.BaseSourceDescriptor {
+    if (data.len == 0) return error.InvalidManifest;
+    var pos: usize = 0;
+    const kind_value = data[pos];
+    pos += 1;
+
+    const descriptor: manifest_types.BaseSourceDescriptor = switch (kind_value) {
+        @intFromEnum(manifest_types.BaseSourceKind.antfly_document_segments) => .{ .antfly_document_segments = {} },
+        @intFromEnum(manifest_types.BaseSourceKind.antfly_lsm_overlay) => .{ .antfly_lsm_overlay = {} },
+        @intFromEnum(manifest_types.BaseSourceKind.antfly_row_fragments) => blk: {
+            const snapshot_id = try decodeStringAlloc(alloc, data, &pos);
+            errdefer alloc.free(snapshot_id);
+            const schema_fingerprint = try decodeStringAlloc(alloc, data, &pos);
+            errdefer alloc.free(schema_fingerprint);
+            const row_fragment_artifacts = try decodeStringListAlloc(alloc, data, &pos);
+            errdefer freeStringList(alloc, row_fragment_artifacts);
+            const row_fragment_stats_artifacts = try decodeStringListAlloc(alloc, data, &pos);
+            errdefer freeStringList(alloc, row_fragment_stats_artifacts);
+            break :blk .{ .antfly_row_fragments = .{
+                .snapshot_id = snapshot_id,
+                .schema_fingerprint = schema_fingerprint,
+                .row_fragment_artifacts = row_fragment_artifacts,
+                .row_fragment_stats_artifacts = row_fragment_stats_artifacts,
+            } };
+        },
+        @intFromEnum(manifest_types.BaseSourceKind.external_parquet),
+        @intFromEnum(manifest_types.BaseSourceKind.external_iceberg),
+        @intFromEnum(manifest_types.BaseSourceKind.external_lance),
+        => blk: {
+            if (pos + 1 > data.len) return error.InvalidManifest;
+            const format: manifest_types.ExternalBaseFormat = switch (data[pos]) {
+                @intFromEnum(manifest_types.ExternalBaseFormat.parquet_prefix) => .parquet_prefix,
+                @intFromEnum(manifest_types.ExternalBaseFormat.iceberg) => .iceberg,
+                @intFromEnum(manifest_types.ExternalBaseFormat.lance) => .lance,
+                else => return error.InvalidManifest,
+            };
+            pos += 1;
+            const source_uri = try decodeStringAlloc(alloc, data, &pos);
+            errdefer alloc.free(source_uri);
+            const snapshot_id = try decodeStringAlloc(alloc, data, &pos);
+            errdefer alloc.free(snapshot_id);
+            const schema_fingerprint = try decodeStringAlloc(alloc, data, &pos);
+            errdefer alloc.free(schema_fingerprint);
+            const file_inventory_artifact = try decodeOptionalStringAlloc(alloc, data, &pos);
+            errdefer if (file_inventory_artifact) |artifact_id| alloc.free(artifact_id);
+            const row_group_metadata_artifact = try decodeOptionalStringAlloc(alloc, data, &pos);
+            errdefer if (row_group_metadata_artifact) |artifact_id| alloc.free(artifact_id);
+            const delete_metadata_artifact = try decodeOptionalStringAlloc(alloc, data, &pos);
+            errdefer if (delete_metadata_artifact) |artifact_id| alloc.free(artifact_id);
+            const source = manifest_types.ExternalBaseSource{
+                .format = format,
+                .source_uri = source_uri,
+                .snapshot_id = snapshot_id,
+                .schema_fingerprint = schema_fingerprint,
+                .file_inventory_artifact = file_inventory_artifact,
+                .row_group_metadata_artifact = row_group_metadata_artifact,
+                .delete_metadata_artifact = delete_metadata_artifact,
+            };
+            break :blk switch (kind_value) {
+                @intFromEnum(manifest_types.BaseSourceKind.external_parquet) => .{ .external_parquet = source },
+                @intFromEnum(manifest_types.BaseSourceKind.external_iceberg) => .{ .external_iceberg = source },
+                @intFromEnum(manifest_types.BaseSourceKind.external_lance) => .{ .external_lance = source },
+                else => unreachable,
+            };
+        },
+        else => return error.InvalidManifest,
+    };
+
+    if (pos != data.len) {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+        return error.InvalidManifest;
+    }
+    descriptor.validate() catch |err| {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+        return err;
+    };
+    return descriptor;
 }
 
 test "manifest codec round-trips deterministically" {
@@ -777,6 +1017,51 @@ test "manifest codec round-trips deterministically" {
     try std.testing.expectEqualStrings("vec-0001", decoded.artifacts[1].artifact_id);
     try std.testing.expectEqual(manifest_types.ArtifactKind.sparse_segment, decoded.artifacts[2].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_segment, decoded.artifacts[3].kind);
+}
+
+test "manifest codec round-trips optional lake base source" {
+    const alloc = std.testing.allocator;
+    var manifest = manifest_types.Manifest{
+        .namespace = try alloc.dupe(u8, "events"),
+        .version = 12,
+        .built_at_ns = 123456,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .base_source = .{ .external_iceberg = .{
+            .format = .iceberg,
+            .source_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events"),
+            .snapshot_id = try alloc.dupe(u8, "iceberg-123"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .file_inventory_artifact = try alloc.dupe(u8, "external-files-0001"),
+        } },
+        .stats = .{
+            .document_count = 0,
+            .document_base_version = 12,
+        },
+        .artifacts = try alloc.alloc(manifest_types.ArtifactRef, 1),
+    };
+    defer manifest.deinit(alloc);
+    manifest.artifacts[0] = .{
+        .kind = .external_base_source,
+        .name = try alloc.dupe(u8, "events.files"),
+        .artifact_id = try alloc.dupe(u8, "external-files-0001"),
+        .byte_len = 4096,
+        .checksum = try alloc.dupe(u8, "sha256:files"),
+    };
+
+    const encoded = try encodeAlloc(alloc, manifest);
+    defer alloc.free(encoded);
+
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expect(decoded.base_source != null);
+    try std.testing.expectEqual(manifest_types.BaseSourceKind.external_iceberg, std.meta.activeTag(decoded.base_source.?));
+    try std.testing.expectEqualStrings("iceberg-123", decoded.base_source.?.external_iceberg.snapshot_id);
+    try std.testing.expectEqualStrings("external-files-0001", decoded.base_source.?.external_iceberg.file_inventory_artifact.?);
+    try std.testing.expectEqual(@as(usize, 1), decoded.artifacts.len);
+    try std.testing.expectEqual(manifest_types.ArtifactKind.external_base_source, decoded.artifacts[0].kind);
+    try std.testing.expectEqualStrings("external-files-0001", decoded.artifacts[0].artifact_id);
 }
 
 test "manifest codec rejects bad magic" {
