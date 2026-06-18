@@ -1805,8 +1805,14 @@ fn quantizeWithSetFromSource(self: anytype, set: *proto.RaBitQuantizedVectorSet,
         }
     }
 
-    const temp_diffs = try self.alloc.alloc(f32, source.floatCount());
-    defer self.alloc.free(temp_diffs);
+    const temp_diff_count = source.floatCount();
+    var temp_diff_stack: [8192]f32 = undefined;
+    const use_temp_diff_stack = temp_diff_count <= temp_diff_stack.len;
+    const temp_diffs = if (use_temp_diff_stack)
+        temp_diff_stack[0..temp_diff_count]
+    else
+        try self.alloc.alloc(f32, temp_diff_count);
+    defer if (!use_temp_diff_stack) self.alloc.free(temp_diffs);
 
     for (0..added_count) |i| {
         const transformed = source.vectorAt(i);
