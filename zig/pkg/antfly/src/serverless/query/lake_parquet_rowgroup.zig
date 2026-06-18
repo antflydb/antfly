@@ -24,7 +24,7 @@ const rowsource = @import("../../storage/rowsource/types.zig");
 
 pub const ColumnChunkInput = struct {
     column_id: []const u8,
-    /// Raw column chunk bytes for a required, uncompressed, PLAIN i64 column.
+    /// Raw column chunk bytes for one supported uncompressed i64 column path.
     bytes: []const u8,
 
     pub fn validate(self: ColumnChunkInput) !void {
@@ -153,7 +153,7 @@ pub const RowGroupSource = struct {
 
         const input = self.row_groups[self.next_index];
         self.next_index += 1;
-        self.current = try buildRequiredPlainI64RowGroupBatchAlloc(
+        self.current = try buildSupportedI64RowGroupBatchAlloc(
             alloc,
             self.inventory,
             input.file_id,
@@ -220,7 +220,7 @@ pub const ObjectRangeRowGroupSource = struct {
 
         const input = self.row_groups[self.next_index];
         self.next_index += 1;
-        self.current = try buildRequiredPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
+        self.current = try buildSupportedI64RowGroupBatchFromObjectRangeReaderAlloc(
             alloc,
             self.reader,
             self.inventory,
@@ -251,7 +251,7 @@ pub fn buildRequiredPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
-    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .required);
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .required });
 }
 
 pub fn buildOptionalPlainI64RowGroupBatchAlloc(
@@ -261,7 +261,7 @@ pub fn buildOptionalPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
-    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .optional);
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .optional });
 }
 
 pub fn buildDictionaryPlainI64RowGroupBatchAlloc(
@@ -271,7 +271,17 @@ pub fn buildDictionaryPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
-    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .dictionary_required);
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .dictionary_required });
+}
+
+pub fn buildSupportedI64RowGroupBatchAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .from_inventory);
 }
 
 const PlainI64Mode = enum {
@@ -280,13 +290,18 @@ const PlainI64Mode = enum {
     dictionary_required,
 };
 
+const PlainI64ModeRequest = union(enum) {
+    fixed: PlainI64Mode,
+    from_inventory,
+};
+
 fn buildPlainI64RowGroupBatchAlloc(
     alloc: Allocator,
     inventory: external_source.Inventory,
     file_id: []const u8,
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
-    mode: PlainI64Mode,
+    mode_request: PlainI64ModeRequest,
 ) !OwnedBatch {
     try inventory.validate();
     if (projected_chunks.len == 0) return error.InvalidParquetRowGroupBatch;
@@ -327,7 +342,11 @@ fn buildPlainI64RowGroupBatchAlloc(
 
     for (projected_chunks, 0..) |input, idx| {
         try input.validate();
-        _ = findColumnChunk(row_group, input.column_id) orelse return error.ParquetColumnNotFound;
+        const chunk = findColumnChunk(row_group, input.column_id) orelse return error.ParquetColumnNotFound;
+        const mode = switch (mode_request) {
+            .fixed => |fixed| fixed,
+            .from_inventory => try plainI64ModeForColumnChunk(chunk),
+        };
         column_names[idx] = try alloc.dupe(u8, input.column_id);
         initialized_names += 1;
         switch (mode) {
@@ -382,6 +401,45 @@ pub fn buildRequiredPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
     row_group_ordinal: u32,
     projected_columns: []const []const u8,
 ) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
+        alloc,
+        reader,
+        inventory,
+        file_id,
+        row_group_ordinal,
+        projected_columns,
+        .{ .fixed = .required },
+    );
+}
+
+pub fn buildSupportedI64RowGroupBatchFromObjectRangeReaderAlloc(
+    alloc: Allocator,
+    reader: ObjectRangeReader,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_columns: []const []const u8,
+) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
+        alloc,
+        reader,
+        inventory,
+        file_id,
+        row_group_ordinal,
+        projected_columns,
+        .from_inventory,
+    );
+}
+
+fn buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
+    alloc: Allocator,
+    reader: ObjectRangeReader,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_columns: []const []const u8,
+    mode_request: PlainI64ModeRequest,
+) !OwnedBatch {
     try inventory.validate();
     if (projected_columns.len == 0) return error.InvalidParquetRowGroupBatch;
     const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
@@ -412,12 +470,13 @@ pub fn buildRequiredPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
         };
     }
 
-    var owned = try buildRequiredPlainI64RowGroupBatchAlloc(
+    var owned = try buildPlainI64RowGroupBatchAlloc(
         alloc,
         inventory,
         file_id,
         row_group_ordinal,
         chunk_inputs,
+        mode_request,
     );
     errdefer owned.deinit(alloc);
 
@@ -472,6 +531,22 @@ fn findColumnChunk(row_group: external_source.RowGroup, column_id: []const u8) ?
         if (std.mem.eql(u8, chunk.column_id, column_id)) return chunk;
     }
     return null;
+}
+
+fn plainI64ModeForColumnChunk(chunk: external_source.ColumnChunk) !PlainI64Mode {
+    if (chunk.compression_codec.len != 0 and
+        !std.ascii.eqlIgnoreCase(chunk.compression_codec, "uncompressed") and
+        !std.ascii.eqlIgnoreCase(chunk.compression_codec, "none"))
+    {
+        return error.UnsupportedParquetPage;
+    }
+    if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .required;
+    if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
+        std.ascii.eqlIgnoreCase(chunk.encoding, "plain_dictionary"))
+    {
+        return .dictionary_required;
+    }
+    return error.UnsupportedParquetPage;
 }
 
 fn appendField(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, previous: *i16, id: i16, field_type: enum(u4) {
@@ -830,6 +905,73 @@ test "parquet row group batch assembles dictionary i64 columns" {
     try std.testing.expectEqual(@as(u64, 3), row_ref.row_ordinal);
 }
 
+test "parquet row group batch dispatches supported i64 encodings from inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2048,
+        .row_count = 4,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 4,
+            .file_offset = 100,
+            .total_byte_len = 256,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 100,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "tenant"),
+                    .file_offset = 196,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    var amount_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer amount_chunk.deinit(alloc);
+    try appendPlainI64DataPage(&amount_chunk, alloc, &[_]i64{ 10, 20, 30, 40 });
+    var tenant_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer tenant_chunk.deinit(alloc);
+    try appendPlainI64DictionaryPage(&tenant_chunk, alloc, &[_]i64{ 7, 8 });
+    try appendDictionaryI64DataPage(&tenant_chunk, alloc, 4, 1, &[_]u8{ 3, 0b00001010 });
+
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{ .column_id = "amount", .bytes = amount_chunk.items },
+        .{ .column_id = "tenant", .bytes = tenant_chunk.items },
+    });
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqual(@as(usize, 4), owned.batch.rowCount());
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30, 40 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8, 7, 8 }, owned.batch.columns[1].values.i64);
+
+    inventory.files[0].row_groups[0].column_chunks[1].encoding[0] = 'd';
+    try std.testing.expectError(error.UnsupportedParquetPage, buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{ .column_id = "tenant", .bytes = tenant_chunk.items },
+    }));
+}
+
 test "parquet row group source scans through lake rows" {
     const alloc = std.testing.allocator;
     const lake_rows = @import("lake_rows.zig");
@@ -873,7 +1015,7 @@ test "parquet row group source scans through lake rows" {
                     .file_offset = 200,
                     .compressed_len = 64,
                     .uncompressed_len = 64,
-                    .encoding = try alloc.dupe(u8, "plain"),
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
                 }}),
             },
         }),
@@ -885,7 +1027,8 @@ test "parquet row group source scans through lake rows" {
     try appendPlainI64DataPage(&first_chunk, alloc, &[_]i64{ 10, 20 });
     var second_chunk = std.ArrayListUnmanaged(u8).empty;
     defer second_chunk.deinit(alloc);
-    try appendPlainI64DataPage(&second_chunk, alloc, &[_]i64{ 30, 40 });
+    try appendPlainI64DictionaryPage(&second_chunk, alloc, &[_]i64{ 30, 40 });
+    try appendDictionaryI64DataPage(&second_chunk, alloc, 2, 1, &[_]u8{ 3, 0b00000010 });
 
     const first_chunks = [_]ColumnChunkInput{.{ .column_id = "amount", .bytes = first_chunk.items }};
     const second_chunks = [_]ColumnChunkInput{.{ .column_id = "amount", .bytes = second_chunk.items }};
@@ -924,7 +1067,8 @@ test "parquet object range row group source reads chunks into lake rows" {
     try appendPlainI64DataPage(&first_chunk, alloc, &[_]i64{ 10, 20 });
     var second_chunk = std.ArrayListUnmanaged(u8).empty;
     defer second_chunk.deinit(alloc);
-    try appendPlainI64DataPage(&second_chunk, alloc, &[_]i64{ 30, 40 });
+    try appendPlainI64DictionaryPage(&second_chunk, alloc, &[_]i64{ 30, 40 });
+    try appendDictionaryI64DataPage(&second_chunk, alloc, 2, 1, &[_]u8{ 3, 0b00000010 });
 
     const first_offset: usize = 100;
     const second_offset: usize = 200;
@@ -1008,7 +1152,7 @@ test "parquet object range row group source reads chunks into lake rows" {
                     .file_offset = second_offset,
                     .compressed_len = second_chunk.items.len,
                     .uncompressed_len = second_chunk.items.len,
-                    .encoding = try alloc.dupe(u8, "plain"),
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
                 }}),
             },
         }),
