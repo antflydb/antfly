@@ -87,6 +87,12 @@ const RemoteOptions = struct {
     bearer_token: ?[]const u8 = null,
 };
 
+const HAStringValidation = enum {
+    ok,
+    missing,
+    padded,
+};
+
 pub fn run(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
@@ -887,10 +893,10 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
             break;
         } else if (std.mem.eql(u8, arg, "--ha-url")) {
             command_start += 1;
-            options.remote_url = try value(argv, &command_start, "--ha-url");
+            options.remote_url = try validateHAAdminURL(try value(argv, &command_start, "--ha-url"));
         } else if (std.mem.eql(u8, arg, "--ha-token-env")) {
             command_start += 1;
-            options.remote_token_env = try value(argv, &command_start, "--ha-token-env");
+            options.remote_token_env = try validateHAAdminTokenEnvName(try value(argv, &command_start, "--ha-token-env"));
         } else if (std.mem.eql(u8, arg, "--ha-token") or
             std.mem.eql(u8, arg, "--token") or
             std.mem.eql(u8, arg, "--ha-token-file"))
@@ -898,28 +904,28 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
             return error.HAAdminRawTokenFlagUnsupported;
         } else if (std.mem.eql(u8, arg, "--primary-log")) {
             command_start += 1;
-            options.primary_log = try value(argv, &command_start, "--primary-log");
+            options.primary_log = try validateHAPath(try value(argv, &command_start, "--primary-log"), .primary_log);
         } else if (std.mem.eql(u8, arg, "--primary-slots")) {
             command_start += 1;
-            options.primary_slots = try value(argv, &command_start, "--primary-slots");
+            options.primary_slots = try validateHAPath(try value(argv, &command_start, "--primary-slots"), .primary_slots);
         } else if (std.mem.eql(u8, arg, "--primary-node-id")) {
             command_start += 1;
-            options.primary_node_id = try value(argv, &command_start, "--primary-node-id");
+            options.primary_node_id = try validateHANodeID(try value(argv, &command_start, "--primary-node-id"), .primary);
         } else if (std.mem.eql(u8, arg, "--standby-log")) {
             command_start += 1;
-            options.standby_log = try value(argv, &command_start, "--standby-log");
+            options.standby_log = try validateHAPath(try value(argv, &command_start, "--standby-log"), .standby_log);
         } else if (std.mem.eql(u8, arg, "--standby-progress")) {
             command_start += 1;
-            options.standby_progress = try value(argv, &command_start, "--standby-progress");
+            options.standby_progress = try validateHAPath(try value(argv, &command_start, "--standby-progress"), .standby_progress);
         } else if (std.mem.eql(u8, arg, "--standby-node-id")) {
             command_start += 1;
-            options.standby_node_id = try value(argv, &command_start, "--standby-node-id");
+            options.standby_node_id = try validateHANodeID(try value(argv, &command_start, "--standby-node-id"), .standby);
         } else if (std.mem.eql(u8, arg, "--fence-wal")) {
             command_start += 1;
-            options.fence_wal = try value(argv, &command_start, "--fence-wal");
+            options.fence_wal = try validateHAPath(try value(argv, &command_start, "--fence-wal"), .fence_wal);
         } else if (std.mem.eql(u8, arg, "--former-primary-log")) {
             command_start += 1;
-            options.former_primary_log = try value(argv, &command_start, "--former-primary-log");
+            options.former_primary_log = try validateHAPath(try value(argv, &command_start, "--former-primary-log"), .former_primary_log);
         } else if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
             command_start += 1;
             options.identity.cluster_id = try parseU64(try value(argv, &command_start, "--ha-cluster-id"));
@@ -962,10 +968,7 @@ fn value(argv: []const []const u8, idx: *usize, flag: []const u8) ![]const u8 {
 }
 
 fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[]u8 {
-    const raw_env_var = options.remote_token_env orelse return null;
-    const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
-    if (env_var.len == 0) return error.HAAdminTokenEnvMissing;
-    if (!isHAAdminTokenEnvName(env_var)) return error.HAAdminTokenEnvInvalid;
+    const env_var = options.remote_token_env orelse return null;
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -974,6 +977,115 @@ fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[
     const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
     if (token.len == 0) return error.HAAdminTokenMissing;
     return try alloc.dupe(u8, token);
+}
+
+fn classifyHAString(value_or_null: ?[]const u8) HAStringValidation {
+    const raw = value_or_null orelse return .missing;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .missing;
+    if (trimmed.len != raw.len) return .padded;
+    return .ok;
+}
+
+const HAPathField = enum {
+    primary_log,
+    primary_slots,
+    standby_log,
+    standby_progress,
+    fence_wal,
+    former_primary_log,
+};
+
+fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
+    switch (classifyHAString(path)) {
+        .ok => {},
+        .missing => return switch (field) {
+            .primary_log => error.PrimaryLogMissing,
+            .primary_slots => error.PrimarySlotsMissing,
+            .standby_log => error.StandbyLogMissing,
+            .standby_progress => error.StandbyProgressMissing,
+            .fence_wal => error.FenceWalMissing,
+            .former_primary_log => error.FormerPrimaryLogMissing,
+        },
+        .padded => return haPathInvalidError(field),
+    }
+    if (!isNormalizedHAPath(path)) return haPathInvalidError(field);
+    return path;
+}
+
+fn haPathInvalidError(field: HAPathField) anyerror {
+    return switch (field) {
+        .primary_log => error.HAPrimaryLogInvalid,
+        .primary_slots => error.HAPrimarySlotsInvalid,
+        .standby_log => error.HAStandbyLogInvalid,
+        .standby_progress => error.HAStandbyProgressInvalid,
+        .fence_wal => error.HAFenceWalInvalid,
+        .former_primary_log => error.HAFormerPrimaryLogInvalid,
+    };
+}
+
+fn isNormalizedHAPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    if (std.mem.eql(u8, path, ".") or std.mem.eql(u8, path, "..")) return false;
+    if (std.mem.indexOf(u8, path, "//") != null) return false;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
+
+const HANodeIDField = enum {
+    primary,
+    standby,
+};
+
+fn validateHANodeID(node_id: []const u8, field: HANodeIDField) ![]const u8 {
+    switch (classifyHAString(node_id)) {
+        .ok => {},
+        .missing, .padded => return haNodeIDInvalidError(field),
+    }
+    if (!isHANodeID(node_id)) return haNodeIDInvalidError(field);
+    return node_id;
+}
+
+fn haNodeIDInvalidError(field: HANodeIDField) anyerror {
+    return switch (field) {
+        .primary => error.HAPrimaryNodeIdInvalid,
+        .standby => error.HAStandbyNodeIdInvalid,
+    };
+}
+
+fn isHANodeID(node_id: []const u8) bool {
+    if (node_id.len == 0 or node_id.len > 128) return false;
+    for (node_id) |byte| {
+        if (!isHANameByte(byte)) return false;
+    }
+    return true;
+}
+
+fn validateHAAdminURL(raw_url: []const u8) ![]const u8 {
+    switch (classifyHAString(raw_url)) {
+        .ok => {},
+        .missing => return error.HAAdminURLMissing,
+        .padded => return error.HAAdminURLInvalid,
+    }
+    const uri = std.Uri.parse(raw_url) catch return error.HAAdminURLInvalid;
+    if (uri.scheme.len == 0) return error.HAAdminURLInvalid;
+    if (uri.host == null) return error.HAAdminURLInvalid;
+    return raw_url;
+}
+
+fn validateHAAdminTokenEnvName(raw_env_var: []const u8) ![]const u8 {
+    switch (classifyHAString(raw_env_var)) {
+        .ok => {},
+        .missing => return error.HAAdminTokenEnvMissing,
+        .padded => return error.HAAdminTokenEnvInvalid,
+    }
+    if (!isHAAdminTokenEnvName(raw_env_var)) return error.HAAdminTokenEnvInvalid;
+    return raw_env_var;
 }
 
 fn isHAAdminTokenEnvName(name: []const u8) bool {
@@ -991,6 +1103,10 @@ fn isEnvNameFirstByte(byte: u8) bool {
 
 fn isEnvNameByte(byte: u8) bool {
     return isEnvNameFirstByte(byte) or (byte >= '0' and byte <= '9');
+}
+
+fn isHANameByte(byte: u8) bool {
+    return isEnvNameByte(byte) or byte == '-' or byte == '.' or byte == ':';
 }
 
 fn parseU64(raw: []const u8) !u64 {
@@ -1110,9 +1226,8 @@ test "ha cmd validates remote bearer token env name" {
     const alloc = std.testing.allocator;
 
     try std.testing.expect((try resolveRemoteBearerToken(alloc, .{})) == null);
-    try std.testing.expectError(error.HAAdminTokenEnvMissing, resolveRemoteBearerToken(alloc, .{
-        .remote_token_env = " \t ",
-    }));
+    try std.testing.expectError(error.HAAdminTokenEnvMissing, parseLocalArgs(alloc, &.{ "--ha-url", "http://127.0.0.1:8081", "--ha-token-env", " \t ", "--", "status", "primary" }));
+    try std.testing.expectError(error.HAAdminTokenEnvInvalid, parseLocalArgs(alloc, &.{ "--ha-url", "http://127.0.0.1:8081", "--ha-token-env", " ANTFLY_HA_ADMIN_TOKEN", "--", "status", "primary" }));
     try std.testing.expectError(error.HAAdminTokenEnvInvalid, resolveRemoteBearerToken(alloc, .{
         .remote_token_env = "bad-token-env",
     }));
@@ -1122,6 +1237,30 @@ test "ha cmd validates remote bearer token env name" {
     try std.testing.expectError(error.HAAdminTokenMissing, resolveRemoteBearerToken(alloc, .{
         .remote_token_env = "ANTFLY_HA_ADMIN_TOKEN_SHOULD_NOT_EXIST",
     }));
+}
+
+test "ha cmd classifies HA strings before field-specific validation" {
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(" \t\r\n"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString(" primary-a"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("primary-a\n"));
+    try std.testing.expectEqual(HAStringValidation.ok, classifyHAString("primary-a"));
+}
+
+test "ha cmd rejects padded or invalid HA local option strings" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", " http://127.0.0.1:8081", "--", "status", "primary" }));
+    try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", "not-a-url", "--", "status", "primary" }));
+    try std.testing.expectError(error.HAPrimaryLogInvalid, parseLocalArgs(alloc, &.{ "--primary-log", " p.wal", "--", "slot", "list" }));
+    try std.testing.expectError(error.HAPrimarySlotsInvalid, parseLocalArgs(alloc, &.{ "--primary-slots", "slots//wal", "--", "slot", "list" }));
+    try std.testing.expectError(error.HAStandbyLogInvalid, parseLocalArgs(alloc, &.{ "--standby-log", "../standby.wal", "--", "status", "standby" }));
+    try std.testing.expectError(error.HAStandbyProgressInvalid, parseLocalArgs(alloc, &.{ "--standby-progress", "progress.wal\n", "--", "status", "standby" }));
+    try std.testing.expectError(error.HAFenceWalInvalid, parseLocalArgs(alloc, &.{ "--fence-wal", ".", "--", "fence", "current" }));
+    try std.testing.expectError(error.HAFormerPrimaryLogInvalid, parseLocalArgs(alloc, &.{ "--former-primary-log", "former/../primary.wal", "--", "rejoin", "assess" }));
+    try std.testing.expectError(error.HAPrimaryNodeIdInvalid, parseLocalArgs(alloc, &.{ "--primary-node-id", "primary a", "--", "status", "primary" }));
+    try std.testing.expectError(error.HAStandbyNodeIdInvalid, parseLocalArgs(alloc, &.{ "--standby-node-id", " standby-a", "--", "status", "standby" }));
 }
 
 test "ha cmd rejects raw bearer token argv flags" {

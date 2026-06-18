@@ -579,18 +579,43 @@ for explicitly local file-transfer or recovery steps.
 ### Implementation Guardrails
 
 The first runtime implementation should keep validation reusable without making
-it vague. `paddedHAString` should become a shared classifier such as
-`classifyHAString(value) -> ok | missing | padded`, not a generic validator that
-trims or rewrites operator input. Field-specific validators should translate
-that classifier into field-specific errors and then add type-specific checks for
-paths, node ids, slot names, environment-variable names, and URLs.
+it vague. `paddedHAString` should become a shared classifier, not a single
+generic validator that tries to do every check. The intended shape is:
+
+```zig
+const HAStringValidation = enum { ok, missing, padded };
+
+fn classifyHAString(value: ?[]const u8) HAStringValidation
+```
+
+Field-specific validators should translate that classifier into field-specific
+errors and then add type-specific checks. A primary log path should still return
+an error such as `HAPrimaryLogInvalid`, a standby slot should still return
+`HAStandbySlotMissing`, and an admin token env var should still return
+`HAAdminTokenEnvInvalid`. The shared helper should classify missing or padded
+input; the caller should decide which path, node-id, slot-name, env-var, or URL
+rule applies and which precise error belongs in the API or CLI response. It
+should never trim and continue, because doing so can hide operator mistakes in
+durable HA identity, WAL path, fence, slot, URL, or token-env configuration.
+
+The type-specific validation layer should include:
+
+- paths: absolute or normalized as required by the runtime, and bounded to the
+  configured storage root when a field refers to local storage;
+- node ids and slot names: restricted character sets and bounded lengths;
+- environment variable names: the same validation used for process env names;
+- URLs: parsed as URLs and rejected when they contain hidden leading/trailing
+  whitespace.
 
 The first `test_standby.py` should be a real process e2e once the runtime and
 admin surfaces are usable. It should start a primary and standby, create a slot
 or seed workflow, write data through the primary, wait for standby catch-up,
 verify read-only standby behavior, restart the standby, and verify replay
-resumes. Argument-validation coverage belongs in unit tests; this e2e should
-prove the supported Postgres-style user path.
+resumes. After fence and promotion support is usable, the same e2e should
+promote the standby and verify the old primary rejects writes or must rejoin
+through rewind/reseed. Argument-validation coverage belongs in unit tests; this
+e2e should prove the supported Postgres-style user path with real Antfly
+processes, files, admin calls, and client-visible reads/writes.
 
 The Zig simulation layer should carry the deeper correctness burden. It should
 model crash, restart, partition, duplicate/gap/out-of-order WAL, promotion,
@@ -604,7 +629,11 @@ needs runtime primary/standby wiring, generated Zig and Go admin clients, operat
 integration through the Go SDK wrapper, base backup, sync commit, fencing,
 promotion, timelines, former-primary repair, standby read freshness, retention
 pressure handling, auth, metrics, runbooks, format compatibility, crash tests,
-real process e2e, and operator e2e.
+real process e2e, and operator e2e. For bulk Postgres-style HA parity, the
+remaining gaps after basic streaming are former-primary repair comparable to
+`pg_rewind`, deeper synchronous commit policy support, WAL archive or PITR-like
+recovery options, robust observability, optional cascading or relay replication,
+and operator workflows that make the common cases boring.
 
 ## Test Strategy
 
