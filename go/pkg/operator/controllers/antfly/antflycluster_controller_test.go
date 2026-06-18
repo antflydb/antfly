@@ -4594,30 +4594,34 @@ func TestHAAdminSDKActionResultsSatisfyOperatorEvidenceGates(t *testing.T) {
 func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 	g := NewWithT(t)
 
-	cluster := &antflyv1.AntflyCluster{
-		Status: antflyv1.AntflyClusterStatus{
-			HAStatus: &antflyv1.HAStatus{
-				LastPromotion: &antflyv1.HAPromotionStatus{
-					ClusterID:         100,
-					ShardID:           10,
-					TableID:           20,
-					OldPrimaryID:      "primary-a",
-					PromotedStandbyID: "standby-a",
-					ParentTimelineID:  4,
-					ParentEpoch:       6,
-					NewTimelineID:     5,
-					NewEpoch:          7,
-					SwitchLSN:         12,
-					RequiredLSN:       12,
-					ObservedLSN:       12,
-					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
-					FenceGeneration:   3,
-					FenceToken:        "ha-fence-token",
+	newRejoinCluster := func() *antflyv1.AntflyCluster {
+		return &antflyv1.AntflyCluster{
+			Status: antflyv1.AntflyClusterStatus{
+				HAStatus: &antflyv1.HAStatus{
+					LastPromotion: &antflyv1.HAPromotionStatus{
+						ClusterID:         100,
+						ShardID:           10,
+						TableID:           20,
+						OldPrimaryID:      "primary-a",
+						PromotedStandbyID: "standby-a",
+						ParentTimelineID:  4,
+						ParentEpoch:       6,
+						NewTimelineID:     5,
+						NewEpoch:          7,
+						SwitchLSN:         12,
+						RequiredLSN:       12,
+						ObservedLSN:       12,
+						FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+						FenceGeneration:   3,
+						FenceToken:        "ha-fence-token",
+					},
 				},
 			},
-		},
+		}
 	}
-	action := antflyv1.HAPlannedActionStatus{
+
+	cluster := newRejoinCluster()
+	rewindAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionRewindFormerPrimary),
 		StandbyName:     "primary-a",
 		TargetLSN:       12,
@@ -4667,13 +4671,81 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{}
-	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(cluster, &action, response)).To(BeTrue())
-	g.Expect(action.AdminResult).NotTo(BeNil())
-	g.Expect(action.AdminResult.RejoinAction).To(Equal("rewind"))
-	g.Expect(action.AdminResult.RewindExecuted).To(BeTrue())
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(cluster, &rewindAction, response)).To(BeTrue())
+	g.Expect(rewindAction.AdminResult).NotTo(BeNil())
+	g.Expect(rewindAction.AdminResult.RejoinAction).To(Equal("rewind"))
+	g.Expect(rewindAction.AdminResult.RewindExecuted).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionRewindFormerPrimary)))
+
+	reseedAction := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionReseedFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 20,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 3,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminNodeID:     "standby-a",
+	}
+	reseedResponse := adminsdk.HARejoinAssessResponse{
+		SchemaVersion: 1,
+		Action: adminsdk.HAActionReceipt{
+			ActionId:   "rejoin_reseed:primary-a",
+			ActionKind: adminsdk.HAActionKindRejoinReseed,
+			Target:     "primary-a",
+			State:      adminsdk.HAActionStateApplied,
+			NodeId:     "standby-a",
+		},
+		Assessment: adminsdk.HARejoinAssessment{
+			Action:            adminsdk.HARejoinActionReseed,
+			Reason:            adminsdk.HARejoinReasonParentTimelineWALExpired,
+			FormerNodeId:      "primary-a",
+			TargetTimelineId:  5,
+			TargetEpoch:       7,
+			ParentClusterId:   100,
+			ParentShardId:     10,
+			ParentTableId:     20,
+			ParentTimelineId:  4,
+			ParentEpoch:       6,
+			ForkLsn:           12,
+			FormerLastLsn:     13,
+			RetainedFromLsn:   20,
+			DataLossDiscarded: true,
+		},
+		Reseed: adminsdk.HARejoinReseedResult{
+			NodeId:             "primary-a",
+			SlotName:           "primary-a",
+			TargetTimelineId:   5,
+			TargetEpoch:        7,
+			ForkLsn:            12,
+			FormerLastLsn:      13,
+			ReseedRequired:     true,
+			BaseBackupRequired: true,
+		},
+	}
+
+	reseedCluster := newRejoinCluster()
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(reseedCluster, &reseedAction, reseedResponse)).To(BeTrue())
+	g.Expect(reseedAction.AdminResult).NotTo(BeNil())
+	g.Expect(reseedAction.AdminResult.ActionNodeID).To(Equal("standby-a"))
+	g.Expect(reseedAction.AdminResult.RejoinAction).To(Equal("reseed"))
+	g.Expect(reseedAction.AdminResult.ReseedExecuted).To(BeTrue())
+	g.Expect(reseedAction.AdminResult.ReseedSlotName).To(Equal("primary-a"))
+	g.Expect(reseedAction.AdminResult.ReseedBaseBackupRequired).To(BeTrue())
+	g.Expect(reseedCluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(reseedCluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
+	g.Expect(reseedCluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionReseedFormerPrimary)))
+	g.Expect(reseedCluster.Status.HAStatus.FormerPrimary.ReseedRequired).To(BeTrue())
+
+	incompleteReseedAction := reseedAction
+	incompleteReseedAction.AdminResult = nil
+	incompleteReseed := reseedResponse
+	incompleteReseed.Reseed.BaseBackupRequired = false
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(newRejoinCluster(), &incompleteReseedAction, incompleteReseed)).To(BeFalse())
+	g.Expect(incompleteReseedAction.AdminResult).To(BeNil())
 }
 
 func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
