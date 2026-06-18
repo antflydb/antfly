@@ -83,6 +83,7 @@ const httpx = @import("httpx");
 const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 const protocol_adapters = @import("protocol_adapters.zig");
+const ard_catalog = @import("ard_catalog.zig");
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const parseOwnedJsonObjectMapAlloc = json_helpers.parseOwnedJsonObjectMapAlloc;
@@ -1926,6 +1927,7 @@ pub const ApiHttpServer = struct {
                 .body = body,
             };
         }
+        if (try self.dispatchArdRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchExtensionRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
@@ -1953,6 +1955,51 @@ pub const ApiHttpServer = struct {
             return try protocol_adapters.handleA2aCard(self);
         }
         return null;
+    }
+
+    fn dispatchArdRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
+            const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
+            const body = try ard_catalog.catalogJsonAlloc(self.alloc, .{ .mode = mode });
+            return try self.ardCatalogResponse(200, body, true);
+        }
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
+            const body = try ard_catalog.catalogJsonAlloc(self.alloc, .{ .mode = .tenant });
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            return try jsonResponse(self.alloc, .{
+                .catalog = routes.Routes.ard_v1_catalog,
+                .search = routes.Routes.ard_v1_search,
+                .explore = routes.Routes.ard_v1_explore,
+                .agents = routes.Routes.ard_v1_agents,
+            });
+        }
+        return null;
+    }
+
+    fn ardCatalogResponse(self: *ApiHttpServer, status: u16, body: []u8, public_cors: bool) !http_common.HttpResponse {
+        errdefer self.alloc.free(body);
+        var headers: []http_common.Header = &.{};
+        errdefer {
+            for (headers) |*header| header.deinit(self.alloc);
+            if (headers.len > 0) self.alloc.free(headers);
+        }
+        if (public_cors) {
+            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
+                .{
+                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
+                    .value = try self.alloc.dupe(u8, "*"),
+                },
+            });
+        }
+        return .{
+            .status = status,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .headers = headers,
+            .body = body,
+        };
     }
 
     fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
@@ -9955,6 +10002,120 @@ test "api http server serves mcp and a2a protocol surfaces" {
     defer cancel_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), cancel_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
+}
+
+test "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var public_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer public_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), public_catalog.status);
+    try std.testing.expectEqualStrings("application/json", public_catalog.content_type.?);
+    try std.testing.expectEqual(@as(usize, 1), public_catalog.headers.len);
+    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_catalog.headers[0].name);
+    try std.testing.expectEqualStrings("*", public_catalog.headers[0].value);
+    try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/ai-registry+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/mcp-server+json\"") == null);
+
+    var tenant_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer tenant_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tenant_catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"type\":\"application/mcp-server+json\"") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tenant_catalog.body, .{});
+    defer parsed.deinit();
+    const entries = parsed.value.object.get("entries").?.array.items;
+    try std.testing.expect(entries.len >= 4);
+    for (entries) |entry| {
+        const object = entry.object;
+        try std.testing.expect(object.get("identifier") != null);
+        try std.testing.expect(object.get("displayName") != null);
+        try std.testing.expect(object.get("type") != null);
+        const has_url = object.get("url") != null;
+        const has_data = object.get("data") != null;
+        try std.testing.expect(has_url != has_data);
+    }
+}
+
+test "api http server requires auth for ARD tenant catalog when auth is enabled" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const secret = "ard-catalog-trusted-principal-secret";
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .auth_enabled = true,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    var unauthorized = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer unauthorized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"tenant-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, payload);
+    defer std.testing.allocator.free(token);
+    const trusted_principal_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = token },
+    };
+
+    var authorized = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer authorized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), authorized.status);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "\"type\":\"application/mcp-server+json\"") != null);
 }
 
 test "api http server lists extension-owned mcp tools" {
