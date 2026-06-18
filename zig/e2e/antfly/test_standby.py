@@ -554,6 +554,14 @@ def _sync_policy(mode: str, *, failure_policy: str = "block", standby_name: str 
     }
 
 
+def _slot_by_name(status: dict[str, Any], slot_name: str) -> dict[str, Any]:
+    return next(
+        slot
+        for slot in status["snapshot"]["slots"]
+        if slot.get("slot_name", slot.get("name")) == slot_name
+    )
+
+
 def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: HACluster):
     table_name = "ha_standby_docs"
     ha_cluster.primary.start()
@@ -642,11 +650,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert second_doc["title"] == "second"
 
     primary_status = ha_cluster.primary.admin_get("/primary/status")
-    slot = next(
-        slot
-        for slot in primary_status["snapshot"]["slots"]
-        if slot.get("slot_name", slot.get("name")) == "standby-a"
-    )
+    slot = _slot_by_name(primary_status, "standby-a")
     assert slot["received_lsn"] >= second_lsn
     assert slot["applied_lsn"] >= second_lsn
     remote_write_status = ha_cluster.primary.admin_get(
@@ -697,6 +701,19 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert failed_commit["gate"]["action"] == "reject"
     assert failed_commit["gate"]["durability"]["status"] == "fail_closed"
+
+    stale_slot = ha_cluster.primary.admin_post(
+        "/replication-slots",
+        {"slot_name": "stale-standby", "initial_lsn": 0},
+    )
+    assert stale_slot["slot"]["slot_name"] == "stale-standby"
+    retention_status = ha_cluster.primary.admin_get("/primary/status", max_lag_lsn=1)
+    assert retention_status["snapshot"]["retention"]["reseed_recommended"] == 1
+    retained_live_slot = _slot_by_name(retention_status, "standby-a")
+    assert retained_live_slot["reseed_required"] is False
+    retained_stale_slot = _slot_by_name(retention_status, "stale-standby")
+    assert retained_stale_slot["reseed_required"] is True
+    assert retained_stale_slot["status"] == "reseed_required"
 
     fence_request = _promotion_fence_request(ha_cluster, second_lsn)
     fence = ha_cluster.standby.admin_post("/fence", fence_request)
