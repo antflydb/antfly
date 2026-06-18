@@ -3016,8 +3016,15 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     if (request.source_cte.len != 0) return error.UnsupportedRowsQuery;
     if (request.row_claim != null) return error.UnsupportedRowsQuery;
     if (request.doc_key_range != null) return error.UnsupportedRowsQuery;
-    if (request.distinct_on.len != 0 or request.distinct_on_expressions.len != 0) return error.UnsupportedRowsQuery;
     try validateLakeRowsQueryPredicateGroupsSupported(alloc, schema, request);
+    for (request.distinct_on) |field| {
+        const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+        if (column.field_type == .embedding) return error.UnsupportedRowsQuery;
+    }
+    for (request.distinct_on_expressions) |expression| {
+        const output_type = try rowsExpressionOutputType(alloc, schema, expression);
+        if (output_type == .embedding) return error.UnsupportedRowsQuery;
+    }
     for (request.array_any) |predicate| {
         const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
         if (column.field_type != .array) return error.InvalidRowsRequest;
@@ -3126,7 +3133,7 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     const scan = lake_rows.ScanRequest{
         .projected_columns = projected_columns,
         .predicate = predicate,
-        .limit = if (request.order_by.len == 0 and !lakeRowsQueryHasResidualPredicates(request)) if (request.limit) |limit| std.math.add(usize, @as(usize, request.offset), @as(usize, limit)) catch return error.InvalidRowsRequest else null else null,
+        .limit = if (request.order_by.len == 0 and request.distinct_on.len == 0 and request.distinct_on_expressions.len == 0 and !lakeRowsQueryHasResidualPredicates(request)) if (request.limit) |limit| std.math.add(usize, @as(usize, request.offset), @as(usize, limit)) catch return error.InvalidRowsRequest else null else null,
     };
     return .{
         .request = scan,
@@ -3162,52 +3169,53 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
         rows.deinit(alloc);
     }
 
-    if (request.order_by.len > 0) {
-        var ordered = std.ArrayListUnmanaged(LakeRowsQueryOrderCandidate).empty;
-        defer {
-            for (ordered.items) |candidate| freeQueryOrderKeySlice(alloc, candidate.order_keys);
-            ordered.deinit(alloc);
-        }
-        try ordered.ensureUnusedCapacity(alloc, filtered_rows.len);
-        for (filtered_rows, 0..) |row, ordinal| {
-            const keys = try lakeRowsQueryOrderKeysAlloc(alloc, row, request.order_by);
-            var keys_transferred = false;
-            errdefer if (!keys_transferred) freeQueryOrderKeySlice(alloc, keys);
-            ordered.appendAssumeCapacity(.{
-                .row = row,
-                .order_keys = keys,
-                .ordinal = ordinal,
-            });
-            keys_transferred = true;
-        }
-        std.sort.pdq(LakeRowsQueryOrderCandidate, ordered.items, QuerySortContext{ .order_by = request.order_by }, lakeRowsQueryOrderCandidateLessThan);
+    var candidates = std.ArrayListUnmanaged(LakeRowsQueryOrderCandidate).empty;
+    defer {
+        for (candidates.items) |candidate| freeQueryOrderKeySlice(alloc, candidate.order_keys);
+        candidates.deinit(alloc);
+    }
+    try candidates.ensureUnusedCapacity(alloc, filtered_rows.len);
+    for (filtered_rows, 0..) |row, ordinal| {
+        const keys = try lakeRowsQueryOrderKeysAlloc(alloc, row, request.order_by);
+        var keys_transferred = false;
+        errdefer if (!keys_transferred) freeQueryOrderKeySlice(alloc, keys);
+        candidates.appendAssumeCapacity(.{
+            .row = row,
+            .order_keys = keys,
+            .ordinal = ordinal,
+        });
+        keys_transferred = true;
+    }
 
-        const start = @min(@as(usize, request.offset), ordered.items.len);
-        const limited_len: usize = if (request.limit) |limit|
-            @min(@as(usize, limit), ordered.items.len - start)
-        else
-            ordered.items.len - start;
-        try rows.ensureUnusedCapacity(alloc, limited_len);
-        for (ordered.items[start .. start + limited_len]) |candidate| {
-            const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, candidate.row);
-            rows.appendAssumeCapacity(encoded);
-        }
+    if (request.order_by.len > 0) {
+        std.sort.pdq(LakeRowsQueryOrderCandidate, candidates.items, QuerySortContext{ .order_by = request.order_by }, lakeRowsQueryOrderCandidateLessThan);
+    }
+
+    var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+    defer candidate_indexes.deinit(alloc);
+    if (request.distinct_on.len > 0 or request.distinct_on_expressions.len > 0) {
+        try appendLakeRowsQueryDistinctOnIndexesAlloc(alloc, candidates.items, request.distinct_on, request.distinct_on_expressions, &candidate_indexes);
     } else {
-        const start = @min(@as(usize, request.offset), filtered_rows.len);
-        const limited_len: usize = if (request.limit) |limit|
-            @min(@as(usize, limit), filtered_rows.len - start)
-        else
-            filtered_rows.len - start;
-        try rows.ensureUnusedCapacity(alloc, limited_len);
-        for (filtered_rows[start .. start + limited_len]) |row| {
-            const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, row);
-            rows.appendAssumeCapacity(encoded);
-        }
+        try candidate_indexes.ensureUnusedCapacity(alloc, candidates.items.len);
+        for (0..candidates.items.len) |i| candidate_indexes.appendAssumeCapacity(i);
+    }
+
+    const start = @min(@as(usize, request.offset), candidate_indexes.items.len);
+    const limited_len: usize = if (request.limit) |limit|
+        @min(@as(usize, limit), candidate_indexes.items.len - start)
+    else
+        candidate_indexes.items.len - start;
+    try rows.ensureUnusedCapacity(alloc, limited_len);
+    for (candidate_indexes.items[start .. start + limited_len]) |candidate_index| {
+        const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, candidates.items[candidate_index].row);
+        rows.appendAssumeCapacity(encoded);
     }
 
     return .{
         .rows = try rows.toOwnedSlice(alloc),
-        .total = if (!has_residual_predicates) result.total else @intCast(filtered_rows.len),
+        .total = if (request.distinct_on.len > 0 or request.distinct_on_expressions.len > 0)
+            @intCast(candidate_indexes.items.len)
+        else if (!has_residual_predicates) result.total else @intCast(filtered_rows.len),
     };
 }
 
@@ -3413,6 +3421,13 @@ fn lakeRowsProjectedColumnsAlloc(
             const column = findRelationalColumn(schema.relational_columns, order.field) orelse return error.InvalidRowsRequest;
             try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
         }
+    }
+    for (request.distinct_on) |field| {
+        const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+        try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
+    }
+    for (request.distinct_on_expressions) |expression| {
+        try appendLakeRowsExpressionProjectedColumnsAlloc(alloc, &columns, expression);
     }
     if (lakeRowsQueryHasResidualPredicates(request)) {
         for (request.predicates) |predicate| {
@@ -5582,6 +5597,70 @@ fn rowsQueryDistinctOnKeyJsonAlloc(
     for (distinct_on_expressions) |expression| {
         if (wrote_key) try writer.writeByte(',');
         const value_json = try expressionValueJsonAlloc(alloc, parsed.value, expression);
+        defer alloc.free(value_json);
+        try writer.writeAll(value_json);
+        wrote_key = true;
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn appendLakeRowsQueryDistinctOnIndexesAlloc(
+    alloc: std.mem.Allocator,
+    candidates: []const LakeRowsQueryOrderCandidate,
+    distinct_on: []const []const u8,
+    distinct_on_expressions: []const db_mod.types.RelationalRowsExpression,
+    out: *std.ArrayListUnmanaged(usize),
+) !void {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var keys = seen.keyIterator();
+        while (keys.next()) |key| alloc.free(@constCast(key.*));
+        seen.deinit(alloc);
+    }
+
+    for (candidates, 0..) |candidate, i| {
+        const key = try lakeRowsQueryDistinctOnKeyJsonAlloc(alloc, candidate.row, distinct_on, distinct_on_expressions);
+        var key_transferred = false;
+        errdefer if (!key_transferred) alloc.free(key);
+        if (seen.contains(key)) {
+            alloc.free(key);
+            continue;
+        }
+        const gop = try seen.getOrPut(alloc, key);
+        if (gop.found_existing) {
+            alloc.free(key);
+            continue;
+        }
+        key_transferred = true;
+        try out.append(alloc, i);
+    }
+}
+
+fn lakeRowsQueryDistinctOnKeyJsonAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    distinct_on: []const []const u8,
+    distinct_on_expressions: []const db_mod.types.RelationalRowsExpression,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var wrote_key = false;
+    for (distinct_on, 0..) |field, i| {
+        if (i > 0) try writer.writeByte(',');
+        const maybe_cell = row.find(field);
+        if (maybe_cell) |cell| {
+            try writeLakeRowsCellJson(writer, cell.value);
+        } else {
+            try writer.writeAll("null");
+        }
+        wrote_key = true;
+    }
+    for (distinct_on_expressions) |expression| {
+        if (wrote_key) try writer.writeByte(',');
+        const value_json = try lakeRowsExpressionValueJsonAlloc(alloc, row, expression);
         defer alloc.free(value_json);
         try writer.writeAll(value_json);
         wrote_key = true;

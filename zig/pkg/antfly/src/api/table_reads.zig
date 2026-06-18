@@ -17640,6 +17640,27 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 1), offset_query_result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":30}", offset_query_result.rows[0]);
 
+    const distinct_on = [_][]const u8{"tenant"};
+    const distinct_order_by = [_]db_mod.types.RelationalRowsQueryOrder{
+        .{ .field = "tenant" },
+        .{ .field = "amount", .direction = .desc },
+    };
+    var distinct_query_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+            .distinct_on = distinct_on[0..],
+            .order_by = distinct_order_by[0..],
+            .limit = 5,
+        },
+    }, .read_index)).?;
+    defer distinct_query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 13), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), distinct_query_result.total);
+    try std.testing.expectEqual(@as(usize, 1), distinct_query_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", distinct_query_result.rows[0]);
+
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },
         .{ .name = "sum_amount", .op = .sum, .field = "amount" },
@@ -17651,7 +17672,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 13), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 14), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
