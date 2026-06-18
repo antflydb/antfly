@@ -236,6 +236,27 @@ pub const DropTablespaceSyntax = struct {
     }
 };
 
+pub const BulkIoDirectionSyntax = enum {
+    from,
+    to,
+};
+
+pub const BulkIoSyntax = struct {
+    direction: BulkIoDirectionSyntax,
+    table_name: []const u8,
+    columns: []const []const u8 = &.{},
+    endpoint: []const u8,
+    format: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        freeStringSlice(alloc, self.columns);
+        alloc.free(@constCast(self.endpoint));
+        if (self.format) |format| alloc.free(@constCast(format));
+        self.* = undefined;
+    }
+};
+
 pub const ListenNotificationSyntax = struct {
     channel_name: []const u8,
 
@@ -1068,6 +1089,61 @@ pub fn parseDropTablespaceCatalogTailAlloc(
     return .{ .tablespace_name = tablespace_name, .if_exists = if_exists };
 }
 
+pub fn parseBulkIoTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !BulkIoSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &columns);
+    if (cursor.matchToken(.lparen) != null) {
+        while (true) {
+            const column_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            try columns.append(alloc, column_name);
+            if (cursor.matchToken(.comma) != null) continue;
+            try cursor.expectToken(.rparen);
+            break;
+        }
+    }
+
+    const direction: BulkIoDirectionSyntax = if (cursor.matchKeyword("from"))
+        .from
+    else if (cursor.matchKeyword("to"))
+        .to
+    else
+        return error.UnsupportedSqlShape;
+    const endpoint = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var endpoint_transferred = false;
+    errdefer if (!endpoint_transferred) alloc.free(endpoint);
+
+    var format: ?[]const u8 = null;
+    var format_transferred = false;
+    errdefer if (!format_transferred) if (format) |value| alloc.free(@constCast(value));
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectToken(.lparen);
+        try cursor.expectKeyword("format");
+        format = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        try cursor.expectToken(.rparen);
+    }
+
+    try parseAdapterNoopStatementEnd(cursor);
+    table_transferred = true;
+    endpoint_transferred = true;
+    format_transferred = true;
+    return .{
+        .direction = direction,
+        .table_name = table_name,
+        .columns = try columns.toOwnedSlice(alloc),
+        .endpoint = endpoint,
+        .format = format,
+    };
+}
+
 pub fn parseListenNotificationTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1871,6 +1947,41 @@ test "sql adapter grammar parses database and tablespace catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_tablespace_tokens);
     var unsupported_tablespace_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTablespaceCatalogTailAlloc(alloc, unsupported_tablespace_tokens.items, &unsupported_tablespace_pos));
+}
+
+test "sql adapter grammar parses bulk io tails" {
+    const alloc = std.testing.allocator;
+
+    var copy_from_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (FORMAT csv);");
+    defer lexer.freeTokens(alloc, &copy_from_tokens);
+    var copy_from_pos: usize = 0;
+    var copy_from = try parseBulkIoTailAlloc(alloc, copy_from_tokens.items, &copy_from_pos);
+    defer copy_from.deinit(alloc);
+    try std.testing.expectEqual(copy_from_tokens.items.len, copy_from_pos);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.from, copy_from.direction);
+    try std.testing.expectEqualStrings("usage_records", copy_from.table_name);
+    try std.testing.expectEqual(@as(usize, 2), copy_from.columns.len);
+    try std.testing.expectEqualStrings("id", copy_from.columns[0]);
+    try std.testing.expectEqualStrings("status", copy_from.columns[1]);
+    try std.testing.expectEqualStrings("STDIN", copy_from.endpoint);
+    try std.testing.expectEqualStrings("csv", copy_from.format.?);
+
+    var copy_to_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records TO STDOUT;");
+    defer lexer.freeTokens(alloc, &copy_to_tokens);
+    var copy_to_pos: usize = 0;
+    var copy_to = try parseBulkIoTailAlloc(alloc, copy_to_tokens.items, &copy_to_pos);
+    defer copy_to.deinit(alloc);
+    try std.testing.expectEqual(copy_to_tokens.items.len, copy_to_pos);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.to, copy_to.direction);
+    try std.testing.expectEqualStrings("usage_records", copy_to.table_name);
+    try std.testing.expectEqual(@as(usize, 0), copy_to.columns.len);
+    try std.testing.expectEqualStrings("STDOUT", copy_to.endpoint);
+    try std.testing.expect(copy_to.format == null);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (HEADER true);");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
 test "sql adapter grammar parses notification channel tails" {

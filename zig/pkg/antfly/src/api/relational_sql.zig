@@ -2721,6 +2721,13 @@ fn reindexMaintenanceTargetFromSyntax(syntax: sql_adapter.ReindexMaintenanceTarg
     };
 }
 
+fn bulkIoDirectionFromSyntax(syntax: sql_adapter.BulkIoDirectionSyntax) BulkIoDirection {
+    return switch (syntax) {
+        .from => .from,
+        .to => .to,
+    };
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3456,44 +3463,20 @@ const Parser = struct {
     }
 
     fn parseBulkIoDdl(self: *@This()) !BulkIoPlan {
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        errdefer self.alloc.free(table_name);
-        var columns = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            freeStringSlice(self.alloc, columns.items);
-            columns.deinit(self.alloc);
-        }
-        if (self.match(.lparen) != null) {
-            while (true) {
-                const column_name = try self.parseIdentifierOwned();
-                try columns.append(self.alloc, column_name);
-                if (self.match(.comma) != null) continue;
-                try self.expect(.rparen);
-                break;
-            }
-        }
-        const direction: BulkIoDirection = if (self.matchKeyword("from"))
-            .from
-        else if (self.matchKeyword("to"))
-            .to
-        else
-            return error.UnsupportedSqlShape;
-        const endpoint = try self.parseIdentifierOwned();
-        errdefer self.alloc.free(endpoint);
-        var format: ?[]const u8 = null;
-        errdefer if (format) |value| self.alloc.free(value);
-        if (self.matchKeyword("with")) {
-            try self.expect(.lparen);
-            try self.expectKeyword("format");
-            format = try self.parseIdentifierOwned();
-            try self.expect(.rparen);
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseBulkIoTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const table_name = syntax.table_name;
+        const columns = syntax.columns;
+        const endpoint = syntax.endpoint;
+        const format = syntax.format;
+        syntax.table_name = "";
+        syntax.columns = &.{};
+        syntax.endpoint = "";
+        syntax.format = null;
         return .{
-            .direction = direction,
+            .direction = bulkIoDirectionFromSyntax(syntax.direction),
             .table_name = table_name,
-            .columns = try columns.toOwnedSlice(self.alloc),
+            .columns = columns,
             .endpoint = endpoint,
             .format = format,
         };

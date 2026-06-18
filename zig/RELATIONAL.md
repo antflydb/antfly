@@ -1079,7 +1079,8 @@ mode clauses, maintenance-job grammar for `VACUUM`, `ANALYZE`, `REINDEX`, and
 `CLUSTER`, notification-channel grammar for `LISTEN`, `NOTIFY`, and
 `UNLISTEN`, database/tablespace catalog grammar for `CREATE DATABASE`, `ALTER
 DATABASE ... SET`, `DROP DATABASE`, `CREATE TABLESPACE`, `ALTER TABLESPACE ...
-RENAME TO`, and `DROP TABLESPACE`, prepared-statement subject classification for read, write, and DDL
+RENAME TO`, and `DROP TABLESPACE`, bulk I/O grammar for `COPY ... FROM` and
+`COPY ... TO`, prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
@@ -4679,9 +4680,10 @@ override. Unsupported role-setting forms such as reset, database-scoped
 settings, and multi-token expressions still fail closed until they have
 explicit native semantics.
 
-`COPY FROM` and `COPY TO` lower to typed bulk import/export intent that captures
-table identity, column count, stream endpoint, direction, and format, then fails
-closed when applied to table schema or runtime storage. The production shape
+`COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
+to typed bulk import/export intent that captures table identity, selected
+columns, stream endpoint, direction, and format, then fails closed when applied
+to table schema or runtime storage. The production shape
 should stream rows through typed schema validation, defaults, generated columns,
 checks, unique/FK participants, row-policy/authorization checks, 2PC staging,
 retryable range routing, and deterministic error reporting for imports, and
