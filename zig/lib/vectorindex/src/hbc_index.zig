@@ -9983,7 +9983,10 @@ fn splitVectorSetHilbert(
 
     const Entry = struct {
         index: usize,
-        embedding: []const u8,
+    };
+    const SortContext = struct {
+        embeddings: []const u8,
+        embedding_len: usize,
     };
     const entries = try self.alloc.alloc(Entry, count);
     defer self.alloc.free(entries);
@@ -10005,13 +10008,16 @@ fn splitVectorSetHilbert(
         try hilbert.encodeVecBytesInto(vectors.atConst(i), coords, embedding);
         entries[i] = .{
             .index = i,
-            .embedding = embedding,
         };
     }
 
-    std.mem.sort(Entry, entries, {}, struct {
-        fn lessThan(_: void, a: Entry, b: Entry) bool {
-            return std.mem.order(u8, a.embedding, b.embedding) == .lt;
+    std.mem.sort(Entry, entries, SortContext{ .embeddings = embeddings, .embedding_len = embedding_len }, struct {
+        fn lessThan(ctx: SortContext, a: Entry, b: Entry) bool {
+            const left_offset = a.index * ctx.embedding_len;
+            const right_offset = b.index * ctx.embedding_len;
+            const left = ctx.embeddings[left_offset..][0..ctx.embedding_len];
+            const right = ctx.embeddings[right_offset..][0..ctx.embedding_len];
+            return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
 
