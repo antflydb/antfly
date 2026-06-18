@@ -2374,7 +2374,7 @@ fn printUsage() void {
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
         \\  --ha-fence-wal <path>                 Durable HA promotion fence WAL path
         \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
-        \\  --ha-admin-token-env <name>           Require Authorization: Bearer token from this environment variable for /admin/v1/ha
+        \\  --ha-admin-token-env <name>           Require Authorization: Bearer token from this environment variable for {s}
         \\  --ha-retention-max-lag-lsn <n>        HA primary marks slots reseed-required after this LSN retention lag
         \\  --ha-retention-max-retained-bytes <n> HA primary marks oldest slots reseed-required above this retained WAL byte cap
         \\  --ha-retention-max-retained-age-ns <n> HA primary marks oldest slots reseed-required above this retained WAL age cap
@@ -2395,7 +2395,7 @@ fn printUsage() void {
         \\  --ha-epoch <id>                       HA primary epoch
         \\  -h, --help                            Show this help
         \\
-    , .{});
+    , .{antfly.admin.routes.ha});
 }
 
 fn parseBoolFlag(raw: []const u8) ?bool {

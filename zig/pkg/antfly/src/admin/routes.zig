@@ -173,6 +173,7 @@ test "admin routes own HA admin path literals consumed by Zig runtime code" {
     try expectNoHardCodedHAAdminPath("../storage/ha/http_admin.zig", @embedFile("../storage/ha/http_admin.zig"));
     try expectNoHardCodedHAAdminPath("../storage/ha/http_client.zig", @embedFile("../storage/ha/http_client.zig"));
     try expectNoHardCodedHAAdminPath("../storage/ha/operator.zig", @embedFile("../storage/ha/operator.zig"));
+    try expectNoHardCodedHAAdminPath("../swarm/runtime.zig", @embedFile("../swarm/runtime.zig"));
 }
 
 test "admin routes build and match replication slot lifecycle paths" {
