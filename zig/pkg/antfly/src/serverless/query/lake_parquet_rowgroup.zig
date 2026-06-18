@@ -98,12 +98,17 @@ pub const OwnedBatch = struct {
     columns: []rowsource.ColumnVector,
     column_names: [][]u8,
     i64_values: [][]i64,
+    null_bitmaps: [][]u8,
 
     pub fn deinit(self: *OwnedBatch, alloc: Allocator) void {
         for (self.column_names) |name| alloc.free(name);
         alloc.free(self.column_names);
         for (self.i64_values) |values| alloc.free(values);
         alloc.free(self.i64_values);
+        for (self.null_bitmaps) |nulls| {
+            if (nulls.len > 0) alloc.free(nulls);
+        }
+        alloc.free(self.null_bitmaps);
         alloc.free(self.columns);
         alloc.free(self.row_refs);
         self.* = undefined;
@@ -246,6 +251,32 @@ pub fn buildRequiredPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .required);
+}
+
+pub fn buildOptionalPlainI64RowGroupBatchAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .optional);
+}
+
+const PlainI64Mode = enum {
+    required,
+    optional,
+};
+
+fn buildPlainI64RowGroupBatchAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+    mode: PlainI64Mode,
+) !OwnedBatch {
     try inventory.validate();
     if (projected_chunks.len == 0) return error.InvalidParquetRowGroupBatch;
     const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
@@ -265,6 +296,8 @@ pub fn buildRequiredPlainI64RowGroupBatchAlloc(
     errdefer alloc.free(column_names);
     const i64_values = try alloc.alloc([]i64, projected_chunks.len);
     errdefer alloc.free(i64_values);
+    const null_bitmaps = try alloc.alloc([]u8, projected_chunks.len);
+    errdefer alloc.free(null_bitmaps);
 
     var initialized_names: usize = 0;
     errdefer {
@@ -274,18 +307,37 @@ pub fn buildRequiredPlainI64RowGroupBatchAlloc(
     errdefer {
         for (i64_values[0..initialized_values]) |values| alloc.free(values);
     }
+    var initialized_nulls: usize = 0;
+    errdefer {
+        for (null_bitmaps[0..initialized_nulls]) |nulls| {
+            if (nulls.len > 0) alloc.free(nulls);
+        }
+    }
 
     for (projected_chunks, 0..) |input, idx| {
         try input.validate();
         _ = findColumnChunk(row_group, input.column_id) orelse return error.ParquetColumnNotFound;
         column_names[idx] = try alloc.dupe(u8, input.column_id);
         initialized_names += 1;
-        i64_values[idx] = try parquet_page.scanUncompressedPlainI64ColumnChunkAlloc(alloc, input.bytes);
+        switch (mode) {
+            .required => {
+                i64_values[idx] = try parquet_page.scanUncompressedPlainI64ColumnChunkAlloc(alloc, input.bytes);
+                null_bitmaps[idx] = &.{};
+            },
+            .optional => {
+                var decoded = try parquet_page.scanUncompressedOptionalPlainI64ColumnChunkAlloc(alloc, input.bytes);
+                i64_values[idx] = decoded.values;
+                null_bitmaps[idx] = decoded.nulls;
+                decoded = undefined;
+            },
+        }
         initialized_values += 1;
+        initialized_nulls += 1;
         if (i64_values[idx].len != row_count) return error.ParquetRowGroupRowCountMismatch;
         columns[idx] = .{
             .name = column_names[idx],
             .values = .{ .i64 = i64_values[idx] },
+            .nulls = .{ .bytes = null_bitmaps[idx] },
         };
     }
 
@@ -303,6 +355,7 @@ pub fn buildRequiredPlainI64RowGroupBatchAlloc(
         .columns = columns,
         .column_names = column_names,
         .i64_values = i64_values,
+        .null_bitmaps = null_bitmaps,
     };
 }
 
@@ -489,6 +542,47 @@ fn appendPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, va
     }
 }
 
+fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?i64) !void {
+    var present_count: usize = 0;
+    for (values) |maybe| {
+        if (maybe != null) present_count += 1;
+    }
+    const byte_len: i32 = @intCast(values.len + present_count * 8);
+    const null_count: i32 = @intCast(values.len - present_count);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 3);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 8, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(out, alloc, &data_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 2, .i32);
+    try appendI32(out, alloc, null_count);
+    try appendField(out, alloc, &data_prev, 3, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 4, .i32);
+    try appendI32(out, alloc, 0);
+    try appendField(out, alloc, &data_prev, 5, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 6, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    for (values) |maybe| try out.append(alloc, if (maybe == null) 0 else 1);
+    for (values) |maybe| {
+        const value = maybe orelse continue;
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+}
+
 test "parquet row group batch assembles decoded i64 columns with external row refs" {
     const alloc = std.testing.allocator;
     var inventory = external_source.Inventory{
@@ -543,6 +637,61 @@ test "parquet row group batch assembles decoded i64 columns with external row re
     try std.testing.expectEqualStrings("part-a.parquet", first_ref.file_id);
     try std.testing.expectEqual(@as(u32, 0), first_ref.row_group_ordinal);
     try std.testing.expectEqual(@as(u64, 0), first_ref.row_ordinal);
+}
+
+test "parquet row group batch assembles optional i64 columns with null bitmap" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 1024,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 3,
+            .file_offset = 100,
+            .total_byte_len = 96,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                .column_id = try alloc.dupe(u8, "amount"),
+                .file_offset = 100,
+                .compressed_len = 96,
+                .uncompressed_len = 96,
+                .encoding = try alloc.dupe(u8, "plain"),
+            }}),
+        }}),
+    };
+    try inventory.validate();
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try appendOptionalPlainI64DataPageV2(&chunk, alloc, &[_]?i64{ 10, null, 30 });
+
+    var owned = try buildOptionalPlainI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{.{
+        .column_id = "amount",
+        .bytes = chunk.items,
+    }});
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqual(@as(usize, 3), owned.batch.rowCount());
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 0, 30 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[0].nulls.bytes);
+    try std.testing.expect(!owned.batch.columns[0].nulls.isNull(0));
+    try std.testing.expect(owned.batch.columns[0].nulls.isNull(1));
+    try std.testing.expect(!owned.batch.columns[0].nulls.isNull(2));
+    const null_ref = owned.batch.row_refs[1].external;
+    try std.testing.expectEqualStrings("part-a.parquet", null_ref.file_id);
+    try std.testing.expectEqual(@as(u64, 1), null_ref.row_ordinal);
 }
 
 test "parquet row group source scans through lake rows" {
