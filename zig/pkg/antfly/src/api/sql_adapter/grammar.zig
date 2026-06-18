@@ -57,6 +57,19 @@ pub const DropUpdatePolicySyntax = struct {
     }
 };
 
+pub const CreateUpdatePolicySyntax = struct {
+    trigger_name: []const u8,
+    table_name: []const u8,
+    column_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.trigger_name));
+        alloc.free(@constCast(self.table_name));
+        alloc.free(@constCast(self.column_name));
+        self.* = undefined;
+    }
+};
+
 pub const AdapterNoopTransactionBoundaryTail = struct {
     work: bool = false,
     transaction: bool = false,
@@ -1040,6 +1053,73 @@ pub fn parseDropUpdatePolicyTriggerCatalogTailAlloc(
     trigger_transferred = true;
     table_transferred = true;
     return .{ .trigger_name = trigger_name, .table_name = table_name, .if_exists = if_exists };
+}
+
+pub fn parseCreateUpdatePolicyTriggerCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateUpdatePolicySyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("trigger");
+    const trigger_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var trigger_transferred = false;
+    errdefer if (!trigger_transferred) alloc.free(trigger_name);
+    try cursor.expectKeyword("before");
+    try cursor.expectKeyword("update");
+    if (cursor.matchKeyword("of")) {
+        while (!cursor.peekKeyword("on")) {
+            const column = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            alloc.free(column);
+            if (cursor.matchToken(.comma) == null) break;
+        }
+    }
+    try cursor.expectKeyword("on");
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    if (cursor.matchKeyword("for")) {
+        try cursor.expectKeyword("each");
+        try cursor.expectKeyword("row");
+    }
+    try cursor.expectKeyword("execute");
+    if (!(cursor.matchKeyword("function") or cursor.matchKeyword("procedure"))) return error.UnsupportedSqlShape;
+    const function_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(function_name);
+    if (!isSupportedUpdatedAtTriggerFunction(function_name)) return error.UnsupportedSqlShape;
+    try cursor.expectToken(.lparen);
+    const column_name = if (cursor.matchToken(.rparen) != null)
+        try alloc.dupe(u8, "updated_at")
+    else blk: {
+        const parsed_column = if (cursor.matchToken(.string)) |token|
+            try alloc.dupe(u8, token.text)
+        else
+            try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var parsed_transferred = false;
+        errdefer if (!parsed_transferred) alloc.free(parsed_column);
+        if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+        try cursor.expectToken(.rparen);
+        parsed_transferred = true;
+        break :blk parsed_column;
+    };
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column_name);
+    try parseAdapterNoopStatementEnd(cursor);
+
+    trigger_transferred = true;
+    table_transferred = true;
+    column_transferred = true;
+    return .{ .trigger_name = trigger_name, .table_name = table_name, .column_name = column_name };
+}
+
+fn isSupportedUpdatedAtTriggerFunction(name: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.');
+    const base = if (dot) |idx| name[idx + 1 ..] else name;
+    return std.ascii.eqlIgnoreCase(base, "touch_updated_at") or
+        std.ascii.eqlIgnoreCase(base, "set_updated_at") or
+        std.ascii.eqlIgnoreCase(base, "update_updated_at") or
+        std.ascii.eqlIgnoreCase(base, "antfly_on_update_now") or
+        std.ascii.eqlIgnoreCase(base, "antfly_touch_updated_at");
 }
 
 pub fn parseAdapterNoopSetStatementTail(tokens: []const Token, pos: *usize) !void {
@@ -3611,6 +3691,30 @@ test "sql adapter grammar parses row security catalog tails" {
 
 test "sql adapter grammar parses update policy trigger catalog tails" {
     const alloc = std.testing.allocator;
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "TRIGGER touch_updated_at BEFORE UPDATE OF amount, status ON public.usage_records FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at('updated_at_ns');");
+    defer lexer.freeTokens(alloc, &create_tokens);
+
+    var create_pos: usize = 0;
+    var create = try parseCreateUpdatePolicyTriggerCatalogTailAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(create_tokens.items.len, create_pos);
+    try std.testing.expectEqualStrings("touch_updated_at", create.trigger_name);
+    try std.testing.expectEqualStrings("usage_records", create.table_name);
+    try std.testing.expectEqualStrings("updated_at_ns", create.column_name);
+
+    var default_tokens = try lexer.tokenizeAlloc(alloc, "TRIGGER touch_updated_at BEFORE UPDATE ON usage_records EXECUTE PROCEDURE set_updated_at();");
+    defer lexer.freeTokens(alloc, &default_tokens);
+    var default_pos: usize = 0;
+    var default = try parseCreateUpdatePolicyTriggerCatalogTailAlloc(alloc, default_tokens.items, &default_pos);
+    defer default.deinit(alloc);
+    try std.testing.expectEqual(default_tokens.items.len, default_pos);
+    try std.testing.expectEqualStrings("updated_at", default.column_name);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "TRIGGER audit_changes BEFORE UPDATE ON usage_records EXECUTE FUNCTION audit_changes();");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateUpdatePolicyTriggerCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+
     var tokens = try lexer.tokenizeAlloc(alloc, "TRIGGER IF EXISTS touch_updated_at ON ONLY public.usage_records CASCADE;");
     defer lexer.freeTokens(alloc, &tokens);
 

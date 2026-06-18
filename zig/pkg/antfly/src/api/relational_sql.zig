@@ -4208,63 +4208,19 @@ const Parser = struct {
     }
 
     fn parseCreateTriggerPolicyDdl(self: *@This()) !CreateUpdatePolicyPlan {
-        try self.expectKeyword("trigger");
-        const trigger_name = try self.parseIdentifierOwned();
-        var trigger_name_transferred = false;
-        errdefer if (!trigger_name_transferred) self.alloc.free(trigger_name);
-        try self.expectKeyword("before");
-        try self.expectKeyword("update");
-        if (self.matchKeyword("of")) {
-            while (!self.peekKeyword("on")) {
-                const column = try self.parseIdentifierOwned();
-                self.alloc.free(column);
-                if (self.match(.comma) == null) break;
-            }
-        }
-        try self.expectKeyword("on");
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        if (self.matchKeyword("for")) {
-            try self.expectKeyword("each");
-            try self.expectKeyword("row");
-        }
-        try self.expectKeyword("execute");
-        if (!(self.matchKeyword("function") or self.matchKeyword("procedure"))) return error.UnsupportedSqlShape;
-        const function_name = try self.parseSqlObjectIdentifierOwned();
-        defer self.alloc.free(function_name);
-        if (!isSupportedUpdatedAtTriggerFunction(function_name)) return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        const column_name = if (self.match(.rparen) != null)
-            try self.alloc.dupe(u8, "updated_at")
-        else blk: {
-            const parsed_column = if (self.match(.string)) |token|
-                try self.alloc.dupe(u8, token.text)
-            else
-                try self.parseIdentifierOwned();
-            var parsed_column_transferred = false;
-            errdefer if (!parsed_column_transferred) self.alloc.free(parsed_column);
-            if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-            try self.expect(.rparen);
-            parsed_column_transferred = true;
-            break :blk parsed_column;
-        };
-        var column_name_transferred = false;
-        errdefer if (!column_name_transferred) self.alloc.free(column_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseCreateUpdatePolicyTriggerCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var syntax_transferred = false;
+        errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
 
         const value_json = try self.alloc.dupe(u8, "");
         var value_transferred = false;
         errdefer if (!value_transferred) self.alloc.free(value_json);
-        trigger_name_transferred = true;
-        table_name_transferred = true;
-        column_name_transferred = true;
+        syntax_transferred = true;
         value_transferred = true;
         return .{
-            .trigger_name = trigger_name,
-            .table_name = table_name,
-            .column_name = column_name,
+            .trigger_name = syntax.trigger_name,
+            .table_name = syntax.table_name,
+            .column_name = syntax.column_name,
             .on_update_value = .{ .kind = .now_ns, .value_json = value_json },
         };
     }
@@ -35110,16 +35066,6 @@ fn joinProjectionOutputIsUnique(select: []const db_mod.types.RelationalRowsJoinP
 fn identifierContainsQualifier(identifier: []const u8) bool {
     const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return false;
     return dot > 0 and dot + 1 < identifier.len;
-}
-
-fn isSupportedUpdatedAtTriggerFunction(name: []const u8) bool {
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.');
-    const base = if (dot) |index| name[index + 1 ..] else name;
-    return std.ascii.eqlIgnoreCase(base, "touch_updated_at") or
-        std.ascii.eqlIgnoreCase(base, "set_updated_at") or
-        std.ascii.eqlIgnoreCase(base, "update_updated_at") or
-        std.ascii.eqlIgnoreCase(base, "antfly_on_update_now") or
-        std.ascii.eqlIgnoreCase(base, "antfly_touch_updated_at");
 }
 
 fn findDdlColumn(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
