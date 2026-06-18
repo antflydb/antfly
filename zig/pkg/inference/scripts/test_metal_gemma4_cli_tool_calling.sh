@@ -70,7 +70,7 @@ run_antfly() {
 }
 
 if ! run_antfly generate --help 2>&1 | grep -q -- '--tools'; then
-  echo "metal Gemma4 CLI tool-calling smoke skipped: generate CLI has no --tools support; use test-metal-gemma4-tool-calling for the server API path"
+  echo "metal Gemma4 CLI tool-calling diagnostic: generate CLI has no --tools support; server API coverage is test-metal-gemma4-tool-calling"
   exit 0
 fi
 

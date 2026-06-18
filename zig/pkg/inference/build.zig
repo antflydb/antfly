@@ -275,7 +275,7 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_prefill_frame_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_prefill_frame_test_step = b.step(
         "test-metal-gemma4-prefill-frame",
-        "Run the local Metal Gemma4 prefill-frame token-anchor regression test",
+        "Run the local Metal Gemma4 prefill-frame no-fallback/stage-sync smoke test",
     );
     metal_gemma4_prefill_frame_test_step.dependOn(&metal_gemma4_prefill_frame_test.step);
 
@@ -307,8 +307,8 @@ pub fn build(b: *std.Build) void {
     });
     metal_gemma4_cli_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_cli_tool_calling_test_step = b.step(
-        "test-metal-gemma4-cli-tool-calling",
-        "Run the local Metal Gemma4 CLI tool-calling smoke test",
+        "diagnose-metal-gemma4-cli-tool-calling",
+        "Diagnose the optional Metal Gemma4 CLI tool-calling surface; server coverage lives in test-metal-gemma4-tool-calling",
     );
     metal_gemma4_cli_tool_calling_test_step.dependOn(&metal_gemma4_cli_tool_calling_test.step);
 

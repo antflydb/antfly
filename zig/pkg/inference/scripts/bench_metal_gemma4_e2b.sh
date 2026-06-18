@@ -165,11 +165,12 @@ summary = {
 }
 (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
-    f.write("label\ttokens\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tbackend\tdecode_fallback\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tq8_mmv\tq8_mm\tcommand_ops\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tfile\n")
+    f.write("label\ttokens\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tq8_mmv\tq8_mm\tcommand_ops\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tfile\n")
     for r in rows:
         f.write(
             f"{r['label']}\t{r['tokens']}\t{r['generate_ms']}\t{r['total_ms']}\t{r['runtime_prewarm_ms']}\t"
-            f"{r['decode_tok_s']:.3f}\t{r['e2e_tok_s']:.3f}\t{r['hot_decode_tok_s']:.3f}\t{r['backend']}\t"
+            f"{r['decode_tok_s']:.3f}\t{r['e2e_tok_s']:.3f}\t{r['hot_decode_tok_s']:.3f}\t"
+            f"{r['prefill_tokens']}\t{r['prefill_tok_s']:.3f}\t{r['backend']}\t"
             f"{r['decode_fallback']}\t{r['frame_begins']}\t{r['frame_wait_ms']}\t"
             f"{r['frame_gpu_ms']}\t{r['q8_mmv']}\t{r['q8_mm']}\t{r['command_ops']}\t"
             f"{r['greedy_calls']}\t{r['greedy_direct_ms']}\t{r['greedy_layer_specs_ms']}\t"

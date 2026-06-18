@@ -126,6 +126,6 @@ assert_anchor default "$default_out"
 sync_out="$(run_case stage-sync env TERMITE_METAL_SYNC_GATED_FAMILY_STAGES=1)"
 assert_anchor stage-sync "$sync_out"
 
-echo "metal Gemma4 prefill-frame anchor passed"
+echo "metal Gemma4 prefill-frame no-fallback/stage-sync smoke passed"
 echo "default:    $default_out"
 echo "stage-sync: $sync_out"

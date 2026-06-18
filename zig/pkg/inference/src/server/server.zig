@@ -2409,11 +2409,7 @@ pub const Node = struct {
             // Draft model uses the same backend kind as the target — they run
             // on the same machine so the available backends are identical.
             const draft_backend_kind = backend_kind;
-            const draft_kv_dtype: runtime.kv.pool.KvDType = switch (draft_backend_kind) {
-                .native => .f32,
-                .cuda => .f16,
-                .metal => if (draft_cfg.family == .gemma) .f32 else .f16,
-            };
+            const draft_kv_dtype = session_factory.recommendedKvDTypeForGptConfig(draft_cfg, draft_backend_kind);
             draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
             const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
                 null
