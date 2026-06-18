@@ -5493,7 +5493,44 @@ func TestObserveHAPrimaryAdminStatusDoesNotFallbackToCommandEndpoint(t *testing.
 	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).NotTo(Succeed())
 	g.Expect(requestCount).To(Equal(1))
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminStatusCode).To(Equal(http.StatusNotFound))
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("get HA primary status returned status 404"))
+}
+
+func TestObserveHAPrimaryAdminStatusRecordsUnauthorizedStatus(t *testing.T) {
+	g := NewWithT(t)
+
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader("missing bearer token")),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+			},
+		},
+	}
+
+	err := reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminStatusCode).To(Equal(http.StatusUnauthorized))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("status 401"))
+
+	reconciler.updateHAStatusAndConditions(cluster)
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminUnauthorized))
+	g.Expect(degraded.Message).To(ContainSubstring("status 401"))
 }
 
 func TestObserveHAPrimaryAdminStatusRejectsMismatchedIdentityScope(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1980,6 +1981,43 @@ func TestUpdateHAStatusReportsPrimaryAdminUnavailable(t *testing.T) {
 	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
 	if degraded == nil || degraded.Status != metav1.ConditionFalse || degraded.Reason != antflyv1.ReasonHASyncPolicySatisfied {
 		t.Fatalf("expected primary admin degraded condition to clear, got %#v", degraded)
+	}
+}
+
+func TestUpdateHAStatusReportsPrimaryAdminUnauthorized(t *testing.T) {
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN:                10,
+		PrimaryAdminReachable:     false,
+		PrimaryAdminLastError:     "get HA primary status returned status 401: missing bearer token",
+		PrimaryAdminStatusCode:    http.StatusUnauthorized,
+		ReadSafeStandbyCount:      1,
+		HealthyStandbyCount:       1,
+		DesiredStandbyCount:       1,
+		UnhealthyStandbyCount:     0,
+		LaggingStandbyCount:       0,
+		ReseedRequiredCount:       0,
+		AutomaticPromotionAllowed: false,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:              "standby-a",
+			SlotName:          "standby-a",
+			Active:            true,
+			ReceivedLSN:       10,
+			AppliedLSN:        10,
+			SafeReadLSN:       10,
+			CanServeSafeReads: true,
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil ||
+		degraded.Status != metav1.ConditionTrue ||
+		degraded.Reason != antflyv1.ReasonHAAdminUnauthorized ||
+		!strings.Contains(degraded.Message, "status 401") {
+		t.Fatalf("expected unauthorized HA admin degraded condition, got %#v", degraded)
 	}
 }
 

@@ -1517,6 +1517,10 @@ type HAStatus struct {
 	// +optional
 	PrimaryAdminLastError string `json:"primaryAdminLastError,omitempty"`
 
+	// PrimaryAdminStatusCode records the latest typed /admin/v1 HA status-observation HTTP status code.
+	// +optional
+	PrimaryAdminStatusCode int `json:"primaryAdminStatusCode,omitempty"`
+
 	// DesiredStandbyCount is the count requested by spec.highAvailability.
 	// +optional
 	DesiredStandbyCount int32 `json:"desiredStandbyCount,omitempty"`

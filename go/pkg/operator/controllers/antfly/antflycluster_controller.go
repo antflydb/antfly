@@ -3407,7 +3407,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 				cluster,
 				antflyv1.TypeHADegraded,
 				metav1.ConditionTrue,
-				antflyv1.ReasonHAAdminStatusUnavailable,
+				haAdminStatusUnavailableReason(cluster, antflyv1.ReasonHAAdminStatusUnavailable),
 				fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 			)
 		}
@@ -3502,7 +3502,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			cluster,
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
-			antflyv1.ReasonHAAdminStatusUnavailable,
+			haAdminStatusUnavailableReason(cluster, antflyv1.ReasonHAAdminStatusUnavailable),
 			fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 		)
 	}
@@ -3905,6 +3905,15 @@ func haAdminSDKResponseValue[T any](value *adminsdk.HAResponse[T], err error) (*
 		return nil, fmt.Errorf("HA admin SDK response is nil")
 	}
 	return value.Value, nil
+}
+
+func haAdminStatusUnavailableReason(cluster *antflyv1.AntflyCluster, defaultReason string) string {
+	if cluster != nil &&
+		cluster.Status.HAStatus != nil &&
+		cluster.Status.HAStatus.PrimaryAdminStatusCode == http.StatusUnauthorized {
+		return antflyv1.ReasonHAAdminUnauthorized
+	}
+	return defaultReason
 }
 
 func haAdminActionResultFromReplicationSlotSDK(response adminsdk.HAReplicationSlotActionResponse) *antflyv1.HAAdminActionResultStatus {
@@ -6225,6 +6234,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 		if promoted := haPromotedPrimaryNodeID(cluster.Status.HAStatus); promoted != "" {
 			cluster.Status.HAStatus.PrimaryAdminReachable = false
 			cluster.Status.HAStatus.PrimaryAdminLastError = fmt.Sprintf("promoted primary %s admin URL is not configured", promoted)
+			cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
 		}
 		return nil
 	}
@@ -6232,10 +6242,16 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	if err != nil {
 		cluster.Status.HAStatus.PrimaryAdminReachable = false
 		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
+		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+			cluster.Status.HAStatus.PrimaryAdminStatusCode = statusCode
+		} else {
+			cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+		}
 		return err
 	}
 	cluster.Status.HAStatus.PrimaryAdminReachable = true
 	cluster.Status.HAStatus.PrimaryAdminLastError = ""
+	cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
 	cluster.Status.HAStatus.Retention = status.Retention
 	cluster.Status.HAStatus.Standbys = status.Standbys

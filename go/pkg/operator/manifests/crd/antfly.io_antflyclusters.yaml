@@ -9249,6 +9249,10 @@ spec:
                       PrimaryAdminReachable reports whether the operator most recently reached the primary HA admin endpoint.
                       Automatic promotion requires this to be false with PrimaryAdminLastError set.
                     type: boolean
+                  primaryAdminStatusCode:
+                    description: PrimaryAdminStatusCode records the latest typed /admin/v1
+                      HA status-observation HTTP status code.
+                    type: integer
                   primaryLSN:
                     description: PrimaryLSN is the current primary replication LSN.
                     format: int64

@@ -1583,7 +1583,7 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 			cluster,
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
-			antflyv1.ReasonHAPrimaryAdminUnavailable,
+			haAdminStatusUnavailableReason(cluster, antflyv1.ReasonHAPrimaryAdminUnavailable),
 			fmt.Sprintf("Primary HA admin endpoint is unreachable: %s", strings.TrimSpace(cluster.Status.HAStatus.PrimaryAdminLastError)),
 		)
 	} else {
