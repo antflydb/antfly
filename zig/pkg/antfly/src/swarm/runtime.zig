@@ -2205,8 +2205,15 @@ fn validateHARole(cli: CliConfig) !void {
         if (!isHAAdminTokenEnvName(trimmed)) return error.HAAdminTokenEnvInvalid;
     }
     if ((primary_requested or standby_requested) and cli.ha_fence_wal == null) return error.HAFenceWalMissing;
+    if (primary_requested or standby_requested) try validateHAIdentity(cli);
     if (haRetentionPolicyRequested(cli) and !primary_requested) return error.HARetentionPolicyRequiresPrimary;
     if (haSyncPolicyRequested(cli) and !primary_requested) return error.HASyncPolicyRequiresPrimary;
+}
+
+fn validateHAIdentity(cli: CliConfig) !void {
+    if (cli.ha_cluster_id == null) return error.HAClusterIdMissing;
+    if (cli.ha_timeline_id == null) return error.HATimelineIdMissing;
+    if (cli.ha_epoch == null) return error.HAEpochMissing;
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
@@ -2908,6 +2915,12 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
         "/tmp/ha-primary.slots",
         "--ha-fence-wal",
         "/tmp/ha-fence.wal",
+        "--ha-cluster-id",
+        "100",
+        "--ha-timeline-id",
+        "3",
+        "--ha-epoch",
+        "4",
         "--ha-sync-mode",
         "remote-apply",
         "--ha-sync-selection",
@@ -2944,6 +2957,12 @@ test "parse cli accepts HA primary retention policy flags" {
         "primary-a",
         "--ha-fence-wal",
         "/tmp/ha-fence.wal",
+        "--ha-cluster-id",
+        "100",
+        "--ha-timeline-id",
+        "3",
+        "--ha-epoch",
+        "4",
         "--ha-retention-max-lag-lsn",
         "50",
         "--ha-retention-max-retained-bytes",
@@ -3097,6 +3116,30 @@ test "swarm HA runtime rejects ambiguous role flags" {
     try std.testing.expectError(error.HAFenceWalMissing, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
     }));
+    try std.testing.expectError(error.HAClusterIdMissing, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HATimelineIdMissing, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAEpochMissing, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+    }));
+    try std.testing.expectError(error.HAClusterIdMissing, validateHARole(.{
+        .ha_standby_log = "/tmp/standby.log",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
     try std.testing.expectError(error.HARetentionPolicyRequiresPrimary, validateHARole(.{
         .ha_retention_max_lag_lsn = 50,
     }));
@@ -3113,6 +3156,9 @@ test "swarm HA runtime rejects ambiguous role flags" {
     try std.testing.expectError(error.InvalidHASyncPolicy, haSyncPolicyFromCli(std.testing.allocator, .{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
         .ha_sync_mode = .remote_write,
         .ha_sync_required = 1,
     }));
