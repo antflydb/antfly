@@ -43,9 +43,6 @@ spec:
       port: 9021
     health:
       port: 4200
-    envFrom:
-    - secretRef:
-        name: antfly-ha-admin-token
     resources:
       cpu: "1000m"
       memory: "2Gi"
@@ -81,6 +78,10 @@ spec:
       fencePath: /antflydb/ha/fence.wal
       formerPrimaryLogPath: /antflydb/ha/primary.wal
       adminTokenEnvVar: ANTFLY_HA_ADMIN_TOKEN
+      adminTokenSecretRef:
+        name: antfly-ha-admin-token
+        key: token
+        optional: false
       primary:
         logPath: /antflydb/ha/primary.wal
         slotsPath: /antflydb/ha/slots
@@ -143,9 +144,6 @@ spec:
       port: 9021
     health:
       port: 4200
-    envFrom:
-    - secretRef:
-        name: antfly-ha-admin-token
     resources:
       cpu: "1000m"
       memory: "2Gi"
@@ -180,6 +178,10 @@ spec:
       nodeID: standby-a
       fencePath: /antflydb/ha/fence.wal
       adminTokenEnvVar: ANTFLY_HA_ADMIN_TOKEN
+      adminTokenSecretRef:
+        name: antfly-ha-admin-token
+        key: token
+        optional: false
       standby:
         logPath: /antflydb/ha/standby.wal
         progressPath: /antflydb/ha/standby-progress.wal

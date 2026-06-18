@@ -48,6 +48,11 @@ Kubernetes should inject it from a Secret into process environments; the
 operator does not need broad Secret read permissions just to call the HA admin
 API.
 
+When Antfly pods use `spec.highAvailability.runtime.adminTokenSecretRef`, set
+`optional: false` or omit `optional` so Kubernetes fails pod startup if the
+token Secret is missing. Use `spec.swarm.envFrom` only when the same Secret is
+already being injected for other runtime configuration.
+
 When using CLI commands, pass `--ha-token-env ANTFLY_HA_ADMIN_TOKEN`. Do not
 put raw tokens in command-line flags because argv can be exposed through process
 inspection and job history.

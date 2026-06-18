@@ -64,14 +64,18 @@ workflow.
 - typed admin execution through `/admin/v1/ha`
 - synchronous `RemoteApply` policy for `standby-a`
 - Kubernetes Lease fencing and automatic promotion prerequisites
-- optional `ANTFLY_HA_ADMIN_TOKEN` injection from the `antfly-ha-admin-token`
-  Secret
+- `ANTFLY_HA_ADMIN_TOKEN` injection from the `antfly-ha-admin-token` Secret
+  into the operator and Antfly runtime pods
 
-The default operator deployment reads `ANTFLY_HA_ADMIN_TOKEN` from an optional
-Secret reference. The operator does not need Kubernetes Secret read permissions;
-Kubernetes injects the environment variable into the operator pod.
-Create the Secret before installing the operator, or restart the operator
-deployment after changing the Secret so the pod environment is refreshed.
+For authenticated HA automation, create `antfly-ha-admin-token` before starting
+the operator and the HA clusters. The Antfly runtime pods use
+`spec.highAvailability.runtime.adminTokenSecretRef` with `optional: false` so a
+missing token fails pod startup instead of exposing an unauthenticated admin
+surface. The operator deployment also needs `ANTFLY_HA_ADMIN_TOKEN` in its own
+environment for typed `/admin/v1/ha` calls; Kubernetes injects it into the pod,
+so the operator does not need broad Secret read permissions. Restart the
+operator deployment after changing the Secret so the process environment is
+refreshed.
 See the [Hot-Standby HA runbook](../docs/operations/hot-standby-ha.md) for
 status checks, promotion, reseed, and former-primary repair operations.
 
