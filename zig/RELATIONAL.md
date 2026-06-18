@@ -1081,7 +1081,9 @@ mode clauses, maintenance-job grammar for `VACUUM`, `ANALYZE`, `REINDEX`, and
 DATABASE ... SET`, `DROP DATABASE`, `CREATE TABLESPACE`, `ALTER TABLESPACE ...
 RENAME TO`, and `DROP TABLESPACE`, bulk I/O grammar for `COPY ... FROM` and
 `COPY ... TO`, schema-namespace catalog grammar for `CREATE SCHEMA`, `ALTER
-SCHEMA ... RENAME TO`, and `DROP SCHEMA`, prepared-statement subject classification for read, write, and DDL
+SCHEMA ... RENAME TO`, and `DROP SCHEMA`, extension catalog grammar for
+`CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`,
+prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
@@ -5160,7 +5162,8 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public`, is an
    adapter-only no-op with a stable `extension` reason. Other supported
    `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`
-   statements lower to typed extension catalog intent and execute through the
+   tails parse in `api/sql_adapter/grammar.zig`, lower to typed extension
+   catalog intent, and execute through the
    canonical extension lifecycle described in `EXTENSIONS.md`. The SQL
    compatibility adapter routes those plans to `extensions.lifecycle`
    install/update/drop operations rather than implementing a second extension

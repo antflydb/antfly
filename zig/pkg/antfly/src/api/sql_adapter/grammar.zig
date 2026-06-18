@@ -268,6 +268,42 @@ pub const DropSchemaNamespaceSyntax = struct {
     }
 };
 
+pub const CreateExtensionSyntax = struct {
+    extension_name: []const u8,
+    schema_name: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.extension_name));
+        if (self.schema_name) |schema_name| alloc.free(@constCast(schema_name));
+        if (self.version) |version| alloc.free(@constCast(version));
+        self.* = undefined;
+    }
+};
+
+pub const UpdateExtensionSyntax = struct {
+    extension_name: []const u8,
+    target_version: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.extension_name));
+        if (self.target_version) |version| alloc.free(@constCast(version));
+        self.* = undefined;
+    }
+};
+
+pub const DropExtensionSyntax = struct {
+    extension_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.extension_name));
+        self.* = undefined;
+    }
+};
+
 pub const BulkIoDirectionSyntax = enum {
     from,
     to,
@@ -1187,6 +1223,98 @@ pub fn parseDropSchemaNamespaceCatalogTailAlloc(
     return .{ .schema_name = schema_name, .if_exists = if_exists, .cascade = cascade };
 }
 
+pub fn parseCreateExtensionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateExtensionSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("extension");
+    var if_not_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("exists");
+        if_not_exists = true;
+    }
+    const extension_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var extension_transferred = false;
+    errdefer if (!extension_transferred) alloc.free(extension_name);
+
+    var schema_name: ?[]const u8 = null;
+    var schema_transferred = false;
+    errdefer if (!schema_transferred) if (schema_name) |owned| alloc.free(@constCast(owned));
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("schema");
+        schema_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("schema")) {
+        schema_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    }
+
+    var version: ?[]const u8 = null;
+    var version_transferred = false;
+    errdefer if (!version_transferred) if (version) |owned| alloc.free(@constCast(owned));
+    if (cursor.matchKeyword("version")) {
+        version = try parseSqlStringLiteralValueAlloc(alloc, cursor);
+    }
+    if (cursor.peekKeyword("from") or cursor.peekKeyword("cascade")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    extension_transferred = true;
+    schema_transferred = true;
+    version_transferred = true;
+    return .{
+        .extension_name = extension_name,
+        .schema_name = schema_name,
+        .version = version,
+        .if_not_exists = if_not_exists,
+    };
+}
+
+pub fn parseUpdateExtensionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !UpdateExtensionSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("extension");
+    const extension_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var extension_transferred = false;
+    errdefer if (!extension_transferred) alloc.free(extension_name);
+    try cursor.expectKeyword("update");
+
+    var target_version: ?[]const u8 = null;
+    var version_transferred = false;
+    errdefer if (!version_transferred) if (target_version) |owned| alloc.free(@constCast(owned));
+    if (cursor.matchKeyword("to")) {
+        target_version = try parseSqlStringLiteralValueAlloc(alloc, cursor);
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    extension_transferred = true;
+    version_transferred = true;
+    return .{ .extension_name = extension_name, .target_version = target_version };
+}
+
+pub fn parseDropExtensionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropExtensionSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("extension");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const extension_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var extension_transferred = false;
+    errdefer if (!extension_transferred) alloc.free(extension_name);
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    extension_transferred = true;
+    return .{ .extension_name = extension_name, .if_exists = if_exists, .cascade = cascade };
+}
+
 pub fn parseBulkIoTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1313,6 +1441,11 @@ pub fn parseIdentifierOwnedAlloc(
     pos: *usize,
 ) ![]const u8 {
     const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, token.text);
+}
+
+pub fn parseSqlStringLiteralValueAlloc(alloc: std.mem.Allocator, cursor: parser.Cursor) ![]const u8 {
+    const token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, token.text);
 }
 
@@ -2087,6 +2220,54 @@ test "sql adapter grammar parses schema namespace catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_drop_tokens);
     var unsupported_drop_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseDropSchemaNamespaceCatalogTailAlloc(alloc, unsupported_drop_tokens.items, &unsupported_drop_pos));
+}
+
+test "sql adapter grammar parses extension catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateExtensionCatalogTailAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(create_tokens.items.len, create_pos);
+    try std.testing.expectEqualStrings("pgcrypto", create.extension_name);
+    try std.testing.expectEqualStrings("public", create.schema_name.?);
+    try std.testing.expect(create.if_not_exists);
+    try std.testing.expect(create.version == null);
+
+    var create_version_tokens = try lexer.tokenizeAlloc(alloc, "EXTENSION postgis VERSION '3.4.0';");
+    defer lexer.freeTokens(alloc, &create_version_tokens);
+    var create_version_pos: usize = 0;
+    var create_version = try parseCreateExtensionCatalogTailAlloc(alloc, create_version_tokens.items, &create_version_pos);
+    defer create_version.deinit(alloc);
+    try std.testing.expectEqual(create_version_tokens.items.len, create_version_pos);
+    try std.testing.expectEqualStrings("postgis", create_version.extension_name);
+    try std.testing.expectEqualStrings("3.4.0", create_version.version.?);
+
+    var update_tokens = try lexer.tokenizeAlloc(alloc, "EXTENSION postgis UPDATE TO '3.5.0';");
+    defer lexer.freeTokens(alloc, &update_tokens);
+    var update_pos: usize = 0;
+    var update = try parseUpdateExtensionCatalogTailAlloc(alloc, update_tokens.items, &update_pos);
+    defer update.deinit(alloc);
+    try std.testing.expectEqual(update_tokens.items.len, update_pos);
+    try std.testing.expectEqualStrings("postgis", update.extension_name);
+    try std.testing.expectEqualStrings("3.5.0", update.target_version.?);
+
+    var drop_tokens = try lexer.tokenizeAlloc(alloc, "EXTENSION IF EXISTS postgis CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_tokens);
+    var drop_pos: usize = 0;
+    var drop = try parseDropExtensionCatalogTailAlloc(alloc, drop_tokens.items, &drop_pos);
+    defer drop.deinit(alloc);
+    try std.testing.expectEqual(drop_tokens.items.len, drop_pos);
+    try std.testing.expectEqualStrings("postgis", drop.extension_name);
+    try std.testing.expect(drop.if_exists);
+    try std.testing.expect(drop.cascade);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "EXTENSION postgis VERSION '3.4.0' FROM '3.3.0';");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateExtensionCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
 test "sql adapter grammar parses bulk io tails" {

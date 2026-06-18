@@ -3148,86 +3148,39 @@ const Parser = struct {
     }
 
     fn parseCreateExtensionDdl(self: *@This()) !CreateExtensionPlan {
-        try self.expectKeyword("extension");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const extension_name = try self.parseSqlObjectIdentifierOwned();
-        var extension_transferred = false;
-        errdefer if (!extension_transferred) self.alloc.free(extension_name);
-        if (self.matchKeyword("with")) {
-            try self.expectKeyword("schema");
-            const schema_name = try self.parseSqlObjectIdentifierOwned();
-            defer self.alloc.free(schema_name);
-            if (!if_not_exists or
-                !isAdapterNoopExtensionName(extension_name) or
-                !std.ascii.eqlIgnoreCase(schema_name, catalog_resources.default_namespace_name))
-            {
-                return error.UnsupportedSqlShape;
-            }
-        } else if (self.matchKeyword("schema")) {
-            const schema_name = try self.parseSqlObjectIdentifierOwned();
-            defer self.alloc.free(schema_name);
-            if (!if_not_exists or
-                !isAdapterNoopExtensionName(extension_name) or
+        var syntax = try sql_adapter.parseCreateExtensionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        defer syntax.deinit(self.alloc);
+        if (syntax.schema_name) |schema_name| {
+            if (!syntax.if_not_exists or
+                !isAdapterNoopExtensionName(syntax.extension_name) or
                 !std.ascii.eqlIgnoreCase(schema_name, catalog_resources.default_namespace_name))
             {
                 return error.UnsupportedSqlShape;
             }
         }
-        var version: ?[]const u8 = null;
-        var version_transferred = false;
-        errdefer if (!version_transferred) if (version) |owned| self.alloc.free(owned);
-        if (self.matchKeyword("version")) {
-            version = try self.parseSqlStringValueAlloc();
-        }
-        if (self.peekKeyword("from") or self.peekKeyword("cascade")) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        extension_transferred = true;
-        version_transferred = true;
-        return .{ .extension_name = extension_name, .version = version, .if_not_exists = if_not_exists };
+        const extension_name = syntax.extension_name;
+        const version = syntax.version;
+        syntax.extension_name = "";
+        syntax.version = null;
+        return .{ .extension_name = extension_name, .version = version, .if_not_exists = syntax.if_not_exists };
     }
 
     fn parseAlterExtensionDdl(self: *@This()) !UpdateExtensionPlan {
-        try self.expectKeyword("extension");
-        const extension_name = try self.parseSqlObjectIdentifierOwned();
-        var extension_transferred = false;
-        errdefer if (!extension_transferred) self.alloc.free(extension_name);
-        try self.expectKeyword("update");
-
-        var target_version: ?[]const u8 = null;
-        var version_transferred = false;
-        errdefer if (!version_transferred) if (target_version) |owned| self.alloc.free(owned);
-        if (self.matchKeyword("to")) {
-            target_version = try self.parseSqlStringValueAlloc();
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        extension_transferred = true;
-        version_transferred = true;
+        var syntax = try sql_adapter.parseUpdateExtensionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        defer syntax.deinit(self.alloc);
+        const extension_name = syntax.extension_name;
+        const target_version = syntax.target_version;
+        syntax.extension_name = "";
+        syntax.target_version = null;
         return .{ .extension_name = extension_name, .target_version = target_version };
     }
 
     fn parseDropExtensionDdl(self: *@This()) !DropExtensionPlan {
-        try self.expectKeyword("extension");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const extension_name = try self.parseSqlObjectIdentifierOwned();
-        var extension_transferred = false;
-        errdefer if (!extension_transferred) self.alloc.free(extension_name);
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        extension_transferred = true;
-        return .{ .extension_name = extension_name, .if_exists = if_exists, .cascade = cascade };
+        var syntax = try sql_adapter.parseDropExtensionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        defer syntax.deinit(self.alloc);
+        const extension_name = syntax.extension_name;
+        syntax.extension_name = "";
+        return .{ .extension_name = extension_name, .if_exists = syntax.if_exists, .cascade = syntax.cascade };
     }
 
     fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
