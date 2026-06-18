@@ -990,9 +990,11 @@ pub const LazyDirectorySnapshot = struct {
             while (delta_index > range.first_index) {
                 delta_index -= 1;
                 const found = try deltaIndexEntryFromIndexData(index_data, delta_index);
-                const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
-                defer alloc.free(value);
-                try latestDeltaValueRecordAfterGenerationForMember(value, vector_id, base_generation, &best_sequence, &best_record);
+                {
+                    const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
+                    defer alloc.free(value);
+                    try latestDeltaValueRecordAfterGenerationForMember(value, vector_id, base_generation, &best_sequence, &best_record);
+                }
             }
         }
         return best_record;
