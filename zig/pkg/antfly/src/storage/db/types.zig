@@ -1426,6 +1426,7 @@ pub const RelationalRowsCte = struct {
     query: RelationalRowsQueryRequest = .{},
     max_rows: ?u32 = null,
     max_bytes: ?u64 = null,
+    spill_after_bytes: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.name);
@@ -1436,17 +1437,90 @@ pub const RelationalRowsCte = struct {
 
 pub const default_relational_rows_cte_max_rows: u32 = 65_536;
 pub const default_relational_rows_cte_max_bytes: u64 = 64 * 1024 * 1024;
+pub const default_relational_rows_cte_spill_after_bytes: u64 = default_relational_rows_cte_max_bytes;
+
+pub const RelationalRowsCteMaterializationDecision = enum {
+    memory,
+    spill,
+    reject,
+};
 
 pub const RelationalRowsCteMaterializationLimits = struct {
     max_rows: u32,
     max_bytes: u64,
+    spill_after_bytes: u64,
 };
 
 pub fn relationalRowsCteMaterializationLimits(cte: RelationalRowsCte) RelationalRowsCteMaterializationLimits {
+    const max_bytes = cte.max_bytes orelse default_relational_rows_cte_max_bytes;
+    const configured_spill_after = cte.spill_after_bytes orelse default_relational_rows_cte_spill_after_bytes;
     return .{
         .max_rows = cte.max_rows orelse default_relational_rows_cte_max_rows,
-        .max_bytes = cte.max_bytes orelse default_relational_rows_cte_max_bytes,
+        .max_bytes = max_bytes,
+        .spill_after_bytes = @min(configured_spill_after, max_bytes),
     };
+}
+
+pub fn relationalRowsCteMaterializedJsonBytes(rows: []const []const u8) ?u64 {
+    var materialized_bytes: u64 = 2; // JSON array brackets around the materialized stream.
+    for (rows, 0..) |row, row_index| {
+        if (row_index > 0) {
+            materialized_bytes = std.math.add(u64, materialized_bytes, 1) catch return null;
+        }
+        materialized_bytes = std.math.add(u64, materialized_bytes, @intCast(row.len)) catch return null;
+    }
+    return materialized_bytes;
+}
+
+pub fn relationalRowsCteMaterializationDecision(
+    cte: RelationalRowsCte,
+    observed_rows: usize,
+    observed_bytes: u64,
+) RelationalRowsCteMaterializationDecision {
+    const limits = relationalRowsCteMaterializationLimits(cte);
+    if (observed_rows > limits.max_rows) return .reject;
+    if (observed_bytes > limits.max_bytes) return .reject;
+    if (observed_bytes > limits.spill_after_bytes) return .spill;
+    return .memory;
+}
+
+test "relational CTE materialization admission distinguishes memory spill and reject" {
+    const rows = [_][]const u8{
+        "{\"id\":\"1\"}",
+        "{\"id\":\"2\"}",
+    };
+    const observed_bytes = relationalRowsCteMaterializedJsonBytes(&rows) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 23), observed_bytes);
+
+    const in_memory = RelationalRowsCte{
+        .name = "small",
+        .max_rows = 2,
+        .max_bytes = 23,
+        .spill_after_bytes = 23,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.memory, relationalRowsCteMaterializationDecision(in_memory, rows.len, observed_bytes));
+
+    const spill = RelationalRowsCte{
+        .name = "spill",
+        .max_rows = 2,
+        .max_bytes = 23,
+        .spill_after_bytes = 22,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.spill, relationalRowsCteMaterializationDecision(spill, rows.len, observed_bytes));
+
+    const too_many_rows = RelationalRowsCte{
+        .name = "too_many_rows",
+        .max_rows = 1,
+        .max_bytes = 23,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.reject, relationalRowsCteMaterializationDecision(too_many_rows, rows.len, observed_bytes));
+
+    const too_many_bytes = RelationalRowsCte{
+        .name = "too_many_bytes",
+        .max_rows = 2,
+        .max_bytes = 22,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.reject, relationalRowsCteMaterializationDecision(too_many_bytes, rows.len, observed_bytes));
 }
 
 pub const RelationalRowsQueryPlan = struct {

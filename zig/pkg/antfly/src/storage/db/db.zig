@@ -18228,9 +18228,11 @@ pub const DB = struct {
                     mutable.deinit(alloc);
                 }
             }
-            const limits = types.relationalRowsCteMaterializationLimits(cte);
-            if (result.rows.len > limits.max_rows) return error.UnsupportedQueryRequest;
-            try validateRelationalRowsCteMaterializedBytes(result.rows, limits.max_bytes);
+            const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedQueryRequest;
+            switch (types.relationalRowsCteMaterializationDecision(cte, result.rows.len, materialized_bytes)) {
+                .memory => {},
+                .spill, .reject => return error.UnsupportedQueryRequest,
+            }
             const output_fields = try relationalRowsQueryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
             var output_fields_transferred = false;
             errdefer if (!output_fields_transferred) freeOwnedConstStringSlice(alloc, output_fields);
@@ -18241,19 +18243,6 @@ pub const DB = struct {
             });
             result_transferred = true;
             output_fields_transferred = true;
-        }
-    }
-
-    fn validateRelationalRowsCteMaterializedBytes(rows: []const []const u8, max_bytes: u64) !void {
-        var materialized_bytes: u64 = 2; // JSON array brackets around the materialized stream.
-        if (materialized_bytes > max_bytes) return error.UnsupportedQueryRequest;
-        for (rows, 0..) |row, row_index| {
-            if (row_index > 0) {
-                materialized_bytes = std.math.add(u64, materialized_bytes, 1) catch return error.UnsupportedQueryRequest;
-                if (materialized_bytes > max_bytes) return error.UnsupportedQueryRequest;
-            }
-            materialized_bytes = std.math.add(u64, materialized_bytes, @intCast(row.len)) catch return error.UnsupportedQueryRequest;
-            if (materialized_bytes > max_bytes) return error.UnsupportedQueryRequest;
         }
     }
 
@@ -82891,6 +82880,7 @@ test "relational rows query plan composes non-recursive ctes" {
     const default_cte_limits = types.relationalRowsCteMaterializationLimits(ctes[0]);
     try std.testing.expectEqual(types.default_relational_rows_cte_max_rows, default_cte_limits.max_rows);
     try std.testing.expectEqual(types.default_relational_rows_cte_max_bytes, default_cte_limits.max_bytes);
+    try std.testing.expectEqual(types.default_relational_rows_cte_spill_after_bytes, default_cte_limits.spill_after_bytes);
 
     var result = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
         .ctes = ctes[0..],
@@ -82907,6 +82897,23 @@ test "relational rows query plan composes non-recursive ctes" {
     try std.testing.expectEqual(@as(u32, 1), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":20}", result.rows[0]);
+
+    const spill_ctes = [_]types.RelationalRowsCte{.{
+        .name = "open_orders",
+        .query = .{
+            .predicates = open_predicates[0..],
+            .select_all = true,
+        },
+        .spill_after_bytes = 8,
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = spill_ctes[0..],
+        .query = .{
+            .source_cte = "open_orders",
+            .select = select[0..],
+            .select_all = false,
+        },
+    }));
 
     try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
         .query = .{

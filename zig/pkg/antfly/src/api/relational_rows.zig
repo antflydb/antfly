@@ -994,9 +994,11 @@ fn materializeRowsJsonCtesAlloc(
         var result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, source_schema, query, source_rows, source_ranges);
         var result_transferred = false;
         errdefer if (!result_transferred) result.deinit(alloc);
-        const limits = db_mod.types.relationalRowsCteMaterializationLimits(cte);
-        if (result.rows.len > limits.max_rows) return error.UnsupportedRowsQuery;
-        try validateRowsJsonCteMaterializedBytes(result.rows, limits.max_bytes);
+        const materialized_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedRowsQuery;
+        switch (db_mod.types.relationalRowsCteMaterializationDecision(cte, result.rows.len, materialized_bytes)) {
+            .memory => {},
+            .spill, .reject => return error.UnsupportedRowsQuery,
+        }
         try materialized_ctes.append(alloc, .{
             .name = cte.name,
             .schema = rowsSchemaFromPlannedCte(planned_ctes[cte_index]),
@@ -1011,19 +1013,6 @@ fn findRowsJsonMaterializedCte(ctes: []RowsJsonMaterializedCte, name: []const u8
         if (std.mem.eql(u8, cte.name, name)) return cte;
     }
     return null;
-}
-
-fn validateRowsJsonCteMaterializedBytes(rows: []const []const u8, max_bytes: u64) !void {
-    var materialized_bytes: u64 = 2;
-    if (materialized_bytes > max_bytes) return error.UnsupportedRowsQuery;
-    for (rows, 0..) |row, row_index| {
-        if (row_index > 0) {
-            materialized_bytes = std.math.add(u64, materialized_bytes, 1) catch return error.UnsupportedRowsQuery;
-            if (materialized_bytes > max_bytes) return error.UnsupportedRowsQuery;
-        }
-        materialized_bytes = std.math.add(u64, materialized_bytes, @intCast(row.len)) catch return error.UnsupportedRowsQuery;
-        if (materialized_bytes > max_bytes) return error.UnsupportedRowsQuery;
-    }
 }
 
 pub const UniqueSelectorResolver = struct {
@@ -5966,13 +5955,14 @@ fn parseRowsCtesAlloc(
 
     for (ctes_value.array.items) |item| {
         if (item != .object) return error.InvalidRowsRequest;
-        try requireJsonObjectOnlyKeys(item.object, &.{ "name", "query", "max_rows", "max_bytes" });
+        try requireJsonObjectOnlyKeys(item.object, &.{ "name", "query", "max_rows", "max_bytes", "spill_after_bytes" });
         const name_value = item.object.get("name") orelse return error.InvalidRowsRequest;
         const query_value = item.object.get("query") orelse return error.InvalidRowsRequest;
         if (name_value != .string or name_value.string.len == 0) return error.InvalidRowsRequest;
         if (rowsCteNameExists(out[0..initialized], name_value.string)) return error.InvalidRowsRequest;
         const max_rows = try parseOptionalU32(item.object.get("max_rows"));
         const max_bytes = try parseOptionalU64(item.object.get("max_bytes"));
+        const spill_after_bytes = try parseOptionalU64(item.object.get("spill_after_bytes"));
 
         const name = try alloc.dupe(u8, name_value.string);
         var name_transferred = false;
@@ -5997,6 +5987,7 @@ fn parseRowsCtesAlloc(
             .query = query,
             .max_rows = max_rows,
             .max_bytes = max_bytes,
+            .spill_after_bytes = spill_after_bytes,
         };
         name_transferred = true;
         try planned.append(alloc, .{
@@ -18371,7 +18362,7 @@ test "relational rows cte plan contract accepts ordered typed subplans" {
 
     var query_plan = try parseRowsQueryPlanRequest(
         std.testing.allocator,
-        "{\"ctes\":[{\"name\":\"open_rows\",\"max_rows\":100,\"max_bytes\":4096,\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},\"select\":[\"id\",\"tenant\",\"amount\"]}},{\"name\":\"expensive_open_rows\",\"query\":{\"source_cte\":\"open_rows\",\"where\":{\"field\":\"amount\",\"op\":\"gt\",\"value\":10},\"select\":[\"id\",\"amount\"]}}],\"query\":{\"source_cte\":\"expensive_open_rows\",\"select\":[\"id\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}],\"limit\":2}}",
+        "{\"ctes\":[{\"name\":\"open_rows\",\"max_rows\":100,\"max_bytes\":4096,\"spill_after_bytes\":2048,\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},\"select\":[\"id\",\"tenant\",\"amount\"]}},{\"name\":\"expensive_open_rows\",\"query\":{\"source_cte\":\"open_rows\",\"where\":{\"field\":\"amount\",\"op\":\"gt\",\"value\":10},\"select\":[\"id\",\"amount\"]}}],\"query\":{\"source_cte\":\"expensive_open_rows\",\"select\":[\"id\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}],\"limit\":2}}",
         schema,
     );
     defer query_plan.deinit(std.testing.allocator);
@@ -18379,10 +18370,12 @@ test "relational rows cte plan contract accepts ordered typed subplans" {
     try std.testing.expectEqualStrings("open_rows", query_plan.ctes[0].name);
     try std.testing.expectEqual(@as(u32, 100), query_plan.ctes[0].max_rows.?);
     try std.testing.expectEqual(@as(u64, 4096), query_plan.ctes[0].max_bytes.?);
+    try std.testing.expectEqual(@as(u64, 2048), query_plan.ctes[0].spill_after_bytes.?);
     try std.testing.expectEqualStrings("", query_plan.ctes[0].query.source_cte);
     try std.testing.expectEqualStrings("expensive_open_rows", query_plan.ctes[1].name);
     try std.testing.expectEqual(@as(?u32, null), query_plan.ctes[1].max_rows);
     try std.testing.expectEqual(@as(?u64, null), query_plan.ctes[1].max_bytes);
+    try std.testing.expectEqual(@as(?u64, null), query_plan.ctes[1].spill_after_bytes);
     try std.testing.expectEqualStrings("open_rows", query_plan.ctes[1].query.source_cte);
     try std.testing.expectEqualStrings("expensive_open_rows", query_plan.query.source_cte);
     try std.testing.expectEqual(@as(u32, 2), query_plan.query.limit.?);
@@ -18933,6 +18926,14 @@ test "relational rows cte plan contract executes derived outputs across read sta
     try std.testing.expectEqualStrings("{\"id\":\"d\"}", query_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", query_result.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"c\"}", query_result.rows[2]);
+
+    var spill_required_query_plan = try parseRowsQueryPlanRequest(
+        alloc,
+        "{\"ctes\":[{\"name\":\"scoped_rows\",\"spill_after_bytes\":8,\"query\":{\"select\":[\"id\",\"tenant\"]}}],\"query\":{\"source_cte\":\"scoped_rows\",\"select\":[\"id\"]}}",
+        schema,
+    );
+    defer spill_required_query_plan.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedRowsQuery, executeRowsQueryPlanOnJsonRowsAlloc(alloc, schema, spill_required_query_plan, rows[0..]));
 
     var ranged_query_plan = try parseRowsQueryPlanRequest(
         alloc,
