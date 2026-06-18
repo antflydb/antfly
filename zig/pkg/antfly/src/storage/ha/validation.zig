@@ -20,13 +20,13 @@
 
 const std = @import("std");
 
-pub const StringValidation = enum {
+pub const HAStringValidation = enum {
     ok,
     missing,
     padded,
 };
 
-pub fn classifyString(value_or_null: ?[]const u8) StringValidation {
+pub fn classifyHAString(value_or_null: ?[]const u8) HAStringValidation {
     const raw = value_or_null orelse return .missing;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return .missing;
@@ -90,12 +90,12 @@ pub fn isAbsoluteNormalizedPathWithinRoot(path: []const u8, root: []const u8) bo
 }
 
 test "storage.ha validation classifies missing padded and valid strings" {
-    try std.testing.expectEqual(StringValidation.missing, classifyString(null));
-    try std.testing.expectEqual(StringValidation.missing, classifyString(""));
-    try std.testing.expectEqual(StringValidation.missing, classifyString(" \t\r\n"));
-    try std.testing.expectEqual(StringValidation.padded, classifyString(" primary-a"));
-    try std.testing.expectEqual(StringValidation.padded, classifyString("primary-a\n"));
-    try std.testing.expectEqual(StringValidation.ok, classifyString("primary-a"));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(" \t\r\n"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString(" primary-a"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("primary-a\n"));
+    try std.testing.expectEqual(HAStringValidation.ok, classifyHAString("primary-a"));
 }
 
 test "storage.ha validation checks identifiers env names and normalized paths" {

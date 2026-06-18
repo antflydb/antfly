@@ -1351,7 +1351,7 @@ const HAPathField = enum {
 };
 
 fn validateHASlotName(raw: []const u8) ![]const u8 {
-    switch (validation.classifyString(raw)) {
+    switch (validation.classifyHAString(raw)) {
         .ok => {},
         .missing => return error.SlotNameMissing,
         .padded => return error.InvalidSlotName,
@@ -1361,7 +1361,7 @@ fn validateHASlotName(raw: []const u8) ![]const u8 {
 }
 
 fn validateHANodeID(raw: []const u8) ![]const u8 {
-    switch (validation.classifyString(raw)) {
+    switch (validation.classifyHAString(raw)) {
         .ok => {},
         .missing, .padded => return error.InvalidNodeId,
     }
@@ -1370,7 +1370,7 @@ fn validateHANodeID(raw: []const u8) ![]const u8 {
 }
 
 fn validateHAPath(raw: []const u8, field: HAPathField) ![]const u8 {
-    switch (validation.classifyString(raw)) {
+    switch (validation.classifyHAString(raw)) {
         .ok => {},
         .missing => return switch (field) {
             .manifest => error.ManifestPathMissing,
@@ -1390,7 +1390,7 @@ fn haPathInvalidError(field: HAPathField) anyerror {
 }
 
 fn validateHAAdminURL(raw: []const u8) ![]const u8 {
-    switch (validation.classifyString(raw)) {
+    switch (validation.classifyHAString(raw)) {
         .ok => {},
         .missing, .padded => return error.InvalidHAAdminURL,
     }

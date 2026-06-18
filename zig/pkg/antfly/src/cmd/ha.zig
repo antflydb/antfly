@@ -984,7 +984,7 @@ const HAPathField = enum {
 };
 
 fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
-    switch (ha_validation.classifyString(path)) {
+    switch (ha_validation.classifyHAString(path)) {
         .ok => {},
         .missing => return switch (field) {
             .primary_log => error.PrimaryLogMissing,
@@ -1017,7 +1017,7 @@ const HANodeIDField = enum {
 };
 
 fn validateHANodeID(node_id: []const u8, field: HANodeIDField) ![]const u8 {
-    switch (ha_validation.classifyString(node_id)) {
+    switch (ha_validation.classifyHAString(node_id)) {
         .ok => {},
         .missing, .padded => return haNodeIDInvalidError(field),
     }
@@ -1033,7 +1033,7 @@ fn haNodeIDInvalidError(field: HANodeIDField) anyerror {
 }
 
 fn validateHAAdminURL(raw_url: []const u8) ![]const u8 {
-    switch (ha_validation.classifyString(raw_url)) {
+    switch (ha_validation.classifyHAString(raw_url)) {
         .ok => {},
         .missing => return error.HAAdminURLMissing,
         .padded => return error.HAAdminURLInvalid,
@@ -1045,7 +1045,7 @@ fn validateHAAdminURL(raw_url: []const u8) ![]const u8 {
 }
 
 fn validateHAAdminTokenEnvName(raw_env_var: []const u8) ![]const u8 {
-    switch (ha_validation.classifyString(raw_env_var)) {
+    switch (ha_validation.classifyHAString(raw_env_var)) {
         .ok => {},
         .missing => return error.HAAdminTokenEnvMissing,
         .padded => return error.HAAdminTokenEnvInvalid,
@@ -1185,12 +1185,12 @@ test "ha cmd validates remote bearer token env name" {
 }
 
 test "ha cmd classifies HA strings before field-specific validation" {
-    try std.testing.expectEqual(ha_validation.StringValidation.missing, ha_validation.classifyString(null));
-    try std.testing.expectEqual(ha_validation.StringValidation.missing, ha_validation.classifyString(""));
-    try std.testing.expectEqual(ha_validation.StringValidation.missing, ha_validation.classifyString(" \t\r\n"));
-    try std.testing.expectEqual(ha_validation.StringValidation.padded, ha_validation.classifyString(" primary-a"));
-    try std.testing.expectEqual(ha_validation.StringValidation.padded, ha_validation.classifyString("primary-a\n"));
-    try std.testing.expectEqual(ha_validation.StringValidation.ok, ha_validation.classifyString("primary-a"));
+    try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(null));
+    try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(""));
+    try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(" \t\r\n"));
+    try std.testing.expectEqual(ha_validation.HAStringValidation.padded, ha_validation.classifyHAString(" primary-a"));
+    try std.testing.expectEqual(ha_validation.HAStringValidation.padded, ha_validation.classifyHAString("primary-a\n"));
+    try std.testing.expectEqual(ha_validation.HAStringValidation.ok, ha_validation.classifyHAString("primary-a"));
 }
 
 test "ha cmd rejects padded or invalid HA local option strings" {
