@@ -108,6 +108,11 @@ const ProgressReplay = struct {
     progress: Progress = .{},
 };
 
+const TimelineSwitchRecovery = struct {
+    identity: Identity,
+    progress: Progress,
+};
+
 pub const OpenOptions = struct {
     receive_log_options: replication_log.OpenOptions = .{},
     progress_wal_options: wal_mod.WalOptions = .{},
@@ -148,17 +153,18 @@ pub const Standby = struct {
         const replayed = try standby.replayProgress();
         standby.progress = replayed.progress;
         const received_identity = try standby.validateReceivedLog();
-        try validateOpenIdentities(replayed.identity, received_identity, standby.identity);
 
         const durable_received_lsn = standby.receive_log.lastLsn();
         const replayed_progress = standby.progress;
         if (standby.progress.received_lsn > durable_received_lsn) return error.ProgressAheadOfReceivedWal;
         standby.progress.received_lsn = durable_received_lsn;
-        if (try standby.recoverTimelineSwitch(replayed_progress)) |timeline_progress| {
-            standby.progress = timeline_progress;
+        if (try standby.recoverTimelineSwitch(replayed_progress)) |timeline_recovery| {
+            standby.identity = timeline_recovery.identity;
+            standby.progress = timeline_recovery.progress;
         } else if (try standby.recoverBootstrapCheckpoint(replayed_progress)) |checkpoint_progress| {
             standby.progress = checkpoint_progress;
         }
+        try validateOpenIdentities(replayed.identity, received_identity, standby.identity);
         if (standby.progress.applied_lsn > standby.progress.received_lsn) return error.AppliedAheadOfReceived;
         if (standby.progress.safe_read_lsn > standby.progress.applied_lsn) return error.SafeReadAheadOfApplied;
 
@@ -449,7 +455,7 @@ pub const Standby = struct {
         };
     }
 
-    fn recoverTimelineSwitch(self: *Standby, replayed_progress: Progress) !?Progress {
+    fn recoverTimelineSwitch(self: *Standby, replayed_progress: Progress) !?TimelineSwitchRecovery {
         const durable_received_lsn = self.receive_log.lastLsn();
         if (durable_received_lsn == 0) return null;
         if (replayed_progress.received_lsn >= durable_received_lsn) return null;
@@ -457,13 +463,27 @@ pub const Standby = struct {
         var entry = (try self.receive_log.entryAt(self.alloc, durable_received_lsn)) orelse return error.MissingReceivedRecord;
         defer entry.deinit(self.alloc);
         if (entry.record.kind != .timeline_switch) return null;
-        try self.validateRecord(entry.record);
+        if (entry.record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
+        if (entry.record.shard_id != self.identity.shard_id) return error.WrongShard;
+        if (entry.record.table_id != self.identity.table_id) return error.WrongTable;
+        if (entry.record.timeline_id < self.identity.timeline_id) return error.WrongTimeline;
+        if (entry.record.timeline_id == self.identity.timeline_id and entry.record.epoch != self.identity.epoch) return error.WrongEpoch;
+        if (entry.record.timeline_id > self.identity.timeline_id and entry.record.epoch <= self.identity.epoch) return error.InvalidTimelineSwitch;
         if (entry.record.previous_lsn != replayed_progress.received_lsn) return error.MissingReceivedRecord;
 
         return .{
-            .received_lsn = entry.record.lsn,
-            .applied_lsn = entry.record.lsn,
-            .safe_read_lsn = entry.record.lsn,
+            .identity = .{
+                .cluster_id = entry.record.cluster_id,
+                .shard_id = entry.record.shard_id,
+                .table_id = entry.record.table_id,
+                .timeline_id = entry.record.timeline_id,
+                .epoch = entry.record.epoch,
+            },
+            .progress = .{
+                .received_lsn = entry.record.lsn,
+                .applied_lsn = entry.record.lsn,
+                .safe_read_lsn = entry.record.lsn,
+            },
         };
     }
 
@@ -1129,7 +1149,15 @@ test "storage.ha standby recovers timeline switch when promotion progress lags" 
         });
     }
 
-    try std.testing.expectError(error.WrongTimeline, Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{}));
+    {
+        var recovered = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer recovered.close();
+        try std.testing.expectEqual(promoted_identity.timeline_id, recovered.identity.timeline_id);
+        try std.testing.expectEqual(promoted_identity.epoch, recovered.identity.epoch);
+        try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().applied_lsn);
+        try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().safe_read_lsn);
+    }
 
     {
         var recovered = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, promoted_identity, .{});
