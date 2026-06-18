@@ -14,6 +14,8 @@
 
 const std = @import("std");
 
+const ast = @import("ast.zig");
+const db_mod = @import("../../storage/db/mod.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const token_mod = @import("token.zig");
@@ -32,6 +34,17 @@ pub const AdapterNoopTransactionBoundaryTail = struct {
 
 pub const SavepointNameSyntax = struct {
     savepoint_name: []const u8,
+};
+
+pub const RowClaimSyntax = struct {
+    clause: ast.SqlRowClaimClause,
+    targets: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.targets) |target| alloc.free(@constCast(target));
+        if (self.targets.len > 0) alloc.free(self.targets);
+        self.* = undefined;
+    }
 };
 
 pub const NamedOrAllSyntax = struct {
@@ -158,6 +171,54 @@ pub fn parseRollbackToSavepointTail(tokens: []const Token, pos: *usize) !Savepoi
     try cursor.expectKeyword("to");
     _ = cursor.matchKeyword("savepoint");
     return try parseSavepointNameTailFromCursor(cursor);
+}
+
+pub fn parseForRowClaimClauseAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !RowClaimSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const mode: db_mod.types.RowClaimMode = if (cursor.matchKeyword("no")) blk: {
+        try cursor.expectKeyword("key");
+        try cursor.expectKeyword("update");
+        break :blk .for_no_key_update;
+    } else if (cursor.matchKeyword("key")) blk: {
+        try cursor.expectKeyword("share");
+        break :blk .for_key_share;
+    } else if (cursor.matchKeyword("share")) blk: {
+        break :blk .for_share;
+    } else blk: {
+        try cursor.expectKeyword("update");
+        break :blk .for_update;
+    };
+
+    var targets = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (targets.items) |target| alloc.free(@constCast(target));
+        targets.deinit(alloc);
+    }
+    if (cursor.matchKeyword("of")) {
+        while (true) {
+            _ = cursor.matchKeyword("only");
+            const target = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+            try targets.append(alloc, try alloc.dupe(u8, target.text));
+            if (cursor.matchToken(.comma) == null) break;
+        }
+    }
+
+    const wait_policy: db_mod.types.RowClaimWaitPolicy = if (cursor.matchKeyword("skip")) blk: {
+        try cursor.expectKeyword("locked");
+        break :blk .skip_locked;
+    } else if (cursor.matchKeyword("nowait"))
+        .nowait
+    else
+        .wait;
+
+    return .{
+        .clause = .{ .mode = mode, .wait_policy = wait_policy },
+        .targets = try targets.toOwnedSlice(alloc),
+    };
 }
 
 pub fn parseDeallocatePreparedStatementTail(tokens: []const Token, pos: *usize) !NamedOrAllSyntax {
@@ -801,6 +862,47 @@ test "sql adapter grammar parses protocol cleanup tails" {
     defer lexer.freeTokens(alloc, &extra_tokens);
     var extra_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCloseCursorPortalTail(extra_tokens.items, &extra_pos));
+}
+
+test "sql adapter grammar parses row claim clauses" {
+    const alloc = std.testing.allocator;
+
+    var skip_tokens = try lexer.tokenizeAlloc(alloc, "NO KEY UPDATE OF usage_records, public.jobs SKIP LOCKED");
+    defer lexer.freeTokens(alloc, &skip_tokens);
+    var skip_pos: usize = 0;
+    var skip_clause = try parseForRowClaimClauseAlloc(alloc, skip_tokens.items, &skip_pos);
+    defer skip_clause.deinit(alloc);
+    try std.testing.expectEqual(skip_tokens.items.len, skip_pos);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_no_key_update, skip_clause.clause.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, skip_clause.clause.wait_policy);
+    try std.testing.expectEqual(@as(usize, 2), skip_clause.targets.len);
+    try std.testing.expectEqualStrings("usage_records", skip_clause.targets[0]);
+    try std.testing.expectEqualStrings("public.jobs", skip_clause.targets[1]);
+
+    var share_tokens = try lexer.tokenizeAlloc(alloc, "KEY SHARE OF ONLY usage_records NOWAIT");
+    defer lexer.freeTokens(alloc, &share_tokens);
+    var share_pos: usize = 0;
+    var share_clause = try parseForRowClaimClauseAlloc(alloc, share_tokens.items, &share_pos);
+    defer share_clause.deinit(alloc);
+    try std.testing.expectEqual(share_tokens.items.len, share_pos);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_key_share, share_clause.clause.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, share_clause.clause.wait_policy);
+    try std.testing.expectEqual(@as(usize, 1), share_clause.targets.len);
+    try std.testing.expectEqualStrings("usage_records", share_clause.targets[0]);
+
+    var default_tokens = try lexer.tokenizeAlloc(alloc, "UPDATE");
+    defer lexer.freeTokens(alloc, &default_tokens);
+    var default_pos: usize = 0;
+    var default_clause = try parseForRowClaimClauseAlloc(alloc, default_tokens.items, &default_pos);
+    defer default_clause.deinit(alloc);
+    try std.testing.expectEqual(default_tokens.items.len, default_pos);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, default_clause.clause.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, default_clause.clause.wait_policy);
+
+    var invalid_tokens = try lexer.tokenizeAlloc(alloc, "SHARE SKIP");
+    defer lexer.freeTokens(alloc, &invalid_tokens);
+    var invalid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseForRowClaimClauseAlloc(alloc, invalid_tokens.items, &invalid_pos));
 }
 
 test "sql adapter grammar parses relation population syntax" {

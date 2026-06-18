@@ -125,6 +125,115 @@ search, graph, backup, auth, extension, and change-feed features on one table
 catalog object instead of splitting them across parallel collection and table
 systems.
 
+## API, MCP, A2A, CLI, and Auth Integration
+
+OpenAPI should be the contract for explicit database and namespace operations.
+MCP, A2A, CLI, SDKs, and SQL adapters should bind to the same generated API
+operations and shared catalog-resolution helpers rather than each inventing
+separate catalog semantics.
+
+Use one request-level target model everywhere:
+
+```text
+database: optional, defaults to current/default database
+namespace: optional, defaults to public
+table: required for table operations
+```
+
+The existing shorthand remains:
+
+```text
+/db/v1/tables/{table}
+```
+
+and resolves to:
+
+```text
+default.public.{table}
+```
+
+Explicit routes should be added when the backing catalog and authorization
+checks exist:
+
+```text
+/db/v1/databases
+/db/v1/databases/{database}
+/db/v1/databases/{database}/namespaces
+/db/v1/databases/{database}/namespaces/{namespace}
+/db/v1/databases/{database}/namespaces/{namespace}/tables
+/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}
+```
+
+MCP tools should be catalog-aware wrappers over those OpenAPI operations:
+
+```text
+list_tables(database?, namespace?)
+create_table(database?, namespace?, table, schema, ...)
+query_table(database?, namespace?, table, query)
+execute_sql(database?, sql)
+```
+
+MCP must not bypass Antfly authorization. A trusted MCP principal maps into the
+normal authenticated identity model, including role memberships, role settings,
+row filters, and extension capability grants. Extension-owned MCP tools should
+run with the intersection of caller permissions and the extension install's
+declared capabilities.
+
+A2A agent cards should advertise catalog-scoped skills, such as:
+
+```json
+{
+  "skill": "query_table",
+  "scopes": ["database:tenant_ops", "namespace:analytics", "table:events"]
+}
+```
+
+A2A tasks should execute as a delegated principal. If an agent queries
+`analytics.events`, it must pass the same authorization checks as HTTP, SQL,
+MCP, and CLI calls. There should be no separate agent superuser path.
+
+The CLI should be a thin generated-client wrapper around the OpenAPI surface:
+
+```sh
+antfly database create tenant_ops
+antfly namespace create analytics --database tenant_ops
+antfly table create events --database tenant_ops --namespace analytics
+antfly sql --database tenant_ops 'CREATE TABLE analytics.events (...)'
+```
+
+The CLI can carry local defaults for ergonomics:
+
+```sh
+antfly config set current-database tenant_ops
+antfly config set current-namespace analytics
+antfly table list
+```
+
+Explicit flags always override local defaults.
+
+The user and role system should authorize qualified resources:
+
+```text
+database:tenant_ops
+namespace:tenant_ops.analytics
+table:tenant_ops.analytics.events
+```
+
+SQL authorization should map onto those resource names:
+
+```sql
+GRANT USAGE ON DATABASE tenant_ops TO app_reader;
+GRANT USAGE ON SCHEMA analytics TO app_reader;
+GRANT SELECT ON TABLE analytics.events TO app_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO app_reader;
+```
+
+Unqualified grants remain compatibility sugar for the current database and
+`public` namespace. Role settings such as `app.tenant_id` remain useful for row
+security. Settings that imply native catalog behavior, such as `search_path` or
+`current_database`, should stay fail-closed until Antfly has real native
+semantics for them.
+
 ## Migration Path
 
 1. Keep `/tables/{table}` as shorthand for the default database and `public`
@@ -135,6 +244,12 @@ systems.
    rename, drop, dependency, and authorization semantics.
 4. Teach SQL object resolution to use current database plus namespace search
    rules instead of stripping all non-`public` prefixes.
-5. Add explicit database/namespace API routes only after the underlying catalog
+5. Add explicit database/namespace OpenAPI routes only after the underlying catalog
    identity and authorization checks exist.
-
+6. Bind MCP, A2A, CLI, and SDK helpers to the generated OpenAPI operations and
+   shared target-resolution helpers.
+7. Extend user and role permissions from bare table names to qualified
+   database/namespace/table resources, then teach SQL `GRANT`/`REVOKE` to emit
+   those qualified permissions.
+8. Add parity tests proving the same principal can or cannot access a qualified
+   table consistently through HTTP, SQL, MCP, A2A, and CLI paths.

@@ -31741,35 +31741,12 @@ const Parser = struct {
     }
 
     fn parseForRowClaimClause(self: *@This(), allowed_targets: []const []const u8) !SqlRowClaimClause {
-        const mode: db_mod.types.RowClaimMode = if (self.matchKeyword("no")) blk: {
-            try self.expectKeyword("key");
-            try self.expectKeyword("update");
-            break :blk .for_no_key_update;
-        } else if (self.matchKeyword("key")) blk: {
-            try self.expectKeyword("share");
-            break :blk .for_key_share;
-        } else if (self.matchKeyword("share")) blk: {
-            break :blk .for_share;
-        } else blk: {
-            try self.expectKeyword("update");
-            break :blk .for_update;
-        };
-        if (self.matchKeyword("of")) {
-            while (true) {
-                const target = try self.parseSqlTableReferenceIdentifierOwned();
-                defer self.alloc.free(target);
-                if (!self.rowClaimTargetAllowed(target, allowed_targets)) return error.UnsupportedSqlShape;
-                if (self.match(.comma) == null) break;
-            }
+        var syntax = try sql_adapter.parseForRowClaimClauseAlloc(self.alloc, self.tokens, &self.pos);
+        defer syntax.deinit(self.alloc);
+        for (syntax.targets) |target| {
+            if (!self.rowClaimTargetAllowed(target, allowed_targets)) return error.UnsupportedSqlShape;
         }
-        if (self.matchKeyword("skip")) {
-            try self.expectKeyword("locked");
-            return .{ .mode = mode, .wait_policy = .skip_locked };
-        }
-        if (self.matchKeyword("nowait")) {
-            return .{ .mode = mode, .wait_policy = .nowait };
-        }
-        return .{ .mode = mode, .wait_policy = .wait };
+        return syntax.clause;
     }
 
     fn parseExclusiveForRowClaimClause(self: *@This(), allowed_targets: []const []const u8) !SqlRowClaimClause {

@@ -1041,9 +1041,14 @@ intent instead of scanning raw SQL. This boundary is now partially implemented:
 `api/sql_adapter/` owns token definitions, lexer behavior, parser cursor
 helpers, statement classification, diagnostics, parity-corpus fingerprints,
 catalog/source-name prebinding, adapter-noop grammar tails, row-security grammar
-syntax, and relation-population syntax parsing for `SELECT INTO` and
+syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
+`FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
+tails, and relation-population syntax parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/relational_sql.zig` keeps the public lowering entrypoints
-and maps adapter syntax into Antfly-native typed plans. Next extract the shared expression grammar,
+and maps adapter syntax into Antfly-native typed plans. Row-lock target
+validation remains in the lowerer/binder boundary because it depends on table
+aliases and catalog-normalized object names, but the SQL grammar emits only the
+native row-claim mode and wait-policy struct used by REST/SDK plans. Next extract the shared expression grammar,
 because expressions are reused by SELECT, DML, DDL checks, partial indexes,
 defaults, generated columns, conflict actions, and RETURNING. The binder boundary should
 own catalog source lookup, cross-table source-name pre-scans for read,
