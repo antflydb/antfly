@@ -8167,8 +8167,7 @@ pub fn bulkBuildExternalSequentialTxnOptions(
     switch (options.algo orelse self.config.bulk_build_algo) {
         .hilbert_seeded => {
             const Entry = struct {
-                vector_id: u64,
-                embedding_offset: usize,
+                embedding_index: usize,
             };
             const SortContext = struct {
                 embeddings: []const u8,
@@ -8202,8 +8201,7 @@ pub fn bulkBuildExternalSequentialTxnOptions(
                     const embedding = embeddings[entry_index * embedding_len ..][0..embedding_len];
                     try hilbert.encodeVecBytesInto(transformed[i * dims ..][0..dims], coords, embedding);
                     entries[entry_index] = .{
-                        .vector_id = vector_ids[i],
-                        .embedding_offset = entry_index * embedding_len,
+                        .embedding_index = entry_index,
                     };
                 }
                 offset += group_size;
@@ -8211,8 +8209,10 @@ pub fn bulkBuildExternalSequentialTxnOptions(
 
             std.mem.sort(Entry, entries, SortContext{ .embeddings = embeddings, .embedding_len = embedding_len }, struct {
                 fn lessThan(ctx: SortContext, a: Entry, b: Entry) bool {
-                    const left = ctx.embeddings[a.embedding_offset..][0..ctx.embedding_len];
-                    const right = ctx.embeddings[b.embedding_offset..][0..ctx.embedding_len];
+                    const left_offset = a.embedding_index * ctx.embedding_len;
+                    const right_offset = b.embedding_index * ctx.embedding_len;
+                    const left = ctx.embeddings[left_offset..][0..ctx.embedding_len];
+                    const right = ctx.embeddings[right_offset..][0..ctx.embedding_len];
                     return std.mem.order(u8, left, right) == .lt;
                 }
             }.lessThan);
@@ -8220,7 +8220,7 @@ pub fn bulkBuildExternalSequentialTxnOptions(
             var entry_offset: usize = 0;
             while (entry_offset < count) {
                 const group_size = @min(target_leaf_size, count - entry_offset);
-                for (0..group_size) |i| vector_ids[i] = entries[entry_offset + i].vector_id;
+                for (0..group_size) |i| vector_ids[i] = @intCast(entries[entry_offset + i].embedding_index + 1);
                 try loadTransformedVectorIdsIntoMatrix(self, txn, vector_ids[0..group_size], transformed[0 .. group_size * dims], .{});
                 for (0..group_size) |i| {
                     inputs[i] = .{
