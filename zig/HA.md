@@ -636,6 +636,30 @@ client writes, standby catch-up observation, standby restart, and read-only
 verification. Whitespace or argument-validation coverage belongs in unit tests;
 it is not enough evidence for HA.
 
+Treat the e2e work as a set of concrete product-path gates:
+
+- the initial gate proves primary startup, slot creation, base-backup seed,
+  standby startup, primary writes, standby catch-up, read-only enforcement, and
+  standby restart/replay using real processes and durable files;
+- the admin-auth gate proves typed `/admin/v1/ha` calls require bearer auth when
+  `--ha-admin-token-env` is configured, while health checks and replication
+  traffic remain separate from that control-plane auth;
+- the freshness gate proves standby reads report stale, `at_least_lsn`, and
+  primary-only routing decisions instead of serving ambiguous read-after-write
+  behavior;
+- the synchronous-commit gate proves `remote_write` and `remote_apply` decisions
+  against real standby progress, including fail-closed behavior when no standby
+  can satisfy the requested durability;
+- the retention gate proves lagging or abandoned slots become
+  `reseed_required` and do not pin WAL forever without an operator-visible
+  status;
+- the promotion gate proves a standby can be fenced, promoted, and made current
+  only with machine-checkable receipt evidence, and that the old primary rejects
+  writes once it has observed the fence;
+- the former-primary gate proves an old primary cannot rejoin without a fence,
+  can rewind only when the retained WAL/fork record is sufficient, and otherwise
+  is explicitly marked for reseed.
+
 The Zig simulation tests should carry most of the correctness burden because
 they can explore interleavings that are expensive or flaky in process e2e. Add
 model or harness coverage for:
