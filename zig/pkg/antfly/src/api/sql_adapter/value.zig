@@ -14,6 +14,11 @@
 
 const std = @import("std");
 
+const parser = @import("parser.zig");
+const token_mod = @import("token.zig");
+
+pub const Token = token_mod.Token;
+
 pub const SqlValue = union(enum) {
     null,
     bool: bool,
@@ -40,6 +45,24 @@ pub const SqlValue = union(enum) {
         };
     }
 };
+
+pub fn parseSqlUntypedValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("true")) return try alloc.dupe(u8, "true");
+    if (cursor.matchKeyword("false")) return try alloc.dupe(u8, "false");
+    if (cursor.matchKeyword("null")) return try alloc.dupe(u8, "null");
+    if (cursor.matchToken(.string)) |token| return try std.json.Stringify.valueAlloc(alloc, token.text, .{});
+    if (cursor.matchToken(.number)) |token| return try alloc.dupe(u8, token.text);
+    if (cursor.matchToken(.minus) != null) {
+        const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+        return try std.fmt.allocPrint(alloc, "-{s}", .{token.text});
+    }
+    return error.UnsupportedSqlShape;
+}
 
 pub fn parseSqlTimestampLiteralNs(raw: []const u8) !i64 {
     const text = std.mem.trim(u8, trimSqlRangeEndpointQuotes(raw), " \t\r\n");

@@ -21,6 +21,7 @@ const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const token_mod = @import("token.zig");
+const sql_value = @import("value.zig");
 
 pub const Token = token_mod.Token;
 
@@ -166,6 +167,36 @@ pub const ClusterMaintenanceSyntax = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.table_name));
         if (self.index_name) |index_name| alloc.free(@constCast(index_name));
+        self.* = undefined;
+    }
+};
+
+pub const ListenNotificationSyntax = struct {
+    channel_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.channel_name));
+        self.* = undefined;
+    }
+};
+
+pub const NotifyNotificationSyntax = struct {
+    channel_name: []const u8,
+    payload_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.channel_name));
+        if (self.payload_json) |payload| alloc.free(@constCast(payload));
+        self.* = undefined;
+    }
+};
+
+pub const UnlistenNotificationSyntax = struct {
+    channel_name: ?[]const u8 = null,
+    all: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.channel_name) |channel_name| alloc.free(@constCast(channel_name));
         self.* = undefined;
     }
 };
@@ -347,7 +378,7 @@ fn isSqlIdentifierByte(byte: u8) bool {
 
 pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAlterSyntax {
     const start = pos.*;
-    var cursor = parser.Cursor.init(tokens, pos);
+    const cursor = parser.Cursor.init(tokens, pos);
     if (!cursor.matchKeyword("table")) return null;
     const table_token = cursor.matchToken(.identifier) orelse {
         pos.* = start;
@@ -823,6 +854,62 @@ pub fn parseClusterMaintenanceTailAlloc(
     table_transferred = true;
     index_transferred = true;
     return .{ .table_name = table_name, .index_name = index_name, .verbose = verbose };
+}
+
+pub fn parseListenNotificationTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !ListenNotificationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const channel_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var channel_transferred = false;
+    errdefer if (!channel_transferred) alloc.free(channel_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    channel_transferred = true;
+    return .{ .channel_name = channel_name };
+}
+
+pub fn parseNotifyNotificationTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !NotifyNotificationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const channel_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var channel_transferred = false;
+    errdefer if (!channel_transferred) alloc.free(channel_name);
+    var payload_json: ?[]const u8 = null;
+    errdefer if (payload_json) |payload| alloc.free(@constCast(payload));
+    if (cursor.matchToken(.comma) != null) {
+        payload_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    channel_transferred = true;
+    const syntax = NotifyNotificationSyntax{
+        .channel_name = channel_name,
+        .payload_json = payload_json,
+    };
+    payload_json = null;
+    return syntax;
+}
+
+pub fn parseUnlistenNotificationTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !UnlistenNotificationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.star) != null) {
+        try parseAdapterNoopStatementEnd(cursor);
+        return .{ .all = true };
+    }
+    const channel_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var channel_transferred = false;
+    errdefer if (!channel_transferred) alloc.free(channel_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    channel_transferred = true;
+    return .{ .channel_name = channel_name };
 }
 
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
@@ -1503,6 +1590,49 @@ test "sql adapter grammar parses maintenance job tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseVacuumMaintenanceTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses notification channel tails" {
+    const alloc = std.testing.allocator;
+
+    var listen_tokens = try lexer.tokenizeAlloc(alloc, "usage_events;");
+    defer lexer.freeTokens(alloc, &listen_tokens);
+    var listen_pos: usize = 0;
+    var listen = try parseListenNotificationTailAlloc(alloc, listen_tokens.items, &listen_pos);
+    defer listen.deinit(alloc);
+    try std.testing.expectEqual(listen_tokens.items.len, listen_pos);
+    try std.testing.expectEqualStrings("usage_events", listen.channel_name);
+
+    var notify_tokens = try lexer.tokenizeAlloc(alloc, "usage_events, 'queued';");
+    defer lexer.freeTokens(alloc, &notify_tokens);
+    var notify_pos: usize = 0;
+    var notify = try parseNotifyNotificationTailAlloc(alloc, notify_tokens.items, &notify_pos);
+    defer notify.deinit(alloc);
+    try std.testing.expectEqual(notify_tokens.items.len, notify_pos);
+    try std.testing.expectEqualStrings("usage_events", notify.channel_name);
+    try std.testing.expectEqualStrings("\"queued\"", notify.payload_json.?);
+
+    var notify_no_payload_tokens = try lexer.tokenizeAlloc(alloc, "usage_events;");
+    defer lexer.freeTokens(alloc, &notify_no_payload_tokens);
+    var notify_no_payload_pos: usize = 0;
+    var notify_no_payload = try parseNotifyNotificationTailAlloc(alloc, notify_no_payload_tokens.items, &notify_no_payload_pos);
+    defer notify_no_payload.deinit(alloc);
+    try std.testing.expectEqual(notify_no_payload_tokens.items.len, notify_no_payload_pos);
+    try std.testing.expect(notify_no_payload.payload_json == null);
+
+    var unlisten_tokens = try lexer.tokenizeAlloc(alloc, "*;");
+    defer lexer.freeTokens(alloc, &unlisten_tokens);
+    var unlisten_pos: usize = 0;
+    var unlisten = try parseUnlistenNotificationTailAlloc(alloc, unlisten_tokens.items, &unlisten_pos);
+    defer unlisten.deinit(alloc);
+    try std.testing.expectEqual(unlisten_tokens.items.len, unlisten_pos);
+    try std.testing.expect(unlisten.all);
+    try std.testing.expect(unlisten.channel_name == null);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_events trailing;");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseListenNotificationTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
 test "sql adapter grammar parses savepoint transaction tails" {

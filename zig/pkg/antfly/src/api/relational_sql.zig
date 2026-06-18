@@ -3614,48 +3614,33 @@ const Parser = struct {
     }
 
     fn parseListenNotificationDdl(self: *@This()) !ListenNotificationPlan {
-        const channel_name = try self.parseIdentifierOwned();
-        var channel_transferred = false;
-        errdefer if (!channel_transferred) self.alloc.free(channel_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        channel_transferred = true;
+        var syntax = try sql_adapter.parseListenNotificationTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const channel_name = syntax.channel_name;
+        syntax.channel_name = "";
         return .{ .channel_name = channel_name };
     }
 
     fn parseNotifyNotificationDdl(self: *@This()) !NotifyNotificationPlan {
-        const channel_name = try self.parseIdentifierOwned();
-        var channel_transferred = false;
-        errdefer if (!channel_transferred) self.alloc.free(channel_name);
-        var payload_json: ?[]const u8 = null;
-        errdefer if (payload_json) |payload| self.alloc.free(payload);
-        if (self.match(.comma) != null) {
-            payload_json = try self.parseSqlUntypedValueJsonAlloc();
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        channel_transferred = true;
+        var syntax = try sql_adapter.parseNotifyNotificationTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const channel_name = syntax.channel_name;
+        const payload_json = syntax.payload_json;
+        syntax.channel_name = "";
+        syntax.payload_json = null;
         const out = NotifyNotificationPlan{
             .channel_name = channel_name,
             .payload_json = payload_json,
         };
-        payload_json = null;
         return out;
     }
 
     fn parseUnlistenNotificationDdl(self: *@This()) !UnlistenNotificationPlan {
-        if (self.match(.star) != null) {
-            if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-            if (!self.atEnd()) return error.UnsupportedSqlShape;
-            return .{ .all = true };
-        }
-        const channel_name = try self.parseIdentifierOwned();
-        var channel_transferred = false;
-        errdefer if (!channel_transferred) self.alloc.free(channel_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        channel_transferred = true;
-        return .{ .channel_name = channel_name };
+        var syntax = try sql_adapter.parseUnlistenNotificationTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const channel_name = syntax.channel_name;
+        syntax.channel_name = null;
+        return .{ .channel_name = channel_name, .all = syntax.all };
     }
 
     fn parseCreatePublicationDdl(self: *@This()) !CreatePublicationPlan {
@@ -7475,13 +7460,7 @@ const Parser = struct {
     }
 
     fn parseSqlUntypedValueJsonAlloc(self: *@This()) ![]const u8 {
-        if (self.matchKeyword("true")) return try self.alloc.dupe(u8, "true");
-        if (self.matchKeyword("false")) return try self.alloc.dupe(u8, "false");
-        if (self.matchKeyword("null")) return try self.alloc.dupe(u8, "null");
-        if (self.match(.string)) |token| return try std.json.Stringify.valueAlloc(self.alloc, token.text, .{});
-        if (self.match(.number)) |token| return try self.alloc.dupe(u8, token.text);
-        if (self.match(.minus) != null) return try self.parseNegativeNumberJsonAlloc();
-        return error.UnsupportedSqlShape;
+        return try sql_adapter.parseSqlUntypedValueJsonAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseNegativeNumberJsonAlloc(self: *@This()) ![]const u8 {

@@ -1076,7 +1076,8 @@ tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
 direction/count tails, transaction-control grammar for `LOCK TABLE`,
 `SET CONSTRAINTS`, `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN`
 mode clauses, maintenance-job grammar for `VACUUM`, `ANALYZE`, `REINDEX`, and
-`CLUSTER`, prepared-statement subject classification for read, write, and DDL
+`CLUSTER`, notification-channel grammar for `LISTEN`, `NOTIFY`, and
+`UNLISTEN`, prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
@@ -4371,6 +4372,15 @@ records with the stable `transaction_control` reason. Mode-bearing transaction
 starts remain typed transaction-control plans, and non-boundary operations such
 as prepared transaction commit must fail closed until Antfly owns a durable
 prepared-transaction model.
+
+Notification-channel SQL is also adapter grammar over typed native intent, not
+backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in
+`api/sql_adapter/grammar.zig`; `NOTIFY` payload literals use the shared
+`api/sql_adapter/value.zig` untyped literal-to-JSON helper; and
+`relational_sql.zig` only maps the resulting channel name, optional payload JSON,
+or `UNLISTEN *` flag into typed notification-channel plans. Durable notification
+delivery, session subscriptions, fan-out, and wakeup ordering remain native
+runtime work rather than syntax state.
 
 Schema namespace syntax is only adapter-only when it is proven boilerplate for
 the default `public` namespace, such as `CREATE SCHEMA IF NOT EXISTS public`.
