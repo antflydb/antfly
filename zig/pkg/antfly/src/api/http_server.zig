@@ -4080,13 +4080,13 @@ pub const ApiHttpServer = struct {
         }
         if (std.mem.eql(u8, suffix, "indexes")) {
             if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
-            return try self.handlePublicTableListIndexes(storage_table_name);
+            return try self.handlePublicCatalogTableListIndexes(target, storage_table_name);
         }
         if (std.mem.startsWith(u8, suffix, "indexes/")) {
             const index_name = suffix["indexes/".len..];
             if (index_name.len == 0 or std.mem.indexOfScalar(u8, index_name, '/') != null) return try textResponse(self.alloc, 404, "not found");
             return switch (req.method) {
-                .GET => try self.handlePublicTableGetIndex(storage_table_name, index_name),
+                .GET => try self.handlePublicCatalogTableGetIndex(target, storage_table_name, index_name),
                 .POST => try self.handlePublicTableCreateIndex(storage_table_name, index_name, req.body),
                 .DELETE => try self.handlePublicTableDeleteIndex(storage_table_name, index_name),
                 else => try textResponse(self.alloc, 405, "method not allowed"),
@@ -4099,6 +4099,48 @@ pub const ApiHttpServer = struct {
             return try self.handlePublicTableDocumentLookup(storage_table_name, key, uri_parts.query, authenticated_identity);
         }
         return try textResponse(self.alloc, 404, "not found");
+    }
+
+    fn handlePublicCatalogTableListIndexes(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        storage_table_name: []const u8,
+    ) !http_common.HttpResponse {
+        var snapshot = (try self.statusAdminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return try textResponse(self.alloc, 404, "not found");
+        var local_statuses = self.localTableRuntimeStatusesWithSnapshot(storage_table_name, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
+        defer if (local_statuses) |*status| status.deinit(self.alloc);
+        const body = indexes_api.encodeIndexListForTable(
+            self.alloc,
+            &snapshot,
+            table,
+            if (local_statuses) |*status| status else null,
+        ) catch return try textResponse(self.alloc, 500, "index lookup failed");
+        defer self.alloc.free(body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, body);
+    }
+
+    fn handlePublicCatalogTableGetIndex(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        storage_table_name: []const u8,
+        index_name: []const u8,
+    ) !http_common.HttpResponse {
+        var snapshot = (try self.statusAdminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return try textResponse(self.alloc, 404, "not found");
+        var local_statuses = self.localTableRuntimeStatusesWithSnapshot(storage_table_name, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
+        defer if (local_statuses) |*status| status.deinit(self.alloc);
+        const body = (indexes_api.encodeSingleIndexForTableWithSnapshot(
+            self.alloc,
+            &snapshot,
+            table,
+            index_name,
+            if (local_statuses) |*status| status else null,
+        ) catch return try textResponse(self.alloc, 500, "index lookup failed")) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, body);
     }
 
     fn handlePublicGetCatalogTable(self: *ApiHttpServer, target: catalog_resources.TableTarget) !http_common.HttpResponse {

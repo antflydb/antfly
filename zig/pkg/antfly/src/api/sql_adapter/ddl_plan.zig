@@ -787,6 +787,126 @@ pub const UnlistenNotificationPlan = struct {
     }
 };
 
+pub const LogicalReplicationPlan = union(enum) {
+    publication: PublicationCatalogPlan,
+    subscription: SubscriptionCatalogPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .publication => |*plan| plan.deinit(alloc),
+            .subscription => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const PublicationCatalogPlan = union(enum) {
+    create: CreatePublicationPlan,
+    alter: AlterPublicationPlan,
+    drop: DropPublicationPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .alter => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreatePublicationPlan = struct {
+    publication_name: []const u8,
+    table_names: []const []const u8 = &.{},
+    all_tables: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.publication_name);
+        freeStringSlice(alloc, self.table_names);
+        self.* = undefined;
+    }
+};
+
+pub const AlterPublicationPlan = struct {
+    publication_name: []const u8,
+    operation: PublicationAlterOperation,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.publication_name);
+        self.operation.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PublicationAlterOperation = union(enum) {
+    add_tables: []const []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .add_tables => |tables| freeStringSlice(alloc, tables),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const DropPublicationPlan = struct {
+    publication_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.publication_name);
+        self.* = undefined;
+    }
+};
+
+pub const SubscriptionCatalogPlan = union(enum) {
+    create: CreateSubscriptionPlan,
+    alter: AlterSubscriptionPlan,
+    drop: DropSubscriptionPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .alter => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateSubscriptionPlan = struct {
+    subscription_name: []const u8,
+    connection_json: []const u8,
+    publication_names: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.subscription_name);
+        alloc.free(self.connection_json);
+        freeStringSlice(alloc, self.publication_names);
+        self.* = undefined;
+    }
+};
+
+pub const AlterSubscriptionPlan = struct {
+    subscription_name: []const u8,
+    enabled: bool,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.subscription_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropSubscriptionPlan = struct {
+    subscription_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.subscription_name);
+        self.* = undefined;
+    }
+};
+
 pub const AdvisoryLockPlan = struct {
     action: AdvisoryLockAction,
     key1: i64,
@@ -1086,4 +1206,41 @@ test "SQL adapter DDL database tablespace and notification plans own strings" {
         .payload_json = try alloc.dupe(u8, "{\"event\":\"reload\"}"),
     } };
     notification.deinit(alloc);
+}
+
+test "SQL adapter DDL logical replication plans own nested strings" {
+    const alloc = std.testing.allocator;
+
+    var publication_tables = try alloc.alloc([]const u8, 2);
+    publication_tables[0] = try alloc.dupe(u8, "usage_records");
+    publication_tables[1] = try alloc.dupe(u8, "account_events");
+    var create_publication: LogicalReplicationPlan = .{ .publication = .{ .create = .{
+        .publication_name = try alloc.dupe(u8, "usage_publication"),
+        .table_names = publication_tables,
+    } } };
+    create_publication.deinit(alloc);
+
+    var alter_tables = try alloc.alloc([]const u8, 1);
+    alter_tables[0] = try alloc.dupe(u8, "audit_events");
+    var alter_publication: LogicalReplicationPlan = .{ .publication = .{ .alter = .{
+        .publication_name = try alloc.dupe(u8, "usage_publication"),
+        .operation = .{ .add_tables = alter_tables },
+    } } };
+    alter_publication.deinit(alloc);
+
+    var publication_names = try alloc.alloc([]const u8, 2);
+    publication_names[0] = try alloc.dupe(u8, "usage_publication");
+    publication_names[1] = try alloc.dupe(u8, "audit_publication");
+    var create_subscription: LogicalReplicationPlan = .{ .subscription = .{ .create = .{
+        .subscription_name = try alloc.dupe(u8, "usage_subscription"),
+        .connection_json = try alloc.dupe(u8, "{\"uri\":\"postgres://source\"}"),
+        .publication_names = publication_names,
+    } } };
+    create_subscription.deinit(alloc);
+
+    var drop_subscription: LogicalReplicationPlan = .{ .subscription = .{ .drop = .{
+        .subscription_name = try alloc.dupe(u8, "usage_subscription"),
+        .if_exists = true,
+    } } };
+    drop_subscription.deinit(alloc);
 }

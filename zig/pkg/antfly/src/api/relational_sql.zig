@@ -217,6 +217,16 @@ pub const NotificationChannelPlan = sql_adapter.NotificationChannelPlan;
 pub const ListenNotificationPlan = sql_adapter.ListenNotificationPlan;
 pub const NotifyNotificationPlan = sql_adapter.NotifyNotificationPlan;
 pub const UnlistenNotificationPlan = sql_adapter.UnlistenNotificationPlan;
+pub const LogicalReplicationPlan = sql_adapter.LogicalReplicationPlan;
+pub const PublicationCatalogPlan = sql_adapter.PublicationCatalogPlan;
+pub const CreatePublicationPlan = sql_adapter.CreatePublicationPlan;
+pub const AlterPublicationPlan = sql_adapter.AlterPublicationPlan;
+pub const PublicationAlterOperation = sql_adapter.PublicationAlterOperation;
+pub const DropPublicationPlan = sql_adapter.DropPublicationPlan;
+pub const SubscriptionCatalogPlan = sql_adapter.SubscriptionCatalogPlan;
+pub const CreateSubscriptionPlan = sql_adapter.CreateSubscriptionPlan;
+pub const AlterSubscriptionPlan = sql_adapter.AlterSubscriptionPlan;
+pub const DropSubscriptionPlan = sql_adapter.DropSubscriptionPlan;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -583,126 +593,6 @@ pub const RowSecurityCurrentSettingPredicate = struct {
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.field);
         alloc.free(self.setting_name);
-        self.* = undefined;
-    }
-};
-
-pub const LogicalReplicationPlan = union(enum) {
-    publication: PublicationCatalogPlan,
-    subscription: SubscriptionCatalogPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .publication => |*plan| plan.deinit(alloc),
-            .subscription => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const PublicationCatalogPlan = union(enum) {
-    create: CreatePublicationPlan,
-    alter: AlterPublicationPlan,
-    drop: DropPublicationPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .alter => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreatePublicationPlan = struct {
-    publication_name: []const u8,
-    table_names: []const []const u8 = &.{},
-    all_tables: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.publication_name);
-        freeStringSlice(alloc, self.table_names);
-        self.* = undefined;
-    }
-};
-
-pub const AlterPublicationPlan = struct {
-    publication_name: []const u8,
-    operation: PublicationAlterOperation,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.publication_name);
-        self.operation.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const PublicationAlterOperation = union(enum) {
-    add_tables: []const []const u8,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .add_tables => |tables| freeStringSlice(alloc, tables),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const DropPublicationPlan = struct {
-    publication_name: []const u8,
-    if_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.publication_name);
-        self.* = undefined;
-    }
-};
-
-pub const SubscriptionCatalogPlan = union(enum) {
-    create: CreateSubscriptionPlan,
-    alter: AlterSubscriptionPlan,
-    drop: DropSubscriptionPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .alter => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateSubscriptionPlan = struct {
-    subscription_name: []const u8,
-    connection_json: []const u8,
-    publication_names: []const []const u8 = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.subscription_name);
-        alloc.free(self.connection_json);
-        freeStringSlice(alloc, self.publication_names);
-        self.* = undefined;
-    }
-};
-
-pub const AlterSubscriptionPlan = struct {
-    subscription_name: []const u8,
-    enabled: bool,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.subscription_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropSubscriptionPlan = struct {
-    subscription_name: []const u8,
-    if_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.subscription_name);
         self.* = undefined;
     }
 };

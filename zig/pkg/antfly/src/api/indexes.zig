@@ -223,6 +223,15 @@ pub fn encodeIndexList(
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) !?[]u8 {
     const table = tables_api.findTableByName(snapshot, table_name) orelse return null;
+    return try encodeIndexListForTable(alloc, snapshot, table, local_statuses);
+}
+
+pub fn encodeIndexListForTable(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(table.indexes_json), .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -266,6 +275,18 @@ pub fn encodeSingleIndexForTable(
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) !?[]u8 {
     return try encodeSingleIndexForTableWithTopology(alloc, table, index_name, &.{}, local_statuses);
+}
+
+pub fn encodeSingleIndexForTableWithSnapshot(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    index_name: []const u8,
+    local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+) !?[]u8 {
+    const expected_group_ids = try expectedTableGroupIds(alloc, snapshot, table.table_id);
+    defer if (expected_group_ids.len > 0) alloc.free(expected_group_ids);
+    return try encodeSingleIndexForTableWithTopology(alloc, table, index_name, expected_group_ids, local_statuses);
 }
 
 fn encodeSingleIndexForTableWithTopology(
