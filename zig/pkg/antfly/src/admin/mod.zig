@@ -289,6 +289,7 @@ const ha_promotion_assessment_fields = [_][]const u8{
     "caught_up_to_received",
     "fencing_confirmed",
     "force",
+    "mode",
     "data_loss_possible",
     "safe",
     "requires_fencing",

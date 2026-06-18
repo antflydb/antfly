@@ -3957,6 +3957,7 @@ func applyHAPromotionAssessmentToAdminActionResult(result *antflyv1.HAAdminActio
 	result.PromotionFenced = assessment.FencingConfirmed
 	result.PromotionSafe = assessment.Safe
 	result.PromotionForce = assessment.Force
+	result.PromotionMode = strings.TrimSpace(string(assessment.Mode))
 	result.PromotionDataLossPossible = assessment.DataLossPossible
 	result.PromotionRequiresFencing = assessment.RequiresFencing
 	result.PromotionRequiresForce = assessment.RequiresForce
@@ -4213,6 +4214,7 @@ type haPromotionAssessmentJSON struct {
 	CaughtUpToReceived *bool   `json:"caught_up_to_received"`
 	FencingConfirmed   *bool   `json:"fencing_confirmed"`
 	Force              *bool   `json:"force"`
+	Mode               string  `json:"mode"`
 	DataLossPossible   *bool   `json:"data_loss_possible"`
 	Safe               *bool   `json:"safe"`
 	RequiresFencing    *bool   `json:"requires_fencing"`
@@ -4387,6 +4389,7 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		PromotionFenced:           haBoolJSONValue(result.Assessment.FencingConfirmed),
 		PromotionSafe:             haBoolJSONValue(result.Assessment.Safe),
 		PromotionForce:            haBoolJSONValue(result.Assessment.Force),
+		PromotionMode:             strings.TrimSpace(result.Assessment.Mode),
 		PromotionDataLossPossible: haBoolJSONValue(result.Assessment.DataLossPossible),
 		PromotionRequiresFencing:  haBoolJSONValue(result.Assessment.RequiresFencing),
 		PromotionRequiresForce:    haBoolJSONValue(result.Assessment.RequiresForce),
@@ -4436,6 +4439,7 @@ func haPromotionAssessmentJSONComplete(assessment haPromotionAssessmentJSON) boo
 		assessment.CaughtUpToReceived != nil &&
 		assessment.FencingConfirmed != nil &&
 		assessment.Force != nil &&
+		strings.TrimSpace(assessment.Mode) != "" &&
 		assessment.DataLossPossible != nil &&
 		assessment.Safe != nil &&
 		assessment.RequiresFencing != nil &&
@@ -4867,6 +4871,7 @@ func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdmin
 		FenceObservedLSN:          result.ObservedLSN,
 		FenceForced:               result.Forced,
 		PromotionForce:            result.Forced,
+		PromotionMode:             strings.TrimSpace(result.PromotionMode),
 		PromotionDataLossPossible: result.DataLossPossible,
 	}
 }
@@ -5341,6 +5346,7 @@ type haPromotionJobResult struct {
 	FenceGeneration  uint64
 	FenceToken       string
 	Forced           bool
+	PromotionMode    string
 	DataLossPossible bool
 }
 
@@ -5405,8 +5411,15 @@ func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
 		return haPromotionJobResult{}, false
 	}
 	result.ObservedLSN = receivedLSN
+	result.PromotionMode = strings.TrimSpace(lines["assessment.mode"])
+	if result.PromotionMode == "" {
+		return haPromotionJobResult{}, false
+	}
 	result.Forced, _ = parseHAResultBool(lines, "promotion.forced")
 	result.DataLossPossible, _ = parseHAResultBool(lines, "promotion.data_loss_possible")
+	if result.PromotionMode != haExpectedPromotionMode(result.Forced, result.DataLossPossible, true) {
+		return haPromotionJobResult{}, false
+	}
 	if !result.Forced && result.ObservedLSN < result.RequiredLSN {
 		return haPromotionJobResult{}, false
 	}
@@ -5506,6 +5519,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		FenceGeneration:  result.FenceGeneration,
 		FenceToken:       strings.TrimSpace(result.FenceToken),
 		Forced:           haBoolJSONValue(result.Forced) || haBoolJSONValue(result.Promotion.Forced),
+		PromotionMode:    strings.TrimSpace(result.Assessment.Mode),
 		DataLossPossible: haBoolJSONValue(result.Promotion.DataLossPossible),
 	}, true
 }
@@ -5540,13 +5554,28 @@ func haPromotionAssessmentJSONConsistent(assessment haPromotionAssessmentJSON) b
 	requiresFencing := !fencingConfirmed && !forced
 	requiresForce := dataLossPossible && !forced
 	canPromote := !requiresFencing && (!requiresForce || forced)
+	mode := haExpectedPromotionMode(forced, dataLossPossible, canPromote)
 	return haBoolJSONValue(assessment.HasRequiredLSN) == hasRequiredLSN &&
 		haBoolJSONValue(assessment.CaughtUpToReceived) == caughtUpToReceived &&
+		strings.TrimSpace(assessment.Mode) == mode &&
 		haBoolJSONValue(assessment.DataLossPossible) == dataLossPossible &&
 		haBoolJSONValue(assessment.Safe) == (fencingConfirmed && !dataLossPossible) &&
 		haBoolJSONValue(assessment.RequiresFencing) == requiresFencing &&
 		haBoolJSONValue(assessment.RequiresForce) == requiresForce &&
 		haBoolJSONValue(assessment.CanPromote) == canPromote
+}
+
+func haExpectedPromotionMode(force bool, dataLossPossible bool, canPromote bool) string {
+	if !canPromote {
+		return "blocked"
+	}
+	if dataLossPossible {
+		return "lossy"
+	}
+	if force {
+		return "forced"
+	}
+	return "safe"
 }
 
 func haAdminActionReceiptPresent(action haAdminActionReceiptJSON) bool {
@@ -6946,6 +6975,7 @@ func haPromotionAssessmentResultMatchesAction(action antflyv1.HAPlannedActionSta
 		!result.PromotionFenced ||
 		!result.PromotionSafe ||
 		result.PromotionForce ||
+		strings.TrimSpace(result.PromotionMode) != "safe" ||
 		result.PromotionDataLossPossible ||
 		result.PromotionRequiresFencing ||
 		result.PromotionRequiresForce {
@@ -7036,6 +7066,7 @@ func haPromotionAdminResultHasEvidence(action antflyv1.HAPlannedActionStatus, re
 		result.FenceObservedLSN < result.FenceRequiredLSN ||
 		result.FenceForced ||
 		result.PromotionForce ||
+		strings.TrimSpace(result.PromotionMode) != "safe" ||
 		result.PromotionDataLossPossible {
 		return false
 	}

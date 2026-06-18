@@ -1814,6 +1814,10 @@ type HAAdminActionResultStatus struct {
 	// +optional
 	PromotionForce bool `json:"promotionForce,omitempty"`
 
+	// PromotionMode is the explicit promotion assessment mode reported by the admin API.
+	// +optional
+	PromotionMode string `json:"promotionMode,omitempty"`
+
 	// PromotionDataLossPossible reports whether a promotion assessment found possible data loss.
 	// +optional
 	PromotionDataLossPossible bool `json:"promotionDataLossPossible,omitempty"`

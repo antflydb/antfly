@@ -120,6 +120,7 @@ func haPromotionResponseJSON() string {
 			"caught_up_to_received": true,
 			"fencing_confirmed":     true,
 			"force":                 false,
+			"mode":                  "safe",
 			"data_loss_possible":    false,
 			"safe":                  true,
 			"requires_fencing":      false,
@@ -1640,14 +1641,14 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`)),
 				}, nil
 			case "/admin/v1/ha/promotion/current-fence":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -1722,31 +1723,31 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 	}{
 		{
 			name: "cannot promote",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":false}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"blocked","data_loss_possible":false,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":false}}`,
 		},
 		{
 			name: "missing applied lsn",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
 		},
 		{
 			name: "missing fence confirmation",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
 		},
 		{
 			name: "missing force field",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
 		},
 		{
 			name: "forced assessment",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"mode":"forced","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
 		},
 		{
 			name: "lossy force assessment",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":true,"data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":true,"mode":"lossy","data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
 		},
 		{
 			name: "requires force",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":true,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"mode":"lossy","data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":true,"can_promote":true}}`,
 		},
 	}
 
@@ -1977,7 +1978,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":false}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"mode":"blocked","data_loss_possible":false,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":false}}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -4076,6 +4077,7 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 		"assessment.required_lsn=12",
 		"assessment.received_lsn=12",
 		"assessment.applied_lsn=11",
+		"assessment.mode=lossy",
 		"promotion.node_id=standby-a",
 		"promotion.switch_lsn=13",
 		"promotion.old_identity.cluster_id=100",
@@ -4107,6 +4109,7 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(result.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(result.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(result.Forced).To(BeTrue())
+	g.Expect(result.PromotionMode).To(Equal("lossy"))
 	g.Expect(result.DataLossPossible).To(BeTrue())
 
 	adminResult := haPromotionAdminActionResult(result)
@@ -4209,16 +4212,16 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":15,"received_lsn":14,"applied_lsn":14,"has_required_lsn":false,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":15,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
+	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":15,"received_lsn":14,"applied_lsn":14,"has_required_lsn":false,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"mode":"lossy","data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":15,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(legacyResult.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(legacyResult.PromotedNodeID).To(Equal("standby-a"))
@@ -4405,6 +4408,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"assessment.required_lsn=12",
 		"assessment.received_lsn=12",
 		"assessment.applied_lsn=12",
+		"assessment.mode=safe",
 		"promotion.node_id=standby-a",
 		"promotion.switch_lsn=13",
 		"promotion.old_identity.timeline_id=4",
@@ -4426,6 +4430,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(4)))
 	g.Expect(promotion.FenceToken).To(Equal("promotion-token"))
 	g.Expect(promotion.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(promotion.PromotionMode).To(Equal("safe"))
 	g.Expect(promotion.FenceParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(promotion.FenceNewTimelineID).To(Equal(uint64(5)))
 	g.Expect(promotion.FenceRequiredLSN).To(Equal(uint64(12)))

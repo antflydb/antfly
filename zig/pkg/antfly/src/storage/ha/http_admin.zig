@@ -1145,6 +1145,7 @@ fn adminPromotionAssessment(assessment: status_mod.PromotionAssessment) !admin_a
         .caught_up_to_received = assessment.caught_up_to_received,
         .fencing_confirmed = assessment.fencing_confirmed,
         .force = assessment.force,
+        .mode = @tagName(assessment.mode),
         .data_loss_possible = assessment.data_loss_possible,
         .safe = assessment.safe,
         .requires_fencing = assessment.requires_fencing,

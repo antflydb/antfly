@@ -444,6 +444,7 @@ fn adminPromotionAssessment(assessment: status.PromotionAssessment) !admin_api.H
         .caught_up_to_received = assessment.caught_up_to_received,
         .fencing_confirmed = assessment.fencing_confirmed,
         .force = assessment.force,
+        .mode = @tagName(assessment.mode),
         .data_loss_possible = assessment.data_loss_possible,
         .safe = assessment.safe,
         .requires_fencing = assessment.requires_fencing,
@@ -1610,6 +1611,7 @@ fn appendPromotionAssessmentLines(
     try appendPrefixedBoolLine(alloc, out, prefix, "caught_up_to_received", assessment.caught_up_to_received);
     try appendPrefixedBoolLine(alloc, out, prefix, "fencing_confirmed", assessment.fencing_confirmed);
     try appendPrefixedBoolLine(alloc, out, prefix, "force", assessment.force);
+    try appendPrefixedLine(alloc, out, prefix, "mode", @tagName(assessment.mode));
     try appendPrefixedBoolLine(alloc, out, prefix, "data_loss_possible", assessment.data_loss_possible);
     try appendPrefixedBoolLine(alloc, out, prefix, "safe", assessment.safe);
     try appendPrefixedBoolLine(alloc, out, prefix, "requires_fencing", assessment.requires_fencing);

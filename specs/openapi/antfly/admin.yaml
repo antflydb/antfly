@@ -1393,6 +1393,7 @@ components:
         - caught_up_to_received
         - fencing_confirmed
         - force
+        - mode
         - data_loss_possible
         - safe
         - requires_fencing
@@ -1420,6 +1421,15 @@ components:
           type: boolean
         force:
           type: boolean
+        mode:
+          type: string
+          enum: [blocked, safe, forced, lossy]
+          description: |
+            Explicit promotion mode for automation. `blocked` means the
+            assessment is not promotable. `safe` means fencing is confirmed and
+            all required/applied LSN evidence is present without forcing.
+            `forced` means force was requested but no data loss is indicated.
+            `lossy` means force was requested and data loss is possible.
         data_loss_possible:
           type: boolean
         safe:

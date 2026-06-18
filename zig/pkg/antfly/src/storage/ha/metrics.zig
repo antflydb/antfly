@@ -550,6 +550,7 @@ test "storage.ha metrics derives standby and promotion gauges" {
         .caught_up_to_received = false,
         .fencing_confirmed = true,
         .force = false,
+        .mode = .blocked,
         .data_loss_possible = true,
         .safe = false,
         .requires_fencing = false,

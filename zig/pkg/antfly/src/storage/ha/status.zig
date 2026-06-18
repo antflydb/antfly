@@ -90,6 +90,13 @@ pub const PromotionCheck = struct {
     force: bool = false,
 };
 
+pub const PromotionMode = enum {
+    blocked,
+    safe,
+    forced,
+    lossy,
+};
+
 pub const PromotionAssessment = struct {
     required_lsn: u64,
     received_lsn: u64,
@@ -98,6 +105,7 @@ pub const PromotionAssessment = struct {
     caught_up_to_received: bool,
     fencing_confirmed: bool,
     force: bool,
+    mode: PromotionMode,
     data_loss_possible: bool,
     safe: bool,
     requires_fencing: bool,
@@ -229,6 +237,8 @@ pub fn assessPromotion(standby: *const standby_mod.Standby, check: PromotionChec
     const data_loss_possible = !has_required_lsn or !caught_up_to_received or progress.applied_lsn < required_lsn;
     const requires_fencing = !check.fencing_confirmed and !check.force;
     const requires_force = data_loss_possible and !check.force;
+    const safe = check.fencing_confirmed and !data_loss_possible;
+    const can_promote = !requires_fencing and (!requires_force or check.force);
     return .{
         .required_lsn = required_lsn,
         .received_lsn = progress.received_lsn,
@@ -237,12 +247,28 @@ pub fn assessPromotion(standby: *const standby_mod.Standby, check: PromotionChec
         .caught_up_to_received = caught_up_to_received,
         .fencing_confirmed = check.fencing_confirmed,
         .force = check.force,
+        .mode = promotionMode(.{
+            .force = check.force,
+            .data_loss_possible = data_loss_possible,
+            .can_promote = can_promote,
+        }),
         .data_loss_possible = data_loss_possible,
-        .safe = check.fencing_confirmed and !data_loss_possible,
+        .safe = safe,
         .requires_fencing = requires_fencing,
         .requires_force = requires_force,
-        .can_promote = !requires_fencing and (!requires_force or check.force),
+        .can_promote = can_promote,
     };
+}
+
+pub fn promotionMode(input: struct {
+    force: bool,
+    data_loss_possible: bool,
+    can_promote: bool,
+}) PromotionMode {
+    if (!input.can_promote) return .blocked;
+    if (input.data_loss_possible) return .lossy;
+    if (input.force) return .forced;
+    return .safe;
 }
 
 pub fn assessPromotionWithFence(standby: *const standby_mod.Standby, receipt: fencing.Receipt) PromotionAssessment {
@@ -421,6 +447,7 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     try std.testing.expect(unsafe.requires_force);
     try std.testing.expect(!unsafe.safe);
     try std.testing.expect(!unsafe.can_promote);
+    try std.testing.expectEqual(PromotionMode.blocked, unsafe.mode);
 
     {
         var capture = ApplyCapture{};
@@ -437,6 +464,12 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     try std.testing.expect(!safe.data_loss_possible);
     try std.testing.expect(safe.safe);
     try std.testing.expect(safe.can_promote);
+    try std.testing.expectEqual(PromotionMode.safe, safe.mode);
+
+    const forced = assessPromotion(&standby, .{ .required_lsn = 2, .fencing_confirmed = true, .force = true });
+    try std.testing.expect(!forced.data_loss_possible);
+    try std.testing.expect(forced.can_promote);
+    try std.testing.expectEqual(PromotionMode.forced, forced.mode);
 
     const fenced = assessPromotionWithFence(&standby, .{
         .identity = .{
@@ -462,6 +495,7 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     try std.testing.expect(fenced.fencing_confirmed);
     try std.testing.expect(fenced.safe);
     try std.testing.expect(fenced.can_promote);
+    try std.testing.expectEqual(PromotionMode.safe, fenced.mode);
 
     const standby_json = try renderStandbyJsonAlloc(alloc, ready);
     defer alloc.free(standby_json);
@@ -474,6 +508,7 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     defer alloc.free(promotion_json);
     try expectContains(promotion_json, "\"schema_version\":1");
     try expectContains(promotion_json, "\"assessment\"");
+    try expectContains(promotion_json, "\"mode\":\"safe\"");
     try expectContains(promotion_json, "\"safe\":true");
     try expectContains(promotion_json, "\"can_promote\":true");
 }

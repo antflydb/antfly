@@ -971,6 +971,7 @@ fn validatePromotionResponse(
     if (assessment.requires_fencing != (!assessment.fencing_confirmed and !assessment.force)) return error.AdminPromotionResponseMismatch;
     if (assessment.requires_force != (assessment.data_loss_possible and !assessment.force)) return error.AdminPromotionResponseMismatch;
     if (assessment.can_promote != (!assessment.requires_fencing and (!assessment.requires_force or assessment.force))) return error.AdminPromotionResponseMismatch;
+    if (!std.mem.eql(u8, assessment.mode, expectedPromotionMode(assessment))) return error.AdminPromotionResponseMismatch;
     if (!response.assessment.fencing_confirmed) return error.AdminPromotionResponseMismatch;
     if (!response.assessment.can_promote) return error.AdminPromotionResponseMismatch;
     if (response.forced != promotion.forced) return error.AdminPromotionResponseMismatch;
@@ -997,6 +998,13 @@ fn validatePromotionResponse(
         if (response.assessment.received_lsn < expected.observed_lsn) return error.AdminPromotionResponseMismatch;
         if (response.forced != expected.force) return error.AdminPromotionResponseMismatch;
     }
+}
+
+fn expectedPromotionMode(assessment: admin_api.HAPromotionAssessment) []const u8 {
+    if (!assessment.can_promote) return "blocked";
+    if (assessment.data_loss_possible) return "lossy";
+    if (assessment.force) return "forced";
+    return "safe";
 }
 
 const RejoinResponseKind = enum {
@@ -1885,7 +1893,7 @@ test "storage.ha http client rejects mismatched promotion admin responses" {
     const alloc = std.testing.allocator;
     var executor = StaticJsonExecutor{
         .body =
-        \\{"schema_version":1,"action":{"action_id":"promotion:standby-b","action_kind":"promotion","target":"standby-b","state":"applied","node_id":"standby-b"},"assessment":{"required_lsn":1,"received_lsn":1,"applied_lsn":1,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-b","switch_lsn":2,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":1,"epoch":1},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"forced":false,"data_loss_possible":false},"fence_generation":1,"fence_token":"token","forced":false}
+        \\{"schema_version":1,"action":{"action_id":"promotion:standby-b","action_kind":"promotion","target":"standby-b","state":"applied","node_id":"standby-b"},"assessment":{"required_lsn":1,"received_lsn":1,"applied_lsn":1,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-b","switch_lsn":2,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":1,"epoch":1},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"forced":false,"data_loss_possible":false},"fence_generation":1,"fence_token":"token","forced":false}
         ,
     };
     var client = Client.init(alloc, executor.executor());
@@ -1946,7 +1954,7 @@ test "storage.ha http client accepts already applied idempotent admin receipts" 
     {
         var executor = StaticJsonExecutor{
             .body =
-            \\{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"already_applied","node_id":"standby-a"},"assessment":{"required_lsn":1,"received_lsn":1,"applied_lsn":1,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":2,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":1,"epoch":1},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"forced":false,"data_loss_possible":false},"fence_generation":1,"fence_token":"token","forced":false}
+            \\{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"already_applied","node_id":"standby-a"},"assessment":{"required_lsn":1,"received_lsn":1,"applied_lsn":1,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":2,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":1,"epoch":1},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"forced":false,"data_loss_possible":false},"fence_generation":1,"fence_token":"token","forced":false}
             ,
         };
         var client = Client.init(alloc, executor.executor());

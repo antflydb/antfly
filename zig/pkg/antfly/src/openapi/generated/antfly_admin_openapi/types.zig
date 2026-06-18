@@ -112,6 +112,8 @@ pub const HAPromotionAssessment = struct {
     caught_up_to_received: bool,
     fencing_confirmed: bool,
     force: bool,
+    /// Explicit promotion mode for automation. `blocked` means the assessment is not promotable. `safe` means fencing is confirmed and all required/applied LSN evidence is present without forcing. `forced` means force was requested but no data loss is indicated. `lossy` means force was requested and data loss is possible.
+    mode: []const u8,
     data_loss_possible: bool,
     safe: bool,
     requires_fencing: bool,

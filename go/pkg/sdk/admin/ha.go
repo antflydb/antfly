@@ -74,6 +74,7 @@ type (
 	HAPrimaryStatusResponse            = oapi.HAPrimaryStatusResponse
 	HAPromotionAssessResponse          = oapi.HAPromotionAssessResponse
 	HAPromotionAssessment              = oapi.HAPromotionAssessment
+	HAPromotionAssessmentMode          = oapi.HAPromotionAssessmentMode
 	HAPromotionHandoff                 = oapi.HAPromotionHandoff
 	HAPromotionResponse                = oapi.HAPromotionResponse
 	HAPromotionResult                  = oapi.HAPromotionResult
@@ -226,6 +227,11 @@ const (
 	HAOwnerJobDecisionRolePrimary         = oapi.HAOwnerJobDecisionRolePrimary
 	HAOwnerJobDecisionRolePromotedStandby = oapi.HAOwnerJobDecisionRolePromotedStandby
 	HAOwnerJobDecisionRoleStandby         = oapi.HAOwnerJobDecisionRoleStandby
+
+	HAPromotionModeBlocked = oapi.HAPromotionAssessmentModeBlocked
+	HAPromotionModeSafe    = oapi.HAPromotionAssessmentModeSafe
+	HAPromotionModeForced  = oapi.HAPromotionAssessmentModeForced
+	HAPromotionModeLossy   = oapi.HAPromotionAssessmentModeLossy
 
 	HARejoinActionAlreadyCurrent = oapi.HARejoinAssessmentActionAlreadyCurrent
 	HARejoinActionRejectUnfenced = oapi.HARejoinAssessmentActionRejectUnfenced
@@ -891,7 +897,23 @@ func validateHAPromotionAssessmentConsistency(assessment HAPromotionAssessment) 
 	if assessment.CanPromote != canPromote {
 		return fmt.Errorf("promotion assessment can_promote mismatch")
 	}
+	if assessment.Mode != expectedHAPromotionMode(assessment.Force, assessment.DataLossPossible, assessment.CanPromote) {
+		return fmt.Errorf("promotion assessment mode mismatch")
+	}
 	return nil
+}
+
+func expectedHAPromotionMode(force bool, dataLossPossible bool, canPromote bool) HAPromotionAssessmentMode {
+	if !canPromote {
+		return HAPromotionModeBlocked
+	}
+	if dataLossPossible {
+		return HAPromotionModeLossy
+	}
+	if force {
+		return HAPromotionModeForced
+	}
+	return HAPromotionModeSafe
 }
 
 func ValidateHAPromotionResponseEvidence(raw []byte) error {
@@ -1013,6 +1035,7 @@ type haPromotionAssessmentEvidence struct {
 	CaughtUpToReceived *bool   `json:"caught_up_to_received"`
 	FencingConfirmed   *bool   `json:"fencing_confirmed"`
 	Force              *bool   `json:"force"`
+	Mode               *string `json:"mode"`
 	DataLossPossible   *bool   `json:"data_loss_possible"`
 	Safe               *bool   `json:"safe"`
 	RequiresFencing    *bool   `json:"requires_fencing"`
@@ -1147,6 +1170,8 @@ func haPromotionAssessmentEvidenceComplete(assessment haPromotionAssessmentEvide
 		assessment.CaughtUpToReceived != nil &&
 		assessment.FencingConfirmed != nil &&
 		assessment.Force != nil &&
+		assessment.Mode != nil &&
+		strings.TrimSpace(*assessment.Mode) != "" &&
 		assessment.DataLossPossible != nil &&
 		assessment.Safe != nil &&
 		assessment.RequiresFencing != nil &&

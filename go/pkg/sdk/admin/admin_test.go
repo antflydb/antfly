@@ -1138,6 +1138,8 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 		HasRequiredLsn:     true,
 		CaughtUpToReceived: true,
 		FencingConfirmed:   true,
+		Force:              false,
+		Mode:               HAPromotionModeSafe,
 		CanPromote:         true,
 		Safe:               true,
 	}
@@ -1164,6 +1166,11 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	inconsistentAssess.Assessment.HasRequiredLsn = false
 	if err := ValidateHAPromotionAssessResponse(inconsistentAssess); err == nil || !strings.Contains(err.Error(), "has_required_lsn") {
 		t.Fatalf("inconsistent promotion assessment error = %v, want has_required_lsn mismatch", err)
+	}
+	wrongMode := assess
+	wrongMode.Assessment.Mode = HAPromotionModeForced
+	if err := ValidateHAPromotionAssessResponse(wrongMode); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("wrong promotion assessment mode error = %v, want mode mismatch", err)
 	}
 	assess.Assessment.RequiredLsn = 0
 	if err := ValidateHAPromotionAssessResponse(assess); err == nil || !strings.Contains(err.Error(), "assessment fields") {
@@ -1267,7 +1274,7 @@ func TestValidateHAResponseEvidence(t *testing.T) {
 		t.Fatalf("missing held evidence error = %v, want held evidence error", err)
 	}
 
-	assessment := `"assessment":{"required_lsn":8,"received_lsn":8,"applied_lsn":8,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}`
+	assessment := `"assessment":{"required_lsn":8,"received_lsn":8,"applied_lsn":8,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}`
 	promotionAssess := `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},` + assessment + `}`
 	if err := ValidateHAPromotionAssessResponseEvidence([]byte(promotionAssess)); err != nil {
 		t.Fatalf("ValidateHAPromotionAssessResponseEvidence returned error: %v", err)

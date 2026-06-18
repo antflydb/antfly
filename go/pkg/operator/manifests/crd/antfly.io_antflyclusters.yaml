@@ -9055,6 +9055,10 @@ spec:
                               description: PromotionForce reports whether a promotion
                                 assessment used force.
                               type: boolean
+                            promotionMode:
+                              description: PromotionMode is the explicit promotion
+                                assessment mode reported by the admin API.
+                              type: string
                             promotionReceivedLSN:
                               description: PromotionReceivedLSN is the standby received
                                 LSN observed by a promotion assessment.
