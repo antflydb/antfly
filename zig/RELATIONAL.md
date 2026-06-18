@@ -999,9 +999,11 @@ moves behind a `api/sql_adapter/` package:
   stored durably and never passed to storage.
 - `parser.zig`: parser cursor, statement dispatch, and grammar entrypoints.
 - `grammar.zig`: handwritten grammar helpers today, or the checked-in
-  generated-parser wrapper later if a grammar generator is introduced.
-- `binder.zig`: schema/catalog lookup, parameter binding, name resolution,
-  output-column inference, and type validation.
+  generated-parser wrapper later if a grammar generator is introduced. Grammar
+  also owns PostgreSQL syntax normalization that is independent of catalog
+  state, such as `public.` object-name elision.
+- `binder.zig`: schema/catalog lookup, parameter binding, catalog-backed name
+  resolution, output-column inference, and type validation.
 - `lower_expr.zig`: shared expression lowering into Antfly row-expression,
   check, index-predicate, default, conflict-action, and returning-expression
   ASTs.
@@ -1064,8 +1066,9 @@ prefix and option parsing belongs in grammar helpers so lowerers receive typed
 wrapper intent instead of scanning raw SQL. This boundary is now partially implemented:
 `api/sql_adapter/` owns token definitions, lexer behavior, parser cursor
 helpers, statement classification, diagnostics, parity-corpus fingerprints,
-catalog/source-name prebinding, adapter-noop grammar tails, `EXPLAIN` prefix and
-option grammar, row-security grammar
+catalog/source-name prebinding, catalog-independent object identifier
+normalization, adapter-noop grammar tails, `EXPLAIN` prefix and option grammar,
+row-security grammar
 syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 `FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
 tails, and relation-population syntax parsing for `SELECT INTO` and

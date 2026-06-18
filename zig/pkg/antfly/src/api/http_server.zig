@@ -17452,7 +17452,7 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 20), ordered_rows[0].object.get("amount").?.integer);
     try std.testing.expect(ordered_rows[0].object.get("rank") == null);
 
-    var aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"net_amount_sum\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]}},{\"name\":\"large_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter\":{\"field\":\"amount\",\"op\":\"gte\",\"value\":20}}]}}", null);
+    var aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"net_amount_sum\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]}},{\"name\":\"large_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter\":{\"field\":\"amount\",\"op\":\"gte\",\"value\":20}},{\"name\":\"rank_two_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter_in\":[{\"field\":\"rank\",\"op\":\"in\",\"value\":[2]}]}]}}", null);
     defer aggregate_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), aggregate_response.status);
     try std.testing.expectEqual(@as(u32, 3), resolver.open_count);
@@ -17468,11 +17468,13 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 10), aggregate_rows[0].object.get("amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 9), aggregate_rows[0].object.get("net_amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 0), aggregate_rows[0].object.get("large_amount_sum").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), aggregate_rows[0].object.get("rank_two_amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 8), aggregate_rows[1].object.get("tenant").?.integer);
     try std.testing.expectEqual(@as(i64, 2), aggregate_rows[1].object.get("row_count").?.integer);
     try std.testing.expectEqual(@as(i64, 50), aggregate_rows[1].object.get("amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 43), aggregate_rows[1].object.get("net_amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 50), aggregate_rows[1].object.get("large_amount_sum").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), aggregate_rows[1].object.get("rank_two_amount_sum").?.integer);
 
     var source_response = try server.handle(.{
         .method = .GET,

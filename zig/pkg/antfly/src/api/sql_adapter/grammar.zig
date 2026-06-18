@@ -339,6 +339,15 @@ pub fn parseCloseCursorPortalTail(tokens: []const Token, pos: *usize) !NamedOrAl
     return try parseNamedOrAllTail(cursor);
 }
 
+pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
+    const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
+    if (dot == 0) return error.UnsupportedSqlShape;
+    const object_name = identifier[dot + 1 ..];
+    if (object_name.len == 0 or std.mem.indexOfScalar(u8, object_name, '.') != null) return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(identifier[0..dot], "public")) return try alloc.dupe(u8, identifier);
+    return try alloc.dupe(u8, object_name);
+}
+
 fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
     if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
     const path = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
@@ -859,4 +868,24 @@ test "sql adapter grammar parses relation population syntax" {
         error.UnsupportedSqlShape,
         parseRelationPopulationSqlAlloc(alloc, "CREATE TABLE usage_archive SELECT account_id FROM usage_records"),
     );
+}
+
+test "sql adapter grammar normalizes public object identifiers" {
+    const alloc = std.testing.allocator;
+
+    const bare = try normalizeSqlObjectIdentifierAlloc(alloc, "usage_records");
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings("usage_records", bare);
+
+    const public_qualified = try normalizeSqlObjectIdentifierAlloc(alloc, "public.usage_records");
+    defer alloc.free(public_qualified);
+    try std.testing.expectEqualStrings("usage_records", public_qualified);
+
+    const other_schema = try normalizeSqlObjectIdentifierAlloc(alloc, "tenant_1.usage_records");
+    defer alloc.free(other_schema);
+    try std.testing.expectEqualStrings("tenant_1.usage_records", other_schema);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, ".usage_records"));
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public."));
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public.analytics.usage_records"));
 }

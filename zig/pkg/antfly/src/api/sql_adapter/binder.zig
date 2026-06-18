@@ -21,6 +21,7 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const schema_api = @import("../../schema/mod.zig");
 const table_catalog = @import("../table_catalog.zig");
+const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const token_mod = @import("token.zig");
@@ -335,13 +336,8 @@ fn readSourceTableNamesFromWithAlloc(
     return .{ .left = final_tables.left, .source = source };
 }
 
-pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
-    const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
-    if (dot == 0) return error.UnsupportedSqlShape;
-    const object_name = identifier[dot + 1 ..];
-    if (object_name.len == 0 or std.mem.indexOfScalar(u8, object_name, '.') != null) return error.UnsupportedSqlShape;
-    if (!std.ascii.eqlIgnoreCase(identifier[0..dot], "public")) return try alloc.dupe(u8, identifier);
-    return try alloc.dupe(u8, object_name);
+fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, identifier);
 }
 
 fn insertSourceTableNamesFromInsertAlloc(
