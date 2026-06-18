@@ -523,6 +523,96 @@ pub fn scanPlainByteArrayColumnChunkAlloc(
     return try values.toOwnedSlice(alloc);
 }
 
+pub fn decodePlainByteArrayDictionaryPageAlloc(alloc: Allocator, header: Header, page_payload: []const u8) ![][]u8 {
+    try header.validatePlainDictionary();
+    return try decodePlainByteArraysAlloc(alloc, .{
+        .page_type = .data_page,
+        .uncompressed_page_size = header.uncompressed_page_size,
+        .compressed_page_size = header.compressed_page_size,
+        .value_count = header.value_count,
+        .encoding = .plain,
+    }, page_payload);
+}
+
+pub fn decodeDictionaryByteArrayDataPageAlloc(
+    alloc: Allocator,
+    header: Header,
+    dictionary: []const []const u8,
+    page_payload: []const u8,
+) ![][]u8 {
+    try header.validateDictionaryRequired();
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    const payload = page_payload[header.data_payload_offset..];
+    if (payload.len == 0) return error.InvalidParquetPage;
+    const bit_width_raw = payload[0];
+    if (bit_width_raw > 32) return error.UnsupportedParquetPage;
+    const bit_width: u6 = @intCast(bit_width_raw);
+    const row_count: usize = @intCast(header.value_count);
+    const indexes = try decodeHybridIndexesAlloc(alloc, payload[1..], bit_width, row_count);
+    defer alloc.free(indexes);
+
+    const values = try alloc.alloc([]u8, row_count);
+    errdefer alloc.free(values);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |value| alloc.free(value);
+    }
+    for (indexes, values) |index, *value| {
+        if (index >= dictionary.len) return error.InvalidParquetPage;
+        value.* = try alloc.dupe(u8, dictionary[@intCast(index)]);
+        initialized += 1;
+    }
+    return values;
+}
+
+pub fn scanUncompressedDictionaryByteArrayColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![][]u8 {
+    return try scanDictionaryByteArrayColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanDictionaryByteArrayColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+) ![][]u8 {
+    var cursor: usize = 0;
+    if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
+
+    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+    try parsed_dictionary.header.validatePlainDictionary();
+    cursor += parsed_dictionary.header_len;
+    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+    cursor += parsed_dictionary.header.compressed_page_size;
+    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+    defer dictionary_payload.deinit(alloc);
+    const dictionary = try decodePlainByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    defer freePlainByteArrays(alloc, dictionary);
+
+    var values = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (values.items) |value| alloc.free(value);
+        values.deinit(alloc);
+    }
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validateDictionaryRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+        const payload = try decodePagePayloadAlloc(alloc, parsed.header, compression, compressed_payload);
+        defer payload.deinit(alloc);
+
+        const page_values = try decodeDictionaryByteArrayDataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        defer alloc.free(page_values);
+        try values.ensureUnusedCapacity(alloc, page_values.len);
+        for (page_values) |value| {
+            values.appendAssumeCapacity(value);
+        }
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
 pub fn freePlainByteArrays(alloc: Allocator, values: [][]u8) void {
     for (values) |value| alloc.free(value);
     alloc.free(values);
@@ -1292,6 +1382,41 @@ test "parquet page scanner decodes dictionary i64 pages" {
     try std.testing.expectError(
         error.InvalidParquetPage,
         decodeDictionaryI64DataPageAlloc(alloc, parsed_data.header, &[_]i64{100}, &invalid_payload),
+    );
+}
+
+test "parquet page scanner decodes dictionary byte array pages" {
+    const alloc = std.testing.allocator;
+    var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 12);
+    defer dictionary_header.deinit(alloc);
+    var data_header = try buildDictionaryDataPageHeaderFixture(alloc, 3, 3);
+    defer data_header.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, dictionary_header.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        2, 0, 0, 0, 't', '1',
+        2, 0, 0, 0, 't', '2',
+    });
+    try chunk.appendSlice(alloc, data_header.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        1,
+        3,
+        0b00000110,
+    });
+
+    const values = try scanUncompressedDictionaryByteArrayColumnChunkAlloc(alloc, chunk.items);
+    defer freePlainByteArrays(alloc, values);
+    try std.testing.expectEqualStrings("t1", values[0]);
+    try std.testing.expectEqualStrings("t2", values[1]);
+    try std.testing.expectEqualStrings("t2", values[2]);
+
+    const parsed_data = try parsePageHeader(data_header.items);
+    const invalid_payload = [_]u8{ 1, 3, 0b00000010 };
+    try std.testing.expectError(
+        error.InvalidParquetPage,
+        decodeDictionaryByteArrayDataPageAlloc(alloc, parsed_data.header, &[_][]const u8{"t1"}, &invalid_payload),
     );
 }
 
