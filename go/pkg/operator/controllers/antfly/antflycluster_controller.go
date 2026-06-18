@@ -3986,6 +3986,9 @@ func haPlannedActionDirectAdminOperation(action antflyv1.HAPlannedActionStatus) 
 	if method != "" && apiPath != "" {
 		return method, apiPath, true
 	}
+	if action.Executor == string(haActionExecutorAdminAPI) {
+		return method, apiPath, false
+	}
 	method, apiPath = haAdminOperation(haPlannedAction{
 		Kind:             haActionKind(action.Kind),
 		StandbyName:      action.StandbyName,
@@ -4041,7 +4044,13 @@ func haDirectAdminActionReceiptSpec(kind haActionKind) (string, string, bool) {
 }
 
 func haValidatePlannedActionAdminOperation(action antflyv1.HAPlannedActionStatus) error {
-	if strings.TrimSpace(action.AdminMethod) == "" && strings.TrimSpace(action.AdminPath) == "" {
+	method := strings.TrimSpace(action.AdminMethod)
+	apiPath := strings.TrimSpace(action.AdminPath)
+	if method == "" && apiPath == "" {
+		if action.Executor == string(haActionExecutorAdminAPI) &&
+			haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+			return fmt.Errorf("planned HA action %q is marked AdminAPI but status does not publish typed admin method/path", action.Kind)
+		}
 		return nil
 	}
 	expectedMethod, expectedPath := haAdminOperation(haPlannedAction{
@@ -4052,7 +4061,7 @@ func haValidatePlannedActionAdminOperation(action antflyv1.HAPlannedActionStatus
 	if expectedMethod == "" || expectedPath == "" {
 		return fmt.Errorf("planned HA action %q has typed admin operation %s %s but no matching direct admin API operation", action.Kind, action.AdminMethod, action.AdminPath)
 	}
-	if strings.TrimSpace(action.AdminMethod) != expectedMethod || strings.TrimSpace(action.AdminPath) != expectedPath {
+	if method != expectedMethod || apiPath != expectedPath {
 		return fmt.Errorf("planned HA action %q typed admin operation mismatch: status has %s %s, expected %s %s", action.Kind, action.AdminMethod, action.AdminPath, expectedMethod, expectedPath)
 	}
 	return nil

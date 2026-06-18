@@ -1136,6 +1136,29 @@ func TestHADirectAdminSupportMatchesAdminOperations(t *testing.T) {
 			if !haActionRequiresAdminResult(action.Kind) {
 				t.Fatalf("direct admin action %s is directly executable without typed result evidence", action.Kind)
 			}
+
+			status := antflyv1.HAPlannedActionStatus{
+				Kind:     string(action.Kind),
+				Executor: string(haActionExecutorAdminAPI),
+			}
+			if err := haValidatePlannedActionAdminOperation(status); err == nil {
+				t.Fatalf("direct admin action %s executed without published typed method/path", action.Kind)
+			}
+			if haPlannedActionHasDirectAdminOperation(status) {
+				t.Fatalf("direct admin action %s reported executable without published typed method/path", action.Kind)
+			}
+
+			status.StandbyName = action.StandbyName
+			status.SlotName = action.SlotName
+			status.SeedManifestPath = action.SeedManifestPath
+			status.AdminMethod = method
+			status.AdminPath = path
+			if err := haValidatePlannedActionAdminOperation(status); err != nil {
+				t.Fatalf("direct admin action %s rejected matching typed operation: %v", action.Kind, err)
+			}
+			if !haPlannedActionHasDirectAdminOperation(status) {
+				t.Fatalf("direct admin action %s did not report executable with published typed method/path", action.Kind)
+			}
 		})
 	}
 
