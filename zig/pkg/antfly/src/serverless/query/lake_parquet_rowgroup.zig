@@ -5600,6 +5600,49 @@ test "parquet object range rows query filters on unprojected column" {
     try std.testing.expectEqual(@as(u64, 1), result.rows[0].row_ref.external.row_ordinal);
 }
 
+test "parquet object range rows query rejects sidecars without binding" {
+    const alloc = std.testing.allocator;
+    const DummyRangeReader = struct {
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: u64,
+            _: usize,
+        ) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var reader = DummyRangeReader{};
+
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 0),
+    };
+    defer inventory.deinit(alloc);
+
+    const projection = [_][]const u8{"amount"};
+    const desired = [_]lake_sidecar_selection.DesiredSidecar{.{ .kind = .vector }};
+    try std.testing.expectError(error.InvalidLakeSidecarSelection, querySupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .reader = reader.reader(),
+        .inventory = inventory,
+        .projected_columns = &projection,
+        .desired_sidecars = &desired,
+    }));
+}
+
 test "parquet object range rows query prunes row groups with i64 statistics" {
     const alloc = std.testing.allocator;
 

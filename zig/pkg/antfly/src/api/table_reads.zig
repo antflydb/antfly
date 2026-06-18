@@ -54,6 +54,9 @@ const relational_rows_api = @import("relational_rows.zig");
 const relational_sql_api = @import("relational_sql.zig");
 const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
 const external_source_api = @import("../serverless/external_source/mod.zig");
+const artifact_ref_api = @import("../serverless/manifest/artifact_ref.zig");
+const sidecar_manifest_api = @import("../serverless/segment/sidecar_manifest.zig");
+const source_binding_api = @import("../serverless/segment/source_binding.zig");
 const object_store_support = @import("../serverless/object_store_support.zig");
 const configured_object_store_support = @import("../serverless/configured_object_store_support.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
@@ -4819,6 +4822,7 @@ pub const PinnedExternalLakeRowsScanner = struct {
     reader: serverless_query.LakeParquetObjectRangeReader,
     cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
+    sidecar_context: PinnedExternalLakeSidecarContext = .{},
 
     pub fn scanAlloc(
         self: PinnedExternalLakeRowsScanner,
@@ -4833,9 +4837,17 @@ pub const PinnedExternalLakeRowsScanner = struct {
             self.reader,
             self.cache,
             self.coalesce_options,
+            self.sidecar_context,
             request,
         );
     }
+};
+
+pub const PinnedExternalLakeSidecarContext = struct {
+    sidecars: []const sidecar_manifest_api.DeclaredArtifact = &.{},
+    desired_sidecars: []const serverless_query.LakeSidecarDesired = &.{},
+    sidecar_policy: serverless_query.LakeSidecarSelectionPolicy = .{},
+    candidates: []const serverless_query.LakeRowsSidecarCandidateSet = &.{},
 };
 
 pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
@@ -4843,6 +4855,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
     object_reader: serverless_query.LakeObjectStorageRangeReader,
     cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
+    sidecar_context: PinnedExternalLakeSidecarContext = .{},
 
     pub fn init(
         inventory: external_source_api.Inventory,
@@ -4860,6 +4873,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
             .reader = self.object_reader.parquetReader(),
             .cache = self.cache,
             .coalesce_options = self.coalesce_options,
+            .sidecar_context = self.sidecar_context,
         };
     }
 
@@ -4897,6 +4911,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
             .reader = self.object_reader.parquetReader(),
             .cache = self.cache,
             .coalesce_options = self.coalesce_options,
+            .sidecar_context = self.sidecar_context,
         };
         return try scanner.scanAlloc(alloc, runtime_schema, request);
     }
@@ -5845,6 +5860,7 @@ pub fn executePinnedExternalLakeRowsScanAlloc(
     reader: serverless_query.LakeParquetObjectRangeReader,
     cache: ?*serverless_query.LakeParquetObjectRangeCache,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions,
+    sidecar_context: PinnedExternalLakeSidecarContext,
     request: serverless_query.LakeRowsScanRequest,
 ) !serverless_query.LakeRowsScanResult {
     if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
@@ -5861,6 +5877,10 @@ pub fn executePinnedExternalLakeRowsScanAlloc(
         .predicate = request.predicate,
         .limit = request.limit,
         .coalesce_options = coalesce_options,
+        .sidecars = sidecar_context.sidecars,
+        .desired_sidecars = sidecar_context.desired_sidecars,
+        .sidecar_policy = sidecar_context.sidecar_policy,
+        .candidates = sidecar_context.candidates,
     });
 }
 
@@ -17815,6 +17835,114 @@ test "pinned external lake rows scanner validates schema binding against invento
             reader,
             null,
             .{},
+            .{},
+            .{ .projected_columns = projection[0..] },
+        ),
+    );
+}
+
+test "pinned external lake rows scanner forwards sidecar freshness policy" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:expected" },
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var inventory = external_source_api.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:expected"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source_api.types.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 128,
+        .row_count = 1,
+        .row_groups = try alloc.dupe(external_source_api.types.RowGroup, &[_]external_source_api.types.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 1,
+            .file_offset = 0,
+            .total_byte_len = 1,
+            .column_chunks = try alloc.dupe(external_source_api.types.ColumnChunk, &[_]external_source_api.types.ColumnChunk{.{
+                .column_id = try alloc.dupe(u8, "amount"),
+                .file_offset = 0,
+                .compressed_len = 1,
+                .uncompressed_len = 1,
+                .encoding = try alloc.dupe(u8, "plain"),
+                .physical_type = try alloc.dupe(u8, "int64"),
+            }}),
+        }}),
+    };
+
+    const NeverRead = struct {
+        fn readRangeAlloc(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: u64,
+            _: usize,
+        ) ![]u8 {
+            return error.UnexpectedLakeRangeRead;
+        }
+    };
+    var ctx: u8 = 0;
+    const reader = serverless_query.LakeParquetObjectRangeReader{
+        .ctx = &ctx,
+        .read_range_alloc = NeverRead.readRangeAlloc,
+    };
+
+    const stale_sidecars = [_]sidecar_manifest_api.DeclaredArtifact{.{
+        .name = "events.amount.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_parquet,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "sha256:old",
+            .schema_fingerprint = "schema-v1",
+            .column_bindings = &[_][]const u8{"amount"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = artifact_ref_api.ArtifactKind.vector_segment,
+            .name = "events.amount.vector",
+            .artifact_id = "artifact:vector:old",
+            .byte_len = 1,
+            .checksum = "sha256:artifact",
+        },
+    }};
+    const desired = [_]serverless_query.LakeSidecarDesired{.{ .kind = source_binding_api.SidecarKind.vector }};
+    const projection = [_][]const u8{"amount"};
+
+    try std.testing.expectError(
+        error.StaleLakeSidecar,
+        executePinnedExternalLakeRowsScanAlloc(
+            alloc,
+            schema,
+            inventory,
+            reader,
+            null,
+            .{},
+            .{
+                .sidecars = stale_sidecars[0..],
+                .desired_sidecars = desired[0..],
+            },
             .{ .projected_columns = projection[0..] },
         ),
     );
