@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const routes = @import("http_routes.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const wasmtime_runtime = extension_domain.wasmtime_runtime;
@@ -525,7 +526,11 @@ fn identityHasPermission(
 ) bool {
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
-        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or
+            (if (resource_type == .table)
+                catalog_resources.tableResourceMatches(permission.resource, resource)
+            else
+                std.mem.eql(u8, permission.resource, resource));
         if (!type_match or !resource_match) continue;
         if (permission.type == .admin or permission.type == permission_type) return true;
     }

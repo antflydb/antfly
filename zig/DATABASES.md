@@ -132,13 +132,32 @@ MCP, A2A, CLI, SDKs, and SQL adapters should bind to the same generated API
 operations and shared catalog-resolution helpers rather than each inventing
 separate catalog semantics.
 
-Use one request-level target model everywhere:
+Use one request-level target model everywhere. The model is deliberately close
+to PostgreSQL naming, but it is not SQL-only; document, search, graph, MCP, A2A,
+CLI, backup, and extension code should resolve through the same object:
 
 ```text
 database: optional, defaults to current/default database
 namespace: optional, defaults to public
 table: required for table operations
 ```
+
+The resolved target should be carried internally as a typed catalog target, not
+as a pre-concatenated table string:
+
+```text
+CatalogTarget {
+  database_name
+  namespace_name
+  table_name?
+}
+```
+
+OpenAPI request types, SQL lowering, MCP tool handlers, A2A task handlers, CLI
+commands, and authorization checks should all call the same target resolver.
+That resolver owns defaulting, validation, three-part-name rejection, future
+search-path behavior, and audit metadata. Each integration layer can accept
+ergonomic shorthand, but none of them should reimplement catalog parsing.
 
 The existing shorthand remains:
 
@@ -164,6 +183,14 @@ checks exist:
 /db/v1/databases/{database}/namespaces/{namespace}/tables/{table}
 ```
 
+The generated API types should expose `database` and `namespace` as structured
+fields where possible. When an older endpoint only has `{table}`, the server
+must resolve that table through the same defaulting rule before planning,
+authorization, audit, and routing. New explicit endpoints should not be
+implemented as string rewrites into old `/tables/{table}` handlers; they should
+share the handler core after target resolution so non-default namespaces remain
+real catalog identity.
+
 MCP tools should be catalog-aware wrappers over those OpenAPI operations:
 
 ```text
@@ -179,6 +206,13 @@ row filters, and extension capability grants. Extension-owned MCP tools should
 run with the intersection of caller permissions and the extension install's
 declared capabilities.
 
+MCP tool schemas can remain protocol-native, but their fields should mirror the
+generated OpenAPI request fields. For example, `query_table` should pass
+`database`, `namespace`, and `table` into the OpenAPI-backed request builder,
+then execute as the caller's Antfly principal. If MCP later supports per-session
+default database or namespace, those defaults should be session metadata that
+feeds the shared resolver rather than hidden tool-specific state.
+
 A2A agent cards should advertise catalog-scoped skills, such as:
 
 ```json
@@ -191,6 +225,12 @@ A2A agent cards should advertise catalog-scoped skills, such as:
 A2A tasks should execute as a delegated principal. If an agent queries
 `analytics.events`, it must pass the same authorization checks as HTTP, SQL,
 MCP, and CLI calls. There should be no separate agent superuser path.
+
+A2A skill declarations should describe the maximum catalog scope the agent can
+use, while each task still resolves and authorizes the concrete target at
+execution time. Delegation should preserve the user, service account, role
+membership, extension capability grants, and row-level settings used by ordinary
+API calls. Agent cards are discovery metadata; they are not permission grants.
 
 The CLI should be a thin generated-client wrapper around the OpenAPI surface:
 
@@ -210,6 +250,12 @@ antfly table list
 ```
 
 Explicit flags always override local defaults.
+
+The CLI should persist defaults only in local client configuration. Server-side
+effects must always include the resolved database and namespace in the request
+or derive them from authenticated server-side defaults. Scripts should prefer
+explicit `--database` and `--namespace` flags so catalog intent survives moving
+between environments.
 
 The user and role system should authorize qualified resources:
 
@@ -233,6 +279,38 @@ Unqualified grants remain compatibility sugar for the current database and
 security. Settings that imply native catalog behavior, such as `search_path` or
 `current_database`, should stay fail-closed until Antfly has real native
 semantics for them.
+
+Authorization should be checked at the most specific resource needed by the
+operation and may require parent access where the operation depends on parent
+catalog visibility:
+
+```text
+database read/write/admin    database lifecycle, namespace listing, backup scope
+namespace read/write/admin   namespace lifecycle and table listing
+table read/write/admin       row reads, row writes, table DDL, indexes
+```
+
+For compatibility, old bare table permissions may be interpreted as
+`default.public.<table>` during migration, but new grants and audit records
+should write the qualified resource. SQL `GRANT` and `REVOKE`, OpenAPI auth
+admin endpoints, MCP tools, A2A delegated tasks, and CLI commands should all
+produce or consume the same resource strings. This keeps a role granted access
+to `tenant_ops.analytics.events` from accidentally gaining access to
+`default.public.events`.
+
+Cross-surface parity tests should prove at least these cases:
+
+```text
+HTTP shorthand /tables/events resolves to default.public.events.
+HTTP explicit /databases/tenant_ops/namespaces/analytics/tables/events resolves
+  to tenant_ops.analytics.events.
+SQL SELECT FROM analytics.events resolves to current_database.analytics.events.
+MCP query_table(database=tenant_ops, namespace=analytics, table=events) resolves
+  and authorizes the same target as HTTP.
+A2A delegated query_table tasks use the same principal and target.
+CLI table commands emit the same OpenAPI requests as hand-written HTTP calls.
+Qualified table grants do not leak across databases or namespaces.
+```
 
 ## Migration Path
 

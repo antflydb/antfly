@@ -16615,8 +16615,7 @@ pub const DB = struct {
             }
         }
 
-        const source_source = relationalRowsJoinedMutationSourceSide(req);
-        var source_rows = try self.queryRelationalRowsAcrossRanges(alloc, source_schema, source_source, source_ranges);
+        var source_rows = try self.queryRelationalRowsJoinedMutationSourceSideAcrossRangesAlloc(alloc, source_schema, req, source_ranges);
         defer source_rows.deinit(alloc);
 
         var target_slice = try target_candidates.toOwnedSlice(alloc);
@@ -16712,7 +16711,7 @@ pub const DB = struct {
         if (claim.txn_id == null) return error.InvalidQueryRequest;
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
         if (source.row_claim != null) return error.InvalidQueryRequest;
-        if (target.source_cte.len != 0 or source.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        try validateRelationalRowsJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
         if (relationalRowsQueryHasDistinctOn(target) or relationalRowsQueryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
         try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
@@ -16749,9 +16748,39 @@ pub const DB = struct {
         source_doc_key_range: ?types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsQueryResult {
         try validateRelationalRowsJoinedMutationSourceSideRequest(source_schema, req);
-        var source_source = relationalRowsJoinedMutationSourceSide(req);
-        if (source_doc_key_range) |range| source_source.doc_key_range = range;
-        return try self.queryRelationalRows(alloc, source_schema, source_source);
+        if (source_doc_key_range) |range| {
+            const ranges = [_]types.RelationalRowsDocKeyRange{range};
+            return try self.queryRelationalRowsJoinedMutationSourceSideAcrossRangesAlloc(alloc, source_schema, req, ranges[0..]);
+        }
+        return try self.queryRelationalRowsJoinedMutationSourceSideAcrossRangesAlloc(alloc, source_schema, req, &.{});
+    }
+
+    fn queryRelationalRowsJoinedMutationSourceSideAcrossRangesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        source_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        source_ranges: []const types.RelationalRowsDocKeyRange,
+    ) !types.RelationalRowsQueryResult {
+        try validateRelationalRowsJoinedMutationSourceSideRequest(source_schema, req);
+        try validateRelationalRowsDocKeyRanges(source_ranges);
+        const source_source = relationalRowsJoinedMutationSourceSide(req);
+        if (req.ctes.len == 0) {
+            if (source_ranges.len > 0) return try self.queryRelationalRowsAcrossRanges(alloc, source_schema, source_source, source_ranges);
+            return try self.queryRelationalRows(alloc, source_schema, source_source);
+        }
+
+        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, source_schema, req.ctes);
+        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        try validateRelationalRowsJoinAgainstPlannedCteOutput(planned_ctes, req.join);
+
+        var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
+        defer {
+            for (materialized_ctes.items) |*cte| cte.deinit(alloc);
+            materialized_ctes.deinit(alloc);
+        }
+        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, source_schema, source_ranges, req.ctes, &materialized_ctes);
+        return try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, source_schema, materialized_ctes.items, source_ranges, source_source);
     }
 
     fn validateRelationalRowsJoinedMutationSourceSideRequest(
@@ -16769,7 +16798,7 @@ pub const DB = struct {
         if (claim.txn_id == null) return error.InvalidQueryRequest;
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
         if (source.row_claim != null) return error.InvalidQueryRequest;
-        if (target.source_cte.len != 0 or source.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        try validateRelationalRowsJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
         if (relationalRowsQueryHasDistinctOn(target) or relationalRowsQueryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
         try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
@@ -16781,6 +16810,19 @@ pub const DB = struct {
             if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
             _ = relationalRowsFindColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
         }
+    }
+
+    fn validateRelationalRowsJoinedMutationCteReferences(req: types.RelationalRowsJoinedMutationSourceRequest) !void {
+        const target = relationalRowsJoinedMutationTargetQuery(req);
+        const source = relationalRowsJoinedMutationSourceQuery(req);
+        if (target.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        if (req.ctes.len == 0) {
+            if (source.source_cte.len != 0) return error.InvalidQueryRequest;
+            return;
+        }
+        if (source.source_cte.len == 0) return error.InvalidQueryRequest;
+        try validateRelationalRowsMaterializedCtes(req.ctes, &.{});
+        try validateRelationalRowsFinalCteReference(req.ctes, source.source_cte);
     }
 
     fn validateRelationalRowsJoinedMutationJoinFieldsForSide(
@@ -88105,6 +88147,103 @@ test "relational joined mutation source stages target-side updates from source r
 
     try db.commitTransaction(delete_txn_id, 20_001);
     try std.testing.expect((try db.lookup(alloc, "row:t3", .{})) == null);
+}
+
+test "relational joined mutation source consumes bounded source CTEs" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["kind","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:s1", .value = "{\"kind\":\"source\",\"id\":\"s1\",\"status\":\"ready\",\"quantity\":42}" },
+            .{ .key = "row:s2", .value = "{\"kind\":\"source\",\"id\":\"s2\",\"status\":\"stale\",\"quantity\":99}" },
+            .{ .key = "row:t1", .value = "{\"kind\":\"target\",\"id\":\"t1\",\"source_id\":\"s1\",\"status\":\"open\",\"quantity\":1,\"rank\":1}" },
+            .{ .key = "row:t2", .value = "{\"kind\":\"target\",\"id\":\"t2\",\"source_id\":\"s2\",\"status\":\"open\",\"quantity\":2,\"rank\":2}" },
+        },
+        .sync_level = .write,
+    });
+
+    const txn_id = try db.beginTransaction(30_000);
+    const target_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "kind", .op = .eq, .value_json = "\"target\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+    };
+    const cte_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "kind", .op = .eq, .value_json = "\"source\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"ready\"" },
+    };
+    const ctes = [_]types.RelationalRowsCte{.{
+        .name = "ready_sources",
+        .query = .{
+            .predicates = cte_predicates[0..],
+            .select_all = true,
+        },
+        .max_rows = 4,
+    }};
+    const on = [_]types.RelationalRowsJoinOn{.{
+        .left_field = "source_id",
+        .right_field = "id",
+    }};
+    const returning = [_][]const u8{ "id", "status" };
+    const req = types.RelationalRowsJoinedMutationSourceRequest{
+        .kind = .update,
+        .ctes = ctes[0..],
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .predicates = target_predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:joined-cte",
+                    .txn_id = txn_id,
+                },
+            },
+            .right = .{ .source_cte = "ready_sources", .select_all = true },
+            .on = on[0..],
+        },
+        .operations = &.{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"synced\"",
+        }},
+        .returning = returning[0..],
+    };
+
+    var result = try db.mutateRelationalRowsJoinedSourceAlloc(alloc, runtime_schema, req);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"synced\"}", result.returning_rows[0]);
+
+    try db.commitTransaction(txn_id, 30_001);
+    var updated = (try db.lookup(alloc, "row:t1", .{})).?;
+    defer updated.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, updated.json, "\"status\":\"synced\"") != null);
+
+    var untouched = (try db.lookup(alloc, "row:t2", .{})).?;
+    defer untouched.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, untouched.json, "\"status\":\"open\"") != null);
+
+    var bad_target_cte_req = req;
+    bad_target_cte_req.join.left.source_cte = "ready_sources";
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.planRelationalRowsJoinedMutationSourceAlloc(alloc, runtime_schema, bad_target_cte_req));
 }
 
 test "relational joined mutation source plans across injected owner ranges" {

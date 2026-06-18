@@ -2044,14 +2044,18 @@ pub const User = struct {
     metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
-/// Type of the resource, e.g., table, user, or global ('*').
+/// Type of the resource, e.g., database, namespace, table, user, or global ('*').
 pub const ResourceType = enum {
+    database,
+    namespace,
     table,
     user,
     @"*",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .database => "database",
+            .namespace => "namespace",
             .table => "table",
             .user => "user",
             .@"*" => "*",
@@ -2065,6 +2069,8 @@ pub const ResourceType = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "database", .database },
+            .{ "namespace", .namespace },
             .{ "table", .table },
             .{ "user", .user },
             .{ "*", .@"*" },

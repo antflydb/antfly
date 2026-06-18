@@ -37,11 +37,15 @@ const sql_role_catalog_subject = "__antfly_sql_role_catalog__";
 const sql_row_security_policy_subject_prefix = "__antfly_sql_rls_policy__:";
 
 pub const ResourceType = enum {
+    database,
+    namespace,
     table,
     user,
     @"*",
 
     pub fn fromSlice(raw: []const u8) !ResourceType {
+        if (std.mem.eql(u8, raw, "database")) return .database;
+        if (std.mem.eql(u8, raw, "namespace")) return .namespace;
         if (std.mem.eql(u8, raw, "table")) return .table;
         if (std.mem.eql(u8, raw, "user")) return .user;
         if (std.mem.eql(u8, raw, "*")) return .@"*";
@@ -50,6 +54,8 @@ pub const ResourceType = enum {
 
     pub fn slice(self: ResourceType) []const u8 {
         return switch (self) {
+            .database => "database",
+            .namespace => "namespace",
             .table => "table",
             .user => "user",
             .@"*" => "*",

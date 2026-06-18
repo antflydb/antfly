@@ -1126,21 +1126,21 @@ identity mutation into an unclaimed scan.
 For CTE-backed writes, adapter classification is based on the final statement
 after the non-recursive CTE list. `WITH ... INSERT` routes to insert-source
 lowering, while `WITH ... UPDATE`, `WITH ... DELETE`, and `WITH ... MERGE` route
-to their own write families and currently fail closed unless the corresponding
-typed CTE-backed execution shape is implemented. Recursive CTE-backed writes do
+to their own write families. Native joined mutation-source requests now carry a
+bounded `ctes` list, but only the non-target/source side may read from a CTE.
+The target side remains a real table query so row claims, version predicates,
+OCC writes, identity rewrites, and transaction participants stay grounded in
+durable row identity. Planning materializes source CTEs under the same row/byte
+caps as read plans, validates source-side join fields against the materialized
+output, rejects ambiguous source-to-target matches, and then stages selected
+target preimages through the ordinary owner-local mutation-source path. Source
+CTEs that are unreferenced, missing, recursive, over cap, target-side, or mixed
+with embedded doc-key ranges fail request validation. SQL lowering for
+`WITH ... UPDATE` / `WITH ... DELETE` still must map into that native request
+before those SQL forms leave the `cte_mutation_source_plan` fail-closed corpus
+bucket; `WITH ... MERGE` remains fail-closed until the matched-mutation plan
+also carries the same source-side CTE contract. Recursive CTE-backed writes do
 not enter a write family until recursive stream semantics have a native plan.
-The SQL/API parity corpus pins CTE-backed `UPDATE`, `DELETE`, and `MERGE`
-failures with the stable `cte_mutation_source_plan` reason, so these statements
-cannot regress into point writes, unclaimed scans, or insert-source lowering
-while execution support is still absent. The long-term execution shape is a native mutation-source plan
-whose source can be a bounded, validated CTE materialization: planning must
-materialize the CTE output under explicit row/byte caps, prove the final stream
-is lockable back to target-row identity, reject ambiguous source-to-target
-matches, attach the ordinary row-claim owner/transaction metadata, and then
-stage selected target preimages through the same owner-local OCC and topology
-epoch path used by ordinary and joined mutation sources. Any CTE stream that
-cannot prove a stable target row identity remains fail-closed rather than being
-lowered as an unclaimed scan.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.

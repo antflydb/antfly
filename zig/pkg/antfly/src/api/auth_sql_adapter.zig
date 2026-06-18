@@ -15,6 +15,7 @@
 const std = @import("std");
 const relational_sql = @import("relational_sql.zig");
 const tables_api = @import("tables.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
@@ -27,8 +28,16 @@ pub fn executeRelationalSqlDdlOnUserManager(
     return try executeRelationalSqlDdlOnUserManagerWithCatalog(manager, alloc, sql, .{});
 }
 
+pub const SqlAuthTableRef = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
 pub const SqlAuthCatalog = struct {
+    database_name: []const u8 = tables_api.default_database_name,
     public_table_names: ?[]const []const u8 = null,
+    tables: []const SqlAuthTableRef = &.{},
 };
 
 pub fn executeRelationalSqlDdlOnUserManagerWithCatalog(
@@ -122,15 +131,10 @@ fn executePrivilegeChange(
     defer freeSqlPermissionChanges(alloc, &changes);
 
     if (std.ascii.eqlIgnoreCase(plan.object_kind, "all_tables_in_schema")) {
-        if (!std.ascii.eqlIgnoreCase(plan.object_name, "public")) return error.UnsupportedSqlShape;
-        const table_names = catalog.public_table_names orelse return error.UnsupportedSqlShape;
-        for (table_names) |table_name| {
-            for (plan.privileges) |privilege_name| {
-                try appendSqlPrivilegeMapping(alloc, &changes, subject, .table, table_name, privilege_name, kind);
-            }
-        }
+        try appendAllTablesInSchemaPrivilegeChanges(alloc, &changes, subject, plan.object_name, plan.privileges, kind, catalog);
     } else {
-        const resource_target = try resourceTargetForSqlPrivilegeObject(plan.object_kind, plan.object_name);
+        const resource_target = try resourceTargetForSqlPrivilegeObject(alloc, plan.object_kind, plan.object_name, catalog);
+        defer resource_target.deinit(alloc);
         for (plan.privileges) |privilege_name| {
             try appendSqlPrivilegeMapping(alloc, &changes, subject, resource_target.resource_type, resource_target.resource_name, privilege_name, kind);
         }
@@ -182,13 +186,78 @@ fn executeDropRowSecurityPolicy(
 
 const SqlPrivilegeResourceTarget = struct {
     resource_type: usermgr.ResourceType,
-    resource_name: []const u8,
+    resource_name: []u8,
+
+    fn deinit(self: SqlPrivilegeResourceTarget, alloc: std.mem.Allocator) void {
+        alloc.free(self.resource_name);
+    }
 };
 
-fn resourceTargetForSqlPrivilegeObject(object_kind: []const u8, object_name: []const u8) !SqlPrivilegeResourceTarget {
-    if (std.ascii.eqlIgnoreCase(object_kind, "table")) return .{ .resource_type = .table, .resource_name = object_name };
-    if (std.ascii.eqlIgnoreCase(object_kind, "user")) return .{ .resource_type = .user, .resource_name = object_name };
-    if (std.mem.eql(u8, object_kind, "*")) return .{ .resource_type = .@"*", .resource_name = object_name };
+fn resourceTargetForSqlPrivilegeObject(
+    alloc: std.mem.Allocator,
+    object_kind: []const u8,
+    object_name: []const u8,
+    catalog: SqlAuthCatalog,
+) !SqlPrivilegeResourceTarget {
+    if (std.ascii.eqlIgnoreCase(object_kind, "database")) {
+        return .{
+            .resource_type = .database,
+            .resource_name = try catalog_resources.databaseResourceNameAlloc(alloc, object_name),
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(object_kind, "schema") or std.ascii.eqlIgnoreCase(object_kind, "namespace")) {
+        return .{
+            .resource_type = .namespace,
+            .resource_name = try catalog_resources.namespaceResourceNameAlloc(alloc, catalog.database_name, object_name),
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(object_kind, "table")) {
+        return .{
+            .resource_type = .table,
+            .resource_name = try catalog_resources.tableResourceNameFromSqlObjectAlloc(alloc, object_name, catalog.database_name),
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(object_kind, "user")) return .{ .resource_type = .user, .resource_name = try alloc.dupe(u8, object_name) };
+    if (std.mem.eql(u8, object_kind, "*")) return .{ .resource_type = .@"*", .resource_name = try alloc.dupe(u8, object_name) };
+    return error.UnsupportedSqlShape;
+}
+
+fn appendAllTablesInSchemaPrivilegeChanges(
+    alloc: std.mem.Allocator,
+    changes: *SqlPermissionChangeList,
+    subject: []const u8,
+    schema_name: []const u8,
+    privilege_names: []const []const u8,
+    kind: PrivilegeChangeKind,
+    catalog: SqlAuthCatalog,
+) !void {
+    if (schema_name.len == 0 or std.mem.indexOfScalar(u8, schema_name, '.') != null) return error.UnsupportedSqlShape;
+    var matched: usize = 0;
+    for (catalog.tables) |table_ref| {
+        if (!std.mem.eql(u8, table_ref.database_name, catalog.database_name)) continue;
+        if (!std.mem.eql(u8, table_ref.namespace_name, schema_name)) continue;
+        const resource_name = try catalog_resources.tableResourceNameAlloc(alloc, table_ref.database_name, table_ref.namespace_name, table_ref.table_name);
+        defer alloc.free(resource_name);
+        for (privilege_names) |privilege_name| {
+            try appendSqlPrivilegeMapping(alloc, changes, subject, .table, resource_name, privilege_name, kind);
+        }
+        matched += 1;
+    }
+    if (matched > 0) return;
+
+    if (catalog.tables.len == 0 and std.ascii.eqlIgnoreCase(schema_name, catalog_resources.default_namespace_name)) {
+        const table_names = catalog.public_table_names orelse return error.UnsupportedSqlShape;
+        for (table_names) |table_name| {
+            const resource_name = try catalog_resources.defaultPublicTableResourceNameAlloc(alloc, table_name);
+            defer alloc.free(resource_name);
+            for (privilege_names) |privilege_name| {
+                try appendSqlPrivilegeMapping(alloc, changes, subject, .table, resource_name, privilege_name, kind);
+            }
+            matched += 1;
+        }
+        if (matched > 0) return;
+    }
+
     return error.UnsupportedSqlShape;
 }
 
@@ -202,6 +271,7 @@ fn appendSqlPrivilegeMapping(
     kind: PrivilegeChangeKind,
 ) !void {
     if (std.ascii.eqlIgnoreCase(privilege_name, "select")) {
+        if (resource_type != .table and resource_type != .@"*") return error.UnsupportedSqlShape;
         try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .read, kind);
         return;
     }
@@ -210,6 +280,17 @@ fn appendSqlPrivilegeMapping(
         std.ascii.eqlIgnoreCase(privilege_name, "delete") or
         std.ascii.eqlIgnoreCase(privilege_name, "truncate"))
     {
+        if (resource_type != .table and resource_type != .@"*") return error.UnsupportedSqlShape;
+        try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .write, kind);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(privilege_name, "usage")) {
+        if (resource_type != .database and resource_type != .namespace and resource_type != .@"*") return error.UnsupportedSqlShape;
+        try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .read, kind);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(privilege_name, "create")) {
+        if (resource_type != .database and resource_type != .namespace and resource_type != .@"*") return error.UnsupportedSqlShape;
         try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .write, kind);
         return;
     }
@@ -230,6 +311,8 @@ fn sqlPrivilegeMappingCount(privilege_name: []const u8) usize {
     {
         return 1;
     }
+    if (std.ascii.eqlIgnoreCase(privilege_name, "usage")) return 1;
+    if (std.ascii.eqlIgnoreCase(privilege_name, "create")) return 1;
     if (std.ascii.eqlIgnoreCase(privilege_name, "all")) return 3;
     return 0;
 }
@@ -392,8 +475,9 @@ test "sql auth adapter creates roles and applies table grants through user manag
     )).?;
     defer schema_granted.deinit(alloc);
     try manager.addRoleToUser("alice", "role:app_writer");
-    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .read));
-    try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.docs", .read));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .read)));
     try std.testing.expect(!(try manager.enforce("alice", .table, "future_table", .read)));
     var schema_revoked = (try executeRelationalSqlDdlOnUserManagerWithCatalog(
         &manager,
@@ -402,46 +486,95 @@ test "sql auth adapter creates roles and applies table grants through user manag
         .{ .public_table_names = public_tables[0..] },
     )).?;
     defer schema_revoked.deinit(alloc);
-    try std.testing.expect(!(try manager.enforce("alice", .table, "docs", .read)));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.docs", .read)));
     try manager.removeRoleFromUser("alice", "role:app_writer");
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON ALL TABLES IN SCHEMA private TO app_writer;"));
+
+    const catalog_tables = [_]SqlAuthTableRef{
+        .{ .database_name = "default", .namespace_name = "analytics", .table_name = "events" },
+        .{ .database_name = "default", .namespace_name = "analytics", .table_name = "rollups" },
+        .{ .database_name = "default", .namespace_name = "public", .table_name = "events" },
+        .{ .database_name = "tenant_ops", .namespace_name = "analytics", .table_name = "events" },
+    };
+    var analytics_granted = (try executeRelationalSqlDdlOnUserManagerWithCatalog(
+        &manager,
+        alloc,
+        "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO app_writer;",
+        .{ .database_name = "default", .tables = catalog_tables[0..] },
+    )).?;
+    defer analytics_granted.deinit(alloc);
+    try manager.addRoleToUser("alice", "role:app_writer");
+    try std.testing.expect(try manager.enforce("alice", .table, "default.analytics.events", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.analytics.rollups", .read));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.events", .read)));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "tenant_ops.analytics.events", .read)));
+    var analytics_revoked = (try executeRelationalSqlDdlOnUserManagerWithCatalog(
+        &manager,
+        alloc,
+        "REVOKE SELECT ON ALL TABLES IN SCHEMA analytics FROM app_writer;",
+        .{ .database_name = "default", .tables = catalog_tables[0..] },
+    )).?;
+    defer analytics_revoked.deinit(alloc);
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.analytics.events", .read)));
+    try manager.removeRoleFromUser("alice", "role:app_writer");
 
     var granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;")).?;
     defer granted.deinit(alloc);
     try manager.addRoleToUser("alice", "role:app_writer");
-    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .read));
-    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .write));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .write));
 
     var revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;")).?;
     defer revoked.deinit(alloc);
-    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .read));
-    try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .write)));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .read));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .write)));
     try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
+
+    var qualified_granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE analytics.events TO app_writer;")).?;
+    defer qualified_granted.deinit(alloc);
+    try std.testing.expect(try manager.enforce("alice", .table, "default.analytics.events", .read));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.events", .read)));
+    var qualified_revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE SELECT ON TABLE analytics.events FROM app_writer;")).?;
+    defer qualified_revoked.deinit(alloc);
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.analytics.events", .read)));
+
+    var database_usage = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON DATABASE tenant_ops TO app_writer;")).?;
+    defer database_usage.deinit(alloc);
+    var schema_usage = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON SCHEMA analytics TO app_writer;")).?;
+    defer schema_usage.deinit(alloc);
+    try std.testing.expect(try manager.enforce("alice", .database, "tenant_ops", .read));
+    try std.testing.expect(try manager.enforce("alice", .namespace, "default.analytics", .read));
 
     var all_granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT ALL PRIVILEGES ON TABLE usage_records TO app_writer;")).?;
     defer all_granted.deinit(alloc);
-    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .read));
-    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .write));
-    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .admin));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .write));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.usage_records", .admin));
 
     var all_revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE ALL PRIVILEGES ON TABLE usage_records FROM app_writer;")).?;
     defer all_revoked.deinit(alloc);
-    try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .read)));
-    try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .write)));
-    try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .admin)));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .read)));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .write)));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .admin)));
+    var database_usage_revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE USAGE ON DATABASE tenant_ops FROM app_writer;")).?;
+    defer database_usage_revoked.deinit(alloc);
+    var schema_usage_revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE USAGE ON SCHEMA analytics FROM app_writer;")).?;
+    defer schema_usage_revoked.deinit(alloc);
+    try std.testing.expect(!(try manager.enforce("alice", .database, "tenant_ops", .read)));
+    try std.testing.expect(!(try manager.enforce("alice", .namespace, "default.analytics", .read)));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON TABLE usage_records TO app_writer;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, USAGE ON TABLE usage_records TO app_writer;"));
     try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
 
     try manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
     defer dropped.deinit(alloc);
-    try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .read)));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "default.public.usage_records", .read)));
 
     var missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE IF EXISTS app_writer;")).?;
     defer missing.deinit(alloc);
     try std.testing.expect(missing.noop);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON TABLE usage_records TO app_writer;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, USAGE ON TABLE usage_records TO app_writer;"));
     try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';"));
 
     var recreated = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_writer;")).?;
@@ -565,7 +698,7 @@ test "sql auth adapter grants directly to existing antfly users" {
     var granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE docs TO alice;")).?;
     defer granted.deinit(alloc);
 
-    try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "default.public.docs", .read));
     try std.testing.expect(!(try manager.roleSubjectExists("role:alice")));
     var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE alice SET app.tenant_id = 'direct';")).?;
     defer altered.deinit(alloc);

@@ -2304,6 +2304,7 @@ test "relational rows join sorted input proof requires leading ascending join ke
 
 pub const RelationalRowsJoinedMutationSourceRequest = struct {
     kind: RelationalRowsMutationKind,
+    ctes: []const RelationalRowsCte = &.{},
     source_table: []const u8 = "",
     target_side: RelationalRowsJoinProjectionSide = .left,
     join: RelationalRowsJoinRequest = .{},

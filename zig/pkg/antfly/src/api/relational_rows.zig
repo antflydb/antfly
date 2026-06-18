@@ -187,6 +187,7 @@ pub const OwnedRowsJoinedMutationSourceRequest = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.req.source_table.len > 0) alloc.free(@constCast(self.req.source_table));
+        freeRowsCtes(alloc, self.req.ctes);
         self.req.join.deinit(alloc);
         freeRowsQueryExpressionConditions(alloc, self.req.match_expression_predicates);
         freeRowsQueryExpressionPredicateGroups(alloc, self.req.match_expression_or_predicates);
@@ -2215,7 +2216,7 @@ pub fn parseRowsJoinedMutationSourceRequestWithSchemas(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "op", "source_table", "target_side", "join", "match_expression_where", "match_expression_any", "match_expression_not", "match_expression_array_contains", "rewrite_identity", "source_assignments", "patch", "patch_expr", "increment", "increment_expr", "json_set", "returning", "returning_expressions" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "op", "ctes", "source_table", "target_side", "join", "match_expression_where", "match_expression_any", "match_expression_not", "match_expression_array_contains", "rewrite_identity", "source_assignments", "patch", "patch_expr", "increment", "increment_expr", "json_set", "returning", "returning_expressions" });
 
     const op_value = parsed.value.object.get("op") orelse return error.InvalidRowsRequest;
     if (op_value != .string) return error.InvalidRowsRequest;
@@ -2232,10 +2233,20 @@ pub fn parseRowsJoinedMutationSourceRequestWithSchemas(
     errdefer if (source_table.len > 0) alloc.free(source_table);
 
     const target_side = try parseRowsJoinSide(parsed.value.object.get("target_side") orelse return error.InvalidRowsRequest);
-    const left_schema = if (target_side == .left) target_schema else source_schema;
-    const right_schema = if (target_side == .left) source_schema else target_schema;
-    var join = try parseRowsJoinedMutationJoinAllocWithSchemas(alloc, left_schema, right_schema, parsed.value.object.get("join") orelse return error.InvalidRowsRequest, target_side);
+    const ctes = try parseRowsCtesAlloc(alloc, source_schema, parsed.value.object.get("ctes"));
+    errdefer freeRowsCtes(alloc, ctes);
+    const planned_ctes = try planRowsCteOutputsAlloc(alloc, source_schema, ctes);
+    defer freeRowsPlannedCtes(alloc, planned_ctes);
+    const join_value = parsed.value.object.get("join") orelse return error.InvalidRowsRequest;
+    const left_schema = if (target_side == .left) target_schema else try rowsSchemaForJoinSideValue(source_schema, planned_ctes, join_value, "left");
+    const right_schema = if (target_side == .right) target_schema else try rowsSchemaForJoinSideValue(source_schema, planned_ctes, join_value, "right");
+    var join = try parseRowsJoinedMutationJoinAllocWithSchemas(alloc, left_schema, right_schema, join_value, target_side);
     errdefer join.deinit(alloc);
+    const target_query = if (target_side == .left) join.left else join.right;
+    const source_query = if (target_side == .left) join.right else join.left;
+    if (target_query.source_cte.len != 0) return error.InvalidRowsRequest;
+    try validateRowsQuerySourceCteReference(ctes, source_query);
+    try validateRowsJoinAgainstPlannedCteOutput(planned_ctes, join);
 
     const match_expression_predicates = try parseRowsJoinedMutationMatchExpressionPredicatesAlloc(alloc, target_schema, source_schema, parsed.value.object.get("match_expression_where"));
     errdefer freeRowsQueryExpressionConditions(alloc, match_expression_predicates);
@@ -2278,6 +2289,7 @@ pub fn parseRowsJoinedMutationSourceRequestWithSchemas(
 
     return .{ .req = .{
         .kind = kind,
+        .ctes = ctes,
         .source_table = source_table,
         .target_side = target_side,
         .join = join,
@@ -5489,7 +5501,7 @@ fn parseRowsJoinedMutationSourceSideAlloc(
     defer alloc.free(source_json);
     var source = try parseRowsQueryRequest(alloc, source_json, schema);
     errdefer source.deinit(alloc);
-    if (source.source_cte.len != 0 or source.doc_key_range != null) return error.InvalidRowsRequest;
+    if (source.doc_key_range != null) return error.InvalidRowsRequest;
     return source;
 }
 
@@ -22043,6 +22055,23 @@ test "relational rows joined mutation source contract parses lockable join plans
     try std.testing.expectEqualStrings("source_status", request.req.json_set_expressions[0].path[1]);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, request.req.json_set_expressions[0].expression.operands[0].field_source);
     try std.testing.expectEqual(@as(usize, 2), request.req.returning.len);
+
+    var cte_request = try parseRowsJoinedMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"ctes\":[{\"name\":\"ready_sources\",\"query\":{\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}]},\"select\":[\"id\",\"status\",\"quantity\"]},\"max_rows\":16}],\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:joined\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"right\":{\"source_cte\":\"ready_sources\"},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}]},\"patch\":{\"status\":\"synced\"},\"returning\":[\"id\"]}",
+        schema,
+    );
+    defer cte_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), cte_request.req.ctes.len);
+    try std.testing.expectEqualStrings("ready_sources", cte_request.req.ctes[0].name);
+    try std.testing.expectEqualStrings("ready_sources", cte_request.req.join.right.source_cte);
+    try std.testing.expectEqual(@as(u32, 16), cte_request.req.ctes[0].max_rows.?);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinedMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"ctes\":[{\"name\":\"ready_targets\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"}}}],\"target_side\":\"left\",\"join\":{\"left\":{\"source_cte\":\"ready_targets\",\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:joined\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}]},\"patch\":{\"status\":\"synced\"}}",
+        schema,
+    ));
 
     var delete_request = try parseRowsJoinedMutationSourceRequest(
         std.testing.allocator,

@@ -45,6 +45,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
@@ -427,6 +428,8 @@ pub const StatusSource = struct {
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        create_namespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void = null,
+        drop_namespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         wait_table_lifecycle: ?*const fn (ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) anyerror!void = null,
@@ -487,6 +490,16 @@ pub const StatusSource = struct {
     pub fn applyRelationalSqlDdl(self: StatusSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, sql);
+    }
+
+    pub fn createNamespace(self: StatusSource, database_name: []const u8, namespace_name: []const u8) !void {
+        const fn_ptr = self.vtable.create_namespace orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, database_name, namespace_name);
+    }
+
+    pub fn dropNamespace(self: StatusSource, database_name: []const u8, namespace_name: []const u8) !void {
+        const fn_ptr = self.vtable.drop_namespace orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, database_name, namespace_name);
     }
 
     pub fn createIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -617,6 +630,14 @@ pub const StatusSource = struct {
                 return try applyRelationalSqlDdlOnService(cast(ptr), alloc, sql);
             }
 
+            fn createNamespace(ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void {
+                return try createNamespaceOnService(cast(ptr), database_name, namespace_name);
+            }
+
+            fn dropNamespace(ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void {
+                return try dropNamespaceOnService(cast(ptr), database_name, namespace_name);
+            }
+
             fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void {
                 return try createIndexOnService(cast(ptr), alloc, table_name, index_name, index_json);
             }
@@ -700,6 +721,8 @@ pub const StatusSource = struct {
             .drop_table = Gen.dropTable,
             .update_schema = Gen.updateSchema,
             .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
+            .create_namespace = Gen.createNamespace,
+            .drop_namespace = Gen.dropNamespace,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
@@ -814,6 +837,40 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
     try svc.upsertTable(updated);
+    try svc.runRound();
+}
+
+fn createNamespaceOnService(svc: anytype, database_name: []const u8, namespace_name: []const u8) !void {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !@hasDecl(ServiceDeclType, "upsertNamespace")) return error.UnsupportedOperation;
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const database = tables_api.findDatabaseByName(&snapshot, database_name) orelse return error.DatabaseNotFound;
+    if (tables_api.findNamespaceByName(&snapshot, database_name, namespace_name) != null) return error.NamespaceAlreadyExists;
+    try svc.upsertNamespace(.{
+        .namespace_id = metadata_table_manager.deriveNamespaceId(database.database_id, namespace_name),
+        .database_id = database.database_id,
+        .name = namespace_name,
+    });
+    try svc.runRound();
+}
+
+fn dropNamespaceOnService(svc: anytype, database_name: []const u8, namespace_name: []const u8) !void {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !@hasDecl(ServiceDeclType, "removeNamespace")) return error.UnsupportedOperation;
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    _ = tables_api.findDatabaseByName(&snapshot, database_name) orelse return error.DatabaseNotFound;
+    const namespace = tables_api.findNamespaceByName(&snapshot, database_name, namespace_name) orelse return error.NamespaceNotFound;
+    try svc.removeNamespace(namespace.namespace_id);
     try svc.runRound();
 }
 
@@ -1840,10 +1897,17 @@ pub const ApiHttpServer = struct {
     const OwnedSqlAuthCatalog = struct {
         value: auth_sql_adapter.SqlAuthCatalog = .{},
         public_table_names: []const []const u8 = &.{},
+        tables: []const auth_sql_adapter.SqlAuthTableRef = &.{},
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             for (self.public_table_names) |name| alloc.free(@constCast(name));
             if (self.public_table_names.len > 0) alloc.free(self.public_table_names);
+            for (self.tables) |table| {
+                alloc.free(@constCast(table.database_name));
+                alloc.free(@constCast(table.namespace_name));
+                alloc.free(@constCast(table.table_name));
+            }
+            if (self.tables.len > 0) alloc.free(self.tables);
             self.* = undefined;
         }
     };
@@ -1867,18 +1931,46 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return error.UnsupportedOperation;
         defer self.source.freeAdminSnapshot(&snapshot);
         const names = try self.alloc.alloc([]const u8, snapshot.tables.len);
+        const table_refs = try self.alloc.alloc(auth_sql_adapter.SqlAuthTableRef, snapshot.tables.len);
         var filled: usize = 0;
         errdefer {
             for (names[0..filled]) |name| self.alloc.free(@constCast(name));
             self.alloc.free(names);
+            for (table_refs[0..filled]) |table| {
+                self.alloc.free(@constCast(table.database_name));
+                self.alloc.free(@constCast(table.namespace_name));
+                self.alloc.free(@constCast(table.table_name));
+            }
+            self.alloc.free(table_refs);
         }
         for (snapshot.tables) |table| {
-            names[filled] = try self.alloc.dupe(u8, table.name);
-            filled += 1;
+            {
+                const name = try self.alloc.dupe(u8, table.name);
+                errdefer self.alloc.free(name);
+                const database_name = try self.alloc.dupe(u8, table.database_name);
+                errdefer self.alloc.free(database_name);
+                const namespace_name = try self.alloc.dupe(u8, table.namespace_name);
+                errdefer self.alloc.free(namespace_name);
+                const table_name = try self.alloc.dupe(u8, table.name);
+                errdefer self.alloc.free(table_name);
+
+                names[filled] = name;
+                table_refs[filled] = .{
+                    .database_name = database_name,
+                    .namespace_name = namespace_name,
+                    .table_name = table_name,
+                };
+                filled += 1;
+            }
         }
         return .{
-            .value = .{ .public_table_names = names[0..filled] },
+            .value = .{
+                .database_name = tables_api.default_database_name,
+                .public_table_names = names[0..filled],
+                .tables = table_refs[0..filled],
+            },
             .public_table_names = names,
+            .tables = table_refs,
         };
     }
 
@@ -3619,6 +3711,39 @@ pub const ApiHttpServer = struct {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
             return try self.handlePublicClusterBackupList(params.location);
+        }
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.databases)) {
+            return try self.handlePublicListDatabases();
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchDatabasePath(uri_parts.path)) |database_path| {
+                return try self.handlePublicGetDatabase(database_path.database_name);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchDatabasePath(uri_parts.path)) |database_path| {
+                return try self.handlePublicCreateDatabase(database_path.database_name);
+            }
+        }
+        if (req.method == .DELETE) {
+            if (routes.Routes.matchDatabasePath(uri_parts.path)) |database_path| {
+                return try self.handlePublicDropDatabase(database_path.database_name);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchDatabaseNamespaces(uri_parts.path)) |database_path| {
+                return try self.handlePublicListNamespaces(database_path.database_name);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchDatabaseNamespacePath(uri_parts.path)) |namespace_path| {
+                return try self.handlePublicCreateNamespace(namespace_path.database_name, namespace_path.namespace_name);
+            }
+        }
+        if (req.method == .DELETE) {
+            if (routes.Routes.matchDatabaseNamespacePath(uri_parts.path)) |namespace_path| {
+                return try self.handlePublicDropNamespace(namespace_path.database_name, namespace_path.namespace_name);
+            }
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.tables)) {
             var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
@@ -9090,11 +9215,31 @@ pub fn permissionsAllow(
 ) bool {
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
-        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or
+            (if (resource_type == .table)
+                catalog_resources.tableResourceMatches(permission.resource, resource)
+            else
+                std.mem.eql(u8, permission.resource, resource));
         if (!type_match or !resource_match) continue;
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
+}
+
+test "table permissions allow default public qualified resources during migration" {
+    const alloc = std.testing.allocator;
+
+    var qualified = try usermgr.Permission.initOwned(alloc, .table, "default.public.docs", .read);
+    defer qualified.deinit(alloc);
+    var non_default = try usermgr.Permission.initOwned(alloc, .table, "tenant_ops.analytics.docs", .read);
+    defer non_default.deinit(alloc);
+    var legacy = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer legacy.deinit(alloc);
+
+    try std.testing.expect(permissionsAllow(&.{qualified}, .table, "docs", .read));
+    try std.testing.expect(permissionsAllow(&.{legacy}, .table, "default.public.docs", .read));
+    try std.testing.expect(!permissionsAllow(&.{non_default}, .table, "docs", .read));
+    try std.testing.expect(!permissionsAllow(&.{legacy}, .table, "tenant_ops.analytics.docs", .read));
 }
 
 test "document artifact routes declare read and admin permissions" {
@@ -9573,6 +9718,8 @@ fn parseListTablesParams(query: []const u8) !metadata_openapi.server.ListTablesP
 
 fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.ResourceType {
     return switch (value) {
+        .database => .database,
+        .namespace => .namespace,
         .table => .table,
         .user => .user,
         .@"*" => .@"*",
@@ -9589,6 +9736,8 @@ fn permissionTypeFromOpenApi(value: usermgr_openapi.PermissionType) usermgr.Perm
 
 fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceType {
     return switch (value) {
+        .database => .database,
+        .namespace => .namespace,
         .table => .table,
         .user => .user,
         .@"*" => .@"*",
@@ -12618,8 +12767,8 @@ test "api http server applies authorization SQL DDL through user manager" {
     defer row_policy.deinit(alloc);
 
     try auth.manager.addRoleToUser("alice", "role:app_writer");
-    try std.testing.expect(try auth.manager.enforce("alice", .table, "usage_records", .read));
-    try std.testing.expect(try auth.manager.enforce("alice", .table, "docs", .read));
+    try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read));
+    try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.docs", .read));
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "future_table", .read)));
     const stored_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records");
     defer alloc.free(stored_policy);
@@ -12633,7 +12782,7 @@ test "api http server applies authorization SQL DDL through user manager" {
     try auth.manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
     defer dropped.deinit(alloc);
-    try std.testing.expect(!(try auth.manager.enforce("alice", .table, "usage_records", .read)));
+    try std.testing.expect(!(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read)));
 }
 
 test "api http server serves api key and row filter routes" {

@@ -15117,10 +15117,12 @@ components:
     ResourceType:
       type: string
       enum:
+        - database
+        - namespace
         - table
         - user
         - '*'
-      description: Type of the resource, e.g., table, user, or global ('*').
+      description: Type of the resource, e.g., database, namespace, table, user, or global ('*').
       example: table
     PermissionType:
       type: string

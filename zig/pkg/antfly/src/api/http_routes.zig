@@ -53,6 +53,10 @@ pub const Routes = struct {
     pub const backup = "/backup";
     pub const restore = "/restore";
     pub const backups = "/backups";
+    pub const databases = "/databases";
+    pub const databases_prefix = "/databases/";
+    pub const namespaces_segment = "/namespaces";
+    pub const namespaces_segment_prefix = "/namespaces/";
     pub const tables = "/tables";
     pub const tables_prefix = "/tables/";
     pub const transactions = "/transactions";
@@ -160,6 +164,15 @@ pub const Routes = struct {
 
     pub const TablePath = struct {
         table_name: []const u8,
+    };
+
+    pub const DatabasePath = struct {
+        database_name: []const u8,
+    };
+
+    pub const NamespacePath = struct {
+        database_name: []const u8,
+        namespace_name: []const u8,
     };
 
     pub const TableSchema = struct {
@@ -561,6 +574,32 @@ pub const Routes = struct {
 
     pub fn matchTableRowsMutationSource(path: []const u8) ?TableRows {
         return matchTableRowsAction(path, rows_mutation_source_suffix);
+    }
+
+    pub fn matchDatabasePath(path: []const u8) ?DatabasePath {
+        if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
+        const database_name = path[databases_prefix.len..];
+        if (database_name.len == 0 or std.mem.indexOfScalar(u8, database_name, '/') != null) return null;
+        return .{ .database_name = database_name };
+    }
+
+    pub fn matchDatabaseNamespaces(path: []const u8) ?DatabasePath {
+        if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, namespaces_segment)) return null;
+        const database_name = path[databases_prefix.len .. path.len - namespaces_segment.len];
+        if (database_name.len == 0 or std.mem.indexOfScalar(u8, database_name, '/') != null) return null;
+        return .{ .database_name = database_name };
+    }
+
+    pub fn matchDatabaseNamespacePath(path: []const u8) ?NamespacePath {
+        if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
+        const rest = path[databases_prefix.len..];
+        const marker = std.mem.indexOf(u8, rest, namespaces_segment_prefix) orelse return null;
+        if (marker == 0) return null;
+        const database_name = rest[0..marker];
+        const namespace_name = rest[marker + namespaces_segment_prefix.len ..];
+        if (namespace_name.len == 0 or std.mem.indexOfScalar(u8, namespace_name, '/') != null) return null;
+        return .{ .database_name = database_name, .namespace_name = namespace_name };
     }
 
     fn matchTableRowsAction(path: []const u8, suffix: []const u8) ?TableRows {
