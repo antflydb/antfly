@@ -325,15 +325,7 @@ pub const Primary = struct {
     fn retainedByteCount(self: *Primary, snapshot: slot_store.RetentionSnapshot) !u64 {
         if (snapshot.retained_lsn_count == 0) return 0;
         const from_lsn = @max(snapshot.oldest_restart_lsn, 1);
-        const entries = try self.log.iterateFrom(self.alloc, from_lsn);
-        defer replication_log.freeEntries(self.alloc, entries);
-
-        var total: u64 = 0;
-        for (entries) |entry| {
-            if (entry.wal_lsn > snapshot.primary_lsn) continue;
-            total += @intCast(entry.encoded.len);
-        }
-        return total;
+        return try self.log.encodedByteCount(from_lsn, snapshot.primary_lsn);
     }
 
     pub fn evaluateDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {

@@ -131,6 +131,13 @@ pub const ReplicationLog = struct {
         };
     }
 
+    pub fn encodedByteCount(self: *ReplicationLog, from_lsn: u64, to_lsn: u64) !u64 {
+        if (from_lsn == 0 or to_lsn < from_lsn) return 0;
+        var context = EncodedByteCountContext{ .to_lsn = to_lsn };
+        try self.wal.iterateFromStreamingWithContext(from_lsn, &context, countEncodedBytes);
+        return context.total;
+    }
+
     pub fn truncate(self: *ReplicationLog, up_to_lsn: u64) !void {
         try self.wal.truncate(up_to_lsn);
     }
@@ -139,6 +146,20 @@ pub const ReplicationLog = struct {
         try self.wal.truncateAfter(keep_lsn);
     }
 };
+
+const EncodedByteCountContext = struct {
+    to_lsn: u64,
+    total: u64 = 0,
+};
+
+fn countEncodedBytes(context: *EncodedByteCountContext, entry: wal_mod.WalEntry) !wal_mod.WAL.ScanAction {
+    if (entry.lsn > context.to_lsn) return .stop;
+    const decoded = try replication_record.decode(entry.data);
+    if (decoded.lsn != entry.lsn) return error.RecordWalLsnMismatch;
+    if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
+    context.total += @intCast(entry.data.len);
+    return .@"continue";
+}
 
 pub fn freeEntries(alloc: Allocator, entries: []Entry) void {
     for (entries) |*entry| entry.deinit(alloc);
@@ -288,6 +309,30 @@ test "storage.ha replication log truncates acknowledged entries" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 3), entries[0].record.lsn);
     try std.testing.expectEqualStrings("three", entries[0].record.payload);
+}
+
+test "storage.ha replication log counts encoded retained bytes without materializing entries" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "encoded-byte-count");
+    defer alloc.free(path);
+
+    var log = try ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    _ = try log.append(alloc, baseRecord(2, "two"));
+    _ = try log.append(alloc, baseRecord(3, "three"));
+
+    const entries = try log.iterateFrom(alloc, 2);
+    defer freeEntries(alloc, entries);
+    var expected: u64 = 0;
+    for (entries) |entry| {
+        if (entry.wal_lsn <= 3) expected += @intCast(entry.encoded.len);
+    }
+
+    try std.testing.expectEqual(expected, try log.encodedByteCount(2, 3));
+    try std.testing.expectEqual(@as(u64, 0), try log.encodedByteCount(4, 3));
+    try std.testing.expectEqual(@as(u64, 0), try log.encodedByteCount(0, 3));
 }
 
 test "storage.ha replication log truncates divergent suffix and reuses next lsn" {
