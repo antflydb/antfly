@@ -3757,144 +3757,82 @@ const Parser = struct {
     }
 
     fn parseCreateCollationDdl(self: *@This()) !CreateCollationPlan {
-        try self.expectKeyword("collation");
-        const collation_name = try self.parseIdentifierOwned();
-        var collation_transferred = false;
-        errdefer if (!collation_transferred) self.alloc.free(collation_name);
-        const option_count = try self.countParenthesizedAssignments();
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        collation_transferred = true;
-        return .{ .collation_name = collation_name, .option_count = option_count };
+        var syntax = try sql_adapter.parseCreateCollationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const collation_name = syntax.collation_name;
+        syntax.collation_name = "";
+        return .{ .collation_name = collation_name, .option_count = syntax.option_count };
     }
 
     fn parseRenameCollationDdl(self: *@This()) !RenameCollationPlan {
-        try self.expectKeyword("collation");
-        const collation_name = try self.parseIdentifierOwned();
-        var collation_transferred = false;
-        errdefer if (!collation_transferred) self.alloc.free(collation_name);
-        try self.expectKeyword("rename");
-        try self.expectKeyword("to");
-        const new_collation_name = try self.parseIdentifierOwned();
-        var new_collation_transferred = false;
-        errdefer if (!new_collation_transferred) self.alloc.free(new_collation_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        collation_transferred = true;
-        new_collation_transferred = true;
+        var syntax = try sql_adapter.parseRenameCollationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const collation_name = syntax.collation_name;
+        const new_collation_name = syntax.new_collation_name;
+        syntax.collation_name = "";
+        syntax.new_collation_name = "";
         return .{ .collation_name = collation_name, .new_collation_name = new_collation_name };
     }
 
     fn parseDropCollationDdl(self: *@This()) !DropCollationPlan {
-        try self.expectKeyword("collation");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const collation_name = try self.parseIdentifierOwned();
-        var collation_transferred = false;
-        errdefer if (!collation_transferred) self.alloc.free(collation_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        collation_transferred = true;
-        return .{ .collation_name = collation_name, .if_exists = if_exists };
+        var syntax = try sql_adapter.parseDropCollationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const collation_name = syntax.collation_name;
+        syntax.collation_name = "";
+        return .{ .collation_name = collation_name, .if_exists = syntax.if_exists };
     }
 
     fn parseCreateOperatorDdl(self: *@This()) !CreateOperatorPlan {
-        try self.expectKeyword("operator");
-        const operator_name = try self.parseSqlOperatorNameOwned();
-        var operator_transferred = false;
-        errdefer if (!operator_transferred) self.alloc.free(operator_name);
-        const option_count = try self.countParenthesizedAssignments();
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        operator_transferred = true;
-        return .{ .operator_name = operator_name, .option_count = option_count };
+        var syntax = try sql_adapter.parseCreateOperatorCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const operator_name = syntax.operator_name;
+        syntax.operator_name = "";
+        return .{ .operator_name = operator_name, .option_count = syntax.option_count };
     }
 
     fn parseDropOperatorDdl(self: *@This()) !DropOperatorPlan {
-        try self.expectKeyword("operator");
-        const operator_name = try self.parseSqlOperatorNameOwned();
-        var operator_transferred = false;
-        errdefer if (!operator_transferred) self.alloc.free(operator_name);
-        const argument_count = try self.countParenthesizedTypeList();
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        operator_transferred = true;
-        return .{ .operator_name = operator_name, .argument_count = argument_count };
+        var syntax = try sql_adapter.parseDropOperatorCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const operator_name = syntax.operator_name;
+        syntax.operator_name = "";
+        return .{ .operator_name = operator_name, .argument_count = syntax.argument_count };
     }
 
     fn parseCreateAggregateDdl(self: *@This()) !CreateAggregatePlan {
-        try self.expectKeyword("aggregate");
-        const aggregate_name = try self.parseIdentifierOwned();
-        var aggregate_transferred = false;
-        errdefer if (!aggregate_transferred) self.alloc.free(aggregate_name);
-        const argument_count = try self.countParenthesizedTypeList();
-        const option_count = try self.countParenthesizedAssignments();
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        aggregate_transferred = true;
-        return .{ .aggregate_name = aggregate_name, .argument_count = argument_count, .option_count = option_count };
+        var syntax = try sql_adapter.parseCreateAggregateCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const aggregate_name = syntax.aggregate_name;
+        syntax.aggregate_name = "";
+        return .{ .aggregate_name = aggregate_name, .argument_count = syntax.argument_count, .option_count = syntax.option_count };
     }
 
     fn parseDropAggregateDdl(self: *@This()) !DropAggregatePlan {
-        try self.expectKeyword("aggregate");
-        const aggregate_name = try self.parseIdentifierOwned();
-        var aggregate_transferred = false;
-        errdefer if (!aggregate_transferred) self.alloc.free(aggregate_name);
-        const argument_count = try self.countParenthesizedTypeList();
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        aggregate_transferred = true;
-        return .{ .aggregate_name = aggregate_name, .argument_count = argument_count };
+        var syntax = try sql_adapter.parseDropAggregateCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const aggregate_name = syntax.aggregate_name;
+        syntax.aggregate_name = "";
+        return .{ .aggregate_name = aggregate_name, .argument_count = syntax.argument_count };
     }
 
     fn parseCreateCastDdl(self: *@This()) !CreateCastPlan {
-        try self.expectKeyword("cast");
-        try self.expect(.lparen);
-        const source_type = try self.parseIdentifierOwned();
-        var source_transferred = false;
-        errdefer if (!source_transferred) self.alloc.free(source_type);
-        try self.expectKeyword("as");
-        const target_type = try self.parseIdentifierOwned();
-        var target_transferred = false;
-        errdefer if (!target_transferred) self.alloc.free(target_type);
-        try self.expect(.rparen);
-        try self.expectKeyword("with");
-        try self.expectKeyword("function");
-        const function_name = try self.parseIdentifierOwned();
-        var function_transferred = false;
-        errdefer if (!function_transferred) self.alloc.free(function_name);
-        _ = try self.countParenthesizedTypeList();
-        const assignment = if (self.matchKeyword("as")) blk: {
-            if (self.matchKeyword("assignment")) break :blk true;
-            if (self.matchKeyword("implicit")) break :blk false;
-            return error.UnsupportedSqlShape;
-        } else false;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        source_transferred = true;
-        target_transferred = true;
-        function_transferred = true;
-        return .{ .source_type = source_type, .target_type = target_type, .function_name = function_name, .assignment = assignment };
+        var syntax = try sql_adapter.parseCreateCastCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const source_type = syntax.source_type;
+        const target_type = syntax.target_type;
+        const function_name = syntax.function_name;
+        syntax.source_type = "";
+        syntax.target_type = "";
+        syntax.function_name = "";
+        return .{ .source_type = source_type, .target_type = target_type, .function_name = function_name, .assignment = syntax.assignment };
     }
 
     fn parseDropCastDdl(self: *@This()) !DropCastPlan {
-        try self.expectKeyword("cast");
-        try self.expect(.lparen);
-        const source_type = try self.parseIdentifierOwned();
-        var source_transferred = false;
-        errdefer if (!source_transferred) self.alloc.free(source_type);
-        try self.expectKeyword("as");
-        const target_type = try self.parseIdentifierOwned();
-        var target_transferred = false;
-        errdefer if (!target_transferred) self.alloc.free(target_type);
-        try self.expect(.rparen);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        source_transferred = true;
-        target_transferred = true;
+        var syntax = try sql_adapter.parseDropCastCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const source_type = syntax.source_type;
+        const target_type = syntax.target_type;
+        syntax.source_type = "";
+        syntax.target_type = "";
         return .{ .source_type = source_type, .target_type = target_type };
     }
 
@@ -3904,67 +3842,6 @@ const Parser = struct {
 
     fn parseSqlObjectIdentifierListAlloc(self: *@This()) ![]const []const u8 {
         return try sql_adapter.parseSqlObjectIdentifierListAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseSqlOperatorNameOwned(self: *@This()) ![]const u8 {
-        var out = std.ArrayListUnmanaged(u8).empty;
-        errdefer out.deinit(self.alloc);
-        while (!self.atEnd() and !self.peekKind(.lparen)) {
-            const token = self.tokens[self.pos];
-            switch (token.kind) {
-                .identifier, .eq, .neq, .gt, .gte, .lt, .lte, .plus, .minus, .star, .slash, .percent, .at_contains, .range_overlap, .pipe_concat, .question, .question_any, .question_all => {
-                    try out.appendSlice(self.alloc, token.text);
-                    self.pos += 1;
-                },
-                else => return error.UnsupportedSqlShape,
-            }
-        }
-        if (out.items.len == 0) return error.UnsupportedSqlShape;
-        return try out.toOwnedSlice(self.alloc);
-    }
-
-    fn countParenthesizedAssignments(self: *@This()) !usize {
-        try self.expect(.lparen);
-        var depth: usize = 1;
-        var count: usize = 0;
-        var expect_assignment_name = true;
-        while (self.pos < self.tokens.len and depth > 0) {
-            if (self.match(.lparen) != null) {
-                depth += 1;
-                continue;
-            }
-            if (self.match(.rparen) != null) {
-                depth -= 1;
-                continue;
-            }
-            if (depth == 1 and expect_assignment_name) {
-                _ = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-                try self.expect(.eq);
-                count += 1;
-                expect_assignment_name = false;
-                continue;
-            }
-            if (depth == 1 and self.match(.comma) != null) {
-                expect_assignment_name = true;
-                continue;
-            }
-            self.pos += 1;
-        }
-        if (depth != 0 or expect_assignment_name) return error.UnsupportedSqlShape;
-        return count;
-    }
-
-    fn countParenthesizedTypeList(self: *@This()) !usize {
-        try self.expect(.lparen);
-        if (self.match(.rparen) != null) return 0;
-        var count: usize = 0;
-        while (true) {
-            _ = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-            count += 1;
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        return count;
     }
 
     fn parseAlterDomainDdl(self: *@This()) !AlterDomainPlan {

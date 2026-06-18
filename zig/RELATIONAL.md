@@ -1089,6 +1089,8 @@ logical-replication catalog grammar for `CREATE PUBLICATION`,
 `ALTER PUBLICATION ... ADD TABLE`, `DROP PUBLICATION`,
 `CREATE SUBSCRIPTION`, `ALTER SUBSCRIPTION ENABLE/DISABLE`, and
 `DROP SUBSCRIPTION`,
+type-system catalog grammar for collation, operator, aggregate, and cast
+create/drop/rename forms,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -4473,7 +4475,11 @@ shared expression AST, index metadata, query planner, schema validation,
 rebuild/validation jobs, and result-type metadata. Unsupported user-defined
 functions or opaque SQL bodies must not become hidden expression behavior; every
 accepted object needs deterministic execution semantics that are visible to
-REST/SDK typed plans before PostgreSQL syntax can execute it.
+REST/SDK typed plans before PostgreSQL syntax can execute it. These custom
+type-system tails parse in `api/sql_adapter/grammar.zig`; the SQL lowerer only
+transfers owned grammar syntax into typed catalog plans, so future syntax growth
+must become explicit native catalog metadata instead of lowerer-local token
+scans.
 
 PostgreSQL `COMMENT ON TABLE`, `COMMENT ON COLUMN`, `COMMENT ON INDEX`, and
 `COMMENT ON CONSTRAINT` lower to typed `comment_metadata` DDL intents that

@@ -473,6 +473,103 @@ pub const DropSubscriptionSyntax = struct {
     }
 };
 
+pub const CreateCollationSyntax = struct {
+    collation_name: []const u8,
+    option_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.collation_name));
+        self.* = undefined;
+    }
+};
+
+pub const RenameCollationSyntax = struct {
+    collation_name: []const u8,
+    new_collation_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.collation_name));
+        alloc.free(@constCast(self.new_collation_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropCollationSyntax = struct {
+    collation_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.collation_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateOperatorSyntax = struct {
+    operator_name: []const u8,
+    option_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.operator_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropOperatorSyntax = struct {
+    operator_name: []const u8,
+    argument_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.operator_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateAggregateSyntax = struct {
+    aggregate_name: []const u8,
+    argument_count: usize = 0,
+    option_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.aggregate_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropAggregateSyntax = struct {
+    aggregate_name: []const u8,
+    argument_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.aggregate_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateCastSyntax = struct {
+    source_type: []const u8,
+    target_type: []const u8,
+    function_name: []const u8,
+    assignment: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.source_type));
+        alloc.free(@constCast(self.target_type));
+        alloc.free(@constCast(self.function_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropCastSyntax = struct {
+    source_type: []const u8,
+    target_type: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.source_type));
+        alloc.free(@constCast(self.target_type));
+        self.* = undefined;
+    }
+};
+
 pub const RowClaimSyntax = struct {
     clause: ast.SqlRowClaimClause,
     targets: []const []const u8 = &.{},
@@ -1809,6 +1906,189 @@ pub fn parseDropSubscriptionCatalogTailAlloc(
     return .{ .subscription_name = subscription_name, .if_exists = if_exists };
 }
 
+pub fn parseCreateCollationCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateCollationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("collation");
+    const collation_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) alloc.free(collation_name);
+    const option_count = try countParenthesizedAssignments(cursor);
+    try parseAdapterNoopStatementEnd(cursor);
+    collation_transferred = true;
+    return .{ .collation_name = collation_name, .option_count = option_count };
+}
+
+pub fn parseRenameCollationCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !RenameCollationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("collation");
+    const collation_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) alloc.free(collation_name);
+    try cursor.expectKeyword("rename");
+    try cursor.expectKeyword("to");
+    const new_collation_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var new_collation_transferred = false;
+    errdefer if (!new_collation_transferred) alloc.free(new_collation_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    collation_transferred = true;
+    new_collation_transferred = true;
+    return .{ .collation_name = collation_name, .new_collation_name = new_collation_name };
+}
+
+pub fn parseDropCollationCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropCollationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("collation");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const collation_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) alloc.free(collation_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    collation_transferred = true;
+    return .{ .collation_name = collation_name, .if_exists = if_exists };
+}
+
+pub fn parseCreateOperatorCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateOperatorSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("operator");
+    const operator_name = try parseSqlOperatorNameOwnedAlloc(alloc, cursor);
+    var operator_transferred = false;
+    errdefer if (!operator_transferred) alloc.free(operator_name);
+    const option_count = try countParenthesizedAssignments(cursor);
+    try parseAdapterNoopStatementEnd(cursor);
+    operator_transferred = true;
+    return .{ .operator_name = operator_name, .option_count = option_count };
+}
+
+pub fn parseDropOperatorCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropOperatorSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("operator");
+    const operator_name = try parseSqlOperatorNameOwnedAlloc(alloc, cursor);
+    var operator_transferred = false;
+    errdefer if (!operator_transferred) alloc.free(operator_name);
+    const argument_count = try countParenthesizedTypeList(cursor);
+    try parseAdapterNoopStatementEnd(cursor);
+    operator_transferred = true;
+    return .{ .operator_name = operator_name, .argument_count = argument_count };
+}
+
+pub fn parseCreateAggregateCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateAggregateSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("aggregate");
+    const aggregate_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var aggregate_transferred = false;
+    errdefer if (!aggregate_transferred) alloc.free(aggregate_name);
+    const argument_count = try countParenthesizedTypeList(cursor);
+    const option_count = try countParenthesizedAssignments(cursor);
+    try parseAdapterNoopStatementEnd(cursor);
+    aggregate_transferred = true;
+    return .{ .aggregate_name = aggregate_name, .argument_count = argument_count, .option_count = option_count };
+}
+
+pub fn parseDropAggregateCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropAggregateSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("aggregate");
+    const aggregate_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var aggregate_transferred = false;
+    errdefer if (!aggregate_transferred) alloc.free(aggregate_name);
+    const argument_count = try countParenthesizedTypeList(cursor);
+    try parseAdapterNoopStatementEnd(cursor);
+    aggregate_transferred = true;
+    return .{ .aggregate_name = aggregate_name, .argument_count = argument_count };
+}
+
+pub fn parseCreateCastCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateCastSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("cast");
+    try cursor.expectToken(.lparen);
+    const source_type = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var source_transferred = false;
+    errdefer if (!source_transferred) alloc.free(source_type);
+    try cursor.expectKeyword("as");
+    const target_type = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var target_transferred = false;
+    errdefer if (!target_transferred) alloc.free(target_type);
+    try cursor.expectToken(.rparen);
+    try cursor.expectKeyword("with");
+    try cursor.expectKeyword("function");
+    const function_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var function_transferred = false;
+    errdefer if (!function_transferred) alloc.free(function_name);
+    _ = try countParenthesizedTypeList(cursor);
+    const assignment = if (cursor.matchKeyword("as")) blk: {
+        if (cursor.matchKeyword("assignment")) break :blk true;
+        if (cursor.matchKeyword("implicit")) break :blk false;
+        return error.UnsupportedSqlShape;
+    } else false;
+    try parseAdapterNoopStatementEnd(cursor);
+    source_transferred = true;
+    target_transferred = true;
+    function_transferred = true;
+    return .{
+        .source_type = source_type,
+        .target_type = target_type,
+        .function_name = function_name,
+        .assignment = assignment,
+    };
+}
+
+pub fn parseDropCastCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropCastSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("cast");
+    try cursor.expectToken(.lparen);
+    const source_type = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var source_transferred = false;
+    errdefer if (!source_transferred) alloc.free(source_type);
+    try cursor.expectKeyword("as");
+    const target_type = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var target_transferred = false;
+    errdefer if (!target_transferred) alloc.free(target_type);
+    try cursor.expectToken(.rparen);
+    try parseAdapterNoopStatementEnd(cursor);
+    source_transferred = true;
+    target_transferred = true;
+    return .{ .source_type = source_type, .target_type = target_type };
+}
+
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
     const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
     if (dot == 0) return error.UnsupportedSqlShape;
@@ -2058,6 +2338,72 @@ fn countParenthesizedTypeList(cursor: parser.Cursor) !usize {
         if (cursor.matchToken(.comma) == null) break;
     }
     try cursor.expectToken(.rparen);
+    return count;
+}
+
+fn parseSqlOperatorNameOwnedAlloc(alloc: std.mem.Allocator, cursor: parser.Cursor) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    while (!cursor.atEnd() and !cursor.peekKind(.lparen)) {
+        const token = cursor.tokens[cursor.pos.*];
+        switch (token.kind) {
+            .identifier,
+            .eq,
+            .neq,
+            .gt,
+            .gte,
+            .lt,
+            .lte,
+            .plus,
+            .minus,
+            .star,
+            .slash,
+            .percent,
+            .at_contains,
+            .range_overlap,
+            .pipe_concat,
+            .question,
+            .question_any,
+            .question_all,
+            => {
+                try out.appendSlice(alloc, token.text);
+                cursor.pos.* += 1;
+            },
+            else => return error.UnsupportedSqlShape,
+        }
+    }
+    if (out.items.len == 0) return error.UnsupportedSqlShape;
+    return try out.toOwnedSlice(alloc);
+}
+
+fn countParenthesizedAssignments(cursor: parser.Cursor) !usize {
+    try cursor.expectToken(.lparen);
+    var depth: usize = 1;
+    var count: usize = 0;
+    var expect_assignment_name = true;
+    while (!cursor.atEnd() and depth > 0) {
+        if (cursor.matchToken(.lparen) != null) {
+            depth += 1;
+            continue;
+        }
+        if (cursor.matchToken(.rparen) != null) {
+            depth -= 1;
+            continue;
+        }
+        if (depth == 1 and expect_assignment_name) {
+            _ = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            count += 1;
+            expect_assignment_name = false;
+            continue;
+        }
+        if (depth == 1 and cursor.matchToken(.comma) != null) {
+            expect_assignment_name = true;
+            continue;
+        }
+        try cursor.advance(1);
+    }
+    if (depth != 0 or expect_assignment_name) return error.UnsupportedSqlShape;
     return count;
 }
 
@@ -2816,6 +3162,94 @@ test "sql adapter grammar parses logical replication catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreatePublicationCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses type system catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_collation_tokens = try lexer.tokenizeAlloc(alloc, "COLLATION en_us (locale = 'en_US', deterministic = true);");
+    defer lexer.freeTokens(alloc, &create_collation_tokens);
+    var create_collation_pos: usize = 0;
+    var create_collation = try parseCreateCollationCatalogTailAlloc(alloc, create_collation_tokens.items, &create_collation_pos);
+    defer create_collation.deinit(alloc);
+    try std.testing.expectEqual(create_collation_tokens.items.len, create_collation_pos);
+    try std.testing.expectEqualStrings("en_us", create_collation.collation_name);
+    try std.testing.expectEqual(@as(usize, 2), create_collation.option_count);
+
+    var rename_collation_tokens = try lexer.tokenizeAlloc(alloc, "COLLATION en_us RENAME TO en_us_v2;");
+    defer lexer.freeTokens(alloc, &rename_collation_tokens);
+    var rename_collation_pos: usize = 0;
+    var rename_collation = try parseRenameCollationCatalogTailAlloc(alloc, rename_collation_tokens.items, &rename_collation_pos);
+    defer rename_collation.deinit(alloc);
+    try std.testing.expectEqual(rename_collation_tokens.items.len, rename_collation_pos);
+    try std.testing.expectEqualStrings("en_us", rename_collation.collation_name);
+    try std.testing.expectEqualStrings("en_us_v2", rename_collation.new_collation_name);
+
+    var drop_collation_tokens = try lexer.tokenizeAlloc(alloc, "COLLATION IF EXISTS en_us_v2;");
+    defer lexer.freeTokens(alloc, &drop_collation_tokens);
+    var drop_collation_pos: usize = 0;
+    var drop_collation = try parseDropCollationCatalogTailAlloc(alloc, drop_collation_tokens.items, &drop_collation_pos);
+    defer drop_collation.deinit(alloc);
+    try std.testing.expectEqual(drop_collation_tokens.items.len, drop_collation_pos);
+    try std.testing.expectEqualStrings("en_us_v2", drop_collation.collation_name);
+    try std.testing.expect(drop_collation.if_exists);
+
+    var create_operator_tokens = try lexer.tokenizeAlloc(alloc, "OPERATOR + (leftarg = int, rightarg = int, procedure = int4pl);");
+    defer lexer.freeTokens(alloc, &create_operator_tokens);
+    var create_operator_pos: usize = 0;
+    var create_operator = try parseCreateOperatorCatalogTailAlloc(alloc, create_operator_tokens.items, &create_operator_pos);
+    defer create_operator.deinit(alloc);
+    try std.testing.expectEqual(create_operator_tokens.items.len, create_operator_pos);
+    try std.testing.expectEqualStrings("+", create_operator.operator_name);
+    try std.testing.expectEqual(@as(usize, 3), create_operator.option_count);
+
+    var drop_operator_tokens = try lexer.tokenizeAlloc(alloc, "OPERATOR + (int, int);");
+    defer lexer.freeTokens(alloc, &drop_operator_tokens);
+    var drop_operator_pos: usize = 0;
+    var drop_operator = try parseDropOperatorCatalogTailAlloc(alloc, drop_operator_tokens.items, &drop_operator_pos);
+    defer drop_operator.deinit(alloc);
+    try std.testing.expectEqual(drop_operator_tokens.items.len, drop_operator_pos);
+    try std.testing.expectEqualStrings("+", drop_operator.operator_name);
+    try std.testing.expectEqual(@as(usize, 2), drop_operator.argument_count);
+
+    var create_aggregate_tokens = try lexer.tokenizeAlloc(alloc, "AGGREGATE sum2 (int) (sfunc = int4pl, stype = int);");
+    defer lexer.freeTokens(alloc, &create_aggregate_tokens);
+    var create_aggregate_pos: usize = 0;
+    var create_aggregate = try parseCreateAggregateCatalogTailAlloc(alloc, create_aggregate_tokens.items, &create_aggregate_pos);
+    defer create_aggregate.deinit(alloc);
+    try std.testing.expectEqual(create_aggregate_tokens.items.len, create_aggregate_pos);
+    try std.testing.expectEqualStrings("sum2", create_aggregate.aggregate_name);
+    try std.testing.expectEqual(@as(usize, 1), create_aggregate.argument_count);
+    try std.testing.expectEqual(@as(usize, 2), create_aggregate.option_count);
+
+    var drop_aggregate_tokens = try lexer.tokenizeAlloc(alloc, "AGGREGATE sum2 (int);");
+    defer lexer.freeTokens(alloc, &drop_aggregate_tokens);
+    var drop_aggregate_pos: usize = 0;
+    var drop_aggregate = try parseDropAggregateCatalogTailAlloc(alloc, drop_aggregate_tokens.items, &drop_aggregate_pos);
+    defer drop_aggregate.deinit(alloc);
+    try std.testing.expectEqual(drop_aggregate_tokens.items.len, drop_aggregate_pos);
+    try std.testing.expectEqualStrings("sum2", drop_aggregate.aggregate_name);
+    try std.testing.expectEqual(@as(usize, 1), drop_aggregate.argument_count);
+
+    var create_cast_tokens = try lexer.tokenizeAlloc(alloc, "CAST (text AS int) WITH FUNCTION text_to_int(text) AS ASSIGNMENT;");
+    defer lexer.freeTokens(alloc, &create_cast_tokens);
+    var create_cast_pos: usize = 0;
+    var create_cast = try parseCreateCastCatalogTailAlloc(alloc, create_cast_tokens.items, &create_cast_pos);
+    defer create_cast.deinit(alloc);
+    try std.testing.expectEqual(create_cast_tokens.items.len, create_cast_pos);
+    try std.testing.expectEqualStrings("text", create_cast.source_type);
+    try std.testing.expectEqualStrings("int", create_cast.target_type);
+    try std.testing.expectEqualStrings("text_to_int", create_cast.function_name);
+    try std.testing.expect(create_cast.assignment);
+
+    var drop_cast_tokens = try lexer.tokenizeAlloc(alloc, "CAST (text AS int);");
+    defer lexer.freeTokens(alloc, &drop_cast_tokens);
+    var drop_cast_pos: usize = 0;
+    var drop_cast = try parseDropCastCatalogTailAlloc(alloc, drop_cast_tokens.items, &drop_cast_pos);
+    defer drop_cast.deinit(alloc);
+    try std.testing.expectEqual(drop_cast_tokens.items.len, drop_cast_pos);
+    try std.testing.expectEqualStrings("text", drop_cast.source_type);
+    try std.testing.expectEqualStrings("int", drop_cast.target_type);
 }
 
 test "sql adapter grammar parses bulk io tails" {
