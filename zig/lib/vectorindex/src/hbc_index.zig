@@ -88,6 +88,7 @@ pub const LeafKeyEntry = struct {
 
 const FixedKeyLookup = search_runtime.RerankLookup;
 const small_metadata_batch_count = 64;
+const small_coalesced_batch_count = 512;
 
 pub const SplitResult = struct {
     c1: []f32,
@@ -6878,14 +6879,21 @@ pub fn batchApplyOptions(
 
     try batchDeleteTxn(self, &batch, deletes);
 
+    var processed_write_stack: [small_coalesced_batch_count]bool = undefined;
+    var remaining_write_stack: [small_coalesced_batch_count]hbc_runtime.BatchInsertItem = undefined;
     var processed_write_updates: []bool = &.{};
     var remaining_write_storage: []hbc_runtime.BatchInsertItem = &.{};
-    defer if (processed_write_updates.len > 0) self.alloc.free(processed_write_updates);
-    defer if (remaining_write_storage.len > 0) self.alloc.free(remaining_write_storage);
+    var processed_write_on_stack = false;
+    var remaining_write_on_stack = false;
+    defer if (processed_write_updates.len > 0 and !processed_write_on_stack) self.alloc.free(processed_write_updates);
+    defer if (remaining_write_storage.len > 0 and !remaining_write_on_stack) self.alloc.free(remaining_write_storage);
 
     var effective_writes = writes;
     if (writes.len > 1 and options.coalesce_leaf_writes) {
-        processed_write_updates = try self.alloc.alloc(bool, writes.len);
+        processed_write_updates = if (writes.len <= processed_write_stack.len) blk: {
+            processed_write_on_stack = true;
+            break :blk processed_write_stack[0..writes.len];
+        } else try self.alloc.alloc(bool, writes.len);
         @memset(processed_write_updates, false);
         const processed_count = try batchCoalesceBaseDeltaExistingUpdatesTxnOptions(
             self,
@@ -6895,7 +6903,11 @@ pub fn batchApplyOptions(
             processed_write_updates,
         );
         if (processed_count != 0) {
-            remaining_write_storage = try self.alloc.alloc(hbc_runtime.BatchInsertItem, writes.len - processed_count);
+            const remaining_count = writes.len - processed_count;
+            remaining_write_storage = if (remaining_count <= remaining_write_stack.len) blk: {
+                remaining_write_on_stack = true;
+                break :blk remaining_write_stack[0..remaining_count];
+            } else try self.alloc.alloc(hbc_runtime.BatchInsertItem, remaining_count);
             var wi: usize = 0;
             for (writes, 0..) |item, i| {
                 if (processed_write_updates[i]) continue;
@@ -6946,14 +6958,21 @@ pub fn batchInsertWithMetadataOptions(
         if (shouldUseCursorTxnForBatchWrites(self, options)) {
             var txn = try self.beginRuntimeWriteTxn();
             errdefer txn.abort();
+            var processed_write_stack: [small_coalesced_batch_count]bool = undefined;
+            var remaining_write_stack: [small_coalesced_batch_count]hbc_runtime.BatchInsertItem = undefined;
             var processed_write_updates: []bool = &.{};
             var remaining_write_storage: []hbc_runtime.BatchInsertItem = &.{};
-            defer if (processed_write_updates.len > 0) self.alloc.free(processed_write_updates);
-            defer if (remaining_write_storage.len > 0) self.alloc.free(remaining_write_storage);
+            var processed_write_on_stack = false;
+            var remaining_write_on_stack = false;
+            defer if (processed_write_updates.len > 0 and !processed_write_on_stack) self.alloc.free(processed_write_updates);
+            defer if (remaining_write_storage.len > 0 and !remaining_write_on_stack) self.alloc.free(remaining_write_storage);
 
             var effective_items = items;
             if (options.coalesce_leaf_writes) {
-                processed_write_updates = try self.alloc.alloc(bool, items.len);
+                processed_write_updates = if (items.len <= processed_write_stack.len) blk: {
+                    processed_write_on_stack = true;
+                    break :blk processed_write_stack[0..items.len];
+                } else try self.alloc.alloc(bool, items.len);
                 @memset(processed_write_updates, false);
                 const processed_count = try batchCoalesceBaseDeltaExistingUpdatesTxnOptions(
                     self,
@@ -6963,7 +6982,11 @@ pub fn batchInsertWithMetadataOptions(
                     processed_write_updates,
                 );
                 if (processed_count != 0) {
-                    remaining_write_storage = try self.alloc.alloc(hbc_runtime.BatchInsertItem, items.len - processed_count);
+                    const remaining_count = items.len - processed_count;
+                    remaining_write_storage = if (remaining_count <= remaining_write_stack.len) blk: {
+                        remaining_write_on_stack = true;
+                        break :blk remaining_write_stack[0..remaining_count];
+                    } else try self.alloc.alloc(hbc_runtime.BatchInsertItem, remaining_count);
                     var wi: usize = 0;
                     for (items, 0..) |item, i| {
                         if (processed_write_updates[i]) continue;
