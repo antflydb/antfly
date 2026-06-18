@@ -4402,7 +4402,7 @@ fn namespaceTxnChildMatches(comptime T: type, comptime cursor_txn: bool) bool {
 
 fn deleteDeltaTail(index: anytype, txn: anytype, posting_id: PostingId) !DeleteDeltaTailStats {
     const TailKey = struct {
-        key: []u8,
+        key: [18]u8,
         value_len: usize,
     };
 
@@ -4412,16 +4412,15 @@ fn deleteDeltaTail(index: anytype, txn: anytype, posting_id: PostingId) !DeleteD
     var prefix_buf: [10]u8 = undefined;
     const prefix = hbc.encodePostingDeltaPrefix(&prefix_buf, posting_id);
     var keys: std.ArrayList(TailKey) = .empty;
-    defer {
-        for (keys.items) |entry| index.alloc.free(entry.key);
-        keys.deinit(index.alloc);
-    }
+    defer keys.deinit(index.alloc);
 
     var maybe_entry = try cursor.seekAtOrAfter(prefix);
     while (maybe_entry) |entry| {
         if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+        var key: [18]u8 = undefined;
+        @memcpy(key[0..], entry.key);
         try keys.append(index.alloc, .{
-            .key = try index.alloc.dupe(u8, entry.key),
+            .key = key,
             .value_len = entry.value.len,
         });
         maybe_entry = try cursor.next();
@@ -4429,7 +4428,7 @@ fn deleteDeltaTail(index: anytype, txn: anytype, posting_id: PostingId) !DeleteD
 
     var stats = DeleteDeltaTailStats{};
     for (keys.items) |entry| {
-        try index.deleteNamespaced(txn, .nodes, entry.key);
+        try index.deleteNamespaced(txn, .nodes, entry.key[0..]);
         stats.keys += 1;
         stats.key_bytes += entry.key.len;
         stats.value_bytes += entry.value_len;

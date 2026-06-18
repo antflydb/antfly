@@ -966,7 +966,9 @@ implementations cleanly:
    consider observed query replay cost, tail bytes, tombstone density, and
    maintenance resource pressure. Fold decision scans and replay/application
    scans should also converge toward one streaming pass that buffers only a
-   bounded operation summary before deciding whether to fold.
+   bounded operation summary before deciding whether to fold. LSM tail deletion
+   now stores fixed-size posting-delta keys inline while collecting keys to
+   delete, avoiding one heap allocation per tail key during folds.
 
    Expected win: avoid folding cold tiny tails while keeping hot query
    overlays cheap, and avoid duplicate cursor/decode work when folding.
