@@ -3015,6 +3015,7 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     if (schema.storage_mode != .relational) return error.InvalidRowsRequest;
     if (request.source_cte.len != 0) return error.UnsupportedRowsQuery;
     if (request.row_claim != null) return error.UnsupportedRowsQuery;
+    if (request.doc_key_range != null and schema.primary_key == null) return error.InvalidRowsRequest;
     try validateLakeRowsQueryPredicateGroupsSupported(alloc, schema, request);
     for (request.distinct_on) |field| {
         const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
@@ -4076,11 +4077,13 @@ fn lakeProjectedRowDocKeyAlloc(
     maybe_schema: ?runtime_schema.TableSchema,
     row: lake_rows.ProjectedRow,
 ) ![]u8 {
-    if (maybe_schema) |schema| if (schema.primary_key != null) {
-        const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
-        defer alloc.free(row_json);
-        return try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
-    };
+    if (maybe_schema) |schema| {
+        if (schema.primary_key != null) {
+            const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+            defer alloc.free(row_json);
+            return try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+        }
+    }
     return switch (row.row_ref) {
         .relational_key => |key| try alloc.dupe(u8, key),
         .serverless, .external => error.InvalidRowsRequest,
@@ -18429,6 +18432,80 @@ test "relational rows lake bridge supports field ordering before query limit" {
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":20}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"amount\":30}", result.rows[1]);
+}
+
+test "relational rows lake bridge applies doc key range before query limit" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+    const range_start = try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, "{\"id\":\"b\"}");
+    defer alloc.free(range_start);
+    const range_end = try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, "{\"id\":\"c\"}");
+    defer alloc.free(range_end);
+    const select = [_][]const u8{"amount"};
+    const request = OwnedRowsQueryRequest{
+        .select_all = false,
+        .select = &select,
+        .doc_key_range = .{ .start = range_start, .end = range_end },
+        .limit = 1,
+    };
+
+    var lake_request = try buildLakeRowsScanRequestForRowsQueryAlloc(alloc, schema, request);
+    defer lake_request.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?usize, null), lake_request.request.limit);
+    try std.testing.expectEqual(@as(usize, 2), lake_request.request.projected_columns.len);
+    try std.testing.expectEqualStrings("amount", lake_request.request.projected_columns[0]);
+    try std.testing.expectEqualStrings("id", lake_request.request.projected_columns[1]);
+
+    const amount_a = @constCast("amount"[0..]);
+    const id_a = @constCast("id"[0..]);
+    const row_a = @constCast("a"[0..]);
+    const amount_b = @constCast("amount"[0..]);
+    const id_b = @constCast("id"[0..]);
+    const row_b = @constCast("b"[0..]);
+    const amount_c = @constCast("amount"[0..]);
+    const id_c = @constCast("id"[0..]);
+    const row_c = @constCast("c"[0..]);
+    var cells_a = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_a, .value = .{ .i64 = 10 } },
+        .{ .name = id_a, .value = .{ .bytes = row_a } },
+    };
+    var cells_b = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_b, .value = .{ .i64 = 20 } },
+        .{ .name = id_b, .value = .{ .bytes = row_b } },
+    };
+    var cells_c = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_c, .value = .{ .i64 = 30 } },
+        .{ .name = id_c, .value = .{ .bytes = row_c } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 0 } }, .cells = &cells_a },
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 1 } }, .cells = &cells_b },
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 2 } }, .cells = &cells_c },
+    };
+
+    var result = try buildRowsQueryResultFromLakeRowsWithSchemaAlloc(
+        alloc,
+        schema,
+        request,
+        .{
+            .rows = &projected,
+            .total = 3,
+        },
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":20}", result.rows[0]);
 }
 
 test "relational rows lake bridge lowers expression predicates to residual scan columns" {

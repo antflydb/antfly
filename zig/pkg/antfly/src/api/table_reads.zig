@@ -17200,6 +17200,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     const alloc = std.testing.allocator;
 
     var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
         .{ .name = "tenant", .path = "tenant", .field_type = .keyword, .nullable = false },
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
         .{ .name = "attrs", .path = "attrs", .field_type = .json, .nullable = false },
@@ -17209,6 +17210,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     const schema = storage_schema.TableSchema{
         .storage_mode = .relational,
         .relational_columns = columns[0..],
+        .primary_key = .{ .columns = &.{"id"} },
         .external_base_source = .{
             .table_id = "events",
             .format = .parquet,
@@ -17355,7 +17357,9 @@ test "external lake rows query and aggregate plans route through lake scan hook"
             for (projected_columns, cells) |column, *cell| {
                 cell.* = .{
                     .name = try row_alloc.dupe(u8, column),
-                    .value = if (std.mem.eql(u8, column, "amount"))
+                    .value = if (std.mem.eql(u8, column, "id"))
+                        .{ .bytes = try row_alloc.dupe(u8, if (amount == 20) "a" else "b") }
+                    else if (std.mem.eql(u8, column, "amount"))
                         .{ .i64 = amount }
                     else if (std.mem.eql(u8, column, "tenant"))
                         .{ .bytes = try row_alloc.dupe(u8, "t2") }
@@ -17643,6 +17647,26 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 1), offset_query_result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":30}", offset_query_result.rows[0]);
 
+    const doc_range_start = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, "{\"id\":\"b\"}");
+    defer alloc.free(doc_range_start);
+    const doc_range_end = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, "{\"id\":\"c\"}");
+    defer alloc.free(doc_range_end);
+    var doc_key_range_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+            .doc_key_range = .{ .start = doc_range_start, .end = doc_range_end },
+            .limit = 1,
+        },
+    }, .read_index)).?;
+    defer doc_key_range_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 13), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(?usize, null), fake.last_scan_limit);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), doc_key_range_result.total);
+    try std.testing.expectEqual(@as(usize, 1), doc_key_range_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", doc_key_range_result.rows[0]);
+
     const distinct_on = [_][]const u8{"tenant"};
     var unordered_distinct_query_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
         .query = .{
@@ -17653,7 +17677,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer unordered_distinct_query_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 13), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 14), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(?usize, null), fake.last_scan_limit);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), unordered_distinct_query_result.total);
@@ -17674,7 +17698,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer distinct_query_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 14), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 15), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(?usize, null), fake.last_scan_limit);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), distinct_query_result.total);
@@ -17704,7 +17728,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer distinct_expression_query_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 15), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 16), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(?usize, null), fake.last_scan_limit);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), distinct_expression_query_result.total);
@@ -17722,7 +17746,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 16), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 17), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
