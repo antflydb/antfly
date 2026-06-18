@@ -80,6 +80,15 @@ pub fn isAbsoluteNormalizedPath(path: []const u8) bool {
     return std.fs.path.isAbsolute(path) and isNormalizedPath(path);
 }
 
+pub fn isAbsoluteNormalizedPathWithinRoot(path: []const u8, root: []const u8) bool {
+    if (!isAbsoluteNormalizedPath(path)) return false;
+    if (!isAbsoluteNormalizedPath(root)) return false;
+    if (std.mem.eql(u8, root, "/")) return true;
+    if (std.mem.eql(u8, path, root)) return true;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len > root.len and path[root.len] == '/';
+}
+
 test "storage.ha validation classifies missing padded and valid strings" {
     try std.testing.expectEqual(StringValidation.missing, classifyString(null));
     try std.testing.expectEqual(StringValidation.missing, classifyString(""));
@@ -106,4 +115,14 @@ test "storage.ha validation checks identifiers env names and normalized paths" {
     try std.testing.expect(!isNormalizedPath("ha//primary.wal"));
     try std.testing.expect(!isNormalizedPath("."));
     try std.testing.expect(!isAbsoluteNormalizedPath("/tmp/../ha-primary.wal"));
+}
+
+test "storage.ha validation checks paths are bounded by an allowed root" {
+    try std.testing.expect(isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly/ha/primary.wal", "/var/lib/antfly"));
+    try std.testing.expect(isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly", "/var/lib/antfly"));
+    try std.testing.expect(isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly/ha/primary.wal", "/"));
+    try std.testing.expect(!isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly2/ha/primary.wal", "/var/lib/antfly"));
+    try std.testing.expect(!isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly/../primary.wal", "/var/lib/antfly"));
+    try std.testing.expect(!isAbsoluteNormalizedPathWithinRoot("ha/primary.wal", "/var/lib/antfly"));
+    try std.testing.expect(!isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly/ha/primary.wal", "var/lib/antfly"));
 }

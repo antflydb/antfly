@@ -742,6 +742,7 @@ pub fn runFromIterator(
     defer local_metadata.deinit();
 
     try validateHARole(cli);
+    try validateHAPathsUnderRoot(cli, data_dir);
     var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
     defer ha_sync_policy.deinit(alloc);
     const ha_retention_policy = try haRetentionPolicyFromCli(cli);
@@ -2240,6 +2241,12 @@ fn requireHAPath(value: ?[]const u8, comptime missing_err: anyerror, comptime in
     return raw;
 }
 
+fn requireHAPathWithinRoot(value: ?[]const u8, root: []const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
+    const raw = try requireHAPath(value, missing_err, invalid_err);
+    if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(raw, root)) return invalid_err;
+    return raw;
+}
+
 fn requireHAIdentifier(value: ?[]const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
     const raw = try requireHAString(value, missing_err, invalid_err);
     if (!antfly.ha.validation.isIdentifier(raw)) return invalid_err;
@@ -2256,6 +2263,23 @@ fn validateHAStandbyRoleComplete(cli: CliConfig) !void {
     _ = try requireHAPath(cli.ha_standby_log, error.HAStandbyLogMissing, error.HAStandbyLogInvalid);
     _ = try requireHAPath(cli.ha_standby_progress, error.HAStandbyProgressMissing, error.HAStandbyProgressInvalid);
     _ = try requireHAIdentifier(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid);
+}
+
+fn validateHAPathsUnderRoot(cli: CliConfig, data_root: []const u8) !void {
+    if (cli.ha_former_primary_log != null) {
+        _ = try requireHAPathWithinRoot(cli.ha_former_primary_log, data_root, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
+    }
+    if (haPrimaryRequested(cli) or haStandbyRequested(cli)) {
+        _ = try requireHAPathWithinRoot(cli.ha_fence_wal, data_root, error.HAFenceWalMissing, error.HAFenceWalInvalid);
+    }
+    if (haPrimaryRequested(cli)) {
+        _ = try requireHAPathWithinRoot(cli.ha_primary_log, data_root, error.HAPrimaryLogMissing, error.HAPrimaryLogInvalid);
+        _ = try requireHAPathWithinRoot(cli.ha_primary_slots, data_root, error.HAPrimarySlotsMissing, error.HAPrimarySlotsInvalid);
+    }
+    if (haStandbyRequested(cli)) {
+        _ = try requireHAPathWithinRoot(cli.ha_standby_log, data_root, error.HAStandbyLogMissing, error.HAStandbyLogInvalid);
+        _ = try requireHAPathWithinRoot(cli.ha_standby_progress, data_root, error.HAStandbyProgressMissing, error.HAStandbyProgressInvalid);
+    }
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
@@ -3439,6 +3463,100 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_sync_mode = .remote_write,
         .ha_sync_required = 1,
     }));
+}
+
+test "swarm HA runtime requires HA paths under resolved data root" {
+    const root = "/tmp/antfly-data-root";
+    const primary_cfg = CliConfig{
+        .ha_primary_log = root ++ "/ha/primary.log",
+        .ha_primary_slots = root ++ "/ha/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_former_primary_log = root ++ "/ha/primary.log",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    };
+    try validateHARole(primary_cfg);
+    try validateHAPathsUnderRoot(primary_cfg, root);
+
+    try std.testing.expectError(error.HAPrimaryLogInvalid, validateHAPathsUnderRoot(.{
+        .ha_primary_log = "/tmp/outside/primary.log",
+        .ha_primary_slots = root ++ "/ha/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }, root));
+    try std.testing.expectError(error.HAPrimarySlotsInvalid, validateHAPathsUnderRoot(.{
+        .ha_primary_log = root ++ "/ha/primary.log",
+        .ha_primary_slots = "/tmp/outside/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }, root));
+    try std.testing.expectError(error.HAFenceWalInvalid, validateHAPathsUnderRoot(.{
+        .ha_primary_log = root ++ "/ha/primary.log",
+        .ha_primary_slots = root ++ "/ha/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = "/tmp/outside/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }, root));
+    try std.testing.expectError(error.HAFormerPrimaryLogInvalid, validateHAPathsUnderRoot(.{
+        .ha_primary_log = root ++ "/ha/primary.log",
+        .ha_primary_slots = root ++ "/ha/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_former_primary_log = "/tmp/outside/former-primary.log",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }, root));
+
+    const standby_cfg = CliConfig{
+        .ha_standby_log = root ++ "/ha/standby.log",
+        .ha_standby_progress = root ++ "/ha/standby-progress.wal",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    };
+    try validateHARole(standby_cfg);
+    try validateHAPathsUnderRoot(standby_cfg, root);
+
+    try std.testing.expectError(error.HAStandbyLogInvalid, validateHAPathsUnderRoot(.{
+        .ha_standby_log = "/tmp/outside/standby.log",
+        .ha_standby_progress = root ++ "/ha/standby-progress.wal",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }, root));
+    try std.testing.expectError(error.HAStandbyProgressInvalid, validateHAPathsUnderRoot(.{
+        .ha_standby_log = root ++ "/ha/standby.log",
+        .ha_standby_progress = "/tmp/outside/standby-progress.wal",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }, root));
+    try std.testing.expectError(error.HAPrimaryLogInvalid, validateHAPathsUnderRoot(.{
+        .ha_primary_log = "/tmp/antfly-data-root2/ha/primary.log",
+        .ha_primary_slots = root ++ "/ha/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = root ++ "/ha/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }, root));
 }
 
 test "swarm HA runtime validates bearer token env name before lookup" {
