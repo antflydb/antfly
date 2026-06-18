@@ -475,6 +475,38 @@ fragments. Steps 8 through 10 make that path interoperable with Iceberg,
 Parquet, and Lance-style data without making those protocols the center of
 Antfly's storage design.
 
+## Implementation Tracker
+
+The current branch has the Antfly-owned scaffold in place: shared `RowSource`
+types, local/external batch adapters, serverless row fragments and stats,
+manifest base-source/artifact kinds, row-fragment publication, a
+`ServerlessFragmentRowSource`, algebraic group/expression materializations,
+sidecar source declarations, adaptive promotion recommendations, and scaffold
+operations for compatibility, GC, explain, rebuild, and cache accounting.
+
+That scaffold is intentionally not yet the real lake query engine. The
+remaining work is the production path that turns the scaffold into efficient
+queries over user-owned object-storage files:
+
+| Track | Status | Next Proof |
+| --- | --- | --- |
+| Real Parquet scanner | Not implemented. Current external row sources are batch adapters used to prove the `RowSource` contract. | Filesystem-backed Parquet fixture can run projection, scalar predicate, row-group pruning, and stable external row refs through `rows:query`. |
+| Object-store range I/O | Designed, not wired into a Parquet scanner. | Scanner reads footers from object tails and coalesces projected column chunk ranges through Antfly's object-storage abstraction with cache keys including object version/ETag and byte range. |
+| Catalog/schema lake binding | Designed, not attached to relational table schema/catalog metadata. | Table schema accepts an external base-source binding with URI, format, credential ref, snapshot mode, schema fingerprint, and read-only write policy. |
+| Relational `rows:query` integration | Scaffold query helpers exist; public row-plan execution is not yet routed through external lake sources. | `rows:query` over an external Parquet table supports projection, scalar filters, limit, simple ordering, and JSON-row adaptation while typed execution matures. |
+| Relational aggregate integration | Algebraic artifact scaffolding exists; aggregate API integration over lake scans is not yet production. | `rows:aggregate` over external batches supports `count`, `sum`, `min`, `max`, and `avg`, first by scan/prune and then by algebraic materialization when available. |
+| Iceberg reader | External Iceberg source identity exists; metadata/manifest/delete handling is not implemented. | Iceberg snapshot binding reads metadata/manifests, expands data files, applies position/equality deletes, and preserves schema/snapshot correctness. |
+| Sidecar builders over real lake rows | Binding/declaration layer exists. Builders still need to consume real Parquet/Iceberg batches. | Full-text, dense vector, sparse vector, and graph sidecars build from external row refs and can produce candidate row refs that hydrate projected lake columns. |
+| Freshness and consistency enforcement | Snapshot binding rules are designed; scaffold validation exists for declared artifacts and batches. | Query planning pins one source snapshot, rejects or ignores stale sidecars by policy, and never mixes candidate row refs from one snapshot with data files from another. |
+| Cache isolation | Cache accounting classes exist; scanner/cache integration is not complete. | Metadata/footer, decoded data/page, broad-scan scratch, and serving-critical sidecar caches have separate admission/eviction policy. |
+| Production operations | Scaffold compatibility, GC, explain, rebuild, and cache accounting exist. | Operator workflows rebuild sidecars from snapshot inventories, garbage-collect retained snapshots safely, expose explain output for lake scans/sidecars, and cover failure modes with fixtures. |
+
+This tracker is the line between "scaffold complete" and "lake engine
+complete." The scaffold proves Antfly's owned shape; the engine is complete
+only when external Parquet/Iceberg/Lance tables can be queried through the
+public relational APIs with snapshot correctness, object-store-efficient reads,
+sidecar acceleration, cache isolation, and operational rebuild/GC behavior.
+
 ## Object Storage Reads
 
 Antfly already has an object storage abstraction for S3, GCS, filesystem, and
