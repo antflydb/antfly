@@ -1311,6 +1311,7 @@ fn serveUnifiedInner(
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
     try registerHAAdminRoutes(&server);
+    try registerHAInternalRoutes(&server);
     try registerMcpRoutes(&server);
     try registerInternalGroupRoutes(&server);
     try registerAntfarmRoutes(&server);
@@ -1388,6 +1389,19 @@ fn registerHAAdminRoutes(server: anytype) !void {
         try server.post(path, haAdminBridgeHandler);
         try server.put(path, haAdminBridgeHandler);
         try server.delete(path, haAdminBridgeHandler);
+    }
+}
+
+fn registerHAInternalRoutes(server: anytype) !void {
+    const ha_paths = [_][]const u8{
+        antfly.internal.routes.ha,
+        antfly.internal.routes.ha ++ "/*",
+    };
+    inline for (ha_paths) |path| {
+        try server.get(path, haInternalBridgeHandler);
+        try server.post(path, haInternalBridgeHandler);
+        try server.put(path, haInternalBridgeHandler);
+        try server.delete(path, haInternalBridgeHandler);
     }
 }
 
@@ -1530,6 +1544,36 @@ fn isAntfarmReservedPath(path: []const u8) bool {
 }
 
 fn haAdminBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    const server = active_api_server orelse {
+        _ = ctx.status(503);
+        return ctx.text("not ready");
+    };
+
+    const method: http_common.Method = switch (ctx.request.method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        else => {
+            _ = ctx.status(405);
+            return ctx.text("method not allowed");
+        },
+    };
+
+    const body_data = (try ctx.body()) orelse "";
+    const legacy_req = http_common.HttpRequest{
+        .method = method,
+        .uri = ctx.request.uri.raw,
+        .authorization = ctx.header("authorization"),
+        .content_type = ctx.header("content-type"),
+        .body = body_data,
+    };
+
+    var resp = try server.handle(legacy_req);
+    return AntflyApiHandler.respond(ctx, &resp);
+}
+
+fn haInternalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const server = active_api_server orelse {
         _ = ctx.status(503);
         return ctx.text("not ready");
@@ -2649,6 +2693,26 @@ test "swarm runtime registers HA admin bridge routes before antfarm catch-all" {
 
     const ha_base = antfly.admin.routes.ha;
     const ha_prefix = antfly.admin.routes.ha ++ "/*";
+    try std.testing.expect(server.hasRoute(.get, ha_base));
+    try std.testing.expect(server.hasRoute(.post, ha_base));
+    try std.testing.expect(server.hasRoute(.put, ha_base));
+    try std.testing.expect(server.hasRoute(.delete, ha_base));
+    try std.testing.expect(server.hasRoute(.get, ha_prefix));
+    try std.testing.expect(server.hasRoute(.post, ha_prefix));
+    try std.testing.expect(server.hasRoute(.put, ha_prefix));
+    try std.testing.expect(server.hasRoute(.delete, ha_prefix));
+    try std.testing.expect(server.hasRoute(.get, "/*"));
+}
+
+test "swarm runtime registers HA internal replication bridge routes before antfarm catch-all" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try registerHAInternalRoutes(&server);
+    try registerAntfarmRoutes(&server);
+
+    const ha_base = antfly.internal.routes.ha;
+    const ha_prefix = antfly.internal.routes.ha ++ "/*";
     try std.testing.expect(server.hasRoute(.get, ha_base));
     try std.testing.expect(server.hasRoute(.post, ha_base));
     try std.testing.expect(server.hasRoute(.put, ha_base));
