@@ -751,6 +751,18 @@ pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
             alloc,
             metrics.fromPromotionAssessment(assessment),
         ),
+        .rejoin_assess => |assessment| try metrics.renderRejoinPrometheusAlloc(
+            alloc,
+            metrics.fromRejoinAssessment(assessment),
+        ),
+        .rejoin_rewind => |rejoin_result| try metrics.renderRejoinPrometheusAlloc(
+            alloc,
+            metrics.fromRejoinAssessment(rejoin_result.assessment),
+        ),
+        .rejoin_reseed => |rejoin_result| try metrics.renderRejoinPrometheusAlloc(
+            alloc,
+            metrics.fromRejoinAssessment(rejoin_result.assessment),
+        ),
         .primary_metrics => |metric_snapshot| try metrics.renderPrimaryPrometheusAlloc(alloc, metric_snapshot),
         .standby_metrics => |metric_snapshot| try metrics.renderStandbyPrometheusAlloc(alloc, metric_snapshot),
         else => error.PrometheusUnsupportedForResult,
@@ -2870,6 +2882,11 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(rejoin_json, "\"action_kind\":\"rejoin_assess\"");
     try expectContains(rejoin_json, "\"assessment\"");
     try expectContains(rejoin_json, "\"action\":\"reject_unfenced\"");
+    const rejoin_prometheus = try renderPrometheusAlloc(alloc, rejoin_result);
+    defer alloc.free(rejoin_prometheus);
+    try expectContains(rejoin_prometheus, "antfly_ha_rejoin_action_code 0\n");
+    try expectContains(rejoin_prometheus, "antfly_ha_rejoin_reason_code 0\n");
+    try expectContains(rejoin_prometheus, "antfly_ha_rejoin_rejected_unfenced 1\n");
 
     const read_json = try renderJsonAlloc(alloc, read);
     defer alloc.free(read_json);

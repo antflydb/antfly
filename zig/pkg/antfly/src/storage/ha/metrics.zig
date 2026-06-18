@@ -22,6 +22,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const primary_mod = @import("primary.zig");
+const rejoin = @import("rejoin.zig");
 const slot_store = @import("slot_store.zig");
 const status_mod = @import("status.zig");
 
@@ -37,6 +38,26 @@ pub const DurabilityStatusCode = enum(u64) {
     fail_closed = 2,
     degraded_to_async = 3,
     not_configured = 4,
+};
+
+pub const RejoinActionCode = enum(u64) {
+    reject_unfenced = 0,
+    already_current = 1,
+    rewind = 2,
+    reseed = 3,
+};
+
+pub const RejoinReasonCode = enum(u64) {
+    no_fence = 0,
+    current_timeline = 1,
+    parent_timeline_retained = 2,
+    parent_timeline_wal_expired = 3,
+    incompatible_timeline = 4,
+    wrong_old_primary = 5,
+    wrong_cluster = 6,
+    wrong_shard = 7,
+    wrong_table = 8,
+    local_lsn_before_fork = 9,
 };
 
 pub const SlotMetrics = struct {
@@ -115,6 +136,26 @@ pub const PromotionMetrics = struct {
     requires_fencing: u64,
     requires_force: u64,
     can_promote: u64,
+};
+
+pub const RejoinMetrics = struct {
+    action_code: u64,
+    reason_code: u64,
+    rejected_unfenced: u64,
+    already_current: u64,
+    can_rewind: u64,
+    requires_reseed: u64,
+    target_timeline_id: u64,
+    target_epoch: u64,
+    parent_cluster_id: u64,
+    parent_shard_id: u64,
+    parent_table_id: u64,
+    parent_timeline_id: u64,
+    parent_epoch: u64,
+    fork_lsn: u64,
+    former_last_lsn: u64,
+    retained_from_lsn: u64,
+    data_loss_discarded: u64,
 };
 
 pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) !PrimaryMetrics {
@@ -232,6 +273,28 @@ pub fn fromPromotionAssessment(assessment: status_mod.PromotionAssessment) Promo
     };
 }
 
+pub fn fromRejoinAssessment(assessment: rejoin.Assessment) RejoinMetrics {
+    return .{
+        .action_code = @intFromEnum(rejoinActionCode(assessment.action)),
+        .reason_code = @intFromEnum(rejoinReasonCode(assessment.reason)),
+        .rejected_unfenced = boolGauge(assessment.action == .reject_unfenced),
+        .already_current = boolGauge(assessment.action == .already_current),
+        .can_rewind = boolGauge(assessment.action == .rewind),
+        .requires_reseed = boolGauge(assessment.action == .reseed),
+        .target_timeline_id = assessment.target_timeline_id,
+        .target_epoch = assessment.target_epoch,
+        .parent_cluster_id = assessment.parent_cluster_id,
+        .parent_shard_id = assessment.parent_shard_id,
+        .parent_table_id = assessment.parent_table_id,
+        .parent_timeline_id = assessment.parent_timeline_id,
+        .parent_epoch = assessment.parent_epoch,
+        .fork_lsn = assessment.fork_lsn,
+        .former_last_lsn = assessment.former_last_lsn,
+        .retained_from_lsn = assessment.retained_from_lsn,
+        .data_loss_discarded = boolGauge(assessment.data_loss_discarded),
+    };
+}
+
 pub fn slotStatusCode(slot_status: slot_store.SlotStatus) SlotStatusCode {
     return switch (slot_status) {
         .healthy => .healthy,
@@ -246,6 +309,30 @@ pub fn durabilityStatusCode(durability_status: primary_mod.DurabilityStatus) Dur
         .would_block => .would_block,
         .fail_closed => .fail_closed,
         .degraded_to_async => .degraded_to_async,
+    };
+}
+
+pub fn rejoinActionCode(action: rejoin.Action) RejoinActionCode {
+    return switch (action) {
+        .reject_unfenced => .reject_unfenced,
+        .already_current => .already_current,
+        .rewind => .rewind,
+        .reseed => .reseed,
+    };
+}
+
+pub fn rejoinReasonCode(reason: rejoin.Reason) RejoinReasonCode {
+    return switch (reason) {
+        .no_fence => .no_fence,
+        .current_timeline => .current_timeline,
+        .parent_timeline_retained => .parent_timeline_retained,
+        .parent_timeline_wal_expired => .parent_timeline_wal_expired,
+        .incompatible_timeline => .incompatible_timeline,
+        .wrong_old_primary => .wrong_old_primary,
+        .wrong_cluster => .wrong_cluster,
+        .wrong_shard => .wrong_shard,
+        .wrong_table => .wrong_table,
+        .local_lsn_before_fork => .local_lsn_before_fork,
     };
 }
 
@@ -328,6 +415,31 @@ pub fn renderPromotionPrometheusAlloc(alloc: Allocator, metrics: PromotionMetric
     try appendGauge(alloc, &out, "antfly_ha_promotion_requires_fencing", metrics.requires_fencing);
     try appendGauge(alloc, &out, "antfly_ha_promotion_requires_force", metrics.requires_force);
     try appendGauge(alloc, &out, "antfly_ha_promotion_can_promote", metrics.can_promote);
+
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn renderRejoinPrometheusAlloc(alloc: Allocator, metrics: RejoinMetrics) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_action_code", metrics.action_code);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_reason_code", metrics.reason_code);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_rejected_unfenced", metrics.rejected_unfenced);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_already_current", metrics.already_current);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_can_rewind", metrics.can_rewind);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_requires_reseed", metrics.requires_reseed);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_target_timeline_id", metrics.target_timeline_id);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_target_epoch", metrics.target_epoch);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_cluster_id", metrics.parent_cluster_id);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_shard_id", metrics.parent_shard_id);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_table_id", metrics.parent_table_id);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_timeline_id", metrics.parent_timeline_id);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_epoch", metrics.parent_epoch);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_fork_lsn", metrics.fork_lsn);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_former_last_lsn", metrics.former_last_lsn);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_retained_from_lsn", metrics.retained_from_lsn);
+    try appendGauge(alloc, &out, "antfly_ha_rejoin_data_loss_discarded", metrics.data_loss_discarded);
 
     return try out.toOwnedSlice(alloc);
 }
@@ -575,6 +687,40 @@ test "storage.ha metrics derives standby and promotion gauges" {
     try std.testing.expectEqual(@as(u64, 0), promotion_metrics.can_promote);
 }
 
+test "storage.ha metrics derives rejoin gauges" {
+    const assessment = rejoin.Assessment{
+        .action = .reseed,
+        .reason = .parent_timeline_wal_expired,
+        .former_node_id = "primary-a",
+        .target_timeline_id = 5,
+        .target_epoch = 7,
+        .parent_cluster_id = 100,
+        .parent_shard_id = 10,
+        .parent_table_id = 20,
+        .parent_timeline_id = 4,
+        .parent_epoch = 6,
+        .fork_lsn = 12,
+        .former_last_lsn = 13,
+        .retained_from_lsn = 14,
+        .data_loss_discarded = true,
+    };
+    const rejoin_metrics = fromRejoinAssessment(assessment);
+    try std.testing.expectEqual(@as(u64, @intFromEnum(RejoinActionCode.reseed)), rejoin_metrics.action_code);
+    try std.testing.expectEqual(@as(u64, @intFromEnum(RejoinReasonCode.parent_timeline_wal_expired)), rejoin_metrics.reason_code);
+    try std.testing.expectEqual(@as(u64, 0), rejoin_metrics.rejected_unfenced);
+    try std.testing.expectEqual(@as(u64, 0), rejoin_metrics.already_current);
+    try std.testing.expectEqual(@as(u64, 0), rejoin_metrics.can_rewind);
+    try std.testing.expectEqual(@as(u64, 1), rejoin_metrics.requires_reseed);
+    try std.testing.expectEqual(@as(u64, 5), rejoin_metrics.target_timeline_id);
+    try std.testing.expectEqual(@as(u64, 7), rejoin_metrics.target_epoch);
+    try std.testing.expectEqual(@as(u64, 100), rejoin_metrics.parent_cluster_id);
+    try std.testing.expectEqual(@as(u64, 4), rejoin_metrics.parent_timeline_id);
+    try std.testing.expectEqual(@as(u64, 12), rejoin_metrics.fork_lsn);
+    try std.testing.expectEqual(@as(u64, 13), rejoin_metrics.former_last_lsn);
+    try std.testing.expectEqual(@as(u64, 14), rejoin_metrics.retained_from_lsn);
+    try std.testing.expectEqual(@as(u64, 1), rejoin_metrics.data_loss_discarded);
+}
+
 test "storage.ha metrics renders prometheus text" {
     const alloc = std.testing.allocator;
 
@@ -669,6 +815,32 @@ test "storage.ha metrics renders prometheus text" {
     defer alloc.free(promotion_text);
     try expectContains(promotion_text, "antfly_ha_promotion_requires_force 1\n");
     try expectContains(promotion_text, "antfly_ha_promotion_can_promote 0\n");
+
+    const rejoin_text = try renderRejoinPrometheusAlloc(alloc, .{
+        .action_code = @intFromEnum(RejoinActionCode.rewind),
+        .reason_code = @intFromEnum(RejoinReasonCode.parent_timeline_retained),
+        .rejected_unfenced = 0,
+        .already_current = 0,
+        .can_rewind = 1,
+        .requires_reseed = 0,
+        .target_timeline_id = 5,
+        .target_epoch = 7,
+        .parent_cluster_id = 100,
+        .parent_shard_id = 10,
+        .parent_table_id = 20,
+        .parent_timeline_id = 4,
+        .parent_epoch = 6,
+        .fork_lsn = 12,
+        .former_last_lsn = 13,
+        .retained_from_lsn = 8,
+        .data_loss_discarded = 1,
+    });
+    defer alloc.free(rejoin_text);
+    try expectContains(rejoin_text, "antfly_ha_rejoin_action_code 2\n");
+    try expectContains(rejoin_text, "antfly_ha_rejoin_reason_code 2\n");
+    try expectContains(rejoin_text, "antfly_ha_rejoin_can_rewind 1\n");
+    try expectContains(rejoin_text, "antfly_ha_rejoin_requires_reseed 0\n");
+    try expectContains(rejoin_text, "antfly_ha_rejoin_data_loss_discarded 1\n");
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
