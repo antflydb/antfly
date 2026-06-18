@@ -175,6 +175,103 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case HABaseBackupsPath:
+			got := string(body)
+			if !strings.Contains(got, `"slot_name":"standby-a"`) ||
+				!strings.Contains(got, `"manifest_id":"manifest-a"`) {
+				t.Fatalf("base backup begin body = %s, want slot and manifest", got)
+			}
+			_, _ = fmt.Fprint(w, haBaseBackupBeginResponseJSON())
+		case HABaseBackupsFinishPath:
+			got := string(body)
+			if !strings.Contains(got, `"manifest_path":"/backup/manifest-a.json"`) {
+				t.Fatalf("base backup finish body = %s, want manifest path", got)
+			}
+			_, _ = fmt.Fprint(w, haBaseBackupFinishResponseJSON())
+		case HAStandbyBootstrapPath:
+			got := string(body)
+			if !strings.Contains(got, `"manifest_path":"/backup/manifest-a.json"`) ||
+				!strings.Contains(got, `"content_root":"/backup/files"`) {
+				t.Fatalf("standby bootstrap body = %s, want manifest path and content root", got)
+			}
+			_, _ = fmt.Fprint(w, haStandbyBootstrapResponseJSON())
+		default:
+			t.Fatalf("path = %s, want HA seed workflow endpoint", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	client.WithToken("test-token")
+
+	begin, err := client.BeginBaseBackup(context.Background(), BaseBackupStartRequest{
+		SlotName:   "standby-a",
+		ManifestId: "manifest-a",
+	})
+	if err != nil {
+		t.Fatalf("BeginBaseBackup returned error: %v", err)
+	}
+	if begin.Action.ActionKind != HAActionKindBaseBackupBegin ||
+		begin.Action.NodeId != "primary-a" ||
+		begin.BackupLsn != 7 ||
+		begin.StartRecordLsn != 8 {
+		t.Fatalf("begin base backup response = %#v, want primary begin evidence", begin)
+	}
+
+	finish, err := client.FinishBaseBackup(context.Background(), BaseBackupManifestPathRequest{
+		ManifestPath: "/backup/manifest-a.json",
+	})
+	if err != nil {
+		t.Fatalf("FinishBaseBackup returned error: %v", err)
+	}
+	if finish.Action.ActionKind != HAActionKindBaseBackupFinish ||
+		finish.Action.NodeId != "primary-a" ||
+		finish.BackupLsn != 7 ||
+		finish.EndRecordLsn != 9 {
+		t.Fatalf("finish base backup response = %#v, want primary finish evidence", finish)
+	}
+
+	bootstrap, err := client.BootstrapStandby(context.Background(), StandbyBootstrapRequest{
+		ManifestPath: "/backup/manifest-a.json",
+		ContentRoot:  "/backup/files",
+	})
+	if err != nil {
+		t.Fatalf("BootstrapStandby returned error: %v", err)
+	}
+	if bootstrap.Action.ActionKind != HAActionKindStandbyBootstrap ||
+		bootstrap.Action.NodeId != "standby-a" ||
+		bootstrap.BackupLsn != 7 ||
+		bootstrap.CheckpointLsn != 10 {
+		t.Fatalf("standby bootstrap response = %#v, want standby bootstrap evidence", bootstrap)
+	}
+}
+
 func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
@@ -2115,6 +2212,55 @@ func TestHAStatusHelpersClassifyWrappedErrors(t *testing.T) {
 	if HAIsUnauthorized(validation) || HAIsConflict(validation) {
 		t.Fatal("status helpers classified validation error as HTTP API error")
 	}
+}
+
+func haBaseBackupBeginResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"base_backup_begin:manifest-a",
+			"action_kind":"base_backup_begin",
+			"target":"manifest-a",
+			"state":"applied",
+			"node_id":"primary-a"
+		},
+		"slot_name":"standby-a",
+		"manifest_id":"manifest-a",
+		"backup_lsn":7,
+		"start_record_lsn":8
+	}`
+}
+
+func haBaseBackupFinishResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"base_backup_finish:manifest-a",
+			"action_kind":"base_backup_finish",
+			"target":"manifest-a",
+			"state":"applied",
+			"node_id":"primary-a"
+		},
+		"manifest_id":"manifest-a",
+		"backup_lsn":7,
+		"end_record_lsn":9
+	}`
+}
+
+func haStandbyBootstrapResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"standby_bootstrap:manifest-a",
+			"action_kind":"standby_bootstrap",
+			"target":"manifest-a",
+			"state":"applied",
+			"node_id":"standby-a"
+		},
+		"manifest_id":"manifest-a",
+		"backup_lsn":7,
+		"checkpoint_lsn":10
+	}`
 }
 
 func haPromotionResponseJSON() string {
