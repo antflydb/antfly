@@ -1127,7 +1127,13 @@ func resourceSpecHasCPUAndMemory(resources ResourceSpec) bool {
 
 func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 	ha := r.Spec.HighAvailability
-	if ha == nil || ha.modeOrDefault() == HAModeDisabled {
+	if ha == nil {
+		return nil
+	}
+	if ha.modeOrDefault() == HAModeDisabled {
+		if highAvailabilityHasManagedConfig(ha) {
+			return fmt.Errorf("high availability validation failed:\n  - spec.highAvailability.mode must be HotStandby when HA configuration fields are set")
+		}
 		return nil
 	}
 
@@ -1488,6 +1494,19 @@ func validateHAAdminJobPodSpec(admin *HAAdminSpec) []string {
 
 func standbyDesiredBySpec(standby HAStandbySpec) bool {
 	return standby.Desired == nil || *standby.Desired
+}
+
+func highAvailabilityHasManagedConfig(ha *HighAvailabilitySpec) bool {
+	if ha == nil {
+		return false
+	}
+	return len(ha.Standbys) > 0 ||
+		ha.Identity != nil ||
+		ha.Admin != nil ||
+		ha.Runtime != nil ||
+		ha.SyncPolicy != nil ||
+		ha.Retention != nil ||
+		ha.AutomaticFailover != nil
 }
 
 func (s *HighAvailabilitySpec) modeOrDefault() HAMode {

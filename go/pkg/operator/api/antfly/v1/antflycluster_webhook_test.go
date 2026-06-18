@@ -1843,6 +1843,48 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsEmptyDisabledConfig(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected empty disabled HA configuration to be accepted, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Mode = HAModeDisabled
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected explicit disabled HA configuration to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsManagedConfigWithoutHotStandbyMode(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Standbys: []HAStandbySpec{{Name: "standby-a"}},
+		Admin: &HAAdminSpec{
+			PrimaryURL: "http://primary-ha.default.svc:8081",
+		},
+		Retention: &HARetentionPolicy{MaxLagLSN: 5},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA configuration without HotStandby mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mode must be HotStandby when HA configuration fields are set") {
+		t.Fatalf("expected HA mode validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Mode = HAModeDisabled
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected disabled HA configuration with managed fields to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mode must be HotStandby when HA configuration fields are set") {
+		t.Fatalf("expected disabled HA mode validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStandbyAdminURL(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
