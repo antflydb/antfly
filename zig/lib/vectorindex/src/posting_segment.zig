@@ -1026,15 +1026,16 @@ pub const LazyDirectorySnapshot = struct {
                 .meta = entry.meta,
                 .path = entry.path,
             };
-            const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
-            defer alloc.free(index_data);
+            var stack_index: [stack_index_max_bytes]u8 = undefined;
+            const index_data = try readSegmentIndexWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, &stack_index);
+            defer index_data.deinit(alloc);
 
-            const range = (try readSegmentDeltaValueRangeAlloc(alloc, self.io, self.dir, manifest_entry, index_data, posting_id)) orelse continue;
+            const range = (try readSegmentDeltaValueRangeAlloc(alloc, self.io, self.dir, manifest_entry, index_data.data, posting_id)) orelse continue;
             defer range.deinit(alloc);
             var delta_index = range.past_index;
             while (delta_index > range.first_index) {
                 delta_index -= 1;
-                const found = try deltaIndexEntryFromRange(index_data, range, delta_index);
+                const found = try deltaIndexEntryFromRange(index_data.data, range, delta_index);
                 const value = try deltaValueFromEntryRange(range, found);
                 try latestDeltaValueRecordAfterGenerationForMember(
                     value,
@@ -3831,8 +3832,9 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
     entry: ManifestEntry,
     candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
 ) !void {
-    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
-    defer alloc.free(index_data);
+    var stack_index: [stack_index_max_bytes]u8 = undefined;
+    const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
+    defer index_data.deinit(alloc);
 
     const file = try dir.openFile(io, entry.path, .{});
     defer file.close(io);
@@ -3843,13 +3845,13 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
 
     var index: usize = 0;
     while (index < entry.meta.entry_count) {
-        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+        const found = try indexEntryFromBytes(index_data.data[index * index_entry_size ..][0..index_entry_size]);
         if (found.kind != .centroid_directory) {
             index += 1;
             continue;
         }
 
-        const range = try centroidDirectoryIndexRange(index_data, entry.meta, index);
+        const range = try centroidDirectoryIndexRange(index_data.data, entry.meta, index);
         const range_len = range.end - range.offset;
         try range_scratch.resize(alloc, range_len);
         const bytes = range_scratch.items;
@@ -3861,7 +3863,7 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
 
         var record_index = index;
         while (record_index < range.past_index) : (record_index += 1) {
-            const record_entry = try indexEntryFromBytes(index_data[record_index * index_entry_size ..][0..index_entry_size]);
+            const record_entry = try indexEntryFromBytes(index_data.data[record_index * index_entry_size ..][0..index_entry_size]);
             if (record_entry.kind != .centroid_directory) continue;
             const value = try valueFromBufferedRange(bytes, range.offset, record_entry);
             var record = try posting.CentroidDirectoryFormat.decode(alloc, value);
