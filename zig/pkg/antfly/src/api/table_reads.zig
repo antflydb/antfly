@@ -49,6 +49,8 @@ const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const relational_rows_api = @import("relational_rows.zig");
 const relational_sql_api = @import("relational_sql.zig");
+const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
+const external_source_api = @import("../serverless/external_source/mod.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
 const schema_api = @import("../schema/mod.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -4674,6 +4676,56 @@ fn rowsAggregatePlanFromLakeScanAlloc(
     var scan_result = (try source.lakeRowsScan(alloc, table_name, runtime_schema, lake_request.request, consistency)) orelse return null;
     defer scan_result.deinit(alloc);
     return try relational_rows_api.buildRowsAggregateResultFromLakeRowsAlloc(alloc, plan.aggregate, scan_result);
+}
+
+pub const PinnedExternalLakeRowsScanner = struct {
+    inventory: external_source_api.Inventory,
+    reader: serverless_query.LakeParquetObjectRangeReader,
+    cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
+    coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
+
+    pub fn scanAlloc(
+        self: PinnedExternalLakeRowsScanner,
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        request: serverless_query.LakeRowsScanRequest,
+    ) !serverless_query.LakeRowsScanResult {
+        return try executePinnedExternalLakeRowsScanAlloc(
+            alloc,
+            runtime_schema,
+            self.inventory,
+            self.reader,
+            self.cache,
+            self.coalesce_options,
+            request,
+        );
+    }
+};
+
+pub fn executePinnedExternalLakeRowsScanAlloc(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    inventory: external_source_api.Inventory,
+    reader: serverless_query.LakeParquetObjectRangeReader,
+    cache: ?*serverless_query.LakeParquetObjectRangeCache,
+    coalesce_options: serverless_query.LakeRangeCoalesceOptions,
+    request: serverless_query.LakeRowsScanRequest,
+) !serverless_query.LakeRowsScanResult {
+    if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
+    const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+    const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+    if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+
+    return try serverless_query.queryLakeParquetSupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .binding = binding,
+        .reader = reader,
+        .cache = cache,
+        .inventory = inventory,
+        .projected_columns = request.projected_columns,
+        .predicate = request.predicate,
+        .limit = request.limit,
+        .coalesce_options = coalesce_options,
+    });
 }
 
 fn rowsWindowPlanFromRoutedScansAlloc(
@@ -16212,6 +16264,74 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
+}
+
+test "pinned external lake rows scanner validates schema binding against inventory" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:expected" },
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var inventory = external_source_api.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:stale"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source_api.types.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 128,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+
+    const NeverRead = struct {
+        fn readRangeAlloc(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: u64,
+            _: usize,
+        ) ![]u8 {
+            return error.UnexpectedLakeRangeRead;
+        }
+    };
+    var ctx: u8 = 0;
+    const reader = serverless_query.LakeParquetObjectRangeReader{
+        .ctx = &ctx,
+        .read_range_alloc = NeverRead.readRangeAlloc,
+    };
+    const projection = [_][]const u8{"amount"};
+
+    try std.testing.expectError(
+        error.ExternalLakeSnapshotMismatch,
+        executePinnedExternalLakeRowsScanAlloc(
+            alloc,
+            schema,
+            inventory,
+            reader,
+            null,
+            .{},
+            .{ .projected_columns = projection[0..] },
+        ),
+    );
 }
 
 test "lowered sql cross-table read plans execute through routed scans" {

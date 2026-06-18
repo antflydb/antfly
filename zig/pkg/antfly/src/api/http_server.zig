@@ -2304,7 +2304,7 @@ pub const ApiHttpServer = struct {
             return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) {
-            return try protocol_adapters.handleA2aRequest(self, req);
+            return try protocol_adapters.handleA2aRequest(self, req, delegatedIdentityView(authenticated_identity));
         }
         if (req.method == .GET and (std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card_legacy) or std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card))) {
             return try protocol_adapters.handleA2aCard(self);
@@ -3447,6 +3447,7 @@ pub const ApiHttpServer = struct {
         task_id: []const u8,
         context_id: []const u8,
         queue: *a2a.EventQueue,
+        authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
         const source = self.table_reads orelse {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
@@ -3456,6 +3457,7 @@ pub const ApiHttpServer = struct {
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
+            authenticated_identity: ?AuthenticatedIdentity,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -3474,6 +3476,9 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                try runner.ensureTableReadable(table_name);
+                const row_filter_json = try resolveEffectiveRowFilterJson(inner_alloc, runner.authenticated_identity, table_name);
+                defer if (row_filter_json) |value| inner_alloc.free(value);
                 var semantic_resolver = SemanticStatusResolver{
                     .source = runner.server.source,
                     .antfly_provider = runner.server.antfly_provider,
@@ -3490,6 +3495,7 @@ pub const ApiHttpServer = struct {
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
+                if (row_filter_json) |value| try injectRowFilterIntoSearchRequest(inner_alloc, &query_req.req, value);
                 return (runner.source.query(
                     inner_alloc,
                     table_name,
@@ -3508,6 +3514,7 @@ pub const ApiHttpServer = struct {
                 table_name: []const u8,
             ) ![]const []const u8 {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                try runner.ensureTableReadable(table_name);
                 var scan = (try runner.source.scan(
                     inner_alloc,
                     table_name,
@@ -3531,6 +3538,11 @@ pub const ApiHttpServer = struct {
                     try keys.append(inner_alloc, key);
                 }
                 return try keys.toOwnedSlice(inner_alloc);
+            }
+
+            fn ensureTableReadable(runner: *@This(), table_name: []const u8) !void {
+                const identity = runner.authenticated_identity orelse return;
+                if (!permissionsAllow(identity.permissions, .table, table_name, .read)) return error.PermissionDenied;
             }
         };
 
@@ -3565,6 +3577,7 @@ pub const ApiHttpServer = struct {
         var query_runner = RetrievalQueryRunner{
             .server = self,
             .source = source,
+            .authenticated_identity = authenticated_identity,
         };
 
         const RetrievalA2aSink = struct {
@@ -3615,6 +3628,10 @@ pub const ApiHttpServer = struct {
             },
             error.TableNotFound => {
                 try queue.status(alloc, task_id, context_id, "failed", "not found");
+                return;
+            },
+            error.PermissionDenied => {
+                try queue.status(alloc, task_id, context_id, "failed", "forbidden");
                 return;
             },
             error.DocIdentityNamespaceMismatch => {
@@ -3971,8 +3988,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn defaultPublicCatalog(database_name: []const u8, namespace_name: []const u8) bool {
-        return std.mem.eql(u8, database_name, tables_api.default_database_name) and
-            std.mem.eql(u8, namespace_name, tables_api.default_namespace_name);
+        return catalog_resources.isDefaultPublicNamespace(database_name, namespace_name);
     }
 
     fn handlePublicGetCatalogTable(self: *ApiHttpServer, target: catalog_resources.TableTarget) !http_common.HttpResponse {
@@ -4164,11 +4180,7 @@ pub const ApiHttpServer = struct {
                 return try textResponse(self.alloc, 501, "explicit catalog table subroutes are not supported until table storage APIs are catalog-aware");
             }
             if (!catalogApiIdentifierValid(table_path.table_path)) return try textResponse(self.alloc, 400, "invalid table name");
-            const target: catalog_resources.TableTarget = .{
-                .database_name = table_path.database_name,
-                .namespace_name = table_path.namespace_name,
-                .table_name = table_path.table_path,
-            };
+            const target = try catalog_resources.tableTargetFromOptional(table_path.database_name, table_path.namespace_name, table_path.table_path);
             return switch (req.method) {
                 .GET => try self.handlePublicGetCatalogTable(target),
                 .POST => try self.handlePublicCreateCatalogTable(target, req.body),
@@ -5691,12 +5703,14 @@ pub const ApiHttpServer = struct {
             const identity = authenticated_identity.?;
             if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) return false;
             if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
-                if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) return false;
+                const resource = required.resourceNameAlloc(self.alloc) catch return false;
+                defer self.alloc.free(resource);
+                if (!permissionsAllow(identity.permissions, required.resource_type, resource, required.permission_type)) return false;
             }
         }
 
         self.recordHandledRequest();
-        return try protocol_adapters.handleA2aStreamingRequest(self, req, writer);
+        return try protocol_adapters.handleA2aStreamingRequest(self, req, writer, delegatedIdentityView(authenticated_identity));
     }
 
     pub fn tableApi(self: *ApiHttpServer) public_table_http.TableApi {
@@ -9494,7 +9508,7 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
-    if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
@@ -12910,6 +12924,13 @@ test "api http server query builder requires table read permission when auth is 
     var reader = try auth.manager.createUser("reader", "reader", &other_permission);
     defer reader.deinit(alloc);
 
+    var docs_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "docs", .read),
+    };
+    defer docs_permission[0].deinit(alloc);
+    var docs_reader = try auth.manager.createUser("docs_reader", "docs_reader", &docs_permission);
+    defer docs_reader.deinit(alloc);
+
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
@@ -12930,6 +12951,107 @@ test "api http server query builder requires table read permission when auth is 
     var parsed = try std.json.parseFromSlice(ErrorResponse, alloc, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("forbidden", parsed.value.@"error");
+
+    var a2a_forbidden = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.a2a,
+        .authorization = reader_auth,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"qb-forbidden\",\"method\":\"message/send\",\"params\":{\"taskId\":\"qb-forbidden\",\"contextId\":\"ctx\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"query-builder\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find raft docs\"},{\"kind\":\"data\",\"data\":{\"table\":\"docs\"}}]}}}",
+    });
+    defer a2a_forbidden.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), a2a_forbidden.status);
+    try std.testing.expect(std.mem.indexOf(u8, a2a_forbidden.body, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a2a_forbidden.body, "forbidden") != null);
+
+    const docs_reader_auth = try encodeBasicAuthorization(alloc, "docs_reader", "docs_reader");
+    defer alloc.free(docs_reader_auth);
+    var a2a_allowed = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.a2a,
+        .authorization = docs_reader_auth,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"qb-allowed\",\"method\":\"message/send\",\"params\":{\"taskId\":\"qb-allowed\",\"contextId\":\"ctx\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"query-builder\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find raft docs\"},{\"kind\":\"data\",\"data\":{\"table\":\"docs\"}}]}}}",
+    });
+    defer a2a_allowed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), a2a_allowed.status);
+    try std.testing.expect(std.mem.indexOf(u8, a2a_allowed.body, "\"state\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a2a_allowed.body, "\"name\":\"query\"") != null);
+}
+
+test "api http server a2a retrieval enforces delegated table read permission" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeReads = struct {
+        fn source(_: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnexpectedLookupForForbiddenA2aRetrieval;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnexpectedScanForForbiddenA2aRetrieval;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnexpectedQueryForForbiddenA2aRetrieval;
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var other_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "other", .read),
+    };
+    defer other_permission[0].deinit(alloc);
+    var reader = try auth.manager.createUser("reader", "reader", &other_permission);
+    defer reader.deinit(alloc);
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+    }, source.iface(), reads.source(), null);
+    defer server.deinit();
+
+    const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
+    defer alloc.free(reader_auth);
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.a2a,
+        .authorization = reader_auth,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"retrieval-forbidden\",\"method\":\"message/send\",\"params\":{\"taskId\":\"retrieval-forbidden\",\"contextId\":\"ctx\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"retrieval\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find docs\"},{\"kind\":\"data\",\"data\":{\"table\":\"docs\",\"limit\":5}}]}}}",
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "forbidden") != null);
 }
 
 test "api http server restricts runtime schema debug to admins when auth is enabled" {

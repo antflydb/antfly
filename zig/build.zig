@@ -4137,6 +4137,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table read source executes relational row query plans across ranges",
             "routed rows query plan executes over scanned owner rows with ctes",
             "external lake rows query and aggregate plans route through lake scan hook",
+            "pinned external lake rows scanner validates schema binding against inventory",
             "lowered sql cross-table read plans execute through routed scans",
             "lowered sql insert source plans build batches from routed scans",
             "lowered sql merge mutation plans build batches from routed scans",

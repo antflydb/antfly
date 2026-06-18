@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const catalog_resources = @import("catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const json_helpers = @import("json_helpers.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -4638,7 +4639,7 @@ const Parser = struct {
             defer self.alloc.free(schema_name);
             if (!if_not_exists or
                 !isAdapterNoopExtensionName(extension_name) or
-                !std.ascii.eqlIgnoreCase(schema_name, "public"))
+                !std.ascii.eqlIgnoreCase(schema_name, catalog_resources.default_namespace_name))
             {
                 return error.UnsupportedSqlShape;
             }
@@ -4647,7 +4648,7 @@ const Parser = struct {
             defer self.alloc.free(schema_name);
             if (!if_not_exists or
                 !isAdapterNoopExtensionName(extension_name) or
-                !std.ascii.eqlIgnoreCase(schema_name, "public"))
+                !std.ascii.eqlIgnoreCase(schema_name, catalog_resources.default_namespace_name))
             {
                 return error.UnsupportedSqlShape;
             }

@@ -59,6 +59,48 @@ pub const TableTarget = struct {
     table_name: []const u8,
 };
 
+pub const NamespaceTarget = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+};
+
+pub fn namespaceTargetFromOptional(
+    database_name: ?[]const u8,
+    namespace_name: ?[]const u8,
+) NamespaceTarget {
+    return .{
+        .database_name = database_name orelse default_database_name,
+        .namespace_name = namespace_name orelse default_namespace_name,
+    };
+}
+
+pub fn tableTargetFromOptional(
+    database_name: ?[]const u8,
+    namespace_name: ?[]const u8,
+    table_name: []const u8,
+) !TableTarget {
+    if (table_name.len == 0) return error.UnsupportedSqlShape;
+    const namespace = namespaceTargetFromOptional(database_name, namespace_name);
+    return .{
+        .database_name = namespace.database_name,
+        .namespace_name = namespace.namespace_name,
+        .table_name = table_name,
+    };
+}
+
+pub fn isDefaultPublicNamespace(database_name: []const u8, namespace_name: []const u8) bool {
+    return std.mem.eql(u8, database_name, default_database_name) and
+        std.mem.eql(u8, namespace_name, default_namespace_name);
+}
+
+pub fn namespaceIsDefaultPublic(target: NamespaceTarget) bool {
+    return isDefaultPublicNamespace(target.database_name, target.namespace_name);
+}
+
+pub fn tableIsDefaultPublic(target: TableTarget) bool {
+    return isDefaultPublicNamespace(target.database_name, target.namespace_name);
+}
+
 pub fn sqlTableTargetFromObjectName(object_name: []const u8, current_database_name: []const u8) !TableTarget {
     if (object_name.len == 0) return error.UnsupportedSqlShape;
     if (std.mem.indexOfScalar(u8, object_name, '.')) |dot| {
@@ -122,4 +164,15 @@ test "catalog resource names and migration table matching" {
     try std.testing.expect(tableResourceMatches("docs", "default.public.docs"));
     try std.testing.expect(!tableResourceMatches("tenant_ops.analytics.docs", "docs"));
     try std.testing.expect(!tableResourceMatches("docs", "tenant_ops.analytics.docs"));
+
+    const namespace = namespaceTargetFromOptional("tenant_ops", "analytics");
+    try std.testing.expectEqualStrings("tenant_ops", namespace.database_name);
+    try std.testing.expectEqualStrings("analytics", namespace.namespace_name);
+    try std.testing.expect(!namespaceIsDefaultPublic(namespace));
+
+    const default_target = try tableTargetFromOptional(null, null, "docs");
+    try std.testing.expect(tableIsDefaultPublic(default_target));
+    try std.testing.expectEqualStrings("default", default_target.database_name);
+    try std.testing.expectEqualStrings("public", default_target.namespace_name);
+    try std.testing.expectEqualStrings("docs", default_target.table_name);
 }
