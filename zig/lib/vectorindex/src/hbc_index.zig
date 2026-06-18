@@ -6378,10 +6378,16 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
     defer self.alloc.free(points);
     const inputs = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, leaf.members.len);
     defer self.alloc.free(inputs);
-    const vector_scratch = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(vector_scratch);
-    const transformed_scratch = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(transformed_scratch);
+    const scratch_len = try std.math.mul(usize, dims, 2);
+    var stack_scratch: [4096]f32 = undefined;
+    const use_stack_scratch = scratch_len <= stack_scratch.len;
+    const scratch = if (use_stack_scratch)
+        stack_scratch[0..scratch_len]
+    else
+        try self.alloc.alloc(f32, scratch_len);
+    defer if (!use_stack_scratch) self.alloc.free(scratch);
+    const vector_scratch = scratch[0..dims];
+    const transformed_scratch = scratch[dims..scratch_len];
 
     const vector_load_start = now_fn();
     var used_cached_nonquant = false;
