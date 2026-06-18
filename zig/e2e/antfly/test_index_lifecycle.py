@@ -202,14 +202,14 @@ def test_table_index_lifecycle(table_api):
         raise AssertionError("expected deleted index lookup to return 404")
 
 
-def test_table_rejects_public_full_text_create_index(table_api):
-    table_name = f"index_backfill_{time.time_ns()}"
+def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
+    table_name = f"public_full_text_{time.time_ns()}"
 
-    created = table_api.create_table(table_name)
+    created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    try:
-        table_api.create_index(
+    assert (
+        stateful_api.create_index(
             table_name,
             "search_idx",
             {
@@ -217,11 +217,57 @@ def test_table_rejects_public_full_text_create_index(table_api):
                 "type": "full_text",
             },
         )
-    except requests.HTTPError as exc:
-        assert exc.response is not None
-        assert exc.response.status_code == 400
-    else:
-        raise AssertionError("expected public full-text create_index to be rejected")
+        == {}
+    )
+
+    detail = stateful_api.get_index(table_name, "search_idx")
+    assert detail["config"]["name"] == "search_idx"
+    assert detail["config"]["type"] == "full_text"
+
+
+def test_stateful_table_accepts_document_full_text_create_index_with_inline_enrichments(stateful_api):
+    table_name = f"document_full_text_{time.time_ns()}"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+
+    assert (
+        stateful_api.create_index(
+            table_name,
+            "document_text",
+            {
+                "name": "document_text",
+                "type": "full_text",
+                "artifact_name": "document_chunks_v1",
+                "enrichments": [
+                    {
+                        "name": "document_units_v1",
+                        "kind": "asset",
+                        "field": "url",
+                        "content_type": "application/json",
+                        "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+                    },
+                    {
+                        "name": "document_chunks_v1",
+                        "kind": "chunk",
+                        "source_artifact_name": "document_units_v1",
+                        "field": "text",
+                        "chunk_size": 512,
+                        "chunk_overlap": 50,
+                    },
+                ],
+            },
+        )
+        == {}
+    )
+
+    detail = stateful_api.get_index(table_name, "document_text")
+    assert detail["config"]["name"] == "document_text"
+    assert detail["config"]["type"] == "full_text"
+    assert detail["config"]["artifact_name"] == "document_chunks_v1"
+    encoded_detail = json.dumps(detail, sort_keys=True)
+    assert "document_units_v1" in encoded_detail
+    assert "document_chunks_v1" in encoded_detail
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):
@@ -922,9 +968,9 @@ def test_table_rejects_non_go_full_text_chunk_config(table_api):
     try:
         table_api.create_index(
             table_name,
-            "full_text_index_v1",
+            "search_idx",
             {
-                "name": "full_text_index_v1",
+                "name": "search_idx",
                 "type": "full_text",
                 "chunk_name": "serverless_chunk_preview",
             },

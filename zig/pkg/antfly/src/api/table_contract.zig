@@ -195,9 +195,6 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
         if (!std.mem.eql(u8, name_value.string, index_name)) return error.InvalidCreateIndexRequest;
     }
     if (isReservedFullTextIndexName(index_name)) return error.InvalidCreateIndexRequest;
-    if (std.mem.eql(u8, extractPublicIndexType(root) orelse "full_text", "full_text")) {
-        return error.InvalidCreateIndexRequest;
-    }
 
     return normalizeIndexConfigJson(alloc, root, index_name, .{
         .include_name = true,
@@ -297,7 +294,9 @@ fn isAllowedPublicFullTextField(field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "name") or
         std.mem.eql(u8, field_name, "type") or
         std.mem.eql(u8, field_name, "description") or
-        std.mem.eql(u8, field_name, "mem_only");
+        std.mem.eql(u8, field_name, "mem_only") or
+        std.mem.eql(u8, field_name, "artifact_name") or
+        std.mem.eql(u8, field_name, "enrichments");
 }
 
 fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -534,20 +533,45 @@ test "table contract ignores create-table full text entries and preserves non-fu
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}") != null);
 }
 
-test "table contract rejects public full text create index" {
-    try std.testing.expectError(
-        error.InvalidCreateIndexRequest,
-        parseCreateIndexRequest(
-            std.testing.allocator,
-            "search_idx",
-            "{\"type\":\"full_text\"}",
-        ),
+test "table contract accepts public full text create index" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "search_idx",
+        "{\"type\":\"full_text\"}",
     );
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"search_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"type\":\"full_text\"") != null);
+
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,
         parseCreateIndexRequest(
             std.testing.allocator,
             "default",
+            "{}",
+        ),
+    );
+}
+
+test "table contract accepts full text create index with document enrichments" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_text",
+        "{\"type\":\"full_text\",\"artifact_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\",\"content_type\":\"application/json\",\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{}}\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"source_artifact_name\":\"document_units_v1\",\"field\":\"text\",\"chunk_size\":512,\"chunk_overlap\":50}]}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"document_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"type\":\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"artifact_name\":\"document_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"document_chunks_v1\"") != null);
+
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "full_text_index_v1",
             "{}",
         ),
     );
