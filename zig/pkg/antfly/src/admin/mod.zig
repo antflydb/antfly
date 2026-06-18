@@ -384,6 +384,7 @@ const ha_standby_snapshot_fields = [_][]const u8{
     "write_lag_lsn",
     "receive_lag_lsn",
     "apply_lag_lsn",
+    "last_error",
     "unapplied_lsn_count",
     "caught_up_to_received",
     "can_serve_safe_reads",

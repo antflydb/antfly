@@ -1483,6 +1483,45 @@ pub const HAStandbyReplicationOptions = antfly.ha.http_replication_client.Replic
 pub const HAStandbyReplicationResult = antfly.ha.http_replication_client.Result;
 pub const HAStandbyReplicationLoopResult = antfly.ha.http_replication_client.LoopResult;
 
+const HAStandbyReplicationErrorCode = enum(u8) {
+    none = 0,
+    HttpConnectionClosing,
+    ConnectionResetByPeer,
+    ConnectionRefused,
+    BrokenPipe,
+    EndOfStream,
+    UnexpectedHttpStatus,
+    NotListening,
+    Other,
+};
+
+fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
+    return switch (err) {
+        error.HttpConnectionClosing => .HttpConnectionClosing,
+        error.ConnectionResetByPeer => .ConnectionResetByPeer,
+        error.ConnectionRefused => .ConnectionRefused,
+        error.BrokenPipe => .BrokenPipe,
+        error.EndOfStream => .EndOfStream,
+        error.UnexpectedHttpStatus => .UnexpectedHttpStatus,
+        error.NotListening => .NotListening,
+        else => .Other,
+    };
+}
+
+fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u8 {
+    return switch (code) {
+        .none => null,
+        .HttpConnectionClosing => "HttpConnectionClosing",
+        .ConnectionResetByPeer => "ConnectionResetByPeer",
+        .ConnectionRefused => "ConnectionRefused",
+        .BrokenPipe => "BrokenPipe",
+        .EndOfStream => "EndOfStream",
+        .UnexpectedHttpStatus => "UnexpectedHttpStatus",
+        .NotListening => "NotListening",
+        .Other => "Other",
+    };
+}
+
 pub const StoreRegistrationConfig = struct {
     node_id: u64,
     store_id: u64,
@@ -1803,6 +1842,7 @@ pub const DataServer = struct {
     ha_primary_mirror_sync_wait_count: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_failure_count: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HAStandbyReplicationErrorCode.none)),
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -2220,6 +2260,10 @@ pub const DataServer = struct {
             if (self.ha_cfg.admin_context) |ctx| {
                 self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(self.alloc, ctx, .{
                     .bearer_token = self.ha_cfg.admin_bearer_token,
+                    .standby_status_extras = .{
+                        .ptr = self,
+                        .last_error = haStandbyReplicationLastErrorCallback,
+                    },
                 });
                 api_server_cfg.ha_admin_executor = self.ha_admin_server.?.executor();
             }
@@ -2296,20 +2340,26 @@ pub const DataServer = struct {
     }
 
     pub fn runRound(self: *DataServer) !void {
-        self.runHAStandbyReplicationRound() catch |err| {
-            _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
-            switch (err) {
-                error.HttpConnectionClosing,
-                error.ConnectionResetByPeer,
-                error.ConnectionRefused,
-                error.BrokenPipe,
-                error.EndOfStream,
-                error.UnexpectedHttpStatus,
-                error.NotListening,
-                => std.log.warn("HA standby replication round skipped err={}", .{err}),
-                else => return err,
-            }
+        const ha_standby_replication_ok = blk: {
+            self.runHAStandbyReplicationRound() catch |err| {
+                _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
+                self.recordHAStandbyReplicationError(err);
+                switch (err) {
+                    error.HttpConnectionClosing,
+                    error.ConnectionResetByPeer,
+                    error.ConnectionRefused,
+                    error.BrokenPipe,
+                    error.EndOfStream,
+                    error.UnexpectedHttpStatus,
+                    error.NotListening,
+                    => std.log.warn("HA standby replication round skipped err={}", .{err}),
+                    else => return err,
+                }
+                break :blk false;
+            };
+            break :blk true;
         };
+        if (ha_standby_replication_ok) self.clearHAStandbyReplicationError();
         if (self.data_raft) |raft| {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
@@ -2519,6 +2569,24 @@ pub const DataServer = struct {
             self.lsm_maintenance_stop.store(false, .release);
             self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});
         }
+    }
+
+    fn clearHAStandbyReplicationError(self: *DataServer) void {
+        self.ha_standby_replication_last_error.store(@intFromEnum(HAStandbyReplicationErrorCode.none), .release);
+    }
+
+    fn recordHAStandbyReplicationError(self: *DataServer, err: anyerror) void {
+        self.ha_standby_replication_last_error.store(@intFromEnum(haStandbyReplicationErrorCode(err)), .release);
+    }
+
+    fn haStandbyReplicationLastError(self: *DataServer) ?[]const u8 {
+        const code: HAStandbyReplicationErrorCode = @enumFromInt(self.ha_standby_replication_last_error.load(.acquire));
+        return haStandbyReplicationErrorName(code);
+    }
+
+    fn haStandbyReplicationLastErrorCallback(ptr: *anyopaque) ?[]const u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationLastError();
     }
 
     fn densePostingMaintenanceDue(self: *DataServer, now_ns: u64) bool {
@@ -14462,6 +14530,14 @@ test "data runtime records HA standby replication round failures" {
 
     try server.runRound();
     try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+
+    var admin_status = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_standby_status,
+    });
+    defer admin_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"ConnectionRefused\"") != null);
 
     var health = HealthSource{ .data_server = &server };
     var writer_buf: [262144]u8 = undefined;

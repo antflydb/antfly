@@ -79,6 +79,7 @@ pub const StandbySnapshot = struct {
     write_lag_lsn: ?u64,
     receive_lag_lsn: ?u64,
     apply_lag_lsn: ?u64,
+    last_error: ?[]const u8 = null,
     unapplied_lsn_count: u64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,

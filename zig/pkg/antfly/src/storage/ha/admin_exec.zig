@@ -552,6 +552,7 @@ fn adminStandbySnapshot(snapshot: status.StandbySnapshot, node_id: []const u8) !
         .write_lag_lsn = if (snapshot.write_lag_lsn) |value| try adminI64(value) else null,
         .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
         .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
+        .last_error = snapshot.last_error,
         .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
         .caught_up_to_received = snapshot.caught_up_to_received,
         .can_serve_safe_reads = snapshot.can_serve_safe_reads,

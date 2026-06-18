@@ -6559,7 +6559,10 @@ func haObservedStandbyStatusFromAdminSDK(response adminsdk.HAStandbyStatusRespon
 	status.WriteLagLSN = snapshot.WriteLagLsn
 	status.ReceiveLagLSN = snapshot.ReceiveLagLsn
 	status.ApplyLagLSN = snapshot.ApplyLagLsn
-	if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
+	status.LastError = strings.TrimSpace(snapshot.LastError)
+	if status.LastError != "" {
+		status.Status = "unhealthy"
+	} else if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
 		status.Status = "lagging"
 	} else if status.CanServeSafeReads && status.Status == "" {
 		status.Status = "healthy"

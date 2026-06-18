@@ -92,6 +92,7 @@ type haStandbyStatusJSON struct {
 	WriteLagLSN        *uint64             `json:"write_lag_lsn"`
 	ReceiveLagLSN      *uint64             `json:"receive_lag_lsn"`
 	ApplyLagLSN        *uint64             `json:"apply_lag_lsn"`
+	LastError          *string             `json:"last_error"`
 	UnappliedLSNCount  *uint64             `json:"unapplied_lsn_count"`
 	CaughtUpToReceived *bool               `json:"caught_up_to_received"`
 	CanServeSafeReads  *bool               `json:"can_serve_safe_reads"`
@@ -274,6 +275,7 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 			WriteLagLsn:        haUint64StatusValue(snapshot.WriteLagLSN),
 			ReceiveLagLsn:      haUint64StatusValue(snapshot.ReceiveLagLSN),
 			ApplyLagLsn:        haUint64StatusValue(snapshot.ApplyLagLSN),
+			LastError:          haStringStatusValue(snapshot.LastError),
 			UnappliedLsnCount:  haUint64StatusValue(snapshot.UnappliedLSNCount),
 			CaughtUpToReceived: haBoolStatusValue(snapshot.CaughtUpToReceived),
 			CanServeSafeReads:  haBoolStatusValue(snapshot.CanServeSafeReads),
@@ -591,6 +593,13 @@ func haUint64StatusValue(value *uint64) uint64 {
 
 func haBoolStatusValue(value *bool) bool {
 	return value != nil && *value
+}
+
+func haStringStatusValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func haSaturatingSub(a, b uint64) uint64 {

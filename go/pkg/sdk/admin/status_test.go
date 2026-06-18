@@ -129,6 +129,9 @@ func TestHAStatusParserAcceptsLegacyStandbyEnvelope(t *testing.T) {
 	if snapshot.ReceivedLsn != 12 || snapshot.AppliedLsn != 11 || !snapshot.CanServeSafeReads {
 		t.Fatalf("Snapshot = %+v, want received=12 applied=11 safe reads", snapshot)
 	}
+	if snapshot.LastError != "ConnectionRefused" {
+		t.Fatalf("LastError = %q, want ConnectionRefused", snapshot.LastError)
+	}
 }
 
 func TestHAStatusParserRejectsMissingStandbySafeReadFlag(t *testing.T) {
@@ -366,7 +369,7 @@ func TestHAClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) {
 		t.Fatalf("Body is empty, want raw response body")
 	}
 	var parsed *ParsedHAStandbyStatus = response.Value
-	if parsed.Snapshot.ReceivedLsn != 12 || parsed.Snapshot.AppliedLsn != 11 || !parsed.Snapshot.CanServeSafeReads {
+	if parsed.Snapshot.ReceivedLsn != 12 || parsed.Snapshot.AppliedLsn != 11 || !parsed.Snapshot.CanServeSafeReads || parsed.Snapshot.LastError != "ConnectionRefused" {
 		t.Fatalf("parsed response = %+v, want received=12 applied=11 safe reads", parsed)
 	}
 }
@@ -467,6 +470,7 @@ func haGeneratedStandbyStatusJSON() string {
 			"write_lag_lsn":0,
 			"receive_lag_lsn":0,
 			"apply_lag_lsn":1,
+			"last_error":"ConnectionRefused",
 			"unapplied_lsn_count":1,
 			"caught_up_to_received":false,
 			"can_serve_safe_reads":true
@@ -550,10 +554,11 @@ func haLegacyStandbyStatusJSON() string {
 				"upstream_lsn":12,
 				"write_lag_lsn":0,
 				"receive_lag_lsn":0,
-				"apply_lag_lsn":1,
-				"unapplied_lsn_count":1,
-				"caught_up_to_received":false,
-				"can_serve_safe_reads":true
+			"apply_lag_lsn":1,
+			"last_error":"ConnectionRefused",
+			"unapplied_lsn_count":1,
+			"caught_up_to_received":false,
+			"can_serve_safe_reads":true
 			}
 		}
 	}`

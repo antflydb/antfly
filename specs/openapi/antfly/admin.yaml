@@ -1644,6 +1644,10 @@ components:
           format: uint64
           minimum: 0
           nullable: true
+        last_error:
+          type: string
+          nullable: true
+          description: Last local standby replication pull or apply error observed by the node-local runtime.
         unapplied_lsn_count:
           type: integer
           format: uint64

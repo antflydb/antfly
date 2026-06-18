@@ -56,8 +56,18 @@ pub const Server = struct {
     ctx: admin_exec.Context,
     auth: AuthOptions = .{},
 
+    pub const StandbyStatusExtras = struct {
+        ptr: *anyopaque,
+        last_error: *const fn (ptr: *anyopaque) ?[]const u8,
+
+        pub fn lastError(self: StandbyStatusExtras) ?[]const u8 {
+            return self.last_error(self.ptr);
+        }
+    };
+
     pub const AuthOptions = struct {
         bearer_token: ?[]const u8 = null,
+        standby_status_extras: ?StandbyStatusExtras = null,
     };
 
     pub fn init(alloc: Allocator, ctx: admin_exec.Context) Server {
@@ -258,9 +268,13 @@ pub const Server = struct {
         else
             null;
 
+        var snapshot = ha_admin.standbyStatus(standby, upstream_lsn);
+        if (self.auth.standby_status_extras) |extras| {
+            snapshot.last_error = extras.lastError();
+        }
         return try self.handleTypedJson(admin_api.HAStandbyStatusResponse{
             .schema_version = 1,
-            .snapshot = try adminStandbySnapshot(ha_admin.standbyStatus(standby, upstream_lsn), node_id),
+            .snapshot = try adminStandbySnapshot(snapshot, node_id),
         });
     }
 
@@ -1112,6 +1126,7 @@ fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot, node_id: []const u
         .write_lag_lsn = if (snapshot.write_lag_lsn) |value| try adminI64(value) else null,
         .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
         .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
+        .last_error = snapshot.last_error,
         .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
         .caught_up_to_received = snapshot.caught_up_to_received,
         .can_serve_safe_reads = snapshot.can_serve_safe_reads,
