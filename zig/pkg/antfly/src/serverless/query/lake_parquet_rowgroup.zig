@@ -27,6 +27,7 @@ const lake_scan_plan = @import("lake_scan_plan.zig");
 const range_io = @import("lake_range_io.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const snappy = @import("../../encoding/snappy.zig");
+pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 pub const ColumnChunkInput = struct {
     column_id: []const u8,
@@ -163,8 +164,13 @@ pub const ObjectRangeCachePolicy = struct {
     }
 };
 
+pub const ObjectRangeCacheEntry = struct {
+    bytes: []u8,
+    checksum: ObjectRangeCacheDigest,
+};
+
 pub const ObjectRangeCache = struct {
-    entries: std.StringHashMapUnmanaged([]u8) = .empty,
+    entries: std.StringHashMapUnmanaged(ObjectRangeCacheEntry) = .empty,
     stats: ObjectRangeCacheStats = .{},
     policy: ObjectRangeCachePolicy = .{},
 
@@ -176,7 +182,7 @@ pub const ObjectRangeCache = struct {
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
             alloc.free(entry.key_ptr.*);
-            alloc.free(entry.value_ptr.*);
+            alloc.free(entry.value_ptr.bytes);
         }
         self.entries.deinit(alloc);
         self.* = undefined;
@@ -224,10 +230,10 @@ pub const ObjectRangeCache = struct {
             if (entry_lane != cache_lane) continue;
             const key = entry.key_ptr.*;
             const value = entry.value_ptr.*;
-            const byte_len = value.len;
+            const byte_len = value.bytes.len;
             if (!self.entries.remove(key)) return false;
             alloc.free(key);
-            alloc.free(value);
+            alloc.free(value.bytes);
             decrementSaturating(&self.stats.stored_bytes, byte_len);
             decrementSaturating(&self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes, byte_len);
             self.stats.evicted_bytes += byte_len;
@@ -261,13 +267,13 @@ pub const ObjectRangeCache = struct {
         self: *ObjectRangeCache,
         alloc: Allocator,
         key: []const u8,
-        value: []u8,
+        value: ObjectRangeCacheEntry,
         cache_lane: range_io.CacheLane,
     ) bool {
-        const byte_len = value.len;
+        const byte_len = value.bytes.len;
         if (!self.entries.remove(key)) return false;
         alloc.free(key);
-        alloc.free(value);
+        alloc.free(value.bytes);
         decrementSaturating(&self.stats.stored_bytes, byte_len);
         decrementSaturating(&self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes, byte_len);
         self.stats.evicted_bytes += byte_len;
@@ -288,14 +294,19 @@ pub const ObjectRangeCache = struct {
                 alloc.free(cache_key);
                 return error.InvalidLakeRangeRead;
             };
-            if (cached.len != read_len) {
+            if (cached.bytes.len != read_len) {
+                alloc.free(cache_key);
+                return error.InvalidLakeRangeRead;
+            }
+            const checksum = objectRangeCacheDigest(cached.bytes);
+            if (!std.mem.eql(u8, &cached.checksum, &checksum)) {
                 alloc.free(cache_key);
                 return error.InvalidLakeRangeRead;
             }
             self.stats.hits += 1;
             self.stats.lanes[@intFromEnum(cache_lane)].hits += 1;
             alloc.free(cache_key);
-            return try alloc.dupe(u8, cached);
+            return try alloc.dupe(u8, cached.bytes);
         }
 
         self.stats.misses += 1;
@@ -312,7 +323,11 @@ pub const ObjectRangeCache = struct {
         }
         const stored = try alloc.dupe(u8, bytes);
         errdefer alloc.free(stored);
-        self.entries.put(alloc, cache_key, stored) catch |err| {
+        const entry = ObjectRangeCacheEntry{
+            .bytes = stored,
+            .checksum = objectRangeCacheDigest(stored),
+        };
+        self.entries.put(alloc, cache_key, entry) catch |err| {
             alloc.free(cache_key);
             return err;
         };
@@ -321,6 +336,12 @@ pub const ObjectRangeCache = struct {
         return bytes;
     }
 };
+
+fn objectRangeCacheDigest(bytes: []const u8) ObjectRangeCacheDigest {
+    var digest: ObjectRangeCacheDigest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
 
 fn decrementSaturating(value: *usize, amount: usize) void {
     value.* = if (value.* >= amount) value.* - amount else 0;
@@ -4822,7 +4843,72 @@ test "parquet object range cache rejects corrupted cached range lengths" {
         .decoded_column_id = "amount",
     };
     const cache_key = try read.cacheKeyAlloc(alloc);
-    try cache.entries.put(alloc, cache_key, try alloc.dupe(u8, "short"));
+    const stored = try alloc.dupe(u8, "short");
+    try cache.entries.put(alloc, cache_key, .{
+        .bytes = stored,
+        .checksum = objectRangeCacheDigest(stored),
+    });
+
+    const UnusedReader = struct {
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = ctx;
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            return try a.alloc(u8, len);
+        }
+    };
+    var reader = UnusedReader{};
+
+    try std.testing.expectError(
+        error.InvalidLakeRangeRead,
+        cache.readAlloc(alloc, reader.reader(), read),
+    );
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), stats.hits);
+    try std.testing.expectEqual(@as(usize, 0), stats.misses);
+}
+
+test "parquet object range cache rejects corrupted cached range checksums" {
+    const alloc = std.testing.allocator;
+    var cache = ObjectRangeCache{};
+    defer cache.deinit(alloc);
+
+    const file = external_source.FileEntry{
+        .file_id = @constCast("part-a.parquet"),
+        .object_uri = @constCast("s3://bucket/events/part-a.parquet"),
+        .etag = @constCast("etag-a"),
+        .byte_len = 16,
+        .row_count = 1,
+        .row_groups = &.{},
+    };
+    const object = try range_io.objectRefForExternalFileUri(file);
+    const read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 4, .len = 6 },
+        .purpose = .parquet_column_chunk,
+        .decoded_column_id = "amount",
+    };
+    const cache_key = try read.cacheKeyAlloc(alloc);
+    const stored = try alloc.dupe(u8, "abcdef");
+    try cache.entries.put(alloc, cache_key, .{
+        .bytes = stored,
+        .checksum = objectRangeCacheDigest("ghijkl"),
+    });
 
     const UnusedReader = struct {
         fn reader(self: *@This()) ObjectRangeReader {

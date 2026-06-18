@@ -401,7 +401,10 @@ test "iceberg snapshot reader rejects corrupted cached metadata range lengths" {
     defer cache.deinit(alloc);
     const cache_key = try read.cacheKeyAlloc(alloc);
     const corrupt_bytes = try alloc.dupe(u8, "{}");
-    cache.entries.put(alloc, cache_key, corrupt_bytes) catch |err| {
+    cache.entries.put(alloc, cache_key, .{
+        .bytes = corrupt_bytes,
+        .checksum = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+    }) catch |err| {
         alloc.free(cache_key);
         alloc.free(corrupt_bytes);
         return err;
