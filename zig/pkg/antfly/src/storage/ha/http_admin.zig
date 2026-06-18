@@ -202,7 +202,7 @@ pub const Server = struct {
 
     fn authorized(self: *const Server, req: http_common.HttpRequest) bool {
         const token = self.auth.bearer_token orelse return true;
-        if (token.len == 0) return true;
+        if (token.len == 0) return false;
         const authorization = req.authorization orelse req.header("authorization") orelse return false;
         return bearerAuthorizationMatches(token, authorization);
     }
@@ -2597,6 +2597,29 @@ test "storage.ha http admin bearer authorization requires exact token" {
     try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-token "));
     try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret"));
     try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-token-extra"));
+}
+
+test "storage.ha http admin empty configured bearer token fails closed" {
+    const alloc = std.testing.allocator;
+    var server = Server.initWithOptions(alloc, .{}, .{ .bearer_token = "" });
+    defer server.deinit();
+
+    var health = try server.handle(.{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+
+    var admin = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    defer admin.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), admin.status);
+
+    var command = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"identify\"]}",
+    });
+    defer command.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), command.status);
 }
 
 test "storage.ha http admin rejects invalid fence request identity and bounds" {
