@@ -1246,6 +1246,7 @@ fn refreshQuantizedWithKnownVectors(
     txn: anytype,
     node: *const types.Node,
     vectors: []const f32,
+    vectors_owned: ?*bool,
     now_fn: fn () u64,
     elapsed_fn: fn (u64) u64,
 ) !void {
@@ -1262,6 +1263,8 @@ fn refreshQuantizedWithKnownVectors(
 
     const dims: usize = @intCast(self.metadata.dims);
     if (vectors.len < count * dims) return error.InvalidArgument;
+    const vector_count = count * dims;
+    const can_take_vectors = vectors_owned != null and vectors_owned.?.* and vectors.len == vector_count;
 
     const compute_start = now_fn();
     var qs: hbc_runtime.QuantizedSet = if (usesNonQuantizedPayload(node))
@@ -1269,11 +1272,12 @@ fn refreshQuantizedWithKnownVectors(
             .vectors = .{
                 .dims = @intCast(dims),
                 .count = @intCast(count),
-                .data = try self.alloc.dupe(f32, vectors[0 .. count * dims]),
+                .data = if (can_take_vectors) @constCast(vectors[0..vector_count]) else try self.alloc.dupe(f32, vectors[0..vector_count]),
             },
         } }
     else
-        .{ .rabit = try self.quantizer.quantize(node.centroid, vectors[0 .. count * dims], count) };
+        .{ .rabit = try self.quantizer.quantize(node.centroid, vectors[0..vector_count], count) };
+    if (can_take_vectors and usesNonQuantizedPayload(node)) vectors_owned.?.* = false;
     self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
     defer qs.deinit(self.alloc);
 
@@ -1310,6 +1314,7 @@ fn saveLeafNodeBodyWithKnownVectors(
     txn: anytype,
     node: *const types.Node,
     vectors: []const f32,
+    vectors_owned: ?*bool,
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
 ) !void {
@@ -1328,7 +1333,7 @@ fn saveLeafNodeBodyWithKnownVectors(
     } else {
         try saveDeltaBackedLeafNodeValue(self, txn, node);
     }
-    try refreshQuantizedWithKnownVectors(self, txn, node, vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
+    try refreshQuantizedWithKnownVectors(self, txn, node, vectors, vectors_owned, nowNsU64Fixed, elapsedSinceU64Fixed);
     clearDeferredQuantizedNode(self, node.id);
     var posting_state_to_save = node.posting_state;
     if (node.is_leaf) {
@@ -1350,7 +1355,7 @@ fn saveLeafNodeWithKnownVectors(
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
 ) !void {
-    try saveLeafNodeBodyWithKnownVectors(self, txn, node, vectors, now_fn, elapsed_fn);
+    try saveLeafNodeBodyWithKnownVectors(self, txn, node, vectors, null, now_fn, elapsed_fn);
     const range_start = now_fn();
     try saveNodeSplitRange(self, txn, node, isNotFoundGeneric);
     self.write_profile.save_split_range_ns += elapsed_fn(range_start);
@@ -9339,12 +9344,13 @@ fn buildBulkLeafIndexed(
         .members = members,
     };
     const leaf_vectors = try self.alloc.alloc(f32, indexes.len * self.config.dims);
-    defer self.alloc.free(leaf_vectors);
+    var leaf_vectors_owned = true;
+    defer if (leaf_vectors_owned) self.alloc.free(leaf_vectors);
     for (indexes, 0..) |input_idx, i| {
         const transformed = inputs[input_idx].transformed;
         @memcpy(leaf_vectors[i * self.config.dims ..][0..self.config.dims], transformed);
     }
-    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, nowNsI128Fixed, elapsedSinceNsFixed);
+    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, &leaf_vectors_owned, nowNsI128Fixed, elapsedSinceNsFixed);
     try self.putNodeSplitRange(txn, node_id, &range);
     self.alloc.free(members);
 
@@ -9699,11 +9705,12 @@ fn buildBulkLeaf(
         .members = members,
     };
     const leaf_vectors = try self.alloc.alloc(f32, inputs.len * self.config.dims);
-    defer self.alloc.free(leaf_vectors);
+    var leaf_vectors_owned = true;
+    defer if (leaf_vectors_owned) self.alloc.free(leaf_vectors);
     for (inputs, 0..) |input, i| {
         @memcpy(leaf_vectors[i * self.config.dims ..][0..self.config.dims], input.transformed);
     }
-    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, nowNsI128Fixed, elapsedSinceNsFixed);
+    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, &leaf_vectors_owned, nowNsI128Fixed, elapsedSinceNsFixed);
     try self.putNodeSplitRange(txn, node_id, &range);
     self.alloc.free(members);
 
