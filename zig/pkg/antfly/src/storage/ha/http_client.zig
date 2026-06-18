@@ -2100,7 +2100,7 @@ test "storage.ha http client maps admin errors" {
 test "storage.ha http client renders primary status sync query with OpenAPI enum spelling" {
     const alloc = std.testing.allocator;
     const standby_names = [_][]const u8{ "standby-a", "standby b%" };
-    var uri = try alloc.dupe(u8, "http://ha-admin.test/admin/v1/ha/primary/status");
+    var uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.ha_primary_status});
     uri = try appendQuerySyncPolicy(alloc, uri, .{
         .mode = .remote_write,
         .selection = .first,

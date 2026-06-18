@@ -2188,7 +2188,7 @@ test "storage.ha http admin serves health and command endpoint" {
 
     var invalid_typed_slot_path = try server.handle(.{
         .method = .DELETE,
-        .uri = "/admin/v1/ha/replication-slots/standby%XX",
+        .uri = admin_api.routes.ha_replication_slot_prefix ++ "standby%XX",
     });
     defer invalid_typed_slot_path.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_typed_slot_path.status);

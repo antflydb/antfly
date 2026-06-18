@@ -167,6 +167,14 @@ test "admin routes match generated OpenAPI HA operations" {
     try expectEveryGeneratedHARouteCovered();
 }
 
+test "admin routes own HA admin path literals consumed by Zig runtime code" {
+    try expectNoHardCodedHAAdminPath("../cmd/ha.zig", @embedFile("../cmd/ha.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/ha/admin_exec.zig", @embedFile("../storage/ha/admin_exec.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/ha/http_admin.zig", @embedFile("../storage/ha/http_admin.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/ha/http_client.zig", @embedFile("../storage/ha/http_client.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/ha/operator.zig", @embedFile("../storage/ha/operator.zig"));
+}
+
 test "admin routes build and match replication slot lifecycle paths" {
     const alloc = std.testing.allocator;
 
@@ -279,6 +287,12 @@ fn expectEveryGeneratedHARouteCovered() !void {
         );
         return error.TestExpectedGeneratedHARouteCovered;
     }
+}
+
+fn expectNoHardCodedHAAdminPath(label: []const u8, source: []const u8) !void {
+    if (std.mem.indexOf(u8, source, "\"/admin/v1/ha") == null) return;
+    std.debug.print("{s} hard-codes a /admin/v1/ha path; use zig/pkg/antfly/src/admin/routes.zig constants\n", .{label});
+    return error.TestExpectedNoHardCodedHAAdminPath;
 }
 
 fn expectedHARoute(generated: openapi.server.Route) ?ExpectedRoute {
