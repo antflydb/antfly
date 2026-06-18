@@ -88,12 +88,15 @@ pub const DataFileEntry = struct {
     content: DataFileContent = .data,
     file_path: []u8,
     file_format: []u8,
+    partition_values: []PartitionValue = &.{},
     record_count: u64,
     file_size_in_bytes: u64,
 
     pub fn deinit(self: *DataFileEntry, alloc: Allocator) void {
         alloc.free(self.file_path);
         alloc.free(self.file_format);
+        for (self.partition_values) |*partition| partition.deinit(alloc);
+        if (self.partition_values.len > 0) alloc.free(self.partition_values);
         self.* = undefined;
     }
 
@@ -103,6 +106,27 @@ pub const DataFileEntry = struct {
         if (!std.ascii.eqlIgnoreCase(self.file_format, "PARQUET")) return error.UnsupportedIcebergDataFileFormat;
         if (self.record_count == 0) return error.InvalidIcebergDataManifest;
         if (self.file_size_in_bytes == 0) return error.InvalidIcebergDataManifest;
+        for (self.partition_values, 0..) |partition, idx| {
+            try partition.validate();
+            for (self.partition_values[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous.column_id, partition.column_id)) return error.InvalidIcebergDataManifest;
+            }
+        }
+    }
+};
+
+pub const PartitionValue = struct {
+    column_id: []u8,
+    string_value: []u8,
+
+    pub fn deinit(self: *PartitionValue, alloc: Allocator) void {
+        alloc.free(self.column_id);
+        alloc.free(self.string_value);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: PartitionValue) !void {
+        if (self.column_id.len == 0) return error.InvalidIcebergDataManifest;
     }
 };
 
@@ -591,12 +615,15 @@ const DataFileScratch = struct {
     content: ?DataFileContent = null,
     file_path: ?[]u8 = null,
     file_format: ?[]u8 = null,
+    partition_values: []PartitionValue = &.{},
     record_count: u64 = 0,
     file_size_in_bytes: u64 = 0,
 
     fn deinit(self: *DataFileScratch, alloc: Allocator) void {
         if (self.file_path) |path| alloc.free(path);
         if (self.file_format) |format| alloc.free(format);
+        for (self.partition_values) |*partition| partition.deinit(alloc);
+        if (self.partition_values.len > 0) alloc.free(self.partition_values);
         self.* = undefined;
     }
 };
@@ -636,6 +663,8 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
     const content = data_file.content orelse return error.InvalidIcebergDataManifest;
     data_file.file_path = null;
     data_file.file_format = null;
+    const partition_values = data_file.partition_values;
+    data_file.partition_values = &.{};
     var entry = DataFileEntry{
         .status = status,
         .snapshot_id = scratch.snapshot_id,
@@ -644,6 +673,7 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
         .content = content,
         .file_path = file_path,
         .file_format = file_format,
+        .partition_values = partition_values,
         .record_count = data_file.record_count,
         .file_size_in_bytes = data_file.file_size_in_bytes,
     };
@@ -670,6 +700,9 @@ fn readDataFileRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.V
         } else if (std.mem.eql(u8, name, "file_format")) {
             if (scratch.file_format != null) return error.InvalidIcebergDataManifest;
             scratch.file_format = try readJsonAvroStringAlloc(alloc, reader, field_type);
+        } else if (std.mem.eql(u8, name, "partition")) {
+            if (scratch.partition_values.len != 0) return error.InvalidIcebergDataManifest;
+            scratch.partition_values = try readPartitionRecordAlloc(alloc, reader, field_type);
         } else if (std.mem.eql(u8, name, "record_count")) {
             scratch.record_count = try nonNegativeDataU64(try readJsonAvroLong(reader, field_type));
         } else if (std.mem.eql(u8, name, "file_size_in_bytes")) {
@@ -680,6 +713,56 @@ fn readDataFileRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.V
     }
 
     return scratch;
+}
+
+fn readPartitionRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]PartitionValue {
+    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return &.{};
+    const fields = try recordFields(value_schema);
+    var partitions = std.ArrayListUnmanaged(PartitionValue).empty;
+    errdefer {
+        for (partitions.items) |*partition| partition.deinit(alloc);
+        partitions.deinit(alloc);
+    }
+
+    for (fields.items) |field| {
+        const field_object = try jsonObject(field);
+        const name = try jsonRequiredString(field_object, "name");
+        const field_type = field_object.get("type") orelse return error.InvalidIcebergDataManifest;
+        if (try readJsonAvroPartitionStringAlloc(alloc, reader, field_type)) |value| {
+            var keep = false;
+            errdefer if (!keep) alloc.free(value);
+            const column_id = try alloc.dupe(u8, name);
+            errdefer if (!keep) alloc.free(column_id);
+            try partitions.append(alloc, .{
+                .column_id = column_id,
+                .string_value = value,
+            });
+            keep = true;
+        }
+    }
+
+    return try partitions.toOwnedSlice(alloc);
+}
+
+fn readJsonAvroPartitionStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) !?[]u8 {
+    switch (schema) {
+        .array => |branches| {
+            const tag = try reader.readLong();
+            if (tag < 0) return error.InvalidIcebergDataManifest;
+            const tag_index = std.math.cast(usize, tag) orelse return error.InvalidIcebergDataManifest;
+            if (tag_index >= branches.items.len) return error.InvalidIcebergDataManifest;
+            const branch = branches.items[tag_index];
+            if (jsonTypeNameEql(branch, "null")) return null;
+            if (jsonTypeNameEql(branch, "string")) return try reader.readStringAlloc(alloc);
+            try skipJsonAvroValueAfterUnionTag(reader, branch);
+            return null;
+        },
+        else => {
+            if (jsonTypeNameEql(schema, "string")) return try reader.readStringAlloc(alloc);
+            try skipJsonAvroValue(reader, schema);
+            return null;
+        },
+    }
 }
 
 fn readJsonAvroStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]u8 {
@@ -721,8 +804,18 @@ fn readJsonUnionTagForValue(reader: *Reader, schema: std.json.Value) !?std.json.
     };
 }
 
-fn skipJsonAvroValue(reader: *Reader, schema: std.json.Value) !void {
+const JsonAvroSkipError = error{
+    InvalidAvroContainer,
+    InvalidIcebergDataManifest,
+    UnsupportedAvroManifestField,
+};
+
+fn skipJsonAvroValue(reader: *Reader, schema: std.json.Value) JsonAvroSkipError!void {
     const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return;
+    return try skipJsonAvroValueAfterUnionTag(reader, value_schema);
+}
+
+fn skipJsonAvroValueAfterUnionTag(reader: *Reader, value_schema: std.json.Value) JsonAvroSkipError!void {
     const type_name = try jsonTypeName(value_schema);
     if (std.mem.eql(u8, type_name, "null")) {
         return;
@@ -913,6 +1006,9 @@ test "iceberg avro data-manifest decoder reads parquet data files" {
     try std.testing.expectEqual(DataFileContent.data, manifest.entries[0].content);
     try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", manifest.entries[0].file_path);
     try std.testing.expectEqualStrings("PARQUET", manifest.entries[0].file_format);
+    try std.testing.expectEqual(@as(usize, 1), manifest.entries[0].partition_values.len);
+    try std.testing.expectEqualStrings("region", manifest.entries[0].partition_values[0].column_id);
+    try std.testing.expectEqualStrings("us-west", manifest.entries[0].partition_values[0].string_value);
     try std.testing.expectEqual(@as(u64, 3), manifest.entries[0].record_count);
     try std.testing.expectEqual(@as(u64, 4096), manifest.entries[0].file_size_in_bytes);
 

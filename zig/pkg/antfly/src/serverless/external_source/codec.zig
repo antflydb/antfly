@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("types.zig");
 
 const magic = "AFXS";
-const version: u32 = 7;
+const version: u32 = 8;
 
 pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8 {
     try inventory.validate();
@@ -41,6 +41,11 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
         try appendBytes(alloc, &out, file.version_id);
         try appendU64(alloc, &out, file.byte_len);
         try appendU64(alloc, &out, file.row_count);
+        try appendU32(alloc, &out, @intCast(file.partition_values.len));
+        for (file.partition_values) |partition| {
+            try appendBytes(alloc, &out, partition.column_id);
+            try appendBytes(alloc, &out, partition.string_value);
+        }
         try appendU32(alloc, &out, @intCast(file.row_groups.len));
         for (file.row_groups) |row_group| {
             try appendU32(alloc, &out, row_group.ordinal);
@@ -76,7 +81,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidExternalSourceInventoryMagic;
     cursor += magic.len;
     const got_version = try readU32(bytes, &cursor);
-    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
+    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
     if (cursor >= bytes.len) return error.InvalidExternalSourceInventory;
     const format = try decodeFormat(bytes[cursor]);
     cursor += 1;
@@ -110,6 +115,26 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
         errdefer if (!keep_file and version_id.len > 0) alloc.free(version_id);
         const byte_len = try readU64(bytes, &cursor);
         const row_count = try readU64(bytes, &cursor);
+        const partition_count = if (got_version >= 8) try readU32(bytes, &cursor) else 0;
+        const partition_values = try alloc.alloc(external_source.PartitionValue, partition_count);
+        var initialized_partitions: usize = 0;
+        errdefer if (!keep_file) {
+            for (partition_values[0..initialized_partitions]) |*partition| partition.deinit(alloc);
+            alloc.free(partition_values);
+        };
+        for (partition_values) |*partition| {
+            var keep_partition = false;
+            const column_id = try readBytesAlloc(alloc, bytes, &cursor);
+            errdefer if (!keep_partition) alloc.free(column_id);
+            const string_value = try readBytesAlloc(alloc, bytes, &cursor);
+            errdefer if (!keep_partition) alloc.free(string_value);
+            partition.* = .{
+                .column_id = column_id,
+                .string_value = string_value,
+            };
+            keep_partition = true;
+            initialized_partitions += 1;
+        }
         const row_group_count = try readU32(bytes, &cursor);
         const row_groups = try alloc.alloc(external_source.RowGroup, row_group_count);
         var initialized_row_groups: usize = 0;
@@ -193,6 +218,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
             .version_id = version_id,
             .byte_len = byte_len,
             .row_count = row_count,
+            .partition_values = partition_values,
             .row_groups = row_groups,
         };
         keep_file = true;
@@ -326,6 +352,10 @@ test "external source inventory codec round-trips file inventory" {
         .version_id = try alloc.dupe(u8, "version-file-a"),
         .byte_len = 1024,
         .row_count = 2,
+        .partition_values = try alloc.dupe(external_source.PartitionValue, &[_]external_source.PartitionValue{.{
+            .column_id = try alloc.dupe(u8, "region"),
+            .string_value = try alloc.dupe(u8, "us-west"),
+        }}),
         .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
             .{
                 .ordinal = 0,
@@ -364,6 +394,9 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqualStrings("file-a.parquet", decoded.files[0].file_id);
     try std.testing.expectEqualStrings("etag-file-a", decoded.files[0].etag);
     try std.testing.expectEqualStrings("version-file-a", decoded.files[0].version_id);
+    try std.testing.expectEqual(@as(usize, 1), decoded.files[0].partition_values.len);
+    try std.testing.expectEqualStrings("region", decoded.files[0].partition_values[0].column_id);
+    try std.testing.expectEqualStrings("us-west", decoded.files[0].partition_values[0].string_value);
     try std.testing.expectEqual(@as(u64, 2), decoded.files[0].row_groups[0].row_count);
     try std.testing.expectEqual(@as(u64, 512), decoded.files[0].row_groups[0].total_byte_len);
     try std.testing.expectEqual(@as(usize, 1), decoded.files[0].row_groups[0].column_chunks.len);

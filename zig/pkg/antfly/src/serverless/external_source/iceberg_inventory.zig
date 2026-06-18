@@ -113,12 +113,18 @@ pub fn planInventoryFromDataFilesAlloc(
         errdefer alloc.free(object_uri);
         const version_id = try syntheticVersionIdAlloc(alloc, request.snapshot_id, data_file);
         errdefer alloc.free(version_id);
+        const partition_values = try clonePartitionValuesAlloc(alloc, data_file.partition_values);
+        errdefer {
+            for (partition_values) |*partition| partition.deinit(alloc);
+            if (partition_values.len > 0) alloc.free(partition_values);
+        }
         files[out_idx] = .{
             .file_id = file_id,
             .object_uri = object_uri,
             .version_id = version_id,
             .byte_len = data_file.file_size_in_bytes,
             .row_count = data_file.record_count,
+            .partition_values = partition_values,
             .row_groups = &.{},
         };
         initialized += 1;
@@ -179,6 +185,27 @@ pub fn planInventoryFromSnapshotManifestsAlloc(
         .schema_fingerprint = request.metadata_plan.schema_fingerprint,
         .data_files = data_files,
     });
+}
+
+fn clonePartitionValuesAlloc(
+    alloc: Allocator,
+    source: []const iceberg_avro.PartitionValue,
+) ![]external_source.PartitionValue {
+    if (source.len == 0) return &.{};
+    const cloned = try alloc.alloc(external_source.PartitionValue, source.len);
+    errdefer alloc.free(cloned);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*partition| partition.deinit(alloc);
+    }
+    for (source, 0..) |partition, idx| {
+        cloned[idx] = .{
+            .column_id = try alloc.dupe(u8, partition.column_id),
+            .string_value = try alloc.dupe(u8, partition.string_value),
+        };
+        initialized += 1;
+    }
+    return cloned;
 }
 
 fn decodedManifestForPath(
@@ -270,6 +297,10 @@ test "iceberg inventory planner creates active parquet inventory" {
             .content = .data,
             .file_path = try alloc.dupe(u8, "s3://bucket/t/data/b.parquet"),
             .file_format = try alloc.dupe(u8, "PARQUET"),
+            .partition_values = try alloc.dupe(iceberg_avro.PartitionValue, &[_]iceberg_avro.PartitionValue{.{
+                .column_id = try alloc.dupe(u8, "region"),
+                .string_value = try alloc.dupe(u8, "us-west"),
+            }}),
             .record_count = 2,
             .file_size_in_bytes = 2048,
         },
@@ -316,6 +347,9 @@ test "iceberg inventory planner creates active parquet inventory" {
     try std.testing.expectEqual(@as(u64, 4096), inventory.files[0].byte_len);
     try std.testing.expect(std.mem.startsWith(u8, inventory.files[0].version_id, "iceberg:v1:snapshot=12:"));
     try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", inventory.files[1].file_id);
+    try std.testing.expectEqual(@as(usize, 1), inventory.files[1].partition_values.len);
+    try std.testing.expectEqualStrings("region", inventory.files[1].partition_values[0].column_id);
+    try std.testing.expectEqualStrings("us-west", inventory.files[1].partition_values[0].string_value);
 }
 
 test "iceberg inventory planner expands snapshot manifests into pinned inventory" {

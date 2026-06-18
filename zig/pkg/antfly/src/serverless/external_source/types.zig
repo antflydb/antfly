@@ -93,6 +93,7 @@ pub const FileEntry = struct {
     version_id: []u8 = &.{},
     byte_len: u64,
     row_count: u64,
+    partition_values: []PartitionValue = &.{},
     row_groups: []RowGroup,
 
     pub fn deinit(self: *FileEntry, alloc: Allocator) void {
@@ -100,6 +101,8 @@ pub const FileEntry = struct {
         alloc.free(self.object_uri);
         if (self.etag.len > 0) alloc.free(self.etag);
         if (self.version_id.len > 0) alloc.free(self.version_id);
+        for (self.partition_values) |*partition| partition.deinit(alloc);
+        if (self.partition_values.len > 0) alloc.free(self.partition_values);
         for (self.row_groups) |*row_group| row_group.deinit(alloc);
         if (self.row_groups.len > 0) alloc.free(self.row_groups);
         self.* = undefined;
@@ -110,6 +113,12 @@ pub const FileEntry = struct {
         if (self.object_uri.len == 0) return error.InvalidExternalSourceInventory;
         if (self.etag.len == 0 and self.version_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.byte_len == 0) return error.InvalidExternalSourceInventory;
+        for (self.partition_values, 0..) |partition, idx| {
+            try partition.validate();
+            for (self.partition_values[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous.column_id, partition.column_id)) return error.InvalidExternalSourceInventory;
+            }
+        }
         var total_rows: u64 = 0;
         for (self.row_groups, 0..) |row_group, idx| {
             try row_group.validate(self.byte_len);
@@ -117,6 +126,21 @@ pub const FileEntry = struct {
             total_rows += row_group.row_count;
         }
         if (self.row_groups.len != 0 and total_rows != self.row_count) return error.InvalidExternalSourceInventory;
+    }
+};
+
+pub const PartitionValue = struct {
+    column_id: []u8,
+    string_value: []u8,
+
+    pub fn deinit(self: *PartitionValue, alloc: Allocator) void {
+        alloc.free(self.column_id);
+        alloc.free(self.string_value);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: PartitionValue) !void {
+        if (self.column_id.len == 0) return error.InvalidExternalSourceInventory;
     }
 };
 
