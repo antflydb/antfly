@@ -3475,8 +3475,18 @@ pub const ApiHttpServer = struct {
                 defer self.alloc.free(decoded_key);
                 var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, uri_parts.query);
                 defer lookup_opts.deinit(self.alloc);
+                const consistency = parseLookupReadConsistency(uri_parts.query) catch {
+                    return try textResponse(self.alloc, 400, "invalid read consistency");
+                };
 
-                var result = (try source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, .read_index)) orelse {
+                var result = (source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
+                    error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    else => {
+                        std.log.err("public table lookup failed table={s} key={s} err={}", .{ lookup.table_name, decoded_key, err });
+                        return try textResponse(self.alloc, 500, "lookup failed");
+                    },
+                }) orelse {
                     return try textResponse(self.alloc, 404, "not found");
                 };
                 defer result.deinit(self.alloc);
@@ -8173,6 +8183,16 @@ fn parseSimpleQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+pub fn parseLookupReadConsistency(query: []const u8) !raft_mod.ReadConsistency {
+    const value = parseSimpleQueryParam(query, "consistency") orelse
+        parseSimpleQueryParam(query, "read_consistency") orelse
+        return .read_index;
+    if (std.mem.eql(u8, value, "stale")) return .stale;
+    if (std.mem.eql(u8, value, "read_index") or std.mem.eql(u8, value, "read-index")) return .read_index;
+    if (std.mem.eql(u8, value, "leader_lease") or std.mem.eql(u8, value, "leader-lease")) return .leader_lease;
+    return error.InvalidReadConsistency;
+}
+
 pub fn runtimeSchemaDebugRequested(query: []const u8) bool {
     const value = parseSimpleQueryParam(query, "debug") orelse return false;
     return std.mem.eql(u8, value, "runtime_schema");
@@ -9938,6 +9958,75 @@ test "api http server serves table lookup with version header" {
     try std.testing.expectEqual(@as(usize, 1), resp.headers.len);
     try std.testing.expectEqualStrings("X-Antfly-Version", resp.headers[0].name);
     try std.testing.expectEqualStrings("4321", resp.headers[0].value);
+}
+
+test "api http server allows explicit stale table lookup consistency" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a", key);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency);
+            return .{
+                .json = try inner_alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+                .version = 42,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", resp.body);
+
+    var invalid = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=linearizable" });
+    defer invalid.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
+    try std.testing.expectEqualStrings("invalid read consistency", invalid.body);
 }
 
 test "api http server decodes percent-encoded lookup keys" {

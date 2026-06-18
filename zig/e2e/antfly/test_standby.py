@@ -34,6 +34,7 @@ from conftest import (
     _read_log_tail,
     _swarm_stateful_command,
     find_free_port,
+    lookup_key_path,
     maybe_preserve_tempdir,
     resolve_binary_path,
     wait_for_server,
@@ -214,6 +215,15 @@ class HASwarmNode:
             timeout=30,
         )
 
+    def lookup_key(self, table_name: str, key: str, *, consistency: str | None = None) -> dict[str, Any]:
+        params = {"consistency": consistency} if consistency is not None else None
+        response = requests.get(
+            f"{self.url}{DB_API_ROOT}{lookup_key_path(table_name, key)}",
+            params=params,
+            timeout=30,
+        )
+        return self._check(response)
+
     def _check(self, response: requests.Response) -> dict[str, Any]:
         if response.status_code >= 400:
             raise requests.HTTPError(
@@ -308,6 +318,30 @@ def _wait_for_standby_applied(cluster: HACluster, lsn: int, *, timeout_s: float 
     )
 
 
+def _wait_for_standby_lookup(
+    cluster: HACluster,
+    table_name: str,
+    key: str,
+    *,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return cluster.standby.lookup_key(table_name, key, consistency="stale")
+        except requests.HTTPError as err:
+            if err.response is not None and err.response.status_code == 404:
+                last_error = err
+                time.sleep(0.25)
+                continue
+            raise
+        except requests.RequestException as err:
+            last_error = err
+            time.sleep(0.25)
+    raise AssertionError(f"standby lookup for {key!r} did not become visible; last_error={last_error}\n{cluster.debug_logs()}")
+
+
 def _primary_lsn(cluster: HACluster) -> int:
     status = cluster.primary.admin_get("/primary/status")
     return int(status["snapshot"]["current_lsn"])
@@ -393,6 +427,8 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert read_check["decision"]["action"] == "serve_standby"
     assert read_check["decision"]["serve_lsn"] >= first_lsn
+    first_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:first")
+    assert first_doc["title"] == "first"
 
     write_check = ha_cluster.standby.admin_post("/write/check", {"role": "standby"})
     assert write_check["decision"]["action"] == "reject_read_only_standby"
@@ -401,6 +437,8 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     restarted_snapshot = _wait_for_standby_applied(ha_cluster, first_lsn)
     assert restarted_snapshot["received_lsn"] >= first_lsn
     assert restarted_snapshot["applied_lsn"] >= first_lsn
+    restarted_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:first")
+    assert restarted_doc["title"] == "first"
 
     ha_cluster.primary.batch_write(table_name, {"doc:second": {"title": "second"}})
     second_lsn = _primary_lsn(ha_cluster)
@@ -414,6 +452,8 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert second_read_check["decision"]["action"] == "serve_standby"
     assert second_read_check["decision"]["serve_lsn"] >= second_lsn
+    second_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:second")
+    assert second_doc["title"] == "second"
 
     primary_status = ha_cluster.primary.admin_get("/primary/status")
     slot = next(

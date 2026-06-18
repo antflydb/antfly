@@ -59,6 +59,8 @@ pub const ListTablesParams = struct {
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
+    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
+    consistency: ?[]const u8 = null,
 };
 
 pub const ListDocumentArtifactManifestsParams = struct {
@@ -585,6 +587,12 @@ pub const Client = struct {
         if (params.fields) |v| {
             try query_buf.appendSlice(self.allocator, &.{sep});
             try query_buf.appendSlice(self.allocator, "fields=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.consistency) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "consistency=");
             try query_buf.appendSlice(self.allocator, v);
             sep = '&';
         }
