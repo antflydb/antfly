@@ -8950,7 +8950,7 @@ pub fn refreshQuantizedWithOptions(
     }
 
     if (node.is_leaf) {
-        try posting.PostingStore.refreshQuantizedPayload(self, txn, node, vectors, now_fn, elapsed_fn);
+        try posting.PostingStore.refreshQuantizedPayload(self, txn, node, vectors, &vectors_owned, now_fn, elapsed_fn);
         return;
     }
 

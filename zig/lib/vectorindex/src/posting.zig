@@ -4252,14 +4252,17 @@ pub const PostingStore = struct {
         index: anytype,
         txn: anytype,
         node: *const types.Node,
-        vectors: []const f32,
+        vectors: []f32,
+        vectors_owned: ?*bool,
         now_fn: fn () u64,
         elapsed_fn: fn (u64) u64,
     ) !void {
         const posting = try view(node);
         const count = posting.members.len;
         const dims: usize = @intCast(index.metadata.dims);
-        if (vectors.len < count * dims) return error.BufferTooSmall;
+        const vector_count = count * dims;
+        if (vectors.len < vector_count) return error.BufferTooSmall;
+        const can_take_vectors = vectors_owned != null and vectors_owned.?.* and vectors.len == vector_count;
 
         if (index.getCachedQuantizedPtr(posting.id)) |cached| {
             switch (cached.*) {
@@ -4276,12 +4279,18 @@ pub const PostingStore = struct {
                     }
                     set.vectors.dims = @intCast(dims);
                     set.vectors.count = @intCast(count);
-                    if (set.vectors.data.len == 0) {
-                        set.vectors.data = try index.alloc.alloc(f32, count * dims);
+                    if (can_take_vectors) {
+                        if (set.vectors.data.len > 0) index.alloc.free(set.vectors.data);
+                        set.vectors.data = vectors;
+                        vectors_owned.?.* = false;
                     } else {
-                        set.vectors.data = try index.alloc.realloc(set.vectors.data, count * dims);
+                        if (set.vectors.data.len == 0) {
+                            set.vectors.data = try index.alloc.alloc(f32, vector_count);
+                        } else {
+                            set.vectors.data = try index.alloc.realloc(set.vectors.data, vector_count);
+                        }
+                        @memcpy(set.vectors.data, vectors[0..vector_count]);
                     }
-                    @memcpy(set.vectors.data, vectors[0 .. count * dims]);
                     noteMutatedCachedQuantized(index, posting.id);
                     const store_start = now_fn();
                     try index.putQuantizedCached(txn, posting.id, cached);
@@ -4295,9 +4304,10 @@ pub const PostingStore = struct {
                             .vectors = .{
                                 .dims = @intCast(dims),
                                 .count = @intCast(count),
-                                .data = try index.alloc.dupe(f32, vectors[0 .. count * dims]),
+                                .data = if (can_take_vectors) vectors else try index.alloc.dupe(f32, vectors[0..vector_count]),
                             },
                         } };
+                        if (can_take_vectors) vectors_owned.?.* = false;
                         index.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
                         defer fresh.deinit(index.alloc);
                         const store_start = now_fn();
@@ -4318,16 +4328,16 @@ pub const PostingStore = struct {
         }
 
         const compute_start = now_fn();
-        var qs: hbc_runtime.QuantizedSet = if (posting.usesNonQuantizedPayload())
-            .{ .nonquant = .{
+        var qs: hbc_runtime.QuantizedSet = if (posting.usesNonQuantizedPayload()) blk: {
+            break :blk .{ .nonquant = .{
                 .vectors = .{
                     .dims = @intCast(dims),
                     .count = @intCast(count),
-                    .data = try index.alloc.dupe(f32, vectors[0 .. count * dims]),
+                    .data = if (can_take_vectors) vectors else try index.alloc.dupe(f32, vectors[0..vector_count]),
                 },
-            } }
-        else
-            .{ .rabit = try index.quantizer.quantize(posting.centroid, vectors, count) };
+            } };
+        } else .{ .rabit = try index.quantizer.quantize(posting.centroid, vectors, count) };
+        if (can_take_vectors and posting.usesNonQuantizedPayload()) vectors_owned.?.* = false;
         index.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
         defer qs.deinit(index.alloc);
         const store_start = now_fn();
