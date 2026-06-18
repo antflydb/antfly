@@ -4959,6 +4959,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
                     .source_id = binding.table_id,
                     .metadata_uri = metadata_uri,
                     .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
+                    .cache = options.cache,
                 });
             },
             .lance => return error.UnsupportedRowsQuery,

@@ -24,6 +24,7 @@ const external_source = @import("../external_source/types.zig");
 const iceberg_avro = @import("../external_source/iceberg_avro.zig");
 const iceberg_inventory = @import("../external_source/iceberg_inventory.zig");
 const iceberg_metadata = @import("../external_source/iceberg_metadata.zig");
+const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 const lake_range_io = @import("lake_range_io.zig");
 const object_storage = @import("../../storage/object_storage.zig");
 
@@ -32,6 +33,7 @@ pub const SnapshotReadRequest = struct {
     source_id: []const u8,
     metadata_uri: []const u8,
     requested_snapshot_id: ?[]const u8 = null,
+    cache: ?*lake_parquet_rowgroup.ObjectRangeCache = null,
 
     pub fn validate(self: SnapshotReadRequest) !void {
         if (self.source_id.len == 0) return error.InvalidIcebergSnapshotRead;
@@ -47,7 +49,7 @@ pub fn readSnapshotInventoryAlloc(
     var client = request.client;
     client.allocator = alloc;
 
-    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.metadata_uri, .iceberg_metadata);
+    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata);
     defer alloc.free(metadata_bytes);
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
@@ -58,7 +60,7 @@ pub fn readSnapshotInventoryAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, current_snapshot.manifest_list_uri, .iceberg_metadata);
+    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata);
     defer alloc.free(manifest_list_bytes);
     var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
     defer manifest_list.deinit(alloc);
@@ -77,6 +79,7 @@ pub fn readSnapshotInventoryAlloc(
         const manifest_bytes = try readFullObjectAlloc(
             alloc,
             &client,
+            request.cache,
             manifest_entry.manifest_path,
             .iceberg_metadata,
         );
@@ -99,6 +102,7 @@ pub fn readSnapshotInventoryAlloc(
 fn readFullObjectAlloc(
     alloc: Allocator,
     client: *object_storage.ObjectStorage,
+    cache: ?*lake_parquet_rowgroup.ObjectRangeCache,
     uri: []const u8,
     purpose: lake_range_io.RangePurpose,
 ) ![]u8 {
@@ -116,6 +120,43 @@ fn readFullObjectAlloc(
         .iceberg_delete_metadata => try lake_range_io.planIcebergManifestRead(object, .deletes),
         else => return error.InvalidIcebergSnapshotRead,
     };
+    return try readMaybeCachedIcebergRangeAlloc(alloc, client, cache, read);
+}
+
+fn readMaybeCachedIcebergRangeAlloc(
+    alloc: Allocator,
+    client: *object_storage.ObjectStorage,
+    cache: ?*lake_parquet_rowgroup.ObjectRangeCache,
+    read: lake_range_io.RangeRead,
+) ![]u8 {
+    if (cache) |range_cache| {
+        const cache_key = try read.cacheKeyAlloc(alloc);
+        if (range_cache.entries.get(cache_key)) |cached| {
+            range_cache.stats.hits += 1;
+            alloc.free(cache_key);
+            return try alloc.dupe(u8, cached);
+        }
+
+        range_cache.stats.misses += 1;
+        const bytes = try readIcebergObjectRangeAlloc(alloc, client, read);
+        errdefer alloc.free(bytes);
+        const stored = try alloc.dupe(u8, bytes);
+        errdefer alloc.free(stored);
+        range_cache.entries.put(alloc, cache_key, stored) catch |err| {
+            alloc.free(cache_key);
+            return err;
+        };
+        range_cache.stats.stored_bytes += stored.len;
+        return bytes;
+    }
+    return try readIcebergObjectRangeAlloc(alloc, client, read);
+}
+
+fn readIcebergObjectRangeAlloc(
+    alloc: Allocator,
+    client: *object_storage.ObjectStorage,
+    read: lake_range_io.RangeRead,
+) ![]u8 {
     var result = try client.getObject(read.object.bucket, read.object.key, .{
         .range = .{
             .offset = read.range.offset,
@@ -186,6 +227,55 @@ test "iceberg snapshot reader plans inventory from object storage metadata and m
     try std.testing.expectEqual(@as(usize, 2), inventory.files.len);
     try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", inventory.files[0].file_id);
     try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", inventory.files[1].file_id);
+}
+
+test "iceberg snapshot reader reuses cached metadata and manifest ranges" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var manifest_list = try buildManifestListFixture(alloc);
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "t/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest = try buildDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "t/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+
+    var cache = lake_parquet_rowgroup.ObjectRangeCache{};
+    defer cache.deinit(alloc);
+
+    var first = try readSnapshotInventoryAlloc(alloc, .{
+        .client = client,
+        .source_id = "events",
+        .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json",
+        .requested_snapshot_id = "12",
+        .cache = &cache,
+    });
+    defer first.deinit(alloc);
+    const first_stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), first_stats.hits);
+    try std.testing.expectEqual(@as(usize, 3), first_stats.misses);
+    try std.testing.expect(first_stats.stored_bytes > 0);
+
+    var second = try readSnapshotInventoryAlloc(alloc, .{
+        .client = client,
+        .source_id = "events",
+        .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json",
+        .requested_snapshot_id = "12",
+        .cache = &cache,
+    });
+    defer second.deinit(alloc);
+    const second_stats = cache.statsSnapshot();
+    try std.testing.expectEqual(first_stats.misses, second_stats.misses);
+    try std.testing.expectEqual(@as(usize, 3), second_stats.hits);
+    try std.testing.expectEqualStrings(first.snapshot_id, second.snapshot_id);
+    try std.testing.expectEqual(first.files.len, second.files.len);
 }
 
 test "iceberg snapshot reader rejects requested snapshot mismatch" {
