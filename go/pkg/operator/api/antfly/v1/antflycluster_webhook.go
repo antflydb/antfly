@@ -1435,11 +1435,21 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 		if strings.TrimSpace(runtime.AdminTokenEnvVar) == "" {
 			errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar is required when adminTokenSecretRef is set")
 		}
-		if strings.TrimSpace(ref.Name) == "" {
+		refName := strings.TrimSpace(ref.Name)
+		refKey := strings.TrimSpace(ref.Key)
+		if refName == "" {
 			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.name is required")
+		} else if ref.Name != refName {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.name must not have leading or trailing whitespace")
+		} else if nameErrs := utilvalidation.IsDNS1123Subdomain(refName); len(nameErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.runtime.adminTokenSecretRef.name %q is invalid: %s", refName, strings.Join(nameErrs, "; ")))
 		}
-		if strings.TrimSpace(ref.Key) == "" {
+		if refKey == "" {
 			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.key is required")
+		} else if ref.Key != refKey {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.key must not have leading or trailing whitespace")
+		} else if keyErrs := utilvalidation.IsConfigMapKey(refKey); len(keyErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.runtime.adminTokenSecretRef.key %q is invalid: %s", refKey, strings.Join(keyErrs, "; ")))
 		}
 		if ref.Optional != nil && *ref.Optional {
 			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.optional must be false")

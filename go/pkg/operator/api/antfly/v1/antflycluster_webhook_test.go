@@ -2262,6 +2262,64 @@ func TestValidateCreate_HighAvailabilityRuntimeAdminTokenAcceptsSecretRef(t *tes
 	}
 
 	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = "ANTFLY_HA_ADMIN_TOKEN"
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = ""
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref without name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.name is required") {
+		t.Fatalf("expected adminTokenSecretRef name-required validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = " ha-admin-token "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref name with whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.name must not have leading or trailing whitespace") {
+		t.Fatalf("expected adminTokenSecretRef name whitespace validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = "HA_ADMIN_TOKEN"
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref invalid name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.name") ||
+		!strings.Contains(err.Error(), "is invalid") {
+		t.Fatalf("expected adminTokenSecretRef invalid-name validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = "ha-admin-token"
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = ""
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref without key to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.key is required") {
+		t.Fatalf("expected adminTokenSecretRef key-required validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = " token "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref key with whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.key must not have leading or trailing whitespace") {
+		t.Fatalf("expected adminTokenSecretRef key whitespace validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = "bad/key"
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref invalid key to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.key") ||
+		!strings.Contains(err.Error(), "is invalid") {
+		t.Fatalf("expected adminTokenSecretRef invalid-key validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = "token"
 	optional := true
 	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Optional = &optional
 	err = cluster.ValidateCreate()
