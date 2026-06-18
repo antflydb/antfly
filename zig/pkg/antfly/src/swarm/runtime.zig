@@ -2949,6 +2949,11 @@ test "swarm HA runtime rejects ambiguous role flags" {
 
 test "swarm HA runtime validates bearer token env name before lookup" {
     const alloc = std.testing.allocator;
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const env_name = "ANTFLY_HA_ADMIN_TOKEN_TEST_VALUE";
 
     try std.testing.expect((try resolveHAAdminBearerTokenFromCli(alloc, .{})) == null);
     try std.testing.expectError(error.HAAdminTokenEnvMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
@@ -2962,6 +2967,19 @@ test "swarm HA runtime validates bearer token env name before lookup" {
     }));
     try std.testing.expectError(error.HAAdminTokenMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
         .ha_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN_SHOULD_NOT_EXIST",
+    }));
+
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name, " secret-token\n", 1));
+    defer _ = c.unsetenv(env_name);
+    const token = try resolveHAAdminBearerTokenFromCli(alloc, .{
+        .ha_admin_token_env = env_name,
+    });
+    defer alloc.free(token.?);
+    try std.testing.expectEqualStrings("secret-token", token.?);
+
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name, " \t\n", 1));
+    try std.testing.expectError(error.HAAdminTokenMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
+        .ha_admin_token_env = env_name,
     }));
 }
 
