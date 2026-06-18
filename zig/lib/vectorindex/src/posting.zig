@@ -1075,14 +1075,19 @@ pub const PostingFormat = struct {
         }
         try scratch.ensureMemberIdCapacity(alloc, live_count);
         var out_count: usize = 0;
+        var already_sorted = true;
+        var previous: VectorId = 0;
         var i: usize = 0;
         while (i < appended_count) : (i += 1) {
             if (!appended_live[i]) continue;
-            scratch.member_ids[out_count] = appended_ids[i];
+            const vector_id = appended_ids[i];
+            if (out_count != 0 and previous > vector_id) already_sorted = false;
+            scratch.member_ids[out_count] = vector_id;
+            previous = vector_id;
             out_count += 1;
         }
         const out = scratch.member_ids[0..out_count];
-        std.mem.sort(VectorId, out, {}, comptime std.sort.asc(VectorId));
+        if (!already_sorted) std.mem.sort(VectorId, out, {}, comptime std.sort.asc(VectorId));
         return out;
     }
 
