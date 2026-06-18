@@ -2462,6 +2462,70 @@ test "sql adapter grammar parses extension catalog tails" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateExtensionCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
+test "sql adapter grammar parses authorization catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer;");
+    defer lexer.freeTokens(alloc, &create_role_tokens);
+    var create_role_pos: usize = 0;
+    var create_role = try parseCreateRoleCatalogTailAlloc(alloc, create_role_tokens.items, &create_role_pos);
+    defer create_role.deinit(alloc);
+    try std.testing.expectEqual(create_role_tokens.items.len, create_role_pos);
+    try std.testing.expectEqualStrings("app_writer", create_role.role_name);
+
+    var alter_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app_tenant = 'acme';");
+    defer lexer.freeTokens(alloc, &alter_role_tokens);
+    var alter_role_pos: usize = 0;
+    var alter_role = try parseAlterRoleCatalogTailAlloc(alloc, alter_role_tokens.items, &alter_role_pos);
+    defer alter_role.deinit(alloc);
+    try std.testing.expectEqual(alter_role_tokens.items.len, alter_role_pos);
+    try std.testing.expectEqualStrings("app_writer", alter_role.role_name);
+    try std.testing.expectEqualStrings("app_tenant", alter_role.setting_name);
+    try std.testing.expectEqualStrings("acme", alter_role.setting_value);
+
+    var drop_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE IF EXISTS app_writer;");
+    defer lexer.freeTokens(alloc, &drop_role_tokens);
+    var drop_role_pos: usize = 0;
+    var drop_role = try parseDropRoleCatalogTailAlloc(alloc, drop_role_tokens.items, &drop_role_pos);
+    defer drop_role.deinit(alloc);
+    try std.testing.expectEqual(drop_role_tokens.items.len, drop_role_pos);
+    try std.testing.expectEqualStrings("app_writer", drop_role.role_name);
+    try std.testing.expect(drop_role.if_exists);
+
+    var grant_tokens = try lexer.tokenizeAlloc(alloc, "SELECT, INSERT ON TABLE usage_records TO app_writer;");
+    defer lexer.freeTokens(alloc, &grant_tokens);
+    var grant_pos: usize = 0;
+    var grant = try parsePrivilegeChangeTailAlloc(alloc, grant_tokens.items, &grant_pos, .grant);
+    defer grant.deinit(alloc);
+    try std.testing.expectEqual(grant_tokens.items.len, grant_pos);
+    try std.testing.expectEqual(@as(usize, 2), grant.privileges.len);
+    try std.testing.expectEqualStrings("SELECT", grant.privileges[0]);
+    try std.testing.expectEqualStrings("INSERT", grant.privileges[1]);
+    try std.testing.expectEqualStrings("TABLE", grant.object_kind);
+    try std.testing.expectEqualStrings("usage_records", grant.object_name);
+    try std.testing.expectEqualStrings("app_writer", grant.principal_name);
+
+    var grant_all_tokens = try lexer.tokenizeAlloc(alloc, "ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_writer;");
+    defer lexer.freeTokens(alloc, &grant_all_tokens);
+    var grant_all_pos: usize = 0;
+    var grant_all = try parsePrivilegeChangeTailAlloc(alloc, grant_all_tokens.items, &grant_all_pos, .grant);
+    defer grant_all.deinit(alloc);
+    try std.testing.expectEqual(grant_all_tokens.items.len, grant_all_pos);
+    try std.testing.expectEqual(@as(usize, 1), grant_all.privileges.len);
+    try std.testing.expectEqualStrings("ALL", grant_all.privileges[0]);
+    try std.testing.expectEqualStrings("ALL_TABLES_IN_SCHEMA", grant_all.object_kind);
+    try std.testing.expectEqualStrings("public", grant_all.object_name);
+
+    var revoke_tokens = try lexer.tokenizeAlloc(alloc, "INSERT ON TABLE public.usage_records FROM app_writer;");
+    defer lexer.freeTokens(alloc, &revoke_tokens);
+    var revoke_pos: usize = 0;
+    var revoke = try parsePrivilegeChangeTailAlloc(alloc, revoke_tokens.items, &revoke_pos, .revoke);
+    defer revoke.deinit(alloc);
+    try std.testing.expectEqual(revoke_tokens.items.len, revoke_pos);
+    try std.testing.expectEqualStrings("usage_records", revoke.object_name);
+    try std.testing.expectEqualStrings("app_writer", revoke.principal_name);
+}
+
 test "sql adapter grammar parses bulk io tails" {
     const alloc = std.testing.allocator;
 

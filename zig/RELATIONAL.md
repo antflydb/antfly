@@ -1083,6 +1083,8 @@ RENAME TO`, and `DROP TABLESPACE`, bulk I/O grammar for `COPY ... FROM` and
 `COPY ... TO`, schema-namespace catalog grammar for `CREATE SCHEMA`, `ALTER
 SCHEMA ... RENAME TO`, and `DROP SCHEMA`, extension catalog grammar for
 `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`,
+authorization catalog grammar for `CREATE ROLE`, `ALTER ROLE ... SET`,
+`DROP ROLE`, `GRANT`, and `REVOKE`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -4652,7 +4654,10 @@ PostgreSQL privilege and role DDL is also not adapter-only syntax. `GRANT`,
 `REVOKE`, and role lifecycle statements lower to typed authorization-catalog
 intent that captures role names, privilege counts, object kind/name, principal
 identity, and role setting names, then fail closed when applied to table schema
-storage. Public API execution routes authorization-catalog SQL through the
+storage. Those role and privilege tails parse in `api/sql_adapter/grammar.zig`;
+`relational_sql.zig` only maps the owned authorization syntax into typed plan
+fields and validation-owned allocation. Public API execution routes
+authorization-catalog SQL through the
 native user-management surface instead: `CREATE ROLE app_writer` creates the
 Antfly auth subject `role:app_writer`, `DROP ROLE` succeeds only after that
 subject has no remaining permissions, row filters, inheritance edges, or user
