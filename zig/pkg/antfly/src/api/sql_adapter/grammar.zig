@@ -411,6 +411,20 @@ pub const DropEnumTypeSyntax = struct {
     }
 };
 
+pub const CommentMetadataSyntax = struct {
+    target: ddl_plan.CommentMetadataTarget,
+    object_name: []const u8,
+    parent_table_name: ?[]const u8 = null,
+    comment_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.object_name));
+        if (self.parent_table_name) |parent| alloc.free(@constCast(parent));
+        if (self.comment_json) |comment| alloc.free(@constCast(comment));
+        self.* = undefined;
+    }
+};
+
 pub const PrivilegeChangeActionSyntax = enum {
     grant,
     revoke,
@@ -1922,6 +1936,59 @@ pub fn parseDropEnumTypeCatalogTailAlloc(
     try parseAdapterNoopStatementEnd(cursor);
     type_transferred = true;
     return .{ .type_name = type_name, .if_exists = if_exists, .cascade = cascade };
+}
+
+pub fn parseCommentMetadataCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CommentMetadataSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("on");
+    const target: ddl_plan.CommentMetadataTarget = if (cursor.matchKeyword("table"))
+        .table
+    else if (cursor.matchKeyword("column"))
+        .column
+    else if (cursor.matchKeyword("index"))
+        .index
+    else if (cursor.matchKeyword("constraint"))
+        .constraint
+    else
+        return error.UnsupportedSqlShape;
+
+    const object_name = switch (target) {
+        .table, .index => try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos),
+        .column, .constraint => try parseIdentifierOwnedAlloc(alloc, tokens, pos),
+    };
+    var object_transferred = false;
+    errdefer if (!object_transferred) alloc.free(object_name);
+
+    var parent_table_name: ?[]const u8 = null;
+    var parent_transferred = false;
+    errdefer if (!parent_transferred) if (parent_table_name) |parent| alloc.free(@constCast(parent));
+    if (target == .constraint) {
+        try cursor.expectKeyword("on");
+        parent_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    }
+
+    try cursor.expectKeyword("is");
+    var comment_json: ?[]const u8 = null;
+    var comment_transferred = false;
+    errdefer if (!comment_transferred) if (comment_json) |comment| alloc.free(@constCast(comment));
+    if (!cursor.matchKeyword("null")) {
+        comment_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+
+    object_transferred = true;
+    parent_transferred = true;
+    comment_transferred = true;
+    return .{
+        .target = target,
+        .object_name = object_name,
+        .parent_table_name = parent_table_name,
+        .comment_json = comment_json,
+    };
 }
 
 pub fn parseCreateRoleCatalogTailAlloc(
@@ -3765,6 +3832,47 @@ test "sql adapter grammar parses enum type catalog tails" {
     defer lexer.freeTokens(alloc, &duplicate_tokens);
     var duplicate_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateEnumTypeCatalogTailAlloc(alloc, duplicate_tokens.items, &duplicate_pos));
+}
+
+test "sql adapter grammar parses comment metadata catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var table_tokens = try lexer.tokenizeAlloc(alloc, "ON TABLE public.usage_records IS 'metered usage rows';");
+    defer lexer.freeTokens(alloc, &table_tokens);
+    var table_pos: usize = 0;
+    var table = try parseCommentMetadataCatalogTailAlloc(alloc, table_tokens.items, &table_pos);
+    defer table.deinit(alloc);
+    try std.testing.expectEqual(table_tokens.items.len, table_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.table, table.target);
+    try std.testing.expectEqualStrings("usage_records", table.object_name);
+    try std.testing.expect(table.parent_table_name == null);
+    try std.testing.expectEqualStrings("\"metered usage rows\"", table.comment_json.?);
+
+    var column_tokens = try lexer.tokenizeAlloc(alloc, "ON COLUMN usage_records.updated_at_ns IS NULL;");
+    defer lexer.freeTokens(alloc, &column_tokens);
+    var column_pos: usize = 0;
+    var column = try parseCommentMetadataCatalogTailAlloc(alloc, column_tokens.items, &column_pos);
+    defer column.deinit(alloc);
+    try std.testing.expectEqual(column_tokens.items.len, column_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.column, column.target);
+    try std.testing.expectEqualStrings("usage_records.updated_at_ns", column.object_name);
+    try std.testing.expect(column.comment_json == null);
+
+    var constraint_tokens = try lexer.tokenizeAlloc(alloc, "ON CONSTRAINT usage_records_updated_check ON public.usage_records IS 'valid update clock';");
+    defer lexer.freeTokens(alloc, &constraint_tokens);
+    var constraint_pos: usize = 0;
+    var constraint = try parseCommentMetadataCatalogTailAlloc(alloc, constraint_tokens.items, &constraint_pos);
+    defer constraint.deinit(alloc);
+    try std.testing.expectEqual(constraint_tokens.items.len, constraint_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.constraint, constraint.target);
+    try std.testing.expectEqualStrings("usage_records_updated_check", constraint.object_name);
+    try std.testing.expectEqualStrings("usage_records", constraint.parent_table_name.?);
+    try std.testing.expectEqualStrings("\"valid update clock\"", constraint.comment_json.?);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "ON SEQUENCE usage_records_id_seq IS 'unsupported';");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCommentMetadataCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
 test "sql adapter grammar parses authorization catalog tails" {

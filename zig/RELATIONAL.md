@@ -1097,6 +1097,8 @@ sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`,
 enum-type catalog grammar for `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD
 VALUE`, and `DROP TYPE`,
+comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
+`COMMENT ON INDEX`, and `COMMENT ON CONSTRAINT`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -4494,6 +4496,8 @@ comment is set or cleared. Schema application stores comments under typed
 public schema JSON metadata such as `comments.table`, `comments.columns`,
 `comments.indexes`, and `comments.constraints` after validating referenced
 columns, indexes, and constraints against the current relational schema. The
+`COMMENT ON` tails parse in `api/sql_adapter/grammar.zig`; the SQL lowerer only
+transfers owned grammar syntax into typed comment metadata plans. The
 runtime row-schema parser ignores that metadata, and direct runtime-schema DDL
 application validates comment targets before returning an unchanged relational
 schema, so comments do not change row validity, routing, index contents,

@@ -3598,51 +3598,15 @@ const Parser = struct {
     }
 
     fn parseCommentMetadataDdl(self: *@This()) !CommentMetadataPlan {
-        try self.expectKeyword("on");
-        const target: CommentMetadataTarget = if (self.matchKeyword("table"))
-            .table
-        else if (self.matchKeyword("column"))
-            .column
-        else if (self.matchKeyword("index"))
-            .index
-        else if (self.matchKeyword("constraint"))
-            .constraint
-        else
-            return error.UnsupportedSqlShape;
-
-        const object_name = switch (target) {
-            .table, .index => try self.parseSqlObjectIdentifierOwned(),
-            .column, .constraint => try self.parseIdentifierOwned(),
-        };
-        var object_transferred = false;
-        errdefer if (!object_transferred) self.alloc.free(object_name);
-
-        var parent_table_name: ?[]const u8 = null;
-        var parent_transferred = false;
-        errdefer if (!parent_transferred) if (parent_table_name) |parent| self.alloc.free(parent);
-        if (target == .constraint) {
-            try self.expectKeyword("on");
-            parent_table_name = try self.parseSqlObjectIdentifierOwned();
-        }
-
-        try self.expectKeyword("is");
-        var comment_json: ?[]const u8 = null;
-        var comment_transferred = false;
-        errdefer if (!comment_transferred) if (comment_json) |comment| self.alloc.free(comment);
-        if (!self.matchKeyword("null")) {
-            comment_json = try self.parseSqlUntypedValueJsonAlloc();
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-
-        object_transferred = true;
-        parent_transferred = true;
-        comment_transferred = true;
+        var syntax = try sql_adapter.parseCommentMetadataCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .target = target,
-            .object_name = object_name,
-            .parent_table_name = parent_table_name,
-            .comment_json = comment_json,
+            .target = syntax.target,
+            .object_name = syntax.object_name,
+            .parent_table_name = syntax.parent_table_name,
+            .comment_json = syntax.comment_json,
         };
     }
 
