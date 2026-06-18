@@ -52,6 +52,7 @@ const relational_sql_api = @import("relational_sql.zig");
 const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
 const external_source_api = @import("../serverless/external_source/mod.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
+const object_storage_api = @import("../storage/object_storage.zig");
 const schema_api = @import("../schema/mod.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
@@ -4699,6 +4700,138 @@ pub const PinnedExternalLakeRowsScanner = struct {
             self.coalesce_options,
             request,
         );
+    }
+};
+
+pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
+    inventory: external_source_api.Inventory,
+    object_reader: serverless_query.LakeObjectStorageRangeReader,
+    cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
+    coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
+
+    pub fn init(
+        inventory: external_source_api.Inventory,
+        client: object_storage_api.ObjectStorage,
+    ) PinnedExternalObjectStorageLakeRowsScanner {
+        return .{
+            .inventory = inventory,
+            .object_reader = serverless_query.LakeObjectStorageRangeReader.init(client),
+        };
+    }
+
+    pub fn parquetScanner(self: *@This()) PinnedExternalLakeRowsScanner {
+        return .{
+            .inventory = self.inventory,
+            .reader = self.object_reader.parquetReader(),
+            .cache = self.cache,
+            .coalesce_options = self.coalesce_options,
+        };
+    }
+
+    pub fn scanAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        request: serverless_query.LakeRowsScanRequest,
+    ) !serverless_query.LakeRowsScanResult {
+        const scanner = self.parquetScanner();
+        return try scanner.scanAlloc(alloc, runtime_schema, request);
+    }
+};
+
+pub const PinnedExternalObjectStorageLakeRowsSource = struct {
+    scanner: PinnedExternalObjectStorageLakeRowsScanner,
+
+    pub fn init(
+        inventory: external_source_api.Inventory,
+        client: object_storage_api.ObjectStorage,
+    ) PinnedExternalObjectStorageLakeRowsSource {
+        return .{
+            .scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client),
+        };
+    }
+
+    pub fn source(self: *@This()) TableReadSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+                .rows_query_plan = rowsQueryPlan,
+                .rows_aggregate_plan = rowsAggregatePlan,
+                .lake_rows_scan = lakeRowsScan,
+            },
+        };
+    }
+
+    fn lookup(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+        _: db_mod.types.LookupOptions,
+        _: raft_mod.ReadConsistency,
+    ) !?LookupResponse {
+        return error.UnsupportedOperation;
+    }
+
+    fn scan(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: db_mod.types.ScanOptions,
+        _: raft_mod.ReadConsistency,
+    ) !?ScanResponse {
+        return error.UnsupportedOperation;
+    }
+
+    fn query(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: db_mod.types.SearchRequest,
+        _: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
+        return error.UnsupportedOperation;
+    }
+
+    fn rowsQueryPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try rowsQueryPlanFromRoutedScansAlloc(alloc, self.source(), table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsAggregatePlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsAggregatePlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsAggregateResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try rowsAggregatePlanFromRoutedScansAlloc(alloc, self.source(), table_name, runtime_schema, plan, consistency);
+    }
+
+    fn lakeRowsScan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        request: serverless_query.LakeRowsScanRequest,
+        _: raft_mod.ReadConsistency,
+    ) !?serverless_query.LakeRowsScanResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.scanner.scanAlloc(alloc, runtime_schema, request);
     }
 };
 
@@ -16331,6 +16464,72 @@ test "pinned external lake rows scanner validates schema binding against invento
             .{},
             .{ .projected_columns = projection[0..] },
         ),
+    );
+}
+
+test "object storage pinned external lake source routes row plans through scanner" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:expected" },
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var inventory = external_source_api.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:stale"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source_api.types.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 128,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var lake_source = PinnedExternalObjectStorageLakeRowsSource.init(inventory, client);
+    var source = lake_source.source();
+    const projection = [_][]const u8{"amount"};
+    try std.testing.expectError(
+        error.ExternalLakeSnapshotMismatch,
+        source.rowsQueryPlan(alloc, "events", schema, .{
+            .query = .{
+                .select = projection[0..],
+                .select_all = false,
+            },
+        }, .read_index),
+    );
+
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "count_all", .op = .count },
+    };
+    try std.testing.expectError(
+        error.ExternalLakeSnapshotMismatch,
+        source.rowsAggregatePlan(alloc, "events", schema, .{
+            .aggregate = .{
+                .aggregations = aggregations[0..],
+            },
+        }, .read_index),
     );
 }
 

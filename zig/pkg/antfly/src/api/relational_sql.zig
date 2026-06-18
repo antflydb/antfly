@@ -161,6 +161,15 @@ pub const ExtensionCatalogPlan = sql_adapter.ExtensionCatalogPlan;
 pub const CreateExtensionPlan = sql_adapter.CreateExtensionPlan;
 pub const UpdateExtensionPlan = sql_adapter.UpdateExtensionPlan;
 pub const DropExtensionPlan = sql_adapter.DropExtensionPlan;
+pub const FunctionCatalogPlan = sql_adapter.FunctionCatalogPlan;
+pub const CreateRoutinePlan = sql_adapter.CreateRoutinePlan;
+pub const DropRoutinePlan = sql_adapter.DropRoutinePlan;
+pub const RoutineKind = sql_adapter.RoutineKind;
+pub const AuthorizationCatalogPlan = sql_adapter.AuthorizationCatalogPlan;
+pub const CreateRolePlan = sql_adapter.CreateRolePlan;
+pub const AlterRolePlan = sql_adapter.AlterRolePlan;
+pub const DropRolePlan = sql_adapter.DropRolePlan;
+pub const PrivilegeChangePlan = sql_adapter.PrivilegeChangePlan;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -456,119 +465,6 @@ pub const DatabaseCatalogPlan = union(enum) {
             .alter => |*plan| plan.deinit(alloc),
             .drop => |*plan| plan.deinit(alloc),
         }
-        self.* = undefined;
-    }
-};
-
-pub const FunctionCatalogPlan = union(enum) {
-    create: CreateRoutinePlan,
-    drop: DropRoutinePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const RoutineKind = enum {
-    function,
-    procedure,
-};
-
-pub const CreateRoutinePlan = struct {
-    kind: RoutineKind,
-    routine_name: []const u8,
-    replace_existing: bool = false,
-    argument_count: usize = 0,
-    returns_type: ?[]const u8 = null,
-    language: ?[]const u8 = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.routine_name);
-        if (self.returns_type) |returns_type| alloc.free(returns_type);
-        if (self.language) |language| alloc.free(language);
-        self.* = undefined;
-    }
-};
-
-pub const DropRoutinePlan = struct {
-    kind: RoutineKind,
-    routine_name: []const u8,
-    if_exists: bool = false,
-    argument_count: usize = 0,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.routine_name);
-        self.* = undefined;
-    }
-};
-
-pub const AuthorizationCatalogPlan = union(enum) {
-    create_role: CreateRolePlan,
-    alter_role: AlterRolePlan,
-    drop_role: DropRolePlan,
-    grant_privilege: PrivilegeChangePlan,
-    revoke_privilege: PrivilegeChangePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create_role => |*plan| plan.deinit(alloc),
-            .alter_role => |*plan| plan.deinit(alloc),
-            .drop_role => |*plan| plan.deinit(alloc),
-            .grant_privilege => |*plan| plan.deinit(alloc),
-            .revoke_privilege => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateRolePlan = struct {
-    role_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.role_name);
-        self.* = undefined;
-    }
-};
-
-pub const AlterRolePlan = struct {
-    role_name: []const u8,
-    setting_name: []const u8,
-    setting_value: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.role_name);
-        alloc.free(self.setting_name);
-        alloc.free(self.setting_value);
-        self.* = undefined;
-    }
-};
-
-pub const DropRolePlan = struct {
-    role_name: []const u8,
-    if_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.role_name);
-        self.* = undefined;
-    }
-};
-
-pub const PrivilegeChangePlan = struct {
-    privileges: []const []const u8 = &.{},
-    object_kind: []const u8,
-    object_name: []const u8,
-    principal_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        freeStringSlice(alloc, self.privileges);
-        alloc.free(self.object_kind);
-        alloc.free(self.object_name);
-        alloc.free(self.principal_name);
         self.* = undefined;
     }
 };
