@@ -8353,8 +8353,11 @@ pub fn buildBulkHilbertSeeded(
     inputs: []const bulk_build.PreparedBulkBuildInput,
 ) !BuiltBulkNode {
     const Entry = struct {
-        input: bulk_build.PreparedBulkBuildInput,
-        embedding: []const u8,
+        input_index: usize,
+    };
+    const SortContext = struct {
+        embeddings: []const u8,
+        embedding_len: usize,
     };
 
     const entries = try self.alloc.alloc(Entry, inputs.len);
@@ -8375,13 +8378,16 @@ pub fn buildBulkHilbertSeeded(
         const embedding = embeddings[i * embedding_len ..][0..embedding_len];
         try hilbert.encodeVecBytesInto(input.transformed, coords, embedding);
         entries[i] = .{
-            .input = input,
-            .embedding = embedding,
+            .input_index = i,
         };
     }
-    std.mem.sort(Entry, entries, {}, struct {
-        fn lessThan(_: void, a: Entry, b: Entry) bool {
-            return std.mem.order(u8, a.embedding, b.embedding) == .lt;
+    std.mem.sort(Entry, entries, SortContext{ .embeddings = embeddings, .embedding_len = embedding_len }, struct {
+        fn lessThan(ctx: SortContext, a: Entry, b: Entry) bool {
+            const left_offset = a.input_index * ctx.embedding_len;
+            const right_offset = b.input_index * ctx.embedding_len;
+            const left = ctx.embeddings[left_offset..][0..ctx.embedding_len];
+            const right = ctx.embeddings[right_offset..][0..ctx.embedding_len];
+            return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
 
@@ -8402,7 +8408,7 @@ pub fn buildBulkHilbertSeeded(
         const node_id = self.nextNodeId();
         const group_inputs = group_inputs_scratch[0..group_size];
         for (0..group_size) |i| {
-            group_inputs[i] = entries[entry_cursor + i].input;
+            group_inputs[i] = inputs[entries[entry_cursor + i].input_index];
         }
         current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
         current_count += 1;
