@@ -254,6 +254,10 @@ pub const ApiHttpServerConfig = struct {
     /// public row reads use URI-native object-store opening for credential-free
     /// bindings only.
     external_lake_object_store_resolver: ?table_reads.ExternalLakeObjectStoreResolver = null,
+    /// Optional per-open serving range-cache budget for external lake row reads.
+    /// When set, opened external lake sources own an object-range cache with the
+    /// named lake-serving policy.
+    external_lake_serving_cache_max_bytes: ?usize = null,
 };
 
 const RowsUniqueSelectorResolverContext = struct {
@@ -1529,9 +1533,15 @@ pub const ApiHttpServer = struct {
         if (self.external_lake_routing_reads == null) {
             self.external_lake_configured_resolver.configure(self.cfg.node_config, self.cfg.secret_store);
             const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_configured_resolver.resolver();
-            self.external_lake_routing_reads = table_reads.ExternalLakeRoutingTableReadSource.init(base, resolver, .{});
+            self.external_lake_routing_reads = table_reads.ExternalLakeRoutingTableReadSource.init(base, resolver, self.externalLakeRowsSourceOptions());
         }
         return self.external_lake_routing_reads.?.source();
+    }
+
+    fn externalLakeRowsSourceOptions(self: *const ApiHttpServer) table_reads.ExternalObjectStorageLakeRowsSourceOptions {
+        return .{
+            .serving_cache_max_bytes = self.cfg.external_lake_serving_cache_max_bytes,
+        };
     }
 
     pub fn initWithConfig(
@@ -8516,7 +8526,8 @@ pub const ApiHttpServer = struct {
         const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
         self.external_lake_configured_resolver.configure(self.cfg.node_config, self.cfg.secret_store);
         const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_configured_resolver.resolver();
-        const opened_store = resolver.openParquetPrefixAlloc(self.alloc, binding, .{}) catch |err| switch (err) {
+        const lake_options = self.externalLakeRowsSourceOptions();
+        const opened_store = resolver.openParquetPrefixAlloc(self.alloc, binding, lake_options) catch |err| switch (err) {
             error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef => return try textResponse(self.alloc, 501, "rows source unavailable"),
             error.ExternalLakeCredentialRefNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ExternalLakeCredentialScopeMismatch => return try textResponse(self.alloc, 403, "forbidden"),
@@ -8526,7 +8537,7 @@ pub const ApiHttpServer = struct {
             self.alloc,
             schema,
             opened_store,
-            .{},
+            lake_options,
         ) catch |err| switch (err) {
             error.EmptyExternalSourceSnapshot, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows source unavailable"),
             error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
@@ -18695,6 +18706,7 @@ test "api http server routes public external lake row queries through configured
 
     const FakeLakeResolver = struct {
         memory: *object_storage_api.MemoryObjectStorage,
+        expected_serving_cache_max_bytes: ?usize = null,
         open_count: u32 = 0,
 
         fn resolver(self: *@This()) table_reads.ExternalLakeObjectStoreResolver {
@@ -18710,12 +18722,13 @@ test "api http server routes public external lake row queries through configured
             ptr: *anyopaque,
             inner_alloc: std.mem.Allocator,
             binding: external_binding_api.Binding,
-            _: table_reads.ExternalObjectStorageLakeRowsSourceOptions,
+            options: table_reads.ExternalObjectStorageLakeRowsSourceOptions,
         ) !object_store_support.OpenedObjectStore {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.open_count += 1;
             try std.testing.expectEqual(external_source_api.Format.parquet, binding.format);
             try std.testing.expectEqualStrings("s3://bucket/events", binding.source_uri);
+            try std.testing.expectEqual(self.expected_serving_cache_max_bytes, options.serving_cache_max_bytes);
             return try object_store_support.OpenedObjectStore.initWithClient(inner_alloc, self.memory.client(), "bucket", "events");
         }
     };
@@ -18742,10 +18755,16 @@ test "api http server routes public external lake row queries through configured
         .desired_replica_count = 1,
     }} };
     var base_reads = FakeBaseReads{};
-    var resolver = FakeLakeResolver{ .memory = &memory };
+    var resolver = FakeLakeResolver{
+        .memory = &memory,
+        .expected_serving_cache_max_bytes = 4096,
+    };
     var server = ApiHttpServer.init(
         alloc,
-        .{ .external_lake_object_store_resolver = resolver.resolver() },
+        .{
+            .external_lake_object_store_resolver = resolver.resolver(),
+            .external_lake_serving_cache_max_bytes = 4096,
+        },
         source.iface(),
         base_reads.source(),
         null,
