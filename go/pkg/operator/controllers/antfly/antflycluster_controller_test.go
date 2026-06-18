@@ -7833,23 +7833,23 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	sts := &appsv1.StatefulSet{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
 	primaryArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log "/antflydb/ha/primary.wal"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots "/antflydb/ha/slots"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id "primary-a"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal "/antflydb/ha/fence.wal"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log "/antflydb/ha/primary.wal"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-admin-token-env "ANTFLY_HA_ADMIN_TOKEN"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/primary.wal'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/slots'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id 'primary-a'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/ha/fence.wal'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/primary.wal'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-cluster-id 100`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-shard-id 10`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-table-id 20`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-timeline-id 1`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-epoch 2`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-mode "remote-apply"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-selection "first"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-mode 'remote-apply'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-selection 'first'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-required 2`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-a"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-b"`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-failure "fail-closed"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby 'standby-a'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby 'standby-b'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-failure 'fail-closed'`))
 	optionalFalse := false
 	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
 		Name: "ANTFLY_HA_ADMIN_TOKEN",
@@ -7882,14 +7882,14 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
 	standbyArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-log "/antflydb/custom/standby.wal"`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress "/antflydb/custom/progress.wal"`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id "standby-a"`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-fence-wal "/antflydb/custom/fence.wal"`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log "/antflydb/custom/former-primary.wal"`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-admin-token-env "CUSTOM_HA_ADMIN_TOKEN"`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-upstream-url "http://primary.default.svc:8080"`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-slot "standby-a"`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/standby.wal'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id 'standby-a'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/custom/fence.wal'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/custom/former-primary.wal'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-upstream-url 'http://primary.default.svc:8080'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-slot 'standby-a'`))
 	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
 		Name: "CUSTOM_HA_ADMIN_TOKEN",
 		ValueFrom: &corev1.EnvVarSource{
@@ -7900,6 +7900,35 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			},
 		},
 	}))
+}
+
+func TestSwarmHAArgsShellQuotesRuntimeValues(t *testing.T) {
+	g := NewWithT(t)
+
+	args := swarmHAArgs(&antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            2,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role:                 antflyv1.HARuntimeRolePrimary,
+			NodeID:               "primary-$(touch /tmp/pwned)`x`",
+			FormerPrimaryLogPath: "/antflydb/ha/'former.wal",
+		},
+		SyncPolicy: &antflyv1.HASyncPolicy{
+			Mode:         antflyv1.HADurabilityModeRemoteWrite,
+			StandbyNames: []string{"standby-$(touch /tmp/pwned)"},
+		},
+	})
+
+	g.Expect(args).To(ContainSubstring(`--ha-primary-node-id 'primary-$(touch /tmp/pwned)` + "`" + `x` + "`" + `'`))
+	g.Expect(args).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/'\''former.wal'`))
+	g.Expect(args).To(ContainSubstring(`--ha-sync-standby 'standby-$(touch /tmp/pwned)'`))
+	g.Expect(args).NotTo(ContainSubstring(`"primary-$(touch /tmp/pwned)`))
+	g.Expect(args).NotTo(ContainSubstring(`"standby-$(touch /tmp/pwned)"`))
 }
 
 func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {

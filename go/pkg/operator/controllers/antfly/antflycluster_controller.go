@@ -188,7 +188,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		args.WriteString(" \\\n  ")
 		args.WriteString(name)
 		args.WriteByte(' ')
-		args.WriteString(strconv.Quote(strings.TrimSpace(value)))
+		args.WriteString(shellQuoteArg(strings.TrimSpace(value)))
 	}
 	appendHAUint := func(name string, value uint64) {
 		args.WriteString(" \\\n  ")
@@ -270,7 +270,7 @@ func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncP
 		args.WriteString(" \\\n  ")
 		args.WriteString(name)
 		args.WriteByte(' ')
-		args.WriteString(strconv.Quote(strings.TrimSpace(value)))
+		args.WriteString(shellQuoteArg(strings.TrimSpace(value)))
 	}
 	appendUint := func(name string, value int32) {
 		args.WriteString(" \\\n  ")
@@ -294,6 +294,10 @@ func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncP
 	if policy.FailurePolicy != "" {
 		appendArg("--ha-sync-failure", swarmHAFailurePolicy(policy.FailurePolicy))
 	}
+}
+
+func shellQuoteArg(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
 func swarmHASyncMode(mode antflyv1.HADurabilityMode) string {
