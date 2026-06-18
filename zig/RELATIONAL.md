@@ -1056,7 +1056,10 @@ own catalog source lookup, cross-table source-name pre-scans for read,
 insert-source, and joined-write statements, non-recursive CTE source-name
 resolution, cross-table source schema derivation, identifier normalization, and
 scope resolution so statement lowerers consume typed schemas instead of
-re-reading metadata snapshots directly. Then
+re-reading metadata snapshots directly. Default SQL catalog source-schema lookup
+now binds unqualified table references to `default.public.<table>` instead of
+first-match table names, and the adapter binder exposes a qualified runtime
+schema lookup for future explicit catalog targets. Then
 move statement families one at a time into AST plus binder plus lowerer modules,
 with the existing SQL/API parity tests as the acceptance gate. Only after those
 boundaries are stable should a generated grammar be considered.

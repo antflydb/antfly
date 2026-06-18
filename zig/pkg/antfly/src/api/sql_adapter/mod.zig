@@ -94,6 +94,7 @@ pub const parseWrappedIdentifierOperand = parser.parseWrappedIdentifierOperand;
 pub const rowExpressionBoundaryKeyword = grammar.rowExpressionBoundaryKeyword;
 pub const readSourceTableNamesAlloc = binder.readSourceTableNamesAlloc;
 pub const runtimeSchemaForCatalogTableAlloc = binder.runtimeSchemaForCatalogTableAlloc;
+pub const runtimeSchemaForQualifiedCatalogTableAlloc = binder.runtimeSchemaForQualifiedCatalogTableAlloc;
 pub const stripBalancedOuterParens = parser.stripBalancedOuterParens;
 pub const sqlAssignmentTailKeyword = grammar.sqlAssignmentTailKeyword;
 pub const sqlJoinedSourceAliasTerminator = grammar.sqlJoinedSourceAliasTerminator;

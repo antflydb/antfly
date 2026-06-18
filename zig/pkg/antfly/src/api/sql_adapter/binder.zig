@@ -32,9 +32,25 @@ pub fn runtimeSchemaForCatalogTableAlloc(
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
 ) !runtime_schema.TableSchema {
+    return try runtimeSchemaForQualifiedCatalogTableAlloc(
+        alloc,
+        catalog,
+        metadata_table_manager.default_database_name,
+        metadata_table_manager.default_namespace_name,
+        table_name,
+    );
+}
+
+pub fn runtimeSchemaForQualifiedCatalogTableAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) !runtime_schema.TableSchema {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const schema_json = tableSchemaJson(&snapshot, table_name) orelse return error.InvalidSqlCatalog;
+    const schema_json = qualifiedTableSchemaJson(&snapshot, database_name, namespace_name, table_name) orelse return error.InvalidSqlCatalog;
     if (schema_json.len == 0) return error.InvalidSqlCatalog;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -42,7 +58,23 @@ pub fn runtimeSchemaForCatalogTableAlloc(
 }
 
 pub fn tableSchemaJson(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?[]const u8 {
+    return qualifiedTableSchemaJson(
+        snapshot,
+        metadata_table_manager.default_database_name,
+        metadata_table_manager.default_namespace_name,
+        table_name,
+    );
+}
+
+pub fn qualifiedTableSchemaJson(
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) ?[]const u8 {
     for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, database_name)) continue;
+        if (!std.mem.eql(u8, table.namespace_name, namespace_name)) continue;
         if (std.mem.eql(u8, table.name, table_name)) return table.schema_json;
     }
     return null;
@@ -479,12 +511,20 @@ test "sql adapter binder resolves runtime schema from catalog table name" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
-    var catalog = TestCatalog.init("usage_records", schema_json);
+    const tenant_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"}},"required":["tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id"]}}
+    ;
+    var catalog = TestCatalog.init("usage_records", schema_json, tenant_schema_json);
     const runtime = try runtimeSchemaForCatalogTableAlloc(alloc, catalog.iface(), "usage_records");
     defer runtime_schema.freeSchema(alloc, runtime);
     try std.testing.expectEqual(runtime_schema.StorageMode.relational, runtime.storage_mode);
     try std.testing.expect(runtime.primary_key != null);
     try std.testing.expectEqual(@as(usize, 2), runtime.relational_columns.len);
+
+    const tenant_runtime = try runtimeSchemaForQualifiedCatalogTableAlloc(alloc, catalog.iface(), "tenant_ops", "analytics", "usage_records");
+    defer runtime_schema.freeSchema(alloc, tenant_runtime);
+    try std.testing.expectEqual(runtime_schema.StorageMode.relational, tenant_runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), tenant_runtime.relational_columns.len);
     try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaForCatalogTableAlloc(alloc, catalog.iface(), "missing_records"));
 }
 
@@ -520,11 +560,26 @@ test "sql adapter binder rejects ambiguous physical cte read source tables" {
 }
 
 const TestCatalog = struct {
-    tables: [1]metadata_table_manager.TableRecord,
+    tables: [2]metadata_table_manager.TableRecord,
 
-    fn init(table_name: []const u8, schema_json: []const u8) @This() {
+    fn init(table_name: []const u8, schema_json: []const u8, tenant_schema_json: []const u8) @This() {
         return .{ .tables = .{
-            .{ .table_id = 1, .name = table_name, .placement_role = "data", .schema_json = schema_json },
+            .{
+                .table_id = 2,
+                .name = table_name,
+                .database_name = "tenant_ops",
+                .namespace_name = "analytics",
+                .placement_role = "data",
+                .schema_json = tenant_schema_json,
+            },
+            .{
+                .table_id = 1,
+                .name = table_name,
+                .database_name = metadata_table_manager.default_database_name,
+                .namespace_name = metadata_table_manager.default_namespace_name,
+                .placement_role = "data",
+                .schema_json = schema_json,
+            },
         } };
     }
 
