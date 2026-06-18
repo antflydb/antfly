@@ -2349,6 +2349,32 @@ const PendingDeltaBatch = struct {
         self.min_sequence = min_sequence;
         self.max_sequence = max_sequence;
     }
+
+    fn latestRecordAfterGenerationForMember(
+        self: PendingDeltaBatch,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+        best_sequence: *u64,
+        best_record: *?posting.PostingDeltaRecord,
+    ) void {
+        if (self.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(self.max_sequence) <= base_generation) return;
+        if (best_record.* != null and self.max_sequence < best_sequence.*) return;
+
+        var found_in_batch = false;
+        var index = self.records.items.len;
+        while (index > 0) {
+            index -= 1;
+            const record = self.records.items[index];
+            if (record.vector_id != vector_id) continue;
+            if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            if (best_record.* != null and record.sequence < best_sequence.*) continue;
+            if (best_record.* != null and record.sequence == best_sequence.* and found_in_batch) continue;
+
+            best_sequence.* = record.sequence;
+            best_record.* = record;
+            found_in_batch = true;
+        }
+    }
 };
 
 fn deltaRecordEncodedSizeFromBaseSequence(record: posting.PostingDeltaRecord, base_sequence: u64) !usize {
@@ -2832,16 +2858,7 @@ pub const DirectoryBatchWriter = struct {
         var best_record: ?posting.PostingDeltaRecord = null;
         try self.latestPendingDeltaEntryAfterGenerationForMember(posting_id, vector_id, base_generation, &best_sequence, &best_record);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
-            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) return best_record;
-            if (best_record != null and batch.max_sequence < best_sequence) return best_record;
-            for (batch.records.items) |record| {
-                if (record.vector_id != vector_id) continue;
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                if (best_record == null or record.sequence >= best_sequence) {
-                    best_sequence = record.sequence;
-                    best_record = record;
-                }
-            }
+            batch.latestRecordAfterGenerationForMember(vector_id, base_generation, &best_sequence, &best_record);
         }
         return best_record;
     }
@@ -6431,6 +6448,29 @@ test "posting segment pending delta batch size uses cached min sequence" {
 
     try std.testing.expectEqual(records[1].sequence, batch.min_sequence);
     try std.testing.expectEqual(records[2].sequence, batch.max_sequence);
+}
+
+test "posting segment pending delta batch latest member scan preserves equal sequence order" {
+    const alloc = std.testing.allocator;
+    const sequence = (@as(u64, 10) << 32) | 7;
+    const records = [_]posting.PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 9) << 32) | 1, .op = .insert, .vector_id = 42 },
+        .{ .sequence = sequence, .op = .insert, .vector_id = 42 },
+        .{ .sequence = sequence, .op = .tombstone, .vector_id = 42 },
+        .{ .sequence = (@as(u64, 11) << 32) | 1, .op = .insert, .vector_id = 99 },
+    };
+
+    var batch = PendingDeltaBatch{};
+    defer batch.deinit(alloc);
+    try batch.records.appendSlice(alloc, &records);
+    batch.noteAppendedRecords(&records, try posting.PostingFormat.encodedDeltaTailSize(&records));
+
+    var best_sequence = sequence;
+    var best_record: ?posting.PostingDeltaRecord = .{ .sequence = sequence, .op = .insert, .vector_id = 42 };
+    batch.latestRecordAfterGenerationForMember(42, 0, &best_sequence, &best_record);
+
+    try std.testing.expectEqual(sequence, best_sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, best_record.?.op);
 }
 
 test "posting segment directory batch writer flushes bounded segments" {
