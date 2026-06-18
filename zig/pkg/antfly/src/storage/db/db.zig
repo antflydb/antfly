@@ -5817,6 +5817,8 @@ pub const DB = struct {
     }
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.updateRange(byte_range);
@@ -38112,6 +38114,10 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(
         error.HAReadOnlyStandby,
         db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.updateRange(.{ .start = "doc:a", .end = "doc:z" }),
     );
 
     try db.batchReplicatedApply(.{
