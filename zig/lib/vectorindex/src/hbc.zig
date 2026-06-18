@@ -95,6 +95,40 @@ pub fn encodeNodeKey(buf: *[12]u8, node_id: u64, suffix: Suffix) []u8 {
     return buf;
 }
 
+pub fn encodeNodeKeyPrefix(buf: *[2]u8) []u8 {
+    buf[0] = 'n';
+    buf[1] = ':';
+    return buf;
+}
+
+pub const DecodedNodeKey = struct {
+    id: u64,
+    suffix: Suffix,
+};
+
+pub fn decodeNodeKey(key: []const u8) ?DecodedNodeKey {
+    if (key.len != 12) return null;
+    if (key[0] != 'n' or key[1] != ':' or key[10] != ':') return null;
+    const suffix: Suffix = switch (key[11]) {
+        @intFromEnum(Suffix.header) => .header,
+        @intFromEnum(Suffix.centroid) => .centroid,
+        @intFromEnum(Suffix.children) => .children,
+        @intFromEnum(Suffix.members) => .members,
+        @intFromEnum(Suffix.packed_node) => .packed_node,
+        @intFromEnum(Suffix.range) => .range,
+        @intFromEnum(Suffix.posting) => .posting,
+        else => return null,
+    };
+    return .{
+        .id = std.mem.readInt(u64, key[2..10], .big),
+        .suffix = suffix,
+    };
+}
+
+pub fn nodeKeyPrefixMatches(key: []const u8) bool {
+    return key.len >= 2 and key[0] == 'n' and key[1] == ':';
+}
+
 pub fn encodeVecKey(buf: *[10]u8, vector_id: u64) []u8 {
     buf[0] = 'v';
     buf[1] = ':';

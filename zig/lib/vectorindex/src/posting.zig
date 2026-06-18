@@ -22,6 +22,11 @@ const vec = @import("antfly_vector").vector;
 pub const VectorId = u64;
 pub const PostingId = u64;
 
+pub const PostingStateRecord = struct {
+    posting_id: PostingId,
+    state: types.PostingState,
+};
+
 pub const PostingView = struct {
     id: PostingId,
     parent: PostingId,
@@ -2933,6 +2938,37 @@ pub const PostingStore = struct {
         return try decodeState(data);
     }
 
+    pub fn canLoadStatesByScan(comptime IndexParam: type, comptime Txn: type) bool {
+        return canScanDeltaTail(IndexParam, Txn);
+    }
+
+    pub fn loadStatesByScan(index: anytype, txn: anytype) ![]PostingStateRecord {
+        var cursor = try openNamespacedCursor(index, txn, .nodes);
+        defer cursor.close();
+
+        var prefix_buf: [2]u8 = undefined;
+        const prefix = hbc.encodeNodeKeyPrefix(&prefix_buf);
+        var out: std.ArrayList(PostingStateRecord) = .empty;
+        errdefer out.deinit(index.alloc);
+
+        var maybe_entry = try cursor.seekAtOrAfter(prefix);
+        while (maybe_entry) |entry| {
+            if (!hbc.nodeKeyPrefixMatches(entry.key)) break;
+            const decoded = hbc.decodeNodeKey(entry.key) orelse {
+                maybe_entry = try cursor.next();
+                continue;
+            };
+            if (decoded.suffix == .posting) {
+                try out.append(index.alloc, .{
+                    .posting_id = decoded.id,
+                    .state = try decodeState(entry.value),
+                });
+            }
+            maybe_entry = try cursor.next();
+        }
+        return try out.toOwnedSlice(index.alloc);
+    }
+
     pub fn saveState(index: anytype, txn: anytype, posting_id: PostingId, state: PostingState) !void {
         var key_buf: [12]u8 = undefined;
         var buf: [state_encoded_size]u8 = undefined;
@@ -5276,6 +5312,46 @@ test "posting state encoding round trips" {
     try std.testing.expectEqual(state.dirty, decoded.dirty);
     try std.testing.expectEqual(state.centroid_dirty, decoded.centroid_dirty);
     try std.testing.expectEqual(state.payload_dirty, decoded.payload_dirty);
+}
+
+test "posting state scan filters node suffixes" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{ .alloc = alloc };
+    defer index.deinit();
+
+    var key_buf: [12]u8 = undefined;
+    try index.appendNamespaced(.{}, .nodes, hbc.encodeNodeKey(&key_buf, 7, .packed_node), "packed");
+
+    var state_buf_9: [state_encoded_size]u8 = undefined;
+    const state_9 = PostingState{
+        .mutation_version = 90,
+        .centroid_version = 91,
+        .payload_version = 92,
+        .dirty = true,
+        .centroid_dirty = false,
+        .payload_dirty = true,
+    };
+    try index.appendNamespaced(.{}, .nodes, hbc.encodeNodeKey(&key_buf, 9, .posting), encodeState(state_9, &state_buf_9));
+
+    var state_buf_4: [state_encoded_size]u8 = undefined;
+    const state_4 = PostingState{
+        .mutation_version = 40,
+        .centroid_version = 41,
+        .payload_version = 42,
+        .dirty = false,
+        .centroid_dirty = true,
+        .payload_dirty = false,
+    };
+    try index.appendNamespaced(.{}, .nodes, hbc.encodeNodeKey(&key_buf, 4, .posting), encodeState(state_4, &state_buf_4));
+
+    const records = try PostingStore.loadStatesByScan(&index, .{});
+    defer alloc.free(records);
+
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expectEqual(@as(PostingId, 4), records[0].posting_id);
+    try std.testing.expectEqual(state_4, records[0].state);
+    try std.testing.expectEqual(@as(PostingId, 9), records[1].posting_id);
+    try std.testing.expectEqual(state_9, records[1].state);
 }
 
 test "posting fold scratch trims retained buffers to budget" {
