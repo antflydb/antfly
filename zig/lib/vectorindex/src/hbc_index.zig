@@ -498,7 +498,8 @@ fn rebuildInternalQuantizedReadHandleForQuery(
     if (child_ids.len == 0) return null;
     const dims: usize = @intCast(self.metadata.dims);
     const child_vectors = try self.alloc.alloc(f32, child_ids.len * dims);
-    defer self.alloc.free(child_vectors);
+    var child_vectors_owned = true;
+    defer if (child_vectors_owned) self.alloc.free(child_vectors);
 
     for (child_ids, 0..) |child_id, i| {
         var child_handle = loadNodeReadHandleProfiled(self, txn, child_id, profile, now_fn, elapsed_fn) catch return null;
@@ -508,15 +509,16 @@ fn rebuildInternalQuantizedReadHandleForQuery(
         @memcpy(child_vectors[i * dims ..][0..dims], child.centroid[0..dims]);
     }
 
-    var rebuilt: hbc_runtime.QuantizedSet = if (uses_nonquantized_payload)
-        .{ .nonquant = .{
+    var rebuilt: hbc_runtime.QuantizedSet = if (uses_nonquantized_payload) blk: {
+        child_vectors_owned = false;
+        break :blk .{ .nonquant = .{
             .vectors = .{
                 .dims = @intCast(dims),
                 .count = @intCast(child_ids.len),
-                .data = try self.alloc.dupe(f32, child_vectors),
+                .data = child_vectors,
             },
-        } }
-    else blk: {
+        } };
+    } else blk: {
         var node_handle = loadNodeReadHandleProfiled(self, txn, node_id, profile, now_fn, elapsed_fn) catch return null;
         defer node_handle.deinit(self.alloc);
         const node = node_handle.ptr();
