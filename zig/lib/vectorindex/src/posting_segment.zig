@@ -793,6 +793,7 @@ pub const Catalog = struct {
     }
 
     fn getLatestExact(self: Catalog, posting_id: PostingId, kind: EntryKind) !?[]const u8 {
+        const sorted_by_segment_id = segmentBlobsSortedBySegmentId(self.segments);
         var best_segment_id: u64 = 0;
         var best: ?[]const u8 = null;
         var segment_index = self.segments.len;
@@ -808,6 +809,7 @@ pub const Catalog = struct {
                 .delta => null,
             };
             if (value) |found| {
+                if (sorted_by_segment_id) return found;
                 best_segment_id = segment.meta.segment_id;
                 best = found;
             }
@@ -1087,10 +1089,10 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readLatestPointValueWithSegmentAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, kind: EntryKind) !?LatestPointValue {
+        const sorted_by_segment_id = ownedManifestEntriesSortedBySegmentId(self.manifest.segments);
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
-        const newest_segment_id = if (self.manifest.next_segment_id == 0) 0 else self.manifest.next_segment_id - 1;
 
         var segment_index = self.manifest.segments.len;
         while (segment_index > 0) {
@@ -1102,15 +1104,15 @@ pub const LazyDirectorySnapshot = struct {
 
             const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
             const found = (try readSegmentPointIndexEntryAlloc(alloc, self.io, self.dir, manifest_entry, posting_id, kind)) orelse continue;
-            best_segment_id = entry.meta.segment_id;
-            best_manifest_entry = manifest_entry;
-            best_index_entry = found;
-            if (best_segment_id == newest_segment_id) {
+            if (sorted_by_segment_id) {
                 return .{
-                    .segment_id = best_segment_id,
+                    .segment_id = entry.meta.segment_id,
                     .data = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found),
                 };
             }
+            best_segment_id = entry.meta.segment_id;
+            best_manifest_entry = manifest_entry;
+            best_index_entry = found;
         }
 
         const manifest_entry = best_manifest_entry orelse return null;
@@ -1121,10 +1123,10 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readLatestBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
+        const sorted_by_segment_id = ownedManifestEntriesSortedBySegmentId(self.manifest.segments);
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
-        const newest_segment_id = if (self.manifest.next_segment_id == 0) 0 else self.manifest.next_segment_id - 1;
 
         var segment_index = self.manifest.segments.len;
         while (segment_index > 0) {
@@ -1136,21 +1138,24 @@ pub const LazyDirectorySnapshot = struct {
 
             const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
             const found = (try readSegmentPointIndexEntryAlloc(alloc, self.io, self.dir, manifest_entry, posting_id, .base)) orelse continue;
+            if (sorted_by_segment_id) return try self.readBaseHeaderFromIndexEntry(posting_id, manifest_entry, found);
             best_segment_id = entry.meta.segment_id;
             best_manifest_entry = manifest_entry;
             best_index_entry = found;
-            if (best_segment_id == newest_segment_id) {
-                var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
-                try readSegmentEntryValuePrefixInto(self.io, self.dir, manifest_entry, found, &header_data);
-                const header = try posting.PostingFormat.decodeBaseHeader(&header_data);
-                if (header.posting_id != posting_id) return error.CorruptedPostingSegment;
-                return header;
-            }
         }
 
         const manifest_entry = best_manifest_entry orelse return null;
+        return try self.readBaseHeaderFromIndexEntry(posting_id, manifest_entry, best_index_entry);
+    }
+
+    fn readBaseHeaderFromIndexEntry(
+        self: LazyDirectorySnapshot,
+        posting_id: PostingId,
+        manifest_entry: ManifestEntry,
+        index_entry: IndexEntry,
+    ) !posting.PostingBaseHeader {
         var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
-        try readSegmentEntryValuePrefixInto(self.io, self.dir, manifest_entry, best_index_entry, &header_data);
+        try readSegmentEntryValuePrefixInto(self.io, self.dir, manifest_entry, index_entry, &header_data);
         const header = try posting.PostingFormat.decodeBaseHeader(&header_data);
         if (header.posting_id != posting_id) return error.CorruptedPostingSegment;
         return header;
@@ -4005,6 +4010,22 @@ fn sortManifestEntriesIfNeeded(entries: []ManifestEntry) void {
             return;
         }
     }
+}
+
+fn ownedManifestEntriesSortedBySegmentId(entries: []const OwnedManifestEntry) bool {
+    var index: usize = 1;
+    while (index < entries.len) : (index += 1) {
+        if (entries[index].meta.segment_id < entries[index - 1].meta.segment_id) return false;
+    }
+    return true;
+}
+
+fn segmentBlobsSortedBySegmentId(segments: []const SegmentBlob) bool {
+    var index: usize = 1;
+    while (index < segments.len) : (index += 1) {
+        if (segments[index].meta.segment_id < segments[index - 1].meta.segment_id) return false;
+    }
+    return true;
 }
 
 fn deltaValueLessThan(_: void, lhs: DeltaValue, rhs: DeltaValue) bool {
