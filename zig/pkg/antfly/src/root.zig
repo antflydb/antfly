@@ -231,6 +231,7 @@ test {
 
     // Inference
     _ = inference;
+    _ = table_schema;
     _ = pdf;
 
     // Serverless
