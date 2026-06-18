@@ -24,6 +24,7 @@ const external_source = @import("../external_source/types.zig");
 const iceberg_avro = @import("../external_source/iceberg_avro.zig");
 const iceberg_inventory = @import("../external_source/iceberg_inventory.zig");
 const iceberg_metadata = @import("../external_source/iceberg_metadata.zig");
+const lake_object_reader = @import("lake_object_reader.zig");
 const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 const lake_range_io = @import("lake_range_io.zig");
 const object_storage = @import("../../storage/object_storage.zig");
@@ -204,63 +205,21 @@ fn readFullObjectAlloc(
         .iceberg_delete_metadata => try lake_range_io.planIcebergManifestRead(object, .deletes),
         else => return error.InvalidIcebergSnapshotRead,
     };
-    return try readMaybeCachedIcebergRangeAlloc(alloc, client, cache, read);
+    return try readMaybeCachedIcebergRangeAlloc(alloc, client.*, cache, read);
 }
 
 fn readMaybeCachedIcebergRangeAlloc(
     alloc: Allocator,
-    client: *object_storage.ObjectStorage,
+    client: object_storage.ObjectStorage,
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache,
     read: lake_range_io.RangeRead,
 ) ![]u8 {
+    var range_reader = lake_object_reader.ObjectStorageRangeReader.init(client);
+    const parquet_reader = range_reader.parquetReader();
     if (cache) |range_cache| {
-        const cache_key = try read.cacheKeyAlloc(alloc);
-        if (range_cache.entries.get(cache_key)) |cached| {
-            const expected_len: usize = std.math.cast(usize, read.range.len) orelse {
-                alloc.free(cache_key);
-                return error.InvalidLakeRangeRead;
-            };
-            if (cached.len != expected_len) {
-                alloc.free(cache_key);
-                return error.InvalidLakeRangeRead;
-            }
-            range_cache.stats.hits += 1;
-            alloc.free(cache_key);
-            return try alloc.dupe(u8, cached);
-        }
-
-        range_cache.stats.misses += 1;
-        const bytes = try readIcebergObjectRangeAlloc(alloc, client, read);
-        errdefer alloc.free(bytes);
-        const stored = try alloc.dupe(u8, bytes);
-        errdefer alloc.free(stored);
-        range_cache.entries.put(alloc, cache_key, stored) catch |err| {
-            alloc.free(cache_key);
-            return err;
-        };
-        range_cache.stats.stored_bytes += stored.len;
-        return bytes;
+        return try range_cache.readAlloc(alloc, parquet_reader, read);
     }
-    return try readIcebergObjectRangeAlloc(alloc, client, read);
-}
-
-fn readIcebergObjectRangeAlloc(
-    alloc: Allocator,
-    client: *object_storage.ObjectStorage,
-    read: lake_range_io.RangeRead,
-) ![]u8 {
-    const expected_len: usize = std.math.cast(usize, read.range.len) orelse return error.InvalidLakeRangeRead;
-    var result = try client.getObject(read.object.bucket, read.object.key, .{
-        .range = .{
-            .offset = read.range.offset,
-            .length = expected_len,
-        },
-        .if_match_etag = if (read.object.version.etag.len == 0) null else read.object.version.etag,
-        .version_id = if (read.object.version.version_id.len == 0) null else read.object.version.version_id,
-    });
-    defer result.deinit(alloc);
-    if (result.body.len != expected_len) return error.InvalidLakeRangeRead;
-    return try alloc.dupe(u8, result.body);
+    return try parquet_reader.readPlannedAlloc(alloc, read);
 }
 
 fn objectVersionForMetadataAlloc(
@@ -355,6 +314,8 @@ test "iceberg snapshot reader reuses cached metadata and manifest ranges" {
     try std.testing.expectEqual(@as(usize, 0), first_stats.hits);
     try std.testing.expectEqual(@as(usize, 3), first_stats.misses);
     try std.testing.expect(first_stats.stored_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 3), first_stats.lane(.metadata).misses);
+    try std.testing.expect(first_stats.lane(.metadata).stored_bytes > 0);
 
     var second = try readSnapshotInventoryAlloc(alloc, .{
         .client = client,
@@ -367,8 +328,49 @@ test "iceberg snapshot reader reuses cached metadata and manifest ranges" {
     const second_stats = cache.statsSnapshot();
     try std.testing.expectEqual(first_stats.misses, second_stats.misses);
     try std.testing.expectEqual(@as(usize, 3), second_stats.hits);
+    try std.testing.expectEqual(@as(usize, 3), second_stats.lane(.metadata).hits);
     try std.testing.expectEqualStrings(first.snapshot_id, second.snapshot_id);
     try std.testing.expectEqual(first.files.len, second.files.len);
+}
+
+test "iceberg snapshot reader applies object range cache metadata lane admission" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var data_manifest = try buildDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var manifest_list = try buildManifestListFixture(alloc, data_manifest.items.len);
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "t/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "t/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+
+    var cache = lake_parquet_rowgroup.ObjectRangeCache{
+        .policy = lake_parquet_rowgroup.ObjectRangeCachePolicy.withLaneLimit(.metadata, 1),
+    };
+    defer cache.deinit(alloc);
+
+    var inventory = try readSnapshotInventoryAlloc(alloc, .{
+        .client = client,
+        .source_id = "events",
+        .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json",
+        .requested_snapshot_id = "12",
+        .cache = &cache,
+    });
+    defer inventory.deinit(alloc);
+
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 3), stats.misses);
+    try std.testing.expectEqual(@as(usize, 3), stats.lane(.metadata).misses);
+    try std.testing.expectEqual(@as(usize, 0), stats.stored_bytes);
+    try std.testing.expect(stats.rejected_bytes >= testMetadataJson().len + manifest_list.items.len + data_manifest.items.len);
+    try std.testing.expectEqual(stats.rejected_bytes, stats.lane(.metadata).rejected_bytes);
 }
 
 test "iceberg snapshot reader rejects corrupted cached metadata range lengths" {
@@ -475,6 +477,7 @@ test "iceberg snapshot reader reads delete manifest metadata before failing clos
     const stats = cache.statsSnapshot();
     try std.testing.expectEqual(@as(usize, 0), stats.hits);
     try std.testing.expectEqual(@as(usize, 3), stats.misses);
+    try std.testing.expectEqual(@as(usize, 3), stats.lane(.metadata).misses);
     try std.testing.expect(stats.stored_bytes >= testMetadataJson().len + manifest_list.items.len + delete_manifest.items.len);
 }
 
