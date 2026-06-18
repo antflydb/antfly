@@ -4322,28 +4322,14 @@ const Parser = struct {
     }
 
     fn parseDropRowSecurityPolicyDdl(self: *@This()) !DropRowSecurityPolicyPlan {
-        try self.expectKeyword("policy");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const policy_name = try self.parseIdentifierOwned();
-        var policy_transferred = false;
-        errdefer if (!policy_transferred) self.alloc.free(policy_name);
-        try self.expectKeyword("on");
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_transferred = false;
-        errdefer if (!table_transferred) self.alloc.free(table_name);
-        _ = self.matchKeyword("cascade") or self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        policy_transferred = true;
-        table_transferred = true;
+        var syntax = try sql_adapter.parseDropRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .policy_name = policy_name,
-            .table_name = table_name,
-            .if_exists = if_exists,
+            .policy_name = syntax.policy_name,
+            .table_name = syntax.table_name,
+            .if_exists = syntax.if_exists,
         };
     }
 

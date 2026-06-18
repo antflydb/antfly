@@ -33,6 +33,18 @@ pub const RowSecurityAlterSyntax = struct {
     enabled: bool,
 };
 
+pub const DropRowSecurityPolicySyntax = struct {
+    policy_name: []const u8,
+    table_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.policy_name));
+        alloc.free(@constCast(self.table_name));
+        self.* = undefined;
+    }
+};
+
 pub const AdapterNoopTransactionBoundaryTail = struct {
     work: bool = false,
     transaction: bool = false,
@@ -964,6 +976,32 @@ pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAl
     if (cursor.matchToken(.semicolon) != null and !cursor.atEnd()) return error.UnsupportedSqlShape;
     if (!cursor.atEnd()) return error.UnsupportedSqlShape;
     return .{ .table_identifier = table_token.text, .enabled = enabled };
+}
+
+pub fn parseDropRowSecurityPolicyCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropRowSecurityPolicySyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("policy");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const policy_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var policy_transferred = false;
+    errdefer if (!policy_transferred) alloc.free(policy_name);
+    try cursor.expectKeyword("on");
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    _ = cursor.matchKeyword("cascade") or cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    policy_transferred = true;
+    table_transferred = true;
+    return .{ .policy_name = policy_name, .table_name = table_name, .if_exists = if_exists };
 }
 
 pub fn parseAdapterNoopSetStatementTail(tokens: []const Token, pos: *usize) !void {
@@ -3511,7 +3549,7 @@ pub const rowExpressionBoundaryKeyword = lower_expr.rowExpressionBoundaryKeyword
 pub const sqlWhereTailClauseKeyword = lower_expr.sqlWhereTailClauseKeyword;
 pub const sqlWindowTailClauseKeyword = lower_expr.sqlWindowTailClauseKeyword;
 
-test "sql adapter grammar parses alter row security" {
+test "sql adapter grammar parses row security catalog tails" {
     const alloc = std.testing.allocator;
     var tokens = try lexer.tokenizeAlloc(alloc, "TABLE public.usage_records DISABLE ROW LEVEL SECURITY;");
     defer lexer.freeTokens(alloc, &tokens);
@@ -3521,6 +3559,16 @@ test "sql adapter grammar parses alter row security" {
     try std.testing.expect(!syntax.enabled);
     try std.testing.expectEqualStrings("public.usage_records", syntax.table_identifier);
     try std.testing.expectEqual(tokens.items.len, pos);
+
+    var drop_tokens = try lexer.tokenizeAlloc(alloc, "POLICY IF EXISTS tenant_policy ON public.usage_records CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_tokens);
+    var drop_pos: usize = 0;
+    var drop = try parseDropRowSecurityPolicyCatalogTailAlloc(alloc, drop_tokens.items, &drop_pos);
+    defer drop.deinit(alloc);
+    try std.testing.expectEqual(drop_tokens.items.len, drop_pos);
+    try std.testing.expectEqualStrings("tenant_policy", drop.policy_name);
+    try std.testing.expectEqualStrings("usage_records", drop.table_name);
+    try std.testing.expect(drop.if_exists);
 }
 
 test "sql adapter grammar leaves non row security alter table to ddl parser" {

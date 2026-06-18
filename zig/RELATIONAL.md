@@ -1069,8 +1069,9 @@ wrapper intent instead of scanning raw SQL. This boundary is now partially imple
 helpers, statement classification, diagnostics, parity-corpus fingerprints,
 catalog/source-name prebinding, catalog-independent object identifier
 normalization, owned identifier/list parsing, adapter-noop grammar tails,
-`EXPLAIN` prefix and option grammar, row-security grammar
-syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
+`EXPLAIN` prefix and option grammar, row-security grammar syntax for
+`ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` and `DROP POLICY ... ON`,
+row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 `FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
 tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
 direction/count tails, transaction-control grammar for `LOCK TABLE`,
