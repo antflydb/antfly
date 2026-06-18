@@ -885,48 +885,7 @@ pub const LazyDirectorySnapshot = struct {
             .max_sequence = stats.max_sequence_after_generation,
         };
 
-        const records = scratch.deltaRecordsMut();
-        if (records.len == 0) return result;
-
-        sortPostingDeltaRecordsIfNeeded(records);
-
-        if (base_members_are_sorted and records.len <= compact_sorted_delta_max_records) {
-            var compact_ids: [compact_sorted_delta_max_records]posting.VectorId = undefined;
-            var compact_ops: [compact_sorted_delta_max_records]posting.PostingDeltaOp = undefined;
-            for (records, 0..) |record, i| {
-                compact_ids[i] = record.vector_id;
-                compact_ops[i] = record.op;
-            }
-            member_count.* = try posting.PostingFormat.applySortedCompactOpsToSortedScratch(
-                alloc,
-                scratch,
-                member_count.*,
-                compact_ids[0..records.len],
-                compact_ops[0..records.len],
-            );
-            return result;
-        }
-
-        const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
-            .pointer => |ptr| ptr.child,
-            else => @TypeOf(scratch),
-        };
-        const can_use_overlay_plan = comptime @hasDecl(Scratch, "resetPostingOverlayApply") and
-            @hasDecl(Scratch, "ensurePostingOverlayAppendCapacity") and
-            @hasField(Scratch, "member_ids");
-        if (can_use_overlay_plan and records.len > overlay_plan_min_delta_records) {
-            scratch.resetPostingOverlayApply();
-            for (records) |record| {
-                try posting.PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
-            }
-            member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
-            return result;
-        }
-
-        try scratch.ensureMemberIdCapacity(alloc, member_count.* + posting.PostingFormat.liveDeltaRecordCount(records));
-        for (records) |record| {
-            posting.PostingFormat.applyDeltaRecordToScratch(scratch, member_count, record);
-        }
+        try applyBufferedDeltaRecordsIntoScratch(alloc, scratch, member_count, base_members_are_sorted);
         return result;
     }
 
@@ -1243,12 +1202,7 @@ pub const Snapshot = struct {
         const records = scratch.deltaRecordsMut();
         if (records.len == 0) return try alloc.dupe(posting.VectorId, scratch.member_ids[0..member_count]);
 
-        sortPostingDeltaRecordsIfNeeded(records);
-
-        try scratch.ensureMemberIdCapacity(alloc, member_count + posting.PostingFormat.liveDeltaRecordCount(records));
-        for (records) |record| {
-            posting.PostingFormat.applyDeltaRecordToScratch(&scratch, &member_count, record);
-        }
+        try applyBufferedDeltaRecordsIntoScratch(alloc, &scratch, &member_count, false);
         return try alloc.dupe(posting.VectorId, scratch.member_ids[0..member_count]);
     }
 };
@@ -4032,6 +3986,56 @@ fn ensureDeltaRecordAppendCapacity(alloc: Allocator, scratch: anytype, additiona
 fn appendDeltaRecordToScratch(alloc: Allocator, scratch: anytype, record: posting.PostingDeltaRecord) !void {
     try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
     scratch.appendDeltaRecordAssumeCapacity(record);
+}
+
+fn applyBufferedDeltaRecordsIntoScratch(
+    alloc: Allocator,
+    scratch: anytype,
+    member_count: *usize,
+    base_members_are_sorted: bool,
+) !void {
+    const records = scratch.deltaRecordsMut();
+    if (records.len == 0) return;
+
+    sortPostingDeltaRecordsIfNeeded(records);
+
+    if (base_members_are_sorted and records.len <= compact_sorted_delta_max_records) {
+        var compact_ids: [compact_sorted_delta_max_records]posting.VectorId = undefined;
+        var compact_ops: [compact_sorted_delta_max_records]posting.PostingDeltaOp = undefined;
+        for (records, 0..) |record, i| {
+            compact_ids[i] = record.vector_id;
+            compact_ops[i] = record.op;
+        }
+        member_count.* = try posting.PostingFormat.applySortedCompactOpsToSortedScratch(
+            alloc,
+            scratch,
+            member_count.*,
+            compact_ids[0..records.len],
+            compact_ops[0..records.len],
+        );
+        return;
+    }
+
+    const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(scratch),
+    };
+    const can_use_overlay_plan = comptime @hasDecl(Scratch, "resetPostingOverlayApply") and
+        @hasDecl(Scratch, "ensurePostingOverlayAppendCapacity") and
+        @hasField(Scratch, "member_ids");
+    if (can_use_overlay_plan and records.len > overlay_plan_min_delta_records) {
+        scratch.resetPostingOverlayApply();
+        for (records) |record| {
+            try posting.PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+        }
+        member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
+        return;
+    }
+
+    try scratch.ensureMemberIdCapacity(alloc, member_count.* + posting.PostingFormat.liveDeltaRecordCount(records));
+    for (records) |record| {
+        posting.PostingFormat.applyDeltaRecordToScratch(scratch, member_count, record);
+    }
 }
 
 fn compactMembersWithOverlayPlan(alloc: Allocator, scratch: anytype, base_member_count: usize) !usize {
@@ -6875,6 +6879,62 @@ test "posting segment lazy materialization uses adaptive overlay replay for larg
     const member_count = (try lazy.snapshot().materializeMembersIntoScratch(alloc, 7, &scratch)).?;
 
     try std.testing.expectEqualSlices(posting.VectorId, &.{ 50, 60, 70, 30, 80, 90, 40, 100 }, scratch.member_ids[0..member_count]);
+}
+
+test "posting segment eager snapshot uses adaptive overlay replay for large tails" {
+    const alloc = std.testing.allocator;
+
+    const base_members = [_]posting.VectorId{ 10, 20, 30, 40, 50, 60 };
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &base_members,
+    });
+    defer alloc.free(base);
+    const records = [_]posting.PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = (@as(u64, 2) << 32) | 2, .op = .insert, .vector_id = 70 },
+        .{ .sequence = (@as(u64, 2) << 32) | 3, .op = .replace, .vector_id = 30 },
+        .{ .sequence = (@as(u64, 2) << 32) | 4, .op = .tombstone, .vector_id = 999 },
+        .{ .sequence = (@as(u64, 2) << 32) | 5, .op = .insert, .vector_id = 80 },
+        .{ .sequence = (@as(u64, 2) << 32) | 6, .op = .tombstone, .vector_id = 10 },
+        .{ .sequence = (@as(u64, 2) << 32) | 7, .op = .insert, .vector_id = 90 },
+        .{ .sequence = (@as(u64, 2) << 32) | 8, .op = .replace, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 2) << 32) | 9, .op = .insert, .vector_id = 100 },
+    };
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &records);
+    defer alloc.free(delta);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(7, base);
+    try writer.appendDelta(7, records[0].sequence, delta);
+    const segment = try writer.build();
+    defer alloc.free(segment);
+
+    const reader = try Reader.init(segment);
+    const meta = try reader.metadata(1);
+    const entries = [_]ManifestEntry{.{
+        .meta = meta,
+        .path = "postings/000001.afps",
+    }};
+    const manifest_data = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = 2,
+        .segments = entries[0..],
+    });
+    defer alloc.free(manifest_data);
+    const files = [_]TestSegmentFile{.{
+        .path = "postings/000001.afps",
+        .data = segment,
+    }};
+    const loader = TestSegmentLoader{ .files = files[0..] };
+    var store = try openStoreAlloc(alloc, manifest_data, &loader, TestSegmentLoader.read);
+    defer store.deinit(alloc);
+
+    const members = (try store.snapshot().materializeMembers(alloc, 7)).?;
+    defer alloc.free(members);
+
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 50, 60, 70, 30, 80, 90, 40, 100 }, members);
 }
 
 test "posting segment lazy directory store uses newest point records by segment id" {
