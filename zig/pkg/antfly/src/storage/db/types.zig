@@ -2214,6 +2214,34 @@ pub fn relationalRowsSelectJoinStrategy(
     };
 }
 
+pub fn relationalRowsJoinInputsSortedOnJoinKeys(req: RelationalRowsJoinRequest) bool {
+    return relationalRowsJoinSourceOrderCoversJoinKeys(req.left.order_by, req.on, .left) and
+        relationalRowsJoinSourceOrderCoversJoinKeys(req.right.order_by, req.on, .right);
+}
+
+const RelationalRowsJoinOrderSide = enum {
+    left,
+    right,
+};
+
+fn relationalRowsJoinSourceOrderCoversJoinKeys(
+    order_by: []const RelationalRowsQueryOrder,
+    predicates: []const RelationalRowsJoinOn,
+    side: RelationalRowsJoinOrderSide,
+) bool {
+    if (predicates.len == 0 or order_by.len < predicates.len) return false;
+    for (predicates, 0..) |predicate, i| {
+        const order = order_by[i];
+        if (order.expression != null or order.null_test != null or order.direction != .asc) return false;
+        const field = switch (side) {
+            .left => predicate.left_field,
+            .right => predicate.right_field,
+        };
+        if (!std.mem.eql(u8, order.field, field)) return false;
+    }
+    return true;
+}
+
 test "relational rows join strategy selection is explicit and fail closed for unproven merge" {
     const join_on = [_]RelationalRowsJoinOn{.{
         .left_field = "customer_id",
@@ -2232,6 +2260,46 @@ test "relational rows join strategy selection is explicit and fail closed for un
     const explicit_merge = RelationalRowsJoinRequest{ .on = join_on[0..], .strategy = .merge };
     try std.testing.expect(relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, false) == null);
     try std.testing.expectEqual(RelationalRowsJoinStrategy.merge, relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, true).?.selected);
+}
+
+test "relational rows join sorted input proof requires leading ascending join key order" {
+    const join_on = [_]RelationalRowsJoinOn{.{
+        .left_field = "customer_id",
+        .right_field = "id",
+    }};
+    const left_order = [_]RelationalRowsQueryOrder{.{
+        .field = "customer_id",
+    }};
+    const right_order = [_]RelationalRowsQueryOrder{.{
+        .field = "id",
+    }};
+    const sorted = RelationalRowsJoinRequest{
+        .left = .{ .order_by = left_order[0..] },
+        .right = .{ .order_by = right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(relationalRowsJoinInputsSortedOnJoinKeys(sorted));
+
+    const wrong_right_order = [_]RelationalRowsQueryOrder{.{
+        .field = "other_id",
+    }};
+    const unsorted = RelationalRowsJoinRequest{
+        .left = .{ .order_by = left_order[0..] },
+        .right = .{ .order_by = wrong_right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(!relationalRowsJoinInputsSortedOnJoinKeys(unsorted));
+
+    const desc_left_order = [_]RelationalRowsQueryOrder{.{
+        .field = "customer_id",
+        .direction = .desc,
+    }};
+    const descending = RelationalRowsJoinRequest{
+        .left = .{ .order_by = desc_left_order[0..] },
+        .right = .{ .order_by = right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(!relationalRowsJoinInputsSortedOnJoinKeys(descending));
 }
 
 pub const RelationalRowsJoinedMutationSourceRequest = struct {

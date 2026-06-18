@@ -672,7 +672,7 @@ pub fn executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(
     defer right_result.deinit(alloc);
 
     var join = plan.join;
-    _ = db_mod.types.relationalRowsSelectJoinStrategy(join, left_result.rows.len, right_result.rows.len, false) orelse return error.UnsupportedRowsQuery;
+    _ = db_mod.types.relationalRowsSelectJoinStrategy(join, left_result.rows.len, right_result.rows.len, db_mod.types.relationalRowsJoinInputsSortedOnJoinKeys(join)) orelse return error.UnsupportedRowsQuery;
     join.left.source_cte = "";
     join.right.source_cte = "";
     join.left.doc_key_range = null;
@@ -19117,6 +19117,19 @@ test "relational rows cte plan contract executes derived outputs across read sta
     );
     defer merge_join_plan.deinit(alloc);
     try std.testing.expectError(error.UnsupportedRowsQuery, executeRowsJoinPlanOnJsonRowsAlloc(alloc, schema, merge_join_plan, rows[0..], rows[0..], rows[0..]));
+
+    var sorted_merge_join_plan = try parseRowsJoinPlanRequest(
+        alloc,
+        "{\"join\":{\"left\":{\"order_by\":[{\"field\":\"tenant\"},{\"field\":\"id\"}]},\"right\":{\"order_by\":[{\"field\":\"tenant\"},{\"field\":\"id\"}]},\"strategy\":\"merge\",\"on\":[{\"left_field\":\"tenant\",\"right_field\":\"tenant\"}],\"select\":[{\"as\":\"left_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"right_id\",\"side\":\"right\",\"field\":\"id\"}],\"order_by\":[{\"field\":\"left_id\"},{\"field\":\"right_id\"}]}}",
+        schema,
+    );
+    defer sorted_merge_join_plan.deinit(alloc);
+    var sorted_merge_join_result = try executeRowsJoinPlanOnJsonRowsAlloc(alloc, schema, sorted_merge_join_plan, rows[0..], rows[0..], rows[0..]);
+    defer sorted_merge_join_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 8), sorted_merge_join_result.total_rows);
+    try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", sorted_merge_join_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"left_id\":\"b\",\"right_id\":\"b\"}", sorted_merge_join_result.rows[3]);
+    try std.testing.expectEqualStrings("{\"left_id\":\"d\",\"right_id\":\"d\"}", sorted_merge_join_result.rows[7]);
 
     var lateral_plan = try parseRowsLateralPlanRequest(
         alloc,

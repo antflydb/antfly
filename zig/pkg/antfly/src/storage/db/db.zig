@@ -22481,6 +22481,25 @@ pub const DB = struct {
         right_rows: []const []const u8,
     ) !types.RelationalRowsJoinResult {
         if (req.left.doc_key_range != null or req.right.doc_key_range != null) return error.InvalidQueryRequest;
+        const selection = types.relationalRowsSelectJoinStrategy(
+            req,
+            left_rows.len,
+            right_rows.len,
+            types.relationalRowsJoinInputsSortedOnJoinKeys(req),
+        ) orelse return error.UnsupportedQueryRequest;
+        return switch (selection.selected) {
+            .lookup, .hash => try joinRelationalRowsFromSourceRowsHashAlloc(alloc, req, left_rows, right_rows),
+            .merge => try joinRelationalRowsFromSourceRowsMergeAlloc(alloc, req, left_rows, right_rows),
+            .auto => unreachable,
+        };
+    }
+
+    fn joinRelationalRowsFromSourceRowsHashAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsJoinRequest,
+        left_rows: []const []const u8,
+        right_rows: []const []const u8,
+    ) !types.RelationalRowsJoinResult {
         var right_index = std.StringArrayHashMapUnmanaged(RelationalRowsJoinRightList).empty;
         defer deinitRelationalRowsJoinRightIndex(alloc, &right_index);
         for (right_rows, 0..) |right_row, right_index_id| {
@@ -22538,12 +22557,192 @@ pub const DB = struct {
             }
         }
 
-        try sortRelationalRowsOutputRowsAlloc(alloc, joined.items, req.order_by);
+        return try relationalRowsFinalizeJoinResultAlloc(alloc, &joined, req.order_by, req.limit, req.offset);
+    }
+
+    fn joinRelationalRowsFromSourceRowsMergeAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsJoinRequest,
+        left_rows: []const []const u8,
+        right_rows: []const []const u8,
+    ) !types.RelationalRowsJoinResult {
+        var joined = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (joined.items) |row| alloc.free(@constCast(row));
+            joined.deinit(alloc);
+        }
+
+        var left_index: usize = 0;
+        var right_index: usize = 0;
+        while (left_index < left_rows.len) {
+            var left_key = try relationalRowsJoinOrderKeysForRowAlloc(alloc, left_rows[left_index], req.on, .left);
+            defer left_key.deinit(alloc);
+            if (left_key.keys.len == 0) {
+                try appendRelationalRowsLeftJoinUnmatchedIfNeededAlloc(alloc, &joined, req, left_rows[left_index]);
+                left_index += 1;
+                continue;
+            }
+
+            const left_group_start = left_index;
+            var left_group_end = left_index + 1;
+            while (left_group_end < left_rows.len) : (left_group_end += 1) {
+                var next_left_key = try relationalRowsJoinOrderKeysForRowAlloc(alloc, left_rows[left_group_end], req.on, .left);
+                defer next_left_key.deinit(alloc);
+                if (next_left_key.keys.len == 0) break;
+                if (compareRelationalRowsJoinOrderKeys(left_key.keys, next_left_key.keys) != .eq) break;
+            }
+
+            while (right_index < right_rows.len) {
+                var right_key = try relationalRowsJoinOrderKeysForRowAlloc(alloc, right_rows[right_index], req.on, .right);
+                defer right_key.deinit(alloc);
+                if (right_key.keys.len == 0) {
+                    right_index += 1;
+                    continue;
+                }
+                const comparison = compareRelationalRowsJoinOrderKeys(right_key.keys, left_key.keys);
+                if (comparison == .lt) {
+                    right_index += 1;
+                    continue;
+                }
+                break;
+            }
+
+            const right_group_start = right_index;
+            var right_group_end = right_index;
+            var has_equal_right_group = false;
+            if (right_index < right_rows.len) {
+                var right_key = try relationalRowsJoinOrderKeysForRowAlloc(alloc, right_rows[right_index], req.on, .right);
+                defer right_key.deinit(alloc);
+                if (right_key.keys.len != 0 and compareRelationalRowsJoinOrderKeys(right_key.keys, left_key.keys) == .eq) {
+                    has_equal_right_group = true;
+                    right_group_end = right_index + 1;
+                    while (right_group_end < right_rows.len) : (right_group_end += 1) {
+                        var next_right_key = try relationalRowsJoinOrderKeysForRowAlloc(alloc, right_rows[right_group_end], req.on, .right);
+                        defer next_right_key.deinit(alloc);
+                        if (next_right_key.keys.len == 0) break;
+                        if (compareRelationalRowsJoinOrderKeys(right_key.keys, next_right_key.keys) != .eq) break;
+                    }
+                }
+            }
+
+            if (has_equal_right_group) {
+                for (left_rows[left_group_start..left_group_end]) |left_row| {
+                    var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_row, .{}) catch return error.InvalidQueryRequest;
+                    defer parsed_left.deinit();
+                    if (parsed_left.value != .object) return error.InvalidQueryRequest;
+
+                    var on_matched = false;
+                    for (right_rows[right_group_start..right_group_end]) |right_row| {
+                        if (!(try relationalRowsJoinOnExpressionPredicatesPass(alloc, parsed_left.value, right_row, req))) continue;
+                        on_matched = true;
+                        if (!(try relationalRowsJoinMatchPredicatesPass(alloc, parsed_left.value, right_row, req))) continue;
+                        try appendRelationalRowsJoinedRowAlloc(alloc, &joined, left_row, right_row, req.select);
+                    }
+                    if (!on_matched and req.join_type == .left and !relationalRowsJoinHasMatchPredicates(req)) {
+                        try appendRelationalRowsJoinedRowAlloc(alloc, &joined, left_row, null, req.select);
+                    }
+                }
+                right_index = right_group_end;
+            } else {
+                for (left_rows[left_group_start..left_group_end]) |left_row| {
+                    try appendRelationalRowsLeftJoinUnmatchedIfNeededAlloc(alloc, &joined, req, left_row);
+                }
+            }
+
+            left_index = left_group_end;
+        }
+
+        return try relationalRowsFinalizeJoinResultAlloc(alloc, &joined, req.order_by, req.limit, req.offset);
+    }
+
+    const RelationalRowsJoinOrderKeySet = struct {
+        keys: []RelationalRowsQueryOrderKey = &.{},
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            freeRelationalRowsQueryOrderKeySlice(alloc, self.keys);
+            self.* = undefined;
+        }
+    };
+
+    fn relationalRowsJoinOrderKeysForRowAlloc(
+        alloc: Allocator,
+        row_json: []const u8,
+        predicates: []const types.RelationalRowsJoinOn,
+        side: RelationalRowsJoinSide,
+    ) !RelationalRowsJoinOrderKeySet {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        const keys = try alloc.alloc(RelationalRowsQueryOrderKey, predicates.len);
+        var initialized: usize = 0;
+        errdefer {
+            freeRelationalRowsQueryOrderKeys(alloc, keys[0..initialized]);
+            alloc.free(keys);
+        }
+        for (predicates) |predicate| {
+            const field = switch (side) {
+                .left => predicate.left_field,
+                .right => predicate.right_field,
+            };
+            keys[initialized] = try relationalRowsQueryOrderKeyAlloc(alloc, parsed.value, .{ .field = field });
+            if (keys[initialized] == .missing or keys[initialized] == .null) {
+                freeRelationalRowsQueryOrderKeys(alloc, keys[0 .. initialized + 1]);
+                alloc.free(keys);
+                return .{};
+            }
+            initialized += 1;
+        }
+        return .{ .keys = keys };
+    }
+
+    fn compareRelationalRowsJoinOrderKeys(
+        lhs: []const RelationalRowsQueryOrderKey,
+        rhs: []const RelationalRowsQueryOrderKey,
+    ) RelationalRowsScalarComparison {
+        for (lhs, rhs) |left, right| {
+            const comparison = compareRelationalRowsQueryOrderKeys(left, right);
+            if (comparison != .eq) return comparison;
+        }
+        return .eq;
+    }
+
+    fn appendRelationalRowsLeftJoinUnmatchedIfNeededAlloc(
+        alloc: Allocator,
+        joined: *std.ArrayListUnmanaged([]const u8),
+        req: types.RelationalRowsJoinRequest,
+        left_row: []const u8,
+    ) !void {
+        if (req.join_type != .left or relationalRowsJoinHasMatchPredicates(req)) return;
+        try appendRelationalRowsJoinedRowAlloc(alloc, joined, left_row, null, req.select);
+    }
+
+    fn appendRelationalRowsJoinedRowAlloc(
+        alloc: Allocator,
+        joined: *std.ArrayListUnmanaged([]const u8),
+        left_row: []const u8,
+        right_row: ?[]const u8,
+        select: []const types.RelationalRowsJoinProjection,
+    ) !void {
+        const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, right_row, select);
+        var row_transferred = false;
+        errdefer if (!row_transferred) alloc.free(row_json);
+        try joined.append(alloc, row_json);
+        row_transferred = true;
+    }
+
+    fn relationalRowsFinalizeJoinResultAlloc(
+        alloc: Allocator,
+        joined: *std.ArrayListUnmanaged([]const u8),
+        order_by: []const types.RelationalRowsQueryOrder,
+        limit: ?u32,
+        offset: u32,
+    ) !types.RelationalRowsJoinResult {
+        try sortRelationalRowsOutputRowsAlloc(alloc, joined.items, order_by);
 
         const total_rows: u32 = @intCast(joined.items.len);
-        const start = @min(@as(usize, req.offset), joined.items.len);
-        const limited_len: usize = if (req.limit) |limit|
-            @min(@as(usize, limit), joined.items.len - start)
+        const start = @min(@as(usize, offset), joined.items.len);
+        const limited_len: usize = if (limit) |limit_value|
+            @min(@as(usize, limit_value), joined.items.len - start)
         else
             joined.items.len - start;
         if (start > 0 or limited_len < joined.items.len) {
