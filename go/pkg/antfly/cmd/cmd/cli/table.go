@@ -255,6 +255,9 @@ List available backups:
 					}
 					return writeJSON(map[string]any{"backups": items})
 				}
+				if format != outputTable {
+					return fmt.Errorf("backup --list supports output formats table and json, got %q", formatStr)
+				}
 				if err := antflyClient.ListBackups(cmd.Context(), location); err != nil {
 					return fmt.Errorf("list backups failed: %w", err)
 				}

@@ -121,3 +121,17 @@ func TestBackupListJSONWritesStdout(t *testing.T) {
 		t.Fatalf("stdout did not contain backup JSON: %s", out.String())
 	}
 }
+
+func TestBackupListRejectsJSONL(t *testing.T) {
+	cmd := newBackupCmd()
+	cmd.PreRunE = nil
+	cmd.SetArgs([]string{"--list", "--location", "s3://bucket/backups", "-o", "jsonl"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("backup --list -o jsonl succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "supports output formats table and json") {
+		t.Fatalf("backup --list -o jsonl error = %q", err)
+	}
+}
