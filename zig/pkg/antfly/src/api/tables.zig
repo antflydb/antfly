@@ -1253,7 +1253,8 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
     var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
-    if (try relationalSqlDdlPlanTableRefAlloc(alloc, plan)) |*table_ref| {
+    if (try relationalSqlDdlPlanTableRefAlloc(alloc, plan)) |table_ref_value| {
+        var table_ref = table_ref_value;
         defer table_ref.deinit(alloc);
         if (!tableCatalogIdentityMatches(table.*, table_ref.database_name, table_ref.namespace_name, table_ref.table_name)) return error.InvalidSchemaUpdateRequest;
         try retargetRelationalSqlDdlPlanTableNameAlloc(alloc, &plan, table.name);
@@ -4470,8 +4471,16 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     defer qualified_created.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("users", qualified_created.table.name);
     try std.testing.expectEqualStrings("analytics", qualified_created.table.namespace_name);
-    try std.testing.expect(std.mem.indexOf(u8, qualified_created.table.schema_json, "\"users_pkey\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, qualified_created.table.schema_json, "\"analytics.users_pkey\"") == null);
+
+    var qualified_dropped_pk = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &qualified_created.table,
+        "ALTER TABLE analytics.users DROP CONSTRAINT users_pkey;",
+    );
+    defer qualified_dropped_pk.deinit(std.testing.allocator);
+    try std.testing.expect(qualified_dropped_pk.requires_rebuild);
+    try std.testing.expect(qualified_dropped_pk.rewrite_required);
 
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
