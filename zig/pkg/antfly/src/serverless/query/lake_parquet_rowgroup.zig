@@ -24,7 +24,9 @@ const parquet_metadata = @import("lake_parquet_metadata.zig");
 const parquet_page = @import("lake_parquet_page.zig");
 const lake_rows = @import("lake_rows.zig");
 const lake_scan_plan = @import("lake_scan_plan.zig");
+const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
 const range_io = @import("lake_range_io.zig");
+const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -400,6 +402,10 @@ pub const ObjectRangeRowsQueryRequest = struct {
     predicate: ?lake_rows.Predicate = null,
     limit: ?usize = null,
     coalesce_options: range_io.CoalesceOptions = .{},
+    sidecars: []const sidecar_manifest.DeclaredArtifact = &.{},
+    desired_sidecars: []const lake_sidecar_selection.DesiredSidecar = &.{},
+    sidecar_policy: lake_sidecar_selection.Policy = .{},
+    candidates: []const lake_rows.SidecarCandidateSet = &.{},
 };
 
 pub const OwnedBatch = struct {
@@ -1238,11 +1244,15 @@ pub fn querySupportedI64ObjectRangeRowsAlloc(
     alloc: Allocator,
     request: ObjectRangeRowsQueryRequest,
 ) !lake_rows.ScanResult {
-    if (request.binding) |binding| {
+    const maybe_binding = request.binding;
+    if (maybe_binding) |binding| {
         try lake_scan_plan.validateBindingInventory(binding, request.inventory);
     } else {
         try request.inventory.validate();
         if (request.inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+        if (request.sidecars.len != 0 or request.desired_sidecars.len != 0 or request.candidates.len != 0) {
+            return error.InvalidLakeSidecarSelection;
+        }
     }
 
     const scan_columns = try rowsQueryScanColumnsAlloc(alloc, request.projected_columns, request.predicate);
@@ -1275,11 +1285,29 @@ pub fn querySupportedI64ObjectRangeRowsAlloc(
         );
     defer source.deinit(alloc);
 
-    return try lake_rows.scanRowsAlloc(alloc, source.rowSource(), .{
+    const scan_request: lake_rows.ScanRequest = .{
         .projected_columns = request.projected_columns,
         .predicate = request.predicate,
         .limit = request.limit,
-    });
+    };
+    if (maybe_binding) |binding| {
+        const base_source = try binding.toManifestBaseSource(request.inventory.snapshot_id, null);
+        var sidecar_result = try lake_rows.scanRowsWithAutomaticSidecarsAlloc(alloc, source.rowSource(), .{
+            .scan = scan_request,
+            .base_source = base_source,
+            .sidecars = request.sidecars,
+            .desired_sidecars = request.desired_sidecars,
+            .sidecar_policy = request.sidecar_policy,
+            .candidates = request.candidates,
+        });
+        errdefer sidecar_result.deinit(alloc);
+        return .{
+            .rows = sidecar_result.rows,
+            .total = sidecar_result.total,
+        };
+    }
+
+    return try lake_rows.scanRowsAlloc(alloc, source.rowSource(), scan_request);
 }
 
 fn rowsQueryScanColumnsAlloc(
