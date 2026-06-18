@@ -8391,15 +8391,16 @@ pub fn buildBulkHilbertSeeded(
         }
     }.lessThan);
 
+    const leaf_groups = try bulk_build.planBalancedGroupSizes(self.alloc, entries.len, @max(@as(usize, 1), self.config.leaf_size));
+    defer self.alloc.free(leaf_groups);
+
     var current_count: usize = 0;
-    var current = try self.alloc.alloc(BuiltBulkNode, entries.len);
+    var current = try self.alloc.alloc(BuiltBulkNode, leaf_groups.len);
     defer {
         for (current[0..current_count]) |*node| node.deinit(self.alloc);
         self.alloc.free(current);
     }
 
-    const leaf_groups = try bulk_build.planBalancedGroupSizes(self.alloc, entries.len, @max(@as(usize, 1), self.config.leaf_size));
-    defer self.alloc.free(leaf_groups);
     const group_inputs_scratch = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, @max(@as(usize, 1), self.config.leaf_size));
     defer self.alloc.free(group_inputs_scratch);
 
@@ -8517,15 +8518,16 @@ pub fn buildBulkDocKeySeeded(
         }
     }.lessThan);
 
+    const leaf_groups = try bulk_build.planBalancedGroupSizes(self.alloc, entries.len, @max(@as(usize, 1), self.config.leaf_size));
+    defer self.alloc.free(leaf_groups);
+
     var current_count: usize = 0;
-    var current = try self.alloc.alloc(BuiltBulkNode, entries.len);
+    var current = try self.alloc.alloc(BuiltBulkNode, leaf_groups.len);
     defer {
         for (current[0..current_count]) |*node| node.deinit(self.alloc);
         self.alloc.free(current);
     }
 
-    const leaf_groups = try bulk_build.planBalancedGroupSizes(self.alloc, entries.len, @max(@as(usize, 1), self.config.leaf_size));
-    defer self.alloc.free(leaf_groups);
     const group_inputs_scratch = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, @max(@as(usize, 1), self.config.leaf_size));
     defer self.alloc.free(group_inputs_scratch);
 
