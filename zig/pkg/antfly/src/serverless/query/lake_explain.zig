@@ -24,6 +24,8 @@ const base_source = @import("../manifest/base_source.zig");
 const lake_promotion = @import("../build/lake_promotion.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const lake_cache = @import("lake_cache.zig");
+const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
+const lake_range_io = @import("lake_range_io.zig");
 const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
 
 pub const Operation = enum {
@@ -49,6 +51,7 @@ pub const Request = struct {
     operation: Operation,
     projected_column_count: u16 = 0,
     cache_budget: lake_cache.Budget = .{},
+    range_cache_stats: ?lake_parquet_rowgroup.ObjectRangeCacheStats = null,
     observation: ?lake_promotion.Observation = null,
     thresholds: lake_promotion.Thresholds = .{},
 };
@@ -69,6 +72,42 @@ pub const SidecarSelectionAccounting = struct {
     not_requested_count: u32 = 0,
 };
 
+pub const RangeCacheLaneAccounting = struct {
+    hits: usize = 0,
+    misses: usize = 0,
+    stored_bytes: usize = 0,
+    evicted_bytes: usize = 0,
+    rejected_bytes: usize = 0,
+
+    pub fn hadActivity(self: RangeCacheLaneAccounting) bool {
+        return self.hits != 0 or
+            self.misses != 0 or
+            self.stored_bytes != 0 or
+            self.evicted_bytes != 0 or
+            self.rejected_bytes != 0;
+    }
+};
+
+pub const RangeCacheAccounting = struct {
+    total: RangeCacheLaneAccounting = .{},
+    metadata: RangeCacheLaneAccounting = .{},
+    compressed_range: RangeCacheLaneAccounting = .{},
+    decoded_column: RangeCacheLaneAccounting = .{},
+    projected_batch: RangeCacheLaneAccounting = .{},
+    serving_sidecar: RangeCacheLaneAccounting = .{},
+    broad_scan_scratch: RangeCacheLaneAccounting = .{},
+
+    pub fn anyRejected(self: RangeCacheAccounting) bool {
+        return self.total.rejected_bytes != 0 or
+            self.metadata.rejected_bytes != 0 or
+            self.compressed_range.rejected_bytes != 0 or
+            self.decoded_column.rejected_bytes != 0 or
+            self.projected_batch.rejected_bytes != 0 or
+            self.serving_sidecar.rejected_bytes != 0 or
+            self.broad_scan_scratch.rejected_bytes != 0;
+    }
+};
+
 pub const Plan = struct {
     operation: Operation,
     source_kind: base_source.BaseSourceKind,
@@ -78,6 +117,7 @@ pub const Plan = struct {
     cache_class: CacheClass,
     accounting: ArtifactAccounting,
     cache_accounting: lake_cache.Accounting = .{},
+    range_cache_accounting: RangeCacheAccounting = .{},
     sidecar_selection: SidecarSelectionAccounting = .{},
     recommendation: lake_promotion.Recommendation = .{ .kind = .none },
 };
@@ -108,6 +148,7 @@ pub fn explain(request: Request) !Plan {
         .cache_class = chooseCacheClass(request.operation, request.base_source, accounting),
         .accounting = accounting,
         .cache_accounting = cache_accounting,
+        .range_cache_accounting = summarizeRangeCache(request.range_cache_stats),
         .sidecar_selection = sidecar_selection,
         .recommendation = if (request.observation) |observation|
             lake_promotion.recommend(observation, request.thresholds)
@@ -230,6 +271,35 @@ fn sourceInfo(descriptor: base_source.BaseSourceDescriptor) SourceInfo {
             .snapshot_id = source.snapshot_id,
             .schema_fingerprint = source.schema_fingerprint,
         },
+    };
+}
+
+fn summarizeRangeCache(stats: ?lake_parquet_rowgroup.ObjectRangeCacheStats) RangeCacheAccounting {
+    const snapshot = stats orelse return .{};
+    return .{
+        .total = rangeLaneAccounting(.{
+            .hits = snapshot.hits,
+            .misses = snapshot.misses,
+            .stored_bytes = snapshot.stored_bytes,
+            .evicted_bytes = snapshot.evicted_bytes,
+            .rejected_bytes = snapshot.rejected_bytes,
+        }),
+        .metadata = rangeLaneAccounting(snapshot.lane(.metadata)),
+        .compressed_range = rangeLaneAccounting(snapshot.lane(.compressed_range)),
+        .decoded_column = rangeLaneAccounting(snapshot.lane(.decoded_column)),
+        .projected_batch = rangeLaneAccounting(snapshot.lane(.projected_batch)),
+        .serving_sidecar = rangeLaneAccounting(snapshot.lane(.serving_sidecar)),
+        .broad_scan_scratch = rangeLaneAccounting(snapshot.lane(.broad_scan_scratch)),
+    };
+}
+
+fn rangeLaneAccounting(stats: lake_parquet_rowgroup.ObjectRangeCacheLaneStats) RangeCacheLaneAccounting {
+    return .{
+        .hits = stats.hits,
+        .misses = stats.misses,
+        .stored_bytes = stats.stored_bytes,
+        .evicted_bytes = stats.evicted_bytes,
+        .rejected_bytes = stats.rejected_bytes,
     };
 }
 
@@ -456,4 +526,58 @@ test "lake explain reports sidecar selection fallback" {
     try std.testing.expectEqual(@as(u32, 0), plan.sidecar_selection.selected_count);
     try std.testing.expectEqual(@as(u32, 1), plan.sidecar_selection.stale_ignored_count);
     try std.testing.expectEqual(@as(u32, 1), plan.sidecar_selection.not_requested_count);
+}
+
+test "lake explain reports object range cache lane accounting" {
+    const descriptor = base_source.BaseSourceDescriptor{ .external_parquet = .{
+        .format = .parquet_prefix,
+        .source_uri = "s3://bucket/events",
+        .snapshot_id = "parquet-3",
+        .schema_fingerprint = "schema-v3",
+        .file_inventory_artifact = "files-3",
+    } };
+    const artifacts = [_]artifact_ref.ArtifactRef{
+        .{ .kind = .external_base_source, .artifact_id = "files-3", .byte_len = 2048, .checksum = "len:2048" },
+    };
+    var stats = lake_parquet_rowgroup.ObjectRangeCacheStats{
+        .hits = 4,
+        .misses = 7,
+        .stored_bytes = 2048,
+        .evicted_bytes = 128,
+        .rejected_bytes = 64,
+    };
+    stats.lanes[@intFromEnum(lake_range_io.CacheLane.metadata)] = .{
+        .hits = 2,
+        .misses = 1,
+        .stored_bytes = 512,
+    };
+    stats.lanes[@intFromEnum(lake_range_io.CacheLane.compressed_range)] = .{
+        .misses = 5,
+        .stored_bytes = 1024,
+        .evicted_bytes = 128,
+    };
+    stats.lanes[@intFromEnum(lake_range_io.CacheLane.serving_sidecar)] = .{
+        .hits = 2,
+        .stored_bytes = 512,
+    };
+    stats.lanes[@intFromEnum(lake_range_io.CacheLane.broad_scan_scratch)] = .{
+        .misses = 1,
+        .rejected_bytes = 64,
+    };
+
+    const plan = try explain(.{
+        .base_source = descriptor,
+        .artifacts = &artifacts,
+        .operation = .scan,
+        .range_cache_stats = stats,
+    });
+
+    try std.testing.expectEqual(@as(usize, 4), plan.range_cache_accounting.total.hits);
+    try std.testing.expectEqual(@as(usize, 7), plan.range_cache_accounting.total.misses);
+    try std.testing.expectEqual(@as(usize, 2048), plan.range_cache_accounting.total.stored_bytes);
+    try std.testing.expectEqual(@as(usize, 512), plan.range_cache_accounting.metadata.stored_bytes);
+    try std.testing.expectEqual(@as(usize, 128), plan.range_cache_accounting.compressed_range.evicted_bytes);
+    try std.testing.expect(plan.range_cache_accounting.serving_sidecar.hadActivity());
+    try std.testing.expect(plan.range_cache_accounting.anyRejected());
+    try std.testing.expectEqual(@as(usize, 64), plan.range_cache_accounting.broad_scan_scratch.rejected_bytes);
 }
