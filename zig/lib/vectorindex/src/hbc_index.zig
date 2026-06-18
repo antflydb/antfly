@@ -33,6 +33,7 @@ const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_search_probe_stack_capacity = 128;
+const bulk_parent_child_ids_stack_capacity = 256;
 
 fn debugHitFromApprox(item: search_results.ApproxSearchResult) search_types.DebugHit {
     return .{
@@ -8432,8 +8433,13 @@ pub fn buildBulkHilbertSeeded(
         var child_cursor: usize = 0;
         for (branch_groups) |group_size| {
             const node_id = self.nextNodeId();
-            var child_ids = try self.alloc.alloc(u64, group_size);
-            errdefer self.alloc.free(child_ids);
+            var child_ids_stack: [bulk_parent_child_ids_stack_capacity]u64 = undefined;
+            const use_child_ids_stack = group_size <= child_ids_stack.len;
+            var child_ids = if (use_child_ids_stack)
+                child_ids_stack[0..group_size]
+            else
+                try self.alloc.alloc(u64, group_size);
+            errdefer if (!use_child_ids_stack) self.alloc.free(child_ids);
 
             const centroid = try self.alloc.alloc(f32, self.config.dims);
             errdefer self.alloc.free(centroid);
@@ -8470,7 +8476,7 @@ pub fn buildBulkHilbertSeeded(
             };
             try self.saveNodeBody(txn, &node);
             try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
-            self.alloc.free(child_ids);
+            if (!use_child_ids_stack) self.alloc.free(child_ids);
 
             next[next_count] = .{
                 .node_id = node_id,
@@ -9468,8 +9474,13 @@ fn buildBulkParentLevels(
         var child_cursor: usize = 0;
         for (branch_groups) |group_size| {
             const node_id = self.nextNodeId();
-            var child_ids = try self.alloc.alloc(u64, group_size);
-            errdefer self.alloc.free(child_ids);
+            var child_ids_stack: [bulk_parent_child_ids_stack_capacity]u64 = undefined;
+            const use_child_ids_stack = group_size <= child_ids_stack.len;
+            var child_ids = if (use_child_ids_stack)
+                child_ids_stack[0..group_size]
+            else
+                try self.alloc.alloc(u64, group_size);
+            errdefer if (!use_child_ids_stack) self.alloc.free(child_ids);
 
             const centroid = try self.alloc.alloc(f32, self.config.dims);
             errdefer self.alloc.free(centroid);
@@ -9506,7 +9517,7 @@ fn buildBulkParentLevels(
             };
             try self.saveNodeBody(txn, &node);
             try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
-            self.alloc.free(child_ids);
+            if (!use_child_ids_stack) self.alloc.free(child_ids);
 
             next[next_count] = .{
                 .node_id = node_id,
@@ -9709,8 +9720,13 @@ fn buildBulkParentFromNodeSelection(
 ) !BuiltBulkNode {
     const node_id = self.nextNodeId();
     const child_count = if (indexes) |selected| selected.len else nodes.len;
-    var child_ids = try self.alloc.alloc(u64, child_count);
-    errdefer self.alloc.free(child_ids);
+    var child_ids_stack: [bulk_parent_child_ids_stack_capacity]u64 = undefined;
+    const use_child_ids_stack = child_count <= child_ids_stack.len;
+    var child_ids = if (use_child_ids_stack)
+        child_ids_stack[0..child_count]
+    else
+        try self.alloc.alloc(u64, child_count);
+    errdefer if (!use_child_ids_stack) self.alloc.free(child_ids);
 
     const centroid = try self.alloc.alloc(f32, self.config.dims);
     errdefer self.alloc.free(centroid);
@@ -9749,7 +9765,7 @@ fn buildBulkParentFromNodeSelection(
     };
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
-    self.alloc.free(child_ids);
+    if (!use_child_ids_stack) self.alloc.free(child_ids);
 
     return .{
         .node_id = node_id,
