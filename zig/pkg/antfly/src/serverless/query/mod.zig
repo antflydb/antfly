@@ -82,6 +82,8 @@ pub const LakeRangeCoalesceOptions = lake_range_io.CoalesceOptions;
 pub const accountLakeCacheArtifacts = lake_cache.accountArtifacts;
 pub const classifyLakeCacheArtifact = lake_cache.classifyArtifact;
 pub const planLakeParquetFooterRead = lake_range_io.planParquetFooterRead;
+pub const lakeObjectRefForExternalFile = lake_range_io.objectRefForExternalFile;
+pub const planLakeColumnChunkRead = lake_range_io.planColumnChunkRead;
 pub const coalesceLakePhysicalReadsAlloc = lake_range_io.coalescePhysicalReadsAlloc;
 pub const executeLakeRowsGroupByAlloc = lake_rows.executeGroupByAlloc;
 pub const hydrateLakeRowsAlloc = lake_rows.hydrateRowsAlloc;
@@ -169,6 +171,8 @@ test "serverless query module compiles" {
     _ = accountLakeCacheArtifacts;
     _ = classifyLakeCacheArtifact;
     _ = planLakeParquetFooterRead;
+    _ = lakeObjectRefForExternalFile;
+    _ = planLakeColumnChunkRead;
     _ = coalesceLakePhysicalReadsAlloc;
     _ = executeLakeRowsGroupByAlloc;
     _ = hydrateLakeRowsAlloc;

@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("types.zig");
 
 const magic = "AFXS";
-const version: u32 = 1;
+const version: u32 = 2;
 
 pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8 {
     try inventory.validate();
@@ -37,12 +37,25 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
     for (inventory.files) |file| {
         try appendBytes(alloc, &out, file.file_id);
         try appendBytes(alloc, &out, file.object_uri);
+        try appendBytes(alloc, &out, file.etag);
+        try appendBytes(alloc, &out, file.version_id);
         try appendU64(alloc, &out, file.byte_len);
         try appendU64(alloc, &out, file.row_count);
         try appendU32(alloc, &out, @intCast(file.row_groups.len));
         for (file.row_groups) |row_group| {
             try appendU32(alloc, &out, row_group.ordinal);
             try appendU64(alloc, &out, row_group.row_count);
+            try appendU64(alloc, &out, row_group.file_offset);
+            try appendU64(alloc, &out, row_group.total_byte_len);
+            try appendU32(alloc, &out, @intCast(row_group.column_chunks.len));
+            for (row_group.column_chunks) |chunk| {
+                try appendBytes(alloc, &out, chunk.column_id);
+                try appendU64(alloc, &out, chunk.file_offset);
+                try appendU64(alloc, &out, chunk.compressed_len);
+                try appendU64(alloc, &out, chunk.uncompressed_len);
+                try appendBytes(alloc, &out, chunk.compression_codec);
+                try appendBytes(alloc, &out, chunk.encoding);
+            }
         }
     }
 
@@ -83,20 +96,69 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
         errdefer if (!keep_file) alloc.free(file_id);
         const object_uri = try readBytesAlloc(alloc, bytes, &cursor);
         errdefer if (!keep_file) alloc.free(object_uri);
+        const etag = try readBytesAlloc(alloc, bytes, &cursor);
+        errdefer if (!keep_file and etag.len > 0) alloc.free(etag);
+        const version_id = try readBytesAlloc(alloc, bytes, &cursor);
+        errdefer if (!keep_file and version_id.len > 0) alloc.free(version_id);
         const byte_len = try readU64(bytes, &cursor);
         const row_count = try readU64(bytes, &cursor);
         const row_group_count = try readU32(bytes, &cursor);
         const row_groups = try alloc.alloc(external_source.RowGroup, row_group_count);
-        errdefer if (!keep_file) alloc.free(row_groups);
+        var initialized_row_groups: usize = 0;
+        errdefer if (!keep_file) {
+            for (row_groups[0..initialized_row_groups]) |*row_group| row_group.deinit(alloc);
+            alloc.free(row_groups);
+        };
         for (row_groups) |*row_group| {
-            row_group.* = .{
-                .ordinal = try readU32(bytes, &cursor),
-                .row_count = try readU64(bytes, &cursor),
+            var keep_row_group = false;
+            const ordinal = try readU32(bytes, &cursor);
+            const row_group_rows = try readU64(bytes, &cursor);
+            const file_offset = try readU64(bytes, &cursor);
+            const total_byte_len = try readU64(bytes, &cursor);
+            const column_chunk_count = try readU32(bytes, &cursor);
+            const column_chunks = try alloc.alloc(external_source.ColumnChunk, column_chunk_count);
+            var initialized_chunks: usize = 0;
+            errdefer if (!keep_row_group) {
+                for (column_chunks[0..initialized_chunks]) |*chunk| chunk.deinit(alloc);
+                alloc.free(column_chunks);
             };
+            for (column_chunks) |*chunk| {
+                var keep_chunk = false;
+                const column_id = try readBytesAlloc(alloc, bytes, &cursor);
+                errdefer if (!keep_chunk) alloc.free(column_id);
+                const chunk_file_offset = try readU64(bytes, &cursor);
+                const compressed_len = try readU64(bytes, &cursor);
+                const uncompressed_len = try readU64(bytes, &cursor);
+                const compression_codec = try readBytesAlloc(alloc, bytes, &cursor);
+                errdefer if (!keep_chunk and compression_codec.len > 0) alloc.free(compression_codec);
+                const encoding = try readBytesAlloc(alloc, bytes, &cursor);
+                errdefer if (!keep_chunk and encoding.len > 0) alloc.free(encoding);
+                chunk.* = .{
+                    .column_id = column_id,
+                    .file_offset = chunk_file_offset,
+                    .compressed_len = compressed_len,
+                    .uncompressed_len = uncompressed_len,
+                    .compression_codec = compression_codec,
+                    .encoding = encoding,
+                };
+                keep_chunk = true;
+                initialized_chunks += 1;
+            }
+            row_group.* = .{
+                .ordinal = ordinal,
+                .row_count = row_group_rows,
+                .file_offset = file_offset,
+                .total_byte_len = total_byte_len,
+                .column_chunks = column_chunks,
+            };
+            keep_row_group = true;
+            initialized_row_groups += 1;
         }
         file.* = .{
             .file_id = file_id,
             .object_uri = object_uri,
+            .etag = etag,
+            .version_id = version_id,
             .byte_len = byte_len,
             .row_count = row_count,
             .row_groups = row_groups,
@@ -182,10 +244,25 @@ test "external source inventory codec round-trips file inventory" {
     inventory.files[0] = .{
         .file_id = try alloc.dupe(u8, "file-a.parquet"),
         .object_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events/file-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-file-a"),
+        .version_id = try alloc.dupe(u8, "version-file-a"),
         .byte_len = 1024,
         .row_count = 2,
         .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
-            .{ .ordinal = 0, .row_count = 2 },
+            .{
+                .ordinal = 0,
+                .row_count = 2,
+                .file_offset = 4,
+                .total_byte_len = 512,
+                .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 128,
+                    .compressed_len = 64,
+                    .uncompressed_len = 256,
+                    .compression_codec = try alloc.dupe(u8, "zstd"),
+                    .encoding = try alloc.dupe(u8, "plain"),
+                }}),
+            },
         }),
     };
 
@@ -199,5 +276,12 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqualStrings("iceberg-123", decoded.snapshot_id);
     try std.testing.expectEqual(@as(usize, 1), decoded.files.len);
     try std.testing.expectEqualStrings("file-a.parquet", decoded.files[0].file_id);
+    try std.testing.expectEqualStrings("etag-file-a", decoded.files[0].etag);
+    try std.testing.expectEqualStrings("version-file-a", decoded.files[0].version_id);
     try std.testing.expectEqual(@as(u64, 2), decoded.files[0].row_groups[0].row_count);
+    try std.testing.expectEqual(@as(u64, 512), decoded.files[0].row_groups[0].total_byte_len);
+    try std.testing.expectEqual(@as(usize, 1), decoded.files[0].row_groups[0].column_chunks.len);
+    try std.testing.expectEqualStrings("amount", decoded.files[0].row_groups[0].column_chunks[0].column_id);
+    try std.testing.expectEqual(@as(u64, 128), decoded.files[0].row_groups[0].column_chunks[0].file_offset);
+    try std.testing.expectEqualStrings("zstd", decoded.files[0].row_groups[0].column_chunks[0].compression_codec);
 }

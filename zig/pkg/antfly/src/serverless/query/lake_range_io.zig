@@ -20,6 +20,7 @@
 //! broad scans from evicting serving-critical sidecars.
 
 const std = @import("std");
+const external_source = @import("../external_source/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const CacheLane = enum {
@@ -147,6 +148,36 @@ pub fn planParquetFooterRead(object: ObjectRef, max_probe_bytes: u64) !RangeRead
         .range = .{ .offset = object.byte_len - read_len, .len = read_len },
         .purpose = .parquet_footer,
     };
+}
+
+pub fn objectRefForExternalFile(
+    bucket: []const u8,
+    key: []const u8,
+    file: external_source.FileEntry,
+) !ObjectRef {
+    const object = ObjectRef{
+        .bucket = bucket,
+        .key = key,
+        .byte_len = file.byte_len,
+        .version = .{
+            .etag = file.etag,
+            .version_id = file.version_id,
+        },
+    };
+    try object.validate();
+    return object;
+}
+
+pub fn planColumnChunkRead(object: ObjectRef, chunk: external_source.ColumnChunk) !RangeRead {
+    const read = RangeRead{
+        .object = object,
+        .range = .{ .offset = chunk.file_offset, .len = chunk.compressed_len },
+        .purpose = .parquet_column_chunk,
+        .compression_codec = chunk.compression_codec,
+        .decoded_column_id = chunk.column_id,
+    };
+    try read.validate();
+    return read;
 }
 
 pub fn coalescePhysicalReadsAlloc(
@@ -303,4 +334,38 @@ test "lake range planner validates cache lanes and decoded column keys" {
         .purpose = .decoded_column_page,
     };
     try std.testing.expectError(error.InvalidLakeRangeRead, invalid.validate());
+}
+
+test "lake range planner creates column chunk reads from external inventory metadata" {
+    const alloc = std.testing.allocator;
+    var file = external_source.FileEntry{
+        .file_id = try alloc.dupe(u8, "file-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://warehouse/events/file-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-file-a"),
+        .byte_len = 4096,
+        .row_count = 2,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 2,
+            .file_offset = 4,
+            .total_byte_len = 512,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                .column_id = try alloc.dupe(u8, "amount"),
+                .file_offset = 128,
+                .compressed_len = 64,
+                .uncompressed_len = 256,
+                .compression_codec = try alloc.dupe(u8, "zstd"),
+                .encoding = try alloc.dupe(u8, "plain"),
+            }}),
+        }}),
+    };
+    defer file.deinit(alloc);
+
+    const object = try objectRefForExternalFile("warehouse", "events/file-a.parquet", file);
+    const read = try planColumnChunkRead(object, file.row_groups[0].column_chunks[0]);
+    try std.testing.expectEqual(@as(u64, 128), read.range.offset);
+    try std.testing.expectEqual(@as(u64, 64), read.range.len);
+    try std.testing.expectEqual(CacheLane.compressed_range, read.cacheLane());
+    try std.testing.expectEqualStrings("amount", read.decoded_column_id);
+    try std.testing.expectEqualStrings("zstd", read.compression_codec);
 }

@@ -81,6 +81,7 @@ test "external source inventory bridges to RowSource binding and row refs" {
     inventory.files[0] = .{
         .file_id = try alloc.dupe(u8, "file-a.parquet"),
         .object_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events/file-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-file-a"),
         .byte_len = 1024,
         .row_count = 2,
         .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{

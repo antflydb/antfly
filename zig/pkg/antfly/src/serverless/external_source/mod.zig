@@ -17,6 +17,7 @@ pub const codec = @import("codec.zig");
 pub const rowsource_bridge = @import("rowsource_bridge.zig");
 
 pub const Format = types.Format;
+pub const ColumnChunk = types.ColumnChunk;
 pub const RowGroup = types.RowGroup;
 pub const FileEntry = types.FileEntry;
 pub const Inventory = types.Inventory;
@@ -32,6 +33,7 @@ test "serverless external source module compiles" {
     _ = codec;
     _ = rowsource_bridge;
     _ = Format;
+    _ = ColumnChunk;
     _ = Inventory;
     _ = encodeInventoryAlloc;
     _ = decodeInventoryAlloc;

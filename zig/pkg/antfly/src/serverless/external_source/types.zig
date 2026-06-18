@@ -24,18 +24,62 @@ pub const Format = enum(u8) {
     lance = 3,
 };
 
+pub const ColumnChunk = struct {
+    column_id: []u8,
+    file_offset: u64,
+    compressed_len: u64,
+    uncompressed_len: u64 = 0,
+    compression_codec: []u8 = &.{},
+    encoding: []u8 = &.{},
+
+    pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
+        alloc.free(self.column_id);
+        if (self.compression_codec.len > 0) alloc.free(self.compression_codec);
+        if (self.encoding.len > 0) alloc.free(self.encoding);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: ColumnChunk, file_len: u64) !void {
+        if (self.column_id.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.compressed_len == 0) return error.InvalidExternalSourceInventory;
+        if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
+        if (self.compressed_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
+    }
+};
+
 pub const RowGroup = struct {
     ordinal: u32,
     row_count: u64,
+    file_offset: u64 = 0,
+    total_byte_len: u64 = 0,
+    column_chunks: []ColumnChunk = &.{},
 
-    pub fn validate(self: RowGroup) !void {
+    pub fn deinit(self: *RowGroup, alloc: Allocator) void {
+        for (self.column_chunks) |*chunk| chunk.deinit(alloc);
+        if (self.column_chunks.len > 0) alloc.free(self.column_chunks);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: RowGroup, file_len: u64) !void {
         if (self.row_count == 0) return error.InvalidExternalSourceInventory;
+        if (self.total_byte_len != 0) {
+            if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
+            if (self.total_byte_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
+        }
+        for (self.column_chunks, 0..) |chunk, idx| {
+            try chunk.validate(file_len);
+            for (self.column_chunks[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous.column_id, chunk.column_id)) return error.InvalidExternalSourceInventory;
+            }
+        }
     }
 };
 
 pub const FileEntry = struct {
     file_id: []u8,
     object_uri: []u8,
+    etag: []u8 = &.{},
+    version_id: []u8 = &.{},
     byte_len: u64,
     row_count: u64,
     row_groups: []RowGroup,
@@ -43,17 +87,21 @@ pub const FileEntry = struct {
     pub fn deinit(self: *FileEntry, alloc: Allocator) void {
         alloc.free(self.file_id);
         alloc.free(self.object_uri);
-        alloc.free(self.row_groups);
+        if (self.etag.len > 0) alloc.free(self.etag);
+        if (self.version_id.len > 0) alloc.free(self.version_id);
+        for (self.row_groups) |*row_group| row_group.deinit(alloc);
+        if (self.row_groups.len > 0) alloc.free(self.row_groups);
         self.* = undefined;
     }
 
     pub fn validate(self: FileEntry) !void {
         if (self.file_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.object_uri.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.etag.len == 0 and self.version_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.byte_len == 0) return error.InvalidExternalSourceInventory;
         var total_rows: u64 = 0;
         for (self.row_groups, 0..) |row_group, idx| {
-            try row_group.validate();
+            try row_group.validate(self.byte_len);
             if (row_group.ordinal != idx) return error.InvalidExternalSourceInventory;
             total_rows += row_group.row_count;
         }
@@ -118,11 +166,25 @@ test "external source inventory validates files and row groups" {
     inventory.files[0] = .{
         .file_id = try alloc.dupe(u8, "file-a.parquet"),
         .object_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events/file-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-file-a"),
         .byte_len = 1024,
         .row_count = 3,
         .row_groups = try alloc.dupe(RowGroup, &[_]RowGroup{
-            .{ .ordinal = 0, .row_count = 1 },
-            .{ .ordinal = 1, .row_count = 2 },
+            .{
+                .ordinal = 0,
+                .row_count = 1,
+                .file_offset = 4,
+                .total_byte_len = 100,
+                .column_chunks = try alloc.dupe(ColumnChunk, &[_]ColumnChunk{.{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 16,
+                    .compressed_len = 40,
+                    .uncompressed_len = 80,
+                    .compression_codec = try alloc.dupe(u8, "zstd"),
+                    .encoding = try alloc.dupe(u8, "plain"),
+                }}),
+            },
+            .{ .ordinal = 1, .row_count = 2, .file_offset = 104, .total_byte_len = 120 },
         }),
     };
 
