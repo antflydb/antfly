@@ -53,7 +53,7 @@ pub fn planProjectedScanAlloc(alloc: Allocator, request: Request) !Plan {
     errdefer logical.deinit(alloc);
 
     for (request.inventory.files) |file| {
-        const object = try objectRefForInventoryFile(file);
+        const object = try range_io.objectRefForExternalFileUri(file);
         if (request.include_footer_reads) {
             try logical.append(alloc, try range_io.planParquetFooterRead(object, request.footer_probe_bytes));
         }
@@ -101,35 +101,6 @@ fn projectIncludesColumn(projected_columns: []const []const u8, column_id: []con
         if (std.mem.eql(u8, projected, column_id)) return true;
     }
     return false;
-}
-
-fn objectRefForInventoryFile(file: external_source.FileEntry) !range_io.ObjectRef {
-    const location = try parseObjectUri(file.object_uri);
-    return try range_io.objectRefForExternalFile(location.bucket, location.key, file);
-}
-
-const ObjectLocation = struct {
-    bucket: []const u8,
-    key: []const u8,
-};
-
-fn parseObjectUri(uri: []const u8) !ObjectLocation {
-    if (std.mem.startsWith(u8, uri, "s3://")) return parseBucketKey(uri["s3://".len..]);
-    if (std.mem.startsWith(u8, uri, "gs://")) return parseBucketKey(uri["gs://".len..]);
-    if (std.mem.startsWith(u8, uri, "file://")) {
-        const key = uri["file://".len..];
-        if (key.len == 0) return error.InvalidLakeScanPlan;
-        return .{ .bucket = "file", .key = key };
-    }
-    return error.UnsupportedLakeObjectUri;
-}
-
-fn parseBucketKey(rest: []const u8) !ObjectLocation {
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidLakeScanPlan;
-    const bucket = rest[0..slash];
-    const key = rest[slash + 1 ..];
-    if (bucket.len == 0 or key.len == 0) return error.InvalidLakeScanPlan;
-    return .{ .bucket = bucket, .key = key };
 }
 
 test "lake scan planner projects column chunk reads and coalesces physical ranges" {

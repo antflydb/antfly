@@ -168,6 +168,11 @@ pub fn objectRefForExternalFile(
     return object;
 }
 
+pub fn objectRefForExternalFileUri(file: external_source.FileEntry) !ObjectRef {
+    const location = try parseObjectUri(file.object_uri);
+    return try objectRefForExternalFile(location.bucket, location.key, file);
+}
+
 pub fn planColumnChunkRead(object: ObjectRef, chunk: external_source.ColumnChunk) !RangeRead {
     const read = RangeRead{
         .object = object,
@@ -231,6 +236,30 @@ fn sameObjectVersion(a: ObjectRef, b: ObjectRef) bool {
         std.mem.eql(u8, a.version.version_id, b.version.version_id);
 }
 
+const ObjectLocation = struct {
+    bucket: []const u8,
+    key: []const u8,
+};
+
+fn parseObjectUri(uri: []const u8) !ObjectLocation {
+    if (std.mem.startsWith(u8, uri, "s3://")) return parseBucketKey(uri["s3://".len..]);
+    if (std.mem.startsWith(u8, uri, "gs://")) return parseBucketKey(uri["gs://".len..]);
+    if (std.mem.startsWith(u8, uri, "file://")) {
+        const key = uri["file://".len..];
+        if (key.len == 0) return error.InvalidLakeRangeRead;
+        return .{ .bucket = "file", .key = key };
+    }
+    return error.UnsupportedLakeObjectUri;
+}
+
+fn parseBucketKey(rest: []const u8) !ObjectLocation {
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidLakeRangeRead;
+    const bucket = rest[0..slash];
+    const key = rest[slash + 1 ..];
+    if (bucket.len == 0 or key.len == 0) return error.InvalidLakeRangeRead;
+    return .{ .bucket = bucket, .key = key };
+}
+
 fn lessThanRangeRead(_: void, a: RangeRead, b: RangeRead) bool {
     const bucket_order = std.mem.order(u8, a.object.bucket, b.object.bucket);
     if (bucket_order != .eq) return bucket_order == .lt;
@@ -258,6 +287,29 @@ test "lake range planner creates tail footer reads with versioned cache keys" {
     try std.testing.expect(std.mem.indexOf(u8, key, "etag=etag-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, key, "offset=983040") != null);
     try std.testing.expect(std.mem.indexOf(u8, key, "purpose=parquet_footer") != null);
+}
+
+test "lake range planner derives object refs from external file uris" {
+    const alloc = std.testing.allocator;
+    var file = external_source.FileEntry{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 1024,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+    defer file.deinit(alloc);
+    const object = try objectRefForExternalFileUri(file);
+    try std.testing.expectEqualStrings("bucket", object.bucket);
+    try std.testing.expectEqualStrings("events/part-a.parquet", object.key);
+    try std.testing.expectEqualStrings("etag-a", object.version.etag);
+
+    alloc.free(file.object_uri);
+    file.object_uri = try alloc.dupe(u8, "file:///tmp/events/part-a.parquet");
+    const file_object = try objectRefForExternalFileUri(file);
+    try std.testing.expectEqualStrings("file", file_object.bucket);
+    try std.testing.expectEqualStrings("/tmp/events/part-a.parquet", file_object.key);
 }
 
 test "lake range planner coalesces adjacent column chunks by object version" {
