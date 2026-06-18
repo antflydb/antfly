@@ -284,6 +284,74 @@ func TestHAClientRewindRejoinUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientReseedRejoinUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != HARejoinReseedPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HARejoinReseedPath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if !strings.Contains(got, `"node_id":"primary-a"`) ||
+			!strings.Contains(got, `"last_lsn":13`) ||
+			!strings.Contains(got, `"retained_from_lsn":14`) {
+			t.Fatalf("rejoin reseed body = %s, want former node, LSN, and expired retention boundary", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haRejoinReseedResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.WithToken("test-token").ReseedRejoin(context.Background(), RejoinAssessRequest{
+		NodeId:          "primary-a",
+		LastLsn:         13,
+		RetainedFromLsn: 14,
+		Identity: HAIdentity{
+			ClusterId:  100,
+			ShardId:    10,
+			TableId:    20,
+			TimelineId: 4,
+			Epoch:      6,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReseedRejoin returned error: %v", err)
+	}
+	if resp.Action.ActionKind != HAActionKindRejoinReseed || resp.Action.NodeId != "primary-current" {
+		t.Fatalf("rejoin action = %#v, want current-primary reseed receipt", resp.Action)
+	}
+	if resp.Assessment.Action != HARejoinActionReseed || resp.Assessment.Reason != HARejoinReasonParentTimelineWALExpired {
+		t.Fatalf("rejoin assessment = %#v, want reseed after expired parent timeline WAL", resp.Assessment)
+	}
+	if resp.Reseed.NodeId != "primary-a" ||
+		resp.Reseed.SlotName != "primary-a" ||
+		resp.Reseed.TargetTimelineId != 5 ||
+		!resp.Reseed.BaseBackupRequired ||
+		!resp.Reseed.ReseedRequired {
+		t.Fatalf("rejoin reseed result = %#v, want reseed evidence for primary-a", resp.Reseed)
+	}
+}
+
 func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
 	t.Parallel()
 
@@ -2077,6 +2145,45 @@ func haRejoinRewindResponseJSON() string {
 			"target_timeline_id":5,
 			"target_epoch":7,
 			"data_loss_discarded":true
+		}
+	}`
+}
+
+func haRejoinReseedResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"rejoin_reseed:primary-a",
+			"action_kind":"rejoin_reseed",
+			"target":"primary-a",
+			"state":"applied",
+			"node_id":"primary-current"
+		},
+		"assessment":{
+			"action":"reseed",
+			"reason":"parent_timeline_wal_expired",
+			"former_node_id":"primary-a",
+			"target_timeline_id":5,
+			"target_epoch":7,
+			"parent_cluster_id":100,
+			"parent_shard_id":10,
+			"parent_table_id":20,
+			"parent_timeline_id":4,
+			"parent_epoch":6,
+			"fork_lsn":12,
+			"former_last_lsn":13,
+			"retained_from_lsn":14,
+			"data_loss_discarded":false
+		},
+		"reseed":{
+			"node_id":"primary-a",
+			"slot_name":"primary-a",
+			"target_timeline_id":5,
+			"target_epoch":7,
+			"fork_lsn":12,
+			"former_last_lsn":13,
+			"reseed_required":true,
+			"base_backup_required":true
 		}
 	}`
 }
