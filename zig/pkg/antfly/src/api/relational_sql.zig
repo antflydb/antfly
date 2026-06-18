@@ -181,6 +181,10 @@ pub const CursorScrollMode = sql_adapter.CursorScrollMode;
 pub const FetchCursorPortalPlan = sql_adapter.FetchCursorPortalPlan;
 pub const CursorFetchDirection = sql_adapter.CursorFetchDirection;
 pub const CloseCursorPortalPlan = sql_adapter.CloseCursorPortalPlan;
+pub const SavepointTransactionPlan = sql_adapter.SavepointTransactionPlan;
+pub const SavepointNamePlan = sql_adapter.SavepointNamePlan;
+pub const CommentMetadataPlan = sql_adapter.CommentMetadataPlan;
+pub const CommentMetadataTarget = sql_adapter.CommentMetadataTarget;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -1161,51 +1165,6 @@ pub const ClusterMaintenancePlan = struct {
         if (self.index_name) |index_name| alloc.free(index_name);
         self.* = undefined;
     }
-};
-
-pub const SavepointTransactionPlan = union(enum) {
-    savepoint: SavepointNamePlan,
-    release: SavepointNamePlan,
-    rollback_to: SavepointNamePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .savepoint => |*plan| plan.deinit(alloc),
-            .release => |*plan| plan.deinit(alloc),
-            .rollback_to => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const SavepointNamePlan = struct {
-    savepoint_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.savepoint_name);
-        self.* = undefined;
-    }
-};
-
-pub const CommentMetadataPlan = struct {
-    target: CommentMetadataTarget,
-    object_name: []const u8,
-    parent_table_name: ?[]const u8 = null,
-    comment_json: ?[]const u8 = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.object_name);
-        if (self.parent_table_name) |parent| alloc.free(parent);
-        if (self.comment_json) |comment| alloc.free(comment);
-        self.* = undefined;
-    }
-};
-
-pub const CommentMetadataTarget = enum {
-    table,
-    column,
-    index,
-    constraint,
 };
 
 pub const TransactionControlPlan = union(enum) {

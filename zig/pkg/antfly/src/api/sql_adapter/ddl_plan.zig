@@ -411,6 +411,51 @@ pub const CloseCursorPortalPlan = struct {
     }
 };
 
+pub const SavepointTransactionPlan = union(enum) {
+    savepoint: SavepointNamePlan,
+    release: SavepointNamePlan,
+    rollback_to: SavepointNamePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .savepoint => |*plan| plan.deinit(alloc),
+            .release => |*plan| plan.deinit(alloc),
+            .rollback_to => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const SavepointNamePlan = struct {
+    savepoint_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.savepoint_name);
+        self.* = undefined;
+    }
+};
+
+pub const CommentMetadataPlan = struct {
+    target: CommentMetadataTarget,
+    object_name: []const u8,
+    parent_table_name: ?[]const u8 = null,
+    comment_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.object_name);
+        if (self.parent_table_name) |parent| alloc.free(parent);
+        if (self.comment_json) |comment| alloc.free(comment);
+        self.* = undefined;
+    }
+};
+
+pub const CommentMetadataTarget = enum {
+    table,
+    column,
+    index,
+    constraint,
+};
+
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
@@ -539,4 +584,38 @@ test "SQL adapter DDL prepared statement and cursor plans own strings" {
         .portal_name = try alloc.dupe(u8, "usage_cursor"),
     } };
     close.deinit(alloc);
+}
+
+test "SQL adapter DDL savepoint and comment plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var savepoint: SavepointTransactionPlan = .{ .savepoint = .{
+        .savepoint_name = try alloc.dupe(u8, "before_retry"),
+    } };
+    savepoint.deinit(alloc);
+
+    var release: SavepointTransactionPlan = .{ .release = .{
+        .savepoint_name = try alloc.dupe(u8, "before_retry"),
+    } };
+    release.deinit(alloc);
+
+    var rollback: SavepointTransactionPlan = .{ .rollback_to = .{
+        .savepoint_name = try alloc.dupe(u8, "before_retry"),
+    } };
+    rollback.deinit(alloc);
+
+    var column_comment = CommentMetadataPlan{
+        .target = .column,
+        .object_name = try alloc.dupe(u8, "status"),
+        .parent_table_name = try alloc.dupe(u8, "usage_records"),
+        .comment_json = try alloc.dupe(u8, "\"Current processing state\""),
+    };
+    column_comment.deinit(alloc);
+
+    var table_comment = CommentMetadataPlan{
+        .target = .table,
+        .object_name = try alloc.dupe(u8, "usage_records"),
+        .comment_json = try alloc.dupe(u8, "\"Usage event rows\""),
+    };
+    table_comment.deinit(alloc);
 }

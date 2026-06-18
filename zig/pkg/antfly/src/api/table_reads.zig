@@ -4835,6 +4835,60 @@ pub const PinnedExternalObjectStorageLakeRowsSource = struct {
     }
 };
 
+pub const ExternalObjectStorageLakeRowsSourceOptions = struct {
+    cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
+    coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
+};
+
+pub const OwnedExternalObjectStorageLakeRowsSource = struct {
+    alloc: std.mem.Allocator,
+    inventory: external_source_api.Inventory,
+    pinned_source: PinnedExternalObjectStorageLakeRowsSource,
+
+    pub fn initParquetPrefixAlloc(
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        client: object_storage_api.ObjectStorage,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !OwnedExternalObjectStorageLakeRowsSource {
+        if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+
+        var inventory = try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
+            .client = client,
+            .bucket = bucket,
+            .prefix = prefix,
+            .source_id = binding.table_id,
+            .source_uri = binding.source_uri,
+            .schema_fingerprint = binding.schema_fingerprint,
+        });
+        errdefer inventory.deinit(alloc);
+        try serverless_query.validateLakeBindingInventory(binding, inventory);
+
+        var pinned_source = PinnedExternalObjectStorageLakeRowsSource.init(inventory, client);
+        pinned_source.scanner.cache = options.cache;
+        pinned_source.scanner.coalesce_options = options.coalesce_options;
+        return .{
+            .alloc = alloc,
+            .inventory = inventory,
+            .pinned_source = pinned_source,
+        };
+    }
+
+    pub fn source(self: *@This()) TableReadSource {
+        return self.pinned_source.source();
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.inventory.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
 pub fn executePinnedExternalLakeRowsScanAlloc(
     alloc: std.mem.Allocator,
     runtime_schema: storage_schema.TableSchema,
@@ -16530,6 +16584,73 @@ test "object storage pinned external lake source routes row plans through scanne
                 .aggregations = aggregations[0..],
             },
         }, .read_index),
+    );
+}
+
+test "owned object storage lake source discovers and pins parquet prefix inventory" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const current_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put_a = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put_a.deinit(alloc);
+    var put_b = try client.putObject("bucket", "events/_SUCCESS", "ok", .{});
+    defer put_b.deinit(alloc);
+
+    var owned_source = try OwnedExternalObjectStorageLakeRowsSource.initParquetPrefixAlloc(
+        alloc,
+        current_schema,
+        client,
+        "bucket",
+        "events",
+        .{},
+    );
+    defer owned_source.deinit();
+    try std.testing.expectEqualStrings("events", owned_source.inventory.source_id);
+    try std.testing.expectEqualStrings("s3://bucket/events", owned_source.inventory.source_uri);
+    try std.testing.expect(std.mem.startsWith(u8, owned_source.inventory.snapshot_id, "sha256:"));
+    try std.testing.expectEqual(@as(usize, 1), owned_source.inventory.files.len);
+    try std.testing.expectEqualStrings("part-a.parquet", owned_source.inventory.files[0].file_id);
+    try std.testing.expectEqualStrings("s3://bucket/events/part-a.parquet", owned_source.inventory.files[0].object_uri);
+    _ = owned_source.source();
+
+    const stale_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:stale" },
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+    try std.testing.expectError(
+        error.ExternalLakeSnapshotMismatch,
+        OwnedExternalObjectStorageLakeRowsSource.initParquetPrefixAlloc(
+            alloc,
+            stale_schema,
+            client,
+            "bucket",
+            "events",
+            .{},
+        ),
     );
 }
 
