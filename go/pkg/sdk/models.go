@@ -36,6 +36,7 @@ type (
 	ModelRef          = modelcache.ModelRef
 	ModelPullOptions  = modelcache.ModelPullOptions
 	ModelPullProgress = modelcache.ModelPullProgress
+	ModelPullError    = modelcache.ModelPullError
 )
 
 // SupportedModel describes an Antfly-hosted model that can be pulled from

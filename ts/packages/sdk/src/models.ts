@@ -42,6 +42,9 @@ export interface ModelPullProgress {
   total: number;
   fileDownloaded: number;
   fileTotal: number;
+  blobsDone: number;
+  blobsTotal: number;
+  resumedBytes: number;
 }
 
 export interface ModelPullOptions {
@@ -50,7 +53,18 @@ export interface ModelPullOptions {
   huggingFaceToken?: string;
   huggingFaceBaseUrl?: string;
   fetch?: typeof fetch;
+  diskFreeBytes?: (dir: string) => number | Promise<number>;
   onProgress?: (progress: ModelPullProgress) => void;
+}
+
+export class ModelPullError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = "ModelPullError";
+  }
 }
 
 interface HuggingFaceTreeEntry {
@@ -112,7 +126,47 @@ export async function pullHuggingFaceModel(
 
   const totalBytes = selected.reduce((sum, entry) => sum + (entry.size || 0), 0);
   let completedBytes = 0;
+  let resumedBytes = 0;
+  let blobsDone = 0;
   const files: Array<{ name: string; size: number }> = [];
+  for (const entry of selected) {
+    const destPath = path.join(targetDir, path.basename(entry.path));
+    const expectedSize = entry.size || 0;
+    try {
+      const stat = await fs.stat(destPath);
+      if (expectedSize > 0 && stat.size === expectedSize) {
+        resumedBytes += stat.size;
+        blobsDone += 1;
+      }
+    } catch {
+      // Missing file; download below.
+    }
+  }
+  completedBytes = resumedBytes;
+  const neededBytes = Math.max(0, totalBytes - resumedBytes);
+  if (options.diskFreeBytes && neededBytes > 0) {
+    const free = await options.diskFreeBytes(targetDir);
+    if (free > 0) {
+      const required = neededBytes + Math.floor(neededBytes / 5);
+      if (free < required) {
+        throw new ModelPullError(
+          "disk_space",
+          `need ${formatBytes(required)} free on ${targetDir}, only ${formatBytes(free)} available`
+        );
+      }
+    }
+  }
+  reportProgress(options, {
+    model: repoId,
+    file: "",
+    downloaded: completedBytes,
+    total: totalBytes,
+    fileDownloaded: 0,
+    fileTotal: 0,
+    blobsDone,
+    blobsTotal: selected.length,
+    resumedBytes,
+  });
   for (const entry of selected) {
     const destName = path.basename(entry.path);
     const destPath = path.join(targetDir, destName);
@@ -120,17 +174,39 @@ export async function pullHuggingFaceModel(
     try {
       const stat = await fs.stat(destPath);
       if (expectedSize > 0 && stat.size === expectedSize) {
-        completedBytes += stat.size;
         files.push({ name: destName, size: stat.size });
+        reportProgress(options, {
+          model: repoId,
+          file: destName,
+          downloaded: completedBytes,
+          total: totalBytes,
+          fileDownloaded: 0,
+          fileTotal: expectedSize,
+          blobsDone,
+          blobsTotal: selected.length,
+          resumedBytes,
+        });
         continue;
       }
     } catch {
       // Missing file; download below.
     }
-    await downloadFile(fetchImpl, baseUrl, repoId, entry, destPath, completedBytes, totalBytes, options);
+    await downloadFile(fetchImpl, baseUrl, repoId, entry, destPath, completedBytes, totalBytes, blobsDone, selected.length, resumedBytes, options);
     const stat = await fs.stat(destPath);
     completedBytes += stat.size;
+    blobsDone += 1;
     files.push({ name: destName, size: stat.size });
+    reportProgress(options, {
+      model: repoId,
+      file: destName,
+      downloaded: completedBytes,
+      total: totalBytes,
+      fileDownloaded: stat.size,
+      fileTotal: expectedSize,
+      blobsDone,
+      blobsTotal: selected.length,
+      resumedBytes,
+    });
   }
 
   const manifest = {
@@ -162,7 +238,7 @@ export function parseModelRef(model: string): ModelRef {
   const nameParts = base.split("/");
   const owner = nameParts[0];
   const repo = nameParts[1];
-  if (nameParts.length !== 2 || !owner || !repo || repo.includes("..")) {
+  if (nameParts.length !== 2 || !validPathComponent(owner) || !validPathComponent(repo)) {
     throw new Error(`model must be owner/repo[:format[:variant]], got ${JSON.stringify(model)}`);
   }
   const ref: ModelRef = { owner, repo };
@@ -232,38 +308,74 @@ async function downloadFile(
   destPath: string,
   completedBeforeFile: number,
   totalBytes: number,
+  blobsDone: number,
+  blobsTotal: number,
+  resumedBytes: number,
   options: ModelPullOptions
 ): Promise<void> {
   const fs = await import("node:fs/promises");
+  const { createWriteStream } = await import("node:fs");
+  const { once } = await import("node:events");
   const response = await fetchImpl(`${baseUrl}/${escapeRepoId(repoId)}/resolve/main/${escapeFilePath(entry.path)}`, {
     headers: authHeaders(options.huggingFaceToken),
   });
   if (!response.ok) throw new Error(`downloading ${entry.path} failed: ${response.status} ${await response.text()}`);
   if (!response.body) throw new Error(`downloading ${entry.path} failed: empty response body`);
 
-  const chunks: Uint8Array[] = [];
   let downloaded = 0;
   const reader = response.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    chunks.push(value);
-    downloaded += value.byteLength;
-    options.onProgress?.({
-      model: repoId,
-      file: entry.path.split("/").pop() || entry.path,
-      downloaded: completedBeforeFile + downloaded,
-      total: totalBytes,
-      fileDownloaded: downloaded,
-      fileTotal: entry.size || 0,
+  const tmpPath = `${destPath}.tmp`;
+  const out = createWriteStream(tmpPath);
+  let streamError: Error | undefined;
+  out.on("error", (err) => {
+    streamError = err;
+  });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const chunk = Buffer.from(value);
+      if (!out.write(chunk)) {
+        await Promise.race([
+          once(out, "drain"),
+          once(out, "error").then(([err]) => {
+            throw err;
+          }),
+        ]);
+      }
+      if (streamError) throw streamError;
+      downloaded += value.byteLength;
+      reportProgress(options, {
+        model: repoId,
+        file: entry.path.split("/").pop() || entry.path,
+        downloaded: completedBeforeFile + downloaded,
+        total: totalBytes,
+        fileDownloaded: downloaded,
+        fileTotal: entry.size || 0,
+        blobsDone,
+        blobsTotal,
+        resumedBytes,
+      });
+    }
+    await new Promise<void>((resolve, reject) => {
+      if (streamError) {
+        reject(streamError);
+        return;
+      }
+      out.once("error", reject);
+      out.end(() => resolve());
     });
+  } catch (err) {
+    out.destroy();
+    await fs.rm(tmpPath, { force: true });
+    throw err;
   }
   if (entry.size && downloaded !== entry.size) {
+    await fs.rm(tmpPath, { force: true });
     throw new Error(`downloaded ${entry.path} size = ${downloaded}, want ${entry.size}`);
   }
-  await fs.writeFile(`${destPath}.tmp`, Buffer.concat(chunks));
-  await fs.rename(`${destPath}.tmp`, destPath);
+  await fs.rename(tmpPath, destPath);
 }
 
 function authHeaders(token?: string): Record<string, string> {
@@ -287,4 +399,21 @@ function looksVariantFile(name: string): boolean {
   return ["q4", "q5", "q6", "q8", "int8", "i8", "fp16", "f16", "bf16", "quantized"].some((marker) =>
     normalized.includes(marker)
   );
+}
+
+function validPathComponent(part: string | undefined): part is string {
+  return !!part && part !== "." && part !== ".." && !part.includes("/") && !part.includes("\\");
+}
+
+function reportProgress(options: ModelPullOptions, progress: ModelPullProgress): void {
+  options.onProgress?.(progress);
+}
+
+function formatBytes(n: number): string {
+  const kb = 1024;
+  const mb = kb * 1024;
+  const gb = mb * 1024;
+  if (n >= gb) return `${(n / gb).toFixed(1)} GB`;
+  if (n >= mb) return `${Math.round(n / mb)} MB`;
+  return `${Math.floor(n / kb)} KB`;
 }

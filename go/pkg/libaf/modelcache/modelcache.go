@@ -86,11 +86,14 @@ type ModelPullOptions struct {
 	HuggingFaceBaseURL string
 	// HTTPClient overrides the client used for HuggingFace calls.
 	HTTPClient *http.Client
-	// Progress receives per-file byte progress.
+	// DiskFreeBytes returns free bytes for the cache volume. When set, pulls
+	// preflight the remaining download size with a 20% buffer.
+	DiskFreeBytes func(dir string) (int64, error)
+	// Progress receives cache and per-file byte progress.
 	Progress func(ModelPullProgress)
 }
 
-// ModelPullProgress reports per-file download progress.
+// ModelPullProgress reports cache and per-file download progress.
 type ModelPullProgress struct {
 	Model          string
 	File           string
@@ -98,6 +101,21 @@ type ModelPullProgress struct {
 	Total          int64
 	FileDownloaded int64
 	FileTotal      int64
+	BlobsDone      int
+	BlobsTotal     int
+	ResumedBytes   int64
+}
+
+// ModelPullError is returned for machine-readable pull failures.
+type ModelPullError struct {
+	Code    string
+	Message string
+}
+
+func (e *ModelPullError) Error() string { return e.Message }
+
+func newModelPullError(code, message string) *ModelPullError {
+	return &ModelPullError{Code: code, Message: message}
 }
 
 type hfTreeEntry struct {
@@ -136,10 +154,14 @@ func PullHuggingFaceModel(ctx context.Context, model string, spec ModelSpec, opt
 		return "", err
 	}
 	owner, repo := ref.Owner, ref.Repo
-	modelDir, err := ModelDir(opts.ModelsDir, model)
-	if err != nil {
-		return "", err
+	modelsDir := opts.ModelsDir
+	if modelsDir == "" {
+		modelsDir, err = DefaultModelsDir()
+		if err != nil {
+			return "", err
+		}
 	}
+	modelDir := filepath.Join(modelsDir, owner, repo)
 	if err := os.MkdirAll(modelDir, 0o755); err != nil {
 		return "", fmt.Errorf("creating model directory: %w", err)
 	}
@@ -155,6 +177,9 @@ func PullHuggingFaceModel(ctx context.Context, model string, spec ModelSpec, opt
 	if variant == "" {
 		variant = spec.DefaultVariant
 	}
+	resolvedRef := ref
+	resolvedRef.Format = format
+	resolvedRef.Variant = variant
 	baseURL := strings.TrimRight(opts.HuggingFaceBaseURL, "/")
 	if baseURL == "" {
 		baseURL = "https://huggingface.co"
@@ -178,13 +203,42 @@ func PullHuggingFaceModel(ctx context.Context, model string, spec ModelSpec, opt
 	for _, entry := range selected {
 		totalBytes += entry.Size
 	}
-	var completedBytes int64
+	var completedBytes, resumedBytes int64
+	var blobsDone int
+	for _, entry := range selected {
+		destPath := filepath.Join(modelDir, filepath.Base(entry.Path))
+		if info, err := os.Stat(destPath); err == nil && entry.Size > 0 && info.Size() == entry.Size {
+			resumedBytes += info.Size()
+			blobsDone++
+		}
+	}
+	completedBytes = resumedBytes
+	neededBytes := totalBytes - resumedBytes
+	if neededBytes < 0 {
+		neededBytes = 0
+	}
+	if opts.DiskFreeBytes != nil && neededBytes > 0 {
+		if free, ferr := opts.DiskFreeBytes(modelsDir); ferr == nil && free > 0 {
+			required := neededBytes + neededBytes/5
+			if free < required {
+				return "", newModelPullError("disk_space", fmt.Sprintf("need %s free on %s, only %s available", formatBytes(required), modelsDir, formatBytes(free)))
+			}
+		}
+	}
+	reportProgress(opts.Progress, ModelPullProgress{
+		Model:        repoID,
+		Downloaded:   completedBytes,
+		Total:        totalBytes,
+		BlobsDone:    blobsDone,
+		BlobsTotal:   len(selected),
+		ResumedBytes: resumedBytes,
+	})
 
 	manifest := localManifest{
 		SchemaVersion: 1,
 		Name:          repo,
 		Owner:         owner,
-		Source:        ref.String(),
+		Source:        resolvedRef.String(),
 		Type:          spec.Task,
 		Variant:       variant,
 		Provenance: localProvenance{
@@ -196,11 +250,20 @@ func PullHuggingFaceModel(ctx context.Context, model string, spec ModelSpec, opt
 		destName := filepath.Base(entry.Path)
 		destPath := filepath.Join(modelDir, destName)
 		if info, err := os.Stat(destPath); err == nil && entry.Size > 0 && info.Size() == entry.Size {
-			completedBytes += info.Size()
 			manifest.Files = append(manifest.Files, localManifestFile{Name: destName, Size: info.Size()})
+			reportProgress(opts.Progress, ModelPullProgress{
+				Model:        repoID,
+				File:         destName,
+				Downloaded:   completedBytes,
+				Total:        totalBytes,
+				FileTotal:    entry.Size,
+				BlobsDone:    blobsDone,
+				BlobsTotal:   len(selected),
+				ResumedBytes: resumedBytes,
+			})
 			continue
 		}
-		if err := downloadHuggingFaceFile(ctx, client, baseURL, repoID, entry, destPath, opts.HuggingFaceToken, completedBytes, totalBytes, opts.Progress); err != nil {
+		if err := downloadHuggingFaceFile(ctx, client, baseURL, repoID, entry, destPath, opts.HuggingFaceToken, completedBytes, totalBytes, blobsDone, len(selected), resumedBytes, opts.Progress); err != nil {
 			return "", err
 		}
 		mf, err := manifestFile(destPath, destName)
@@ -209,6 +272,18 @@ func PullHuggingFaceModel(ctx context.Context, model string, spec ModelSpec, opt
 		}
 		manifest.Files = append(manifest.Files, mf)
 		completedBytes += mf.Size
+		blobsDone++
+		reportProgress(opts.Progress, ModelPullProgress{
+			Model:          repoID,
+			File:           destName,
+			Downloaded:     completedBytes,
+			Total:          totalBytes,
+			FileDownloaded: mf.Size,
+			FileTotal:      entry.Size,
+			BlobsDone:      blobsDone,
+			BlobsTotal:     len(selected),
+			ResumedBytes:   resumedBytes,
+		})
 	}
 
 	data, err := json.MarshalIndent(manifest, "", "  ")
@@ -237,7 +312,7 @@ func ParseModelRef(model string) (ModelRef, error) {
 		return ModelRef{}, fmt.Errorf("model must be owner/repo[:format[:variant]], got %q", model)
 	}
 	nameParts := strings.Split(parts[0], "/")
-	if len(nameParts) != 2 || nameParts[0] == "" || nameParts[1] == "" || strings.Contains(nameParts[1], "..") {
+	if len(nameParts) != 2 || !validPathComponent(nameParts[0]) || !validPathComponent(nameParts[1]) {
 		return ModelRef{}, fmt.Errorf("model must be owner/repo[:format[:variant]], got %q", model)
 	}
 	ref := ModelRef{Owner: nameParts[0], Repo: nameParts[1]}
@@ -262,6 +337,10 @@ func (r ModelRef) String() string {
 		return out + ":" + r.Variant
 	}
 	return out
+}
+
+func validPathComponent(part string) bool {
+	return part != "" && part != "." && part != ".." && !strings.Contains(part, `/`) && !strings.Contains(part, `\`)
 }
 
 // BaseModelName returns owner/repo for model refs with optional tags.
@@ -350,7 +429,7 @@ func normalizeVariant(s string) string {
 	return s
 }
 
-func downloadHuggingFaceFile(ctx context.Context, client *http.Client, baseURL, repoID string, entry hfTreeEntry, destPath, token string, completedBeforeFile, totalBytes int64, progress func(ModelPullProgress)) error {
+func downloadHuggingFaceFile(ctx context.Context, client *http.Client, baseURL, repoID string, entry hfTreeEntry, destPath, token string, completedBeforeFile, totalBytes int64, blobsDone, blobsTotal int, resumedBytes int64, progress func(ModelPullProgress)) error {
 	fileURL := fmt.Sprintf("%s/%s/resolve/main/%s", baseURL, escapeRepoID(repoID), escapeFilePath(entry.Path))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
@@ -387,16 +466,17 @@ func downloadHuggingFaceFile(ctx context.Context, client *http.Client, baseURL, 
 				return fmt.Errorf("writing %s: %w", destPath, err)
 			}
 			downloaded += int64(n)
-			if progress != nil {
-				progress(ModelPullProgress{
-					Model:          repoID,
-					File:           filepath.Base(entry.Path),
-					Downloaded:     completedBeforeFile + downloaded,
-					Total:          totalBytes,
-					FileDownloaded: downloaded,
-					FileTotal:      entry.Size,
-				})
-			}
+			reportProgress(progress, ModelPullProgress{
+				Model:          repoID,
+				File:           filepath.Base(entry.Path),
+				Downloaded:     completedBeforeFile + downloaded,
+				Total:          totalBytes,
+				FileDownloaded: downloaded,
+				FileTotal:      entry.Size,
+				BlobsDone:      blobsDone,
+				BlobsTotal:     blobsTotal,
+				ResumedBytes:   resumedBytes,
+			})
 		}
 		if readErr == io.EOF {
 			break
@@ -418,6 +498,28 @@ func downloadHuggingFaceFile(ctx context.Context, client *http.Client, baseURL, 
 		return fmt.Errorf("renaming %s: %w", destPath, err)
 	}
 	return nil
+}
+
+func reportProgress(progress func(ModelPullProgress), p ModelPullProgress) {
+	if progress != nil {
+		progress(p)
+	}
+}
+
+func formatBytes(n int64) string {
+	const (
+		kb = 1024
+		mb = kb * 1024
+		gb = mb * 1024
+	)
+	switch {
+	case n >= gb:
+		return fmt.Sprintf("%.1f GB", float64(n)/float64(gb))
+	case n >= mb:
+		return fmt.Sprintf("%.0f MB", float64(n)/float64(mb))
+	default:
+		return fmt.Sprintf("%d KB", n/kb)
+	}
 }
 
 func manifestFile(path, name string) (localManifestFile, error) {
