@@ -28,9 +28,12 @@ pub const HAStringValidation = enum {
 
 pub fn classifyHAString(value_or_null: ?[]const u8) HAStringValidation {
     const raw = value_or_null orelse return .missing;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return .missing;
-    if (trimmed.len != raw.len) return .padded;
+    var start: usize = 0;
+    while (start < raw.len and isASCIIWhitespace(raw[start])) : (start += 1) {}
+    var end: usize = raw.len;
+    while (end > start and isASCIIWhitespace(raw[end - 1])) : (end -= 1) {}
+    if (start == end) return .missing;
+    if (start != 0 or end != raw.len) return .padded;
     return .ok;
 }
 
@@ -101,20 +104,27 @@ pub fn isURLWithHostNoHiddenWhitespace(raw: []const u8) bool {
 
 pub fn containsASCIIWhitespace(raw: []const u8) bool {
     for (raw) |byte| {
-        switch (byte) {
-            ' ', '\t', '\n', '\r', 0x0b, 0x0c => return true,
-            else => {},
-        }
+        if (isASCIIWhitespace(byte)) return true;
     }
     return false;
+}
+
+fn isASCIIWhitespace(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r', 0x0b, 0x0c => true,
+        else => false,
+    };
 }
 
 test "storage.ha validation classifies missing padded and valid strings" {
     try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
     try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
     try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(" \t\r\n"));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString("\x0b\x0c"));
     try std.testing.expectEqual(HAStringValidation.padded, classifyHAString(" primary-a"));
     try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("primary-a\n"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("\x0bprimary-a"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("primary-a\x0c"));
     try std.testing.expectEqual(HAStringValidation.ok, classifyHAString("primary-a"));
 }
 

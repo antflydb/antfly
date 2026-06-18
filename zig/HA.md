@@ -634,7 +634,21 @@ The concrete follow-up decisions are:
   runbooks, compatibility tests, crash/e2e/operator coverage, and former-primary
   repair paths are all implemented and tested.
 
-#### Review Answer Details
+#### Open Review Question Answers
+
+The direct answers to the HA review questions are:
+
+- `paddedHAString` should become a shared classifier, but not a catch-all
+  `validateHAString` that owns every HA input policy.
+- `test_standby.py` should be added as a black-box Zig e2e once the real admin
+  API and runtime path are usable.
+- HA must be integrated with Zig simulation tests because the sim layer is
+  where crash, replay, promotion, fencing, and retention correctness should be
+  explored exhaustively.
+- The mode is not production grade, or close to bulk Postgres HA parity, until
+  runtime wiring, generated admin clients, operator integration, real
+  base-backup/reseed, sync commit, fencing, former-primary repair, observability,
+  compatibility, e2e, operator e2e, and crash/sim coverage are all in place.
 
 The HA string helper should be generic only at the whitespace/presence
 classification layer:
