@@ -17373,6 +17373,7 @@ test "api http server routes public external lake row queries through configured
 
 test "api http server resolves credentialed external lake rows from node config" {
     const alloc = std.testing.allocator;
+    const object_storage_api = @import("../storage/object_storage.zig");
     const schema_template =
         \\{{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{{"kind":"external","table_id":"events","format":"parquet","uri":"file://{s}","credentials":{{"ref":"prod-lake-read","scope":"events"}},"schema_fingerprint":"schema-v1"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"amount":{{"type":"numeric"}},"tenant":{{"type":"numeric"}}}},"required":["amount","tenant"],"additionalProperties":false}}}}}},"primary_key":{{"columns":["amount"]}}}}
     ;
