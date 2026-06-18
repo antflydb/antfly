@@ -259,6 +259,8 @@ pub const RenameViewPlan = sql_adapter.RenameViewPlan;
 pub const DropViewPlan = sql_adapter.DropViewPlan;
 pub const TableClonePlan = sql_adapter.TableClonePlan;
 pub const TableCloneOptions = sql_adapter.TableCloneOptions;
+pub const DropTablePlan = sql_adapter.DropTablePlan;
+pub const DropIndexPlan = sql_adapter.DropIndexPlan;
 pub const RowSecurityCatalogPlan = sql_adapter.RowSecurityCatalogPlan;
 pub const AlterRowSecurityPlan = sql_adapter.AlterRowSecurityPlan;
 pub const CreateRowSecurityPolicyPlan = sql_adapter.CreateRowSecurityPolicyPlan;
@@ -580,17 +582,6 @@ pub const CreateUpdatePolicyPlan = struct {
     }
 };
 
-pub const DropTablePlan = struct {
-    table_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.* = undefined;
-    }
-};
-
 pub const AlterTablePlan = struct {
     table_name: []const u8,
     if_exists: bool = false,
@@ -718,16 +709,6 @@ pub const DdlIndexOpClass = enum {
     default,
     jsonb_path_ops,
     array_ops,
-};
-
-pub const DropIndexPlan = struct {
-    index_name: []const u8,
-    if_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.index_name);
-        self.* = undefined;
-    }
 };
 
 pub const AppliedDdlSchemaJson = struct {

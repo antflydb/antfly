@@ -4737,8 +4737,55 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
         runtime_schema: storage_schema.TableSchema,
         request: serverless_query.LakeRowsScanRequest,
     ) !serverless_query.LakeRowsScanResult {
-        const scanner = self.parquetScanner();
+        if (inventoryHasRowGroupMetadata(self.inventory)) {
+            const scanner = self.parquetScanner();
+            return try scanner.scanAlloc(alloc, runtime_schema, request);
+        }
+
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        var validation = try serverless_query.planProjectedLakeScanAlloc(alloc, .{
+            .binding = binding,
+            .inventory = self.inventory,
+            .projected_columns = request.projected_columns,
+        });
+        defer validation.deinit(alloc);
+
+        var discovered = serverless_query.discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+            alloc,
+            self.object_reader.parquetReader(),
+            self.inventory,
+            request.projected_columns,
+            64 * 1024,
+        ) catch |err| return normalizedFooterDiscoveryError(err);
+        defer discovered.deinit(alloc);
+
+        const scanner = PinnedExternalLakeRowsScanner{
+            .inventory = discovered.inventory,
+            .reader = self.object_reader.parquetReader(),
+            .cache = self.cache,
+            .coalesce_options = self.coalesce_options,
+        };
         return try scanner.scanAlloc(alloc, runtime_schema, request);
+    }
+
+    fn inventoryHasRowGroupMetadata(inventory: external_source_api.Inventory) bool {
+        for (inventory.files) |file| {
+            if (file.row_groups.len != 0) return true;
+        }
+        return false;
+    }
+
+    fn normalizedFooterDiscoveryError(err: anyerror) anyerror {
+        return switch (err) {
+            error.FileNotFound => error.ExternalLakeSnapshotMismatch,
+            error.InvalidParquetFooter,
+            error.InvalidParquetFooterMagic,
+            error.InvalidParquetMetadata,
+            error.ParquetInventoryFileNotFound,
+            => error.InvalidParquetRowGroupBatch,
+            else => err,
+        };
     }
 };
 

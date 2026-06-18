@@ -1262,6 +1262,35 @@ fn appendParquetTrailer(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, meta
     try out.appendSlice(alloc, "PAR1");
 }
 
+pub fn buildTestSingleColumnPlainI64ParquetObjectAlloc(alloc: Allocator, column_id: []const u8, values: []const i64) ![]u8 {
+    if (column_id.len == 0 or values.len == 0) return error.InvalidParquetRowGroupBatch;
+
+    const column_offset: usize = 100;
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try appendPlainI64DataPage(&chunk, alloc, values);
+
+    var object = std.ArrayListUnmanaged(u8).empty;
+    errdefer object.deinit(alloc);
+    try object.appendNTimes(alloc, 0, column_offset);
+    try object.appendSlice(alloc, chunk.items);
+    const metadata_start = object.items.len;
+    try appendSingleColumnFooterMetadata(
+        &object,
+        alloc,
+        column_id,
+        values.len,
+        column_offset,
+        chunk.items.len,
+        chunk.items.len,
+        0,
+        0,
+    );
+    const metadata_len = object.items.len - metadata_start;
+    try appendParquetTrailer(&object, alloc, metadata_len);
+    return try object.toOwnedSlice(alloc);
+}
+
 fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?i64) !void {
     var present_count: usize = 0;
     for (values) |maybe| {

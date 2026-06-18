@@ -1314,6 +1314,27 @@ pub const TableCloneOptions = struct {
     }
 };
 
+pub const DropTablePlan = struct {
+    table_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropIndexPlan = struct {
+    index_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.index_name);
+        self.* = undefined;
+    }
+};
+
 pub const RowSecurityCatalogPlan = union(enum) {
     alter_table: AlterRowSecurityPlan,
     create_policy: CreateRowSecurityPolicyPlan,
@@ -1871,6 +1892,23 @@ test "SQL adapter DDL table clone plans own strings and expose all options" {
         .options = all,
     };
     clone.deinit(alloc);
+}
+
+test "SQL adapter DDL drop table and index plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var table = DropTablePlan{
+        .table_name = try alloc.dupe(u8, "usage_archive"),
+        .if_exists = true,
+        .cascade = true,
+    };
+    table.deinit(alloc);
+
+    var index = DropIndexPlan{
+        .index_name = try alloc.dupe(u8, "usage_archive_status_idx"),
+        .if_exists = true,
+    };
+    index.deinit(alloc);
 }
 
 test "SQL adapter DDL row security plans own nested fields" {
