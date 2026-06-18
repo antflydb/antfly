@@ -5398,7 +5398,12 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableRowsExplain(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsExplain(rows_route.table_name);
+                return try self.handlePublicTableRowsExplain(rows_route.table_name, &.{}, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsExplain(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsExplain(rows_route.table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
@@ -8586,6 +8591,8 @@ pub const ApiHttpServer = struct {
     pub fn handlePublicTableRowsExplain(
         self: *ApiHttpServer,
         table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
         const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -8605,10 +8612,17 @@ pub const ApiHttpServer = struct {
         defer lake_source.deinit();
 
         const state = lake_source.pinnedState();
+        const explained = self.explainLakeRowsOperationAlloc(schema, body, authenticated_identity, table_name) catch |err| switch (err) {
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows explain request"),
+            error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows explain unavailable"),
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
         const plan = try serverless_query.explainLakeQuery(.{
             .base_source = externalLakeBaseSourceDescriptor(state),
             .artifacts = &.{},
-            .operation = .scan,
+            .operation = explained.operation,
+            .projected_column_count = explained.projected_column_count,
             .range_cache_stats = lake_source.rangeCacheStats(),
         });
         const Source = struct {
@@ -8624,6 +8638,8 @@ pub const ApiHttpServer = struct {
         };
         const Response = struct {
             source: Source,
+            explained_operation: []const u8,
+            scan: LakeRowsExplainScan,
             plan: serverless_query.LakeExplainPlan,
         };
         return try jsonResponse(self.alloc, Response{
@@ -8637,8 +8653,71 @@ pub const ApiHttpServer = struct {
                 .row_count = state.row_count,
                 .byte_len = state.byte_len,
             },
+            .explained_operation = explained.operation_name,
+            .scan = explained.scan,
             .plan = plan,
         });
+    }
+
+    const LakeRowsExplainScan = struct {
+        projected_column_count: u16 = 0,
+        has_predicate: bool = false,
+        scanner_limit: ?usize = null,
+    };
+
+    const LakeRowsExplainedOperation = struct {
+        operation_name: []const u8 = "source",
+        operation: serverless_query.LakeExplainOperation = .scan,
+        projected_column_count: u16 = 0,
+        scan: LakeRowsExplainScan = .{},
+    };
+
+    fn explainLakeRowsOperationAlloc(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        table_name: []const u8,
+    ) !LakeRowsExplainedOperation {
+        if (std.mem.trim(u8, body, " \t\r\n").len == 0) return .{};
+        const operation = relational_rows_api.detectRowsPlanOperationWithoutSchema(self.alloc, body) catch return error.InvalidRowsRequest;
+        return switch (operation) {
+            .query => blk: {
+                var plan = relational_rows_api.parseRowsQueryPlanRequest(self.alloc, body, schema) catch return error.InvalidRowsRequest;
+                defer plan.deinit(self.alloc);
+                try self.applyRowsQueryPlanRowFilter(table_name, authenticated_identity, schema, &plan);
+                var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsQueryAlloc(self.alloc, schema, plan.query);
+                defer lake_request.deinit(self.alloc);
+                break :blk lakeRowsExplainedOperationFromScan("query", .scan, lake_request.request);
+            },
+            .aggregate => blk: {
+                var plan = relational_rows_api.parseRowsAggregatePlanRequest(self.alloc, body, schema) catch return error.InvalidRowsRequest;
+                defer plan.deinit(self.alloc);
+                try self.applyRowsAggregatePlanRowFilter(table_name, authenticated_identity, schema, &plan);
+                var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsAggregateAlloc(self.alloc, schema, plan.aggregate);
+                defer lake_request.deinit(self.alloc);
+                break :blk lakeRowsExplainedOperationFromScan("aggregate", .group_by, lake_request.request);
+            },
+            .window, .join, .lateral => error.UnsupportedRowsQuery,
+        };
+    }
+
+    fn lakeRowsExplainedOperationFromScan(
+        operation_name: []const u8,
+        operation: serverless_query.LakeExplainOperation,
+        scan: serverless_query.LakeRowsScanRequest,
+    ) !LakeRowsExplainedOperation {
+        const projected_column_count = std.math.cast(u16, scan.projected_columns.len) orelse return error.InvalidRowsRequest;
+        return .{
+            .operation_name = operation_name,
+            .operation = operation,
+            .projected_column_count = projected_column_count,
+            .scan = .{
+                .projected_column_count = projected_column_count,
+                .has_predicate = scan.predicate != null,
+                .scanner_limit = scan.limit,
+            },
+        };
     }
 
     fn externalLakeBaseSourceDescriptor(
@@ -18950,15 +19029,41 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqualStrings("external_lake", explain_source.get("kind").?.string);
     try std.testing.expectEqualStrings("parquet", explain_source.get("format").?.string);
     try std.testing.expectEqualStrings("s3://bucket/events", explain_source.get("source_uri").?.string);
+    try std.testing.expectEqualStrings("source", parsed_explain.value.object.get("explained_operation").?.string);
+    const explain_scan = parsed_explain.value.object.get("scan").?.object;
+    try std.testing.expectEqual(@as(i64, 0), explain_scan.get("projected_column_count").?.integer);
+    try std.testing.expect(!explain_scan.get("has_predicate").?.bool);
     const explain_plan = parsed_explain.value.object.get("plan").?.object;
     try std.testing.expectEqualStrings("scan", explain_plan.get("operation").?.string);
     try std.testing.expectEqualStrings("external_parquet", explain_plan.get("source_kind").?.string);
     try std.testing.expectEqualStrings("external_metadata", explain_plan.get("cache_class").?.string);
+    try std.testing.expectEqual(@as(i64, 0), explain_plan.get("projected_column_count").?.integer);
     try std.testing.expect(std.mem.startsWith(u8, explain_plan.get("snapshot_id").?.string, "sha256:"));
     try std.testing.expectEqualStrings("schema-v1", explain_plan.get("schema_fingerprint").?.string);
     const range_cache = explain_plan.get("range_cache_accounting").?.object;
     const total_range_cache = range_cache.get("total").?.object;
     try std.testing.expectEqual(@as(i64, 0), total_range_cache.get("stored_bytes").?.integer);
+
+    var query_explain_response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/events/rows/explain",
+        .body = "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":8},\"limit\":1}}",
+    });
+    defer query_explain_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), query_explain_response.status);
+    try std.testing.expectEqual(@as(u32, 6), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, query_explain_response.body, .{ .allocate = .alloc_always });
+    defer parsed_query_explain.deinit();
+    try std.testing.expectEqualStrings("query", parsed_query_explain.value.object.get("explained_operation").?.string);
+    const query_explain_scan = parsed_query_explain.value.object.get("scan").?.object;
+    try std.testing.expectEqual(@as(i64, 2), query_explain_scan.get("projected_column_count").?.integer);
+    try std.testing.expect(query_explain_scan.get("has_predicate").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), query_explain_scan.get("scanner_limit").?.integer);
+    const query_explain_plan = parsed_query_explain.value.object.get("plan").?.object;
+    try std.testing.expectEqualStrings("scan", query_explain_plan.get("operation").?.string);
+    try std.testing.expectEqual(@as(i64, 2), query_explain_plan.get("projected_column_count").?.integer);
 }
 
 test "api http server resolves credentialed external lake rows from node config" {
