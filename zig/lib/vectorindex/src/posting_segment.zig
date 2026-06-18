@@ -1969,9 +1969,14 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
 
     var index = range.first_index;
     while (index < range.past_index) : (index += 1) {
-        const value = try deltaValueFromRange(index_data, range, index);
-        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+        const found = try deltaIndexEntryFromRange(index_data, range, index);
+        const value = try deltaValueFromEntryRange(range, found);
         if (min_generation) |generation| {
+            if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > generation) {
+                try appendDeltaValueAllRecordsAlloc(alloc, value, &records);
+                continue;
+            }
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
             var reserved = false;
             while (try iterator.next()) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
@@ -1982,8 +1987,7 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
                 records.appendAssumeCapacity(record);
             }
         } else {
-            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
-            while (try iterator.next()) |record| records.appendAssumeCapacity(record);
+            try appendDeltaValueAllRecordsAlloc(alloc, value, &records);
         }
     }
 
@@ -2009,7 +2013,13 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
     const base_generation = min_generation orelse 0;
     var index = range.first_index;
     while (index < range.past_index) : (index += 1) {
-        const value = try deltaValueFromRange(index_data, range, index);
+        const found = try deltaIndexEntryFromRange(index_data, range, index);
+        const value = try deltaValueFromEntryRange(range, found);
+        if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
+            try appendDeltaValueAllRecordsWithStatsAlloc(alloc, value, records, stats);
+            continue;
+        }
+
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         stats.records += iterator.recordCount();
         stats.encoded_value_bytes += value.len;
@@ -2046,7 +2056,13 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
 
     var index = range.first_index;
     while (index < range.past_index) : (index += 1) {
-        const value = try deltaValueFromRange(index_data, range, index);
+        const found = try deltaIndexEntryFromRange(index_data, range, index);
+        const value = try deltaValueFromEntryRange(range, found);
+        if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
+            try appendDeltaValueAllRecordsIntoScratchWithStatsAlloc(alloc, value, scratch, stats);
+            continue;
+        }
+
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         stats.records += iterator.recordCount();
         stats.encoded_value_bytes += value.len;
@@ -2075,7 +2091,13 @@ pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.
 
     var index = range.first_index;
     while (index < range.past_index) : (index += 1) {
-        const value = try deltaValueFromRange(index_data, range, index);
+        const found = try deltaIndexEntryFromRange(index_data, range, index);
+        const value = try deltaValueFromEntryRange(range, found);
+        if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
+            try accumulateDeltaValueAllRecordsStats(value, &out);
+            continue;
+        }
+
         const stats = try posting.PostingFormat.deltaTailStatsAfterGeneration(value, base_generation);
         out.records += stats.records;
         out.records_after_generation += stats.records_after_generation;
@@ -3653,13 +3675,82 @@ fn readSegmentDeltaValueRangeAlloc(
 }
 
 fn deltaValueFromRange(index_data: []const u8, range: OwnedDeltaValueRange, index: usize) ![]const u8 {
-    const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+    const found = try deltaIndexEntryFromRange(index_data, range, index);
+    return try deltaValueFromEntryRange(range, found);
+}
+
+fn deltaIndexEntryFromRange(index_data: []const u8, range: OwnedDeltaValueRange, index: usize) !IndexEntry {
+    if (index < range.first_index or index >= range.past_index) return error.CorruptedPostingSegment;
+    return try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+}
+
+fn deltaValueFromEntryRange(range: OwnedDeltaValueRange, found: IndexEntry) ![]const u8 {
     const relative_offset = std.math.sub(usize, found.offset, range.base_offset) catch return error.CorruptedPostingSegment;
     const relative_end = std.math.add(usize, relative_offset, found.len) catch return error.CorruptedPostingSegment;
     if (relative_end > range.data.len) return error.CorruptedPostingSegment;
     const value = range.data[relative_offset..relative_end];
     try found.location().verifyValue(value);
     return value;
+}
+
+fn appendDeltaValueAllRecordsAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+    while (try iterator.next()) |record| records.appendAssumeCapacity(record);
+}
+
+fn appendDeltaValueAllRecordsWithStatsAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+    stats: *posting.PostingDeltaTailStats,
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    const record_count = iterator.recordCount();
+    stats.records += record_count;
+    stats.encoded_value_bytes += value.len;
+    stats.records_after_generation += record_count;
+    try records.ensureUnusedCapacity(alloc, record_count);
+    while (try iterator.next()) |record| {
+        if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+        stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+        records.appendAssumeCapacity(record);
+    }
+}
+
+fn appendDeltaValueAllRecordsIntoScratchWithStatsAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    scratch: anytype,
+    stats: *posting.PostingDeltaTailStats,
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    const record_count = iterator.recordCount();
+    stats.records += record_count;
+    stats.encoded_value_bytes += value.len;
+    stats.records_after_generation += record_count;
+    try ensureDeltaRecordAppendCapacity(alloc, scratch, record_count);
+    while (try iterator.next()) |record| {
+        if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+        stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+        scratch.appendDeltaRecordAssumeCapacity(record);
+    }
+}
+
+fn accumulateDeltaValueAllRecordsStats(value: []const u8, stats: *posting.PostingDeltaTailStats) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    const record_count = iterator.recordCount();
+    stats.records += record_count;
+    stats.encoded_value_bytes += value.len;
+    stats.records_after_generation += record_count;
+    while (try iterator.next()) |record| {
+        if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+        stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+    }
 }
 
 fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
