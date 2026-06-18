@@ -2879,6 +2879,10 @@ pub const PostingStore = struct {
     fn encodeBaseForIndex(index: anytype, base: PostingBase) ![]u8 {
         const base_member_block_size = postingBaseMemberBlockSize(index);
         if (!shouldSortBaseMembers(index)) return try PostingFormat.encodeBaseWithBlockSize(index.alloc, base, base_member_block_size);
+        if (isVectorIdsSortedAsc(base.members)) {
+            const selected_block_size = try postingBaseMemberBlockSizeForMembers(index, base.members);
+            return try PostingFormat.encodeBaseWithBlockSize(index.alloc, base, selected_block_size.block_size);
+        }
         const sorted_members = try index.alloc.dupe(VectorId, base.members);
         defer index.alloc.free(sorted_members);
         sortVectorIdsAsc(sorted_members);
@@ -4778,6 +4782,16 @@ fn sortVectorIdsAsc(ids: []VectorId) void {
     std.mem.sort(VectorId, ids, {}, comptime std.sort.asc(VectorId));
 }
 
+fn isVectorIdsSortedAsc(ids: []const VectorId) bool {
+    if (ids.len < 2) return true;
+    var previous = ids[0];
+    for (ids[1..]) |id| {
+        if (previous > id) return false;
+        previous = id;
+    }
+    return true;
+}
+
 fn notePostingOverlay(profile: anytype, elapsed_ns: u64, base_member_count: usize, delta_count: usize, materialized_member_count: usize) void {
     const Profile = switch (@typeInfo(@TypeOf(profile))) {
         .pointer => |ptr| ptr.child,
@@ -5249,6 +5263,12 @@ test "posting fold scratch grows delta record buffer geometrically" {
 
     try scratch.ensureDeltaRecordCapacity(alloc, 9);
     try std.testing.expectEqual(@as(usize, 16), scratch.delta_records.len);
+}
+
+test "posting vector id sortedness permits duplicate ascending ids" {
+    try std.testing.expect(isVectorIdsSortedAsc(&.{}));
+    try std.testing.expect(isVectorIdsSortedAsc(&.{ 1, 2, 2, 5 }));
+    try std.testing.expect(!isVectorIdsSortedAsc(&.{ 1, 4, 3 }));
 }
 
 test "posting base format round trips members" {
