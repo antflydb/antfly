@@ -272,6 +272,78 @@ func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientAcquireFenceUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != HAFencePath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAFencePath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if !strings.Contains(got, `"old_primary_id":"primary-a"`) ||
+			!strings.Contains(got, `"promoted_node_id":"standby-a"`) ||
+			!strings.Contains(got, `"required_lsn":12`) ||
+			!strings.Contains(got, `"observed_lsn":12`) ||
+			!strings.Contains(got, `"new_timeline_id":5`) ||
+			!strings.Contains(got, `"reason":"LeaseAcquired"`) {
+			t.Fatalf("fence acquire body = %s, want primary, standby, LSN, timeline, and reason", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haFenceAcquireResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.WithToken("test-token").AcquireFence(context.Background(), FenceAcquireRequest{
+		Identity: HAIdentity{
+			ClusterId:  100,
+			ShardId:    10,
+			TableId:    20,
+			TimelineId: 4,
+			Epoch:      6,
+		},
+		OldPrimaryId:   "primary-a",
+		PromotedNodeId: "standby-a",
+		NewTimelineId:  5,
+		NewEpoch:       7,
+		RequiredLsn:    12,
+		ObservedLsn:    12,
+		Reason:         "LeaseAcquired",
+	})
+	if err != nil {
+		t.Fatalf("AcquireFence returned error: %v", err)
+	}
+	if resp.Action.ActionKind != HAActionKindFenceAcquire || resp.Action.NodeId != "standby-a" {
+		t.Fatalf("fence action = %#v, want standby fence acquisition receipt", resp.Action)
+	}
+	if resp.Receipt.Generation != 3 ||
+		resp.Receipt.Token != "ha-fence-token" ||
+		resp.Receipt.Identity.TimelineId != 5 ||
+		resp.Receipt.ParentTimelineId != 4 ||
+		resp.Receipt.ObservedLsn != 12 {
+		t.Fatalf("fence receipt = %#v, want promoted timeline fence evidence", resp.Receipt)
+	}
+}
+
 func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
@@ -2260,6 +2332,40 @@ func haStandbyBootstrapResponseJSON() string {
 		"manifest_id":"manifest-a",
 		"backup_lsn":7,
 		"checkpoint_lsn":10
+	}`
+}
+
+func haFenceAcquireResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"fence_acquire:standby-a",
+			"action_kind":"fence_acquire",
+			"target":"standby-a",
+			"state":"applied",
+			"node_id":"standby-a"
+		},
+		"receipt":{
+			"identity":{
+				"cluster_id":100,
+				"shard_id":10,
+				"table_id":20,
+				"timeline_id":5,
+				"epoch":7
+			},
+			"old_primary_id":"primary-a",
+			"promoted_node_id":"standby-a",
+			"parent_timeline_id":4,
+			"parent_epoch":6,
+			"new_timeline_id":5,
+			"new_epoch":7,
+			"required_lsn":12,
+			"observed_lsn":12,
+			"generation":3,
+			"forced":false,
+			"token":"ha-fence-token",
+			"reason":"LeaseAcquired"
+		}
 	}`
 }
 
