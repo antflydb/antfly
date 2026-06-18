@@ -87,7 +87,7 @@ pub const Server = struct {
 
     pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const path = requestPath(req.uri);
-        if (isTypedAdminRoute(path) and !self.authorized(req)) {
+        if (isAdminAuthRequired(path) and !self.authorized(req)) {
             return try textResponse(self.alloc, 401, "unauthorized");
         }
         switch (req.method) {
@@ -1322,6 +1322,10 @@ fn isTypedAdminRoute(path: []const u8) bool {
     return std.mem.startsWith(u8, path, admin_api.routes.ha) and knownRoute(path);
 }
 
+fn isAdminAuthRequired(path: []const u8) bool {
+    return std.mem.eql(u8, path, Routes.command) or isTypedAdminRoute(path);
+}
+
 fn generatedRoutePathAlloc(alloc: Allocator, generated_path: []const u8) ![]u8 {
     const slot_param = "{slot_name}";
     if (std.mem.indexOf(u8, generated_path, slot_param)) |idx| {
@@ -2525,6 +2529,16 @@ test "storage.ha http admin enforces optional bearer token on typed admin routes
     defer health.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), health.status);
 
+    var command_missing = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"identify\"]}",
+    });
+    defer command_missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), command_missing.status);
+    try expectContains(command_missing.body, "unauthorized");
+
     var missing = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
     defer missing.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 401), missing.status);
@@ -2537,6 +2551,17 @@ test "storage.ha http admin enforces optional bearer token on typed admin routes
     });
     defer wrong.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 401), wrong.status);
+
+    var command_authorized = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .authorization = "Bearer secret-token",
+        .body = "{\"argv\":[\"identify\"]}",
+    });
+    defer command_authorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), command_authorized.status);
+    try expectContains(command_authorized.body, "PrimaryUnavailable");
 
     var authorized = try server.handle(.{
         .method = .GET,

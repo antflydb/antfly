@@ -2015,9 +2015,11 @@ test "storage.ha http client maps admin errors" {
     defer auth_server.deinit();
     var unauthenticated_client = Client.init(alloc, auth_server.executor());
     try std.testing.expectError(error.HaAdminUnauthorized, unauthenticated_client.getPrimaryStatus("http://ha-admin.test", .{}));
+    try std.testing.expectError(error.HaAdminUnauthorized, unauthenticated_client.executeCommand("http://ha-admin.test", &.{"identify"}));
 
     var authenticated_client = Client.initWithOptions(alloc, auth_server.executor(), .{ .bearer_token = "secret-token" });
     try std.testing.expectError(error.HaCommandConflict, authenticated_client.getPrimaryStatus("http://ha-admin.test", .{}));
+    try std.testing.expectError(error.HaCommandConflict, authenticated_client.executeCommand("http://ha-admin.test", &.{"identify"}));
 }
 
 test "storage.ha http client renders primary status sync query with OpenAPI enum spelling" {
