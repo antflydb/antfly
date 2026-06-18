@@ -2148,6 +2148,9 @@ func (c *HAClient) PrimaryStatusParsedResponse(ctx context.Context, params *HAPr
 	if err := requireHA2xx("get HA primary status", resp.StatusCode(), resp.Body, err); err != nil {
 		return nil, err
 	}
+	if err := validateDirectHAPrimaryStatusEvidence(resp.Body); err != nil {
+		return nil, fmt.Errorf("parse HA primary status: %w", err)
+	}
 	parsed, err := ParseHAPrimaryStatus(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("parse HA primary status: %w", err)
@@ -2182,6 +2185,9 @@ func (c *HAClient) StandbyStatusParsedResponse(ctx context.Context, params *HASt
 	}
 	if err := requireHA2xx("get HA standby status", resp.StatusCode(), resp.Body, err); err != nil {
 		return nil, err
+	}
+	if err := validateDirectHAStandbyStatusEvidence(resp.Body); err != nil {
+		return nil, fmt.Errorf("parse HA standby status: %w", err)
 	}
 	parsed, err := ParseHAStandbyStatus(resp.Body)
 	if err != nil {

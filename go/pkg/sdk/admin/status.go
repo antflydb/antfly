@@ -344,6 +344,17 @@ func ValidateHAPrimaryStatusResponseEvidence(raw []byte) error {
 	return nil
 }
 
+func validateDirectHAPrimaryStatusEvidence(raw []byte) error {
+	var direct haPrimaryStatusEnvelopeJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
+		return err
+	}
+	if direct.Snapshot == nil {
+		return nil
+	}
+	return ValidateHAPrimaryStatusResponseEvidence(raw)
+}
+
 func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionStatusJSON, slotCount int) error {
 	primaryLSN := haUint64StatusValue(retention.PrimaryLSN)
 	oldestRestartLSN := haUint64StatusValue(retention.OldestRestartLSN)
@@ -520,6 +531,17 @@ func ValidateHAStandbyStatusResponseEvidence(raw []byte) error {
 		return fmt.Errorf("missing standby status progress field evidence")
 	}
 	return nil
+}
+
+func validateDirectHAStandbyStatusEvidence(raw []byte) error {
+	var direct haStandbyStatusEnvelopeJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
+		return err
+	}
+	if direct.Snapshot == nil {
+		return nil
+	}
+	return ValidateHAStandbyStatusResponseEvidence(raw)
 }
 
 func haStandbyStatusJSONConsistent(snapshot *haStandbyStatusJSON) error {
