@@ -12990,8 +12990,6 @@ test "api http server query builder requires table read permission when auth is 
     try std.testing.expectEqual(@as(u16, 200), a2a_allowed.status);
     try std.testing.expect(std.mem.indexOf(u8, a2a_allowed.body, "\"state\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, a2a_allowed.body, "\"name\":\"query\"") != null);
-    server.a2a_tasks.deinit(alloc);
-    server.a2a_tasks = a2a.InMemoryTaskStore.init(alloc);
 }
 
 test "api http server a2a retrieval enforces delegated table read permission" {
@@ -13067,8 +13065,6 @@ test "api http server a2a retrieval enforces delegated table read permission" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "forbidden") != null);
-    server.a2a_tasks.deinit(alloc);
-    server.a2a_tasks = a2a.InMemoryTaskStore.init(alloc);
 }
 
 test "api http server restricts runtime schema debug to admins when auth is enabled" {
