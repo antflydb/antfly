@@ -83,6 +83,102 @@ pub const DropEnumTypePlan = struct {
     }
 };
 
+pub const SchemaNamespaceCatalogPlan = union(enum) {
+    create: CreateSchemaNamespacePlan,
+    rename: RenameSchemaNamespacePlan,
+    drop: DropSchemaNamespacePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .rename => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateSchemaNamespacePlan = struct {
+    schema_name: []const u8,
+    if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_name);
+        self.* = undefined;
+    }
+};
+
+pub const RenameSchemaNamespacePlan = struct {
+    schema_name: []const u8,
+    new_schema_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_name);
+        alloc.free(self.new_schema_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropSchemaNamespacePlan = struct {
+    schema_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_name);
+        self.* = undefined;
+    }
+};
+
+pub const ExtensionCatalogPlan = union(enum) {
+    create: CreateExtensionPlan,
+    update: UpdateExtensionPlan,
+    drop: DropExtensionPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .update => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateExtensionPlan = struct {
+    extension_name: []const u8,
+    version: ?[]const u8 = null,
+    if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.extension_name);
+        if (self.version) |version| alloc.free(version);
+        self.* = undefined;
+    }
+};
+
+pub const UpdateExtensionPlan = struct {
+    extension_name: []const u8,
+    target_version: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.extension_name);
+        if (self.target_version) |version| alloc.free(version);
+        self.* = undefined;
+    }
+};
+
+pub const DropExtensionPlan = struct {
+    extension_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.extension_name);
+        self.* = undefined;
+    }
+};
+
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
@@ -115,4 +211,27 @@ test "SQL adapter DDL enum plans own nested values" {
         .cascade = true,
     } };
     drop.deinit(alloc);
+}
+
+test "SQL adapter DDL namespace and extension plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var rename_schema: SchemaNamespaceCatalogPlan = .{ .rename = .{
+        .schema_name = try alloc.dupe(u8, "public"),
+        .new_schema_name = try alloc.dupe(u8, "app"),
+    } };
+    rename_schema.deinit(alloc);
+
+    var create_extension: ExtensionCatalogPlan = .{ .create = .{
+        .extension_name = try alloc.dupe(u8, "pgcrypto"),
+        .version = try alloc.dupe(u8, "1.3"),
+        .if_not_exists = true,
+    } };
+    create_extension.deinit(alloc);
+
+    var update_extension: ExtensionCatalogPlan = .{ .update = .{
+        .extension_name = try alloc.dupe(u8, "pgcrypto"),
+        .target_version = try alloc.dupe(u8, "1.4"),
+    } };
+    update_extension.deinit(alloc);
 }

@@ -152,6 +152,14 @@ pub const CreateEnumTypePlan = sql_adapter.CreateEnumTypePlan;
 pub const AddEnumValuePlan = sql_adapter.AddEnumValuePlan;
 pub const EnumValuePosition = sql_adapter.EnumValuePosition;
 pub const DropEnumTypePlan = sql_adapter.DropEnumTypePlan;
+pub const SchemaNamespaceCatalogPlan = sql_adapter.SchemaNamespaceCatalogPlan;
+pub const CreateSchemaNamespacePlan = sql_adapter.CreateSchemaNamespacePlan;
+pub const RenameSchemaNamespacePlan = sql_adapter.RenameSchemaNamespacePlan;
+pub const DropSchemaNamespacePlan = sql_adapter.DropSchemaNamespacePlan;
+pub const ExtensionCatalogPlan = sql_adapter.ExtensionCatalogPlan;
+pub const CreateExtensionPlan = sql_adapter.CreateExtensionPlan;
+pub const UpdateExtensionPlan = sql_adapter.UpdateExtensionPlan;
+pub const DropExtensionPlan = sql_adapter.DropExtensionPlan;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -436,53 +444,6 @@ pub const IdentityAllocatorSpec = struct {
     }
 };
 
-pub const SchemaNamespaceCatalogPlan = union(enum) {
-    create: CreateSchemaNamespacePlan,
-    rename: RenameSchemaNamespacePlan,
-    drop: DropSchemaNamespacePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .rename => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateSchemaNamespacePlan = struct {
-    schema_name: []const u8,
-    if_not_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.schema_name);
-        self.* = undefined;
-    }
-};
-
-pub const RenameSchemaNamespacePlan = struct {
-    schema_name: []const u8,
-    new_schema_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.schema_name);
-        alloc.free(self.new_schema_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropSchemaNamespacePlan = struct {
-    schema_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.schema_name);
-        self.* = undefined;
-    }
-};
-
 pub const DatabaseCatalogPlan = union(enum) {
     create: CreateDatabasePlan,
     alter: AlterDatabasePlan,
@@ -494,55 +455,6 @@ pub const DatabaseCatalogPlan = union(enum) {
             .alter => |*plan| plan.deinit(alloc),
             .drop => |*plan| plan.deinit(alloc),
         }
-        self.* = undefined;
-    }
-};
-
-pub const ExtensionCatalogPlan = union(enum) {
-    create: CreateExtensionPlan,
-    update: UpdateExtensionPlan,
-    drop: DropExtensionPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .update => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateExtensionPlan = struct {
-    extension_name: []const u8,
-    version: ?[]const u8 = null,
-    if_not_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.extension_name);
-        if (self.version) |version| alloc.free(version);
-        self.* = undefined;
-    }
-};
-
-pub const UpdateExtensionPlan = struct {
-    extension_name: []const u8,
-    target_version: ?[]const u8 = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.extension_name);
-        if (self.target_version) |version| alloc.free(version);
-        self.* = undefined;
-    }
-};
-
-pub const DropExtensionPlan = struct {
-    extension_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.extension_name);
         self.* = undefined;
     }
 };
