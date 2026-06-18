@@ -2728,6 +2728,13 @@ fn bulkIoDirectionFromSyntax(syntax: sql_adapter.BulkIoDirectionSyntax) BulkIoDi
     };
 }
 
+fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) sql_adapter.PrivilegeChangeActionSyntax {
+    return switch (action) {
+        .grant => .grant,
+        .revoke => .revoke,
+    };
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3286,29 +3293,22 @@ const Parser = struct {
     }
 
     fn parseCreateRoleDdl(self: *@This()) !CreateRolePlan {
-        try self.expectKeyword("role");
-        const role_name = try self.parseIdentifierOwned();
-        errdefer self.alloc.free(role_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseCreateRoleCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const role_name = syntax.role_name;
+        syntax.role_name = "";
         return .{ .role_name = role_name };
     }
 
     fn parseAlterRoleDdl(self: *@This()) !AlterRolePlan {
-        try self.expectKeyword("role");
-        const role_name = try self.parseIdentifierOwned();
-        errdefer self.alloc.free(role_name);
-        try self.expectKeyword("set");
-        const setting_name = try self.parseIdentifierOwned();
-        errdefer self.alloc.free(setting_name);
-        try self.expect(.eq);
-        if (self.atEnd() or self.peekKind(.semicolon)) return error.UnsupportedSqlShape;
-        const setting_value_token = self.tokens[self.pos];
-        self.pos += 1;
-        const setting_value = try self.alloc.dupe(u8, setting_value_token.text);
-        errdefer self.alloc.free(setting_value);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseAlterRoleCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const role_name = syntax.role_name;
+        const setting_name = syntax.setting_name;
+        const setting_value = syntax.setting_value;
+        syntax.role_name = "";
+        syntax.setting_name = "";
+        syntax.setting_value = "";
         return .{
             .role_name = role_name,
             .setting_name = setting_name,
@@ -3317,72 +3317,33 @@ const Parser = struct {
     }
 
     fn parseDropRoleDdl(self: *@This()) !DropRolePlan {
-        try self.expectKeyword("role");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const role_name = try self.parseIdentifierOwned();
-        errdefer self.alloc.free(role_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        return .{ .role_name = role_name, .if_exists = if_exists };
-    }
-
-    fn parsePrivilegeListAlloc(self: *@This()) ![]const []const u8 {
-        var privileges = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            freeStringSlice(self.alloc, privileges.items);
-            privileges.deinit(self.alloc);
-        }
-        while (true) {
-            if (self.peekKeyword("on")) break;
-            const privilege = try self.parseIdentifierOwned();
-            try privileges.append(self.alloc, privilege);
-            if (std.ascii.eqlIgnoreCase(privilege, "all")) _ = self.matchKeyword("privileges");
-            if (self.match(.comma) != null) continue;
-            break;
-        }
-        if (privileges.items.len == 0) return error.UnsupportedSqlShape;
-        return try privileges.toOwnedSlice(self.alloc);
+        var syntax = try sql_adapter.parseDropRoleCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const role_name = syntax.role_name;
+        syntax.role_name = "";
+        return .{ .role_name = role_name, .if_exists = syntax.if_exists };
     }
 
     fn parsePrivilegeChangeDdl(self: *@This(), action: PrivilegeChangeAction) !PrivilegeChangePlan {
-        const privileges = try self.parsePrivilegeListAlloc();
-        errdefer freeStringSlice(self.alloc, privileges);
-        try self.expectKeyword("on");
-        var object_kind: ?[]const u8 = null;
-        var object_kind_transferred = false;
-        errdefer if (!object_kind_transferred) if (object_kind) |value| self.alloc.free(value);
-        var object_name: ?[]const u8 = null;
-        var object_name_transferred = false;
-        errdefer if (!object_name_transferred) if (object_name) |value| self.alloc.free(value);
-
-        if (self.matchKeyword("all")) {
-            try self.expectKeyword("tables");
-            try self.expectKeyword("in");
-            try self.expectKeyword("schema");
-            object_kind = try self.alloc.dupe(u8, "ALL_TABLES_IN_SCHEMA");
-            object_name = try self.parseSqlObjectIdentifierOwned();
-        } else {
-            object_kind = try self.parseIdentifierOwned();
-            object_name = try self.parseSqlObjectIdentifierOwned();
-        }
-        switch (action) {
-            .grant => try self.expectKeyword("to"),
-            .revoke => try self.expectKeyword("from"),
-        }
-        const principal_name = try self.parseIdentifierOwned();
-        errdefer self.alloc.free(principal_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        object_kind_transferred = true;
-        object_name_transferred = true;
+        var syntax = try sql_adapter.parsePrivilegeChangeTailAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            privilegeChangeActionToSyntax(action),
+        );
+        errdefer syntax.deinit(self.alloc);
+        const privileges = syntax.privileges;
+        const object_kind = syntax.object_kind;
+        const object_name = syntax.object_name;
+        const principal_name = syntax.principal_name;
+        syntax.privileges = &.{};
+        syntax.object_kind = "";
+        syntax.object_name = "";
+        syntax.principal_name = "";
         return .{
             .privileges = privileges,
-            .object_kind = object_kind.?,
-            .object_name = object_name.?,
+            .object_kind = object_kind,
+            .object_name = object_name,
             .principal_name = principal_name,
         };
     }
