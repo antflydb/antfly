@@ -38,6 +38,7 @@ pub const lake_explain_query = @import("serverless/query/lake_explain.zig");
 pub const lake_cache_query = @import("serverless/query/lake_cache.zig");
 pub const lake_range_io = @import("serverless/query/lake_range_io.zig");
 pub const lake_parquet_footer = @import("serverless/query/lake_parquet_footer.zig");
+pub const lake_parquet_metadata = @import("serverless/query/lake_parquet_metadata.zig");
 pub const lake_scan_plan = @import("serverless/query/lake_scan_plan.zig");
 pub const sidecar_source_binding = @import("serverless/segment/source_binding.zig");
 pub const sidecar_manifest = @import("serverless/segment/sidecar_manifest.zig");
@@ -70,6 +71,7 @@ test {
     _ = lake_cache_query;
     _ = lake_range_io;
     _ = lake_parquet_footer;
+    _ = lake_parquet_metadata;
     _ = lake_scan_plan;
     _ = sidecar_source_binding;
     _ = sidecar_manifest;

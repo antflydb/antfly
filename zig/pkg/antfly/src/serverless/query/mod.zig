@@ -26,6 +26,7 @@ pub const lake_explain = @import("lake_explain.zig");
 pub const lake_cache = @import("lake_cache.zig");
 pub const lake_range_io = @import("lake_range_io.zig");
 pub const lake_parquet_footer = @import("lake_parquet_footer.zig");
+pub const lake_parquet_metadata = @import("lake_parquet_metadata.zig");
 pub const lake_scan_plan = @import("lake_scan_plan.zig");
 
 pub const QueryRuntime = runtime.QueryRuntime;
@@ -82,6 +83,7 @@ pub const LakeByteRange = lake_range_io.ByteRange;
 pub const LakeRangeRead = lake_range_io.RangeRead;
 pub const LakeRangeCoalesceOptions = lake_range_io.CoalesceOptions;
 pub const LakeParquetFooterPreflight = lake_parquet_footer.FooterPreflight;
+pub const LakeParquetParsedFooter = lake_parquet_metadata.ParsedFooter;
 pub const LakeScanPlanRequest = lake_scan_plan.Request;
 pub const LakeScanPlan = lake_scan_plan.Plan;
 pub const accountLakeCacheArtifacts = lake_cache.accountArtifacts;
@@ -92,6 +94,7 @@ pub const planLakeColumnChunkRead = lake_range_io.planColumnChunkRead;
 pub const coalesceLakePhysicalReadsAlloc = lake_range_io.coalescePhysicalReadsAlloc;
 pub const parseLakeParquetFooterPreflight = lake_parquet_footer.parseFooterPreflight;
 pub const planLakeParquetFooterMetadataRead = lake_parquet_footer.planFooterMetadataRead;
+pub const parseLakeParquetMetadataAlloc = lake_parquet_metadata.parseFooterMetadataAlloc;
 pub const planProjectedLakeScanAlloc = lake_scan_plan.planProjectedScanAlloc;
 pub const validateLakeBindingInventory = lake_scan_plan.validateBindingInventory;
 pub const executeLakeRowsGroupByAlloc = lake_rows.executeGroupByAlloc;
@@ -125,6 +128,7 @@ test "serverless query module compiles" {
     _ = lake_cache;
     _ = lake_range_io;
     _ = lake_parquet_footer;
+    _ = lake_parquet_metadata;
     _ = lake_scan_plan;
     _ = QueryRuntime;
     _ = QuerySession;
@@ -180,6 +184,7 @@ test "serverless query module compiles" {
     _ = LakeRangeRead;
     _ = LakeRangeCoalesceOptions;
     _ = LakeParquetFooterPreflight;
+    _ = LakeParquetParsedFooter;
     _ = LakeScanPlanRequest;
     _ = LakeScanPlan;
     _ = accountLakeCacheArtifacts;
@@ -190,6 +195,7 @@ test "serverless query module compiles" {
     _ = coalesceLakePhysicalReadsAlloc;
     _ = parseLakeParquetFooterPreflight;
     _ = planLakeParquetFooterMetadataRead;
+    _ = parseLakeParquetMetadataAlloc;
     _ = planProjectedLakeScanAlloc;
     _ = validateLakeBindingInventory;
     _ = executeLakeRowsGroupByAlloc;
