@@ -2108,7 +2108,7 @@ func (c *HAClient) StandbyStatus(ctx context.Context, params *HAStandbyStatusPar
 	return haResponseValue(c.StandbyStatusResponse(ctx, params))
 }
 
-func (c *HAClient) StandbyStatusParsedResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[HAStandbyStatusResponse], error) {
+func (c *HAClient) StandbyStatusParsedResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[ParsedHAStandbyStatus], error) {
 	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2120,14 +2120,14 @@ func (c *HAClient) StandbyStatusParsedResponse(ctx context.Context, params *HASt
 	if err != nil {
 		return nil, fmt.Errorf("parse HA standby status: %w", err)
 	}
-	return &HAResponse[HAStandbyStatusResponse]{
+	return &HAResponse[ParsedHAStandbyStatus]{
 		Value:      parsed,
 		Body:       resp.Body,
 		StatusCode: resp.StatusCode(),
 	}, nil
 }
 
-func (c *HAClient) StandbyStatusParsed(ctx context.Context, params *HAStandbyStatusParams) (*HAStandbyStatusResponse, error) {
+func (c *HAClient) StandbyStatusParsed(ctx context.Context, params *HAStandbyStatusParams) (*ParsedHAStandbyStatus, error) {
 	return haResponseValue(c.StandbyStatusParsedResponse(ctx, params))
 }
 

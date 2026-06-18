@@ -98,6 +98,8 @@ type ParsedHAPrimaryStatus struct {
 	HasDurability bool
 }
 
+type ParsedHAStandbyStatus = HAStandbyStatusResponse
+
 // ParseHAPrimaryStatus validates a primary status body and returns the
 // generated OpenAPI response model. It accepts the current /admin/v1 shape and
 // the older CLI compatibility envelope used by existing operator tests.
@@ -211,7 +213,7 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 // ParseHAStandbyStatus validates a standby status body and returns the
 // generated OpenAPI response model. It accepts the current /admin/v1 shape and
 // the older CLI compatibility envelope used by existing operator tests.
-func ParseHAStandbyStatus(raw []byte) (*HAStandbyStatusResponse, error) {
+func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 	var direct haStandbyStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return nil, err

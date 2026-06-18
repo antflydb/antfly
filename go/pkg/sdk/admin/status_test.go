@@ -272,6 +272,41 @@ func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 	}
 }
 
+func TestHAClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAStandbyStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyStatusPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haLegacyStandbyStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	response, err := client.StandbyStatusParsedResponse(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("StandbyStatusParsedResponse returned error: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if len(response.Body) == 0 {
+		t.Fatalf("Body is empty, want raw response body")
+	}
+	var parsed *ParsedHAStandbyStatus = response.Value
+	if parsed.Snapshot.ReceivedLsn != 12 || parsed.Snapshot.AppliedLsn != 11 || !parsed.Snapshot.CanServeSafeReads {
+		t.Fatalf("parsed response = %+v, want received=12 applied=11 safe reads", parsed)
+	}
+}
+
 func TestHAClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) {
 	t.Parallel()
 
