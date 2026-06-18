@@ -15,13 +15,14 @@
 //! Iceberg Avro manifest-list planning.
 //!
 //! This is a deliberately small Avro Object Container File reader for the
-//! Iceberg manifest-list boundary. It supports uncompressed and deflate OCF
-//! blocks plus a schema-driven subset of primitive/nullable Avro fields so the
-//! next planner step can expand manifest-list rows into manifest files without
-//! inventing a JSON-only test format.
+//! Iceberg manifest-list boundary. It supports uncompressed, deflate, and
+//! snappy OCF blocks plus a schema-driven subset of primitive/nullable Avro
+//! fields so the next planner step can expand manifest-list rows into manifest
+//! files without inventing a JSON-only test format.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const snappy = @import("../../encoding/snappy.zig");
 
 pub const ManifestContent = enum(u8) {
     data = 0,
@@ -322,6 +323,7 @@ fn decodeZigzag(raw: u64) ?i64 {
 const AvroCodec = enum {
     null,
     deflate,
+    snappy,
 };
 
 const OcfMetadata = struct {
@@ -379,6 +381,7 @@ fn readMetadataMapAlloc(alloc: Allocator, reader: *Reader) !OcfMetadata {
 fn parseAvroCodec(value: []const u8) !AvroCodec {
     if (std.mem.eql(u8, value, "null")) return .null;
     if (std.mem.eql(u8, value, "deflate")) return .deflate;
+    if (std.mem.eql(u8, value, "snappy")) return .snappy;
     return error.UnsupportedAvroCodec;
 }
 
@@ -397,6 +400,16 @@ fn decodeBlockAlloc(
             var decompress: std.compress.flate.Decompress = .init(&in, .raw, &window);
             _ = try decompress.reader.streamRemaining(&out.writer);
             const decoded = try out.toOwnedSlice();
+            break :blk .{ .bytes = decoded, .owned = decoded };
+        },
+        .snappy => blk: {
+            if (encoded_block.len < 4) return error.InvalidAvroContainer;
+            const checksum_start = encoded_block.len - 4;
+            const compressed = encoded_block[0..checksum_start];
+            const expected_crc = std.mem.readInt(u32, encoded_block[checksum_start..][0..4], .big);
+            const decoded = try snappy.decode(alloc, compressed);
+            errdefer alloc.free(decoded);
+            if (std.hash.Crc32.hash(decoded) != expected_crc) return error.AvroBlockChecksumMismatch;
             break :blk .{ .bytes = decoded, .owned = decoded };
         },
     };
@@ -1049,9 +1062,22 @@ test "iceberg avro manifest-list decoder reads deflate blocks" {
     try std.testing.expectEqual(ManifestContent.deletes, list.entries[1].content);
 }
 
-test "iceberg avro manifest-list decoder rejects unsupported codec" {
+test "iceberg avro manifest-list decoder reads snappy blocks" {
     const alloc = std.testing.allocator;
     var fixture = try buildManifestListFixture(alloc, "snappy", true);
+    defer fixture.deinit(alloc);
+
+    var list = try parseManifestListAlloc(alloc, fixture.items);
+    defer list.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), list.entries.len);
+    try std.testing.expectEqualStrings("s3://bucket/t/metadata/m0.avro", list.entries[0].manifest_path);
+    try std.testing.expectEqual(ManifestContent.deletes, list.entries[1].content);
+}
+
+test "iceberg avro manifest-list decoder rejects unsupported codec" {
+    const alloc = std.testing.allocator;
+    var fixture = try buildManifestListFixture(alloc, "zstandard", true);
     defer fixture.deinit(alloc);
 
     try std.testing.expectError(error.UnsupportedAvroCodec, parseManifestListAlloc(alloc, fixture.items));
@@ -1112,9 +1138,31 @@ test "iceberg avro data-manifest decoder reads deflate blocks" {
     try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", manifest.entries[1].file_path);
 }
 
-test "iceberg avro data-manifest decoder rejects unsupported codec" {
+test "iceberg avro data-manifest decoder reads snappy blocks" {
     const alloc = std.testing.allocator;
     var fixture = try buildDataManifestFixture(alloc, "snappy", "PARQUET", 7);
+    defer fixture.deinit(alloc);
+
+    var manifest = try parseDataManifestAlloc(alloc, fixture.items);
+    defer manifest.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), manifest.entries.len);
+    try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", manifest.entries[0].file_path);
+    try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", manifest.entries[1].file_path);
+}
+
+test "iceberg avro data-manifest decoder rejects snappy checksum mismatch" {
+    const alloc = std.testing.allocator;
+    var fixture = try buildDataManifestFixture(alloc, "snappy", "PARQUET", 7);
+    defer fixture.deinit(alloc);
+
+    fixture.items[fixture.items.len - 17] ^= 0x01;
+    try std.testing.expectError(error.AvroBlockChecksumMismatch, parseDataManifestAlloc(alloc, fixture.items));
+}
+
+test "iceberg avro data-manifest decoder rejects unsupported codec" {
+    const alloc = std.testing.allocator;
+    var fixture = try buildDataManifestFixture(alloc, "zstandard", "PARQUET", 7);
     defer fixture.deinit(alloc);
 
     try std.testing.expectError(error.UnsupportedAvroCodec, parseDataManifestAlloc(alloc, fixture.items));
@@ -1242,6 +1290,15 @@ fn encodeFixtureBlockAlloc(
         try compressor.finish();
         const compressed = try alloc.dupe(u8, out.buffered());
         return .{ .bytes = compressed, .owned = compressed };
+    }
+    if (std.mem.eql(u8, codec, "snappy")) {
+        const compressed = try snappy.encode(alloc, block);
+        defer alloc.free(compressed);
+        const encoded = try alloc.alloc(u8, compressed.len + 4);
+        errdefer alloc.free(encoded);
+        @memcpy(encoded[0..compressed.len], compressed);
+        std.mem.writeInt(u32, encoded[compressed.len..][0..4], std.hash.Crc32.hash(block), .big);
+        return .{ .bytes = encoded, .owned = encoded };
     }
     return .{ .bytes = block };
 }
