@@ -2157,6 +2157,67 @@ func TestValidateCreate_HighAvailabilityRejectsWhitespaceFormerPrimaryLogPath(t 
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsPaddedRuntimePaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:                 HARuntimeRolePrimary,
+			NodeID:               "primary-a",
+			FencePath:            " /antflydb/ha/fence.wal ",
+			FormerPrimaryLogPath: " /antflydb/ha/primary.wal ",
+			Primary: &HAPrimaryRuntimeSpec{
+				LogPath:   " /antflydb/ha/primary.wal ",
+				SlotsPath: " /antflydb/ha/slots ",
+			},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded HA primary runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.primary.logPath must not have leading or trailing whitespace",
+		"runtime.primary.slotsPath must not have leading or trailing whitespace",
+		"runtime.fencePath must not have leading or trailing whitespace",
+		"runtime.formerPrimaryLogPath must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "primary-a"
+	cluster.Spec.HighAvailability.Runtime = &HARuntimeSpec{
+		Role:      HARuntimeRoleStandby,
+		NodeID:    "standby-a",
+		FencePath: "/antflydb/ha/fence.wal",
+		Standby: &HAStandbyRuntimeSpec{
+			LogPath:      " /antflydb/ha/standby.wal ",
+			ProgressPath: " /antflydb/ha/progress.wal ",
+		},
+	}
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded HA standby runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.standby.logPath must not have leading or trailing whitespace",
+		"runtime.standby.progressPath must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsInvalidRuntimeAdminTokenEnvVar(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

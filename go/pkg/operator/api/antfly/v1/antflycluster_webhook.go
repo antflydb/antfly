@@ -1375,12 +1375,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 			errors = append(errors, "spec.highAvailability.runtime.standby may only be set when runtime.role is Standby")
 		}
 		if primary := runtime.Primary; primary != nil {
-			if strings.TrimSpace(primary.LogPath) == "" && primary.LogPath != "" {
-				errors = append(errors, "spec.highAvailability.runtime.primary.logPath must not be whitespace")
-			}
-			if strings.TrimSpace(primary.SlotsPath) == "" && primary.SlotsPath != "" {
-				errors = append(errors, "spec.highAvailability.runtime.primary.slotsPath must not be whitespace")
-			}
+			errors = append(errors, validateHAOptionalTrimmedString(primary.LogPath, "spec.highAvailability.runtime.primary.logPath")...)
+			errors = append(errors, validateHAOptionalTrimmedString(primary.SlotsPath, "spec.highAvailability.runtime.primary.slotsPath")...)
 		}
 	case HARuntimeRoleStandby:
 		if nodeID != "" && currentPrimaryID != "" && nodeID == currentPrimaryID {
@@ -1390,12 +1386,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 			errors = append(errors, "spec.highAvailability.runtime.primary may only be set when runtime.role is Primary")
 		}
 		if standby := runtime.Standby; standby != nil {
-			if strings.TrimSpace(standby.LogPath) == "" && standby.LogPath != "" {
-				errors = append(errors, "spec.highAvailability.runtime.standby.logPath must not be whitespace")
-			}
-			if strings.TrimSpace(standby.ProgressPath) == "" && standby.ProgressPath != "" {
-				errors = append(errors, "spec.highAvailability.runtime.standby.progressPath must not be whitespace")
-			}
+			errors = append(errors, validateHAOptionalTrimmedString(standby.LogPath, "spec.highAvailability.runtime.standby.logPath")...)
+			errors = append(errors, validateHAOptionalTrimmedString(standby.ProgressPath, "spec.highAvailability.runtime.standby.progressPath")...)
 			errors = append(errors, validateHAAdminURL(standby.UpstreamURL, "spec.highAvailability.runtime.standby.upstreamURL")...)
 			slotName := strings.TrimSpace(standby.SlotName)
 			upstreamURL := strings.TrimSpace(standby.UpstreamURL)
@@ -1419,12 +1411,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	} else if runtime.NodeID != nodeID {
 		errors = append(errors, "spec.highAvailability.runtime.nodeID must not have leading or trailing whitespace")
 	}
-	if strings.TrimSpace(runtime.FencePath) == "" && runtime.FencePath != "" {
-		errors = append(errors, "spec.highAvailability.runtime.fencePath must not be whitespace")
-	}
-	if strings.TrimSpace(runtime.FormerPrimaryLogPath) == "" && runtime.FormerPrimaryLogPath != "" {
-		errors = append(errors, "spec.highAvailability.runtime.formerPrimaryLogPath must not be whitespace")
-	}
+	errors = append(errors, validateHAOptionalTrimmedString(runtime.FencePath, "spec.highAvailability.runtime.fencePath")...)
+	errors = append(errors, validateHAOptionalTrimmedString(runtime.FormerPrimaryLogPath, "spec.highAvailability.runtime.formerPrimaryLogPath")...)
 	if strings.TrimSpace(runtime.AdminTokenEnvVar) == "" && runtime.AdminTokenEnvVar != "" {
 		errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar must not be whitespace")
 	}
@@ -1459,6 +1447,20 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 		errors = append(errors, "spec.highAvailability.runtime requires spec.highAvailability.identity")
 	}
 	return errors
+}
+
+func validateHAOptionalTrimmedString(value string, fieldPath string) []string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		if value == "" {
+			return nil
+		}
+		return []string{fmt.Sprintf("%s must not be whitespace", fieldPath)}
+	}
+	if value != trimmed {
+		return []string{fmt.Sprintf("%s must not have leading or trailing whitespace", fieldPath)}
+	}
+	return nil
 }
 
 func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySpec) []string {
