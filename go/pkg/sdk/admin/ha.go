@@ -1982,6 +1982,27 @@ func (e *HAAPIError) Retryable() bool {
 	}
 }
 
+// HAStatusCode returns the HTTP status code for a wrapped HA admin API error.
+func HAStatusCode(err error) (int, bool) {
+	var apiErr *HAAPIError
+	if errors.As(err, &apiErr) && apiErr != nil {
+		return apiErr.StatusCode, true
+	}
+	return 0, false
+}
+
+// HAIsUnauthorized reports whether an HA admin API error was rejected by auth.
+func HAIsUnauthorized(err error) bool {
+	status, ok := HAStatusCode(err)
+	return ok && status == http.StatusUnauthorized
+}
+
+// HAIsConflict reports whether an HA admin API error hit an operation conflict.
+func HAIsConflict(err error) bool {
+	status, ok := HAStatusCode(err)
+	return ok && status == http.StatusConflict
+}
+
 // HAResponseValidationError describes a 2xx HA admin response that decoded but
 // did not satisfy the wrapper's typed response contract.
 type HAResponseValidationError struct {

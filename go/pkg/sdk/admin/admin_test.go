@@ -1716,6 +1716,17 @@ func TestHAClientReturnsStatusError(t *testing.T) {
 	if !strings.Contains(apiErr.Body, "not primary") {
 		t.Fatalf("Body = %q, want not primary", apiErr.Body)
 	}
+	wrapped := fmt.Errorf("operator context: %w", err)
+	status, ok := HAStatusCode(wrapped)
+	if !ok || status != http.StatusConflict {
+		t.Fatalf("HAStatusCode(wrapped) = %d, %t, want %d, true", status, ok, http.StatusConflict)
+	}
+	if !HAIsConflict(wrapped) {
+		t.Fatalf("HAIsConflict(wrapped) = false, want true")
+	}
+	if HAIsUnauthorized(wrapped) {
+		t.Fatalf("HAIsUnauthorized(wrapped) = true, want false")
+	}
 }
 
 func TestHAErrorRetryability(t *testing.T) {
@@ -1770,6 +1781,37 @@ func TestHAErrorRetryability(t *testing.T) {
 				t.Fatalf("HAIsRetryable(%T) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHAStatusHelpersClassifyWrappedErrors(t *testing.T) {
+	t.Parallel()
+
+	unauthorized := fmt.Errorf("direct admin call failed: %w", &HAAPIError{
+		Operation:  "get HA primary status",
+		StatusCode: http.StatusUnauthorized,
+		Body:       "missing bearer token",
+	})
+	if !HAIsUnauthorized(unauthorized) {
+		t.Fatal("HAIsUnauthorized(wrapped unauthorized) = false, want true")
+	}
+	if HAIsConflict(unauthorized) {
+		t.Fatal("HAIsConflict(wrapped unauthorized) = true, want false")
+	}
+	status, ok := HAStatusCode(unauthorized)
+	if !ok || status != http.StatusUnauthorized {
+		t.Fatalf("HAStatusCode(wrapped unauthorized) = %d, %t, want %d, true", status, ok, http.StatusUnauthorized)
+	}
+
+	validation := fmt.Errorf("missing evidence: %w", &HAResponseValidationError{
+		Operation: "create HA replication slot",
+		Err:       errors.New("missing action receipt"),
+	})
+	if _, ok := HAStatusCode(validation); ok {
+		t.Fatal("HAStatusCode(validation) returned true, want false")
+	}
+	if HAIsUnauthorized(validation) || HAIsConflict(validation) {
+		t.Fatal("status helpers classified validation error as HTTP API error")
 	}
 }
 
