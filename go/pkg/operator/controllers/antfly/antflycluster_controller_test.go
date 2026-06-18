@@ -5236,6 +5236,7 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 
 func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g := NewWithT(t)
+	t.Setenv("CUSTOM_HA_ADMIN_TOKEN", "operator-token")
 
 	var observedTypedURL string
 	reconciler := &AntflyClusterReconciler{
@@ -5243,6 +5244,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
 			g.Expect(req.Header.Get("Accept")).To(Equal("application/json"))
+			g.Expect(req.Header.Get("Authorization")).To(Equal("Bearer operator-token"))
 			observedTypedURL = req.URL.String()
 			query := req.URL.Query()
 			g.Expect(query.Get("max_lag_lsn")).To(Equal("50"))
@@ -5266,7 +5268,8 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 			HighAvailability: &antflyv1.HighAvailabilitySpec{
 				Mode: antflyv1.HAModeHotStandby,
 				Admin: &antflyv1.HAAdminSpec{
-					PrimaryURL: "http://primary-ha.default.svc:8081",
+					PrimaryURL:  "http://primary-ha.default.svc:8081",
+					TokenEnvVar: "CUSTOM_HA_ADMIN_TOKEN",
 				},
 				Retention: &antflyv1.HARetentionPolicy{MaxLagLSN: 50, MaxRetainedBytes: 4096, MaxRetainedAgeNS: 1000000},
 				SyncPolicy: &antflyv1.HASyncPolicy{
@@ -5760,12 +5763,14 @@ func TestObserveHAPrimaryAdminStatusRejectsPromotedTimelineWithoutCompleteReceip
 
 func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	g := NewWithT(t)
+	t.Setenv(haAdminTokenDefaultEnvVar, "default-operator-token")
 
 	var observedTypedURL string
 	reconciler := &AntflyClusterReconciler{
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
+			g.Expect(req.Header.Get("Authorization")).To(Equal("Bearer default-operator-token"))
 			g.Expect(req.URL.Query().Get("upstream_lsn")).To(Equal("13"))
 			observedTypedURL = req.URL.String()
 			body := `{"schema_version":1,"snapshot":{"role":"standby","node_id":"standby-a","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"upstream_lsn":13,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":2,"last_error":"ConnectionRefused","last_attempt_ns":1000,"last_success_ns":900,"replication_failures_total":3,"unapplied_lsn_count":1,"caught_up_to_received":false,"can_serve_safe_reads":true}}`
