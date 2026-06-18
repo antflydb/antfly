@@ -214,6 +214,24 @@ pub const ExecutionResult = struct {
     }
 };
 
+pub const ReconciledManifest = struct {
+    artifacts: []sidecar_manifest.DeclaredArtifact,
+
+    pub fn deinit(self: *ReconciledManifest, alloc: Allocator) void {
+        for (self.artifacts) |declaration| freeOwnedDeclaration(alloc, declaration);
+        alloc.free(self.artifacts);
+        self.* = undefined;
+    }
+
+    pub fn manifest(self: ReconciledManifest) sidecar_manifest.Manifest {
+        return .{ .artifacts = self.artifacts };
+    }
+
+    pub fn find(self: ReconciledManifest, name: []const u8) ?sidecar_manifest.DeclaredArtifact {
+        return self.manifest().find(name);
+    }
+};
+
 pub fn planAlloc(
     alloc: Allocator,
     desired: []const DesiredArtifact,
@@ -364,6 +382,64 @@ pub fn executeOperationsAlloc(
     }
 
     return .{ .operations = executed };
+}
+
+pub fn reconcileExecutedOperationsAlloc(
+    alloc: Allocator,
+    published: []const PublishedArtifact,
+    plan: OperationPlan,
+    executed: ExecutionResult,
+) !ReconciledManifest {
+    var declarations = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
+    errdefer {
+        for (declarations.items) |declaration| freeOwnedDeclaration(alloc, declaration);
+        declarations.deinit(alloc);
+    }
+
+    for (plan.operations) |operation| {
+        const result = executed.find(operation.name) orelse return error.InvalidLakeRebuildReconciliation;
+        if (result.action != operation.action) return error.InvalidLakeRebuildReconciliation;
+        switch (operation.action) {
+            .rebuild => {
+                const declaration = result.declaration orelse return error.InvalidLakeRebuildReconciliation;
+                try declaration.validate();
+                if (!std.mem.eql(u8, declaration.name, operation.name)) return error.InvalidLakeRebuildReconciliation;
+                if (!std.mem.eql(u8, declaration.artifact.artifact_id, result.artifact_id)) {
+                    return error.InvalidLakeRebuildReconciliation;
+                }
+                if (!bindingsEqual(declaration.binding, operation.binding)) return error.InvalidLakeRebuildReconciliation;
+                if (declaration.artifact.kind != operation.artifact_kind) return error.InvalidLakeRebuildReconciliation;
+                try declarations.append(alloc, try cloneDeclarationAlloc(alloc, declaration));
+            },
+            .reuse => {
+                const existing = findPublished(published, operation.name) orelse return error.InvalidLakeRebuildReconciliation;
+                try existing.binding.validate();
+                try validatePublishedArtifact(existing);
+                if (!std.mem.eql(u8, existing.artifact.artifact_id, operation.artifact_id)) {
+                    return error.InvalidLakeRebuildReconciliation;
+                }
+                if (!std.mem.eql(u8, result.artifact_id, operation.artifact_id)) {
+                    return error.InvalidLakeRebuildReconciliation;
+                }
+                if (!bindingsEqual(existing.binding, operation.binding)) return error.InvalidLakeRebuildReconciliation;
+                try declarations.append(alloc, try declarationFromPublishedAlloc(alloc, existing));
+            },
+            .drop => {
+                const existing = findPublished(published, operation.name) orelse return error.InvalidLakeRebuildReconciliation;
+                if (!std.mem.eql(u8, existing.artifact.artifact_id, operation.artifact_id)) {
+                    return error.InvalidLakeRebuildReconciliation;
+                }
+                if (!std.mem.eql(u8, result.artifact_id, operation.artifact_id)) {
+                    return error.InvalidLakeRebuildReconciliation;
+                }
+            },
+        }
+    }
+
+    const owned = try declarations.toOwnedSlice(alloc);
+    const reconciled = ReconciledManifest{ .artifacts = owned };
+    try reconciled.manifest().validate();
+    return reconciled;
 }
 
 fn findPublished(published: []const PublishedArtifact, name: []const u8) ?PublishedArtifact {
@@ -724,6 +800,52 @@ fn freeOwnedBuildSpec(alloc: Allocator, build_spec: *BuildSpec) void {
         },
     }
     build_spec.* = undefined;
+}
+
+fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_artifact.ArtifactRef) !manifest_artifact.ArtifactRef {
+    const name: []u8 = if (artifact.name.len == 0) &.{} else try alloc.dupe(u8, artifact.name);
+    errdefer if (name.len != 0) alloc.free(name);
+    const artifact_id = try alloc.dupe(u8, artifact.artifact_id);
+    errdefer alloc.free(artifact_id);
+    const checksum = try alloc.dupe(u8, artifact.checksum);
+    errdefer alloc.free(checksum);
+    return .{
+        .kind = artifact.kind,
+        .name = name,
+        .artifact_id = artifact_id,
+        .byte_len = artifact.byte_len,
+        .checksum = checksum,
+    };
+}
+
+fn cloneDeclarationAlloc(alloc: Allocator, declaration: sidecar_manifest.DeclaredArtifact) !sidecar_manifest.DeclaredArtifact {
+    try declaration.validate();
+    const name = try alloc.dupe(u8, declaration.name);
+    errdefer alloc.free(name);
+    const binding = try cloneBindingAlloc(alloc, declaration.binding);
+    errdefer freeOwnedBinding(alloc, binding);
+    const artifact = try cloneArtifactRefAlloc(alloc, declaration.artifact);
+    errdefer {
+        if (artifact.name.len != 0) alloc.free(artifact.name);
+        alloc.free(artifact.artifact_id);
+        alloc.free(artifact.checksum);
+    }
+    return .{
+        .name = name,
+        .binding = binding,
+        .artifact = artifact,
+    };
+}
+
+fn declarationFromPublishedAlloc(alloc: Allocator, published: PublishedArtifact) !sidecar_manifest.DeclaredArtifact {
+    try published.binding.validate();
+    try validatePublishedArtifact(published);
+    const declaration = sidecar_manifest.DeclaredArtifact{
+        .name = published.name,
+        .binding = published.binding,
+        .artifact = published.artifact,
+    };
+    return try cloneDeclarationAlloc(alloc, declaration);
 }
 
 fn freeOwnedDeclaration(alloc: Allocator, declaration: sidecar_manifest.DeclaredArtifact) void {
@@ -1225,4 +1347,127 @@ test "lake rebuild operation planner preserves reuse and drop artifacts" {
     try std.testing.expectEqual(Action.drop, drop.action);
     try std.testing.expect(drop.builder_kind == null);
     try std.testing.expectEqualStrings("graph-1", drop.artifact_id);
+}
+
+test "lake rebuild operation reconciliation publishes rebuilds and reuses while omitting drops" {
+    const alloc = std.testing.allocator;
+    const text_binding = source_binding.Binding{
+        .sidecar_kind = .text,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "docs",
+        .snapshot_id = "parquet-12",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"body"},
+        .index_config_hash = "sha256:text",
+    };
+    const vector_binding = source_binding.Binding{
+        .sidecar_kind = .vector,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "docs",
+        .snapshot_id = "parquet-12",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"embedding"},
+        .index_config_hash = "sha256:vector",
+    };
+    const graph_binding = source_binding.Binding{
+        .sidecar_kind = .graph,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "docs",
+        .snapshot_id = "parquet-12",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"edges"},
+        .index_config_hash = "sha256:graph",
+    };
+    const desired = [_]DesiredArtifact{
+        .{
+            .name = "docs.body_text",
+            .binding = text_binding,
+            .kind = .text_segment,
+        },
+        .{
+            .name = "docs.embedding",
+            .binding = vector_binding,
+            .kind = .vector_segment,
+        },
+    };
+    const published = [_]PublishedArtifact{
+        .{
+            .name = "docs.body_text",
+            .binding = text_binding,
+            .artifact = .{ .kind = .text_segment, .name = "docs.body_text", .artifact_id = "text-1", .byte_len = 64, .checksum = "len:64" },
+        },
+        .{
+            .name = "docs.old_graph",
+            .binding = graph_binding,
+            .artifact = .{ .kind = .graph_segment, .name = "docs.old_graph", .artifact_id = "graph-1", .byte_len = 32, .checksum = "len:32" },
+        },
+    };
+    var plan = try planOperationsAlloc(alloc, &desired, &published);
+    defer plan.deinit(alloc);
+
+    const rebuilt = sidecar_manifest.DeclaredArtifact{
+        .name = "docs.embedding",
+        .binding = vector_binding,
+        .artifact = .{ .kind = .vector_segment, .name = "docs.embedding", .artifact_id = "vector-2", .byte_len = 128, .checksum = "len:128" },
+    };
+    const executed_operations = try alloc.alloc(ExecutedOperation, plan.operations.len);
+    errdefer alloc.free(executed_operations);
+    var initialized: usize = 0;
+    errdefer {
+        for (executed_operations[0..initialized]) |*operation| operation.deinit(alloc);
+    }
+    executed_operations[0] = try makeExecutedOperation(alloc, plan.find("docs.body_text").?, null, "text-1");
+    initialized += 1;
+    const rebuilt_owned = try cloneDeclarationAlloc(alloc, rebuilt);
+    errdefer if (initialized < 2) freeOwnedDeclaration(alloc, rebuilt_owned);
+    executed_operations[1] = try makeExecutedOperation(alloc, plan.find("docs.embedding").?, rebuilt_owned, "vector-2");
+    initialized += 1;
+    executed_operations[2] = try makeExecutedOperation(alloc, plan.find("docs.old_graph").?, null, "graph-1");
+    initialized += 1;
+    var result = ExecutionResult{ .operations = executed_operations };
+    defer result.deinit(alloc);
+
+    var reconciled = try reconcileExecutedOperationsAlloc(alloc, &published, plan, result);
+    defer reconciled.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), reconciled.artifacts.len);
+    try std.testing.expectEqualStrings("text-1", reconciled.find("docs.body_text").?.artifact.artifact_id);
+    try std.testing.expectEqualStrings("vector-2", reconciled.find("docs.embedding").?.artifact.artifact_id);
+    try std.testing.expect(reconciled.find("docs.old_graph") == null);
+    try reconciled.manifest().validate();
+}
+
+test "lake rebuild operation reconciliation fails closed when rebuild declaration is missing" {
+    const alloc = std.testing.allocator;
+    const binding = source_binding.Binding{
+        .sidecar_kind = .vector,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "docs",
+        .snapshot_id = "parquet-12",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"embedding"},
+        .index_config_hash = "sha256:vector",
+    };
+    const desired = [_]DesiredArtifact{.{
+        .name = "docs.embedding",
+        .binding = binding,
+        .kind = .vector_segment,
+    }};
+    var plan = try planOperationsAlloc(alloc, &desired, &.{});
+    defer plan.deinit(alloc);
+
+    const executed_operations = try alloc.alloc(ExecutedOperation, 1);
+    errdefer alloc.free(executed_operations);
+    executed_operations[0] = try makeExecutedOperation(alloc, plan.find("docs.embedding").?, null, "vector-2");
+    var result = ExecutionResult{ .operations = executed_operations };
+    defer result.deinit(alloc);
+
+    try std.testing.expectError(
+        error.InvalidLakeRebuildReconciliation,
+        reconcileExecutedOperationsAlloc(alloc, &.{}, plan, result),
+    );
 }
