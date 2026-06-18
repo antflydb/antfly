@@ -4362,6 +4362,82 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(legacyResult.DataLossPossible).To(BeTrue())
 }
 
+func TestHAPromotionSDKResultPreservesRequiredEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	response := adminsdk.HAPromotionResponse{
+		SchemaVersion: 1,
+		Action: adminsdk.HAActionReceipt{
+			ActionId:   "promotion:standby-a",
+			ActionKind: adminsdk.HAActionKindPromotion,
+			Target:     "standby-a",
+			State:      adminsdk.HAActionStateApplied,
+			NodeId:     "standby-a",
+		},
+		Assessment: adminsdk.HAPromotionAssessment{
+			RequiredLsn:        12,
+			ReceivedLsn:        12,
+			AppliedLsn:         12,
+			HasRequiredLsn:     true,
+			CaughtUpToReceived: true,
+			FencingConfirmed:   true,
+			Force:              false,
+			Mode:               adminsdk.HAPromotionModeSafe,
+			DataLossPossible:   false,
+			Safe:               true,
+			RequiresFencing:    false,
+			RequiresForce:      false,
+			CanPromote:         true,
+		},
+		Promotion: adminsdk.HAPromotionResult{
+			NodeId:    "standby-a",
+			SwitchLsn: 13,
+			OldIdentity: adminsdk.HAIdentity{
+				ClusterId:  100,
+				ShardId:    10,
+				TableId:    20,
+				TimelineId: 4,
+				Epoch:      6,
+			},
+			NewIdentity: adminsdk.HAIdentity{
+				ClusterId:  100,
+				ShardId:    10,
+				TableId:    20,
+				TimelineId: 5,
+				Epoch:      7,
+			},
+			Forced:           false,
+			DataLossPossible: false,
+		},
+		FenceGeneration: 3,
+		FenceToken:      "ha-fence-token",
+		Forced:          false,
+	}
+	result := haPromotionJobResultFromSDK(response)
+	g.Expect(result.PromotionMode).To(Equal("safe"))
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionPromoteStandby),
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceGeneration: 3,
+		FenceReason:     "AutomaticFailoverReady",
+	}
+	adminResult := haPromotionAdminActionResult(result)
+	enrichHAPromotionAdminActionResult(adminResult, &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}, action)
+	action.AdminResult = adminResult
+
+	g.Expect(adminResult.PromotionMode).To(Equal("safe"))
+	g.Expect(haActionHasRequiredAdminResult(action)).To(BeTrue())
+}
+
 func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 

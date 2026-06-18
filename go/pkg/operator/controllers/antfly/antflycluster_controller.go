@@ -4881,6 +4881,7 @@ func haPromotionJobResultFromSDK(response adminsdk.HAPromotionResponse) haPromot
 		FenceGeneration:  response.FenceGeneration,
 		FenceToken:       strings.TrimSpace(response.FenceToken),
 		Forced:           response.Forced || response.Promotion.Forced,
+		PromotionMode:    strings.TrimSpace(string(response.Assessment.Mode)),
 		DataLossPossible: response.Promotion.DataLossPossible,
 	}
 }
