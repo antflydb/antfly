@@ -36,6 +36,7 @@ const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const ha_primary_mod = @import("../storage/ha/primary.zig");
+const ha_write_gate_mod = @import("../storage/ha/write_gate.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lmdb = @import("../storage/lmdb.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -6744,6 +6745,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocal(alloc, group_id, table_name, req);
             return {};
@@ -7605,6 +7607,19 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 };
+
+fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
+    const configured = gate orelse return;
+    const decision = switch (configured) {
+        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
+    };
+    switch (decision.action) {
+        .allow_write => return,
+        .reject_read_only_standby => return error.HAReadOnlyStandby,
+        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+    }
+}
 
 pub const HostedProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,

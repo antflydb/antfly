@@ -13893,6 +13893,14 @@ test "data server propagates standby HA write gate into provisioned write source
         error.HAReadRequiresPrimary,
         server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index),
     );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().batchGroupLocal(alloc, 10, "docs", .{
+            .writes = &.{.{ .key = "doc:local", .value = "{\"title\":\"local-write\"}" }},
+            .timestamp_ns = 1,
+            .sync_level = .write,
+        }),
+    );
     try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
     try server.runLsmMaintenanceForegroundRound();
     try server.requestLsmMaintenanceBackground();
