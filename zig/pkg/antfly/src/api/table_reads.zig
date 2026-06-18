@@ -4662,7 +4662,7 @@ fn rowsQueryPlanFromLakeScanAlloc(
 
     var scan_result = (try source.lakeRowsScan(alloc, table_name, runtime_schema, lake_request.request, consistency)) orelse return null;
     defer scan_result.deinit(alloc);
-    return try relational_rows_api.buildRowsQueryResultFromLakeRowsAlloc(alloc, scan_result);
+    return try relational_rows_api.buildRowsQueryResultFromLakeRowsAlloc(alloc, plan.query, scan_result);
 }
 
 fn rowsAggregatePlanFromLakeScanAlloc(

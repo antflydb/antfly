@@ -277,91 +277,8 @@ pub const IdentityAllocatorPlan = sql_adapter.IdentityAllocatorPlan;
 pub const IdentityAllocatorKind = sql_adapter.IdentityAllocatorKind;
 pub const IdentityAllocatorSpec = sql_adapter.IdentityAllocatorSpec;
 
-pub const LoweredDdlPlan = union(enum) {
-    adapter_noop: AdapterNoopDdlPlan,
-    create_table: CreateTablePlan,
-    table_clone: TableClonePlan,
-    view_catalog: ViewCatalogPlan,
-    materialized_view_catalog: MaterializedViewCatalogPlan,
-    relation_lifetime: RelationLifetimePlan,
-    enum_type_catalog: EnumTypeCatalogPlan,
-    domain_catalog: DomainCatalogPlan,
-    sequence_catalog: SequenceCatalogPlan,
-    identity_allocator_catalog: IdentityAllocatorPlan,
-    schema_namespace_catalog: SchemaNamespaceCatalogPlan,
-    extension_catalog: ExtensionCatalogPlan,
-    function_catalog: FunctionCatalogPlan,
-    authorization_catalog: AuthorizationCatalogPlan,
-    bulk_io: BulkIoPlan,
-    table_partition_catalog: TablePartitionCatalogPlan,
-    row_security_catalog: RowSecurityCatalogPlan,
-    database_catalog: DatabaseCatalogPlan,
-    tablespace_catalog: TablespaceCatalogPlan,
-    notification_channel: NotificationChannelPlan,
-    logical_replication: LogicalReplicationPlan,
-    type_system_catalog: TypeSystemCatalogPlan,
-    maintenance_job: MaintenanceJobPlan,
-    prepared_statement: PreparedStatementPlan,
-    cursor_portal: CursorPortalPlan,
-    savepoint_transaction: SavepointTransactionPlan,
-    comment_metadata: CommentMetadataPlan,
-    transaction_control: TransactionControlPlan,
-    create_index: CreateIndexPlan,
-    drop_index: DropIndexPlan,
-    drop_table: DropTablePlan,
-    alter_table: AlterTablePlan,
-    create_update_policy: CreateUpdatePolicyPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .adapter_noop => {},
-            .create_table => |*plan| plan.deinit(alloc),
-            .table_clone => |*plan| plan.deinit(alloc),
-            .view_catalog => |*plan| plan.deinit(alloc),
-            .materialized_view_catalog => |*plan| plan.deinit(alloc),
-            .relation_lifetime => |*plan| plan.deinit(alloc),
-            .enum_type_catalog => |*plan| plan.deinit(alloc),
-            .domain_catalog => |*plan| plan.deinit(alloc),
-            .sequence_catalog => |*plan| plan.deinit(alloc),
-            .identity_allocator_catalog => |*plan| plan.deinit(alloc),
-            .schema_namespace_catalog => |*plan| plan.deinit(alloc),
-            .extension_catalog => |*plan| plan.deinit(alloc),
-            .function_catalog => |*plan| plan.deinit(alloc),
-            .authorization_catalog => |*plan| plan.deinit(alloc),
-            .bulk_io => |*plan| plan.deinit(alloc),
-            .table_partition_catalog => |*plan| plan.deinit(alloc),
-            .row_security_catalog => |*plan| plan.deinit(alloc),
-            .database_catalog => |*plan| plan.deinit(alloc),
-            .tablespace_catalog => |*plan| plan.deinit(alloc),
-            .notification_channel => |*plan| plan.deinit(alloc),
-            .logical_replication => |*plan| plan.deinit(alloc),
-            .type_system_catalog => |*plan| plan.deinit(alloc),
-            .maintenance_job => |*plan| plan.deinit(alloc),
-            .prepared_statement => |*plan| plan.deinit(alloc),
-            .cursor_portal => |*plan| plan.deinit(alloc),
-            .savepoint_transaction => |*plan| plan.deinit(alloc),
-            .comment_metadata => |*plan| plan.deinit(alloc),
-            .transaction_control => |*plan| plan.deinit(alloc),
-            .create_index => |*plan| plan.deinit(alloc),
-            .drop_index => |*plan| plan.deinit(alloc),
-            .drop_table => |*plan| plan.deinit(alloc),
-            .alter_table => |*plan| plan.deinit(alloc),
-            .create_update_policy => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const RelationLifetimePlan = struct {
-    kind: RelationLifetimeKind,
-    create_table: CreateTablePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.create_table.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
+pub const LoweredDdlPlan = sql_adapter.LoweredDdlPlan;
+pub const RelationLifetimePlan = sql_adapter.RelationLifetimePlan;
 pub const RelationLifetimeKind = sql_adapter.RelationLifetimeKind;
 
 const PrivilegeChangeAction = enum {
@@ -369,250 +286,30 @@ const PrivilegeChangeAction = enum {
     revoke,
 };
 
-pub const TablePartitionCatalogPlan = union(enum) {
-    create_partitioned: CreatePartitionedTablePlan,
-    create_partition: CreateTablePartitionPlan,
-    attach: AttachTablePartitionPlan,
-    detach: DetachTablePartitionPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create_partitioned => |*plan| plan.deinit(alloc),
-            .create_partition => |*plan| plan.deinit(alloc),
-            .attach => |*plan| plan.deinit(alloc),
-            .detach => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreatePartitionedTablePlan = struct {
-    create_table: CreateTablePlan,
-    method: TablePartitionMethod,
-    keys: []const []const u8 = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.create_table.deinit(alloc);
-        freeStringSlice(alloc, self.keys);
-        self.* = undefined;
-    }
-};
-
-pub const CreateTablePartitionPlan = struct {
-    table_name: []const u8,
-    parent_table_name: []const u8,
-    bounds: TablePartitionBounds,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        alloc.free(self.parent_table_name);
-        self.bounds.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const AttachTablePartitionPlan = struct {
-    parent_table_name: []const u8,
-    partition_table_name: []const u8,
-    bounds: TablePartitionBounds,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.parent_table_name);
-        alloc.free(self.partition_table_name);
-        self.bounds.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const DetachTablePartitionPlan = struct {
-    parent_table_name: []const u8,
-    partition_table_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.parent_table_name);
-        alloc.free(self.partition_table_name);
-        self.* = undefined;
-    }
-};
-
-pub const TablePartitionBounds = struct {
-    lower_json: []const u8,
-    upper_json: []const u8,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.lower_json);
-        alloc.free(self.upper_json);
-        self.* = undefined;
-    }
-};
-
-pub const TablePartitionMethod = enum {
-    range,
-};
-
-pub const CreateTablePlan = struct {
-    table_name: []const u8,
-    if_not_exists: bool = false,
-    replace_existing: bool = false,
-    columns: []const runtime_schema.RelationalColumn = &.{},
-    primary_key: ?runtime_schema.PrimaryKey = null,
-    periods: []const runtime_schema.RelationalPeriod = &.{},
-    unique_constraints: []const runtime_schema.UniqueConstraint = &.{},
-    foreign_keys: []const runtime_schema.ForeignKey = &.{},
-    checks: []const runtime_schema.RelationalCheck = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        freeDdlRelationalColumns(alloc, self.columns);
-        if (self.primary_key) |primary_key| freeDdlPrimaryKey(alloc, primary_key);
-        freeDdlPeriods(alloc, self.periods);
-        freeDdlUniqueConstraints(alloc, self.unique_constraints);
-        freeDdlForeignKeys(alloc, self.foreign_keys);
-        freeDdlRelationalChecks(alloc, self.checks);
-        self.* = undefined;
-    }
-};
-
-pub const AlterTablePlan = struct {
-    table_name: []const u8,
-    if_exists: bool = false,
-    operations: []const AlterTableOperation = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        for (self.operations) |operation| freeAlterTableOperation(alloc, operation);
-        if (self.operations.len > 0) alloc.free(self.operations);
-        self.* = undefined;
-    }
-};
-
-pub const AlterTableOperation = union(enum) {
-    add_column: AddColumnOperation,
-    add_period: runtime_schema.RelationalPeriod,
-    add_primary_key: runtime_schema.PrimaryKey,
-    rename_column: RenameColumnOperation,
-    rename_constraint: RenameConstraintOperation,
-    drop_column: DropColumnOperation,
-    drop_constraint: DropConstraintOperation,
-    drop_update_policy: DropUpdatePolicyOperation,
-    alter_column_default: AlterColumnDefaultOperation,
-    alter_column_nullability: AlterColumnNullabilityOperation,
-    alter_column_type: AlterColumnTypeOperation,
-    add_unique_constraint: runtime_schema.UniqueConstraint,
-    add_foreign_key: runtime_schema.ForeignKey,
-    add_check: runtime_schema.RelationalCheck,
-    validate_constraint: []const u8,
-};
-
-pub const AddColumnOperation = struct {
-    column: runtime_schema.RelationalColumn,
-    if_not_exists: bool = false,
-    unique_constraints: []const runtime_schema.UniqueConstraint = &.{},
-    foreign_keys: []const runtime_schema.ForeignKey = &.{},
-    checks: []const runtime_schema.RelationalCheck = &.{},
-};
-
-pub const RenameColumnOperation = struct {
-    old_name: []const u8,
-    new_name: []const u8,
-};
-
-pub const RenameConstraintOperation = struct {
-    old_name: []const u8,
-    new_name: []const u8,
-};
-
-pub const DropDependencyMode = enum {
-    cascade,
-    restrict,
-};
-
-pub const DropColumnOperation = struct {
-    name: []const u8,
-    if_exists: bool = false,
-    dependency_mode: DropDependencyMode = .cascade,
-};
-
-pub const DropConstraintOperation = struct {
-    name: []const u8,
-    if_exists: bool = false,
-    dependency_mode: DropDependencyMode = .restrict,
-};
-
-pub const DropUpdatePolicyOperation = struct {
-    trigger_name: []const u8,
-    if_exists: bool = false,
-};
-
-pub const AlterColumnDefaultOperation = struct {
-    column_name: []const u8,
-    default_value: ?runtime_schema.RelationalDefaultValue = null,
-};
-
-pub const AlterColumnNullabilityOperation = struct {
-    column_name: []const u8,
-    nullable: bool,
-};
-
-pub const AlterColumnTypeOperation = struct {
-    column_name: []const u8,
-    field_type: runtime_schema.AntflyType,
-    array_item_type: ?runtime_schema.AntflyType = null,
-    collation: ?[]const u8 = null,
-};
-
-pub const CreateIndexPlan = struct {
-    index_name: []const u8,
-    table_name: []const u8,
-    if_not_exists: bool = false,
-    unique: bool = false,
-    method: DdlIndexMethod = .btree,
-    opclass: DdlIndexOpClass = .default,
-    columns: []const []const u8 = &.{},
-    include_columns: []const []const u8 = &.{},
-    expressions: []const runtime_schema.UniqueExpression = &.{},
-    generated_expression: ?runtime_schema.RelationalGeneratedValue = null,
-    without_overlaps_period: ?[]const u8 = null,
-    where: []const runtime_schema.UniquePredicate = &.{},
-    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.index_name);
-        alloc.free(self.table_name);
-        freeStringSlice(alloc, self.columns);
-        freeStringSlice(alloc, self.include_columns);
-        freeDdlUniqueExpressions(alloc, self.expressions);
-        if (self.generated_expression) |generated| freeDdlGeneratedValue(alloc, generated);
-        if (self.without_overlaps_period) |period| alloc.free(period);
-        freeDdlUniquePredicates(alloc, self.where);
-        freeExpressionConditions(alloc, self.where_expressions);
-        if (self.where_expressions.len > 0) alloc.free(self.where_expressions);
-        self.* = undefined;
-    }
-};
-
-pub const DdlIndexMethod = enum {
-    btree,
-    gin,
-};
-
-pub const DdlIndexOpClass = enum {
-    default,
-    jsonb_path_ops,
-    array_ops,
-};
-
-pub const AppliedDdlSchemaJson = struct {
-    schema_json: []u8,
-    requires_rebuild: bool = false,
-    validation_required: bool = false,
-    rewrite_required: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.schema_json);
-        self.* = undefined;
-    }
-};
+pub const TablePartitionCatalogPlan = sql_adapter.TablePartitionCatalogPlan;
+pub const CreatePartitionedTablePlan = sql_adapter.CreatePartitionedTablePlan;
+pub const CreateTablePartitionPlan = sql_adapter.CreateTablePartitionPlan;
+pub const AttachTablePartitionPlan = sql_adapter.AttachTablePartitionPlan;
+pub const DetachTablePartitionPlan = sql_adapter.DetachTablePartitionPlan;
+pub const TablePartitionBounds = sql_adapter.TablePartitionBounds;
+pub const TablePartitionMethod = sql_adapter.TablePartitionMethod;
+pub const CreateTablePlan = sql_adapter.CreateTablePlan;
+pub const AlterTablePlan = sql_adapter.AlterTablePlan;
+pub const AlterTableOperation = sql_adapter.AlterTableOperation;
+pub const AddColumnOperation = sql_adapter.AddColumnOperation;
+pub const RenameColumnOperation = sql_adapter.RenameColumnOperation;
+pub const RenameConstraintOperation = sql_adapter.RenameConstraintOperation;
+pub const DropDependencyMode = sql_adapter.DropDependencyMode;
+pub const DropColumnOperation = sql_adapter.DropColumnOperation;
+pub const DropConstraintOperation = sql_adapter.DropConstraintOperation;
+pub const DropUpdatePolicyOperation = sql_adapter.DropUpdatePolicyOperation;
+pub const AlterColumnDefaultOperation = sql_adapter.AlterColumnDefaultOperation;
+pub const AlterColumnNullabilityOperation = sql_adapter.AlterColumnNullabilityOperation;
+pub const AlterColumnTypeOperation = sql_adapter.AlterColumnTypeOperation;
+pub const CreateIndexPlan = sql_adapter.CreateIndexPlan;
+pub const DdlIndexMethod = sql_adapter.DdlIndexMethod;
+pub const DdlIndexOpClass = sql_adapter.DdlIndexOpClass;
+pub const AppliedDdlSchemaJson = sql_adapter.AppliedDdlSchemaJson;
 
 const InsertColumnSpec = union(enum) {
     column: []const u8,

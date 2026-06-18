@@ -17293,7 +17293,7 @@ test "api http server routes public external lake row queries through configured
     const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
     const external_source_api = @import("../serverless/external_source/mod.zig");
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"tenant":{"type":"numeric"}},"required":["amount","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["amount","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
 
     const FakeSource = struct {
@@ -17398,6 +17398,7 @@ test "api http server routes public external lake row queries through configured
     const parquet_columns = [_]serverless_query.LakeParquetTestPlainI64Column{
         .{ .column_id = "amount", .values = &[_]i64{ 10, 20, 30 } },
         .{ .column_id = "tenant", .values = &[_]i64{ 7, 8, 8 } },
+        .{ .column_id = "rank", .values = &[_]i64{ 1, 3, 2 } },
     };
     const parquet_object = try serverless_query.buildLakeParquetTestPlainI64ObjectAlloc(alloc, &parquet_columns);
     defer alloc.free(parquet_object);
@@ -17436,13 +17437,27 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 30), rows[1].object.get("amount").?.integer);
     try std.testing.expect(rows[0].object.get("tenant") == null);
 
+    var ordered_response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":8},\"order_by\":[{\"field\":\"rank\",\"direction\":\"desc\"}],\"limit\":1}}", null);
+    defer ordered_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), ordered_response.status);
+    try std.testing.expectEqual(@as(u32, 2), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_ordered = try std.json.parseFromSlice(std.json.Value, alloc, ordered_response.body, .{ .allocate = .alloc_always });
+    defer parsed_ordered.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_ordered.value.object.get("total").?.integer);
+    const ordered_rows = parsed_ordered.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), ordered_rows.len);
+    try std.testing.expectEqual(@as(i64, 20), ordered_rows[0].object.get("amount").?.integer);
+    try std.testing.expect(ordered_rows[0].object.get("rank") == null);
+
     var source_response = try server.handle(.{
         .method = .GET,
         .uri = "/tables/events/rows:source",
     });
     defer source_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), source_response.status);
-    try std.testing.expectEqual(@as(u32, 2), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 3), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_source = try std.json.parseFromSlice(std.json.Value, alloc, source_response.body, .{ .allocate = .alloc_always });

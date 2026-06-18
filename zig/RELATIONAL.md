@@ -985,8 +985,10 @@ moves behind a `api/sql_adapter/` package:
 - `plan.zig`: adapter public plan structs, fingerprints, and ownership helpers
   that callers already consume.
 - `ddl_plan.zig`: adapter public DDL/catalog plan containers and ownership
-  helpers, split from read/write execution plans so catalog evolution can move
-  behind the adapter facade without growing the main lowerer file.
+  helpers, including table, partition, index, relation-lifetime, identity
+  allocator, domain, and catalog plans. These stay split from read/write
+  execution plans so catalog evolution can move behind the adapter facade
+  without growing the main lowerer file.
 - `token.zig`: token kinds, token source spans, keyword helpers, and simple
   token predicates.
 - `lexer.zig`: PostgreSQL lexical handling for whitespace, comments, quoted
