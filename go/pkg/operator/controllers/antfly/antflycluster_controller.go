@@ -3523,7 +3523,11 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		if handled, err := r.executeHAPlannedActionTyped(ctx, cluster, action); handled {
 			action.AdminJobName = haAdminDirectAPIName
 			if err != nil {
-				action.AdminJobPhase = haAdminJobPhaseFailed
+				if adminsdk.HAIsRetryable(err) {
+					action.AdminJobPhase = haAdminJobPhasePending
+				} else {
+					action.AdminJobPhase = haAdminJobPhaseFailed
+				}
 				action.AdminError = err.Error()
 			} else {
 				action.AdminJobPhase = haAdminJobPhaseSucceeded
