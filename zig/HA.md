@@ -583,76 +583,17 @@ for explicitly local file-transfer or recovery steps.
 The review outcome is to keep HA validation, e2e coverage, simulation coverage,
 and the production bar explicit in the design.
 
-`paddedHAString` should become a shared classifier, not a broad
-`validateHAString` function that tries to validate every HA string in one place
-and not a string-cleaning helper that trims and continues. The intended shape is:
+Treat these review points as acceptance gates, not follow-up polish:
 
-```zig
-const HAStringValidation = enum { ok, missing, padded };
-
-fn classifyHAString(value: ?[]const u8) HAStringValidation
-```
-
-Field-specific validators should translate that classifier into field-specific
-errors and then add type-specific checks. A primary log path should still return
-an error such as `HAPrimaryLogInvalid`, a standby slot should still return
-`HAStandbySlotMissing`, and an admin token env var should still return
-`HAAdminTokenEnvInvalid`. The shared helper should classify missing or padded
-input; the caller should decide which path, node-id, slot-name, env-var, or URL
-rule applies and which precise error belongs in the API or CLI response. It
-should never trim and continue, because doing so can hide operator mistakes in
-durable HA identity, WAL path, fence, slot, URL, or token-env configuration.
-
-The type-specific validation layer should include:
-
-- paths: absolute or normalized as required by the runtime, and bounded to the
-  configured storage root when a field refers to local storage;
-- node ids and slot names: restricted character sets and bounded lengths;
-- environment variable names: the same validation used for process env names;
-- URLs: parsed as URLs and rejected when they contain hidden leading/trailing
-  whitespace.
-
-Add `test_standby.py` as a black-box Zig e2e test once the runtime and admin
-surfaces are usable through real processes. Argument-validation coverage belongs
-in unit tests; this e2e should prove the supported Postgres-style user path with
-real Antfly processes, files, admin calls, and client-visible reads/writes:
-
-1. start a primary;
-2. create or reserve a replication slot;
-3. seed and start a standby;
-4. write data to the primary;
-5. wait for standby catch-up and verify read-only standby visibility;
-6. restart the standby and verify local received-WAL replay plus stream resume;
-7. later, fence and promote the standby, then verify the old primary rejects
-   writes or must rejoin through rewind/reseed.
-
-The Zig simulation layer should carry the deeper correctness burden because it
-can explore crash, restart, partition, and replay-order interleavings that would
-be expensive or flaky in process e2e. Add coverage for receive-before-apply
-crashes, apply-before-ack crashes, primary crashes before and after synchronous
-acknowledgement, duplicate/gap/out-of-order WAL records, promotion with and
-without a valid fence, old-primary rejoin, rewind, reseed, retained-WAL expiry,
-and timeline switch propagation.
-
-The production-grade bar is feature and failure-case parity, not merely "records
-stream." Before Antfly treats this mode as production ready, the implementation
-needs runtime primary/standby wiring, generated Zig and Go admin clients,
-operator integration through the Go SDK wrapper, base backup, sync commit,
-fencing, promotion, timelines, former-primary repair, standby read freshness,
-retention pressure handling, auth, metrics, runbooks, format compatibility,
-crash tests, real process e2e, and operator e2e. For bulk Postgres-style HA
-parity, the remaining gaps after basic streaming are former-primary repair
-comparable to `pg_rewind`, deeper synchronous commit policy support, WAL archive
-or PITR-like recovery options, robust observability, optional cascading or relay
-replication, and operator workflows that make the common cases boring.
-
-Treat those review points as acceptance gates, not follow-up polish:
-`classifyHAString` can land before the full HA runtime, but it must preserve
-field-specific errors; `test_standby.py` must prove a real primary/standby
-process path, not just argument validation; simulation coverage must own
-crash/replay/promotion correctness; and production readiness requires the
-failure cases to be first-class before automatic promotion or synchronous commit
-is advertised as supported.
+- `classifyHAString` can land before the full HA runtime, but it must preserve
+  field-specific errors and never silently trim durable HA identity, WAL path,
+  fence, slot, URL, or token-env configuration.
+- `test_standby.py` must prove a real primary/standby process path, not just
+  argument validation.
+- Zig simulation coverage must own crash, replay, partition, promotion, rejoin,
+  rewind, reseed, retention-expiry, and timeline-switch correctness.
+- Production readiness requires the failure cases to be first-class before
+  automatic promotion or synchronous commit is advertised as supported.
 
 ## Test Strategy
 
@@ -767,9 +708,16 @@ and either rewind or reseed.
   - crash during base backup,
   - crash during WAL receive,
   - crash during apply,
+  - crash after receive before apply,
+  - crash after apply before acknowledgement,
+  - primary crash before and after synchronous acknowledgement,
+  - duplicate, missing, divergent, or out-of-order WAL records,
   - network partition,
+  - promotion with and without valid fence evidence,
   - standby lag and reseed,
-  - former primary return.
+  - retained WAL expiry forcing reseed,
+  - former primary return,
+  - timeline switch propagation.
 - Add metrics and admin status.
 - Add compatibility tests across replication format versions.
 - Add the Python `test_standby.py` e2e path for real primary/standby process
@@ -957,17 +905,22 @@ The remaining work before this mode has the bulk of Postgres-style HA parity is:
   operator policies that prevent dead standbys from pinning WAL forever;
 - versioned replication record compatibility tests and upgrade/downgrade
   behavior for mixed-version rolling deployments;
-- metrics, logs, status conditions, action receipts, and runbooks for slot lag,
-  retained WAL, degraded synchronous commit, promotion readiness, replay
-  failure, and reseed requirements;
+- metrics, logs, audit events, status conditions, action receipts, and runbooks
+  for slot lag, retained WAL, degraded synchronous commit, promotion readiness,
+  replay failure, and reseed requirements;
 - crash, partition, and replay simulation coverage plus real process e2e and
   operator e2e coverage.
 
-Features such as WAL archive/PITR recovery, cascading or relay replication,
-cross-region latency policy, and richer read-replica routing can follow the
-core HA path, but they should not be confused with the minimum safe production
-surface. The minimum production-grade target is a boring single-primary system:
-the primary streams ordered records, standbys recover and apply deterministically,
+For bulk Postgres-style HA parity beyond the first production target, the large
+remaining areas are `pg_rewind`-style former-primary repair depth, richer
+synchronous commit policy support, WAL archive or PITR-like recovery options,
+robust observability, optional cascading or relay replication, cross-region
+latency policy, richer read-replica routing, and operator workflows that make
+the common cases boring. Those features can follow the core HA path, but they
+should not be confused with the minimum safe production surface.
+
+The minimum production-grade target is a boring single-primary system: the
+primary streams ordered records, standbys recover and apply deterministically,
 promotion requires a fence and creates a new timeline, the former primary cannot
 silently continue, and the operator can explain every action it took.
 
