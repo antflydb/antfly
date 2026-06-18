@@ -731,11 +731,18 @@ test "parquet object range row group source reads chunks into lake rows" {
     try inventory.validate();
 
     const projection = [_][]const u8{"amount"};
-    const row_groups = [_]ObjectRangeRowGroupInput{
-        .{ .file_id = "part-a.parquet", .row_group_ordinal = 0, .projected_columns = &projection },
-        .{ .file_id = "part-a.parquet", .row_group_ordinal = 1, .projected_columns = &projection },
-    };
-    var source = try ObjectRangeRowGroupSource.init(range_reader.reader(), inventory, &row_groups);
+    var plan = try planRequiredPlainI64ObjectRangeRowGroupsAlloc(alloc, inventory, &projection);
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), plan.row_groups.len);
+    try std.testing.expectEqualStrings("part-a.parquet", plan.row_groups[0].file_id);
+    try std.testing.expectEqual(@as(u32, 0), plan.row_groups[0].row_group_ordinal);
+    try std.testing.expectEqual(@as(u32, 1), plan.row_groups[1].row_group_ordinal);
+    try std.testing.expectError(
+        error.ParquetColumnNotFound,
+        planRequiredPlainI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"missing"}),
+    );
+
+    var source = try ObjectRangeRowGroupSource.init(range_reader.reader(), inventory, plan.row_groups);
     defer source.deinit(alloc);
 
     var result = try lake_rows.scanRowsAlloc(alloc, source.rowSource(), .{
