@@ -3863,24 +3863,6 @@ func haPlannedActionHasDirectAdminOperation(action antflyv1.HAPlannedActionStatu
 	return ok
 }
 
-func haAdminSDKResponseRaw[T any](value *adminsdk.HAResponse[T], err error) ([]byte, error) {
-	if err != nil {
-		var apiErr *adminsdk.HAAPIError
-		if stderrors.As(err, &apiErr) {
-			return nil, fmt.Errorf("HA admin API returned status %d: %s: %w", apiErr.StatusCode, strings.TrimSpace(apiErr.Body), err)
-		}
-		var validationErr *adminsdk.HAResponseValidationError
-		if stderrors.As(err, &validationErr) {
-			return nil, fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
-		}
-		return nil, err
-	}
-	if value == nil {
-		return nil, fmt.Errorf("HA admin SDK response is nil")
-	}
-	return value.Body, nil
-}
-
 func haAdminSDKResponseValue[T any](value *adminsdk.HAResponse[T], err error) (*T, error) {
 	if err != nil {
 		var apiErr *adminsdk.HAAPIError

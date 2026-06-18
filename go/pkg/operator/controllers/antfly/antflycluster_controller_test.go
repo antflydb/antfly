@@ -598,7 +598,7 @@ func TestHAAdminSDKResponseHelpersPreserveTypedErrors(t *testing.T) {
 		StatusCode: http.StatusServiceUnavailable,
 		Body:       "primary unavailable",
 	}
-	_, err := haAdminSDKResponseRaw[adminsdk.HAReplicationSlotActionResponse](nil, apiErr)
+	_, err := haAdminSDKResponseValue[adminsdk.HAReplicationSlotActionResponse](nil, apiErr)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("HA admin API returned status 503"))
 	var observedAPIError *adminsdk.HAAPIError
