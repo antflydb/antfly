@@ -697,7 +697,7 @@ fn validateActionReceipt(
 ) !void {
     if (receipt.action_id.len == 0) return err;
     if (!std.mem.eql(u8, receipt.action_kind, expected_kind)) return err;
-    if (!std.mem.eql(u8, receipt.state, expected_state)) return err;
+    if (!receiptStateMatches(receipt.state, expected_state)) return err;
     if (receipt.target.len == 0 or receipt.node_id.len == 0) return err;
     if (expected_target) |target| {
         if (!std.mem.eql(u8, receipt.target, target)) return err;
@@ -706,6 +706,11 @@ fn validateActionReceipt(
         if (receipt.action_id[expected_kind.len] != ':') return err;
         if (!std.mem.eql(u8, receipt.action_id[expected_kind.len + 1 ..], target)) return err;
     }
+}
+
+fn receiptStateMatches(actual: []const u8, expected: []const u8) bool {
+    return std.mem.eql(u8, actual, expected) or
+        (std.mem.eql(u8, expected, "applied") and std.mem.eql(u8, actual, "already_applied"));
 }
 
 fn validateIdentity(identity: admin_api.HAIdentity, err: anyerror) !void {
@@ -950,8 +955,7 @@ fn validatePromotionResponse(
     request: ?admin_api.FenceAcquireRequest,
 ) !void {
     if (response.schema_version <= 0) return error.AdminPromotionResponseMismatch;
-    if (!std.mem.eql(u8, response.action.action_kind, "promotion")) return error.AdminPromotionResponseMismatch;
-    if (!std.mem.eql(u8, response.action.state, "applied")) return error.AdminPromotionResponseMismatch;
+    try validateActionReceipt(response.action, "promotion", "applied", response.promotion.node_id, error.AdminPromotionResponseMismatch);
     if (!std.mem.eql(u8, response.action.target, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
     if (!std.mem.eql(u8, response.action.node_id, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
 
@@ -1017,18 +1021,7 @@ fn validateRejoinResponse(
         .assess => "assessed",
         .rewind, .reseed => "applied",
     };
-    if (!std.mem.eql(u8, response.action.action_kind, expected_action_kind)) {
-        return error.AdminRejoinResponseMismatch;
-    }
-    if (!std.mem.eql(u8, response.action.target, request.node_id)) {
-        return error.AdminRejoinResponseMismatch;
-    }
-    if (!std.mem.eql(u8, response.action.state, expected_state)) {
-        return error.AdminRejoinResponseMismatch;
-    }
-    if (response.action.node_id.len == 0) {
-        return error.AdminRejoinResponseMismatch;
-    }
+    try validateActionReceipt(response.action, expected_action_kind, expected_state, request.node_id, error.AdminRejoinResponseMismatch);
     switch (expected) {
         .assess, .rewind => {
             if (!std.mem.eql(u8, response.action.node_id, request.node_id)) {
@@ -1933,6 +1926,80 @@ test "storage.ha http client accepts empty fence receipt reason" {
     defer response.deinit(alloc);
 
     try std.testing.expectEqualStrings("", response.parsed.value.receipt.reason);
+}
+
+test "storage.ha http client accepts already applied idempotent admin receipts" {
+    const alloc = std.testing.allocator;
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"already_applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"current_lsn":0}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        var response = try client.createReplicationSlot("http://ha-admin.test", "standby-a", 0);
+        defer response.deinit(alloc);
+        try std.testing.expectEqualStrings("already_applied", response.parsed.value.action.state);
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"already_applied","node_id":"standby-a"},"assessment":{"required_lsn":1,"received_lsn":1,"applied_lsn":1,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":2,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":1,"epoch":1},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"forced":false,"data_loss_possible":false},"fence_generation":1,"fence_token":"token","forced":false}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        var response = try client.promote("http://ha-admin.test", .{
+            .identity = testAdminIdentity(),
+            .old_primary_id = "primary-a",
+            .promoted_node_id = "standby-a",
+            .new_timeline_id = 2,
+            .new_epoch = 2,
+            .required_lsn = 1,
+            .observed_lsn = 1,
+            .force = false,
+            .reason = "http-client-test",
+        });
+        defer response.deinit(alloc);
+        try std.testing.expectEqualStrings("already_applied", response.parsed.value.action.state);
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"already_applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":2,"target_epoch":2,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":1,"parent_epoch":1,"fork_lsn":1,"former_last_lsn":2,"retained_from_lsn":0,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":1,"previous_last_lsn":2,"current_last_lsn":1,"next_lsn":2,"discarded_lsn_count":1,"target_timeline_id":2,"target_epoch":2,"data_loss_discarded":true}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        var response = try client.rewindRejoin("http://ha-admin.test", .{
+            .node_id = "primary-a",
+            .identity = testAdminIdentity(),
+            .last_lsn = 2,
+            .retained_from_lsn = 0,
+            .allow_rewind_after_forced_promotion = false,
+            .receipt = testFenceReceipt(),
+        });
+        defer response.deinit(alloc);
+        try std.testing.expectEqualStrings("already_applied", response.parsed.value.action.state);
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"already_applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":2,"target_epoch":2,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":1,"parent_epoch":1,"fork_lsn":1,"former_last_lsn":2,"retained_from_lsn":0,"data_loss_discarded":true}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(error.AdminRejoinResponseMismatch, client.assessRejoin("http://ha-admin.test", .{
+            .node_id = "primary-a",
+            .identity = testAdminIdentity(),
+            .last_lsn = 2,
+            .retained_from_lsn = 0,
+            .allow_rewind_after_forced_promotion = false,
+            .receipt = testFenceReceipt(),
+        }));
+    }
 }
 
 test "storage.ha http client rejects invalid typed admin responses" {
