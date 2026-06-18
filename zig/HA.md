@@ -580,40 +580,12 @@ for explicitly local file-transfer or recovery steps.
 
 #### Review Decisions
 
-The review outcome is to keep the HA helpers reusable without hiding
-configuration mistakes. `paddedHAString` should not become a broad
-`validateHAString` function that tries to validate every HA string in one place.
-Use a shared missing/padded classifier, then let field-specific validators
-return precise errors and layer type-specific rules for paths, node ids, slot
-names, token environment variables, and URLs. Validators must reject padded
-input; they must not trim and continue.
+The review outcome is to keep HA validation, e2e coverage, simulation coverage,
+and the production bar explicit in the design.
 
-Add `test_standby.py` as a black-box Zig e2e test once the admin API and
-runtime wiring are usable through real processes. The test should exercise the
-supported Postgres-style path: primary start, slot creation, seed/bootstrap,
-standby start, primary writes, standby catch-up and read-only behavior, standby
-restart with replay resume, and later fenced promotion with old-primary write
-rejection.
-
-Add Zig simulation coverage for the correctness cases that process e2e cannot
-explore exhaustively: receive-before-apply crashes, apply-before-ack crashes,
-primary crashes before and after synchronous acknowledgement, duplicate/gap or
-out-of-order WAL, promotion with and without valid fencing, old-primary
-rejoin/rewind/reseed, retained-WAL expiry, and timeline switch propagation.
-
-Treat production readiness as Postgres-style operational parity, not merely
-successful streaming. Before this mode is production grade, Antfly needs runtime
-primary/standby wiring, stable generated admin clients, operator integration
-through the Go SDK wrapper, base backup, sync commit, fencing, promotion and
-timeline repair, standby freshness controls, WAL retention pressure handling,
-auth/audit/metrics/runbooks, format compatibility, crash/e2e/operator tests,
-and the remaining parity work such as `pg_rewind`-style repair, synchronous
-commit policy depth, WAL archive or PITR-style recovery, observability, optional
-cascading or relay replication, and ergonomic operator workflows.
-
-The first runtime implementation should keep validation reusable without making
-it vague. `paddedHAString` should become a shared classifier, not a single
-generic validator that tries to do every check. The intended shape is:
+`paddedHAString` should become a shared classifier, not a broad
+`validateHAString` function that tries to validate every HA string in one place
+and not a string-cleaning helper that trims and continues. The intended shape is:
 
 ```zig
 const HAStringValidation = enum { ok, missing, padded };
@@ -640,33 +612,39 @@ The type-specific validation layer should include:
 - URLs: parsed as URLs and rejected when they contain hidden leading/trailing
   whitespace.
 
-The first `test_standby.py` should be a real process e2e once the runtime and
-admin surfaces are usable. It should start a primary and standby, create a slot
-or seed workflow, write data through the primary, wait for standby catch-up,
-verify read-only standby behavior, restart the standby, and verify replay
-resumes. After fence and promotion support is usable, the same e2e should
-promote the standby and verify the old primary rejects writes or must rejoin
-through rewind/reseed. Argument-validation coverage belongs in unit tests; this
-e2e should prove the supported Postgres-style user path with real Antfly
-processes, files, admin calls, and client-visible reads/writes.
+Add `test_standby.py` as a black-box Zig e2e test once the runtime and admin
+surfaces are usable through real processes. Argument-validation coverage belongs
+in unit tests; this e2e should prove the supported Postgres-style user path with
+real Antfly processes, files, admin calls, and client-visible reads/writes:
 
-The Zig simulation layer should carry the deeper correctness burden. It should
-model crash, restart, partition, duplicate/gap/out-of-order WAL, promotion,
-old-primary rejoin, rewind/reseed, retained-WAL expiry, and timeline switch
-interleavings before the project relies on black-box e2e as evidence that the
-state machine is correct.
+1. start a primary;
+2. create or reserve a replication slot;
+3. seed and start a standby;
+4. write data to the primary;
+5. wait for standby catch-up and verify read-only standby visibility;
+6. restart the standby and verify local received-WAL replay plus stream resume;
+7. later, fence and promote the standby, then verify the old primary rejects
+   writes or must rejoin through rewind/reseed.
+
+The Zig simulation layer should carry the deeper correctness burden because it
+can explore crash, restart, partition, and replay-order interleavings that would
+be expensive or flaky in process e2e. Add coverage for receive-before-apply
+crashes, apply-before-ack crashes, primary crashes before and after synchronous
+acknowledgement, duplicate/gap/out-of-order WAL records, promotion with and
+without a valid fence, old-primary rejoin, rewind, reseed, retained-WAL expiry,
+and timeline switch propagation.
 
 The production-grade bar is feature and failure-case parity, not merely "records
 stream." Before Antfly treats this mode as production ready, the implementation
-needs runtime primary/standby wiring, generated Zig and Go admin clients, operator
-integration through the Go SDK wrapper, base backup, sync commit, fencing,
-promotion, timelines, former-primary repair, standby read freshness, retention
-pressure handling, auth, metrics, runbooks, format compatibility, crash tests,
-real process e2e, and operator e2e. For bulk Postgres-style HA parity, the
-remaining gaps after basic streaming are former-primary repair comparable to
-`pg_rewind`, deeper synchronous commit policy support, WAL archive or PITR-like
-recovery options, robust observability, optional cascading or relay replication,
-and operator workflows that make the common cases boring.
+needs runtime primary/standby wiring, generated Zig and Go admin clients,
+operator integration through the Go SDK wrapper, base backup, sync commit,
+fencing, promotion, timelines, former-primary repair, standby read freshness,
+retention pressure handling, auth, metrics, runbooks, format compatibility,
+crash tests, real process e2e, and operator e2e. For bulk Postgres-style HA
+parity, the remaining gaps after basic streaming are former-primary repair
+comparable to `pg_rewind`, deeper synchronous commit policy support, WAL archive
+or PITR-like recovery options, robust observability, optional cascading or relay
+replication, and operator workflows that make the common cases boring.
 
 ## Test Strategy
 
