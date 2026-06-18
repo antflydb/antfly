@@ -3801,7 +3801,7 @@ const Parser = struct {
         const statement_name = try self.parseIdentifierOwned();
         var statement_transferred = false;
         errdefer if (!statement_transferred) self.alloc.free(statement_name);
-        const parameter_count = try self.countParenthesizedTypeList();
+        const parameter_count = if (self.peekKind(.lparen)) try self.countParenthesizedTypeList() else 0;
         try self.expectKeyword("as");
         const statement_kind = try self.parsePreparedStatementSubjectKind();
         try self.consumePreparedStatementSubjectTail();
