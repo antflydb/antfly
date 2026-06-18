@@ -544,6 +544,16 @@ def _assert_admin_requires_bearer(node: HASwarmNode, path: str) -> None:
     assert wrong.status_code == 401
 
 
+def _sync_policy(mode: str, *, failure_policy: str = "block", standby_name: str = "standby-a") -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "selection": "first",
+        "required": 1,
+        "standby_names": [standby_name],
+        "failure_policy": failure_policy,
+    }
+
+
 def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: HACluster):
     table_name = "ha_standby_docs"
     ha_cluster.primary.start()
@@ -639,6 +649,54 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert slot["received_lsn"] >= second_lsn
     assert slot["applied_lsn"] >= second_lsn
+    remote_write_status = ha_cluster.primary.admin_get(
+        "/primary/status",
+        sync_mode="remote_write",
+        sync_selection="first",
+        sync_required=1,
+        sync_standby=["standby-a"],
+    )
+    remote_write = remote_write_status["snapshot"]["durability"]
+    assert remote_write["status"] == "satisfied"
+    assert remote_write["mode"] == "remote_write"
+    assert remote_write["progress_lsn"] >= second_lsn
+    assert remote_write["satisfied_count"] == 1
+
+    remote_apply_status = ha_cluster.primary.admin_get(
+        "/primary/status",
+        sync_mode="remote_apply",
+        sync_selection="first",
+        sync_required=1,
+        sync_standby=["standby-a"],
+    )
+    remote_apply = remote_apply_status["snapshot"]["durability"]
+    assert remote_apply["status"] == "satisfied"
+    assert remote_apply["mode"] == "remote_apply"
+    assert remote_apply["progress_lsn"] >= second_lsn
+    assert remote_apply["satisfied_count"] == 1
+
+    blocked_commit = ha_cluster.primary.admin_post(
+        "/commit/check",
+        {"target_lsn": second_lsn, "sync_policy": _sync_policy("remote_apply", standby_name="missing-standby")},
+    )
+    assert blocked_commit["gate"]["action"] == "wait_for_standby"
+    assert blocked_commit["gate"]["durability"]["status"] == "would_block"
+    assert blocked_commit["gate"]["durability"]["candidate_count"] == 0
+    assert blocked_commit["gate"]["durability"]["required_count"] == 1
+
+    failed_commit = ha_cluster.primary.admin_post(
+        "/commit/check",
+        {
+            "target_lsn": second_lsn,
+            "sync_policy": _sync_policy(
+                "remote_apply",
+                failure_policy="fail_closed",
+                standby_name="missing-standby",
+            ),
+        },
+    )
+    assert failed_commit["gate"]["action"] == "reject"
+    assert failed_commit["gate"]["durability"]["status"] == "fail_closed"
 
     fence_request = _promotion_fence_request(ha_cluster, second_lsn)
     fence = ha_cluster.standby.admin_post("/fence", fence_request)
