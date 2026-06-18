@@ -2098,9 +2098,15 @@ fn validateHARole(cli: CliConfig) !void {
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
     if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
+    const raw_upstream = cli.ha_standby_upstream_url orelse return error.HAStandbyUpstreamUrlMissing;
+    const raw_slot = cli.ha_standby_slot orelse return error.HAStandbySlotMissing;
+    const upstream = std.mem.trim(u8, raw_upstream, " \t\r\n");
+    const slot = std.mem.trim(u8, raw_slot, " \t\r\n");
+    if (upstream.len == 0) return error.HAStandbyUpstreamUrlMissing;
+    if (slot.len == 0) return error.HAStandbySlotMissing;
     return .{
-        .upstream_base_uri = cli.ha_standby_upstream_url orelse return error.HAStandbyUpstreamUrlMissing,
-        .slot_name = cli.ha_standby_slot orelse return error.HAStandbySlotMissing,
+        .upstream_base_uri = upstream,
+        .slot_name = slot,
     };
 }
 
@@ -2760,6 +2766,21 @@ test "swarm HA standby replication flags require upstream and slot" {
     try std.testing.expectError(error.HAStandbyUpstreamUrlMissing, haStandbyReplicationConfigFromCli(.{
         .ha_standby_slot = "standby-a",
     }));
+    try std.testing.expectError(error.HAStandbyUpstreamUrlMissing, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = " \t ",
+        .ha_standby_slot = "standby-a",
+    }));
+    try std.testing.expectError(error.HAStandbySlotMissing, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
+        .ha_standby_slot = " \t ",
+    }));
+
+    const replication_cfg = (try haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "  http://primary.antfly.svc:8080 \n",
+        .ha_standby_slot = " standby-a\t",
+    })) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", replication_cfg.upstream_base_uri);
+    try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
 }
 
 test "swarm HA primary identity defaults shard and table to whole instance" {
