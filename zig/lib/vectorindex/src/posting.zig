@@ -1764,6 +1764,21 @@ pub const PostingFormat = struct {
         return stats;
     }
 
+    pub fn deltaTailStatsAllRecords(data: []const u8) !PostingDeltaTailStats {
+        var iterator = try DeltaTailIterator.init(data);
+        const record_count = iterator.recordCount();
+        var stats = PostingDeltaTailStats{
+            .records = record_count,
+            .records_after_generation = record_count,
+            .encoded_value_bytes = data.len,
+        };
+        while (try iterator.next()) |record| {
+            if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+        }
+        return stats;
+    }
+
     pub fn deltaTailRecordsAfterGenerationLimited(data: []const u8, base_generation: u64, remaining_limit: *usize) !bool {
         var iterator = try DeltaTailIterator.init(data);
         while (try iterator.next()) |record| {
@@ -2295,6 +2310,11 @@ pub const PostingBacklogStats = struct {
         );
     }
 };
+
+fn postingDeltaKeySequence(key: []const u8) ?u64 {
+    if (key.len != 18 or key[0] != 'P' or key[1] != 'D') return null;
+    return std.mem.readInt(u64, key[10..18], .big);
+}
 
 pub const PostingStore = struct {
     const overlay_plan_min_delta_records: usize = 8;
@@ -3087,7 +3107,11 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
-            const stats = try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
+            const key_sequence = postingDeltaKeySequence(entry.key) orelse return error.Corrupted;
+            const stats = if (PostingFormat.deltaSequenceGeneration(key_sequence) > base_generation)
+                try PostingFormat.deltaTailStatsAllRecords(entry.value)
+            else
+                try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
             out.records += stats.records;
             out.records_after_generation += stats.records_after_generation;
             out.tombstones_after_generation += stats.tombstones_after_generation;
@@ -5275,6 +5299,25 @@ test "posting delta tail round trips and overlays base members" {
     try std.testing.expectError(error.UnsupportedPostingDeltaVersion, PostingFormat.decodeDeltaTail(alloc, encoded));
 }
 
+test "posting delta all-record stats validates and counts tail" {
+    const alloc = std.testing.allocator;
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 3) << 32) | 11, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 3) << 32) | 12, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = (@as(u64, 4) << 32) | 1, .op = .replace, .vector_id = 10 },
+    };
+
+    const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+
+    const stats = try PostingFormat.deltaTailStatsAllRecords(encoded);
+    try std.testing.expectEqual(records.len, stats.records);
+    try std.testing.expectEqual(records.len, stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 1), stats.tombstones_after_generation);
+    try std.testing.expectEqual(records[2].sequence, stats.max_sequence_after_generation);
+    try std.testing.expectEqual(encoded.len, stats.encoded_value_bytes);
+}
+
 test "posting materialization uses latest-op map for large unsorted tails" {
     const alloc = std.testing.allocator;
     const base_members = [_]VectorId{ 10, 20, 30, 40 };
@@ -5792,7 +5835,11 @@ const PostingPersistenceTestIndex = struct {
         var out = PostingDeltaTailStats{};
         for (self.delta_entries.items) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
-            const stats = try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
+            const key_sequence = postingDeltaKeySequence(entry.key) orelse return error.Corrupted;
+            const stats = if (PostingFormat.deltaSequenceGeneration(key_sequence) > base_generation)
+                try PostingFormat.deltaTailStatsAllRecords(entry.value)
+            else
+                try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
             out.records += stats.records;
             out.records_after_generation += stats.records_after_generation;
             out.tombstones_after_generation += stats.tombstones_after_generation;

@@ -105,7 +105,10 @@ Current status:
   tail length, so tombstone-heavy tails do not inflate scratch allocation.
   Generic delta-tail scans now also append decoded records only after the
   base-generation filter accepts them, avoiding decoded-record scratch growth
-  for stale folded LSM tail values.
+  for stale folded LSM tail values. LSM delta-tail stats now use the ordered
+  posting-delta key sequence to skip per-record generation checks when the whole
+  value is newer than the base generation while still validating every encoded
+  record.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
@@ -843,11 +846,14 @@ implementations cleanly:
 4. Add specialized base decode modes.
 
    Not every path needs a fully materialized member slice. Base header,
-   count/stat, streaming member iteration, and full materialization paths are
-   separate. Canonical base/delta membership checks now use the sorted base
-   stream plus a focused latest-delta-op scan for one vector, so fallback
-   delete scans can avoid materializing whole postings when looking for a
-   single member.
+   count/stat, streaming member iteration, delta-stat, and full materialization
+   paths are separate. Canonical base/delta membership checks now use the sorted
+   base stream plus a focused latest-delta-op scan for one vector, so fallback
+   delete scans can avoid materializing whole postings when looking for a single
+   member. LSM delta-tail stats also use an all-record decoder when the
+   posting-delta key sequence proves the whole value is newer than the base
+   generation, avoiding a per-record generation branch without weakening value
+   validation.
 
    Expected win: fold decisions, backlog stats, and membership checks can avoid
    decoding or allocating full member arrays.
