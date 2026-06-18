@@ -17293,7 +17293,7 @@ test "api http server routes public external lake row queries through configured
     const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
     const external_source_api = @import("../serverless/external_source/mod.zig");
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["amount","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["amount","discount","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
 
     const FakeSource = struct {
@@ -17397,6 +17397,7 @@ test "api http server routes public external lake row queries through configured
     try client.makeBucket("bucket");
     const parquet_columns = [_]serverless_query.LakeParquetTestPlainI64Column{
         .{ .column_id = "amount", .values = &[_]i64{ 10, 20, 30 } },
+        .{ .column_id = "discount", .values = &[_]i64{ 1, 3, 4 } },
         .{ .column_id = "tenant", .values = &[_]i64{ 7, 8, 8 } },
         .{ .column_id = "rank", .values = &[_]i64{ 1, 3, 2 } },
     };
@@ -17451,7 +17452,7 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 20), ordered_rows[0].object.get("amount").?.integer);
     try std.testing.expect(ordered_rows[0].object.get("rank") == null);
 
-    var aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"large_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter\":{\"field\":\"amount\",\"op\":\"gte\",\"value\":20}}]}}", null);
+    var aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"net_amount_sum\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]}},{\"name\":\"large_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter\":{\"field\":\"amount\",\"op\":\"gte\",\"value\":20}}]}}", null);
     defer aggregate_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), aggregate_response.status);
     try std.testing.expectEqual(@as(u32, 3), resolver.open_count);
@@ -17465,10 +17466,12 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 7), aggregate_rows[0].object.get("tenant").?.integer);
     try std.testing.expectEqual(@as(i64, 1), aggregate_rows[0].object.get("row_count").?.integer);
     try std.testing.expectEqual(@as(i64, 10), aggregate_rows[0].object.get("amount_sum").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), aggregate_rows[0].object.get("net_amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 0), aggregate_rows[0].object.get("large_amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 8), aggregate_rows[1].object.get("tenant").?.integer);
     try std.testing.expectEqual(@as(i64, 2), aggregate_rows[1].object.get("row_count").?.integer);
     try std.testing.expectEqual(@as(i64, 50), aggregate_rows[1].object.get("amount_sum").?.integer);
+    try std.testing.expectEqual(@as(i64, 43), aggregate_rows[1].object.get("net_amount_sum").?.integer);
     try std.testing.expectEqual(@as(i64, 50), aggregate_rows[1].object.get("large_amount_sum").?.integer);
 
     var source_response = try server.handle(.{

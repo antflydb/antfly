@@ -264,6 +264,87 @@ pub fn adapterNoopFingerprintAlloc(
     });
 }
 
+pub fn boolFingerprintValue(value: bool) u8 {
+    return if (value) 1 else 0;
+}
+
+pub fn appendNonZeroU32FingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    label: []const u8,
+    value: u32,
+) ![]u8 {
+    if (value == 0) return owned_base;
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={d}", .{ owned_base, label, value });
+    alloc.free(owned_base);
+    return out;
+}
+
+pub fn appendNonZeroUsizeFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    label: []const u8,
+    value: usize,
+) ![]u8 {
+    if (value == 0) return owned_base;
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={d}", .{ owned_base, label, value });
+    alloc.free(owned_base);
+    return out;
+}
+
+pub fn appendNamedNonZeroUsizeFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    prefix: []const u8,
+    label: []const u8,
+    value: usize,
+) ![]u8 {
+    if (value == 0) return owned_base;
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(alloc, "{s}:{s}_{s}={d}", .{ owned_base, prefix, label, value });
+    alloc.free(owned_base);
+    return out;
+}
+
+pub fn appendTrueBoolFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    label: []const u8,
+    value: bool,
+) ![]u8 {
+    if (!value) return owned_base;
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(alloc, "{s}:{s}=1", .{ owned_base, label });
+    alloc.free(owned_base);
+    return out;
+}
+
+pub fn appendBoolFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    label: []const u8,
+    value: bool,
+) ![]u8 {
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={d}", .{ owned_base, label, boolFingerprintValue(value) });
+    alloc.free(owned_base);
+    return out;
+}
+
+pub fn appendStringFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    label: []const u8,
+    value: []const u8,
+) ![]u8 {
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={s}", .{ owned_base, label, value });
+    alloc.free(owned_base);
+    return out;
+}
+
 pub fn unsupportedPlanMatchesFamily(plan: []const u8, family: UnsupportedPlanFamily) bool {
     const prefix = "unsupported:";
     if (!std.mem.startsWith(u8, plan, prefix)) return false;
@@ -690,6 +771,30 @@ test "sql adapter corpus fingerprints unsupported and adapter no-op reasons" {
 
     try std.testing.expectError(error.UnsupportedSqlShape, unsupportedFingerprintAlloc(alloc, .write, .session_setting));
     try std.testing.expectError(error.UnsupportedSqlShape, adapterNoopFingerprintAlloc(alloc, "ddl", .set_operation_plan));
+}
+
+test "sql adapter corpus appends owned fingerprint fields" {
+    const alloc = std.testing.allocator;
+
+    var fingerprint = try alloc.dupe(u8, "query:table=usage_records");
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "pred", 2);
+    fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", 4);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "left", "expr", 1);
+    fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "select_all", true);
+    fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "verbose", false);
+    fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "claim", "skip_locked");
+    defer alloc.free(fingerprint);
+
+    try std.testing.expectEqualStrings(
+        "query:table=usage_records:pred=2:offset=4:left_expr=1:select_all=1:verbose=0:claim=skip_locked",
+        fingerprint,
+    );
+
+    var unchanged = try alloc.dupe(u8, "query:table=usage_records");
+    unchanged = try appendNonZeroUsizeFingerprintAlloc(alloc, unchanged, "pred", 0);
+    unchanged = try appendTrueBoolFingerprintAlloc(alloc, unchanged, "select_all", false);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("query:table=usage_records", unchanged);
 }
 
 test "sql adapter corpus string token matching is exact and unique" {

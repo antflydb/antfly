@@ -1009,9 +1009,9 @@ moves behind a `api/sql_adapter/` package:
   lowering into Antfly typed read plans, write plans, and catalog/schema plans.
 - `diagnostics.zig`: span-aware unsupported-shape diagnostics and stable
   required-feature classification.
-- `corpus.zig`: SQL/API parity corpus fixture metadata, helper predicates, and
-  fingerprint assertions, if those remain implemented in Zig source instead of
-  external fixtures.
+- `corpus.zig`: SQL/API parity corpus fixture metadata, helper predicates,
+  golden-plan fingerprint append mechanics, and fingerprint assertions, if
+  those remain implemented in Zig source instead of external fixtures.
 
 The internal flow is always:
 
@@ -1043,7 +1043,7 @@ typed execution contract, but it must fail closed under the right native family.
 Stable unsupported-shape and adapter-noop reason tokens belong in
 `diagnostics.zig`; the parity corpus must reject unknown reason strings, and
 adapter-only reasons must not be reused as required-feature classifications.
-Golden-plan fingerprint helpers and
+Golden-plan fingerprint append helpers and
 unsupported/adapter-noop plan matching belong in `corpus.zig`, so fixture
 validation and generated corpus promotion share the same adapter-owned contract.
 Exact string, integer, boolean, token-sum, optional-token-sum, and non-`none`

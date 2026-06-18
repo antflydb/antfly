@@ -56359,7 +56359,7 @@ fn freeInsertValueRows(alloc: std.mem.Allocator, rows: InsertValueRows) void {
 }
 
 fn appParityBoolValue(value: bool) u8 {
-    return if (value) 1 else 0;
+    return sql_adapter.boolFingerprintValue(value);
 }
 
 fn appParityGeneratedExpressionCount(plan: CreateIndexPlan) usize {
@@ -56487,11 +56487,7 @@ fn appendNonZeroU32FingerprintAlloc(
     label: []const u8,
     value: u32,
 ) ![]u8 {
-    if (value == 0) return owned_base;
-    errdefer alloc.free(owned_base);
-    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={d}", .{ owned_base, label, value });
-    alloc.free(owned_base);
-    return out;
+    return sql_adapter.appendNonZeroU32FingerprintAlloc(alloc, owned_base, label, value);
 }
 
 fn appendNonZeroUsizeFingerprintAlloc(
@@ -56500,11 +56496,7 @@ fn appendNonZeroUsizeFingerprintAlloc(
     label: []const u8,
     value: usize,
 ) ![]u8 {
-    if (value == 0) return owned_base;
-    errdefer alloc.free(owned_base);
-    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={d}", .{ owned_base, label, value });
-    alloc.free(owned_base);
-    return out;
+    return sql_adapter.appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, label, value);
 }
 
 fn appendNamedNonZeroUsizeFingerprintAlloc(
@@ -56514,11 +56506,7 @@ fn appendNamedNonZeroUsizeFingerprintAlloc(
     label: []const u8,
     value: usize,
 ) ![]u8 {
-    if (value == 0) return owned_base;
-    errdefer alloc.free(owned_base);
-    const out = try std.fmt.allocPrint(alloc, "{s}:{s}_{s}={d}", .{ owned_base, prefix, label, value });
-    alloc.free(owned_base);
-    return out;
+    return sql_adapter.appendNamedNonZeroUsizeFingerprintAlloc(alloc, owned_base, prefix, label, value);
 }
 
 fn appendTrueBoolFingerprintAlloc(
@@ -56527,11 +56515,7 @@ fn appendTrueBoolFingerprintAlloc(
     label: []const u8,
     value: bool,
 ) ![]u8 {
-    if (!value) return owned_base;
-    errdefer alloc.free(owned_base);
-    const out = try std.fmt.allocPrint(alloc, "{s}:{s}=1", .{ owned_base, label });
-    alloc.free(owned_base);
-    return out;
+    return sql_adapter.appendTrueBoolFingerprintAlloc(alloc, owned_base, label, value);
 }
 
 fn appendBoolFingerprintAlloc(
@@ -56540,10 +56524,7 @@ fn appendBoolFingerprintAlloc(
     label: []const u8,
     value: bool,
 ) ![]u8 {
-    errdefer alloc.free(owned_base);
-    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={d}", .{ owned_base, label, appParityBoolValue(value) });
-    alloc.free(owned_base);
-    return out;
+    return sql_adapter.appendBoolFingerprintAlloc(alloc, owned_base, label, value);
 }
 
 fn appendStringFingerprintAlloc(
@@ -56552,10 +56533,7 @@ fn appendStringFingerprintAlloc(
     label: []const u8,
     value: []const u8,
 ) ![]u8 {
-    errdefer alloc.free(owned_base);
-    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={s}", .{ owned_base, label, value });
-    alloc.free(owned_base);
-    return out;
+    return sql_adapter.appendStringFingerprintAlloc(alloc, owned_base, label, value);
 }
 
 fn expressionOrderCount(order_by: []const db_mod.types.RelationalRowsQueryOrder) usize {
