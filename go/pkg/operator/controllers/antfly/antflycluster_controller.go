@@ -3773,9 +3773,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			return true, err
 		}
 		result, err := adminClient.AcquireFenceResponse(ctx, body)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = requireHADirectFenceAcquireResult(cluster, action, raw)
+			err = requireHADirectFenceAcquireResultStatus(cluster, action, haAdminActionResultFromFenceSDK(*value))
 		}
 		return true, err
 	case string(haActionAssessPromotion):
@@ -3787,9 +3787,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			return true, err
 		}
 		result, err := adminClient.AssessPromotionResponse(ctx, body)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = requireHADirectPromotionAssessmentResult(action, raw)
+			err = requireHADirectPromotionAssessmentResultStatus(action, haAdminActionResultFromPromotionAssessSDK(*value))
 		}
 		return true, err
 	case string(haActionPromoteStandby):
@@ -3800,8 +3800,8 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			return true, err
 		}
 		result, err := adminClient.PromoteWithCurrentFenceResponse(ctx)
-		raw, err := haAdminSDKResponseRaw(result, err)
-		if err == nil && !r.applyHADirectPromotionResult(cluster, action, raw) {
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil && !r.applyHADirectPromotionResultFromSDK(cluster, action, *value) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed promotion receipt", action.Kind)
 		}
 		return true, err
@@ -3825,8 +3825,8 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		default:
 			result, err = adminClient.AssessRejoinResponse(ctx, body)
 		}
-		raw, err := haAdminSDKResponseRaw(result, err)
-		if err == nil && !r.applyHADirectRejoinAssessResult(cluster, action, raw) {
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil && !r.applyHADirectRejoinAssessResultFromSDK(cluster, action, *value) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed rejoin assessment", action.Kind)
 		}
 		return true, err
@@ -3929,6 +3929,55 @@ func haAdminActionResultFromStandbyBootstrapSDK(response adminsdk.HAStandbyBoots
 	result.BackupLSN = response.BackupLsn
 	result.CheckpointLSN = response.CheckpointLsn
 	return result
+}
+
+func haAdminActionResultFromFenceSDK(response adminsdk.HAFenceResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	applyHAFenceReceiptToAdminActionResult(result, response.Receipt)
+	return result
+}
+
+func haAdminActionResultFromPromotionAssessSDK(response adminsdk.HAPromotionAssessResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	applyHAPromotionAssessmentToAdminActionResult(result, response.Assessment)
+	return result
+}
+
+func applyHAFenceReceiptToAdminActionResult(result *antflyv1.HAAdminActionResultStatus, receipt adminsdk.HAFenceReceipt) {
+	if result == nil {
+		return
+	}
+	result.FenceGeneration = receipt.Generation
+	result.FenceToken = strings.TrimSpace(receipt.Token)
+	result.FenceClusterID = receipt.Identity.ClusterId
+	result.FenceShardID = receipt.Identity.ShardId
+	result.FenceTableID = receipt.Identity.TableId
+	result.FenceOldPrimaryID = strings.TrimSpace(receipt.OldPrimaryId)
+	result.FencePromotedNodeID = strings.TrimSpace(receipt.PromotedNodeId)
+	result.FenceParentTimelineID = receipt.ParentTimelineId
+	result.FenceParentEpoch = receipt.ParentEpoch
+	result.FenceNewTimelineID = receipt.NewTimelineId
+	result.FenceNewEpoch = receipt.NewEpoch
+	result.FenceRequiredLSN = receipt.RequiredLsn
+	result.FenceObservedLSN = receipt.ObservedLsn
+	result.FenceForced = receipt.Forced
+	result.FenceReason = strings.TrimSpace(receipt.Reason)
+}
+
+func applyHAPromotionAssessmentToAdminActionResult(result *antflyv1.HAAdminActionResultStatus, assessment adminsdk.HAPromotionAssessment) {
+	if result == nil {
+		return
+	}
+	result.PromotionRequiredLSN = assessment.RequiredLsn
+	result.PromotionReceivedLSN = assessment.ReceivedLsn
+	result.PromotionAppliedLSN = assessment.AppliedLsn
+	result.PromotionCanPromote = assessment.CanPromote
+	result.PromotionFenced = assessment.FencingConfirmed
+	result.PromotionSafe = assessment.Safe
+	result.PromotionForce = assessment.Force
+	result.PromotionDataLossPossible = assessment.DataLossPossible
+	result.PromotionRequiresFencing = assessment.RequiresFencing
+	result.PromotionRequiresForce = assessment.RequiresForce
 }
 
 func haAdminActionResultFromReceipt(schemaVersion uint32, receipt adminsdk.HAActionReceipt) *antflyv1.HAAdminActionResultStatus {
@@ -4532,12 +4581,39 @@ func requireHADirectFenceAcquireResult(cluster *antflyv1.AntflyCluster, action *
 	return fmt.Errorf("HA admin action %s succeeded without matching typed fence receipt", action.Kind)
 }
 
+func requireHADirectFenceAcquireResultStatus(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
+	if action == nil {
+		return nil
+	}
+	action.AdminResult = result
+	if haActionHasRequiredAdminResult(*action) &&
+		haDirectAdminActionReceiptMatches(*action) &&
+		haFenceAcquireResultMatchesAction(cluster, action, action.AdminResult) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without matching typed fence receipt", action.Kind)
+}
+
 func requireHADirectPromotionAssessmentResult(action *antflyv1.HAPlannedActionStatus, raw []byte) error {
 	if action == nil {
 		return nil
 	}
 	if applyHADirectAdminActionResult(action, raw) &&
 		haDirectAdminActionReceiptMatches(*action) &&
+		haPromotionAssessmentResultMatchesAction(*action, action.AdminResult) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without safe typed promotion assessment", action.Kind)
+}
+
+func requireHADirectPromotionAssessmentResultStatus(action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
+	if action == nil {
+		return nil
+	}
+	action.AdminResult = result
+	if haDirectAdminActionReceiptMatches(*action) &&
 		haPromotionAssessmentResultMatchesAction(*action, action.AdminResult) {
 		return nil
 	}
@@ -4684,12 +4760,26 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
 		return false
 	}
-	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
-	if identity == nil || action.StandbyName == "" {
-		return false
-	}
 	result, ok := parseHAPromotionAPIResult(raw)
 	if !ok {
+		return false
+	}
+	return r.applyHADirectPromotionJobResult(cluster, action, result)
+}
+
+func (r *AntflyClusterReconciler) applyHADirectPromotionResultFromSDK(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, response adminsdk.HAPromotionResponse) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
+	return r.applyHADirectPromotionJobResult(cluster, action, haPromotionJobResultFromSDK(response))
+}
+
+func (r *AntflyClusterReconciler) applyHADirectPromotionJobResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result haPromotionJobResult) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || action.StandbyName == "" {
 		return false
 	}
 	if !haPromotionResultMatchesAction(result, identity, action) {
@@ -4733,6 +4823,35 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 		cluster.Status.HAStatus.LastPromotion.FenceReason = haPromotionFenceReason(*action)
 	}
 	return true
+}
+
+func haPromotionJobResultFromSDK(response adminsdk.HAPromotionResponse) haPromotionJobResult {
+	return haPromotionJobResult{
+		SchemaVersion:    response.SchemaVersion,
+		ActionID:         strings.TrimSpace(response.Action.ActionId),
+		ActionKind:       strings.TrimSpace(string(response.Action.ActionKind)),
+		ActionTarget:     strings.TrimSpace(response.Action.Target),
+		ActionState:      strings.TrimSpace(string(response.Action.State)),
+		ActionNodeID:     strings.TrimSpace(response.Action.NodeId),
+		PromotedNodeID:   strings.TrimSpace(response.Promotion.NodeId),
+		SwitchLSN:        response.Promotion.SwitchLsn,
+		ParentClusterID:  response.Promotion.OldIdentity.ClusterId,
+		ParentShardID:    response.Promotion.OldIdentity.ShardId,
+		ParentTableID:    response.Promotion.OldIdentity.TableId,
+		ParentTimelineID: response.Promotion.OldIdentity.TimelineId,
+		ParentEpoch:      response.Promotion.OldIdentity.Epoch,
+		NewClusterID:     response.Promotion.NewIdentity.ClusterId,
+		NewShardID:       response.Promotion.NewIdentity.ShardId,
+		NewTableID:       response.Promotion.NewIdentity.TableId,
+		NewTimelineID:    response.Promotion.NewIdentity.TimelineId,
+		NewEpoch:         response.Promotion.NewIdentity.Epoch,
+		RequiredLSN:      response.Assessment.RequiredLsn,
+		ObservedLSN:      response.Assessment.ReceivedLsn,
+		FenceGeneration:  response.FenceGeneration,
+		FenceToken:       strings.TrimSpace(response.FenceToken),
+		Forced:           response.Forced || response.Promotion.Forced,
+		DataLossPossible: response.Promotion.DataLossPossible,
+	}
 }
 
 func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdminActionResultStatus {
@@ -4898,6 +5017,20 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResult(cluster *antfl
 	if !ok {
 		return false
 	}
+	return r.applyHADirectRejoinJobResult(cluster, action, result)
+}
+
+func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResultFromSDK(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, response adminsdk.HARejoinAssessResponse) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
+	return r.applyHADirectRejoinJobResult(cluster, action, haRejoinJobResultFromSDK(response))
+}
+
+func (r *AntflyClusterReconciler) applyHADirectRejoinJobResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result haRejoinJobResult) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
 	if !haDirectRejoinResultMatchesAction(result, cluster.Status.HAStatus, *action) {
 		return false
 	}
@@ -4912,6 +5045,46 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResult(cluster *antfl
 	applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, *action, cluster.Status.HAStatus.LastPromotion)
 	applyHARejoinJobResult(cluster.Status.HAStatus.FormerPrimary, result)
 	return true
+}
+
+func haRejoinJobResultFromSDK(response adminsdk.HARejoinAssessResponse) haRejoinJobResult {
+	result := haRejoinJobResult{
+		SchemaVersion:     response.SchemaVersion,
+		ActionID:          strings.TrimSpace(response.Action.ActionId),
+		ActionKind:        strings.TrimSpace(string(response.Action.ActionKind)),
+		ActionTarget:      strings.TrimSpace(response.Action.Target),
+		ActionState:       strings.TrimSpace(string(response.Action.State)),
+		ActionNodeID:      strings.TrimSpace(response.Action.NodeId),
+		Action:            strings.TrimSpace(string(response.Assessment.Action)),
+		Reason:            strings.TrimSpace(string(response.Assessment.Reason)),
+		FormerNodeID:      strings.TrimSpace(response.Assessment.FormerNodeId),
+		TargetTimelineID:  response.Assessment.TargetTimelineId,
+		TargetEpoch:       response.Assessment.TargetEpoch,
+		ParentClusterID:   response.Assessment.ParentClusterId,
+		ParentShardID:     response.Assessment.ParentShardId,
+		ParentTableID:     response.Assessment.ParentTableId,
+		ParentTimelineID:  response.Assessment.ParentTimelineId,
+		ParentEpoch:       response.Assessment.ParentEpoch,
+		ForkLSN:           response.Assessment.ForkLsn,
+		FormerLastLSN:     response.Assessment.FormerLastLsn,
+		RetainedFromLSN:   response.Assessment.RetainedFromLsn,
+		DataLossDiscarded: response.Assessment.DataLossDiscarded,
+	}
+	if strings.TrimSpace(response.Rewind.NodeId) != "" {
+		result.RewindExecuted = true
+		result.RewindPreviousLastLSN = response.Rewind.PreviousLastLsn
+		result.RewindCurrentLastLSN = response.Rewind.CurrentLastLsn
+		result.RewindNextLSN = response.Rewind.NextLsn
+		result.RewindDiscardedLSNCount = response.Rewind.DiscardedLsnCount
+		result.DataLossDiscarded = result.DataLossDiscarded || response.Rewind.DataLossDiscarded
+	}
+	if strings.TrimSpace(response.Reseed.NodeId) != "" {
+		result.ReseedExecuted = true
+		result.ReseedSlotName = strings.TrimSpace(response.Reseed.SlotName)
+		result.ReseedRequired = response.Reseed.ReseedRequired
+		result.ReseedBaseBackupRequired = response.Reseed.BaseBackupRequired
+	}
+	return result
 }
 
 func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
