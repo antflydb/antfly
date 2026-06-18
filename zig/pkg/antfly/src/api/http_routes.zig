@@ -88,6 +88,7 @@ pub const Routes = struct {
     pub const rows_lateral_suffix = "/rows/lateral";
     pub const rows_mutation_source_suffix = "/rows/mutation-source";
     pub const rows_source_suffix = "/rows/source";
+    pub const rows_explain_suffix = "/rows/explain";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -607,6 +608,10 @@ pub const Routes = struct {
 
     pub fn matchTableRowsSource(path: []const u8) ?TableRows {
         return matchTableRowsAction(path, rows_source_suffix);
+    }
+
+    pub fn matchTableRowsExplain(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_explain_suffix);
     }
 
     pub fn matchDatabasePath(path: []const u8) ?DatabasePath {

@@ -5142,6 +5142,11 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         return ExternalLakePinnedSourceState.fromInventory(self.inventory);
     }
 
+    pub fn rangeCacheStats(self: *const @This()) ?serverless_query.LakeParquetObjectRangeCacheStats {
+        const cache = self.owned_cache orelse return null;
+        return cache.statsSnapshot();
+    }
+
     pub fn deinit(self: *@This()) void {
         if (self.owned_cache) |cache| {
             cache.deinit(self.alloc);
@@ -5333,6 +5338,10 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
 
     pub fn pinnedState(self: *const @This()) ExternalLakePinnedSourceState {
         return self.owned_source.pinnedState();
+    }
+
+    pub fn rangeCacheStats(self: *const @This()) ?serverless_query.LakeParquetObjectRangeCacheStats {
+        return self.owned_source.rangeCacheStats();
     }
 
     pub fn deinit(self: *@This()) void {

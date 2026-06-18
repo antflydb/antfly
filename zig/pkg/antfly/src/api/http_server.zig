@@ -50,6 +50,7 @@ const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
+const lake_base_source = @import("../serverless/manifest/base_source.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -5395,6 +5396,11 @@ pub const ApiHttpServer = struct {
                 return try self.handlePublicTableRowsSource(rows_route.table_name);
             }
         }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableRowsExplain(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsExplain(rows_route.table_name);
+            }
+        }
         if (req.method == .POST) {
             if (routes.Routes.matchTableBatch(uri_parts.path)) |batch_route| {
                 return try self.handlePublicTableBatch(batch_route.table_name, req.body);
@@ -8510,6 +8516,25 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn openPublicExternalLakeRowsSourceAlloc(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+    ) !table_reads.OpenedExternalObjectStorageLakeRowsSource {
+        const external_base_source = schema.external_base_source orelse return error.InvalidRowsRequest;
+        const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        self.external_lake_configured_resolver.configure(self.cfg.node_config, self.cfg.secret_store);
+        const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_configured_resolver.resolver();
+        const lake_options = self.externalLakeRowsSourceOptions();
+        const opened_store = try resolver.openParquetPrefixAlloc(self.alloc, binding, lake_options);
+        return try table_reads.OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+            self.alloc,
+            schema,
+            opened_store,
+            lake_options,
+        );
+    }
+
     pub fn handlePublicTableRowsSource(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -8521,25 +8546,11 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        const external_base_source = schema.external_base_source orelse return try textResponse(self.alloc, 404, "not found");
-        const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
-        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
-        self.external_lake_configured_resolver.configure(self.cfg.node_config, self.cfg.secret_store);
-        const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_configured_resolver.resolver();
-        const lake_options = self.externalLakeRowsSourceOptions();
-        const opened_store = resolver.openParquetPrefixAlloc(self.alloc, binding, lake_options) catch |err| switch (err) {
-            error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef => return try textResponse(self.alloc, 501, "rows source unavailable"),
+        var lake_source = self.openPublicExternalLakeRowsSourceAlloc(schema) catch |err| switch (err) {
+            error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows source unavailable"),
             error.ExternalLakeCredentialRefNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ExternalLakeCredentialScopeMismatch => return try textResponse(self.alloc, 403, "forbidden"),
-            else => return err,
-        };
-        var lake_source = table_reads.OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
-            self.alloc,
-            schema,
-            opened_store,
-            lake_options,
-        ) catch |err| switch (err) {
-            error.EmptyExternalSourceSnapshot, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows source unavailable"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 404, "not found"),
             error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
             else => return err,
         };
@@ -8570,6 +8581,84 @@ pub const ApiHttpServer = struct {
             .row_count = state.row_count,
             .byte_len = state.byte_len,
         } });
+    }
+
+    pub fn handlePublicTableRowsExplain(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+    ) !http_common.HttpResponse {
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var lake_source = self.openPublicExternalLakeRowsSourceAlloc(schema) catch |err| switch (err) {
+            error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows explain unavailable"),
+            error.ExternalLakeCredentialRefNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ExternalLakeCredentialScopeMismatch => return try textResponse(self.alloc, 403, "forbidden"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 404, "not found"),
+            error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
+            else => return err,
+        };
+        defer lake_source.deinit();
+
+        const state = lake_source.pinnedState();
+        const plan = try serverless_query.explainLakeQuery(.{
+            .base_source = externalLakeBaseSourceDescriptor(state),
+            .artifacts = &.{},
+            .operation = .scan,
+            .range_cache_stats = lake_source.rangeCacheStats(),
+        });
+        const Source = struct {
+            kind: []const u8 = "external_lake",
+            format: []const u8,
+            source_uri: []const u8,
+            snapshot_id: []const u8,
+            schema_fingerprint: []const u8,
+            file_count: usize,
+            row_group_count: usize,
+            row_count: u64,
+            byte_len: u64,
+        };
+        const Response = struct {
+            source: Source,
+            plan: serverless_query.LakeExplainPlan,
+        };
+        return try jsonResponse(self.alloc, Response{
+            .source = .{
+                .format = @tagName(state.format),
+                .source_uri = state.source_uri,
+                .snapshot_id = state.snapshot_id,
+                .schema_fingerprint = state.schema_fingerprint,
+                .file_count = state.file_count,
+                .row_group_count = state.row_group_count,
+                .row_count = state.row_count,
+                .byte_len = state.byte_len,
+            },
+            .plan = plan,
+        });
+    }
+
+    fn externalLakeBaseSourceDescriptor(
+        state: table_reads.ExternalLakePinnedSourceState,
+    ) lake_base_source.BaseSourceDescriptor {
+        const source = lake_base_source.ExternalBaseSource{
+            .format = switch (state.format) {
+                .parquet => .parquet_prefix,
+                .iceberg => .iceberg,
+                .lance => .lance,
+            },
+            .source_uri = state.source_uri,
+            .snapshot_id = state.snapshot_id,
+            .schema_fingerprint = state.schema_fingerprint,
+        };
+        return switch (state.format) {
+            .parquet => .{ .external_parquet = source },
+            .iceberg => .{ .external_iceberg = source },
+            .lance => .{ .external_lance = source },
+        };
     }
 
     pub fn handlePublicTableRowsQuery(
@@ -18845,6 +18934,31 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 0), source_state.get("row_group_count").?.integer);
     try std.testing.expectEqual(@as(i64, 0), source_state.get("row_count").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(parquet_object.len)), source_state.get("byte_len").?.integer);
+
+    var explain_response = try server.handle(.{
+        .method = .GET,
+        .uri = "/tables/events/rows/explain",
+    });
+    defer explain_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), explain_response.status);
+    try std.testing.expectEqual(@as(u32, 5), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_explain = try std.json.parseFromSlice(std.json.Value, alloc, explain_response.body, .{ .allocate = .alloc_always });
+    defer parsed_explain.deinit();
+    const explain_source = parsed_explain.value.object.get("source").?.object;
+    try std.testing.expectEqualStrings("external_lake", explain_source.get("kind").?.string);
+    try std.testing.expectEqualStrings("parquet", explain_source.get("format").?.string);
+    try std.testing.expectEqualStrings("s3://bucket/events", explain_source.get("source_uri").?.string);
+    const explain_plan = parsed_explain.value.object.get("plan").?.object;
+    try std.testing.expectEqualStrings("scan", explain_plan.get("operation").?.string);
+    try std.testing.expectEqualStrings("external_parquet", explain_plan.get("source_kind").?.string);
+    try std.testing.expectEqualStrings("external_metadata", explain_plan.get("cache_class").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, explain_plan.get("snapshot_id").?.string, "sha256:"));
+    try std.testing.expectEqualStrings("schema-v1", explain_plan.get("schema_fingerprint").?.string);
+    const range_cache = explain_plan.get("range_cache_accounting").?.object;
+    const total_range_cache = range_cache.get("total").?.object;
+    try std.testing.expectEqual(@as(i64, 0), total_range_cache.get("stored_bytes").?.integer);
 }
 
 test "api http server resolves credentialed external lake rows from node config" {
