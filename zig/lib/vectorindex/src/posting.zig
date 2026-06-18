@@ -783,9 +783,133 @@ pub const PostingFormat = struct {
         ops: []PostingDeltaOp,
     ) !usize {
         stableSortCompactOpsByVector(ids, ops);
-        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + dedupedLiveSortedCompactOpCount(ids, ops));
+        const original_base_members = scratch.member_ids[0..base_member_count];
+        const final_count = sortedCompactOpsMaterializedCount(original_base_members, ids, ops);
+        if (canApplySortedCompactOpsForwardInPlace(original_base_members, ids, ops)) {
+            try scratch.ensureMemberIdCapacity(alloc, final_count);
+            return applySortedCompactOpsForwardInPlace(scratch.member_ids[0..base_member_count], scratch.member_ids, ids, ops);
+        }
+        if (!canApplySortedCompactOpsBackwardInPlace(original_base_members, ids, ops, final_count)) {
+            try scratch.ensurePostingOverlayAppendCapacity(alloc, final_count);
+            const out = overlayAppendedIds(scratch);
+            const out_count = applySortedCompactOpsIntoBuffer(original_base_members, out, ids, ops);
+            try scratch.ensureMemberIdCapacity(alloc, out_count);
+            @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
+            return out_count;
+        }
+        try scratch.ensureMemberIdCapacity(alloc, final_count);
         const base_members = scratch.member_ids[0..base_member_count];
-        const out = overlayAppendedIds(scratch);
+        const out = scratch.member_ids;
+        var out_index = final_count;
+        var base_index = base_members.len;
+        var op_index = ids.len;
+        while (op_index > 0) {
+            const vector_id = ids[op_index - 1];
+            const last_op = ops[op_index - 1];
+            var group_start = op_index - 1;
+            while (group_start > 0 and ids[group_start - 1] == vector_id) : (group_start -= 1) {}
+
+            while (base_index > 0 and base_members[base_index - 1] > vector_id) {
+                base_index -= 1;
+                out_index -= 1;
+                out[out_index] = base_members[base_index];
+            }
+            const present_in_base = base_index > 0 and base_members[base_index - 1] == vector_id;
+            if (last_op != .tombstone) {
+                out_index -= 1;
+                out[out_index] = vector_id;
+            }
+            if (present_in_base) base_index -= 1;
+            op_index = group_start;
+        }
+        while (base_index > 0) {
+            base_index -= 1;
+            out_index -= 1;
+            out[out_index] = base_members[base_index];
+        }
+        std.debug.assert(out_index == 0);
+        return final_count;
+    }
+
+    fn canApplySortedCompactOpsForwardInPlace(base_members: []const VectorId, ids: []const VectorId, ops: []const PostingDeltaOp) bool {
+        var out_count: usize = 0;
+        var base_index: usize = 0;
+        var op_index: usize = 0;
+        while (base_index < base_members.len or op_index < ids.len) {
+            if (op_index >= ids.len) {
+                if (out_count > base_index) return false;
+                out_count += 1;
+                base_index += 1;
+                continue;
+            }
+            const vector_id = ids[op_index];
+            var last_op = ops[op_index];
+            op_index += 1;
+            while (op_index < ids.len and ids[op_index] == vector_id) : (op_index += 1) {
+                last_op = ops[op_index];
+            }
+            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
+                if (out_count > base_index) return false;
+                out_count += 1;
+            }
+            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
+            if (last_op != .tombstone) {
+                if (present_in_base) {
+                    if (out_count > base_index) return false;
+                } else if (base_index < base_members.len and out_count >= base_index) {
+                    return false;
+                }
+                out_count += 1;
+            }
+            if (present_in_base) base_index += 1;
+        }
+        return true;
+    }
+
+    fn canApplySortedCompactOpsBackwardInPlace(base_members: []const VectorId, ids: []const VectorId, ops: []const PostingDeltaOp, final_count: usize) bool {
+        var out_index = final_count;
+        var base_index = base_members.len;
+        var op_index = ids.len;
+        while (op_index > 0) {
+            const vector_id = ids[op_index - 1];
+            const last_op = ops[op_index - 1];
+            var group_start = op_index - 1;
+            while (group_start > 0 and ids[group_start - 1] == vector_id) : (group_start -= 1) {}
+            while (base_index > 0 and base_members[base_index - 1] > vector_id) {
+                if (out_index == 0) return false;
+                const dest_index = out_index - 1;
+                const source_index = base_index - 1;
+                if (dest_index < source_index) return false;
+                out_index = dest_index;
+                base_index = source_index;
+            }
+            const present_in_base = base_index > 0 and base_members[base_index - 1] == vector_id;
+            if (last_op != .tombstone) {
+                if (out_index == 0) return false;
+                const dest_index = out_index - 1;
+                const lowest_safe_index = if (present_in_base) base_index - 1 else base_index;
+                if (dest_index < lowest_safe_index) return false;
+                out_index = dest_index;
+            }
+            if (present_in_base) base_index -= 1;
+            op_index = group_start;
+        }
+        while (base_index > 0) {
+            if (out_index == 0) return false;
+            const dest_index = out_index - 1;
+            const source_index = base_index - 1;
+            if (dest_index < source_index) return false;
+            out_index = dest_index;
+            base_index = source_index;
+        }
+        return out_index == 0;
+    }
+
+    fn applySortedCompactOpsForwardInPlace(base_members: []const VectorId, out: []VectorId, ids: []const VectorId, ops: []const PostingDeltaOp) usize {
+        return applySortedCompactOpsIntoBuffer(base_members, out, ids, ops);
+    }
+
+    fn applySortedCompactOpsIntoBuffer(base_members: []const VectorId, out: []VectorId, ids: []const VectorId, ops: []const PostingDeltaOp) usize {
         var out_count: usize = 0;
         var base_index: usize = 0;
         var op_index: usize = 0;
@@ -813,8 +937,32 @@ pub const PostingFormat = struct {
             }
             if (present_in_base) base_index += 1;
         }
-        try scratch.ensureMemberIdCapacity(alloc, out_count);
-        @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
+        return out_count;
+    }
+
+    fn sortedCompactOpsMaterializedCount(base_members: []const VectorId, ids: []const VectorId, ops: []const PostingDeltaOp) usize {
+        var out_count: usize = 0;
+        var base_index: usize = 0;
+        var op_index: usize = 0;
+        while (base_index < base_members.len or op_index < ids.len) {
+            if (op_index >= ids.len) {
+                out_count += 1;
+                base_index += 1;
+                continue;
+            }
+            const vector_id = ids[op_index];
+            var last_op = ops[op_index];
+            op_index += 1;
+            while (op_index < ids.len and ids[op_index] == vector_id) : (op_index += 1) {
+                last_op = ops[op_index];
+            }
+            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
+                out_count += 1;
+            }
+            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
+            if (last_op != .tombstone) out_count += 1;
+            if (present_in_base) base_index += 1;
+        }
         return out_count;
     }
 
@@ -825,9 +973,133 @@ pub const PostingFormat = struct {
         records: []PostingDeltaRecord,
     ) !usize {
         stableSortDeltaRecordsByVector(records);
-        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + dedupedLiveSortedDeltaRecordCount(records));
+        const original_base_members = scratch.member_ids[0..base_member_count];
+        const final_count = sortedDeltaRecordsMaterializedCount(original_base_members, records);
+        if (canApplySortedDeltaRecordsForwardInPlace(original_base_members, records)) {
+            try scratch.ensureMemberIdCapacity(alloc, final_count);
+            return applySortedDeltaRecordsForwardInPlace(scratch.member_ids[0..base_member_count], scratch.member_ids, records);
+        }
+        if (!canApplySortedDeltaRecordsBackwardInPlace(original_base_members, records, final_count)) {
+            try scratch.ensurePostingOverlayAppendCapacity(alloc, final_count);
+            const out = overlayAppendedIds(scratch);
+            const out_count = applySortedDeltaRecordsIntoBuffer(original_base_members, out, records);
+            try scratch.ensureMemberIdCapacity(alloc, out_count);
+            @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
+            return out_count;
+        }
+        try scratch.ensureMemberIdCapacity(alloc, final_count);
         const base_members = scratch.member_ids[0..base_member_count];
-        const out = overlayAppendedIds(scratch);
+        const out = scratch.member_ids;
+        var out_index = final_count;
+        var base_index = base_members.len;
+        var record_index = records.len;
+        while (record_index > 0) {
+            const vector_id = records[record_index - 1].vector_id;
+            const last_op = records[record_index - 1].op;
+            var group_start = record_index - 1;
+            while (group_start > 0 and records[group_start - 1].vector_id == vector_id) : (group_start -= 1) {}
+
+            while (base_index > 0 and base_members[base_index - 1] > vector_id) {
+                base_index -= 1;
+                out_index -= 1;
+                out[out_index] = base_members[base_index];
+            }
+            const present_in_base = base_index > 0 and base_members[base_index - 1] == vector_id;
+            if (last_op != .tombstone) {
+                out_index -= 1;
+                out[out_index] = vector_id;
+            }
+            if (present_in_base) base_index -= 1;
+            record_index = group_start;
+        }
+        while (base_index > 0) {
+            base_index -= 1;
+            out_index -= 1;
+            out[out_index] = base_members[base_index];
+        }
+        std.debug.assert(out_index == 0);
+        return final_count;
+    }
+
+    fn canApplySortedDeltaRecordsForwardInPlace(base_members: []const VectorId, records: []const PostingDeltaRecord) bool {
+        var out_count: usize = 0;
+        var base_index: usize = 0;
+        var record_index: usize = 0;
+        while (base_index < base_members.len or record_index < records.len) {
+            if (record_index >= records.len) {
+                if (out_count > base_index) return false;
+                out_count += 1;
+                base_index += 1;
+                continue;
+            }
+            const vector_id = records[record_index].vector_id;
+            var last_op = records[record_index].op;
+            record_index += 1;
+            while (record_index < records.len and records[record_index].vector_id == vector_id) : (record_index += 1) {
+                last_op = records[record_index].op;
+            }
+            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
+                if (out_count > base_index) return false;
+                out_count += 1;
+            }
+            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
+            if (last_op != .tombstone) {
+                if (present_in_base) {
+                    if (out_count > base_index) return false;
+                } else if (base_index < base_members.len and out_count >= base_index) {
+                    return false;
+                }
+                out_count += 1;
+            }
+            if (present_in_base) base_index += 1;
+        }
+        return true;
+    }
+
+    fn canApplySortedDeltaRecordsBackwardInPlace(base_members: []const VectorId, records: []const PostingDeltaRecord, final_count: usize) bool {
+        var out_index = final_count;
+        var base_index = base_members.len;
+        var record_index = records.len;
+        while (record_index > 0) {
+            const vector_id = records[record_index - 1].vector_id;
+            const last_op = records[record_index - 1].op;
+            var group_start = record_index - 1;
+            while (group_start > 0 and records[group_start - 1].vector_id == vector_id) : (group_start -= 1) {}
+            while (base_index > 0 and base_members[base_index - 1] > vector_id) {
+                if (out_index == 0) return false;
+                const dest_index = out_index - 1;
+                const source_index = base_index - 1;
+                if (dest_index < source_index) return false;
+                out_index = dest_index;
+                base_index = source_index;
+            }
+            const present_in_base = base_index > 0 and base_members[base_index - 1] == vector_id;
+            if (last_op != .tombstone) {
+                if (out_index == 0) return false;
+                const dest_index = out_index - 1;
+                const lowest_safe_index = if (present_in_base) base_index - 1 else base_index;
+                if (dest_index < lowest_safe_index) return false;
+                out_index = dest_index;
+            }
+            if (present_in_base) base_index -= 1;
+            record_index = group_start;
+        }
+        while (base_index > 0) {
+            if (out_index == 0) return false;
+            const dest_index = out_index - 1;
+            const source_index = base_index - 1;
+            if (dest_index < source_index) return false;
+            out_index = dest_index;
+            base_index = source_index;
+        }
+        return out_index == 0;
+    }
+
+    fn applySortedDeltaRecordsForwardInPlace(base_members: []const VectorId, out: []VectorId, records: []const PostingDeltaRecord) usize {
+        return applySortedDeltaRecordsIntoBuffer(base_members, out, records);
+    }
+
+    fn applySortedDeltaRecordsIntoBuffer(base_members: []const VectorId, out: []VectorId, records: []const PostingDeltaRecord) usize {
         var out_count: usize = 0;
         var base_index: usize = 0;
         var record_index: usize = 0;
@@ -855,8 +1127,32 @@ pub const PostingFormat = struct {
             }
             if (present_in_base) base_index += 1;
         }
-        try scratch.ensureMemberIdCapacity(alloc, out_count);
-        @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
+        return out_count;
+    }
+
+    fn sortedDeltaRecordsMaterializedCount(base_members: []const VectorId, records: []const PostingDeltaRecord) usize {
+        var out_count: usize = 0;
+        var base_index: usize = 0;
+        var record_index: usize = 0;
+        while (base_index < base_members.len or record_index < records.len) {
+            if (record_index >= records.len) {
+                out_count += 1;
+                base_index += 1;
+                continue;
+            }
+            const vector_id = records[record_index].vector_id;
+            var last_op = records[record_index].op;
+            record_index += 1;
+            while (record_index < records.len and records[record_index].vector_id == vector_id) : (record_index += 1) {
+                last_op = records[record_index].op;
+            }
+            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
+                out_count += 1;
+            }
+            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
+            if (last_op != .tombstone) out_count += 1;
+            if (present_in_base) base_index += 1;
+        }
         return out_count;
     }
 
@@ -6715,7 +7011,48 @@ test "posting sorted delta replay sizes output scratch by deduped live records" 
 
     const expected = [_]VectorId{ 10, 30, 40 };
     try std.testing.expectEqual(@as(usize, expected.len), out_count);
-    try std.testing.expectEqual(@as(usize, base_members.len), scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting sorted delta replay expands in place when output shifts right" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20 };
+    try scratch.ensureMemberIdCapacity(alloc, base_members.len);
+    @memcpy(scratch.member_ids[0..base_members.len], base_members[0..]);
+
+    var records = [_]PostingDeltaRecord{
+        .{ .sequence = 1, .op = .insert, .vector_id = 15 },
+    };
+
+    const out_count = try PostingFormat.applySortedDeltaRecordsToSortedScratch(alloc, &scratch, base_members.len, records[0..]);
+
+    const expected = [_]VectorId{ 10, 15, 20 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting sorted compact op replay expands in place when output shifts right" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20 };
+    try scratch.ensureMemberIdCapacity(alloc, base_members.len);
+    @memcpy(scratch.member_ids[0..base_members.len], base_members[0..]);
+
+    var ids = [_]VectorId{15};
+    var ops = [_]PostingDeltaOp{.insert};
+
+    const out_count = try PostingFormat.applySortedCompactOpsToSortedScratch(alloc, &scratch, base_members.len, ids[0..], ops[0..]);
+
+    const expected = [_]VectorId{ 10, 15, 20 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_ids.len);
     try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
 }
 
