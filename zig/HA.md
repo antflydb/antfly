@@ -502,6 +502,26 @@ Recommended split:
   consumers, and OpenAPI compatibility checks on one reviewed contract instead
   of creating a second admin API surface inside `go/pkg/operator`.
 
+Runtime HA validation should be shared but still field-aware. Helpers such as
+`paddedHAString` should evolve into a small classifier, for example
+`classifyHAString(value) -> ok | missing | padded`, so role validation can reuse
+the same whitespace and missing-value rules while preserving field-specific
+errors such as `HAPrimaryLogInvalid`, `HAStandbySlotMissing`, or
+`HAAdminTokenEnvInvalid`. Do not collapse validation into one generic
+string-cleaning function that silently trims operator input. HA runtime identity
+and path fields should fail closed when they contain leading or trailing
+whitespace, because those values become durable node identity, WAL path, fence,
+slot, URL, or token-env configuration. Field-specific validators should layer
+type checks on top of the shared classifier:
+
+- paths must pass path-specific safety rules such as absolute or storage-root
+  bounded paths where appropriate;
+- node ids and slot names must have restricted character sets and bounded
+  lengths;
+- token environment names must pass environment-variable-name validation;
+- admin and replication URLs must be parsed as URLs and reject hidden
+  whitespace instead of relying on implicit trimming.
+
 Admin authentication should be explicit but operationally simple. The Antfly
 runtime may be started with `--ha-admin-token-env <name>`; when set, the Zig
 process reads a bearer token from that environment variable at startup and
@@ -555,6 +575,43 @@ for workflows that need pod-local volume mounts or shared backup files. They
 should not become the only production automation path. The operator should move
 toward typed `/admin/v1/ha` calls for idempotent actions and reserve CLI Jobs
 for explicitly local file-transfer or recovery steps.
+
+## Test Strategy
+
+HA needs both black-box e2e coverage and deterministic simulation coverage. The
+Python e2e suite should add a Zig-backed standby test, for example
+`test_standby.py`, once the runtime and admin API are usable as real process
+surfaces. That e2e test should not exist only to assert argument validation. It
+should launch real Antfly processes and cover the user-visible Postgres-style
+flow:
+
+1. start a primary;
+2. create or reserve a replication slot;
+3. seed and start a standby;
+4. write data to the primary;
+5. wait for standby catch-up and verify read-only standby visibility;
+6. restart the standby and verify local received-WAL replay plus stream resume;
+7. later, fence and promote the standby, then verify the old primary rejects
+   writes or must rejoin through rewind/reseed.
+
+The Zig simulation tests should carry most of the correctness burden because
+they can explore interleavings that are expensive or flaky in process e2e. Add
+model or harness coverage for:
+
+- crash after WAL receive before apply;
+- crash after apply before acknowledgement;
+- primary crash before and after synchronous acknowledgement;
+- duplicate, missing, out-of-order, or divergent WAL records;
+- delayed status updates and stale slot progress;
+- promotion with a valid fence, without a fence, and with stale fence evidence;
+- old-primary return after promotion;
+- rewind versus reseed decisions;
+- retention expiry forcing reseed;
+- timeline switch propagation to remaining standbys.
+
+The expected split is: e2e proves the supported CLI/admin/operator path works
+with real processes and files, while Zig simulation proves the state machine is
+correct under crash, restart, partition, and replay ordering stress.
 
 ## Failure Cases
 
@@ -637,6 +694,10 @@ and either rewind or reseed.
   - former primary return.
 - Add metrics and admin status.
 - Add compatibility tests across replication format versions.
+- Add the Python `test_standby.py` e2e path for real primary/standby process
+  startup, seed, catch-up, standby restart, and read-only standby verification.
+- Add Zig simulation coverage for the HA state machine before depending on
+  black-box e2e for correctness.
 
 ### Phase 7: Synchronous Failover
 
@@ -786,6 +847,51 @@ be validated against that operator package.
 - Automate former-primary demotion, rewind, or reseed after failover.
 - Keep automatic promotion disabled unless Phase 7 fencing requirements are
   satisfied by the configured environment.
+
+## Production Readiness and Postgres-Parity Gaps
+
+Antfly should not call hot standby production grade merely because records can
+stream from one process to another. The production bar is that ordinary and
+adverse operational workflows are typed, observable, restartable, and fenced.
+The remaining work before this mode has the bulk of Postgres-style HA parity is:
+
+- real `antfly swarm` primary and standby runtime wiring, including durable
+  replication logs, received-WAL logs, slot stores, progress WALs, fence WALs,
+  former-primary logs, read/write gates, admin auth, and background-job gating;
+- a stable `/admin/v1/ha` OpenAPI contract generated into Zig admin bindings
+  and the Go SDK admin wrapper, with the Kubernetes operator using that wrapper
+  instead of shelling out or duplicating HTTP code;
+- base-backup creation, manifest pinning, file/object copy, checksum
+  validation, catch-up, and resumable seed workflows against real filesystem
+  and object-store layouts;
+- asynchronous replication with explicit received/apply progress and durable
+  slots;
+- synchronous commit policies matching the intended Postgres semantics:
+  `remote_write`, `remote_apply`, `ANY`, `FIRST`, `ALL`, and clear `block`,
+  `fail_closed`, or `degrade_to_async` failure behavior;
+- promotion with durable timeline switch records, machine-checkable fence
+  receipts, forced-promotion receipts, and old-primary write rejection;
+- `pg_rewind`-style former-primary repair where retained WAL is sufficient,
+  plus explicit reseed when rewind is unsafe or retention has expired;
+- standby read routing and freshness controls such as stale reads,
+  `at_least_lsn`, and primary-only read-after-write routing;
+- WAL retention pressure handling, slot expiration, reseed-required status, and
+  operator policies that prevent dead standbys from pinning WAL forever;
+- versioned replication record compatibility tests and upgrade/downgrade
+  behavior for mixed-version rolling deployments;
+- metrics, logs, status conditions, action receipts, and runbooks for slot lag,
+  retained WAL, degraded synchronous commit, promotion readiness, replay
+  failure, and reseed requirements;
+- crash, partition, and replay simulation coverage plus real process e2e and
+  operator e2e coverage.
+
+Features such as WAL archive/PITR recovery, cascading or relay replication,
+cross-region latency policy, and richer read-replica routing can follow the
+core HA path, but they should not be confused with the minimum safe production
+surface. The minimum production-grade target is a boring single-primary system:
+the primary streams ordered records, standbys recover and apply deterministically,
+promotion requires a fence and creates a new timeline, the former primary cannot
+silently continue, and the operator can explain every action it took.
 
 ## Recommendation
 
