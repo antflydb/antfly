@@ -3151,6 +3151,39 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 	}
 }
 
+func TestReconcileHAFencingLeaseAllowsRemoteWriteCandidate(t *testing.T) {
+	remoteApply := false
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.AutomaticFailover.RequireRemoteApply = &remoteApply
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	cluster.Status.HAStatus.Standbys[0].AppliedLSN = 11
+	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 11
+	cluster.Status.HAStatus.Standbys[0].ApplyLagLSN = 1
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
+		t.Fatalf("get fencing lease: %v", err)
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "standby-a" {
+		t.Fatalf("expected remote-write standby-a lease holder, got %#v", lease.Spec.HolderIdentity)
+	}
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe fencing status: %v", err)
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected received-but-not-applied standby to satisfy automatic promotion when requireRemoteApply=false")
+	}
+}
+
 func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.Standbys = append(cluster.Spec.HighAvailability.Standbys, antflyv1.HAStandbySpec{
