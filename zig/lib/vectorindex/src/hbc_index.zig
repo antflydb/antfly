@@ -8168,7 +8168,11 @@ pub fn bulkBuildExternalSequentialTxnOptions(
         .hilbert_seeded => {
             const Entry = struct {
                 vector_id: u64,
-                embedding: []const u8,
+                embedding_offset: usize,
+            };
+            const SortContext = struct {
+                embeddings: []const u8,
+                embedding_len: usize,
             };
 
             const hilbert = try self.getHilbert();
@@ -8199,15 +8203,17 @@ pub fn bulkBuildExternalSequentialTxnOptions(
                     try hilbert.encodeVecBytesInto(transformed[i * dims ..][0..dims], coords, embedding);
                     entries[entry_index] = .{
                         .vector_id = vector_ids[i],
-                        .embedding = embedding,
+                        .embedding_offset = entry_index * embedding_len,
                     };
                 }
                 offset += group_size;
             }
 
-            std.mem.sort(Entry, entries, {}, struct {
-                fn lessThan(_: void, a: Entry, b: Entry) bool {
-                    return std.mem.order(u8, a.embedding, b.embedding) == .lt;
+            std.mem.sort(Entry, entries, SortContext{ .embeddings = embeddings, .embedding_len = embedding_len }, struct {
+                fn lessThan(ctx: SortContext, a: Entry, b: Entry) bool {
+                    const left = ctx.embeddings[a.embedding_offset..][0..ctx.embedding_len];
+                    const right = ctx.embeddings[b.embedding_offset..][0..ctx.embedding_len];
+                    return std.mem.order(u8, left, right) == .lt;
                 }
             }.lessThan);
 
