@@ -39,6 +39,7 @@ pub const HostImports = struct {
 
 pub const InvokeOptions = struct {
     host_imports: HostImports = .{},
+    package_store_root: ?[]const u8 = null,
     fuel: u64 = 50_000_000,
     max_memory_bytes: i64 = 64 * 1024 * 1024,
 };
@@ -59,7 +60,7 @@ pub fn invokeExtensionWithOptions(
     request_json: []const u8,
     options: InvokeOptions,
 ) InvokeError![]u8 {
-    const artifact_path = try resolveArtifactPathAlloc(alloc, binding);
+    const artifact_path = try resolveArtifactPathAlloc(alloc, binding, options.package_store_root);
     defer alloc.free(artifact_path);
 
     const wasm = readFileAlloc(alloc, artifact_path) catch |err| switch (err) {
@@ -82,10 +83,10 @@ pub fn invokeExtensionWithOptions(
     return try lib.invokeExtensionCAbi(alloc, wasm, tool_name, request_json);
 }
 
-fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding) InvokeError![]u8 {
+fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, package_store_root: ?[]const u8) InvokeError![]u8 {
     if (std.fs.path.isAbsolute(binding.artifact)) return try alloc.dupe(u8, binding.artifact);
 
-    const root = getenv(package_store_env) orelse return error.WasmtimePackageStoreUnavailable;
+    const root = package_store_root orelse getenv(package_store_env) orelse return error.WasmtimePackageStoreUnavailable;
 
     return try std.fs.path.join(alloc, &.{ root, binding.package_name, binding.package_version, binding.artifact });
 }

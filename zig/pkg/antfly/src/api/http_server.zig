@@ -251,6 +251,7 @@ pub const ApiHttpServerConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
     node_config: ?*const common_config.Config = null,

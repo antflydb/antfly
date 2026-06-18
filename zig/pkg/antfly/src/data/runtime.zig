@@ -73,6 +73,7 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
     help: bool = false,
 
@@ -87,12 +88,14 @@ const ResolvedPaths = struct {
     replica_catalog_path: []u8,
     snapshot_root_dir: []u8,
     auth_store_root_dir: []u8,
+    extension_package_store_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
         alloc.free(self.auth_store_root_dir);
+        alloc.free(self.extension_package_store_dir);
     }
 };
 
@@ -7801,6 +7804,7 @@ pub fn runFromIterator(
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     }, metadata_api_urls.urls);
@@ -7935,6 +7939,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extension-package-store")) {
+            cfg.extension_package_store_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -7962,6 +7970,14 @@ fn resolvePaths(
     defer alloc.free(local_base);
     const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
     defer alloc.free(metadata_base);
+    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
+        try normalizeResolvedPathAlloc(alloc, path)
+    else blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+        defer alloc.free(raw);
+        break :blk try normalizeResolvedPathAlloc(alloc, raw);
+    };
+    errdefer alloc.free(extension_package_store_dir);
 
     if (cli.replica_root_dir != null and cli.replica_catalog_path != null) {
         const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
@@ -7989,6 +8005,7 @@ fn resolvePaths(
             .replica_catalog_path = replica_catalog_path,
             .snapshot_root_dir = snapshot_root_dir,
             .auth_store_root_dir = auth_store_root_dir,
+            .extension_package_store_dir = extension_package_store_dir,
         };
     }
 
@@ -8029,6 +8046,7 @@ fn resolvePaths(
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
         .auth_store_root_dir = auth_store_root_dir,
+        .extension_package_store_dir = extension_package_store_dir,
     };
 }
 
@@ -8170,6 +8188,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Data raft snapshot root directory
+        \\  --extension-package-store <path> Extension package store directory
         \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
@@ -8253,6 +8272,14 @@ test "data runtime cli accepts secret store path" {
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
 }
 
+test "data runtime cli accepts extension package store path" {
+    const argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
 test "data runtime resolves metadata api urls from common config" {
     const alloc = std.testing.allocator;
     const orchestration_urls = try alloc.alloc(antfly.common.config.Config.MetadataConfig.NodeUrl, 2);
@@ -8293,6 +8320,7 @@ test "data runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/data/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/data/snapshots", resolved.snapshot_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
 }
 
 test "data runtime parses optional split store registration flags" {

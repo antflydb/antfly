@@ -787,6 +787,7 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization
             .installed = installed,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
+            .package_store_root = server.cfg.extension_package_store_dir,
             .host_imports = .{
                 .ptr = &host_context,
                 .db_query = ExtensionHostContext(@TypeOf(server)).dbQuery,
