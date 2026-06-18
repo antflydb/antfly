@@ -669,7 +669,7 @@ type HARuntimeSpec struct {
 
 	// FormerPrimaryLogPath is the durable HA replication log used by former-primary rewind admin workflows.
 	// Set this on nodes that may need to rejoin after failover; for a primary this is usually the same path
-	// as primary.logPath.
+	// as primary.logPath, and the Swarm runtime wiring defaults it to primary.logPath when omitted.
 	// +optional
 	FormerPrimaryLogPath string `json:"formerPrimaryLogPath,omitempty"`
 

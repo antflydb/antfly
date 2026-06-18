@@ -215,6 +215,9 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		appendHAArg("--ha-primary-slots", slotsPath)
 		appendHAArg("--ha-primary-node-id", runtime.NodeID)
 		appendHAArg("--ha-fence-wal", fencePath)
+		if formerPrimaryLogPath == "" {
+			formerPrimaryLogPath = logPath
+		}
 		if formerPrimaryLogPath != "" {
 			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
 		}

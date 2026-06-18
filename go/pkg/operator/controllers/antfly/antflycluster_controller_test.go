@@ -7930,10 +7930,9 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			CurrentPrimaryID: "primary-a",
 		},
 		Runtime: &antflyv1.HARuntimeSpec{
-			Role:                 antflyv1.HARuntimeRolePrimary,
-			NodeID:               "primary-a",
-			FormerPrimaryLogPath: "/antflydb/ha/primary.wal",
-			AdminTokenEnvVar:     "ANTFLY_HA_ADMIN_TOKEN",
+			Role:             antflyv1.HARuntimeRolePrimary,
+			NodeID:           "primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN",
 			AdminTokenSecretRef: &corev1.SecretKeySelector{
 				LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
 				Key:                  "token",
