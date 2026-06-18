@@ -22,8 +22,14 @@ const native_embed = @import("../native_embed.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 
 const print = std.debug.print;
-const cuda_ptx = if (build_options.enable_cuda) @embedFile("../ops/cuda/artifacts/inference_cuda_kernels.ptx") else "";
-const cuda_ptx_z = cuda_ptx ++ "\x00";
+const cuda_artifact = if (build_options.enable_cuda)
+    if (std.mem.eql(u8, build_options.cuda_artifacts, "fatbin"))
+        @embedFile("../ops/cuda/artifacts/inference_cuda_kernels.fatbin")
+    else
+        @embedFile("../ops/cuda/artifacts/inference_cuda_kernels.ptx")
+else
+    "";
+const cuda_artifact_z = cuda_artifact ++ "\x00";
 
 const q4_k_values_per_block: usize = 256;
 const q4_k_block_bytes: usize = 144;
@@ -42,6 +48,13 @@ const shapes = [_]Shape{
     .{ .label = "CLIP text MLP down", .rows = 77, .in_dim = 3072, .out_dim = 768 },
     .{ .label = "CLAP audio MLP up", .rows = 256, .in_dim = 768, .out_dim = 3072 },
     .{ .label = "pooled projection", .rows = 1, .in_dim = 768, .out_dim = 768 },
+    .{ .label = "GLiNER span up", .rows = 728, .in_dim = 768, .out_dim = 3072 },
+    .{ .label = "GLiNER span down", .rows = 728, .in_dim = 3072, .out_dim = 768 },
+    .{ .label = "GLiNER span out up", .rows = 728, .in_dim = 1536, .out_dim = 3072 },
+    .{ .label = "GLiNER real words up", .rows = 264, .in_dim = 768, .out_dim = 3072 },
+    .{ .label = "GLiNER real words down", .rows = 264, .in_dim = 3072, .out_dim = 768 },
+    .{ .label = "GLiNER real spans up", .rows = 2112, .in_dim = 1536, .out_dim = 3072 },
+    .{ .label = "GLiNER real spans down", .rows = 2112, .in_dim = 3072, .out_dim = 768 },
 };
 
 const Config = struct {
@@ -62,13 +75,23 @@ const BenchModule = if (build_options.enable_cuda) struct {
     linear_q4_k_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_k_bias_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_k_bias_quick_gelu_f32_tile4: cuda_driver.CUfunction = null,
+    linear_q4_k_span_bias_f32_tile8_r2: cuda_driver.CUfunction = null,
+    linear_q4_k_span_bias_relu_f32_tile8_r2: cuda_driver.CUfunction = null,
+    linear_q4_k_span_bias_f32_tile4_r8: cuda_driver.CUfunction = null,
+    linear_q4_k_span_bias_relu_f32_tile4_r8: cuda_driver.CUfunction = null,
     linear_q4_k_triple_bias_f32: cuda_driver.CUfunction = null,
     linear_q4_k_triple_bias_f32_tiled: cuda_driver.CUfunction = null,
+
+    fn loadOptionalKernel(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, name: [*:0]const u8) cuda_driver.CUfunction {
+        var function: cuda_driver.CUfunction = null;
+        if (ctx.driver.fns.cuModuleGetFunction(&function, module, name) == cuda_driver.CUDA_SUCCESS) return function;
+        return null;
+    }
 
     fn load(ctx: *cuda_context.CudaContext) cuda_driver.Error!BenchModule {
         try ctx.makeCurrent();
         var module: cuda_driver.CUmodule = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, cuda_ptx_z.ptr, 0, null, null));
+        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, cuda_artifact_z.ptr, 0, null, null));
         errdefer _ = ctx.driver.fns.cuModuleUnload(module);
 
         var linear_q4_k_f32: cuda_driver.CUfunction = null;
@@ -87,6 +110,10 @@ const BenchModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32_tile4, module, "termite_linear_q4_k_bias_f32_tile4"));
         var linear_q4_k_bias_quick_gelu_f32_tile4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_quick_gelu_f32_tile4, module, "termite_linear_q4_k_bias_quick_gelu_f32_tile4"));
+        const linear_q4_k_span_bias_f32_tile8_r2 = BenchModule.loadOptionalKernel(ctx, module, "termite_linear_q4_k_span_bias_f32_tile8_r2");
+        const linear_q4_k_span_bias_relu_f32_tile8_r2 = BenchModule.loadOptionalKernel(ctx, module, "termite_linear_q4_k_span_bias_relu_f32_tile8_r2");
+        const linear_q4_k_span_bias_f32_tile4_r8 = BenchModule.loadOptionalKernel(ctx, module, "termite_linear_q4_k_span_bias_f32_tile4_r8");
+        const linear_q4_k_span_bias_relu_f32_tile4_r8 = BenchModule.loadOptionalKernel(ctx, module, "termite_linear_q4_k_span_bias_relu_f32_tile4_r8");
         var linear_q4_k_triple_bias_f32: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_triple_bias_f32, module, "termite_linear_q4_k_triple_bias_f32"));
         var linear_q4_k_triple_bias_f32_tiled: cuda_driver.CUfunction = null;
@@ -102,6 +129,10 @@ const BenchModule = if (build_options.enable_cuda) struct {
             .linear_q4_k_f32_tile4 = linear_q4_k_f32_tile4,
             .linear_q4_k_bias_f32_tile4 = linear_q4_k_bias_f32_tile4,
             .linear_q4_k_bias_quick_gelu_f32_tile4 = linear_q4_k_bias_quick_gelu_f32_tile4,
+            .linear_q4_k_span_bias_f32_tile8_r2 = linear_q4_k_span_bias_f32_tile8_r2,
+            .linear_q4_k_span_bias_relu_f32_tile8_r2 = linear_q4_k_span_bias_relu_f32_tile8_r2,
+            .linear_q4_k_span_bias_f32_tile4_r8 = linear_q4_k_span_bias_f32_tile4_r8,
+            .linear_q4_k_span_bias_relu_f32_tile4_r8 = linear_q4_k_span_bias_relu_f32_tile4_r8,
             .linear_q4_k_triple_bias_f32 = linear_q4_k_triple_bias_f32,
             .linear_q4_k_triple_bias_f32_tiled = linear_q4_k_triple_bias_f32_tiled,
         };
@@ -120,6 +151,10 @@ const BenchModule = if (build_options.enable_cuda) struct {
             self.linear_q4_k_f32_tile4 = null;
             self.linear_q4_k_bias_f32_tile4 = null;
             self.linear_q4_k_bias_quick_gelu_f32_tile4 = null;
+            self.linear_q4_k_span_bias_f32_tile8_r2 = null;
+            self.linear_q4_k_span_bias_relu_f32_tile8_r2 = null;
+            self.linear_q4_k_span_bias_f32_tile4_r8 = null;
+            self.linear_q4_k_span_bias_relu_f32_tile4_r8 = null;
             self.linear_q4_k_triple_bias_f32 = null;
             self.linear_q4_k_triple_bias_f32_tiled = null;
         }
@@ -211,7 +246,7 @@ fn runKernelBench(allocator: std.mem.Allocator, cfg: Config) !void {
         cfg.warmup_iters,
         cfg.measure_iters,
     });
-    print("{s:<24} {s:>8} {s:>8} {s:>8} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>12}\n", .{
+    print("{s:<24} {s:>8} {s:>8} {s:>8} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>12}\n", .{
         "shape",
         "rows",
         "in",
@@ -221,9 +256,13 @@ fn runKernelBench(allocator: std.mem.Allocator, cfg: Config) !void {
         "scalar+b ns",
         "tiled+b ns",
         "qgelu ns",
+        "span8+b ns",
+        "span8+relu ns",
+        "span4r8+b ns",
+        "span4r8+relu",
         "checksum",
     });
-    print("{s:<24} {s:>8} {s:>8} {s:>8} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>12}\n", .{
+    print("{s:<24} {s:>8} {s:>8} {s:>8} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>12}\n", .{
         "-----",
         "----",
         "--",
@@ -233,6 +272,10 @@ fn runKernelBench(allocator: std.mem.Allocator, cfg: Config) !void {
         "-----------",
         "---------",
         "--------",
+        "----------",
+        "------------",
+        "------------",
+        "-------------",
         "--------",
     });
 
@@ -305,12 +348,28 @@ fn benchShape(
     const bias_ns = try timeCudaStep(ctx, cfg, launchQ4KBias, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim });
     const bias_tiled_ns = try timeCudaStep(ctx, cfg, launchQ4KBiasTiled, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim });
     const quick_gelu_ns = try timeCudaStep(ctx, cfg, launchQ4KBiasQuickGeluTiled, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim });
+    const span_bias_ns = if (module.linear_q4_k_span_bias_f32_tile8_r2 != null)
+        try timeCudaStep(ctx, cfg, launchQ4KSpanBiasTiled, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim })
+    else
+        0;
+    const span_relu_ns = if (module.linear_q4_k_span_bias_relu_f32_tile8_r2 != null)
+        try timeCudaStep(ctx, cfg, launchQ4KSpanBiasReluTiled, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim })
+    else
+        0;
+    const span_r8_bias_ns = if (module.linear_q4_k_span_bias_f32_tile4_r8 != null)
+        try timeCudaStep(ctx, cfg, launchQ4KSpanBiasTile4Rows8, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim })
+    else
+        0;
+    const span_r8_relu_ns = if (module.linear_q4_k_span_bias_relu_f32_tile4_r8 != null)
+        try timeCudaStep(ctx, cfg, launchQ4KSpanBiasReluTile4Rows8, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim })
+    else
+        0;
 
     var sample: [1]f32 = undefined;
     try output.copyToHost(ctx, std.mem.sliceAsBytes(&sample));
     try ctx.synchronize();
 
-    print("{s:<24} {d:>8} {d:>8} {d:>8} {d:>14} {d:>14} {d:>14} {d:>14} {d:>14} {d:>12.4}\n", .{
+    print("{s:<24} {d:>8} {d:>8} {d:>8} {d:>14} {d:>14} {d:>14} {d:>14} {d:>14} {d:>14} {d:>14} {d:>14} {d:>14} {d:>12.4}\n", .{
         shape.label,
         shape.rows,
         shape.in_dim,
@@ -320,6 +379,10 @@ fn benchShape(
         bias_ns,
         bias_tiled_ns,
         quick_gelu_ns,
+        span_bias_ns,
+        span_relu_ns,
+        span_r8_bias_ns,
+        span_r8_relu_ns,
         sample[0],
     });
 }
@@ -470,6 +533,62 @@ fn launchQ4KBiasQuickGeluTiled(
     try launchLinearQ4KTile4(ctx, module.linear_q4_k_bias_quick_gelu_f32_tile4, output, input, weight, bias, rows, in_dim, out_dim, true, false);
 }
 
+fn launchQ4KSpanBiasTiled(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ4KSpanRows2(ctx, module.linear_q4_k_span_bias_f32_tile8_r2, output, input, weight, bias, rows, in_dim, out_dim);
+}
+
+fn launchQ4KSpanBiasReluTiled(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ4KSpanRows2(ctx, module.linear_q4_k_span_bias_relu_f32_tile8_r2, output, input, weight, bias, rows, in_dim, out_dim);
+}
+
+fn launchQ4KSpanBiasTile4Rows8(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ4KSpanRowsCols(ctx, module.linear_q4_k_span_bias_f32_tile4_r8, output, input, weight, bias, rows, in_dim, out_dim, 4, 8);
+}
+
+fn launchQ4KSpanBiasReluTile4Rows8(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ4KSpanRowsCols(ctx, module.linear_q4_k_span_bias_relu_f32_tile4_r8, output, input, weight, bias, rows, in_dim, out_dim, 4, 8);
+}
+
 fn launchLinearQ4KTile4(
     ctx: *cuda_context.CudaContext,
     function: cuda_driver.CUfunction,
@@ -507,6 +626,72 @@ fn launchLinearQ4KTile4(
         params[5] = @ptrCast(&out_dim_u32);
     }
     try launch2d(ctx, function, (out_dim + 3) / 4, rows, 256, &params);
+}
+
+fn launchLinearQ4KSpanRows2(
+    ctx: *cuda_context.CudaContext,
+    function: cuda_driver.CUfunction,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    if (function == null) return error.CudaSymbolMissing;
+    try validateQ4KBuffers(output, input, weight, bias, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var bias_ptr = bias.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&bias_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(ctx, function, (out_dim + 7) / 8, (rows + 1) / 2, 256, &params);
+}
+
+fn launchLinearQ4KSpanRowsCols(
+    ctx: *cuda_context.CudaContext,
+    function: cuda_driver.CUfunction,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    cols_per_block: usize,
+    rows_per_block: usize,
+) cuda_driver.Error!void {
+    if (function == null) return error.CudaSymbolMissing;
+    try validateQ4KBuffers(output, input, weight, bias, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var bias_ptr = bias.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&bias_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(ctx, function, (out_dim + cols_per_block - 1) / cols_per_block, (rows + rows_per_block - 1) / rows_per_block, 256, &params);
 }
 
 fn launchQ4KTripleBias(

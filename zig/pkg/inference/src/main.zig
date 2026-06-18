@@ -43,7 +43,6 @@ const RunConfig = struct {
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
-    allow_downloads: ?bool = null,
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -107,6 +106,8 @@ pub fn runFromArgs(
         try inference.native_embed.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "classify")) {
         try inference.native_classify.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "rerank")) {
+        try inference.native_rerank.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
         try inference.native_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
@@ -215,7 +216,6 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
-        if (cfg.allow_downloads) |value| node_cfg.allow_downloads = value;
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
@@ -224,7 +224,6 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
-    node.seedAndDiscoverPredictors(io);
 
     try node.serve(allocator, io, host, port);
 
@@ -335,6 +334,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  run       Start the inference server
         \\  embed     Run native text/image/audio embedding from the command line
         \\  classify  Run native text classification from the command line
+        \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors
@@ -347,8 +347,8 @@ fn printUsage(usage_name: []const u8) void {
         \\  compare   Compare inference backends or implementations
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
-        \\  cuda-info Inspect CUDA Driver API availability and optionally run a kernel smoke
-        \\  bench-cuda Benchmark CUDA Q4_K CLIP/CLAP kernel shapes and optional ClipCLAP text embed
+        \\  cuda-info Inspect CUDA Driver API availability and optionally run CUDA smoke checks
+        \\  bench-cuda Benchmark CUDA Q4_K, GLiNER2, and CLIP/CLAP kernel shapes
         \\  list      List available models
         \\  pull      Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
         \\  convert   Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR

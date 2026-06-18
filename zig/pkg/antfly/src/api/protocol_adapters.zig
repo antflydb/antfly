@@ -216,12 +216,14 @@ const ExtensionMcpTool = struct {
     description: []u8,
     input_schema_json: []u8,
     handler: []u8,
+    required_capabilities: []extension_domain.Capability = &.{},
     runtime_binding: ?ExtensionRuntimeBinding = null,
 
     fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
         alloc.free(self.description);
         alloc.free(self.input_schema_json);
         alloc.free(self.handler);
+        freeExtensionCapabilities(alloc, self.required_capabilities);
         if (self.runtime_binding) |binding| binding.deinit(alloc);
     }
 };
@@ -560,6 +562,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
     }
     for (extension_tools.items, extension_contexts) |tool, *ctx| {
+        if (!extensionMcpToolVisibleForIdentity(ctx.installed, &tool, authenticated_identity)) continue;
         try protocol_server.addTool(server_ptr.alloc, .{
             .name = tool.member.object_name,
             .description = tool.description,
@@ -717,6 +720,46 @@ fn identityCanListTables(permissions: []const usermgr.Permission) bool {
         identityHasAnyPermission(permissions, .namespace, .read);
 }
 
+fn extensionMcpToolVisibleForIdentity(installed: *const extension_domain.InstalledExtension, tool: *const ExtensionMcpTool, authenticated_identity: anytype) bool {
+    const identity = authenticated_identity orelse return true;
+    if (tool.required_capabilities.len == 0) {
+        return extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+    }
+
+    var checked_table_permission = false;
+    for (tool.required_capabilities) |capability| {
+        const permission_type = permissionTypeForExtensionCapability(capability.name) orelse continue;
+        checked_table_permission = true;
+        const table = tableResourceForExtensionCapability(installed.*, tool.member.*, capability);
+        if (!identityHasPermission(identity.permissions, .table, table, permission_type)) return false;
+    }
+    return checked_table_permission or extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+}
+
+fn extensionScopeVisibleForIdentity(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, permissions: []const usermgr.Permission) bool {
+    if (member.scope.kind == .table) {
+        return identityHasPermission(permissions, .table, member.scope.table_name, .read);
+    }
+    if (installed.scope.kind == .table) {
+        return identityHasPermission(permissions, .table, installed.scope.table_name, .read);
+    }
+    return identityHasPermission(permissions, .@"*", "*", .admin);
+}
+
+fn permissionTypeForExtensionCapability(name: []const u8) ?usermgr.PermissionType {
+    if (std.mem.eql(u8, name, "db:read") or std.mem.eql(u8, name, "read:table")) return .read;
+    if (std.mem.eql(u8, name, "db:write") or std.mem.eql(u8, name, "write:table")) return .write;
+    if (std.mem.eql(u8, name, "db:admin") or std.mem.eql(u8, name, "admin:table")) return .admin;
+    return null;
+}
+
+fn tableResourceForExtensionCapability(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, capability: extension_domain.Capability) []const u8 {
+    if (capability.scope.len != 0 and !std.mem.eql(u8, capability.scope, installed.package_name)) return capability.scope;
+    if (member.scope.kind == .table) return member.scope.table_name;
+    if (installed.scope.kind == .table) return installed.scope.table_name;
+    return "*";
+}
+
 fn identityHasAnyPermission(permissions: []const usermgr.Permission, resource_type: usermgr.ResourceType, permission_type: usermgr.PermissionType) bool {
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
@@ -761,6 +804,8 @@ fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const exte
     errdefer if (input_schema_json) |value| alloc.free(value);
     var handler: ?[]u8 = null;
     errdefer if (handler) |value| alloc.free(value);
+    var required_capabilities: []extension_domain.Capability = &.{};
+    errdefer freeExtensionCapabilities(alloc, required_capabilities);
 
     if (parsed) |config| {
         if (config.value == .object) {
@@ -777,6 +822,9 @@ fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const exte
             }
             if (jsonStringObjectField(config.value.object, "handler")) |value| {
                 handler = try alloc.dupe(u8, value);
+            }
+            if (config.value.object.get("required_capabilities")) |value| {
+                required_capabilities = try parseExtensionCapabilitiesAlloc(alloc, value);
             }
         }
     }
@@ -796,8 +844,56 @@ fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const exte
         .description = description.?,
         .input_schema_json = input_schema_json.?,
         .handler = handler.?,
+        .required_capabilities = required_capabilities,
         .runtime_binding = try extensionRuntimeBindingAlloc(alloc, member, handler.?, snapshot),
     };
+}
+
+fn parseExtensionCapabilitiesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]extension_domain.Capability {
+    if (value != .array) return try alloc.alloc(extension_domain.Capability, 0);
+    var out = std.ArrayListUnmanaged(extension_domain.Capability).empty;
+    errdefer {
+        freeExtensionCapabilityValues(alloc, out.items);
+        out.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        switch (item) {
+            .string => |name| {
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                try out.append(alloc, .{
+                    .name = owned_name,
+                    .scope = "",
+                });
+            },
+            .object => |object| {
+                const name = jsonStringObjectField(object, "name") orelse continue;
+                const scope = jsonStringObjectField(object, "scope") orelse "";
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                const owned_scope = if (scope.len == 0) "" else try alloc.dupe(u8, scope);
+                errdefer if (owned_scope.len > 0) alloc.free(owned_scope);
+                try out.append(alloc, .{
+                    .name = owned_name,
+                    .scope = owned_scope,
+                });
+            },
+            else => {},
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionCapabilityValues(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) void {
+    for (capabilities) |capability| {
+        alloc.free(capability.name);
+        if (capability.scope.len > 0) alloc.free(capability.scope);
+    }
+}
+
+fn freeExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) void {
+    freeExtensionCapabilityValues(alloc, capabilities);
+    if (capabilities.len > 0) alloc.free(@constCast(capabilities));
 }
 
 fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, handler: []const u8, snapshot: anytype) !?ExtensionRuntimeBinding {
@@ -906,6 +1002,7 @@ fn callExtensionMcpTool(
             .installed = installed,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
+            .package_store_root = server.cfg.extension_package_store_dir,
             .host_imports = .{
                 .ptr = &host_context,
                 .db_query = ExtensionHostContext(@TypeOf(server)).dbQuery,
@@ -1002,8 +1099,8 @@ fn ExtensionHostContext(comptime Server: type) type {
             defer alloc.free(table_uri);
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ table_uri, route });
             defer alloc.free(uri);
-            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |trusted_principal|
-                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = trusted_principal }}
+            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |principal|
+                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = principal }}
             else
                 &.{};
             var resp = try ctx.server.handle(.{

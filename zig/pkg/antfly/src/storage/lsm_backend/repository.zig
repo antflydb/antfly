@@ -259,7 +259,10 @@ pub fn loadManifestIfPresentWithStorage(
             return err;
         },
     };
+    var raw_manifest_owned = true;
+    errdefer if (raw_manifest_owned) allocator.free(raw_manifest);
     var decoded = try lsm_manifest.decodeBorrowedOwnedAlloc(allocator, raw_manifest);
+    raw_manifest_owned = false;
     defer decoded.deinit(allocator);
 
     next_run_id.* = decoded.next_run_id;

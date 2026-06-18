@@ -167,6 +167,23 @@ func TestNewEmbeddingIndex(t *testing.T) {
 	}
 }
 
+func TestEmbeddingIndexCloseBeforeOpen(t *testing.T) {
+	logger := zaptest.NewLogger(t).Sugar().Desugar()
+	tempDir := t.TempDir()
+
+	db, err := pebble.Open(filepath.Join(tempDir, "test.db"), pebbleutils.NewMemPebbleOpts())
+	require.NoError(t, err)
+	defer db.Close()
+
+	config := NewEmbeddingsConfig("close_before_open", EmbeddingsIndexConfig{
+		Dimension: 3,
+		Template:  "{{content}}",
+	})
+	idx, err := NewEmbeddingIndex(logger, nil, db, tempDir, "close_before_open", config, nil)
+	require.NoError(t, err)
+	require.NoError(t, idx.Close())
+}
+
 func TestEmbeddingIndex_Open(t *testing.T) {
 	logger := zaptest.NewLogger(t).Sugar().Desugar()
 	tempDir := t.TempDir()

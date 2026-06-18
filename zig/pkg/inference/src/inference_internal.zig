@@ -26,6 +26,7 @@ pub const ops = @import("ops/ops.zig");
 pub const run = @import("run/root.zig");
 pub const util = @import("util/util.zig");
 pub const native_backend_guard = @import("native_backend_guard.zig");
+pub const native_backend_choice = @import("native_backend_choice.zig");
 pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
