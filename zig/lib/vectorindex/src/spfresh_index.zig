@@ -21,6 +21,8 @@ const search_types = @import("search_types.zig");
 const proto = @import("antfly_vector").proto;
 const vec = @import("antfly_vector").vector;
 
+const hilbert_coord_stack_capacity = 2048;
+
 pub const FlatCentroidBlock = struct {
     posting_ids: []u64,
     parents: []u64,
@@ -485,8 +487,13 @@ fn populateFlatCentroidHilbertSortKeys(self: anytype, entries: []FlatCentroidEnt
     const embedding_len = hilbert.byteLen();
     if (embedding_len == 0) return false;
 
-    const coords = try self.alloc.alloc(u32, hilbert.dimension);
-    defer self.alloc.free(coords);
+    var coords_stack: [hilbert_coord_stack_capacity]u32 = undefined;
+    const use_coords_stack = hilbert.dimension <= coords_stack.len;
+    const coords = if (use_coords_stack)
+        coords_stack[0..hilbert.dimension]
+    else
+        try self.alloc.alloc(u32, hilbert.dimension);
+    defer if (!use_coords_stack) self.alloc.free(coords);
     for (entries) |*entry| {
         if (entry.centroid.len != dims) return error.DimensionMismatch;
         const key = try self.alloc.alloc(u8, embedding_len);
