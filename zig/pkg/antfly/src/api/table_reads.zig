@@ -5043,6 +5043,7 @@ pub const ConfiguredExternalLakeObjectStoreResolver = struct {
         const node_config = self.node_config orelse return error.ExternalLakeCredentialRefNotFound;
         const connection = node_config.connections.get(credential.ref_id) orelse return error.ExternalLakeCredentialRefNotFound;
         if (connection.kind != .external_io) return error.UnsupportedExternalLakeCredentialRef;
+        if (!hasConnectionCapability(connection, "lake_read")) return error.UnsupportedExternalLakeCredentialRef;
         const external_io = connection.external_io orelse return error.UnsupportedExternalLakeCredentialRef;
 
         var parsed = try remote_uri.parseAlloc(alloc, binding.source_uri);
@@ -5118,6 +5119,13 @@ pub const ConfiguredExternalLakeObjectStoreResolver = struct {
         if (allowed_prefix.len == 0) return;
         if (std.mem.startsWith(u8, prefix, allowed_prefix)) return;
         return error.ExternalLakeCredentialScopeMismatch;
+    }
+
+    fn hasConnectionCapability(connection: common_config.Config.ConnectionConfig, capability: []const u8) bool {
+        for (connection.capabilities) |value| {
+            if (std.mem.eql(u8, value, capability)) return true;
+        }
+        return false;
     }
 };
 
@@ -17375,6 +17383,32 @@ test "configured external lake resolver opens credentialed filesystem connection
         .table_id = "events",
         .format = .parquet,
         .source_uri = denied_uri,
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{}));
+
+    const no_lake_read_cfg_json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "connections": {{
+        \\    "prod-lake-read": {{
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_write"],
+        \\      "external_io": {{
+        \\        "protocol": "filesystem",
+        \\        "prefix": ".zig-cache/tmp/{s}/allowed"
+        \\      }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{tmp.sub_path});
+    defer alloc.free(no_lake_read_cfg_json);
+    var no_lake_read_cfg = try common_config.Config.parseFromSlice(alloc, no_lake_read_cfg_json);
+    defer no_lake_read_cfg.deinit();
+    resolver.configure(&no_lake_read_cfg, null);
+    try std.testing.expectError(error.UnsupportedExternalLakeCredentialRef, source.openParquetPrefixAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = allowed_uri,
         .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
         .schema_fingerprint = "schema-v1",
     }, .{}));

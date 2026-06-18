@@ -259,6 +259,12 @@ pub const RenameViewPlan = sql_adapter.RenameViewPlan;
 pub const DropViewPlan = sql_adapter.DropViewPlan;
 pub const TableClonePlan = sql_adapter.TableClonePlan;
 pub const TableCloneOptions = sql_adapter.TableCloneOptions;
+pub const RowSecurityCatalogPlan = sql_adapter.RowSecurityCatalogPlan;
+pub const AlterRowSecurityPlan = sql_adapter.AlterRowSecurityPlan;
+pub const CreateRowSecurityPolicyPlan = sql_adapter.CreateRowSecurityPolicyPlan;
+pub const DropRowSecurityPolicyPlan = sql_adapter.DropRowSecurityPolicyPlan;
+pub const RowSecurityPolicyPredicate = sql_adapter.RowSecurityPolicyPredicate;
+pub const RowSecurityCurrentSettingPredicate = sql_adapter.RowSecurityCurrentSettingPredicate;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -534,78 +540,6 @@ pub const TablePartitionBounds = struct {
 
 pub const TablePartitionMethod = enum {
     range,
-};
-
-pub const RowSecurityCatalogPlan = union(enum) {
-    alter_table: AlterRowSecurityPlan,
-    create_policy: CreateRowSecurityPolicyPlan,
-    drop_policy: DropRowSecurityPolicyPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .alter_table => |*plan| plan.deinit(alloc),
-            .create_policy => |*plan| plan.deinit(alloc),
-            .drop_policy => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const AlterRowSecurityPlan = struct {
-    table_name: []const u8,
-    enabled: bool,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.* = undefined;
-    }
-};
-
-pub const CreateRowSecurityPolicyPlan = struct {
-    policy_name: []const u8,
-    table_name: []const u8,
-    predicate: RowSecurityPolicyPredicate,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.policy_name);
-        alloc.free(self.table_name);
-        self.predicate.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const DropRowSecurityPolicyPlan = struct {
-    policy_name: []const u8,
-    table_name: []const u8,
-    if_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.policy_name);
-        alloc.free(self.table_name);
-        self.* = undefined;
-    }
-};
-
-pub const RowSecurityPolicyPredicate = union(enum) {
-    current_setting_equals: RowSecurityCurrentSettingPredicate,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .current_setting_equals => |*predicate| predicate.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const RowSecurityCurrentSettingPredicate = struct {
-    field: []const u8,
-    setting_name: []const u8,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.field);
-        alloc.free(self.setting_name);
-        self.* = undefined;
-    }
 };
 
 pub const CreateTablePlan = struct {

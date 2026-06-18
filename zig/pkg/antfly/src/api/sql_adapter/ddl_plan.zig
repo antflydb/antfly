@@ -1314,6 +1314,78 @@ pub const TableCloneOptions = struct {
     }
 };
 
+pub const RowSecurityCatalogPlan = union(enum) {
+    alter_table: AlterRowSecurityPlan,
+    create_policy: CreateRowSecurityPolicyPlan,
+    drop_policy: DropRowSecurityPolicyPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .alter_table => |*plan| plan.deinit(alloc),
+            .create_policy => |*plan| plan.deinit(alloc),
+            .drop_policy => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const AlterRowSecurityPlan = struct {
+    table_name: []const u8,
+    enabled: bool,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+pub const CreateRowSecurityPolicyPlan = struct {
+    policy_name: []const u8,
+    table_name: []const u8,
+    predicate: RowSecurityPolicyPredicate,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.policy_name);
+        alloc.free(self.table_name);
+        self.predicate.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const DropRowSecurityPolicyPlan = struct {
+    policy_name: []const u8,
+    table_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.policy_name);
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+pub const RowSecurityPolicyPredicate = union(enum) {
+    current_setting_equals: RowSecurityCurrentSettingPredicate,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .current_setting_equals => |*predicate| predicate.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const RowSecurityCurrentSettingPredicate = struct {
+    field: []const u8,
+    setting_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.field);
+        alloc.free(self.setting_name);
+        self.* = undefined;
+    }
+};
+
 pub const AdvisoryLockPlan = struct {
     action: AdvisoryLockAction,
     key1: i64,
@@ -1799,4 +1871,31 @@ test "SQL adapter DDL table clone plans own strings and expose all options" {
         .options = all,
     };
     clone.deinit(alloc);
+}
+
+test "SQL adapter DDL row security plans own nested fields" {
+    const alloc = std.testing.allocator;
+
+    var alter: RowSecurityCatalogPlan = .{ .alter_table = .{
+        .table_name = try alloc.dupe(u8, "tenant_events"),
+        .enabled = true,
+    } };
+    alter.deinit(alloc);
+
+    var create_policy: RowSecurityCatalogPlan = .{ .create_policy = .{
+        .policy_name = try alloc.dupe(u8, "tenant_isolation"),
+        .table_name = try alloc.dupe(u8, "tenant_events"),
+        .predicate = .{ .current_setting_equals = .{
+            .field = try alloc.dupe(u8, "tenant_id"),
+            .setting_name = try alloc.dupe(u8, "app.tenant_id"),
+        } },
+    } };
+    create_policy.deinit(alloc);
+
+    var drop_policy: RowSecurityCatalogPlan = .{ .drop_policy = .{
+        .policy_name = try alloc.dupe(u8, "tenant_isolation"),
+        .table_name = try alloc.dupe(u8, "tenant_events"),
+        .if_exists = true,
+    } };
+    drop_policy.deinit(alloc);
 }
