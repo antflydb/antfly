@@ -962,6 +962,7 @@ pub fn selectFlatRabitqPostings(
             profile.centroid_directory_posting_centroids_scored += @intCast(candidate_count);
             for (quantized_posting_candidates[0..candidate_count]) |candidate| {
                 const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
+                const distance = vec.distanceToQuery(query, query_measure, centroid, self.config.metric);
                 insertFlatProbe(probes[0..probe_limit], &probe_count, .{
                     .posting_id = candidate.posting_id,
                     .parent = candidate.parent,
@@ -969,8 +970,8 @@ pub fn selectFlatRabitqPostings(
                     .state = candidate.state,
                     .block_index = block_index,
                     .entry_index = candidate.entry_index,
-                    .distance = vec.distanceToQuery(query, query_measure, centroid, self.config.metric),
-                    .error_bound = centroidBlockProbeErrorBound(self.config.metric, vec.distanceToQuery(query, query_measure, centroid, self.config.metric), block.radii[candidate.entry_index]),
+                    .distance = distance,
+                    .error_bound = centroidBlockProbeErrorBound(self.config.metric, distance, block.radii[candidate.entry_index]),
                 });
             }
         } else {
