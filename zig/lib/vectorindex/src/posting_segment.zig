@@ -883,6 +883,8 @@ pub const LazyDirectorySnapshot = struct {
         };
 
         const records = scratch.deltaRecordsMut();
+        if (records.len == 0) return result;
+
         sortPostingDeltaRecordsIfNeeded(records);
 
         if (base_members_are_sorted and records.len <= compact_sorted_delta_max_records) {
@@ -1009,17 +1011,10 @@ pub const LazyDirectorySnapshot = struct {
         scratch.resetDeltaRecords();
         errdefer scratch.resetDeltaRecords();
 
-        var base_iter = try posting.PostingFormat.BaseMemberIterator.init(found_base_data);
-        const base_member_count = base_iter.memberCount();
-        try scratch.ensureMemberIdCapacity(alloc, base_member_count);
-        var member_count: usize = 0;
-        while (try base_iter.next()) |member| {
-            scratch.member_ids[member_count] = member;
-            member_count += 1;
-        }
-        try base_iter.finish();
+        const base = try posting.PostingFormat.materializeBaseMembersIntoScratch(alloc, scratch, found_base_data);
+        var member_count = base.member_count;
 
-        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_iter.header.generation, scratch);
+        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base.header.generation, scratch);
         const records = scratch.deltaRecordsMut();
         if (records.len == 0) return member_count;
 
@@ -1045,6 +1040,10 @@ pub const LazyDirectorySnapshot = struct {
 
         _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_header.generation, scratch);
         const records = scratch.deltaRecordsMut();
+        if (records.len == 0) {
+            return try posting.PostingFormat.materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, found_base_data, base_header);
+        }
+
         sortPostingDeltaRecordsIfNeeded(records);
         try scratch.ensureCompactDeltaCapacity(alloc, records.len);
         for (records) |record| {
@@ -1231,17 +1230,10 @@ pub const Snapshot = struct {
         defer scratch.deinit(alloc);
 
         scratch.resetDeltaRecords();
-        var base_iter = try posting.PostingFormat.BaseMemberIterator.init(base_data);
-        const base_member_count = base_iter.memberCount();
-        try scratch.ensureMemberIdCapacity(alloc, base_member_count);
-        var member_count: usize = 0;
-        while (try base_iter.next()) |member| {
-            scratch.member_ids[member_count] = member;
-            member_count += 1;
-        }
-        try base_iter.finish();
+        const base = try posting.PostingFormat.materializeBaseMembersIntoScratch(alloc, &scratch, base_data);
+        var member_count = base.member_count;
 
-        try self.catalog.appendDeltaRecordsIntoScratch(alloc, posting_id, base_iter.header.generation, &scratch);
+        try self.catalog.appendDeltaRecordsIntoScratch(alloc, posting_id, base.header.generation, &scratch);
         const records = scratch.deltaRecordsMut();
         if (records.len == 0) return try alloc.dupe(posting.VectorId, scratch.member_ids[0..member_count]);
 

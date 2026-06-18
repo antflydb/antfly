@@ -571,6 +571,40 @@ pub const PostingFormat = struct {
         }
     };
 
+    pub const MaterializedBaseMembers = struct {
+        header: PostingBaseHeader,
+        member_count: usize,
+    };
+
+    pub fn materializeBaseMembersIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_data: []const u8,
+    ) !MaterializedBaseMembers {
+        const header = try decodeBaseHeader(base_data);
+        return .{
+            .header = header,
+            .member_count = try materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, base_data, header),
+        };
+    }
+
+    pub fn materializeBaseMembersWithHeaderIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_data: []const u8,
+        header: PostingBaseHeader,
+    ) !usize {
+        var reader = BaseMemberBlockReader.init(base_data, header.member_count);
+        try scratch.ensureMemberIdCapacity(alloc, header.member_count);
+        var member_count: usize = 0;
+        while (try reader.next()) |member| {
+            scratch.member_ids[member_count] = member;
+            member_count += 1;
+        }
+        try reader.finish();
+        return member_count;
+    }
+
     fn readBaseBlockCount(data: []const u8, pos: *usize, remaining_members: usize) !usize {
         if (pos.* >= data.len) return error.Corrupted;
         const block_count = data[pos.*];
