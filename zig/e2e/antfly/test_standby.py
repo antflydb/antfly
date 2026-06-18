@@ -69,6 +69,8 @@ class HASwarmNode:
         table_id: int | None = None,
         upstream_url: str | None = None,
         slot_name: str | None = None,
+        admin_token_env: str | None = None,
+        admin_token: str | None = None,
     ):
         self.binary = binary
         self.root = root
@@ -87,6 +89,8 @@ class HASwarmNode:
         self.epoch = epoch
         self.upstream_url = upstream_url
         self.slot_name = slot_name
+        self.admin_token_env = admin_token_env
+        self.admin_token = admin_token
         self.proc: subprocess.Popen[str] | None = None
 
     @property
@@ -154,12 +158,18 @@ class HASwarmNode:
                 str(self.epoch),
             ]
         )
+        env = os.environ.copy()
+        if self.admin_token_env is not None:
+            command.extend(["--ha-admin-token-env", self.admin_token_env])
+            assert self.admin_token is not None
+            env[self.admin_token_env] = self.admin_token
 
         self.proc = subprocess.Popen(
             command,
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
             cwd=self.root,
+            env=env,
         )
         if not wait_for_server(self.url, path="/status", timeout=30.0):
             logs = self.debug_logs()
@@ -195,12 +205,33 @@ class HASwarmNode:
         self.log_file.flush()
         return _read_log_tail(self.log_path)
 
+    def admin_headers(self) -> dict[str, str] | None:
+        if self.admin_token is None:
+            return None
+        return {"Authorization": f"Bearer {self.admin_token}"}
+
+    def admin_get_response(self, path: str, **params: Any) -> requests.Response:
+        return requests.get(
+            f"{self.url}{HA_ADMIN_ROOT}{path}",
+            params=params,
+            headers=self.admin_headers(),
+            timeout=10,
+        )
+
+    def admin_post_response(self, path: str, payload: dict[str, Any]) -> requests.Response:
+        return requests.post(
+            f"{self.url}{HA_ADMIN_ROOT}{path}",
+            json=payload,
+            headers=self.admin_headers(),
+            timeout=10,
+        )
+
     def admin_get(self, path: str, **params: Any) -> dict[str, Any]:
-        response = requests.get(f"{self.url}{HA_ADMIN_ROOT}{path}", params=params, timeout=10)
+        response = self.admin_get_response(path, **params)
         return self._check(response)
 
     def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = requests.post(f"{self.url}{HA_ADMIN_ROOT}{path}", json=payload, timeout=10)
+        response = self.admin_post_response(path, payload)
         return self._check(response)
 
     def create_table(self, table_name: str) -> dict[str, Any]:
@@ -245,6 +276,8 @@ class HACluster:
     def __init__(self, binary: str):
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-ha-standby-e2e-")
         self.root = Path(self.tempdir.name)
+        self.admin_token_env = "ANTFLY_HA_E2E_ADMIN_TOKEN"
+        self.admin_token = "ha-e2e-secret-token"
         self.primary = HASwarmNode(
             binary=binary,
             root=self.root,
@@ -253,6 +286,8 @@ class HACluster:
             cluster_id=100,
             timeline_id=1,
             epoch=1,
+            admin_token_env=self.admin_token_env,
+            admin_token=self.admin_token,
         )
         self.standby = HASwarmNode(
             binary=binary,
@@ -264,6 +299,8 @@ class HACluster:
             epoch=1,
             upstream_url=self.primary.url,
             slot_name="standby-a",
+            admin_token_env=self.admin_token_env,
+            admin_token=self.admin_token,
         )
 
     def configure_table_identity(self, *, shard_id: int, table_id: int) -> None:
@@ -496,6 +533,17 @@ def _binary_supports_ha_swarm(binary: str) -> bool:
     return "--ha-primary-log" in result.stdout and "--ha-standby-log" in result.stdout
 
 
+def _assert_admin_requires_bearer(node: HASwarmNode, path: str) -> None:
+    missing = requests.get(f"{node.url}{HA_ADMIN_ROOT}{path}", timeout=10)
+    assert missing.status_code == 401
+    wrong = requests.get(
+        f"{node.url}{HA_ADMIN_ROOT}{path}",
+        headers={"Authorization": "Bearer wrong-token"},
+        timeout=10,
+    )
+    assert wrong.status_code == 401
+
+
 def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: HACluster):
     table_name = "ha_standby_docs"
     ha_cluster.primary.start()
@@ -505,11 +553,13 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     ha_cluster.primary.reset_ha_state()
     ha_cluster.configure_table_identity(shard_id=shard_id, table_id=table_id)
     ha_cluster.primary.start()
+    _assert_admin_requires_bearer(ha_cluster.primary, "/primary/status")
 
     seed = ha_cluster.seed_standby_catalog_from_primary()
     assert seed["backup_lsn"] >= 1
 
     ha_cluster.standby.start(enable_replication=False)
+    _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
     bootstrapped = ha_cluster.standby.admin_post(
         "/standby/bootstrap",
         {"manifest_path": str(seed["manifest_path"]), "content_root": str(seed["content_root"])},
