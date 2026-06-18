@@ -8631,12 +8631,29 @@ fn capacityBalanceLeafSplitToMaxMembers(
         count - max_members;
     if (target_left_count == 0 or target_left_count >= count) return;
 
-    const offsets = try self.alloc.alloc(usize, count);
-    defer self.alloc.free(offsets);
-    const margins = try self.alloc.alloc(f32, count);
-    defer self.alloc.free(margins);
-    const assignments = try self.alloc.alloc(u64, count);
-    defer self.alloc.free(assignments);
+    var offsets_stack: [1024]usize = undefined;
+    const use_offsets_stack = count <= offsets_stack.len;
+    const offsets = if (use_offsets_stack)
+        offsets_stack[0..count]
+    else
+        try self.alloc.alloc(usize, count);
+    defer if (!use_offsets_stack) self.alloc.free(offsets);
+
+    var margins_stack: [1024]f32 = undefined;
+    const use_margins_stack = count <= margins_stack.len;
+    const margins = if (use_margins_stack)
+        margins_stack[0..count]
+    else
+        try self.alloc.alloc(f32, count);
+    defer if (!use_margins_stack) self.alloc.free(margins);
+
+    var assignments_stack: [1024]u64 = undefined;
+    const use_assignments_stack = count <= assignments_stack.len;
+    const assignments = if (use_assignments_stack)
+        assignments_stack[0..count]
+    else
+        try self.alloc.alloc(u64, count);
+    defer if (!use_assignments_stack) self.alloc.free(assignments);
 
     const spherical = self.config.metric == .cosine;
     var inv_left_norm: f32 = 1;
