@@ -1585,9 +1585,11 @@ __device__ void termite_qtc_hmma_tile(
         if (row >= rows || col >= out_dim) continue;
         unsigned int idx = row * out_dim + col;
         float y = c_tile[i];
-        if (MODE == 1u || MODE == 2u || MODE == 3u) y += bias[col];
+        if (MODE == 1u || MODE == 2u || MODE == 3u || MODE == 4u || MODE == 5u) y += bias[col];
         if (MODE == 2u) y = 0.5f * y * (1.0f + tanhf(0.7978845608028654f * (y + 0.044715f * y * y * y)));
         if (MODE == 3u) y += residual[idx];
+        if (MODE == 4u) y = y / (1.0f + expf(-1.702f * y));
+        if (MODE == 5u) y = fmaxf(y, 0.0f);
         dst[idx] = y;
     }
 }
@@ -1686,6 +1688,30 @@ extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tc_hmma(
     unsigned int out_dim
 ) {
     termite_qtc_hmma_tile<3u, true>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<4u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_relu_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<5u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 template <unsigned int COLS, unsigned int MODE>
