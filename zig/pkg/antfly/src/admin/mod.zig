@@ -408,6 +408,8 @@ const ha_retention_snapshot_fields = [_][]const u8{
     "primary_lsn",
     "oldest_restart_lsn",
     "retained_lsn_count",
+    "retained_byte_count",
+    "retained_age_ns",
     "active_slots",
     "reseed_recommended",
 };

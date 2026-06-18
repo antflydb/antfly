@@ -5133,7 +5133,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 			g.Expect(query.Get("sync_required")).To(Equal("1"))
 			g.Expect(query["sync_standby"]).To(Equal([]string{"standby-a"}))
 			g.Expect(query.Get("sync_failure")).To(Equal("fail-closed"))
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0},"durability":{"status":"would_block","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":11,"missing_lsn_count":1,"satisfied_count":0,"required_count":1,"candidate_count":1}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"retained_age_ns":400,"active_slots":1,"reseed_recommended":0},"durability":{"status":"would_block","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":11,"missing_lsn_count":1,"satisfied_count":0,"required_count":1,"candidate_count":1}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -5168,6 +5168,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.Retention.OldestRestartLSN).To(Equal(uint64(7)))
 	g.Expect(cluster.Status.HAStatus.Retention.RetainedLSNCount).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.Retention.RetainedByteCount).To(Equal(uint64(512)))
+	g.Expect(cluster.Status.HAStatus.Retention.RetainedAgeNS).To(Equal(uint64(400)))
 	g.Expect(cluster.Status.HAStatus.Retention.ActiveSlots).To(Equal(int32(1)))
 	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
 	standby := cluster.Status.HAStatus.Standbys[0]
@@ -5202,7 +5203,7 @@ func TestObserveHAPrimaryAdminStatusTargetsPromotedPrimaryAdminURL(t *testing.T)
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
 			observedHost = req.URL.Host
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"retained_byte_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"retained_byte_count":0,"retained_age_ns":0,"active_slots":0,"reseed_recommended":0}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -5244,7 +5245,7 @@ func TestObserveHAPrimaryAdminStatusIgnoresIncompletePromotionForTargeting(t *te
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
 			observedHost = req.URL.Host
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"retained_byte_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"retained_byte_count":0,"retained_age_ns":0,"active_slots":0,"reseed_recommended":0}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -5347,7 +5348,7 @@ func TestObserveHAPrimaryAdminStatusRejectsMismatchedIdentityScope(t *testing.T)
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":99,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":12,"retained_lsn_count":0,"retained_byte_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":99,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":12,"retained_lsn_count":0,"retained_byte_count":0,"retained_age_ns":0,"active_slots":0,"reseed_recommended":0}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},

@@ -9293,6 +9293,11 @@ spec:
                       reseedRecommended:
                         format: int32
                         type: integer
+                      retainedAgeNS:
+                        description: RetainedAgeNS is the HA WAL timestamp span retained
+                          for active slots.
+                        format: int64
+                        type: integer
                       retainedByteCount:
                         description: RetainedByteCount is the encoded HA WAL bytes
                           retained for active slots.

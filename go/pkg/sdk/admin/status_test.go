@@ -350,6 +350,7 @@ func haGeneratedPrimaryStatusJSON() string {
 				"oldest_restart_lsn":7,
 				"retained_lsn_count":5,
 				"retained_byte_count":512,
+				"retained_age_ns":400,
 				"active_slots":1,
 				"reseed_recommended":0
 			},

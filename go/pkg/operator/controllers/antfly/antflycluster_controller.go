@@ -6413,6 +6413,7 @@ func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) 
 			OldestRestartLSN:  snapshot.Retention.OldestRestartLsn,
 			RetainedLSNCount:  snapshot.Retention.RetainedLsnCount,
 			RetainedByteCount: snapshot.Retention.RetainedByteCount,
+			RetainedAgeNS:     snapshot.Retention.RetainedAgeNs,
 			ActiveSlots:       haUint64ToInt32(snapshot.Retention.ActiveSlots),
 			ReseedRecommended: haUint64ToInt32(snapshot.Retention.ReseedRecommended),
 		},
