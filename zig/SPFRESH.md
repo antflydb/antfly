@@ -842,8 +842,10 @@ implementations cleanly:
    are for distinct lifetime/shape classes such as vector batches, member ids,
    posting overlay summaries, and posting caches. Small transformed-vector
    matrix loads and small metadata batch lookups now use stack-backed scratch
-   before falling back to heap allocation. `SearchScratch` also slabs the fixed
-   transformed-query, centroid, and vector work buffers into one allocation,
+   before falling back to heap allocation. Centroid recompute and quantized
+   refresh also use stack-backed paired vector scratch for common dimensions,
+   falling back to one combined heap allocation instead of two. `SearchScratch`
+   also slabs the fixed transformed-query, centroid, and vector work buffers,
    posting-delta tail cache entries slab their sequence/id/op arrays, and
    query/fold overlay append IDs plus live flags share one backing allocation.
    Fold compact delta IDs plus ops are likewise slabbed.

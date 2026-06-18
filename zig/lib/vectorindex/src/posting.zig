@@ -4194,10 +4194,16 @@ pub const PostingStore = struct {
         }
         @memset(node.centroid, 0);
 
-        const vector_scratch = try index.alloc.alloc(f32, index.config.dims);
-        defer index.alloc.free(vector_scratch);
-        const transformed = try index.alloc.alloc(f32, index.config.dims);
-        defer index.alloc.free(transformed);
+        const scratch_len = try std.math.mul(usize, index.config.dims, 2);
+        var stack_scratch: [4096]f32 = undefined;
+        const use_stack_scratch = scratch_len <= stack_scratch.len;
+        const scratch = if (use_stack_scratch)
+            stack_scratch[0..scratch_len]
+        else
+            try index.alloc.alloc(f32, scratch_len);
+        defer if (!use_stack_scratch) index.alloc.free(scratch);
+        const vector_scratch = scratch[0..index.config.dims];
+        const transformed = scratch[index.config.dims..scratch_len];
 
         for (node.members) |member_id| {
             const v = try index.getVectorScratch(txn, member_id, vector_scratch);
@@ -4220,10 +4226,16 @@ pub const PostingStore = struct {
         const dims: usize = @intCast(index.metadata.dims);
         if (vectors.len < node.members.len * dims) return error.BufferTooSmall;
 
-        const raw_scratch = try index.alloc.alloc(f32, dims);
-        defer index.alloc.free(raw_scratch);
-        const transformed_scratch = try index.alloc.alloc(f32, dims);
-        defer index.alloc.free(transformed_scratch);
+        const scratch_len = try std.math.mul(usize, dims, 2);
+        var stack_scratch: [4096]f32 = undefined;
+        const use_stack_scratch = scratch_len <= stack_scratch.len;
+        const scratch = if (use_stack_scratch)
+            stack_scratch[0..scratch_len]
+        else
+            try index.alloc.alloc(f32, scratch_len);
+        defer if (!use_stack_scratch) index.alloc.free(scratch);
+        const raw_scratch = scratch[0..dims];
+        const transformed_scratch = scratch[dims..scratch_len];
 
         for (node.members, 0..) |member_id, i| {
             const raw_v = try getBatchVectorScratch(index, txn, member_id, raw_scratch, options);
