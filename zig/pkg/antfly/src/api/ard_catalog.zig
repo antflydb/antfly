@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const extension_domain = @import("../extensions/mod.zig");
+const usermgr = @import("../usermgr/mod.zig");
 
 pub const CatalogMode = enum {
     public_bootstrap,
@@ -23,6 +25,12 @@ pub const CatalogOptions = struct {
     mode: CatalogMode = .public_bootstrap,
     publisher_domain: []const u8 = "antfly.local",
     display_name: []const u8 = "Antfly",
+};
+
+pub const ExtensionCatalogContext = struct {
+    installed_extensions: []const extension_domain.InstalledExtension = &.{},
+    extension_members: []const extension_domain.ExtensionMember = &.{},
+    permissions: ?[]const usermgr.Permission = null,
 };
 
 const Entry = struct {
@@ -248,17 +256,28 @@ const tenant_entries = [_]Entry{
 };
 
 pub fn catalogJsonAlloc(alloc: std.mem.Allocator, options: CatalogOptions) ![]u8 {
+    return try catalogJsonWithExtensionsAlloc(alloc, options, null);
+}
+
+pub fn catalogJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogOptions, extension_context: ?ExtensionCatalogContext) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
 
     try writeCatalogPrefix(&writer.writer, options);
     var first = true;
     try writeScopedEntries(&writer.writer, options, &first, null, null);
+    if (options.mode == .tenant) {
+        if (extension_context) |ctx| try writeExtensionEntries(alloc, &writer.writer, options.publisher_domain, &first, ctx, null, null);
+    }
     try writer.writer.writeAll("]}");
     return try writer.toOwnedSlice();
 }
 
 pub fn searchJsonAlloc(alloc: std.mem.Allocator, options: CatalogOptions, body: []const u8, explore: bool) ![]u8 {
+    return try searchJsonWithExtensionsAlloc(alloc, options, body, explore, null);
+}
+
+pub fn searchJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogOptions, body: []const u8, explore: bool, extension_context: ?ExtensionCatalogContext) ![]u8 {
     const request = try parseSearchRequest(alloc, body);
     defer request.deinit();
 
@@ -269,6 +288,9 @@ pub fn searchJsonAlloc(alloc: std.mem.Allocator, options: CatalogOptions, body: 
     var first = true;
     var matched: usize = 0;
     try writeMatchedEntries(&writer.writer, options, &first, request.text, request.filter, &matched);
+    if (options.mode == .tenant) {
+        if (extension_context) |ctx| try writeMatchedExtensionEntries(alloc, &writer.writer, options.publisher_domain, &first, ctx, request.text, request.filter, &matched);
+    }
     try writer.writer.writeAll("],\"federation\":\"none\",\"count\":");
     try writer.writer.print("{d}", .{matched});
     if (explore) {
@@ -279,6 +301,10 @@ pub fn searchJsonAlloc(alloc: std.mem.Allocator, options: CatalogOptions, body: 
 }
 
 pub fn agentsJsonAlloc(alloc: std.mem.Allocator, options: CatalogOptions) ![]u8 {
+    return try agentsJsonWithExtensionsAlloc(alloc, options, null);
+}
+
+pub fn agentsJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogOptions, extension_context: ?ExtensionCatalogContext) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
 
@@ -286,6 +312,9 @@ pub fn agentsJsonAlloc(alloc: std.mem.Allocator, options: CatalogOptions) ![]u8 
     var first = true;
     var count: usize = 0;
     try writeAgentEntries(&writer.writer, options, &first, &count);
+    if (options.mode == .tenant) {
+        if (extension_context) |ctx| try writeAgentExtensionEntries(alloc, &writer.writer, options.publisher_domain, &first, ctx, &count);
+    }
     try writer.writer.writeAll("],\"count\":");
     try writer.writer.print("{d}", .{count});
     try writer.writer.writeByte('}');
@@ -403,6 +432,335 @@ fn writeAgentEntries(writer: *std.Io.Writer, options: CatalogOptions, first: *bo
             }
         }
     }
+}
+
+fn writeExtensionEntries(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    publisher_domain: []const u8,
+    first: *bool,
+    ctx: ExtensionCatalogContext,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+) !void {
+    for (ctx.installed_extensions) |installed| {
+        const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
+            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", text, filter, publisher_domain))
+        {
+            try writeInstalledExtensionEntry(writer, publisher_domain, first, installed);
+        }
+        if (has_visible_mcp) {
+            if (dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", text, filter, publisher_domain)) {
+                try writeExtensionMcpEntry(writer, publisher_domain, first, installed);
+            }
+        }
+    }
+}
+
+fn writeMatchedExtensionEntries(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    publisher_domain: []const u8,
+    first: *bool,
+    ctx: ExtensionCatalogContext,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    matched: *usize,
+) !void {
+    for (ctx.installed_extensions) |installed| {
+        const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
+            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", text, filter, publisher_domain))
+        {
+            try writeSearchInstalledExtensionEntry(writer, publisher_domain, first, installed, matched, text);
+        }
+        if (has_visible_mcp) {
+            if (dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", text, filter, publisher_domain)) {
+                try writeSearchExtensionMcpEntry(writer, publisher_domain, first, installed, matched, text);
+            }
+        }
+    }
+}
+
+fn writeAgentExtensionEntries(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    publisher_domain: []const u8,
+    first: *bool,
+    ctx: ExtensionCatalogContext,
+    count: *usize,
+) !void {
+    for (ctx.installed_extensions) |installed| {
+        if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) continue;
+        try writeExtensionMcpEntry(writer, publisher_domain, first, installed);
+        count.* += 1;
+    }
+}
+
+fn writeInstalledExtensionEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeByte(',');
+    }
+    try writer.writeByte('{');
+    try writeInstalledExtensionFields(writer, publisher_domain, installed);
+    try writer.writeByte('}');
+}
+
+fn writeExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeByte(',');
+    }
+    try writer.writeByte('{');
+    try writeExtensionMcpFields(writer, publisher_domain, installed);
+    try writer.writeByte('}');
+}
+
+fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeByte(',');
+    }
+    matched.* += 1;
+    try writer.writeByte('{');
+    try writeInstalledExtensionFields(writer, publisher_domain, installed);
+    try writer.writeAll(",\"score\":");
+    try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
+    try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
+}
+
+fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeByte(',');
+    }
+    matched.* += 1;
+    try writer.writeByte('{');
+    try writeExtensionMcpFields(writer, publisher_domain, installed);
+    try writer.writeAll(",\"score\":");
+    try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
+    try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
+}
+
+fn writeInstalledExtensionFields(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
+    try writer.writeAll("\"identifier\":");
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:installed", .{ publisher_domain, installed.name });
+    try writer.writeAll(",\"displayName\":");
+    try writeStringFmt(writer, "Antfly Extension {s}", .{installed.name});
+    try writer.writeAll(",\"type\":\"application/antfly-installed-extension+json\",\"description\":");
+    try writeStringFmt(writer, "Installed Antfly extension {s}.", .{installed.name});
+    try writer.writeAll(",\"data\":{\"name\":");
+    try std.json.Stringify.value(installed.name, .{}, writer);
+    try writer.writeAll(",\"packageName\":");
+    try std.json.Stringify.value(installed.package_name, .{}, writer);
+    try writer.writeAll(",\"packageVersion\":");
+    try std.json.Stringify.value(installed.package_version, .{}, writer);
+    try writer.writeAll(",\"status\":");
+    try std.json.Stringify.value(@tagName(installed.status), .{}, writer);
+    try writer.writeAll(",\"scope\":");
+    try writeExtensionScope(writer, installed.scope);
+    try writer.writeAll("},\"tags\":[\"extension\",\"installed\"],\"capabilities\":");
+    try writeCapabilitiesFromGrants(writer, installed.granted_capabilities);
+    try writer.writeAll(",\"metadata\":{\"digest\":");
+    try std.json.Stringify.value(installed.package_digest, .{}, writer);
+    try writer.writeAll(",\"endpoint\":");
+    try writeStringFmt(writer, "/extensions/v1/installed/{s}", .{installed.name});
+    try writer.writeAll(",\"status\":");
+    try std.json.Stringify.value(@tagName(installed.status), .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn writeExtensionMcpFields(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
+    try writer.writeAll("\"identifier\":");
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:mcp", .{ publisher_domain, installed.name });
+    try writer.writeAll(",\"displayName\":");
+    try writeStringFmt(writer, "Antfly Extension MCP {s}", .{installed.name});
+    try writer.writeAll(",\"type\":\"application/mcp-server+json\",\"description\":");
+    try writeStringFmt(writer, "MCP server for visible tools owned by Antfly extension {s}.", .{installed.name});
+    try writer.writeAll(",\"data\":{\"name\":");
+    try std.json.Stringify.value(installed.name, .{}, writer);
+    try writer.writeAll(",\"endpoint\":");
+    try writeStringFmt(writer, "/mcp/v1/extensions/{s}", .{installed.name});
+    try writer.writeAll("},\"tags\":[\"mcp\",\"extension\"],\"capabilities\":");
+    try writeCapabilitiesFromGrants(writer, installed.granted_capabilities);
+    try writer.writeAll(",\"metadata\":{\"endpoint\":");
+    try writeStringFmt(writer, "/mcp/v1/extensions/{s}", .{installed.name});
+    try writer.writeAll(",\"extension\":");
+    try std.json.Stringify.value(installed.name, .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn writeExtensionScope(writer: *std.Io.Writer, scope: extension_domain.ExtensionScope) !void {
+    try writer.writeAll("{\"kind\":");
+    try std.json.Stringify.value(@tagName(scope.kind), .{}, writer);
+    if (scope.kind == .table) {
+        try writer.writeAll(",\"tableName\":");
+        try std.json.Stringify.value(scope.table_name, .{}, writer);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeCapabilitiesFromGrants(writer: *std.Io.Writer, capabilities: []const extension_domain.Capability) !void {
+    try writer.writeByte('[');
+    for (capabilities, 0..) |capability, index| {
+        if (index > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(capability.name, .{}, writer);
+    }
+    try writer.writeByte(']');
+}
+
+fn installedExtensionVisible(installed: extension_domain.InstalledExtension, permissions: ?[]const usermgr.Permission) bool {
+    if (installed.status != .ready) return false;
+    const perms = permissions orelse return true;
+    if (installed.scope.kind == .table) return identityHasPermission(perms, .table, installed.scope.table_name, .read);
+    return identityHasPermission(perms, .@"*", "*", .admin);
+}
+
+fn installedExtensionHasVisibleMcpTool(
+    alloc: std.mem.Allocator,
+    installed: extension_domain.InstalledExtension,
+    members: []const extension_domain.ExtensionMember,
+    permissions: ?[]const usermgr.Permission,
+) !bool {
+    if (installed.status != .ready) return false;
+    for (members) |member| {
+        if (member.object_kind != .mcp_tool) continue;
+        if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+        if (try extensionMcpMemberVisible(alloc, installed, member, permissions)) return true;
+    }
+    return false;
+}
+
+fn extensionMcpMemberVisible(
+    alloc: std.mem.Allocator,
+    installed: extension_domain.InstalledExtension,
+    member: extension_domain.ExtensionMember,
+    permissions: ?[]const usermgr.Permission,
+) !bool {
+    const perms = permissions orelse return true;
+    const required = try requiredCapabilitiesAlloc(alloc, member.owner_metadata_json);
+    defer freeParsedCapabilities(alloc, required);
+    if (required.len == 0) return extensionScopeVisible(installed, member, perms);
+    var checked_table_permission = false;
+    for (required) |capability| {
+        const permission_type = permissionTypeForCapability(capability.name) orelse continue;
+        checked_table_permission = true;
+        const table = tableResourceForCapability(installed, member, capability);
+        if (!identityHasPermission(perms, .table, table, permission_type)) return false;
+    }
+    return checked_table_permission or extensionScopeVisible(installed, member, perms);
+}
+
+fn extensionScopeVisible(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, permissions: []const usermgr.Permission) bool {
+    if (member.scope.kind == .table) return identityHasPermission(permissions, .table, member.scope.table_name, .read);
+    if (installed.scope.kind == .table) return identityHasPermission(permissions, .table, installed.scope.table_name, .read);
+    return identityHasPermission(permissions, .@"*", "*", .admin);
+}
+
+fn permissionTypeForCapability(name: []const u8) ?usermgr.PermissionType {
+    if (std.mem.eql(u8, name, "db:read") or std.mem.eql(u8, name, "read:table")) return .read;
+    if (std.mem.eql(u8, name, "db:write") or std.mem.eql(u8, name, "write:table")) return .write;
+    if (std.mem.eql(u8, name, "db:admin") or std.mem.eql(u8, name, "admin:table")) return .admin;
+    return null;
+}
+
+fn tableResourceForCapability(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, capability: extension_domain.Capability) []const u8 {
+    if (capability.scope.len != 0 and !std.mem.eql(u8, capability.scope, installed.package_name)) return capability.scope;
+    if (member.scope.kind == .table) return member.scope.table_name;
+    if (installed.scope.kind == .table) return installed.scope.table_name;
+    return "*";
+}
+
+fn identityHasPermission(permissions: []const usermgr.Permission, resource_type: usermgr.ResourceType, resource: []const u8, permission_type: usermgr.PermissionType) bool {
+    for (permissions) |permission| {
+        const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        if (!type_match or !resource_match) continue;
+        if (permission.type == .admin or permission.type == permission_type) return true;
+    }
+    return false;
+}
+
+fn requiredCapabilitiesAlloc(alloc: std.mem.Allocator, metadata_json: []const u8) ![]extension_domain.Capability {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, metadata_json, .{}) catch return &.{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return &.{};
+    const value = parsed.value.object.get("required_capabilities") orelse return &.{};
+    if (value != .array) return &.{};
+    var out = std.ArrayListUnmanaged(extension_domain.Capability).empty;
+    errdefer {
+        freeParsedCapabilityValues(alloc, out.items);
+        out.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        switch (item) {
+            .string => |name| {
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                try out.append(alloc, .{ .name = owned_name });
+            },
+            .object => |object| {
+                const name_value = object.get("name") orelse continue;
+                if (name_value != .string) continue;
+                const scope_value = object.get("scope");
+                const scope = if (scope_value) |scope_inner| switch (scope_inner) {
+                    .string => |scope_text| scope_text,
+                    else => "",
+                } else "";
+                const owned_name = try alloc.dupe(u8, name_value.string);
+                errdefer alloc.free(owned_name);
+                const owned_scope = if (scope.len == 0) "" else try alloc.dupe(u8, scope);
+                errdefer if (owned_scope.len > 0) alloc.free(owned_scope);
+                try out.append(alloc, .{ .name = owned_name, .scope = owned_scope });
+            },
+            else => {},
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeParsedCapabilities(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) void {
+    freeParsedCapabilityValues(alloc, capabilities);
+    if (capabilities.len > 0) alloc.free(@constCast(capabilities));
+}
+
+fn freeParsedCapabilityValues(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) void {
+    for (capabilities) |capability| {
+        alloc.free(capability.name);
+        if (capability.scope.len > 0) alloc.free(capability.scope);
+    }
+}
+
+fn dynamicEntryMatches(name: []const u8, media_type: []const u8, description: []const u8, text: ?[]const u8, filter: ?std.json.Value, publisher_domain: []const u8) bool {
+    if (text) |query| {
+        if (std.mem.trim(u8, query, " \t\r\n").len > 0 and
+            !containsIgnoreCase(name, query) and
+            !containsIgnoreCase(media_type, query) and
+            !containsIgnoreCase(description, query)) return false;
+    }
+    if (filter) |filter_value| {
+        var iterator = filter_value.object.iterator();
+        while (iterator.next()) |kv| {
+            const key = kv.key_ptr.*;
+            const value = kv.value_ptr.*;
+            if (std.mem.eql(u8, key, "type")) {
+                if (!jsonValueMatchesString(value, media_type)) return false;
+            } else if (std.mem.eql(u8, key, "tags")) {
+                if (!jsonValueMatchesString(value, "extension") and !jsonValueMatchesString(value, "mcp")) return false;
+            } else if (std.mem.eql(u8, key, "publisher") or std.mem.eql(u8, key, "publisherId")) {
+                if (!jsonValueMatchesString(value, publisher_domain)) return false;
+            } else {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 fn isAgentLike(entry: Entry) bool {

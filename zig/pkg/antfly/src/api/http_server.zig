@@ -1992,16 +1992,36 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
-            const body = try ard_catalog.catalogJsonAlloc(self.alloc, .{ .mode = mode });
+            var snapshot_opt: ?metadata_api.AdminSnapshot = null;
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const extension_context = if (mode == .tenant) blk: {
+                snapshot_opt = try self.source.adminSnapshot();
+                break :blk self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity);
+            } else null;
+            const body = try ard_catalog.catalogJsonWithExtensionsAlloc(self.alloc, .{ .mode = mode }, extension_context);
             return try self.ardCatalogResponse(200, body, true);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
-            const body = try ard_catalog.catalogJsonAlloc(self.alloc, .{ .mode = .tenant });
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
+                self.alloc,
+                .{ .mode = .tenant },
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            );
             return try self.ardCatalogResponse(200, body, false);
         }
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_search)) {
             if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const body = ard_catalog.searchJsonAlloc(self.alloc, .{ .mode = .tenant }, req.body, false) catch |err| switch (err) {
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+                self.alloc,
+                .{ .mode = .tenant },
+                req.body,
+                false,
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            ) catch |err| switch (err) {
                 error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD search request"),
                 else => return err,
             };
@@ -2009,7 +2029,15 @@ pub const ApiHttpServer = struct {
         }
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_explore)) {
             if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const body = ard_catalog.searchJsonAlloc(self.alloc, .{ .mode = .tenant }, req.body, true) catch |err| switch (err) {
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+                self.alloc,
+                .{ .mode = .tenant },
+                req.body,
+                true,
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            ) catch |err| switch (err) {
                 error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD explore request"),
                 else => return err,
             };
@@ -2017,7 +2045,13 @@ pub const ApiHttpServer = struct {
         }
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_agents)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const body = try ard_catalog.agentsJsonAlloc(self.alloc, .{ .mode = .tenant });
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = try ard_catalog.agentsJsonWithExtensionsAlloc(
+                self.alloc,
+                .{ .mode = .tenant },
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            );
             return try self.ardCatalogResponse(200, body, false);
         }
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
@@ -2046,6 +2080,16 @@ pub const ApiHttpServer = struct {
             });
         }
         return null;
+    }
+
+    fn ardExtensionCatalogContext(self: *ApiHttpServer, snapshot_opt: ?metadata_api.AdminSnapshot, authenticated_identity: ?AuthenticatedIdentity) ?ard_catalog.ExtensionCatalogContext {
+        _ = self;
+        const snapshot = snapshot_opt orelse return null;
+        return .{
+            .installed_extensions = snapshot.installed_extensions,
+            .extension_members = snapshot.extension_members,
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
+        };
     }
 
     fn ardCatalogResponse(self: *ApiHttpServer, status: u16, body: []u8, public_cors: bool) !http_common.HttpResponse {
@@ -10611,6 +10655,28 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") == null);
+
+    var ard_catalog_resp = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_catalog_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_catalog_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"type\":\"application/antfly-installed-extension+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+
+    var ard_search_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &trusted_principal_headers,
+        .body = "{\"query\":{\"filter\":{\"type\":[\"application/mcp-server+json\"]}}}",
+    });
+    defer ard_search_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
 }
 
 test "api http server authenticates trusted principal" {
