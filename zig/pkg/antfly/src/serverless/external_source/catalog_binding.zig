@@ -162,6 +162,46 @@ pub fn manifestFormatForExternalFormat(format: external_source.Format) manifest_
     };
 }
 
+pub fn bindingFromRuntimeExternalBaseSource(source: anytype) Binding {
+    return .{
+        .table_id = source.table_id,
+        .format = externalFormatFromRuntime(source.format),
+        .source_uri = source.source_uri,
+        .credential_ref = if (source.credential_ref) |credential| .{
+            .ref_id = credential.ref_id,
+            .scope = credential.scope,
+        } else null,
+        .snapshot_mode = snapshotModeFromRuntime(source.snapshot_mode),
+        .schema_fingerprint = source.schema_fingerprint,
+        .write_policy = writePolicyFromRuntime(source.write_policy),
+    };
+}
+
+fn externalFormatFromRuntime(format: anytype) external_source.Format {
+    return switch (format) {
+        .parquet => .parquet,
+        .iceberg => .iceberg,
+        .lance => .lance,
+    };
+}
+
+fn snapshotModeFromRuntime(snapshot_mode: anytype) SnapshotMode {
+    return switch (snapshot_mode) {
+        .current => .current,
+        .snapshot_id => |snapshot_id| .{ .snapshot_id = snapshot_id },
+        .object_version_digest => |digest| .{ .object_version_digest = digest },
+    };
+}
+
+fn writePolicyFromRuntime(write_policy: anytype) WritePolicy {
+    return switch (write_policy) {
+        .read_only => .read_only,
+        .materialized_overlay => .materialized_overlay,
+        .iceberg_writer => .iceberg_writer,
+        .lake_native_relational => .lake_native_relational,
+    };
+}
+
 test "external table binding validates read-only iceberg source" {
     const binding = Binding{
         .table_id = "events",
@@ -199,6 +239,54 @@ test "external table binding supports raw parquet object-version snapshots" {
     const descriptor = try binding.toManifestBaseSource("sha256:objects", null);
     try descriptor.validate();
     try std.testing.expectEqual(manifest_base_source.ExternalBaseFormat.parquet_prefix, descriptor.external_parquet.format);
+}
+
+test "external table binding converts from runtime schema base source" {
+    const RuntimeFormat = enum { parquet, iceberg, lance };
+    const RuntimeSnapshotMode = union(enum) {
+        current,
+        snapshot_id: []const u8,
+        object_version_digest: []const u8,
+    };
+    const RuntimeCredentialRef = struct {
+        ref_id: []const u8,
+        scope: []const u8 = "",
+    };
+    const RuntimeWritePolicy = enum {
+        read_only,
+        materialized_overlay,
+        iceberg_writer,
+        lake_native_relational,
+    };
+    const RuntimeSource = struct {
+        table_id: []const u8,
+        format: RuntimeFormat,
+        source_uri: []const u8,
+        credential_ref: ?RuntimeCredentialRef = null,
+        snapshot_mode: RuntimeSnapshotMode = .current,
+        schema_fingerprint: []const u8,
+        write_policy: RuntimeWritePolicy = .read_only,
+    };
+
+    const source = RuntimeSource{
+        .table_id = "events",
+        .format = .iceberg,
+        .source_uri = "s3://bucket/warehouse/events",
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .snapshot_mode = .{ .snapshot_id = "iceberg-123" },
+        .schema_fingerprint = "schema-v5",
+    };
+
+    const binding = bindingFromRuntimeExternalBaseSource(source);
+    try binding.validateReadOnlyMvp();
+    try std.testing.expectEqual(external_source.Format.iceberg, binding.format);
+    try std.testing.expectEqualStrings("events", binding.table_id);
+    try std.testing.expectEqualStrings("s3://bucket/warehouse/events", binding.source_uri);
+    try std.testing.expect(binding.credential_ref != null);
+    try std.testing.expectEqualStrings("prod-lake-read", binding.credential_ref.?.ref_id);
+    try std.testing.expectEqualStrings("events", binding.credential_ref.?.scope);
+    try std.testing.expectEqualStrings("iceberg-123", binding.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v5", binding.schema_fingerprint);
 }
 
 test "external table binding rejects empty fields and non-mvp writes" {

@@ -124,6 +124,40 @@ pub const StorageMode = enum(u8) {
     relational = 1,
 };
 
+pub const ExternalBaseFormat = enum(u8) {
+    parquet = 0,
+    iceberg = 1,
+    lance = 2,
+};
+
+pub const ExternalSnapshotMode = union(enum) {
+    current,
+    snapshot_id: []const u8,
+    object_version_digest: []const u8,
+};
+
+pub const ExternalCredentialRef = struct {
+    ref_id: []const u8,
+    scope: []const u8 = "",
+};
+
+pub const ExternalWritePolicy = enum(u8) {
+    read_only = 0,
+    materialized_overlay = 1,
+    iceberg_writer = 2,
+    lake_native_relational = 3,
+};
+
+pub const ExternalBaseSource = struct {
+    table_id: []const u8,
+    format: ExternalBaseFormat,
+    source_uri: []const u8,
+    credential_ref: ?ExternalCredentialRef = null,
+    snapshot_mode: ExternalSnapshotMode = .current,
+    schema_fingerprint: []const u8,
+    write_policy: ExternalWritePolicy = .read_only,
+};
+
 /// A declared typed column of a relational table. `json` columns
 /// (field_type == .json) are indexed as document subtrees; `array` columns keep
 /// a first-class relational type while storing canonical array bytes until
@@ -677,6 +711,7 @@ pub const TableSchema = struct {
     foreign_keys: []const ForeignKey = &.{},
     unique_constraints: []const UniqueConstraint = &.{},
     checks: []const RelationalCheck = &.{},
+    external_base_source: ?ExternalBaseSource = null,
 };
 
 // ============================================================================
@@ -697,7 +732,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 37); // format version
+    try appendU32(&buf, alloc, 38); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -886,6 +921,36 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         }
     }
 
+    // External base source binding (format version 38+).
+    if (schema.external_base_source) |source| {
+        try buf.append(alloc, 1);
+        try appendStr(&buf, alloc, source.table_id);
+        try buf.append(alloc, @intFromEnum(source.format));
+        try appendStr(&buf, alloc, source.source_uri);
+        if (source.credential_ref) |credential| {
+            try buf.append(alloc, 1);
+            try appendStr(&buf, alloc, credential.ref_id);
+            try appendStr(&buf, alloc, credential.scope);
+        } else {
+            try buf.append(alloc, 0);
+        }
+        switch (source.snapshot_mode) {
+            .current => try buf.append(alloc, 0),
+            .snapshot_id => |snapshot_id| {
+                try buf.append(alloc, 1);
+                try appendStr(&buf, alloc, snapshot_id);
+            },
+            .object_version_digest => |digest| {
+                try buf.append(alloc, 2);
+                try appendStr(&buf, alloc, digest);
+            },
+        }
+        try appendStr(&buf, alloc, source.schema_fingerprint);
+        try buf.append(alloc, @intFromEnum(source.write_policy));
+    } else {
+        try buf.append(alloc, 0);
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -899,7 +964,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 37) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 38) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1454,6 +1519,15 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
     } else &.{};
     errdefer freeRelationalPeriodsSlice(alloc, periods);
 
+    const external_base_source: ?ExternalBaseSource = if (fmt_version >= 38 and data[pos] == 1) source_blk: {
+        pos += 1;
+        break :source_blk try readExternalBaseSourceAlloc(alloc, data, &pos);
+    } else source_blk: {
+        if (fmt_version >= 38) pos += 1;
+        break :source_blk null;
+    };
+    errdefer if (external_base_source) |source| freeExternalBaseSource(alloc, source);
+
     return .{
         .version = version,
         .default_type = default_type,
@@ -1469,6 +1543,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
         .checks = checks,
+        .external_base_source = external_base_source,
     };
 }
 
@@ -1493,6 +1568,22 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     freeForeignKeysSlice(alloc, s.foreign_keys);
     freeUniqueConstraintsSlice(alloc, s.unique_constraints);
     freeRelationalChecksSlice(alloc, s.checks);
+    if (s.external_base_source) |source| freeExternalBaseSource(alloc, source);
+}
+
+pub fn freeExternalBaseSource(alloc: Allocator, source: ExternalBaseSource) void {
+    alloc.free(source.table_id);
+    alloc.free(source.source_uri);
+    if (source.credential_ref) |credential| {
+        alloc.free(credential.ref_id);
+        alloc.free(credential.scope);
+    }
+    switch (source.snapshot_mode) {
+        .current => {},
+        .snapshot_id => |snapshot_id| alloc.free(snapshot_id),
+        .object_version_digest => |digest| alloc.free(digest),
+    }
+    alloc.free(source.schema_fingerprint);
 }
 
 fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColumn) void {
@@ -1540,6 +1631,64 @@ fn freeRelationalPeriod(alloc: Allocator, period: RelationalPeriod) void {
     alloc.free(period.name);
     alloc.free(period.start_column);
     alloc.free(period.end_column);
+}
+
+fn readExternalBaseSourceAlloc(alloc: Allocator, data: []const u8, pos: *usize) !ExternalBaseSource {
+    const table_id = try alloc.dupe(u8, readStr(data, pos));
+    errdefer alloc.free(table_id);
+    const format: ExternalBaseFormat = @enumFromInt(data[pos.*]);
+    pos.* += 1;
+    const source_uri = try alloc.dupe(u8, readStr(data, pos));
+    errdefer alloc.free(source_uri);
+    const credential_ref: ?ExternalCredentialRef = if (data[pos.*] == 1) credential_blk: {
+        pos.* += 1;
+        const ref_id = try alloc.dupe(u8, readStr(data, pos));
+        errdefer alloc.free(ref_id);
+        const scope = try alloc.dupe(u8, readStr(data, pos));
+        errdefer alloc.free(scope);
+        break :credential_blk .{ .ref_id = ref_id, .scope = scope };
+    } else credential_blk: {
+        pos.* += 1;
+        break :credential_blk null;
+    };
+    errdefer if (credential_ref) |credential| {
+        alloc.free(credential.ref_id);
+        alloc.free(credential.scope);
+    };
+
+    const snapshot_mode_tag = data[pos.*];
+    pos.* += 1;
+    const snapshot_mode: ExternalSnapshotMode = switch (snapshot_mode_tag) {
+        0 => .current,
+        1 => snapshot_blk: {
+            const snapshot_id = try alloc.dupe(u8, readStr(data, pos));
+            break :snapshot_blk .{ .snapshot_id = snapshot_id };
+        },
+        2 => digest_blk: {
+            const digest = try alloc.dupe(u8, readStr(data, pos));
+            break :digest_blk .{ .object_version_digest = digest };
+        },
+        else => return error.InvalidFormat,
+    };
+    errdefer switch (snapshot_mode) {
+        .current => {},
+        .snapshot_id => |snapshot_id| alloc.free(snapshot_id),
+        .object_version_digest => |digest| alloc.free(digest),
+    };
+    const schema_fingerprint = try alloc.dupe(u8, readStr(data, pos));
+    errdefer alloc.free(schema_fingerprint);
+    const write_policy: ExternalWritePolicy = @enumFromInt(data[pos.*]);
+    pos.* += 1;
+
+    return .{
+        .table_id = table_id,
+        .format = format,
+        .source_uri = source_uri,
+        .credential_ref = credential_ref,
+        .snapshot_mode = snapshot_mode,
+        .schema_fingerprint = schema_fingerprint,
+        .write_policy = write_policy,
+    };
 }
 
 fn freeUniqueConstraintsSlice(alloc: Allocator, constraints: []const UniqueConstraint) void {
@@ -2641,6 +2790,14 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 },
             },
         },
+        .external_base_source = .{
+            .table_id = "orders",
+            .format = .iceberg,
+            .source_uri = "s3://bucket/warehouse/orders",
+            .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "orders" },
+            .snapshot_mode = .{ .snapshot_id = "iceberg-123" },
+            .schema_fingerprint = "schema-v7",
+        },
     };
 
     const data = try serializeSchema(alloc, schema);
@@ -2766,6 +2923,16 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqualStrings("amount", loaded.checks[1].expression.?.lhs.operands[0].field);
     try std.testing.expectEqual(RelationalCheckOp.gt, loaded.checks[1].expression.?.op);
     try std.testing.expectEqualStrings("0", loaded.checks[1].expression.?.rhs[0].value_json);
+    try std.testing.expect(loaded.external_base_source != null);
+    try std.testing.expectEqualStrings("orders", loaded.external_base_source.?.table_id);
+    try std.testing.expectEqual(ExternalBaseFormat.iceberg, loaded.external_base_source.?.format);
+    try std.testing.expectEqualStrings("s3://bucket/warehouse/orders", loaded.external_base_source.?.source_uri);
+    try std.testing.expect(loaded.external_base_source.?.credential_ref != null);
+    try std.testing.expectEqualStrings("prod-lake-read", loaded.external_base_source.?.credential_ref.?.ref_id);
+    try std.testing.expectEqualStrings("orders", loaded.external_base_source.?.credential_ref.?.scope);
+    try std.testing.expectEqualStrings("iceberg-123", loaded.external_base_source.?.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v7", loaded.external_base_source.?.schema_fingerprint);
+    try std.testing.expectEqual(ExternalWritePolicy.read_only, loaded.external_base_source.?.write_policy);
 }
 
 test "schema relational check clone preserves expression AST" {

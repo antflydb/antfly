@@ -63599,26 +63599,11 @@ fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool
 }
 
 fn appParityPlanBoolTokenValue(plan: []const u8, token: []const u8) ?bool {
-    return switch (appParityPlanScanStringToken(plan, token)) {
-        .value => |value| blk: {
-            if (std.mem.eql(u8, value, "true")) break :blk true;
-            if (std.mem.eql(u8, value, "false")) break :blk false;
-            break :blk null;
-        },
-        .absent, .invalid => null,
-    };
+    return sql_adapter.planBoolTokenValue(plan, token);
 }
 
 fn appParityPlanBoolTokenUsize(plan: []const u8, token: []const u8) ?usize {
-    return switch (appParityPlanScanStringToken(plan, token)) {
-        .absent => 0,
-        .value => |value| blk: {
-            if (std.mem.eql(u8, value, "true")) break :blk 1;
-            if (std.mem.eql(u8, value, "false")) break :blk 0;
-            break :blk null;
-        },
-        .invalid => null,
-    };
+    return sql_adapter.planBoolTokenUsize(plan, token);
 }
 
 fn appParityFixtureDdlSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
@@ -66061,81 +66046,28 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc);
 }
 
-fn appParityPlanParseDelimitedUsizeToken(plan: []const u8, value_start: usize) ?usize {
-    var pos = value_start;
-    if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') return null;
-    var value: usize = 0;
-    while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
-        value = value * 10 + @as(usize, plan[pos] - '0');
-    }
-    if (pos != plan.len and plan[pos] != ':') return null;
-    return value;
-}
-
-const AppParityPlanUsizeTokenScan = union(enum) {
-    absent,
-    value: usize,
-    invalid,
-};
-
-fn appParityPlanScanUsizeToken(plan: []const u8, token: []const u8) AppParityPlanUsizeTokenScan {
-    var start: usize = 0;
-    var found: ?usize = null;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse return .invalid;
-        if (found != null) return .invalid;
-        found = parsed;
-        start = index + token.len;
-    }
-    if (found) |value| return .{ .value = value };
-    return .absent;
+fn appParityPlanScanUsizeToken(plan: []const u8, token: []const u8) sql_adapter.PlanUsizeTokenScan {
+    return sql_adapter.scanUsizeToken(plan, token);
 }
 
 fn appParityPlanUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
-    return switch (appParityPlanScanUsizeToken(plan, token)) {
-        .value => |value| value,
-        .absent, .invalid => null,
-    };
+    return sql_adapter.planUsizeTokenValue(plan, token);
 }
 
 fn appParityPlanHasNonZeroToken(plan: []const u8, token: []const u8) bool {
-    return switch (appParityPlanScanUsizeToken(plan, token)) {
-        .value => |value| value > 0,
-        .absent, .invalid => false,
-    };
+    return sql_adapter.planHasNonZeroToken(plan, token);
 }
 
 fn appParityPlanHasNonZeroUsizeTokenNamePrefix(plan: []const u8, name_prefix: []const u8) bool {
-    var segment_start: usize = 0;
-    var found_non_zero = false;
-    while (segment_start < plan.len) {
-        var segment_end = segment_start;
-        while (segment_end < plan.len and plan[segment_end] != ':') : (segment_end += 1) {}
-        const segment = plan[segment_start..segment_end];
-        if (std.mem.indexOfScalar(u8, segment, '=')) |equals_index| {
-            if (std.mem.startsWith(u8, segment[0..equals_index], name_prefix)) {
-                const value = appParityPlanParseDelimitedUsizeToken(segment, equals_index + 1) orelse return false;
-                found_non_zero = found_non_zero or value > 0;
-            }
-        }
-        segment_start = segment_end + 1;
-    }
-    return found_non_zero;
+    return sql_adapter.planHasNonZeroUsizeTokenNamePrefix(plan, name_prefix);
 }
 
 fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
-    return switch (appParityPlanScanUsizeToken(plan, token)) {
-        .value => |value| value == expected,
-        .absent, .invalid => false,
-    };
+    return sql_adapter.planHasExactUsizeToken(plan, token, expected);
 }
 
 fn appParityPlanUsizeOptionalTokenValue(plan: []const u8, token: []const u8) ?usize {
-    return switch (appParityPlanScanUsizeToken(plan, token)) {
-        .value => |value| value,
-        .absent => 0,
-        .invalid => null,
-    };
+    return sql_adapter.planUsizeOptionalTokenValue(plan, token);
 }
 
 fn appParityPlanUsizeTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
@@ -66156,8 +66088,7 @@ fn appParityPlanUsizeOptionalTokenSumMatches(plan: []const u8, tokens: []const [
 }
 
 fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
-    const value = appParityPlanBoolTokenValue(plan, token) orelse return false;
-    return value == expected;
+    return sql_adapter.planHasExactBoolToken(plan, token, expected);
 }
 
 fn appParityPlanScanStringToken(plan: []const u8, token: []const u8) sql_adapter.PlanStringTokenScan {

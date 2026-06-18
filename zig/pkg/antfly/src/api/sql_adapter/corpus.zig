@@ -140,6 +140,111 @@ pub fn planHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_
     return false;
 }
 
+pub fn parseDelimitedUsizeToken(plan: []const u8, value_start: usize) ?usize {
+    var pos = value_start;
+    if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') return null;
+    var value: usize = 0;
+    while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
+        value = value * 10 + @as(usize, plan[pos] - '0');
+    }
+    if (pos != plan.len and plan[pos] != ':') return null;
+    return value;
+}
+
+pub const PlanUsizeTokenScan = union(enum) {
+    absent,
+    value: usize,
+    invalid,
+};
+
+pub fn scanUsizeToken(plan: []const u8, token: []const u8) PlanUsizeTokenScan {
+    var start: usize = 0;
+    var found: ?usize = null;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        const parsed = parseDelimitedUsizeToken(plan, index + token.len) orelse return .invalid;
+        if (found != null) return .invalid;
+        found = parsed;
+        start = index + token.len;
+    }
+    if (found) |value| return .{ .value = value };
+    return .absent;
+}
+
+pub fn planUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
+    return switch (scanUsizeToken(plan, token)) {
+        .value => |value| value,
+        .absent, .invalid => null,
+    };
+}
+
+pub fn planHasNonZeroToken(plan: []const u8, token: []const u8) bool {
+    return switch (scanUsizeToken(plan, token)) {
+        .value => |value| value > 0,
+        .absent, .invalid => false,
+    };
+}
+
+pub fn planHasNonZeroUsizeTokenNamePrefix(plan: []const u8, name_prefix: []const u8) bool {
+    var segment_start: usize = 0;
+    var found_non_zero = false;
+    while (segment_start < plan.len) {
+        var segment_end = segment_start;
+        while (segment_end < plan.len and plan[segment_end] != ':') : (segment_end += 1) {}
+        const segment = plan[segment_start..segment_end];
+        if (std.mem.indexOfScalar(u8, segment, '=')) |equals_index| {
+            if (std.mem.startsWith(u8, segment[0..equals_index], name_prefix)) {
+                const value = parseDelimitedUsizeToken(segment, equals_index + 1) orelse return false;
+                found_non_zero = found_non_zero or value > 0;
+            }
+        }
+        segment_start = segment_end + 1;
+    }
+    return found_non_zero;
+}
+
+pub fn planHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
+    return switch (scanUsizeToken(plan, token)) {
+        .value => |value| value == expected,
+        .absent, .invalid => false,
+    };
+}
+
+pub fn planUsizeOptionalTokenValue(plan: []const u8, token: []const u8) ?usize {
+    return switch (scanUsizeToken(plan, token)) {
+        .value => |value| value,
+        .absent => 0,
+        .invalid => null,
+    };
+}
+
+pub fn planBoolTokenValue(plan: []const u8, token: []const u8) ?bool {
+    return switch (scanStringToken(plan, token)) {
+        .value => |value| blk: {
+            if (std.mem.eql(u8, value, "true")) break :blk true;
+            if (std.mem.eql(u8, value, "false")) break :blk false;
+            break :blk null;
+        },
+        .absent, .invalid => null,
+    };
+}
+
+pub fn planBoolTokenUsize(plan: []const u8, token: []const u8) ?usize {
+    return switch (scanStringToken(plan, token)) {
+        .absent => 0,
+        .value => |value| blk: {
+            if (std.mem.eql(u8, value, "true")) break :blk 1;
+            if (std.mem.eql(u8, value, "false")) break :blk 0;
+            break :blk null;
+        },
+        .invalid => null,
+    };
+}
+
+pub fn planHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
+    const value = planBoolTokenValue(plan, token) orelse return false;
+    return value == expected;
+}
+
 pub const SqlParameterScan = union(enum) {
     absent,
     value: usize,
@@ -347,6 +452,20 @@ test "sql adapter corpus string token matching is exact and unique" {
     const duplicate = "read:query:table=usage_records:table=usage_records";
     try std.testing.expect(!planHasExactStringToken(duplicate, ":table=", "usage_records"));
     try std.testing.expect(!planHasStringToken(duplicate, ":table="));
+}
+
+test "sql adapter corpus numeric and bool token matching is exact and unique" {
+    const plan = "applied:rebuild=true:validation=false:rewrite=false:unvalidated_unique=10:unvalidated_fk=1";
+    try std.testing.expect(planHasExactBoolToken(plan, "rebuild=", true));
+    try std.testing.expect(planHasExactBoolToken(plan, "validation=", false));
+    try std.testing.expectEqual(@as(?usize, 10), planUsizeTokenValue(plan, "unvalidated_unique="));
+    try std.testing.expect(planHasExactUsizeToken(plan, "unvalidated_fk=", 1));
+    try std.testing.expect(planHasNonZeroToken(plan, "unvalidated_unique="));
+    try std.testing.expect(planHasNonZeroUsizeTokenNamePrefix(plan, "unvalidated_"));
+    try std.testing.expectEqual(@as(?usize, 0), planUsizeOptionalTokenValue(plan, "missing="));
+    try std.testing.expect(!planHasExactUsizeToken("query:pred=10x", "pred=", 10));
+    try std.testing.expect(!planHasExactUsizeToken("query:pred=1:pred=1", "pred=", 1));
+    try std.testing.expect(!planHasExactBoolToken("ddl:replace=true_extra", "replace=", true));
 }
 
 test "sql adapter corpus placeholder coverage ignores literals and comments" {

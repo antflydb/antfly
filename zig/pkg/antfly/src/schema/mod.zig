@@ -77,6 +77,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     errdefer freeRuntimeUniqueConstraints(alloc, unique_constraints);
     const checks = try deriveRuntimeRelationalChecks(alloc, schema);
     errdefer freeRuntimeRelationalChecks(alloc, checks);
+    const external_base_source = if (schema.external_base_source) |source| try cloneRuntimeExternalBaseSource(alloc, source) else null;
+    errdefer if (external_base_source) |source| storage_schema.freeExternalBaseSource(alloc, source);
     const storage_mode: storage_schema.StorageMode = switch (schema.storage_mode) {
         .document => .document,
         .relational => .relational,
@@ -107,6 +109,49 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
         .checks = checks,
+        .external_base_source = external_base_source,
+    };
+}
+
+fn cloneRuntimeExternalBaseSource(
+    alloc: std.mem.Allocator,
+    source: storage_schema.ExternalBaseSource,
+) !storage_schema.ExternalBaseSource {
+    const table_id = try alloc.dupe(u8, source.table_id);
+    errdefer alloc.free(table_id);
+    const source_uri = try alloc.dupe(u8, source.source_uri);
+    errdefer alloc.free(source_uri);
+    const credential_ref = if (source.credential_ref) |credential| credential_blk: {
+        const ref_id = try alloc.dupe(u8, credential.ref_id);
+        errdefer alloc.free(ref_id);
+        const scope = try alloc.dupe(u8, credential.scope);
+        errdefer alloc.free(scope);
+        break :credential_blk storage_schema.ExternalCredentialRef{ .ref_id = ref_id, .scope = scope };
+    } else null;
+    errdefer if (credential_ref) |credential| {
+        alloc.free(credential.ref_id);
+        alloc.free(credential.scope);
+    };
+    const snapshot_mode: storage_schema.ExternalSnapshotMode = switch (source.snapshot_mode) {
+        .current => .current,
+        .snapshot_id => |snapshot_id| .{ .snapshot_id = try alloc.dupe(u8, snapshot_id) },
+        .object_version_digest => |digest| .{ .object_version_digest = try alloc.dupe(u8, digest) },
+    };
+    errdefer switch (snapshot_mode) {
+        .current => {},
+        .snapshot_id => |snapshot_id| alloc.free(snapshot_id),
+        .object_version_digest => |digest| alloc.free(digest),
+    };
+    const schema_fingerprint = try alloc.dupe(u8, source.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+    return .{
+        .table_id = table_id,
+        .format = source.format,
+        .source_uri = source_uri,
+        .credential_ref = credential_ref,
+        .snapshot_mode = snapshot_mode,
+        .schema_fingerprint = schema_fingerprint,
+        .write_policy = source.write_policy,
     };
 }
 
@@ -1473,6 +1518,33 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
         if (std.mem.eql(u8, column.name, name)) return column;
     }
     return null;
+}
+
+test "deriveRuntimeTableSchema carries external lake base source binding" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","credentials":{"ref":"prod-lake-read","scope":"events"},"snapshot":{"mode":"snapshot_id","id":"iceberg-123"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.external_base_source != null);
+    try std.testing.expectEqualStrings("events", parsed.external_base_source.?.table_id);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expect(runtime.external_base_source != null);
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(storage_schema.ExternalBaseFormat.iceberg, runtime.external_base_source.?.format);
+    try std.testing.expectEqualStrings("events", runtime.external_base_source.?.table_id);
+    try std.testing.expectEqualStrings("s3://bucket/warehouse/events", runtime.external_base_source.?.source_uri);
+    try std.testing.expect(runtime.external_base_source.?.credential_ref != null);
+    try std.testing.expectEqualStrings("prod-lake-read", runtime.external_base_source.?.credential_ref.?.ref_id);
+    try std.testing.expectEqualStrings("events", runtime.external_base_source.?.credential_ref.?.scope);
+    try std.testing.expectEqualStrings("iceberg-123", runtime.external_base_source.?.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v5", runtime.external_base_source.?.schema_fingerprint);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","schema_fingerprint":"schema-v1"},"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
+    ));
 }
 
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {

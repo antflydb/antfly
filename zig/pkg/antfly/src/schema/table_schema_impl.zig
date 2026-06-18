@@ -56,6 +56,7 @@ pub const TableSchema = struct {
     foreign_keys: []ForeignKey = &.{},
     unique_constraints: []UniqueConstraint = &.{},
     checks: []RelationalCheck = &.{},
+    external_base_source: ?storage_schema.ExternalBaseSource = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         alloc.free(self.default_type);
@@ -73,6 +74,7 @@ pub const TableSchema = struct {
         if (self.unique_constraints.len > 0) alloc.free(self.unique_constraints);
         for (self.checks) |*check| check.deinit(alloc);
         if (self.checks.len > 0) alloc.free(self.checks);
+        if (self.external_base_source) |source| storage_schema.freeExternalBaseSource(alloc, source);
         self.* = undefined;
     }
 };
@@ -1051,6 +1053,72 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("foreign_keys")) |foreign_keys| if (foreign_keys != .null) try validateForeignKeys(foreign_keys);
     if (root.get("unique_constraints")) |constraints| if (constraints != .null) try validateUniqueConstraints(constraints);
     if (root.get("checks")) |checks| if (checks != .null) try validateRelationalChecksValue(checks);
+    if (root.get("base_source") != null and root.get("external_base_source") != null) return error.InvalidSchemaUpdateRequest;
+    if (root.get("base_source")) |base_source| if (base_source != .null) try validateExternalBaseSource(base_source);
+    if (root.get("external_base_source")) |base_source| if (base_source != .null) try validateExternalBaseSource(base_source);
+}
+
+fn validateExternalBaseSource(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (object.get("kind")) |kind| switch (kind) {
+        .string => |text| if (!enumTokenEql(text, "external")) return error.InvalidSchemaUpdateRequest,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const table_id = object.get("table_id") orelse return error.InvalidSchemaUpdateRequest;
+    if (table_id != .string or table_id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    const format = object.get("format") orelse return error.InvalidSchemaUpdateRequest;
+    if (format != .string or parseExternalBaseFormat(format.string) == null) return error.InvalidSchemaUpdateRequest;
+    const uri = object.get("uri") orelse object.get("source_uri") orelse return error.InvalidSchemaUpdateRequest;
+    if (uri != .string or uri.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("credentials")) |credentials| try validateExternalCredentialRef(credentials);
+    if (object.get("credential_ref")) |credentials| try validateExternalCredentialRef(credentials);
+    if (object.get("snapshot")) |snapshot| try validateExternalSnapshotMode(snapshot);
+    if (object.get("snapshot_mode")) |snapshot| try validateExternalSnapshotMode(snapshot);
+    const schema_fingerprint = object.get("schema_fingerprint") orelse return error.InvalidSchemaUpdateRequest;
+    if (schema_fingerprint != .string or schema_fingerprint.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("write_policy")) |write_policy| {
+        if (write_policy != .string or parseExternalWritePolicy(write_policy.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateExternalCredentialRef(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const ref_id = object.get("ref") orelse object.get("ref_id") orelse return error.InvalidSchemaUpdateRequest;
+    if (ref_id != .string or ref_id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("scope")) |scope| {
+        if (scope != .string) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateExternalSnapshotMode(value: std.json.Value) !void {
+    switch (value) {
+        .string => |text| {
+            if (!enumTokenEql(text, "current") and !enumTokenEql(text, "iceberg_current")) return error.InvalidSchemaUpdateRequest;
+        },
+        .object => |object| {
+            const mode = object.get("mode") orelse return error.InvalidSchemaUpdateRequest;
+            if (mode != .string) return error.InvalidSchemaUpdateRequest;
+            if (enumTokenEql(mode.string, "current") or enumTokenEql(mode.string, "iceberg_current")) return;
+            if (enumTokenEql(mode.string, "snapshot_id") or enumTokenEql(mode.string, "snapshot")) {
+                const id = object.get("id") orelse object.get("snapshot_id") orelse return error.InvalidSchemaUpdateRequest;
+                if (id != .string or id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+                return;
+            }
+            if (enumTokenEql(mode.string, "object_version_digest") or enumTokenEql(mode.string, "raw_parquet_digest")) {
+                const digest = object.get("digest") orelse object.get("object_version_digest") orelse return error.InvalidSchemaUpdateRequest;
+                if (digest != .string or digest.string.len == 0) return error.InvalidSchemaUpdateRequest;
+                return;
+            }
+            return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    }
 }
 
 fn validatePrimaryKey(value: std.json.Value) !void {
@@ -2189,6 +2257,11 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("checks")) |checks| {
         if (checks != .null) parsed.checks = try parseRelationalChecks(alloc, checks);
     }
+    if (root.get("base_source")) |base_source| {
+        if (base_source != .null) parsed.external_base_source = try parseExternalBaseSource(alloc, base_source);
+    } else if (root.get("external_base_source")) |base_source| {
+        if (base_source != .null) parsed.external_base_source = try parseExternalBaseSource(alloc, base_source);
+    }
     if (parsed.storage_mode == .relational) {
         if (root.get("enforce_types")) |enforce_types| {
             if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
@@ -2214,7 +2287,7 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) {
-        if (schema.primary_key != null or schema.periods.len != 0 or schema.foreign_keys.len != 0 or schema.unique_constraints.len != 0 or schema.checks.len != 0) return error.InvalidSchemaUpdateRequest;
+        if (schema.primary_key != null or schema.periods.len != 0 or schema.foreign_keys.len != 0 or schema.unique_constraints.len != 0 or schema.checks.len != 0 or schema.external_base_source != null) return error.InvalidSchemaUpdateRequest;
         return;
     }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
@@ -4297,6 +4370,100 @@ fn parsePrimaryKey(alloc: std.mem.Allocator, value: std.json.Value) !PrimaryKey 
         .include_columns = include_columns,
         .without_overlaps_period = without_overlaps_period,
     };
+}
+
+fn parseExternalBaseSource(alloc: std.mem.Allocator, value: std.json.Value) !storage_schema.ExternalBaseSource {
+    try validateExternalBaseSource(value);
+    const object = value.object;
+    const table_id_value = object.get("table_id") orelse return error.InvalidSchemaUpdateRequest;
+    const table_id = try alloc.dupe(u8, table_id_value.string);
+    errdefer alloc.free(table_id);
+    const format = parseExternalBaseFormat(object.get("format").?.string) orelse return error.InvalidSchemaUpdateRequest;
+    const source_uri_value = object.get("uri") orelse object.get("source_uri") orelse return error.InvalidSchemaUpdateRequest;
+    const source_uri = try alloc.dupe(u8, source_uri_value.string);
+    errdefer alloc.free(source_uri);
+    const credential_ref = if (object.get("credentials") orelse object.get("credential_ref")) |credentials|
+        try parseExternalCredentialRef(alloc, credentials)
+    else
+        null;
+    errdefer if (credential_ref) |credential| {
+        alloc.free(credential.ref_id);
+        alloc.free(credential.scope);
+    };
+    const snapshot_mode = if (object.get("snapshot") orelse object.get("snapshot_mode")) |snapshot|
+        try parseExternalSnapshotMode(alloc, snapshot)
+    else
+        storage_schema.ExternalSnapshotMode.current;
+    errdefer switch (snapshot_mode) {
+        .current => {},
+        .snapshot_id => |snapshot_id| alloc.free(snapshot_id),
+        .object_version_digest => |digest| alloc.free(digest),
+    };
+    const schema_fingerprint_value = object.get("schema_fingerprint") orelse return error.InvalidSchemaUpdateRequest;
+    const schema_fingerprint = try alloc.dupe(u8, schema_fingerprint_value.string);
+    errdefer alloc.free(schema_fingerprint);
+    return .{
+        .table_id = table_id,
+        .format = format,
+        .source_uri = source_uri,
+        .credential_ref = credential_ref,
+        .snapshot_mode = snapshot_mode,
+        .schema_fingerprint = schema_fingerprint,
+        .write_policy = if (object.get("write_policy")) |write_policy|
+            parseExternalWritePolicy(write_policy.string) orelse return error.InvalidSchemaUpdateRequest
+        else
+            .read_only,
+    };
+}
+
+fn parseExternalCredentialRef(alloc: std.mem.Allocator, value: std.json.Value) !storage_schema.ExternalCredentialRef {
+    try validateExternalCredentialRef(value);
+    const object = value.object;
+    const ref_value = object.get("ref") orelse object.get("ref_id") orelse return error.InvalidSchemaUpdateRequest;
+    const ref_id = try alloc.dupe(u8, ref_value.string);
+    errdefer alloc.free(ref_id);
+    const scope = if (object.get("scope")) |scope_value|
+        try alloc.dupe(u8, scope_value.string)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(scope);
+    return .{ .ref_id = ref_id, .scope = scope };
+}
+
+fn parseExternalSnapshotMode(alloc: std.mem.Allocator, value: std.json.Value) !storage_schema.ExternalSnapshotMode {
+    try validateExternalSnapshotMode(value);
+    switch (value) {
+        .string => return .current,
+        .object => |object| {
+            const mode = object.get("mode").?.string;
+            if (enumTokenEql(mode, "current") or enumTokenEql(mode, "iceberg_current")) return .current;
+            if (enumTokenEql(mode, "snapshot_id") or enumTokenEql(mode, "snapshot")) {
+                const id = object.get("id") orelse object.get("snapshot_id") orelse return error.InvalidSchemaUpdateRequest;
+                return .{ .snapshot_id = try alloc.dupe(u8, id.string) };
+            }
+            if (enumTokenEql(mode, "object_version_digest") or enumTokenEql(mode, "raw_parquet_digest")) {
+                const digest = object.get("digest") orelse object.get("object_version_digest") orelse return error.InvalidSchemaUpdateRequest;
+                return .{ .object_version_digest = try alloc.dupe(u8, digest.string) };
+            }
+            return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    }
+}
+
+fn parseExternalBaseFormat(text: []const u8) ?storage_schema.ExternalBaseFormat {
+    if (enumTokenEql(text, "parquet") or enumTokenEql(text, "parquet_prefix") or enumTokenEql(text, "raw_parquet")) return .parquet;
+    if (enumTokenEql(text, "iceberg")) return .iceberg;
+    if (enumTokenEql(text, "lance")) return .lance;
+    return null;
+}
+
+fn parseExternalWritePolicy(text: []const u8) ?storage_schema.ExternalWritePolicy {
+    if (enumTokenEql(text, "read_only")) return .read_only;
+    if (enumTokenEql(text, "materialized_overlay")) return .materialized_overlay;
+    if (enumTokenEql(text, "iceberg_writer")) return .iceberg_writer;
+    if (enumTokenEql(text, "lake_native_relational")) return .lake_native_relational;
+    return null;
 }
 
 fn parseRelationalPeriods(alloc: std.mem.Allocator, value: std.json.Value) ![]RelationalPeriod {

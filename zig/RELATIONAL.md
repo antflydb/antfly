@@ -1030,12 +1030,13 @@ adapter-only reasons must not be reused as required-feature classifications.
 Golden-plan fingerprint helpers and
 unsupported/adapter-noop plan matching belong in `corpus.zig`, so fixture
 validation and generated corpus promotion share the same adapter-owned contract.
-Exact string-token scanners for golden plan assertions also live in `corpus.zig`
-and reject duplicate token occurrences, so coverage checks cannot accidentally
-pass on substring matches or ambiguous plan summaries. The corpus package also
-owns strict placeholder coverage scanning for fixture SQL, including skipped
-numbers, parameters without placeholders, placeholders without params, malformed
-suffixes, quoted string/identifier bodies, comments, and dollar-quoted bodies.
+Exact string, integer, and boolean token scanners for golden plan assertions
+also live in `corpus.zig` and reject duplicate or malformed token occurrences,
+so coverage checks cannot accidentally pass on substring matches or ambiguous
+plan summaries. The corpus package also owns strict placeholder coverage
+scanning for fixture SQL, including skipped numbers, parameters without
+placeholders, placeholders without params, malformed suffixes, quoted
+string/identifier bodies, comments, and dollar-quoted bodies.
 The shared parser cursor belongs in `parser.zig`, so checkpoint/restore,
 expect, match, peek, identifier-predicate matching, function-call detection,
 balanced-paren normalization, wrapped identifier operands, top-level boolean

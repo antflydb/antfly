@@ -60,6 +60,7 @@ pub const IcebergMetadataPlan = external_source.IcebergMetadataPlan;
 pub const IcebergSnapshotRef = external_source.IcebergSnapshotRef;
 pub const sourceKindForExternalFormat = external_source.sourceKindForExternalFormat;
 pub const manifestFormatForExternalFormat = external_source.manifestFormatForExternalFormat;
+pub const externalTableBindingFromRuntimeExternalBaseSource = external_source.externalTableBindingFromRuntimeExternalBaseSource;
 pub const planParquetPrefixInventoryAlloc = external_source.planParquetPrefixInventoryAlloc;
 pub const parseIcebergMetadataPlanAlloc = external_source.parseIcebergMetadataPlanAlloc;
 pub const ArtifactMetadata = artifacts.ArtifactMetadata;

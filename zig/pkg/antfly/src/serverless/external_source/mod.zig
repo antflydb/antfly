@@ -36,6 +36,7 @@ pub const encodeInventoryAlloc = codec.encodeAlloc;
 pub const decodeInventoryAlloc = codec.decodeAlloc;
 pub const sourceKindForExternalFormat = catalog_binding.sourceKindForFormat;
 pub const manifestFormatForExternalFormat = catalog_binding.manifestFormatForExternalFormat;
+pub const externalTableBindingFromRuntimeExternalBaseSource = catalog_binding.bindingFromRuntimeExternalBaseSource;
 pub const isParquetDataObject = object_snapshot.isParquetDataObject;
 pub const planParquetPrefixInventoryAlloc = object_snapshot.planParquetPrefixInventoryAlloc;
 pub const parseIcebergMetadataPlanAlloc = iceberg_metadata.parseMetadataPlanAlloc;
@@ -60,6 +61,7 @@ test "serverless external source module compiles" {
     _ = decodeInventoryAlloc;
     _ = sourceKindForExternalFormat;
     _ = manifestFormatForExternalFormat;
+    _ = externalTableBindingFromRuntimeExternalBaseSource;
     _ = isParquetDataObject;
     _ = planParquetPrefixInventoryAlloc;
     _ = parseIcebergMetadataPlanAlloc;
