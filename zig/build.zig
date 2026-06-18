@@ -3315,6 +3315,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves mcp and a2a protocol surfaces",
             "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
             "api http server requires auth for ARD tenant catalog when auth is enabled",
+            "api http server serves ARD OpenAPI, skill, resource, and registry endpoints",
             "api http server filters extension mcp tools by trusted principal table permissions",
             "auth row filter resolver expands username references",
             "auth row filter resolver expands metadata references",

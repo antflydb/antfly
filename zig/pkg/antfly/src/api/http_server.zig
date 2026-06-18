@@ -87,6 +87,35 @@ const ard_catalog = @import("ard_catalog.zig");
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const parseOwnedJsonObjectMapAlloc = json_helpers.parseOwnedJsonObjectMapAlloc;
+const root_openapi_yaml =
+    \\openapi: 3.1.0
+    \\info:
+    \\  title: Antfly ARD Discovery API
+    \\  version: 1.0.0
+    \\paths:
+    \\  /.well-known/ai-catalog.json:
+    \\    get:
+    \\      summary: Fetch the ARD ai-catalog manifest
+    \\  /ard/v1/catalog:
+    \\    get:
+    \\      summary: Fetch the authenticated tenant ARD catalog
+    \\  /ard/v1/search:
+    \\    post:
+    \\      summary: Search the authenticated tenant ARD catalog
+    \\  /ard/v1/explore:
+    \\    post:
+    \\      summary: Explore the authenticated tenant ARD catalog
+    \\  /ard/v1/agents:
+    \\    get:
+    \\      summary: List visible agent-like ARD resources
+    \\  /ard/v1/skills/{skill}:
+    \\    get:
+    \\      summary: Fetch a tenant-scoped Antfly skill artifact
+    \\  /ard/v1/resources/mcp/{name}:
+    \\    get:
+    \\      summary: Fetch an MCP resource descriptor
+    \\
+;
 
 const ParsedGlobalQueryTable = struct {
     parsed: std.json.Parsed(metadata_openapi.QueryRequest),
@@ -1958,6 +1987,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchArdRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_openapi)) {
+            return try self.bodyResponse(200, "application/yaml", root_openapi_yaml, false);
+        }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
             const body = try ard_catalog.catalogJsonAlloc(self.alloc, .{ .mode = mode });
@@ -1966,6 +1998,43 @@ pub const ApiHttpServer = struct {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
             const body = try ard_catalog.catalogJsonAlloc(self.alloc, .{ .mode = .tenant });
             return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_search)) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const body = ard_catalog.searchJsonAlloc(self.alloc, .{ .mode = .tenant }, req.body, false) catch |err| switch (err) {
+                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD search request"),
+                else => return err,
+            };
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_explore)) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const body = ard_catalog.searchJsonAlloc(self.alloc, .{ .mode = .tenant }, req.body, true) catch |err| switch (err) {
+                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD explore request"),
+                else => return err,
+            };
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_agents)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const body = try ard_catalog.agentsJsonAlloc(self.alloc, .{ .mode = .tenant });
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
+            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, slug)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+            return try self.bodyResponseOwned(200, "text/markdown; charset=utf-8", body, false);
+        }
+        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_resources_prefix)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const rest = uri_parts.path[routes.Routes.ard_v1_resources_prefix.len..];
+            if (std.mem.startsWith(u8, rest, "mcp/")) {
+                const name = rest["mcp/".len..];
+                const body = (try ard_catalog.mcpDescriptorJsonAlloc(self.alloc, name)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try self.ardCatalogResponse(200, body, false);
+            }
+            return try jsonErrorResponse(self.alloc, 404, "not found");
         }
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
@@ -1997,6 +2066,33 @@ pub const ApiHttpServer = struct {
         return .{
             .status = status,
             .content_type = try self.alloc.dupe(u8, "application/json"),
+            .headers = headers,
+            .body = body,
+        };
+    }
+
+    fn bodyResponse(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []const u8, public_cors: bool) !http_common.HttpResponse {
+        return try self.bodyResponseOwned(status, content_type, try self.alloc.dupe(u8, body), public_cors);
+    }
+
+    fn bodyResponseOwned(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []u8, public_cors: bool) !http_common.HttpResponse {
+        errdefer self.alloc.free(body);
+        var headers: []http_common.Header = &.{};
+        errdefer {
+            for (headers) |*header| header.deinit(self.alloc);
+            if (headers.len > 0) self.alloc.free(headers);
+        }
+        if (public_cors) {
+            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
+                .{
+                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
+                    .value = try self.alloc.dupe(u8, "*"),
+                },
+            });
+        }
+        return .{
+            .status = status,
+            .content_type = try self.alloc.dupe(u8, content_type),
             .headers = headers,
             .body = body,
         };
@@ -10116,6 +10212,91 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer authorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "\"type\":\"application/mcp-server+json\"") != null);
+}
+
+test "api http server serves ARD OpenAPI, skill, resource, and registry endpoints" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/openapi+yaml\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/ai-skill+md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"representativeQueries\"") != null);
+
+    var openapi = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_openapi,
+    });
+    defer openapi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), openapi.status);
+    try std.testing.expectEqualStrings("application/yaml", openapi.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "openapi:") != null);
+
+    var skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/antfly-retrieval",
+    });
+    defer skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), skill.status);
+    try std.testing.expectEqualStrings("text/markdown; charset=utf-8", skill.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, skill.body, "# Antfly Retrieval") != null);
+
+    var mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+    });
+    defer mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
+
+    var search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
+    });
+    defer search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), search.status);
+    try std.testing.expect(std.mem.indexOf(u8, search.body, "\"results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/ai-skill+md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/mcp-server+json\"") == null);
+
+    var explore = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_explore,
+        .body = "{\"query\":{\"filter\":{\"capabilities\":[\"retrieval\"]}}}",
+    });
+    defer explore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), explore.status);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"facets\"") != null);
+
+    var agents = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_agents,
+    });
+    defer agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/mcp-server+json\"") != null);
 }
 
 test "api http server lists extension-owned mcp tools" {
