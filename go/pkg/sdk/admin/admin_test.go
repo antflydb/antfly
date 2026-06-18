@@ -215,6 +215,75 @@ func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientRewindRejoinUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != HARejoinRewindPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HARejoinRewindPath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if !strings.Contains(got, `"node_id":"primary-a"`) ||
+			!strings.Contains(got, `"last_lsn":13`) ||
+			!strings.Contains(got, `"retained_from_lsn":8`) ||
+			!strings.Contains(got, `"allow_rewind_after_forced_promotion":true`) {
+			t.Fatalf("rejoin rewind body = %s, want node, LSN, retention, and force-rewind fields", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haRejoinRewindResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.WithToken("test-token").RewindRejoin(context.Background(), RejoinAssessRequest{
+		NodeId:          "primary-a",
+		LastLsn:         13,
+		RetainedFromLsn: 8,
+		Identity: HAIdentity{
+			ClusterId:  100,
+			ShardId:    10,
+			TableId:    20,
+			TimelineId: 4,
+			Epoch:      6,
+		},
+		AllowRewindAfterForcedPromotion: true,
+	})
+	if err != nil {
+		t.Fatalf("RewindRejoin returned error: %v", err)
+	}
+	if resp.Action.ActionKind != HAActionKindRejoinRewind || resp.Action.NodeId != "primary-a" {
+		t.Fatalf("rejoin action = %#v, want former-primary rewind receipt", resp.Action)
+	}
+	if resp.Assessment.Action != HARejoinActionRewind || resp.Assessment.Reason != HARejoinReasonParentTimelineRetained {
+		t.Fatalf("rejoin assessment = %#v, want rewind on retained parent timeline", resp.Assessment)
+	}
+	if resp.Rewind.NodeId != "primary-a" ||
+		resp.Rewind.TargetTimelineId != 5 ||
+		resp.Rewind.NextLsn != 13 ||
+		!resp.Rewind.DataLossDiscarded {
+		t.Fatalf("rejoin rewind result = %#v, want rewind evidence for primary-a", resp.Rewind)
+	}
+}
+
 func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
 	t.Parallel()
 
@@ -1969,6 +2038,46 @@ func haPromotionResponseJSON() string {
 		"fence_generation":3,
 		"fence_token":"ha-fence-token",
 		"forced":false
+	}`
+}
+
+func haRejoinRewindResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"rejoin_rewind:primary-a",
+			"action_kind":"rejoin_rewind",
+			"target":"primary-a",
+			"state":"applied",
+			"node_id":"primary-a"
+		},
+		"assessment":{
+			"action":"rewind",
+			"reason":"parent_timeline_retained",
+			"former_node_id":"primary-a",
+			"target_timeline_id":5,
+			"target_epoch":7,
+			"parent_cluster_id":100,
+			"parent_shard_id":10,
+			"parent_table_id":20,
+			"parent_timeline_id":4,
+			"parent_epoch":6,
+			"fork_lsn":12,
+			"former_last_lsn":13,
+			"retained_from_lsn":8,
+			"data_loss_discarded":true
+		},
+		"rewind":{
+			"node_id":"primary-a",
+			"fork_lsn":12,
+			"previous_last_lsn":13,
+			"current_last_lsn":12,
+			"next_lsn":13,
+			"discarded_lsn_count":1,
+			"target_timeline_id":5,
+			"target_epoch":7,
+			"data_loss_discarded":true
+		}
 	}`
 }
 
