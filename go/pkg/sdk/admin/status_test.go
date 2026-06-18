@@ -224,6 +224,52 @@ func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
 	}
 }
 
+func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAPrimaryStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
+		}
+		query := r.URL.Query()
+		if _, ok := query["max_lag_lsn"]; ok {
+			t.Fatalf("query includes max_lag_lsn = %q, want omitted zero value", query["max_lag_lsn"])
+		}
+		if _, ok := query["max_retained_bytes"]; ok {
+			t.Fatalf("query includes max_retained_bytes = %q, want omitted zero value", query["max_retained_bytes"])
+		}
+		if _, ok := query["max_retained_age_ns"]; ok {
+			t.Fatalf("query includes max_retained_age_ns = %q, want omitted zero value", query["max_retained_age_ns"])
+		}
+		if got := query.Get("sync_selection"); got != "all" {
+			t.Fatalf("sync_selection = %q, want all", got)
+		}
+		if _, ok := query["sync_required"]; ok {
+			t.Fatalf("query includes sync_required = %q, want omitted for ALL policy", query["sync_required"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haLegacyPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.PrimaryStatusParsedResponse(context.Background(), &HAPrimaryStatusParams{
+		SyncMode:      HAPrimaryStatusSyncModeRemoteApply,
+		SyncSelection: HAPrimaryStatusSyncSelectionAll,
+		SyncRequired:  2,
+		SyncStandby:   []string{"standby-a", "standby-b"},
+	})
+	if err != nil {
+		t.Fatalf("PrimaryStatusParsedResponse returned error: %v", err)
+	}
+}
+
 func TestHAClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
 	t.Parallel()
 

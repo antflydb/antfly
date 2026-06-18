@@ -2160,7 +2160,7 @@ func haResponseValue[T any](response *HAResponse[T], err error) (*T, error) {
 }
 
 func (c *HAClient) PrimaryStatusResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[HAPrimaryStatusResponse], error) {
-	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, c.editors...)
+	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, appendHARequestEditors(c.editors, haPrimaryStatusQueryEditor(params))...)
 	if resp == nil {
 		return nil, err
 	}
@@ -2172,7 +2172,7 @@ func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusPar
 }
 
 func (c *HAClient) PrimaryStatusParsedResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[ParsedHAPrimaryStatus], error) {
-	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, c.editors...)
+	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, appendHARequestEditors(c.editors, haPrimaryStatusQueryEditor(params))...)
 	if resp == nil {
 		return nil, err
 	}
@@ -2195,6 +2195,38 @@ func (c *HAClient) PrimaryStatusParsedResponse(ctx context.Context, params *HAPr
 
 func (c *HAClient) PrimaryStatusParsed(ctx context.Context, params *HAPrimaryStatusParams) (*ParsedHAPrimaryStatus, error) {
 	return haResponseValue(c.PrimaryStatusParsedResponse(ctx, params))
+}
+
+func appendHARequestEditors(editors []oapi.RequestEditorFn, extra ...oapi.RequestEditorFn) []oapi.RequestEditorFn {
+	combined := make([]oapi.RequestEditorFn, 0, len(editors)+len(extra))
+	combined = append(combined, editors...)
+	combined = append(combined, extra...)
+	return combined
+}
+
+func haPrimaryStatusQueryEditor(params *HAPrimaryStatusParams) oapi.RequestEditorFn {
+	return func(_ context.Context, req *http.Request) error {
+		if params == nil || req == nil || req.URL == nil {
+			return nil
+		}
+		query := req.URL.Query()
+		removeZeroQueryParam(query, "max_lag_lsn")
+		removeZeroQueryParam(query, "max_retained_bytes")
+		removeZeroQueryParam(query, "max_retained_age_ns")
+		removeZeroQueryParam(query, "sync_required")
+		if params.SyncSelection == HAPrimaryStatusSyncSelectionAll {
+			query.Del("sync_required")
+		}
+		req.URL.RawQuery = query.Encode()
+		return nil
+	}
+}
+
+func removeZeroQueryParam(query url.Values, key string) {
+	values, ok := query[key]
+	if ok && len(values) == 1 && values[0] == "0" {
+		query.Del(key)
+	}
 }
 
 func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[HAStandbyStatusResponse], error) {

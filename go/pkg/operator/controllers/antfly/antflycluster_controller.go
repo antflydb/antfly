@@ -6351,7 +6351,7 @@ func haPrimaryStatusParams(ha *antflyv1.HighAvailabilitySpec) *adminsdk.HAPrimar
 		if ha.SyncPolicy.Selection != "" {
 			params.SyncSelection = haAdminSyncSelectionParam(ha.SyncPolicy.Selection)
 		}
-		if ha.SyncPolicy.Required > 0 {
+		if ha.SyncPolicy.Required > 0 && ha.SyncPolicy.Selection != antflyv1.HAStandbySelectionAll {
 			params.SyncRequired = uint64(ha.SyncPolicy.Required)
 		}
 		for _, name := range ha.SyncPolicy.StandbyNames {
