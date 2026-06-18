@@ -2382,6 +2382,49 @@ pub const PostingStore = struct {
         }
     };
 
+    const AppendStorageViews = struct {
+        ids: []VectorId,
+        live: []bool,
+    };
+
+    fn allocateAppendStorage(alloc: std.mem.Allocator, capacity: usize) ![]u64 {
+        const bytes = appendStorageByteLen(capacity);
+        const words = (bytes + @sizeOf(u64) - 1) / @sizeOf(u64);
+        return try alloc.alloc(u64, words);
+    }
+
+    fn appendStorageByteLen(capacity: usize) usize {
+        var offset: usize = 0;
+        offset = alignForward(offset, @alignOf(VectorId));
+        offset += capacity * @sizeOf(VectorId);
+        offset = alignForward(offset, @alignOf(bool));
+        offset += capacity * @sizeOf(bool);
+        return alignForward(offset, @alignOf(u64));
+    }
+
+    fn carveAppendStorage(storage: []u64, capacity: usize) AppendStorageViews {
+        const bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
+        var offset: usize = 0;
+        return .{
+            .ids = carveAppendStorageSlice(VectorId, bytes, &offset, capacity),
+            .live = carveAppendStorageSlice(bool, bytes, &offset, capacity),
+        };
+    }
+
+    fn carveAppendStorageSlice(comptime T: type, bytes: []align(@alignOf(u64)) u8, offset: *usize, capacity: usize) []T {
+        comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
+        offset.* = alignForward(offset.*, @alignOf(T));
+        const byte_len = capacity * @sizeOf(T);
+        const aligned: []align(@alignOf(T)) u8 = @alignCast(bytes[offset.* .. offset.* + byte_len]);
+        const out = std.mem.bytesAsSlice(T, aligned);
+        offset.* += byte_len;
+        return out;
+    }
+
+    fn alignForward(value: usize, alignment: usize) usize {
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
     pub const FoldScratch = struct {
         delta_records: []PostingDeltaRecord = &.{},
         delta_record_count: usize = 0,
@@ -2392,6 +2435,7 @@ pub const PostingStore = struct {
         member_ids: []VectorId = &.{},
         removed_members: std.AutoHashMapUnmanaged(VectorId, void) = .empty,
         appended_positions: std.AutoHashMapUnmanaged(VectorId, usize) = .empty,
+        append_storage: []u64 = &.{},
         appended_ids: []VectorId = &.{},
         appended_live: []bool = &.{},
         appended_count: usize = 0,
@@ -2462,8 +2506,15 @@ pub const PostingStore = struct {
                 const current_capacity = @min(self.appended_ids.len, self.appended_live.len);
                 const doubled = current_capacity *| 2;
                 const capacity = @max(needed, @max(doubled, @as(usize, 8)));
-                self.appended_ids = try alloc.realloc(self.appended_ids, capacity);
-                self.appended_live = try alloc.realloc(self.appended_live, capacity);
+                const replacement = try allocateAppendStorage(alloc, capacity);
+                errdefer alloc.free(replacement);
+                const views = carveAppendStorage(replacement, capacity);
+                @memcpy(views.ids[0..self.appended_ids.len], self.appended_ids);
+                @memcpy(views.live[0..self.appended_live.len], self.appended_live);
+                alloc.free(self.append_storage);
+                self.append_storage = replacement;
+                self.appended_ids = views.ids;
+                self.appended_live = views.live;
             }
         }
 
@@ -2501,9 +2552,9 @@ pub const PostingStore = struct {
             self.appended_positions = .empty;
             if (self.bytes() <= max_retained_bytes) return;
 
-            alloc.free(self.appended_ids);
+            alloc.free(self.append_storage);
+            self.append_storage = &.{};
             self.appended_ids = &.{};
-            alloc.free(self.appended_live);
             self.appended_live = &.{};
             if (self.bytes() <= max_retained_bytes) return;
 
@@ -2527,8 +2578,7 @@ pub const PostingStore = struct {
                 byteLen(self.member_ids) +
                 approximateHashMapBytes(self.removed_members.capacity(), @sizeOf(VectorId), 0) +
                 approximateHashMapBytes(self.appended_positions.capacity(), @sizeOf(VectorId), @sizeOf(usize)) +
-                byteLen(self.appended_ids) +
-                byteLen(self.appended_live);
+                byteLen(self.append_storage);
         }
 
         pub fn deinit(self: *FoldScratch, alloc: std.mem.Allocator) void {
@@ -2539,8 +2589,7 @@ pub const PostingStore = struct {
             alloc.free(self.member_ids);
             self.removed_members.deinit(alloc);
             self.appended_positions.deinit(alloc);
-            alloc.free(self.appended_ids);
-            alloc.free(self.appended_live);
+            alloc.free(self.append_storage);
             self.* = .{};
         }
     };
@@ -5108,10 +5157,14 @@ test "posting fold scratch grows overlay append buffers geometrically" {
     try scratch.ensureAppendCapacity(alloc, 1);
     try std.testing.expectEqual(@as(usize, 8), scratch.appended_ids.len);
     try std.testing.expectEqual(scratch.appended_ids.len, scratch.appended_live.len);
+    try std.testing.expect(scratch.append_storage.len > scratch.appended_ids.len);
+    try std.testing.expectEqual(scratch.append_storage[0..8].ptr, scratch.appended_ids.ptr);
 
     try scratch.ensureAppendCapacity(alloc, 9);
     try std.testing.expectEqual(@as(usize, 16), scratch.appended_ids.len);
     try std.testing.expectEqual(scratch.appended_ids.len, scratch.appended_live.len);
+    try std.testing.expect(scratch.append_storage.len > scratch.appended_ids.len);
+    try std.testing.expectEqual(scratch.append_storage[0..16].ptr, scratch.appended_ids.ptr);
 }
 
 test "posting fold scratch grows compact delta buffers geometrically" {

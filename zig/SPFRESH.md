@@ -844,7 +844,8 @@ implementations cleanly:
    matrix loads and small metadata batch lookups now use stack-backed scratch
    before falling back to heap allocation. `SearchScratch` also slabs the fixed
    transformed-query, centroid, and vector work buffers into one allocation,
-   and posting-delta tail cache entries slab their sequence/id arrays.
+   posting-delta tail cache entries slab their sequence/id arrays, and query/fold
+   overlay append IDs plus live flags share one backing allocation.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.

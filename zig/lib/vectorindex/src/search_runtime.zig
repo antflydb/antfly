@@ -187,6 +187,7 @@ pub const SearchScratch = struct {
     posting_member_cache_admission_enabled: bool = true,
     posting_overlay_removed_members: std.AutoHashMapUnmanaged(u64, void) = .empty,
     posting_overlay_appended_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    posting_overlay_append_storage: []u64 = &.{},
     posting_overlay_appended_ids: []u64 = &.{},
     posting_overlay_appended_live: []bool = &.{},
     posting_overlay_appended_count: usize = 0,
@@ -363,10 +364,16 @@ pub const SearchScratch = struct {
             const current_capacity = @min(self.posting_overlay_appended_ids.len, self.posting_overlay_appended_live.len);
             const doubled = current_capacity *| 2;
             const capacity = @max(needed, @max(doubled, @as(usize, 8)));
-            self.posting_overlay_appended_ids = try alloc.realloc(self.posting_overlay_appended_ids, capacity);
-            self.noteScratchAllocation(byteLen(self.posting_overlay_appended_ids));
-            self.posting_overlay_appended_live = try alloc.realloc(self.posting_overlay_appended_live, capacity);
-            self.noteScratchAllocation(byteLen(self.posting_overlay_appended_live));
+            const replacement = try allocatePostingOverlayAppendStorage(alloc, capacity);
+            errdefer alloc.free(replacement);
+            const views = carvePostingOverlayAppendStorage(replacement, capacity);
+            @memcpy(views.ids[0..self.posting_overlay_appended_ids.len], self.posting_overlay_appended_ids);
+            @memcpy(views.live[0..self.posting_overlay_appended_live.len], self.posting_overlay_appended_live);
+            alloc.free(self.posting_overlay_append_storage);
+            self.posting_overlay_append_storage = replacement;
+            self.posting_overlay_appended_ids = views.ids;
+            self.posting_overlay_appended_live = views.live;
+            self.noteScratchAllocation(byteLen(self.posting_overlay_append_storage));
         }
     }
 
@@ -620,9 +627,9 @@ pub const SearchScratch = struct {
         self.posting_overlay_removed_members = .empty;
         self.posting_overlay_appended_positions.deinit(alloc);
         self.posting_overlay_appended_positions = .empty;
-        alloc.free(self.posting_overlay_appended_ids);
+        alloc.free(self.posting_overlay_append_storage);
+        self.posting_overlay_append_storage = &.{};
         self.posting_overlay_appended_ids = &.{};
-        alloc.free(self.posting_overlay_appended_live);
         self.posting_overlay_appended_live = &.{};
         self.posting_overlay_appended_count = 0;
         alloc.free(self.posting_delta_records);
@@ -660,8 +667,7 @@ pub const SearchScratch = struct {
         const posting_overlay_bytes =
             approximateHashMapBytes(self.posting_overlay_removed_members.capacity(), @sizeOf(u64), 0) +
             approximateHashMapBytes(self.posting_overlay_appended_positions.capacity(), @sizeOf(u64), @sizeOf(usize)) +
-            byteLen(self.posting_overlay_appended_ids) +
-            byteLen(self.posting_overlay_appended_live);
+            byteLen(self.posting_overlay_append_storage);
         var posting_delta_tail_cache_bytes: u64 = 0;
         for (&self.posting_delta_tail_cache) |*entry| posting_delta_tail_cache_bytes += entry.bytes();
         return estimateScratchBytes(&self.estimate) +
@@ -693,8 +699,7 @@ pub const SearchScratch = struct {
         self.posting_member_cache_miss_counts.deinit(alloc);
         self.posting_overlay_removed_members.deinit(alloc);
         self.posting_overlay_appended_positions.deinit(alloc);
-        alloc.free(self.posting_overlay_appended_ids);
-        alloc.free(self.posting_overlay_appended_live);
+        alloc.free(self.posting_overlay_append_storage);
         alloc.free(self.posting_delta_records);
         for (&self.posting_delta_tail_cache) |*entry| entry.deinit(alloc);
         self.* = undefined;
@@ -712,8 +717,19 @@ const QueryStorageViews = struct {
     vector_views: [][]const f32,
 };
 
+const PostingOverlayAppendViews = struct {
+    ids: []u64,
+    live: []bool,
+};
+
 fn allocateQueryStorage(alloc: Allocator, capacity: usize) ![]u64 {
     const bytes = queryStorageByteLen(capacity);
+    const words = (bytes + @sizeOf(u64) - 1) / @sizeOf(u64);
+    return try alloc.alloc(u64, words);
+}
+
+fn allocatePostingOverlayAppendStorage(alloc: Allocator, capacity: usize) ![]u64 {
+    const bytes = postingOverlayAppendStorageByteLen(capacity);
     const words = (bytes + @sizeOf(u64) - 1) / @sizeOf(u64);
     return try alloc.alloc(u64, words);
 }
@@ -736,6 +752,13 @@ fn queryStorageByteLen(capacity: usize) usize {
     return alignForward(offset, @alignOf(u64));
 }
 
+fn postingOverlayAppendStorageByteLen(capacity: usize) usize {
+    var offset: usize = 0;
+    addQueryStorageSlice(u64, &offset, capacity);
+    addQueryStorageSlice(bool, &offset, capacity);
+    return alignForward(offset, @alignOf(u64));
+}
+
 fn addQueryStorageSlice(comptime T: type, offset: *usize, capacity: usize) void {
     comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
     offset.* = alignForward(offset.*, @alignOf(T));
@@ -754,6 +777,15 @@ fn carveQueryStorage(storage: []u64, capacity: usize) QueryStorageViews {
         .key_views = carveQueryStorageSlice([]const u8, bytes, &offset, capacity),
         .values = carveQueryStorageSlice(?[]const u8, bytes, &offset, capacity),
         .vector_views = carveQueryStorageSlice([]const f32, bytes, &offset, capacity),
+    };
+}
+
+fn carvePostingOverlayAppendStorage(storage: []u64, capacity: usize) PostingOverlayAppendViews {
+    const bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
+    var offset: usize = 0;
+    return .{
+        .ids = carveQueryStorageSlice(u64, bytes, &offset, capacity),
+        .live = carveQueryStorageSlice(bool, bytes, &offset, capacity),
     };
 }
 
@@ -1012,10 +1044,14 @@ test "SearchScratch grows posting overlay append buffers geometrically" {
     try scratch.ensurePostingOverlayAppendCapacity(alloc, 1);
     try std.testing.expectEqual(@as(usize, 8), scratch.posting_overlay_appended_ids.len);
     try std.testing.expectEqual(scratch.posting_overlay_appended_ids.len, scratch.posting_overlay_appended_live.len);
+    try std.testing.expect(scratch.posting_overlay_append_storage.len > scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqual(scratch.posting_overlay_append_storage[0..8].ptr, scratch.posting_overlay_appended_ids.ptr);
 
     try scratch.ensurePostingOverlayAppendCapacity(alloc, 9);
     try std.testing.expectEqual(@as(usize, 16), scratch.posting_overlay_appended_ids.len);
     try std.testing.expectEqual(scratch.posting_overlay_appended_ids.len, scratch.posting_overlay_appended_live.len);
+    try std.testing.expect(scratch.posting_overlay_append_storage.len > scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqual(scratch.posting_overlay_append_storage[0..16].ptr, scratch.posting_overlay_appended_ids.ptr);
 }
 
 test "SearchScratch bounds posting member cache and reports evictions" {
