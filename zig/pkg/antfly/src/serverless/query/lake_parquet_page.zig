@@ -293,6 +293,19 @@ pub fn decodePlainI64DictionaryPageAlloc(alloc: Allocator, header: Header, page_
     return values;
 }
 
+pub fn decodePlainF64DictionaryPageAlloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]f64 {
+    try header.validatePlainDictionary();
+    const count: usize = @intCast(header.value_count);
+    const needed = count * 8;
+    if (page_payload.len < needed) return error.InvalidParquetPage;
+    const values = try alloc.alloc(f64, count);
+    for (values, 0..) |*value, idx| {
+        const bits = std.mem.readInt(u64, page_payload[idx * 8 .. idx * 8 + 8][0..8], .little);
+        value.* = @bitCast(bits);
+    }
+    return values;
+}
+
 pub fn decodePlainI32DictionaryPageAsI64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]i64 {
     try header.validatePlainDictionary();
     const count: usize = @intCast(header.value_count);
@@ -322,6 +335,31 @@ pub fn decodeDictionaryI64DataPageAlloc(
     const indexes = try decodeHybridIndexesAlloc(alloc, payload[1..], bit_width, row_count);
     defer alloc.free(indexes);
     const values = try alloc.alloc(i64, row_count);
+    errdefer alloc.free(values);
+    for (indexes, values) |index, *value| {
+        if (index >= dictionary.len) return error.InvalidParquetPage;
+        value.* = dictionary[@intCast(index)];
+    }
+    return values;
+}
+
+pub fn decodeDictionaryF64DataPageAlloc(
+    alloc: Allocator,
+    header: Header,
+    dictionary: []const f64,
+    page_payload: []const u8,
+) ![]f64 {
+    try header.validateDictionaryRequired();
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    const payload = page_payload[header.data_payload_offset..];
+    if (payload.len == 0) return error.InvalidParquetPage;
+    const bit_width_raw = payload[0];
+    if (bit_width_raw > 32) return error.UnsupportedParquetPage;
+    const bit_width: u6 = @intCast(bit_width_raw);
+    const row_count: usize = @intCast(header.value_count);
+    const indexes = try decodeHybridIndexesAlloc(alloc, payload[1..], bit_width, row_count);
+    defer alloc.free(indexes);
+    const values = try alloc.alloc(f64, row_count);
     errdefer alloc.free(values);
     for (indexes, values) |index, *value| {
         if (index >= dictionary.len) return error.InvalidParquetPage;
@@ -390,8 +428,72 @@ pub fn decodeOptionalDictionaryI64V2HybridLevelsAlloc(
     };
 }
 
+pub fn decodeOptionalDictionaryF64V2HybridLevelsAlloc(
+    alloc: Allocator,
+    header: Header,
+    dictionary: []const f64,
+    page_payload: []const u8,
+) !NullableF64Values {
+    try header.validateDictionaryRequired();
+    if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
+    if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
+    const row_count: usize = @intCast(header.value_count);
+    if (header.definition_level_bytes == 0) return error.UnsupportedParquetPage;
+    if (header.definition_level_bytes > page_payload.len) return error.InvalidParquetPage;
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+
+    const definition_levels = try decodeHybridLevelsAlloc(alloc, page_payload[0..header.definition_level_bytes], 1, row_count);
+    defer alloc.free(definition_levels);
+
+    var present_count: usize = 0;
+    for (definition_levels) |definition_level| {
+        if (definition_level > 1) return error.InvalidParquetPage;
+        if (definition_level == 1) present_count += 1;
+    }
+
+    const payload = page_payload[header.data_payload_offset..];
+    if (present_count > 0 and payload.len == 0) return error.InvalidParquetPage;
+    const bit_width_raw: u8 = if (present_count == 0) 0 else payload[0];
+    if (bit_width_raw > 32) return error.UnsupportedParquetPage;
+    const bit_width: u6 = @intCast(bit_width_raw);
+    const indexes = try decodeHybridIndexesAlloc(alloc, if (present_count == 0) &.{} else payload[1..], bit_width, present_count);
+    defer alloc.free(indexes);
+
+    const values = try alloc.alloc(f64, row_count);
+    errdefer alloc.free(values);
+    const nulls = try alloc.alloc(u8, row_count);
+    errdefer alloc.free(nulls);
+
+    var present_idx: usize = 0;
+    for (definition_levels, 0..) |definition_level, idx| {
+        switch (definition_level) {
+            0 => {
+                values[idx] = 0;
+                nulls[idx] = 1;
+            },
+            1 => {
+                const dictionary_index = indexes[present_idx];
+                present_idx += 1;
+                if (dictionary_index >= dictionary.len) return error.InvalidParquetPage;
+                values[idx] = dictionary[@intCast(dictionary_index)];
+                nulls[idx] = 0;
+            },
+            else => return error.InvalidParquetPage,
+        }
+    }
+
+    return .{
+        .values = values,
+        .nulls = nulls,
+    };
+}
+
 pub fn scanUncompressedDictionaryI64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]i64 {
     return try scanDictionaryI64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanUncompressedDictionaryF64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]f64 {
+    return try scanDictionaryF64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
 }
 
 pub fn scanUncompressedOptionalDictionaryI64ColumnChunkAlloc(
@@ -399,6 +501,13 @@ pub fn scanUncompressedOptionalDictionaryI64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
 ) !NullableI64Values {
     return try scanOptionalDictionaryI64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanUncompressedOptionalDictionaryF64ColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+) !NullableF64Values {
+    return try scanOptionalDictionaryF64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
 }
 
 pub fn scanUncompressedDictionaryI32AsI64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]i64 {
@@ -532,6 +641,44 @@ pub fn scanDictionaryI64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodeDictionaryI64DataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        defer alloc.free(page_values);
+        try values.appendSlice(alloc, page_values);
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
+pub fn scanDictionaryF64ColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+) ![]f64 {
+    var cursor: usize = 0;
+    if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
+
+    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+    try parsed_dictionary.header.validatePlainDictionary();
+    cursor += parsed_dictionary.header_len;
+    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+    cursor += parsed_dictionary.header.compressed_page_size;
+    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+    defer dictionary_payload.deinit(alloc);
+    const dictionary = try decodePlainF64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    defer alloc.free(dictionary);
+
+    var values = std.ArrayListUnmanaged(f64).empty;
+    errdefer values.deinit(alloc);
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validateDictionaryRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+        const payload = try decodePagePayloadAlloc(alloc, parsed.header, compression, compressed_payload);
+        defer payload.deinit(alloc);
+
+        const page_values = try decodeDictionaryF64DataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -967,6 +1114,56 @@ pub fn scanOptionalPlainF64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalPlainF64V2HybridLevelsAlloc(alloc, parsed.header, payload.bytes);
+        defer page_values.deinit(alloc);
+        try values.appendSlice(alloc, page_values.values);
+        try nulls.appendSlice(alloc, page_values.nulls);
+    }
+
+    const out_values = try values.toOwnedSlice(alloc);
+    errdefer alloc.free(out_values);
+    const out_nulls = try nulls.toOwnedSlice(alloc);
+    errdefer alloc.free(out_nulls);
+    return .{
+        .values = out_values,
+        .nulls = out_nulls,
+    };
+}
+
+pub fn scanOptionalDictionaryF64ColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+) !NullableF64Values {
+    var cursor: usize = 0;
+    if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
+
+    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+    try parsed_dictionary.header.validatePlainDictionary();
+    cursor += parsed_dictionary.header_len;
+    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+    cursor += parsed_dictionary.header.compressed_page_size;
+    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+    defer dictionary_payload.deinit(alloc);
+    const dictionary = try decodePlainF64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    defer alloc.free(dictionary);
+
+    var values = std.ArrayListUnmanaged(f64).empty;
+    errdefer values.deinit(alloc);
+    var nulls = std.ArrayListUnmanaged(u8).empty;
+    errdefer nulls.deinit(alloc);
+
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validateDictionaryRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+        const payload = try decodePagePayloadAlloc(alloc, parsed.header, compression, compressed_payload);
+        defer payload.deinit(alloc);
+
+        var page_values = try decodeOptionalDictionaryF64V2HybridLevelsAlloc(alloc, parsed.header, dictionary, payload.bytes);
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -2310,6 +2507,59 @@ test "parquet page scanner decodes optional dictionary i64 v2 pages" {
     defer values.deinit(alloc);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 0, 120, 110 }, values.values);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0, 0 }, values.nulls);
+}
+
+test "parquet page scanner decodes dictionary f64 pages" {
+    const alloc = std.testing.allocator;
+    var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 16);
+    defer dictionary_header.deinit(alloc);
+    var data_header = try buildDictionaryDataPageHeaderFixture(alloc, 3, 3);
+    defer data_header.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, dictionary_header.items);
+    var dictionary_payload: [16]u8 = undefined;
+    std.mem.writeInt(u64, dictionary_payload[0..8], @bitCast(@as(f64, 1.25)), .little);
+    std.mem.writeInt(u64, dictionary_payload[8..16], @bitCast(@as(f64, 2.5)), .little);
+    try chunk.appendSlice(alloc, &dictionary_payload);
+    try chunk.appendSlice(alloc, data_header.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        1,
+        3,
+        0b00000110,
+    });
+
+    const values = try scanUncompressedDictionaryF64ColumnChunkAlloc(alloc, chunk.items);
+    defer alloc.free(values);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 1.25, 2.5, 2.5 }, values);
+}
+
+test "parquet page scanner decodes optional dictionary f64 v2 pages" {
+    const alloc = std.testing.allocator;
+    var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 16);
+    defer dictionary_header.deinit(alloc);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 7);
+    defer data_header.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, dictionary_header.items);
+    var dictionary_payload: [16]u8 = undefined;
+    std.mem.writeInt(u64, dictionary_payload[0..8], @bitCast(@as(f64, 0.125)), .little);
+    std.mem.writeInt(u64, dictionary_payload[8..16], @bitCast(@as(f64, 0.5)), .little);
+    try chunk.appendSlice(alloc, &dictionary_payload);
+    try chunk.appendSlice(alloc, data_header.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        3,          0b00000101,
+        1,          3,
+        0b00000010,
+    });
+
+    var values = try scanUncompressedOptionalDictionaryF64ColumnChunkAlloc(alloc, chunk.items);
+    defer values.deinit(alloc);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 0.125, 0, 0.5 }, values.values);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, values.nulls);
 }
 
 test "parquet page scanner decodes optional plain i32 v2 pages" {

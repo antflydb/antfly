@@ -1085,6 +1085,10 @@ SCHEMA ... RENAME TO`, and `DROP SCHEMA`, extension catalog grammar for
 `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`,
 authorization catalog grammar for `CREATE ROLE`, `ALTER ROLE ... SET`,
 `DROP ROLE`, `GRANT`, and `REVOKE`,
+logical-replication catalog grammar for `CREATE PUBLICATION`,
+`ALTER PUBLICATION ... ADD TABLE`, `DROP PUBLICATION`,
+`CREATE SUBSCRIPTION`, `ALTER SUBSCRIPTION ENABLE/DISABLE`, and
+`DROP SUBSCRIPTION`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -4444,6 +4448,10 @@ applied to table schema or runtime storage. Production execution still requires
 native changefeed or replication catalog objects with table/partition selection,
 schema-version binding, durable resume positions, authorization, backfill
 policy, delivery acknowledgements, and topology-aware range ownership.
+Publication/subscription tails parse in `api/sql_adapter/grammar.zig` before
+the SQL lowerer maps owned syntax into typed logical-replication catalog plans,
+so future accepted options must become explicit native fields rather than raw
+SQL carried through storage.
 `LISTEN`, `NOTIFY`, and `UNLISTEN` lower to typed notification-channel intents
 that capture channel names and optional payloads, then fail closed when applied
 to table schema or runtime storage. Production execution still requires a native

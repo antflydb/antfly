@@ -407,6 +407,72 @@ pub const UnlistenNotificationSyntax = struct {
     }
 };
 
+pub const CreatePublicationSyntax = struct {
+    publication_name: []const u8,
+    table_names: []const []const u8 = &.{},
+    all_tables: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.publication_name));
+        freeStringSlice(alloc, self.table_names);
+        self.* = undefined;
+    }
+};
+
+pub const AlterPublicationSyntax = struct {
+    publication_name: []const u8,
+    table_names: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.publication_name));
+        freeStringSlice(alloc, self.table_names);
+        self.* = undefined;
+    }
+};
+
+pub const DropPublicationSyntax = struct {
+    publication_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.publication_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateSubscriptionSyntax = struct {
+    subscription_name: []const u8,
+    connection_json: []const u8,
+    publication_names: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.subscription_name));
+        alloc.free(@constCast(self.connection_json));
+        freeStringSlice(alloc, self.publication_names);
+        self.* = undefined;
+    }
+};
+
+pub const AlterSubscriptionSyntax = struct {
+    subscription_name: []const u8,
+    enabled: bool,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.subscription_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropSubscriptionSyntax = struct {
+    subscription_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.subscription_name));
+        self.* = undefined;
+    }
+};
+
 pub const RowClaimSyntax = struct {
     clause: ast.SqlRowClaimClause,
     targets: []const []const u8 = &.{},
@@ -1595,6 +1661,154 @@ pub fn parseUnlistenNotificationTailAlloc(
     return .{ .channel_name = channel_name };
 }
 
+pub fn parseCreatePublicationCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreatePublicationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("publication");
+    const publication_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var publication_transferred = false;
+    errdefer if (!publication_transferred) alloc.free(publication_name);
+    try cursor.expectKeyword("for");
+    var all_tables = false;
+    var table_names: []const []const u8 = &.{};
+    errdefer freeStringSlice(alloc, table_names);
+    if (cursor.matchKeyword("all")) {
+        try cursor.expectKeyword("tables");
+        all_tables = true;
+    } else {
+        try cursor.expectKeyword("table");
+        table_names = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
+    }
+    if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    publication_transferred = true;
+    const out = CreatePublicationSyntax{
+        .publication_name = publication_name,
+        .table_names = table_names,
+        .all_tables = all_tables,
+    };
+    table_names = &.{};
+    return out;
+}
+
+pub fn parseAlterPublicationCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterPublicationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("publication");
+    const publication_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var publication_transferred = false;
+    errdefer if (!publication_transferred) alloc.free(publication_name);
+    try cursor.expectKeyword("add");
+    try cursor.expectKeyword("table");
+    var table_names = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
+    errdefer freeStringSlice(alloc, table_names);
+    try parseAdapterNoopStatementEnd(cursor);
+    publication_transferred = true;
+    const out = AlterPublicationSyntax{
+        .publication_name = publication_name,
+        .table_names = table_names,
+    };
+    table_names = &.{};
+    return out;
+}
+
+pub fn parseDropPublicationCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropPublicationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("publication");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const publication_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var publication_transferred = false;
+    errdefer if (!publication_transferred) alloc.free(publication_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    publication_transferred = true;
+    return .{ .publication_name = publication_name, .if_exists = if_exists };
+}
+
+pub fn parseCreateSubscriptionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateSubscriptionSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("subscription");
+    const subscription_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var subscription_transferred = false;
+    errdefer if (!subscription_transferred) alloc.free(subscription_name);
+    try cursor.expectKeyword("connection");
+    const connection_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    var connection_transferred = false;
+    errdefer if (!connection_transferred) alloc.free(@constCast(connection_json));
+    try cursor.expectKeyword("publication");
+    var publication_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+    errdefer freeStringSlice(alloc, publication_names);
+    if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    subscription_transferred = true;
+    connection_transferred = true;
+    const out = CreateSubscriptionSyntax{
+        .subscription_name = subscription_name,
+        .connection_json = connection_json,
+        .publication_names = publication_names,
+    };
+    publication_names = &.{};
+    return out;
+}
+
+pub fn parseAlterSubscriptionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterSubscriptionSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("subscription");
+    const subscription_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var subscription_transferred = false;
+    errdefer if (!subscription_transferred) alloc.free(subscription_name);
+    const enabled = if (cursor.matchKeyword("enable"))
+        true
+    else if (cursor.matchKeyword("disable"))
+        false
+    else
+        return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    subscription_transferred = true;
+    return .{ .subscription_name = subscription_name, .enabled = enabled };
+}
+
+pub fn parseDropSubscriptionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropSubscriptionSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("subscription");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const subscription_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var subscription_transferred = false;
+    errdefer if (!subscription_transferred) alloc.free(subscription_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    subscription_transferred = true;
+    return .{ .subscription_name = subscription_name, .if_exists = if_exists };
+}
+
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
     const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
     if (dot == 0) return error.UnsupportedSqlShape;
@@ -2524,6 +2738,84 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(revoke_tokens.items.len, revoke_pos);
     try std.testing.expectEqualStrings("usage_records", revoke.object_name);
     try std.testing.expectEqualStrings("app_writer", revoke.principal_name);
+}
+
+test "sql adapter grammar parses logical replication catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage FOR TABLE public.usage_records, audit_records;");
+    defer lexer.freeTokens(alloc, &create_publication_tokens);
+    var create_publication_pos: usize = 0;
+    var create_publication = try parseCreatePublicationCatalogTailAlloc(alloc, create_publication_tokens.items, &create_publication_pos);
+    defer create_publication.deinit(alloc);
+    try std.testing.expectEqual(create_publication_tokens.items.len, create_publication_pos);
+    try std.testing.expectEqualStrings("pub_usage", create_publication.publication_name);
+    try std.testing.expect(!create_publication.all_tables);
+    try std.testing.expectEqual(@as(usize, 2), create_publication.table_names.len);
+    try std.testing.expectEqualStrings("usage_records", create_publication.table_names[0]);
+    try std.testing.expectEqualStrings("audit_records", create_publication.table_names[1]);
+
+    var create_all_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_all FOR ALL TABLES;");
+    defer lexer.freeTokens(alloc, &create_all_tokens);
+    var create_all_pos: usize = 0;
+    var create_all = try parseCreatePublicationCatalogTailAlloc(alloc, create_all_tokens.items, &create_all_pos);
+    defer create_all.deinit(alloc);
+    try std.testing.expectEqual(create_all_tokens.items.len, create_all_pos);
+    try std.testing.expect(create_all.all_tables);
+    try std.testing.expectEqual(@as(usize, 0), create_all.table_names.len);
+
+    var alter_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage ADD TABLE public.usage_records;");
+    defer lexer.freeTokens(alloc, &alter_publication_tokens);
+    var alter_publication_pos: usize = 0;
+    var alter_publication = try parseAlterPublicationCatalogTailAlloc(alloc, alter_publication_tokens.items, &alter_publication_pos);
+    defer alter_publication.deinit(alloc);
+    try std.testing.expectEqual(alter_publication_tokens.items.len, alter_publication_pos);
+    try std.testing.expectEqualStrings("pub_usage", alter_publication.publication_name);
+    try std.testing.expectEqualStrings("usage_records", alter_publication.table_names[0]);
+
+    var drop_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION IF EXISTS pub_usage;");
+    defer lexer.freeTokens(alloc, &drop_publication_tokens);
+    var drop_publication_pos: usize = 0;
+    var drop_publication = try parseDropPublicationCatalogTailAlloc(alloc, drop_publication_tokens.items, &drop_publication_pos);
+    defer drop_publication.deinit(alloc);
+    try std.testing.expectEqual(drop_publication_tokens.items.len, drop_publication_pos);
+    try std.testing.expectEqualStrings("pub_usage", drop_publication.publication_name);
+    try std.testing.expect(drop_publication.if_exists);
+
+    var create_subscription_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage CONNECTION 'host=db' PUBLICATION pub_usage, pub_audit;");
+    defer lexer.freeTokens(alloc, &create_subscription_tokens);
+    var create_subscription_pos: usize = 0;
+    var create_subscription = try parseCreateSubscriptionCatalogTailAlloc(alloc, create_subscription_tokens.items, &create_subscription_pos);
+    defer create_subscription.deinit(alloc);
+    try std.testing.expectEqual(create_subscription_tokens.items.len, create_subscription_pos);
+    try std.testing.expectEqualStrings("sub_usage", create_subscription.subscription_name);
+    try std.testing.expectEqualStrings("\"host=db\"", create_subscription.connection_json);
+    try std.testing.expectEqual(@as(usize, 2), create_subscription.publication_names.len);
+    try std.testing.expectEqualStrings("pub_usage", create_subscription.publication_names[0]);
+    try std.testing.expectEqualStrings("pub_audit", create_subscription.publication_names[1]);
+
+    var alter_subscription_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage DISABLE;");
+    defer lexer.freeTokens(alloc, &alter_subscription_tokens);
+    var alter_subscription_pos: usize = 0;
+    var alter_subscription = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_tokens.items, &alter_subscription_pos);
+    defer alter_subscription.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_tokens.items.len, alter_subscription_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription.subscription_name);
+    try std.testing.expect(!alter_subscription.enabled);
+
+    var drop_subscription_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION IF EXISTS sub_usage;");
+    defer lexer.freeTokens(alloc, &drop_subscription_tokens);
+    var drop_subscription_pos: usize = 0;
+    var drop_subscription = try parseDropSubscriptionCatalogTailAlloc(alloc, drop_subscription_tokens.items, &drop_subscription_pos);
+    defer drop_subscription.deinit(alloc);
+    try std.testing.expectEqual(drop_subscription_tokens.items.len, drop_subscription_pos);
+    try std.testing.expectEqualStrings("sub_usage", drop_subscription.subscription_name);
+    try std.testing.expect(drop_subscription.if_exists);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage FOR ALL TABLES WITH (publish = 'insert');");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreatePublicationCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
 test "sql adapter grammar parses bulk io tails" {

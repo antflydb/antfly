@@ -3459,127 +3459,70 @@ const Parser = struct {
     }
 
     fn parseCreatePublicationDdl(self: *@This()) !CreatePublicationPlan {
-        try self.expectKeyword("publication");
-        const publication_name = try self.parseIdentifierOwned();
-        var publication_transferred = false;
-        errdefer if (!publication_transferred) self.alloc.free(publication_name);
-        try self.expectKeyword("for");
-        var all_tables = false;
-        var table_names: []const []const u8 = &.{};
-        errdefer freeStringSlice(self.alloc, table_names);
-        if (self.matchKeyword("all")) {
-            try self.expectKeyword("tables");
-            all_tables = true;
-        } else {
-            try self.expectKeyword("table");
-            table_names = try self.parseSqlObjectIdentifierListAlloc();
-        }
-        if (self.peekKeyword("with")) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        publication_transferred = true;
-        const out = CreatePublicationPlan{
+        var syntax = try sql_adapter.parseCreatePublicationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const publication_name = syntax.publication_name;
+        const table_names = syntax.table_names;
+        syntax.publication_name = "";
+        syntax.table_names = &.{};
+        return CreatePublicationPlan{
             .publication_name = publication_name,
             .table_names = table_names,
-            .all_tables = all_tables,
+            .all_tables = syntax.all_tables,
         };
-        table_names = &.{};
-        return out;
     }
 
     fn parseAlterPublicationDdl(self: *@This()) !AlterPublicationPlan {
-        try self.expectKeyword("publication");
-        const publication_name = try self.parseIdentifierOwned();
-        var publication_transferred = false;
-        errdefer if (!publication_transferred) self.alloc.free(publication_name);
-        try self.expectKeyword("add");
-        try self.expectKeyword("table");
-        var table_names = try self.parseSqlObjectIdentifierListAlloc();
-        errdefer freeStringSlice(self.alloc, table_names);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        publication_transferred = true;
-        const out = AlterPublicationPlan{
+        var syntax = try sql_adapter.parseAlterPublicationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const publication_name = syntax.publication_name;
+        const table_names = syntax.table_names;
+        syntax.publication_name = "";
+        syntax.table_names = &.{};
+        return AlterPublicationPlan{
             .publication_name = publication_name,
             .operation = .{ .add_tables = table_names },
         };
-        table_names = &.{};
-        return out;
     }
 
     fn parseDropPublicationDdl(self: *@This()) !DropPublicationPlan {
-        try self.expectKeyword("publication");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const publication_name = try self.parseIdentifierOwned();
-        var publication_transferred = false;
-        errdefer if (!publication_transferred) self.alloc.free(publication_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        publication_transferred = true;
-        return .{ .publication_name = publication_name, .if_exists = if_exists };
+        var syntax = try sql_adapter.parseDropPublicationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const publication_name = syntax.publication_name;
+        syntax.publication_name = "";
+        return .{ .publication_name = publication_name, .if_exists = syntax.if_exists };
     }
 
     fn parseCreateSubscriptionDdl(self: *@This()) !CreateSubscriptionPlan {
-        try self.expectKeyword("subscription");
-        const subscription_name = try self.parseIdentifierOwned();
-        var subscription_transferred = false;
-        errdefer if (!subscription_transferred) self.alloc.free(subscription_name);
-        try self.expectKeyword("connection");
-        const connection_json = try self.parseSqlUntypedValueJsonAlloc();
-        var connection_transferred = false;
-        errdefer if (!connection_transferred) self.alloc.free(connection_json);
-        try self.expectKeyword("publication");
-        var publication_names = try self.parseIdentifierListAlloc();
-        errdefer freeStringSlice(self.alloc, publication_names);
-        if (self.peekKeyword("with")) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        subscription_transferred = true;
-        connection_transferred = true;
-        const out = CreateSubscriptionPlan{
+        var syntax = try sql_adapter.parseCreateSubscriptionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const subscription_name = syntax.subscription_name;
+        const connection_json = syntax.connection_json;
+        const publication_names = syntax.publication_names;
+        syntax.subscription_name = "";
+        syntax.connection_json = "";
+        syntax.publication_names = &.{};
+        return CreateSubscriptionPlan{
             .subscription_name = subscription_name,
             .connection_json = connection_json,
             .publication_names = publication_names,
         };
-        publication_names = &.{};
-        return out;
     }
 
     fn parseAlterSubscriptionDdl(self: *@This()) !AlterSubscriptionPlan {
-        try self.expectKeyword("subscription");
-        const subscription_name = try self.parseIdentifierOwned();
-        var subscription_transferred = false;
-        errdefer if (!subscription_transferred) self.alloc.free(subscription_name);
-        const enabled = if (self.matchKeyword("enable"))
-            true
-        else if (self.matchKeyword("disable"))
-            false
-        else
-            return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        subscription_transferred = true;
-        return .{ .subscription_name = subscription_name, .enabled = enabled };
+        var syntax = try sql_adapter.parseAlterSubscriptionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const subscription_name = syntax.subscription_name;
+        syntax.subscription_name = "";
+        return .{ .subscription_name = subscription_name, .enabled = syntax.enabled };
     }
 
     fn parseDropSubscriptionDdl(self: *@This()) !DropSubscriptionPlan {
-        try self.expectKeyword("subscription");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const subscription_name = try self.parseIdentifierOwned();
-        var subscription_transferred = false;
-        errdefer if (!subscription_transferred) self.alloc.free(subscription_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        subscription_transferred = true;
-        return .{ .subscription_name = subscription_name, .if_exists = if_exists };
+        var syntax = try sql_adapter.parseDropSubscriptionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const subscription_name = syntax.subscription_name;
+        syntax.subscription_name = "";
+        return .{ .subscription_name = subscription_name, .if_exists = syntax.if_exists };
     }
 
     fn parseVacuumMaintenanceDdl(self: *@This()) !VacuumMaintenancePlan {
