@@ -4909,17 +4909,21 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
     }
 
     fn normalizedFooterDiscoveryError(err: anyerror) anyerror {
-        return switch (err) {
-            error.FileNotFound => error.ExternalLakeSnapshotMismatch,
-            error.InvalidParquetFooter,
-            error.InvalidParquetFooterMagic,
-            error.InvalidParquetMetadata,
-            error.ParquetInventoryFileNotFound,
-            => error.InvalidParquetRowGroupBatch,
-            else => err,
-        };
+        return normalizeLakeFooterDiscoveryError(err);
     }
 };
+
+fn normalizeLakeFooterDiscoveryError(err: anyerror) anyerror {
+    return switch (err) {
+        error.FileNotFound => error.ExternalLakeSnapshotMismatch,
+        error.InvalidParquetFooter,
+        error.InvalidParquetFooterMagic,
+        error.InvalidParquetMetadata,
+        error.ParquetInventoryFileNotFound,
+        => error.InvalidParquetRowGroupBatch,
+        else => err,
+    };
+}
 
 pub const PinnedExternalObjectStorageLakeRowsSource = struct {
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
@@ -5057,6 +5061,15 @@ pub const ExternalLakePinnedSourceState = struct {
     }
 };
 
+pub const ExternalLakePhysicalScanSummary = struct {
+    logical_read_count: usize = 0,
+    physical_read_count: usize = 0,
+    logical_read_bytes: u64 = 0,
+    physical_read_bytes: u64 = 0,
+    footer_read_count: usize = 0,
+    column_chunk_read_count: usize = 0,
+};
+
 pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     alloc: std.mem.Allocator,
     inventory: external_source_api.Inventory,
@@ -5162,6 +5175,59 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
             .include_footer_reads = !inventoryHasAnyRowGroupMetadata(self.inventory),
             .coalesce_options = self.pinned_source.scanner.coalesce_options,
         });
+    }
+
+    pub fn explainProjectedScanSummaryAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        physical_columns: []const []const u8,
+    ) !ExternalLakePhysicalScanSummary {
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+
+        var summary = ExternalLakePhysicalScanSummary{};
+        if (inventoryHasAnyRowGroupMetadata(self.inventory) or physical_columns.len == 0) {
+            var scan_plan = try serverless_query.planProjectedLakeScanAlloc(alloc, .{
+                .binding = binding,
+                .inventory = self.inventory,
+                .projected_columns = physical_columns,
+                .include_footer_reads = !inventoryHasAnyRowGroupMetadata(self.inventory),
+                .coalesce_options = self.pinned_source.scanner.coalesce_options,
+            });
+            defer scan_plan.deinit(alloc);
+            addLakeScanPlanToSummary(&summary, scan_plan);
+            return summary;
+        }
+
+        var discovery_plan = try serverless_query.planProjectedLakeScanAlloc(alloc, .{
+            .binding = binding,
+            .inventory = self.inventory,
+            .projected_columns = physical_columns,
+            .include_footer_reads = true,
+            .coalesce_options = self.pinned_source.scanner.coalesce_options,
+        });
+        defer discovery_plan.deinit(alloc);
+        addLakeScanPlanToSummary(&summary, discovery_plan);
+
+        var discovered = serverless_query.discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+            alloc,
+            self.pinned_source.scanner.object_reader.parquetReader(),
+            self.inventory,
+            physical_columns,
+            64 * 1024,
+        ) catch |err| return normalizeLakeFooterDiscoveryError(err);
+        defer discovered.deinit(alloc);
+
+        var data_plan = try serverless_query.planProjectedLakeScanAlloc(alloc, .{
+            .binding = binding,
+            .inventory = discovered.inventory,
+            .projected_columns = physical_columns,
+            .coalesce_options = self.pinned_source.scanner.coalesce_options,
+        });
+        defer data_plan.deinit(alloc);
+        addLakeScanPlanToSummary(&summary, data_plan);
+        return summary;
     }
 
     pub fn deinit(self: *@This()) void {
@@ -5299,6 +5365,22 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         }
         return false;
     }
+
+    fn addLakeScanPlanToSummary(summary: *ExternalLakePhysicalScanSummary, scan_plan: serverless_query.LakeScanPlan) void {
+        summary.logical_read_count += scan_plan.logical_reads.len;
+        summary.physical_read_count += scan_plan.physical_reads.len;
+        for (scan_plan.logical_reads) |read| {
+            summary.logical_read_bytes +|= read.range.len;
+            switch (read.purpose) {
+                .parquet_footer => summary.footer_read_count += 1,
+                .parquet_column_chunk => summary.column_chunk_read_count += 1,
+                else => {},
+            }
+        }
+        for (scan_plan.physical_reads) |read| {
+            summary.physical_read_bytes +|= read.range.len;
+        }
+    }
 };
 
 pub const OpenedExternalObjectStorageLakeRowsSource = struct {
@@ -5375,6 +5457,15 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
         projected_columns: []const []const u8,
     ) !serverless_query.LakeScanPlan {
         return try self.owned_source.planProjectedScanAlloc(alloc, runtime_schema, projected_columns);
+    }
+
+    pub fn explainProjectedScanSummaryAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        physical_columns: []const []const u8,
+    ) !ExternalLakePhysicalScanSummary {
+        return try self.owned_source.explainProjectedScanSummaryAlloc(alloc, runtime_schema, physical_columns);
     }
 
     pub fn deinit(self: *@This()) void {
