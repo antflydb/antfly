@@ -261,6 +261,7 @@ pub const TableClonePlan = sql_adapter.TableClonePlan;
 pub const TableCloneOptions = sql_adapter.TableCloneOptions;
 pub const DropTablePlan = sql_adapter.DropTablePlan;
 pub const DropIndexPlan = sql_adapter.DropIndexPlan;
+pub const CreateUpdatePolicyPlan = sql_adapter.CreateUpdatePolicyPlan;
 pub const RowSecurityCatalogPlan = sql_adapter.RowSecurityCatalogPlan;
 pub const AlterRowSecurityPlan = sql_adapter.AlterRowSecurityPlan;
 pub const CreateRowSecurityPolicyPlan = sql_adapter.CreateRowSecurityPolicyPlan;
@@ -563,21 +564,6 @@ pub const CreateTablePlan = struct {
         freeDdlUniqueConstraints(alloc, self.unique_constraints);
         freeDdlForeignKeys(alloc, self.foreign_keys);
         freeDdlRelationalChecks(alloc, self.checks);
-        self.* = undefined;
-    }
-};
-
-pub const CreateUpdatePolicyPlan = struct {
-    trigger_name: []const u8,
-    table_name: []const u8,
-    column_name: []const u8,
-    on_update_value: runtime_schema.RelationalDefaultValue,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.trigger_name);
-        alloc.free(self.table_name);
-        alloc.free(self.column_name);
-        alloc.free(self.on_update_value.value_json);
         self.* = undefined;
     }
 };

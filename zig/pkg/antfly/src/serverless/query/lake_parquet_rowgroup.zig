@@ -1196,6 +1196,20 @@ fn appendDictionaryI64DataPage(
     try out.appendSlice(alloc, encoded_indexes);
 }
 
+pub const TestPlainI64Column = struct {
+    column_id: []const u8,
+    values: []const i64,
+};
+
+const TestColumnFooter = struct {
+    column_id: []const u8,
+    column_offset: usize,
+    compressed_len: usize,
+    uncompressed_len: usize,
+    encoding: i32 = 0,
+    compression_codec: i32 = 0,
+};
+
 fn appendSingleColumnFooterMetadata(
     out: *std.ArrayListUnmanaged(u8),
     alloc: Allocator,
@@ -1207,6 +1221,30 @@ fn appendSingleColumnFooterMetadata(
     encoding: i32,
     compression_codec: i32,
 ) !void {
+    const columns = [_]TestColumnFooter{.{
+        .column_id = column_id,
+        .column_offset = column_offset,
+        .compressed_len = compressed_len,
+        .uncompressed_len = uncompressed_len,
+        .encoding = encoding,
+        .compression_codec = compression_codec,
+    }};
+    return try appendPlainI64FooterMetadata(out, alloc, row_count, &columns);
+}
+
+fn appendPlainI64FooterMetadata(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    row_count: usize,
+    columns: []const TestColumnFooter,
+) !void {
+    if (row_count == 0 or columns.len == 0) return error.InvalidParquetRowGroupBatch;
+    var total_byte_len: usize = 0;
+    for (columns) |column| {
+        if (column.column_id.len == 0 or column.compressed_len == 0 or column.uncompressed_len == 0) return error.InvalidParquetRowGroupBatch;
+        total_byte_len += column.uncompressed_len;
+    }
+
     var file_prev: i16 = 0;
     try appendField(out, alloc, &file_prev, 1, .i32);
     try appendI32(out, alloc, 1);
@@ -1217,11 +1255,29 @@ fn appendSingleColumnFooterMetadata(
 
     var rg_prev: i16 = 0;
     try appendField(out, alloc, &rg_prev, 1, .list);
-    try appendListHeader(out, alloc, .struct_, 1);
+    try appendListHeader(out, alloc, .struct_, columns.len);
+    for (columns) |column| {
+        try appendColumnFooterMetadata(out, alloc, column);
+    }
+    try appendField(out, alloc, &rg_prev, 2, .i64);
+    try appendI64(out, alloc, @intCast(total_byte_len));
+    try appendField(out, alloc, &rg_prev, 3, .i64);
+    try appendI64(out, alloc, @intCast(row_count));
+    try appendField(out, alloc, &rg_prev, 5, .i64);
+    try appendI64(out, alloc, @intCast(columns[0].column_offset));
+    try appendStop(out, alloc);
 
+    try appendStop(out, alloc);
+}
+
+fn appendColumnFooterMetadata(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    column: TestColumnFooter,
+) !void {
     var chunk_prev: i16 = 0;
     try appendField(out, alloc, &chunk_prev, 2, .i64);
-    try appendI64(out, alloc, @intCast(column_offset));
+    try appendI64(out, alloc, @intCast(column.column_offset));
     try appendField(out, alloc, &chunk_prev, 3, .struct_);
 
     var meta_prev: i16 = 0;
@@ -1229,27 +1285,18 @@ fn appendSingleColumnFooterMetadata(
     try appendI32(out, alloc, 1);
     try appendField(out, alloc, &meta_prev, 2, .list);
     try appendListHeader(out, alloc, .i32, 1);
-    try appendI32(out, alloc, encoding);
+    try appendI32(out, alloc, column.encoding);
     try appendField(out, alloc, &meta_prev, 3, .list);
     try appendListHeader(out, alloc, .binary, 1);
-    try appendBinary(out, alloc, column_id);
+    try appendBinary(out, alloc, column.column_id);
     try appendField(out, alloc, &meta_prev, 4, .i32);
-    try appendI32(out, alloc, compression_codec);
+    try appendI32(out, alloc, column.compression_codec);
     try appendField(out, alloc, &meta_prev, 6, .i64);
-    try appendI64(out, alloc, @intCast(uncompressed_len));
+    try appendI64(out, alloc, @intCast(column.uncompressed_len));
     try appendField(out, alloc, &meta_prev, 7, .i64);
-    try appendI64(out, alloc, @intCast(compressed_len));
+    try appendI64(out, alloc, @intCast(column.compressed_len));
     try appendField(out, alloc, &meta_prev, 9, .i64);
-    try appendI64(out, alloc, @intCast(column_offset));
-    try appendStop(out, alloc);
-
-    try appendStop(out, alloc);
-    try appendField(out, alloc, &rg_prev, 2, .i64);
-    try appendI64(out, alloc, @intCast(uncompressed_len));
-    try appendField(out, alloc, &rg_prev, 3, .i64);
-    try appendI64(out, alloc, @intCast(row_count));
-    try appendField(out, alloc, &rg_prev, 5, .i64);
-    try appendI64(out, alloc, @intCast(column_offset));
+    try appendI64(out, alloc, @intCast(column.column_offset));
     try appendStop(out, alloc);
 
     try appendStop(out, alloc);
@@ -1263,29 +1310,47 @@ fn appendParquetTrailer(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, meta
 }
 
 pub fn buildTestSingleColumnPlainI64ParquetObjectAlloc(alloc: Allocator, column_id: []const u8, values: []const i64) ![]u8 {
-    if (column_id.len == 0 or values.len == 0) return error.InvalidParquetRowGroupBatch;
+    const columns = [_]TestPlainI64Column{.{ .column_id = column_id, .values = values }};
+    return try buildTestPlainI64ParquetObjectAlloc(alloc, &columns);
+}
 
-    const column_offset: usize = 100;
-    var chunk = std.ArrayListUnmanaged(u8).empty;
-    defer chunk.deinit(alloc);
-    try appendPlainI64DataPage(&chunk, alloc, values);
+pub fn buildTestPlainI64ParquetObjectAlloc(alloc: Allocator, columns: []const TestPlainI64Column) ![]u8 {
+    if (columns.len == 0) return error.InvalidParquetRowGroupBatch;
+    const row_count = columns[0].values.len;
+    if (row_count == 0) return error.InvalidParquetRowGroupBatch;
+    for (columns) |column| {
+        if (column.column_id.len == 0 or column.values.len != row_count) return error.InvalidParquetRowGroupBatch;
+    }
+
+    const chunks = try alloc.alloc(std.ArrayListUnmanaged(u8), columns.len);
+    defer alloc.free(chunks);
+    @memset(chunks, .empty);
+    var initialized_chunks: usize = 0;
+    defer {
+        for (chunks[0..initialized_chunks]) |*chunk| chunk.deinit(alloc);
+    }
+    for (columns, 0..) |column, idx| {
+        try appendPlainI64DataPage(&chunks[idx], alloc, column.values);
+        initialized_chunks += 1;
+    }
+
+    const footers = try alloc.alloc(TestColumnFooter, columns.len);
+    defer alloc.free(footers);
 
     var object = std.ArrayListUnmanaged(u8).empty;
     errdefer object.deinit(alloc);
-    try object.appendNTimes(alloc, 0, column_offset);
-    try object.appendSlice(alloc, chunk.items);
+    try object.appendNTimes(alloc, 0, 100);
+    for (columns, chunks, 0..) |column, chunk, idx| {
+        footers[idx] = .{
+            .column_id = column.column_id,
+            .column_offset = object.items.len,
+            .compressed_len = chunk.items.len,
+            .uncompressed_len = chunk.items.len,
+        };
+        try object.appendSlice(alloc, chunk.items);
+    }
     const metadata_start = object.items.len;
-    try appendSingleColumnFooterMetadata(
-        &object,
-        alloc,
-        column_id,
-        values.len,
-        column_offset,
-        chunk.items.len,
-        chunk.items.len,
-        0,
-        0,
-    );
+    try appendPlainI64FooterMetadata(&object, alloc, row_count, footers);
     const metadata_len = object.items.len - metadata_start;
     try appendParquetTrailer(&object, alloc, metadata_len);
     return try object.toOwnedSlice(alloc);
@@ -2334,6 +2399,102 @@ test "parquet object range discovery reads footers and builds row group source" 
     const row_ref = result.rows[0].row_ref.external;
     try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
     try std.testing.expectEqual(@as(u64, 1), row_ref.row_ordinal);
+}
+
+test "parquet test object builder supports multi-column footer discovery" {
+    const alloc = std.testing.allocator;
+
+    const amount_values = [_]i64{ 10, 20, 30 };
+    const tenant_values = [_]i64{ 7, 8, 7 };
+    const columns = [_]TestPlainI64Column{
+        .{ .column_id = "amount", .values = &amount_values },
+        .{ .column_id = "tenant", .values = &tenant_values },
+    };
+    const object = try buildTestPlainI64ParquetObjectAlloc(alloc, &columns);
+    defer alloc.free(object);
+
+    const MemoryRangeReader = struct {
+        body: []const u8,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqualStrings("bucket", bucket);
+            try std.testing.expectEqualStrings("events/part-a.parquet", key);
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var range_reader = MemoryRangeReader{ .body = object };
+
+    var raw = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer raw.deinit(alloc);
+    raw.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = object.len,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+    try raw.validate();
+
+    const projected = [_][]const u8{"amount"};
+    const scan_columns = [_][]const u8{ "amount", "tenant" };
+    var discovered = try discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+        alloc,
+        range_reader.reader(),
+        raw,
+        &scan_columns,
+        16,
+    );
+    defer discovered.deinit(alloc);
+
+    var result = try querySupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .binding = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:objects" },
+            .schema_fingerprint = "schema-v1",
+        },
+        .reader = range_reader.reader(),
+        .inventory = discovered.inventory,
+        .projected_columns = &projected,
+        .predicate = .{
+            .column = "tenant",
+            .op = .eq_i64,
+            .i64_value = 8,
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), result.rows[0].cells.len);
+    try std.testing.expectEqualStrings("amount", result.rows[0].cells[0].name);
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].cells[0].value.?.i64);
+    try std.testing.expectEqual(@as(u64, 1), result.rows[0].row_ref.external.row_ordinal);
 }
 
 test "parquet object range cache reuses footer discovery reads" {

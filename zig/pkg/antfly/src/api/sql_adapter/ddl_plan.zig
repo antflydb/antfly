@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const runtime_schema = @import("../../storage/schema.zig");
 
 pub const AdapterNoopDdlReason = enum {
     schema_namespace,
@@ -1335,6 +1336,21 @@ pub const DropIndexPlan = struct {
     }
 };
 
+pub const CreateUpdatePolicyPlan = struct {
+    trigger_name: []const u8,
+    table_name: []const u8,
+    column_name: []const u8,
+    on_update_value: runtime_schema.RelationalDefaultValue,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.trigger_name);
+        alloc.free(self.table_name);
+        alloc.free(self.column_name);
+        alloc.free(self.on_update_value.value_json);
+        self.* = undefined;
+    }
+};
+
 pub const RowSecurityCatalogPlan = union(enum) {
     alter_table: AlterRowSecurityPlan,
     create_policy: CreateRowSecurityPolicyPlan,
@@ -1909,6 +1925,21 @@ test "SQL adapter DDL drop table and index plans own strings" {
         .if_exists = true,
     };
     index.deinit(alloc);
+}
+
+test "SQL adapter DDL update policy plans own metadata" {
+    const alloc = std.testing.allocator;
+
+    var policy = CreateUpdatePolicyPlan{
+        .trigger_name = try alloc.dupe(u8, "usage_records_touch_updated_at"),
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .column_name = try alloc.dupe(u8, "updated_at_ns"),
+        .on_update_value = .{
+            .kind = .now_ns,
+            .value_json = try alloc.dupe(u8, "{\"now_ns\":true}"),
+        },
+    };
+    policy.deinit(alloc);
 }
 
 test "SQL adapter DDL row security plans own nested fields" {

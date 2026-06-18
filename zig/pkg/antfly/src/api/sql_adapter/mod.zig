@@ -67,6 +67,7 @@ pub const CreateSchemaNamespacePlan = ddl_plan.CreateSchemaNamespacePlan;
 pub const CreateSequencePlan = ddl_plan.CreateSequencePlan;
 pub const CreateSubscriptionPlan = ddl_plan.CreateSubscriptionPlan;
 pub const CreateTablespacePlan = ddl_plan.CreateTablespacePlan;
+pub const CreateUpdatePolicyPlan = ddl_plan.CreateUpdatePolicyPlan;
 pub const CreateViewPlan = ddl_plan.CreateViewPlan;
 pub const CursorFetchDirection = ddl_plan.CursorFetchDirection;
 pub const CursorPortalPlan = ddl_plan.CursorPortalPlan;

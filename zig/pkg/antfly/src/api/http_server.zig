@@ -17227,7 +17227,7 @@ test "api http server routes public external lake row queries through configured
     const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
     const external_source_api = @import("../serverless/external_source/mod.zig");
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"}},"required":["amount"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"tenant":{"type":"numeric"}},"required":["amount","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
 
     const FakeSource = struct {
@@ -17329,7 +17329,11 @@ test "api http server routes public external lake row queries through configured
     defer memory.deinit();
     var client = memory.client();
     try client.makeBucket("bucket");
-    const parquet_object = try serverless_query.buildLakeParquetTestSingleColumnPlainI64ObjectAlloc(alloc, "amount", &[_]i64{ 10, 20, 30 });
+    const parquet_columns = [_]serverless_query.LakeParquetTestPlainI64Column{
+        .{ .column_id = "amount", .values = &[_]i64{ 10, 20, 30 } },
+        .{ .column_id = "tenant", .values = &[_]i64{ 7, 8, 8 } },
+    };
+    const parquet_object = try serverless_query.buildLakeParquetTestPlainI64ObjectAlloc(alloc, &parquet_columns);
     defer alloc.free(parquet_object);
     var put = try client.putObject("bucket", "events/part-a.parquet", parquet_object, .{});
     defer put.deinit(alloc);
@@ -17351,7 +17355,7 @@ test "api http server routes public external lake row queries through configured
     );
     defer server.deinit();
 
-    var response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"]}}", null);
+    var response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":8}}}", null);
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
@@ -17359,12 +17363,12 @@ test "api http server routes public external lake row queries through configured
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("total").?.integer);
     const rows = parsed.value.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), rows.len);
-    try std.testing.expectEqual(@as(i64, 10), rows[0].object.get("amount").?.integer);
-    try std.testing.expectEqual(@as(i64, 20), rows[1].object.get("amount").?.integer);
-    try std.testing.expectEqual(@as(i64, 30), rows[2].object.get("amount").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 20), rows[0].object.get("amount").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), rows[1].object.get("amount").?.integer);
+    try std.testing.expect(rows[0].object.get("tenant") == null);
 }
 
 test "api http server resolves credentialed external lake rows from node config" {
