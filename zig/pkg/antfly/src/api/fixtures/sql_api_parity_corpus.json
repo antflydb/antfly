@@ -1076,78 +1076,6 @@
       "sql": "ALTER TABLE usage_records DROP COLUMN metadata;"
     },
     {
-      "name": "single table scalar in or query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-      "sql": "SELECT id FROM usage_records WHERE status IN ('closed', 'pending') OR status = 'open' AND amount > 20 ORDER BY created_at DESC LIMIT 5"
-    },
-    {
-      "name": "single table parenthesized scalar or query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-      "sql": "SELECT id FROM usage_records WHERE (status = 'closed') OR (status = 'open' AND amount > 20) ORDER BY created_at DESC LIMIT 5"
-    },
-    {
-      "name": "single table scalar any or query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-      "sql": "SELECT id FROM usage_records WHERE status = ANY(ARRAY['closed','pending']::text[]) OR status = 'open' AND amount > 20 ORDER BY created_at DESC LIMIT 5"
-    },
-    {
-      "name": "single table scalar not in or query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-      "sql": "SELECT id FROM usage_records WHERE status NOT IN ('closed', 'pending') AND amount > 20 OR status = 'open' ORDER BY created_at DESC LIMIT 5"
-    },
-    {
-      "name": "single table parenthesized arithmetic projection query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=5:claim=none",
-      "sql": "SELECT id, (amount + 1) AS bumped_amount FROM usage_records ORDER BY created_at DESC LIMIT 5"
-    },
-    {
-      "name": "single table parenthesized arithmetic order query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "sql": "SELECT id FROM usage_records ORDER BY (amount + quantity) DESC LIMIT 5"
-    },
-    {
       "name": "read classifier row query",
       "family": "read",
       "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
@@ -10745,6 +10673,78 @@
       },
       "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
       "sql": "SELECT id FROM usage_records WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table scalar in or query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE status IN ('closed', 'pending') OR status = 'open' AND amount > 20 ORDER BY created_at DESC LIMIT 5"
+    },
+    {
+      "name": "single table parenthesized scalar or query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE (status = 'closed') OR (status = 'open' AND amount > 20) ORDER BY created_at DESC LIMIT 5"
+    },
+    {
+      "name": "single table scalar any or query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE status = ANY(ARRAY['closed','pending']::text[]) OR status = 'open' AND amount > 20 ORDER BY created_at DESC LIMIT 5"
+    },
+    {
+      "name": "single table scalar not in or query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE status NOT IN ('closed', 'pending') AND amount > 20 OR status = 'open' ORDER BY created_at DESC LIMIT 5"
+    },
+    {
+      "name": "single table parenthesized arithmetic projection query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "SELECT id, (amount + 1) AS bumped_amount FROM usage_records ORDER BY created_at DESC LIMIT 5"
+    },
+    {
+      "name": "single table parenthesized arithmetic order query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records ORDER BY (amount + quantity) DESC LIMIT 5"
     }
   ]
 }

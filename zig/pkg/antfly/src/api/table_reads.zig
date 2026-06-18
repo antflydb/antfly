@@ -17204,6 +17204,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
         .{ .name = "attrs", .path = "attrs", .field_type = .json, .nullable = false },
         .{ .name = "tags", .path = "tags", .field_type = .array, .nullable = false },
+        .{ .name = "nickname", .path = "nickname", .field_type = .keyword, .nullable = true },
     };
     const schema = storage_schema.TableSchema{
         .storage_mode = .relational,
@@ -17360,6 +17361,8 @@ test "external lake rows query and aggregate plans route through lake scan hook"
                         .{ .json = try row_alloc.dupe(u8, if (amount == 20) "{\"tier\":\"gold\",\"flags\":{\"vip\":true}}" else "{\"tier\":\"silver\",\"flags\":{\"vip\":false}}") }
                     else if (std.mem.eql(u8, column, "tags"))
                         .{ .json = try row_alloc.dupe(u8, if (amount == 20) "[\"hot\",\"vip\"]" else "[\"cold\"]") }
+                    else if (std.mem.eql(u8, column, "nickname"))
+                        if (amount == 20) null else .{ .bytes = try row_alloc.dupe(u8, "nick30") }
                     else
                         return error.UnexpectedLakeProjection,
                 };
@@ -17598,10 +17601,18 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         .output = "tenant_alias",
         .field = "tenant",
     }};
+    const coalesce = [_]db_mod.types.RelationalRowsCoalesceProjection{.{
+        .output = "display_name",
+        .operands = &.{
+            .{ .kind = .field, .field = "nickname" },
+            .{ .kind = .value, .value_json = "\"fallback\"" },
+        },
+    }};
     var shaped_projection_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
         .query = .{
             .select_all = false,
             .array_length = array_length[0..],
+            .coalesce = coalesce[0..],
             .field_aliases = field_aliases[0..],
             .limit = 5,
         },
@@ -17611,8 +17622,8 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 2), shaped_projection_result.total);
     try std.testing.expectEqual(@as(usize, 2), shaped_projection_result.rows.len);
-    try std.testing.expectEqualStrings("{\"tag_count\":2,\"tenant_alias\":\"t2\"}", shaped_projection_result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tag_count\":1,\"tenant_alias\":\"t2\"}", shaped_projection_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tag_count\":2,\"display_name\":\"fallback\",\"tenant_alias\":\"t2\"}", shaped_projection_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tag_count\":1,\"display_name\":\"nick30\",\"tenant_alias\":\"t2\"}", shaped_projection_result.rows[1]);
 
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },

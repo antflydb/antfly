@@ -5219,9 +5219,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    string construction/splitting/position/padding, hashing, prefix/suffix tests,
    character-code expressions, date/time bucketing/extraction expressions, and
    JSON object/conversion projections, null-safe expression predicates, and
-   computed membership predicates, array/cardinality/position expressions, and
-   computed-array predicates, belong in the source fixture instead of the
-   embedded Zig seed list.
+   computed membership predicates, scalar OR/membership predicates,
+   parenthesized arithmetic projection/order examples,
+   array/cardinality/position expressions, and computed-array predicates,
+   belong in the source fixture instead of the embedded Zig seed list.
 
 2. **DDL and migration compiler.**
    Compile native migration intent into Antfly schema mutations rather than replaying
@@ -6141,9 +6142,11 @@ the current contract. The source fixture carries `source_format` and an
 `sql_api_parity_corpus.json` is generated output. Source fixture entries should
 cover portable SQL/data examples directly, including scalar and text expression
 queries, date/time expression queries, and JSON expression-projection queries,
-expression-membership/null-safe predicate queries, and array/computed-array
-expression queries, while the embedded Zig seed corpus is reserved for cases
-that need local helper setup or in-process fixture construction.
+expression-membership/null-safe predicate queries, scalar OR/membership
+predicate queries, parenthesized arithmetic projection/order queries, and
+array/computed-array expression queries, while the embedded Zig seed corpus is
+reserved for cases that need local helper setup or in-process fixture
+construction.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 

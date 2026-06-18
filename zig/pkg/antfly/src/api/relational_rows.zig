@@ -3018,7 +3018,6 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     if (request.doc_key_range != null) return error.UnsupportedRowsQuery;
     if (request.offset != 0) return error.UnsupportedRowsQuery;
     if (request.distinct_on.len != 0 or request.distinct_on_expressions.len != 0) return error.UnsupportedRowsQuery;
-    if (request.coalesce.len != 0) return error.UnsupportedRowsQuery;
     try validateLakeRowsQueryPredicateGroupsSupported(alloc, schema, request);
     for (request.array_any) |predicate| {
         const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
@@ -3064,6 +3063,17 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
         switch (column.field_type) {
             .embedding => return error.UnsupportedRowsQuery,
             else => {},
+        }
+    }
+    for (request.coalesce) |projection| {
+        for (projection.operands) |operand| {
+            switch (operand.kind) {
+                .field => {
+                    const column = findRelationalColumn(schema.relational_columns, operand.field) orelse return error.InvalidRowsRequest;
+                    if (column.field_type == .embedding) return error.UnsupportedRowsQuery;
+                },
+                .value => {},
+            }
         }
     }
     for (request.text_patterns) |predicate| {
@@ -3388,7 +3398,7 @@ fn lakeRowsProjectedColumnsAlloc(
         }
         return try columns.toOwnedSlice(alloc);
     }
-    if (request.select.len == 0 and request.json_extract.len == 0 and request.array_length.len == 0 and request.field_aliases.len == 0 and request.expressions.len == 0) return error.InvalidRowsRequest;
+    if (request.select.len == 0 and request.json_extract.len == 0 and request.array_length.len == 0 and request.coalesce.len == 0 and request.field_aliases.len == 0 and request.expressions.len == 0) return error.InvalidRowsRequest;
     var columns = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeLakeProjectedColumnList(alloc, &columns);
     for (request.select) |field| {
@@ -3441,6 +3451,11 @@ fn lakeRowsProjectedColumnsAlloc(
     }
     for (request.field_aliases) |projection| {
         try appendLakeProjectedColumnAlloc(alloc, &columns, projection.field);
+    }
+    for (request.coalesce) |projection| {
+        for (projection.operands) |operand| {
+            if (operand.kind == .field) try appendLakeProjectedColumnAlloc(alloc, &columns, operand.field);
+        }
     }
     for (request.expression_predicates) |condition| {
         try appendLakeRowsExpressionConditionProjectedColumnsAlloc(alloc, &columns, condition);
@@ -3945,7 +3960,7 @@ fn lakeProjectedRowQueryJsonAlloc(
     request: OwnedRowsQueryRequest,
     row: lake_rows.ProjectedRow,
 ) ![]u8 {
-    if (request.select_all and request.expressions.len == 0) return try lakeProjectedRowJsonAlloc(alloc, row);
+    if (request.select_all and request.json_extract.len == 0 and request.array_length.len == 0 and request.coalesce.len == 0 and request.field_aliases.len == 0 and request.expressions.len == 0) return try lakeProjectedRowJsonAlloc(alloc, row);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
@@ -3978,6 +3993,12 @@ fn lakeProjectedRowQueryJsonAlloc(
         first = false;
         try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
         try writeLakeRowsArrayLengthProjectionValueAlloc(alloc, writer, row, projection);
+    }
+    for (request.coalesce) |projection| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+        try writeLakeRowsCoalesceProjectionValueAlloc(alloc, writer, row, projection);
     }
     for (request.field_aliases) |projection| {
         if (!first) try writer.writeByte(',');
@@ -4119,6 +4140,32 @@ fn writeLakeRowsArrayLengthProjectionValueAlloc(
         .vector_f32 => |values| try writer.print("{d}", .{values.len}),
         else => return error.InvalidRowsRequest,
     }
+}
+
+fn writeLakeRowsCoalesceProjectionValueAlloc(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    row: lake_rows.ProjectedRow,
+    projection: db_mod.types.RelationalRowsCoalesceProjection,
+) !void {
+    for (projection.operands) |operand| {
+        switch (operand.kind) {
+            .field => {
+                const cell = row.find(operand.field) orelse return error.RowSourceColumnNotFound;
+                if (cell.value == null) continue;
+                try writeLakeRowsCellJson(writer, cell.value);
+                return;
+            },
+            .value => {
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, operand.value_json, .{}) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value == .null) continue;
+                try std.json.Stringify.value(parsed.value, .{}, writer);
+                return;
+            },
+        }
+    }
+    try writer.writeAll("null");
 }
 
 fn writeLakeRowsCellJson(
