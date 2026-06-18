@@ -204,12 +204,15 @@ class HASwarmNode:
         return self._check(response)
 
     def batch_write(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        response = requests.post(
+        response = self.batch_write_response(table_name, inserts)
+        return self._check(response)
+
+    def batch_write_response(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> requests.Response:
+        return requests.post(
             f"{self.url}{DB_API_ROOT}/tables/{table_name}/batch",
             json={"inserts": inserts},
             timeout=30,
         )
-        return self._check(response)
 
     def _check(self, response: requests.Response) -> dict[str, Any]:
         if response.status_code >= 400:
@@ -318,6 +321,32 @@ def _table_identity_from_catalog(node: HASwarmNode, table_name: str) -> tuple[in
     return int(table_range["group_id"]), table_id
 
 
+def _identity(cluster: HACluster) -> dict[str, int]:
+    assert cluster.primary.shard_id is not None
+    assert cluster.primary.table_id is not None
+    return {
+        "cluster_id": cluster.primary.cluster_id,
+        "shard_id": cluster.primary.shard_id,
+        "table_id": cluster.primary.table_id,
+        "timeline_id": cluster.primary.timeline_id,
+        "epoch": cluster.primary.epoch,
+    }
+
+
+def _promotion_fence_request(cluster: HACluster, required_lsn: int) -> dict[str, Any]:
+    return {
+        "identity": _identity(cluster),
+        "old_primary_id": cluster.primary.node_id,
+        "promoted_node_id": cluster.standby.node_id,
+        "new_timeline_id": cluster.primary.timeline_id + 1,
+        "new_epoch": cluster.primary.epoch + 1,
+        "required_lsn": required_lsn,
+        "observed_lsn": required_lsn,
+        "force": False,
+        "reason": "ha-standby-e2e",
+    }
+
+
 def _binary_supports_ha_swarm(binary: str) -> bool:
     result = subprocess.run(
         [binary, "swarm", "--help"],
@@ -394,3 +423,37 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert slot["received_lsn"] >= second_lsn
     assert slot["applied_lsn"] >= second_lsn
+
+    fence_request = _promotion_fence_request(ha_cluster, second_lsn)
+    fence = ha_cluster.standby.admin_post("/fence", fence_request)
+    assert fence["receipt"]["promoted_node_id"] == "standby-a"
+    assert fence["receipt"]["old_primary_id"] == "primary-a"
+    assert fence["receipt"]["new_timeline_id"] == 2
+
+    assessment = ha_cluster.standby.admin_post(
+        "/promotion/assess",
+        {"required_lsn": second_lsn, "fencing_confirmed": False, "force": False, "use_current_fence": True},
+    )
+    assert assessment["assessment"]["can_promote"] is True
+    assert assessment["assessment"]["fencing_confirmed"] is True
+
+    promoted = ha_cluster.standby.admin_post("/promotion/current-fence", {})
+    assert promoted["promotion"]["node_id"] == "standby-a"
+    assert promoted["promotion"]["new_identity"]["timeline_id"] == 2
+    assert promoted["promotion"]["new_identity"]["epoch"] == 2
+    assert promoted["promotion"]["switch_lsn"] == second_lsn + 1
+
+    primary_fence = ha_cluster.primary.admin_post("/fence", fence_request)
+    assert primary_fence["receipt"]["promoted_node_id"] == "standby-a"
+    fenced_write_check = ha_cluster.primary.admin_post(
+        "/write/check",
+        {"role": "primary", "expected_identity": _identity(ha_cluster)},
+    )
+    assert fenced_write_check["decision"]["role"] == "fenced_primary"
+    assert fenced_write_check["decision"]["action"] == "reject_fenced_primary"
+
+    rejected = ha_cluster.primary.batch_write_response(
+        table_name,
+        {"doc:old-primary": {"title": "must not commit"}},
+    )
+    assert rejected.status_code >= 400, rejected.text
