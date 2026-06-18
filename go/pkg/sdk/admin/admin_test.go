@@ -176,7 +176,7 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientRejectsInvalidHAIdentifiersLocally(t *testing.T) {
+func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 	t.Parallel()
 
 	var requests atomic.Int32
@@ -304,6 +304,43 @@ func TestHAClientRejectsInvalidHAIdentifiersLocally(t *testing.T) {
 			},
 		},
 		{
+			name: "finish base backup relative manifest path",
+			call: func() error {
+				_, err := client.FinishBaseBackup(context.Background(), BaseBackupManifestPathRequest{
+					ManifestPath: "backup/manifest-a.json",
+				})
+				return err
+			},
+		},
+		{
+			name: "finish base backup padded manifest path",
+			call: func() error {
+				_, err := client.FinishBaseBackup(context.Background(), BaseBackupManifestPathRequest{
+					ManifestPath: " /backup/manifest-a.json",
+				})
+				return err
+			},
+		},
+		{
+			name: "bootstrap manifest path not normalized",
+			call: func() error {
+				_, err := client.BootstrapStandby(context.Background(), StandbyBootstrapRequest{
+					ManifestPath: "/backup/../manifest-a.json",
+				})
+				return err
+			},
+		},
+		{
+			name: "bootstrap content root not normalized",
+			call: func() error {
+				_, err := client.BootstrapStandby(context.Background(), StandbyBootstrapRequest{
+					ManifestPath: "/backup/manifest-a.json",
+					ContentRoot:  "/backup/standby-a/..",
+				})
+				return err
+			},
+		},
+		{
 			name: "acquire fence padded old primary id",
 			call: func() error {
 				body := validFence
@@ -380,7 +417,7 @@ func TestHAClientRejectsInvalidHAIdentifiersLocally(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := tt.call(); err == nil || !strings.Contains(err.Error(), "invalid HA") {
-				t.Fatalf("error = %v, want local invalid HA identifier error", err)
+				t.Fatalf("error = %v, want local invalid HA input error", err)
 			}
 		})
 	}

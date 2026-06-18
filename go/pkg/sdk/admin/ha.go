@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
@@ -2508,6 +2509,20 @@ func validateHAFenceReceiptIdentifiersForRequest(operation string, field string,
 	return validateHANodeIDForRequest(operation, field+".promoted_node_id", receipt.PromotedNodeId)
 }
 
+func validateHAPathForRequest(operation string, field string, value string) error {
+	if value == "" || strings.TrimSpace(value) != value || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+		return fmt.Errorf("%s: invalid HA %s %q", operation, field, value)
+	}
+	return nil
+}
+
+func validateHAOptionalPathForRequest(operation string, field string, value string) error {
+	if value == "" {
+		return nil
+	}
+	return validateHAPathForRequest(operation, field, value)
+}
+
 func (c *HAClient) BeginBaseBackupResponse(ctx context.Context, body BaseBackupStartRequest) (*HAResponse[HABaseBackupBeginResponse], error) {
 	if err := validateHAReplicationSlotNameForRequest("begin HA base backup", body.SlotName); err != nil {
 		return nil, err
@@ -2524,6 +2539,9 @@ func (c *HAClient) BeginBaseBackup(ctx context.Context, body BaseBackupStartRequ
 }
 
 func (c *HAClient) FinishBaseBackupResponse(ctx context.Context, body BaseBackupManifestPathRequest) (*HAResponse[HABaseBackupFinishResponse], error) {
+	if err := validateHAPathForRequest("finish HA base backup", "manifest_path", body.ManifestPath); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.FinishHABaseBackupWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2536,6 +2554,12 @@ func (c *HAClient) FinishBaseBackup(ctx context.Context, body BaseBackupManifest
 }
 
 func (c *HAClient) BootstrapStandbyResponse(ctx context.Context, body StandbyBootstrapRequest) (*HAResponse[HAStandbyBootstrapResponse], error) {
+	if err := validateHAPathForRequest("bootstrap HA standby", "manifest_path", body.ManifestPath); err != nil {
+		return nil, err
+	}
+	if err := validateHAOptionalPathForRequest("bootstrap HA standby", "content_root", body.ContentRoot); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.BootstrapHAStandbyWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err

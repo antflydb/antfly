@@ -681,7 +681,7 @@ components:
       properties:
         manifest_path:
           type: string
-          description: Pod-local path to the HA base-backup manifest.
+          description: Absolute normalized pod-local path to the HA base-backup manifest.
           minLength: 1
     StandbyBootstrapRequest:
       type: object
@@ -690,12 +690,12 @@ components:
       properties:
         manifest_path:
           type: string
-          description: Pod-local path to the HA base-backup manifest.
+          description: Absolute normalized pod-local path to the HA base-backup manifest.
           minLength: 1
         content_root:
           type: string
           nullable: true
-          description: Optional pod-local directory containing files referenced by the manifest.
+          description: Optional absolute normalized pod-local directory containing files referenced by the manifest.
     HASyncPolicy:
       type: object
       required: [mode]

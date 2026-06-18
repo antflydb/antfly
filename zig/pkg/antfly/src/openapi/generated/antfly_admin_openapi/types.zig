@@ -13,14 +13,14 @@ pub const HASlotName = []const u8;
 pub const HANodeID = []const u8;
 
 pub const BaseBackupManifestPathRequest = struct {
-    /// Pod-local path to the HA base-backup manifest.
+    /// Absolute normalized pod-local path to the HA base-backup manifest.
     manifest_path: []const u8,
 };
 
 pub const StandbyBootstrapRequest = struct {
-    /// Pod-local path to the HA base-backup manifest.
+    /// Absolute normalized pod-local path to the HA base-backup manifest.
     manifest_path: []const u8,
-    /// Optional pod-local directory containing files referenced by the manifest.
+    /// Optional absolute normalized pod-local directory containing files referenced by the manifest.
     content_root: ?[]const u8 = null,
 };
 
