@@ -1922,6 +1922,15 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testin
 	if !strings.Contains(err.Error(), "admin.tokenEnvVar must not be whitespace") {
 		t.Fatalf("expected admin.tokenEnvVar whitespace validation error, got: %v", err)
 	}
+
+	cluster.Spec.HighAvailability.Admin.TokenEnvVar = " CUSTOM_HA_ADMIN_TOKEN "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA admin token environment variable with surrounding whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.tokenEnvVar must be a valid environment variable name") {
+		t.Fatalf("expected admin.tokenEnvVar raw-name validation error, got: %v", err)
+	}
 }
 
 func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *testing.T) {
@@ -2017,6 +2026,15 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidRuntimeAdminTokenEnvVar(t 
 	}
 	if !strings.Contains(err.Error(), "runtime.adminTokenEnvVar") {
 		t.Fatalf("expected runtime.adminTokenEnvVar validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = " ANTFLY_HA_ADMIN_TOKEN "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token environment variable with surrounding whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.adminTokenEnvVar") {
+		t.Fatalf("expected runtime.adminTokenEnvVar raw-name validation error, got: %v", err)
 	}
 }
 

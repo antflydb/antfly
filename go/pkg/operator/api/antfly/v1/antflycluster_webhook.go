@@ -21,7 +21,8 @@ var (
 	ec2InstancePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*\.[a-z0-9]+$`)
 	// productTierTokenPattern accepts stable external tier/catalog identifiers.
 	productTierTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
-	// envVarNamePattern accepts Kubernetes-compatible environment variable names.
+	// envVarNamePattern accepts shell-safe environment variable names accepted by
+	// the Zig HA CLI/runtime token resolvers.
 	envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
@@ -1187,10 +1188,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if strings.TrimSpace(admin.TokenEnvVar) == "" && admin.TokenEnvVar != "" {
 			errors = append(errors, "spec.highAvailability.admin.tokenEnvVar must not be whitespace")
 		}
-		if tokenEnvVar := strings.TrimSpace(admin.TokenEnvVar); tokenEnvVar != "" {
-			if envErrs := utilvalidation.IsEnvVarName(tokenEnvVar); len(envErrs) > 0 {
-				errors = append(errors, fmt.Sprintf("spec.highAvailability.admin.tokenEnvVar is invalid: %s", strings.Join(envErrs, "; ")))
-			}
+		if tokenEnvVar := admin.TokenEnvVar; tokenEnvVar != "" && !envVarNamePattern.MatchString(tokenEnvVar) {
+			errors = append(errors, "spec.highAvailability.admin.tokenEnvVar must be a valid environment variable name")
 		}
 		if admin.JobBackoffLimit != nil && *admin.JobBackoffLimit < 0 {
 			errors = append(errors, "spec.highAvailability.admin.jobBackoffLimit must not be negative")
@@ -1376,7 +1375,7 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	if strings.TrimSpace(runtime.AdminTokenEnvVar) == "" && runtime.AdminTokenEnvVar != "" {
 		errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar must not be whitespace")
 	}
-	if envVar := strings.TrimSpace(runtime.AdminTokenEnvVar); envVar != "" && !envVarNamePattern.MatchString(envVar) {
+	if envVar := runtime.AdminTokenEnvVar; envVar != "" && !envVarNamePattern.MatchString(envVar) {
 		errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar must be a valid environment variable name")
 	}
 	if ref := runtime.AdminTokenSecretRef; ref != nil {
