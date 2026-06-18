@@ -71,7 +71,10 @@ pub const ObjectRangeReader = struct {
         len: usize,
     ) ![]u8 {
         if (bucket.len == 0 or key.len == 0 or len == 0) return error.InvalidLakeRangeRead;
-        return try self.read_range_alloc(self.ctx, alloc, bucket, key, offset, len);
+        const bytes = try self.read_range_alloc(self.ctx, alloc, bucket, key, offset, len);
+        errdefer alloc.free(bytes);
+        if (bytes.len != len) return error.InvalidLakeRangeRead;
+        return bytes;
     }
 };
 
@@ -107,6 +110,14 @@ pub const ObjectRangeCache = struct {
     ) ![]u8 {
         const cache_key = try read.cacheKeyAlloc(alloc);
         if (self.entries.get(cache_key)) |cached| {
+            const read_len: usize = std.math.cast(usize, read.range.len) orelse {
+                alloc.free(cache_key);
+                return error.InvalidLakeRangeRead;
+            };
+            if (cached.len != read_len) {
+                alloc.free(cache_key);
+                return error.InvalidLakeRangeRead;
+            }
             self.stats.hits += 1;
             alloc.free(cache_key);
             return try alloc.dupe(u8, cached);
@@ -4552,6 +4563,104 @@ test "parquet object range cache reuses coalesced projected chunks" {
     try std.testing.expectEqual(@as(usize, 1), stats.hits);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20 }, second.batch.columns[0].values.i64);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8 }, second.batch.columns[1].values.i64);
+}
+
+test "parquet object range reader rejects malformed range lengths" {
+    const alloc = std.testing.allocator;
+    const MalformedRangeReader = struct {
+        body: []const u8,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return try a.dupe(u8, self.body[0..@min(self.body.len, len + 1)]);
+        }
+    };
+
+    var short_reader = MalformedRangeReader{ .body = "abc" };
+    try std.testing.expectError(
+        error.InvalidLakeRangeRead,
+        short_reader.reader().readAlloc(alloc, "bucket", "object", 0, 4),
+    );
+
+    var long_reader = MalformedRangeReader{ .body = "abcde" };
+    try std.testing.expectError(
+        error.InvalidLakeRangeRead,
+        long_reader.reader().readAlloc(alloc, "bucket", "object", 0, 4),
+    );
+}
+
+test "parquet object range cache rejects corrupted cached range lengths" {
+    const alloc = std.testing.allocator;
+    var cache = ObjectRangeCache{};
+    defer cache.deinit(alloc);
+
+    const file = external_source.FileEntry{
+        .file_id = @constCast("part-a.parquet"),
+        .object_uri = @constCast("s3://bucket/events/part-a.parquet"),
+        .etag = @constCast("etag-a"),
+        .byte_len = 16,
+        .row_count = 1,
+        .row_groups = &.{},
+    };
+    const object = try range_io.objectRefForExternalFileUri(file);
+    const read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 4, .len = 6 },
+        .purpose = .parquet_column_chunk,
+        .decoded_column_id = "amount",
+    };
+    const cache_key = try read.cacheKeyAlloc(alloc);
+    try cache.entries.put(alloc, cache_key, try alloc.dupe(u8, "short"));
+
+    const UnusedReader = struct {
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = ctx;
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            return try a.alloc(u8, len);
+        }
+    };
+    var reader = UnusedReader{};
+
+    try std.testing.expectError(
+        error.InvalidLakeRangeRead,
+        cache.readAlloc(alloc, reader.reader(), read),
+    );
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), stats.hits);
+    try std.testing.expectEqual(@as(usize, 0), stats.misses);
 }
 
 test "parquet object range rows query filters on unprojected column" {
