@@ -271,6 +271,39 @@ fn deepSeekV4DecodeContextWithInputIds(
     return storage;
 }
 
+pub const Gemma4LayerSpecCache = struct {
+    layers: []backend_contracts.DecoderRuntimeLayerSpec = &.{},
+    configured_layer_count: usize = 0,
+    num_hidden_layers: usize = 0,
+    include_output_scale: bool = false,
+    config_fingerprint: u64 = 0,
+    valid: bool = false,
+
+    pub fn reset(self: *Gemma4LayerSpecCache) void {
+        self.valid = false;
+    }
+
+    pub fn deinit(self: *Gemma4LayerSpecCache, allocator: std.mem.Allocator) void {
+        if (self.layers.len > 0) allocator.free(self.layers);
+        self.* = .{};
+    }
+
+    pub fn matches(
+        self: *const Gemma4LayerSpecCache,
+        configured_layer_count: usize,
+        num_hidden_layers: usize,
+        include_output_scale: bool,
+        config_fingerprint: u64,
+    ) bool {
+        return self.valid and
+            self.configured_layer_count == configured_layer_count and
+            self.num_hidden_layers == num_hidden_layers and
+            self.include_output_scale == include_output_scale and
+            self.config_fingerprint == config_fingerprint and
+            self.layers.len >= num_hidden_layers;
+    }
+};
+
 pub const DecodeContext = struct {
     pub const AttentionMode = enum {
         full_recompute,
@@ -316,6 +349,7 @@ pub const DecodeContext = struct {
     deepseek_v4_compressed_cache: ?*DeepSeekV4CompressedCache = null,
     moe_runtime: ?*runtime.moe.runtime.MoeRuntime = null,
     qwen35_linear_cache: ?*Qwen35LinearCache = null,
+    gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
     input_ids: ?[]const i64 = null,
 
     pub fn usesPagedKv(self: DecodeContext) bool {
@@ -329,6 +363,22 @@ pub const DecodeContext = struct {
         return batch[0].per_item_query_len != null;
     }
 };
+
+test "Gemma4LayerSpecCache matches only exact spec shape" {
+    var cache = Gemma4LayerSpecCache{
+        .configured_layer_count = 35,
+        .num_hidden_layers = 35,
+        .include_output_scale = true,
+        .config_fingerprint = 1234,
+        .valid = true,
+    };
+    try std.testing.expect(cache.matches(35, 35, true, 1234));
+    try std.testing.expect(!cache.matches(35, 34, true, 1234));
+    try std.testing.expect(!cache.matches(35, 35, false, 1234));
+    try std.testing.expect(!cache.matches(35, 35, true, 5678));
+    cache.reset();
+    try std.testing.expect(!cache.matches(35, 35, true, 1234));
+}
 
 /// GPT decoder forward pass. Returns logits: [batch * seq_len * vocab_size] as f32.
 pub fn forward(

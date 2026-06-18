@@ -309,9 +309,10 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "decoder_gated_decode_ms: greedy_calls={d} greedy_embed={d} greedy_block={d} greedy_tail={d} sampled_calls={d} sampled_embed={d} sampled_block={d} sampled_tail={d}\n",
+        "decoder_gated_decode_ms: greedy_calls={d} greedy_layer_specs={d} greedy_embed={d} greedy_block={d} greedy_tail={d} sampled_calls={d} sampled_embed={d} sampled_block={d} sampled_tail={d}\n",
         .{
             decoder_gated_stats.greedy_calls,
+            @divTrunc(decoder_gated_stats.greedy_layer_spec_nanos, std.time.ns_per_ms),
             @divTrunc(decoder_gated_stats.greedy_embed_nanos, std.time.ns_per_ms),
             @divTrunc(decoder_gated_stats.greedy_block_nanos, std.time.ns_per_ms),
             @divTrunc(decoder_gated_stats.greedy_tail_nanos, std.time.ns_per_ms),
@@ -1547,6 +1548,9 @@ pub fn supportsSession(session: backends.Session) bool {
 fn prewarmEmbeddingWeight(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Config) !void {
     const embed_w = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
     defer cb.free(embed_w);
+    const ids = [_]i64{0};
+    const embedded = try cb.embeddingLookup(embed_w, ids[0..], ids.len, gpt_config.hidden_size);
+    defer cb.free(embedded);
 }
 
 pub fn prewarmSharedDecoderRuntime(
