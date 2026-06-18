@@ -1270,6 +1270,7 @@ const SyncPolicyBuilder = struct {
     mode: ?primary_mod.DurabilityMode = null,
     selection: primary_mod.StandbySelection = .any,
     required: usize = 1,
+    required_set: bool = false,
     failure_policy: primary_mod.FailurePolicy = .block,
     standby_names: std.ArrayListUnmanaged([]const u8) = .empty,
 
@@ -1292,6 +1293,7 @@ const SyncPolicyBuilder = struct {
         if (std.mem.eql(u8, arg, "--sync-required")) {
             _ = cursor.next();
             self.required = try parseUsize(try cursor.value("--sync-required"));
+            self.required_set = true;
             return true;
         }
         if (std.mem.eql(u8, arg, "--sync-standby")) {
@@ -1311,10 +1313,11 @@ const SyncPolicyBuilder = struct {
         const configured = self.mode != null or
             self.standby_names.items.len > 0 or
             self.selection != .any or
-            self.required != 1 or
+            self.required_set or
             self.failure_policy != .block;
         if (!configured) return null;
         if (self.required == 0) return error.SyncRequiredMustBePositive;
+        if (self.selection == .all and (self.required_set or self.standby_names.items.len == 0)) return error.InvalidSyncPolicy;
 
         const names = try self.standby_names.toOwnedSlice(alloc);
         self.standby_names = .empty;
@@ -1322,7 +1325,7 @@ const SyncPolicyBuilder = struct {
         return primary_mod.SyncPolicy{
             .mode = self.mode orelse .remote_write,
             .selection = self.selection,
-            .required = self.required,
+            .required = if (self.selection == .all) names.len else self.required,
             .standby_names = names,
             .failure_policy = self.failure_policy,
         };
@@ -1532,6 +1535,35 @@ test "storage.ha admin cli parses primary status with sync policy" {
     try std.testing.expectEqual(@as(usize, 2), policy.standby_names.len);
     try std.testing.expectEqualStrings("a", policy.standby_names[0]);
     try std.testing.expectEqualStrings("b", policy.standby_names[1]);
+}
+
+test "storage.ha admin cli treats ALL sync policy as all named standbys" {
+    const alloc = std.testing.allocator;
+    var plan = try parse(alloc, &.{
+        "status",           "primary",
+        "--sync-mode",      "remote-apply",
+        "--sync-selection", "all",
+        "--sync-standby",   "a",
+        "--sync-standby",   "b",
+    });
+    defer plan.deinit(alloc);
+
+    const policy = plan.command.primary_status.sync_policy.?;
+    try std.testing.expectEqual(primary_mod.StandbySelection.all, policy.selection);
+    try std.testing.expectEqual(@as(usize, 2), policy.required);
+
+    try std.testing.expectError(error.InvalidSyncPolicy, parse(alloc, &.{
+        "status",           "primary",
+        "--sync-mode",      "remote-apply",
+        "--sync-selection", "all",
+        "--sync-required",  "1",
+        "--sync-standby",   "a",
+    }));
+    try std.testing.expectError(error.InvalidSyncPolicy, parse(alloc, &.{
+        "status",           "primary",
+        "--sync-mode",      "remote-apply",
+        "--sync-selection", "all",
+    }));
 }
 
 test "storage.ha admin cli parses operator plan command" {

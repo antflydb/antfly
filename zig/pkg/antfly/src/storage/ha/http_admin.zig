@@ -1481,19 +1481,21 @@ const OwnerJobGateRequest = struct {
 };
 
 fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy {
-    const required = if (policy.required) |value| blk: {
+    const selection = if (policy.selection) |raw| try parseStandbySelectionQuery(raw) else .any;
+    const standby_names = policy.standby_names orelse &.{};
+    if (selection == .all and (policy.required != null or standby_names.len == 0)) return error.InvalidAdminRequest;
+    const required = if (selection == .all) standby_names.len else if (policy.required) |value| blk: {
         const parsed = try positiveUint64FromJson(value);
         if (parsed > std.math.maxInt(usize)) return error.InvalidAdminRequest;
         break :blk @as(usize, @intCast(parsed));
     } else 1;
-    const standby_names = policy.standby_names orelse &.{};
     for (standby_names) |name| {
         if (name.len == 0) return error.InvalidAdminRequest;
     }
 
     return .{
         .mode = try parseDurabilityModeQuery(policy.mode),
-        .selection = if (policy.selection) |raw| try parseStandbySelectionQuery(raw) else .any,
+        .selection = selection,
         .required = required,
         .standby_names = standby_names,
         .failure_policy = if (policy.failure_policy) |raw| try parseFailurePolicyQuery(raw) else .block,
@@ -1609,6 +1611,7 @@ fn buildSyncPolicyFromQuery(alloc: Allocator, query: []const u8) !QuerySyncPolic
     var mode: ?primary_mod.DurabilityMode = null;
     var selection: primary_mod.StandbySelection = .any;
     var required: usize = 1;
+    var required_set = false;
     var failure_policy: primary_mod.FailurePolicy = .block;
     var names = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -1622,6 +1625,7 @@ fn buildSyncPolicyFromQuery(alloc: Allocator, query: []const u8) !QuerySyncPolic
         const parsed = try uint64Text(raw);
         if (parsed == 0 or parsed > std.math.maxInt(usize)) return error.InvalidAdminRequest;
         required = @intCast(parsed);
+        required_set = true;
     }
     if (queryValue(query, "sync_failure")) |raw| failure_policy = try parseFailurePolicyQuery(raw);
 
@@ -1643,10 +1647,14 @@ fn buildSyncPolicyFromQuery(alloc: Allocator, query: []const u8) !QuerySyncPolic
 
     const configured = mode != null or
         selection != .any or
-        required != 1 or
+        required_set or
         failure_policy != .block or
         names.items.len > 0;
     if (!configured) return .{};
+    if (selection == .all) {
+        if (required_set or names.items.len == 0) return error.InvalidAdminRequest;
+        required = names.items.len;
+    }
 
     const owned = try names.toOwnedSlice(alloc);
     names = .empty;
@@ -3141,10 +3149,49 @@ test "storage.ha http admin decodes sync policy query values" {
     try std.testing.expectEqualStrings("standby b%", policy.standby_names[0]);
     try std.testing.expectEqualStrings("standby c", policy.standby_names[1]);
 
+    var all_sync = try buildSyncPolicyFromQuery(
+        alloc,
+        "sync_mode=remote-apply&sync_selection=all&sync_standby=standby-a&sync_standby=standby-b",
+    );
+    defer all_sync.deinit(alloc);
+    const all_policy = all_sync.policy orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(primary_mod.StandbySelection.all, all_policy.selection);
+    try std.testing.expectEqual(@as(usize, 2), all_policy.required);
+
     try std.testing.expectError(
         error.InvalidAdminRequest,
         buildSyncPolicyFromQuery(alloc, "sync_mode=remote-write&sync_standby=standby%XX"),
     );
+    try std.testing.expectError(
+        error.InvalidAdminRequest,
+        buildSyncPolicyFromQuery(alloc, "sync_mode=remote-apply&sync_selection=all&sync_required=1&sync_standby=standby-a"),
+    );
+    try std.testing.expectError(
+        error.InvalidAdminRequest,
+        buildSyncPolicyFromQuery(alloc, "sync_mode=remote-apply&sync_selection=all"),
+    );
+}
+
+test "storage.ha http admin decodes OpenAPI ALL sync policy" {
+    const all_policy = try syncPolicyFromOpenApi(.{
+        .mode = "remote_apply",
+        .selection = "all",
+        .standby_names = &.{ "standby-a", "standby-b" },
+    });
+    try std.testing.expectEqual(primary_mod.StandbySelection.all, all_policy.selection);
+    try std.testing.expectEqual(@as(usize, 2), all_policy.required);
+
+    try std.testing.expectError(error.InvalidAdminRequest, syncPolicyFromOpenApi(.{
+        .mode = "remote_apply",
+        .selection = "all",
+        .required = 1,
+        .standby_names = &.{"standby-a"},
+    }));
+    try std.testing.expectError(error.InvalidAdminRequest, syncPolicyFromOpenApi(.{
+        .mode = "remote_apply",
+        .selection = "all",
+        .standby_names = &.{},
+    }));
 }
 
 test "storage.ha http admin preserves omitted commit append shard and table defaults" {

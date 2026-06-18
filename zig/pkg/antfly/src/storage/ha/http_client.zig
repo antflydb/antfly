@@ -641,7 +641,9 @@ fn appendQuerySyncPolicy(alloc: Allocator, old_uri: []u8, policy: primary_mod.Sy
 
     uri = try appendQueryString(alloc, uri, "sync_mode", durabilityModeQueryName(policy.mode));
     uri = try appendQueryString(alloc, uri, "sync_selection", @tagName(policy.selection));
-    uri = try appendQueryU64(alloc, uri, "sync_required", policy.required);
+    if (policy.selection != .all) {
+        uri = try appendQueryU64(alloc, uri, "sync_required", policy.required);
+    }
     uri = try appendQueryString(alloc, uri, "sync_failure", failurePolicyQueryName(policy.failure_policy));
     for (policy.standby_names) |name| {
         uri = try appendQueryString(alloc, uri, "sync_standby", name);
@@ -2128,6 +2130,23 @@ test "storage.ha http client renders primary status sync query with OpenAPI enum
     try expectContains(uri, "sync_failure=fail-closed");
     try expectContains(uri, "sync_standby=standby-a");
     try expectContains(uri, "sync_standby=standby%20b%25");
+
+    const all_names = [_][]const u8{ "standby-a", "standby-b" };
+    var all_uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.ha_primary_status});
+    all_uri = try appendQuerySyncPolicy(alloc, all_uri, .{
+        .mode = .remote_apply,
+        .selection = .all,
+        .required = all_names.len,
+        .standby_names = &all_names,
+        .failure_policy = .block,
+    });
+    defer alloc.free(all_uri);
+
+    try expectContains(all_uri, "sync_mode=remote-apply");
+    try expectContains(all_uri, "sync_selection=all");
+    try expectContains(all_uri, "sync_standby=standby-a");
+    try expectContains(all_uri, "sync_standby=standby-b");
+    try std.testing.expect(std.mem.indexOf(u8, all_uri, "sync_required") == null);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
