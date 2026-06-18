@@ -92,6 +92,13 @@ pub fn bindingFromSnapshot(
 }
 
 pub fn validateBatchAgainstBinding(binding: Binding, batch: rowsource.ColumnBatch) !void {
+    try validateBatchSnapshotAgainstBinding(binding, batch);
+    for (binding.column_bindings) |column| {
+        if (batch.findColumn(column) == null) return error.SidecarSourceBindingMismatch;
+    }
+}
+
+pub fn validateBatchSnapshotAgainstBinding(binding: Binding, batch: rowsource.ColumnBatch) !void {
     try binding.validate();
     try batch.validate();
     if (binding.source_id.len != 0 and !std.mem.eql(u8, binding.source_id, batch.snapshot.table_id)) {
@@ -100,12 +107,17 @@ pub fn validateBatchAgainstBinding(binding: Binding, batch: rowsource.ColumnBatc
     if (!std.mem.eql(u8, binding.snapshot_id, batch.snapshot.snapshot_id)) {
         return error.SidecarSourceBindingMismatch;
     }
-    for (binding.column_bindings) |column| {
-        if (batch.findColumn(column) == null) return error.SidecarSourceBindingMismatch;
-    }
     for (batch.row_refs) |row_ref| {
-        if (!rowRefMatchesKind(row_ref, binding.row_ref_kind)) return error.SidecarSourceBindingMismatch;
+        try validateRowRefAgainstBinding(binding, row_ref);
     }
+}
+
+pub fn validateCandidateRowRefsAgainstBinding(
+    binding: Binding,
+    row_refs: []const rowsource.RowRef,
+) !void {
+    try binding.validate();
+    for (row_refs) |row_ref| try validateRowRefAgainstBinding(binding, row_ref);
 }
 
 pub fn sameSourceSnapshot(a: Binding, b: Binding) bool {
@@ -122,6 +134,17 @@ pub fn rowRefMatchesKind(row_ref: rowsource.RowRef, kind: RowRefKind) bool {
         .serverless => kind == .serverless,
         .external => kind == .external,
     };
+}
+
+pub fn validateRowRefAgainstBinding(binding: Binding, row_ref: rowsource.RowRef) !void {
+    if (!rowRefMatchesKind(row_ref, binding.row_ref_kind)) return error.SidecarSourceBindingMismatch;
+    switch (row_ref) {
+        .external => |value| {
+            if (!std.mem.eql(u8, value.source_id, binding.source_id)) return error.SidecarSourceBindingMismatch;
+            if (!std.mem.eql(u8, value.snapshot_id, binding.snapshot_id)) return error.SidecarSourceBindingMismatch;
+        },
+        .serverless, .relational_key => {},
+    }
 }
 
 pub fn rowRefKeyAlloc(alloc: std.mem.Allocator, row_ref: rowsource.RowRef) ![]u8 {
@@ -262,4 +285,16 @@ test "sidecar source binding validates external row-ref batches" {
     var missing_column = batch;
     missing_column.columns = &.{};
     try std.testing.expectError(error.SidecarSourceBindingMismatch, validateBatchAgainstBinding(binding, missing_column));
+
+    const stale_refs = [_]rowsource.RowRef{.{ .external = .{
+        .source_id = "events",
+        .snapshot_id = "iceberg-8",
+        .file_id = "file-a.parquet",
+        .row_group_ordinal = 2,
+        .row_ordinal = 42,
+    } }};
+    try std.testing.expectError(
+        error.SidecarSourceBindingMismatch,
+        validateCandidateRowRefsAgainstBinding(binding, &stale_refs),
+    );
 }

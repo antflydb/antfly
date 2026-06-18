@@ -20,6 +20,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
+const source_binding = @import("../segment/source_binding.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 
 pub const GroupByRequest = struct {
@@ -196,6 +197,27 @@ pub fn hydrateRowsAlloc(
     wanted_refs: []const rowsource.RowRef,
     projected_columns: []const []const u8,
 ) !HydrateResult {
+    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, projected_columns);
+}
+
+pub fn hydrateRowsForBindingAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    wanted_refs: []const rowsource.RowRef,
+    projected_columns: []const []const u8,
+) !HydrateResult {
+    try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
+    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, projected_columns);
+}
+
+fn hydrateRowsInternalAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: ?source_binding.Binding,
+    wanted_refs: []const rowsource.RowRef,
+    projected_columns: []const []const u8,
+) !HydrateResult {
     if (wanted_refs.len == 0) return .{ .rows = try alloc.alloc(ProjectedRow, 0), .total = 0 };
     if (projected_columns.len == 0) return error.InvalidLakeRowsQuery;
 
@@ -206,6 +228,9 @@ pub fn hydrateRowsAlloc(
     }
 
     while (try source.next(alloc)) |batch| {
+        if (binding) |sidecar_binding| {
+            try source_binding.validateBatchSnapshotAgainstBinding(sidecar_binding, batch);
+        }
         for (batch.row_refs, 0..) |row_ref, row_idx| {
             if (!containsRowRef(wanted_refs, row_ref)) continue;
             try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, projected_columns));
@@ -644,6 +669,72 @@ test "lake rows hydrates projected cells by row ref" {
     try std.testing.expect(rowRefsEqual(wanted[0], result.rows[0].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqualStrings("{\"tier\":\"pro\"}", result.rows[0].find("attrs").?.value.?.json);
+}
+
+test "lake rows binding-aware hydration rejects stale external candidates" {
+    const alloc = std.testing.allocator;
+    const external = @import("../../storage/rowsource/external.zig");
+
+    const external_binding = external.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+        try external.makeRowRef(external_binding, "file-a.parquet", 0, 1),
+    };
+    const amounts = [_]i64{ 10, 20 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = external_binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try external.BatchSource.init(external_binding, &batches);
+
+    const sidecar_binding = source_binding.Binding{
+        .sidecar_kind = .vector,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+        .column_bindings = &[_][]const u8{"embedding"},
+        .index_config_hash = "sha256:vector",
+    };
+    const projection = [_][]const u8{"amount"};
+    var matched = try hydrateRowsForBindingAlloc(
+        alloc,
+        batch_source.rowSource(),
+        sidecar_binding,
+        &[_]rowsource.RowRef{row_refs[1]},
+        &projection,
+    );
+    defer matched.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), matched.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], matched.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), matched.rows[0].find("amount").?.value.?.i64);
+
+    const stale_refs = [_]rowsource.RowRef{.{ .external = .{
+        .source_id = "events",
+        .snapshot_id = "iceberg-8",
+        .file_id = "file-a.parquet",
+        .row_group_ordinal = 0,
+        .row_ordinal = 1,
+    } }};
+    try std.testing.expectError(error.SidecarSourceBindingMismatch, hydrateRowsForBindingAlloc(
+        alloc,
+        batch_source.rowSource(),
+        sidecar_binding,
+        &stale_refs,
+        &projection,
+    ));
 }
 
 test "lake rows hydrates projected cells from serverless row fragments" {

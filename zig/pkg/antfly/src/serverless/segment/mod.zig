@@ -28,6 +28,8 @@ pub const encodeAlloc = codec.encodeAlloc;
 pub const decodeAlloc = codec.decodeAlloc;
 pub const sidecarBindingFromSnapshot = source_binding.bindingFromSnapshot;
 pub const validateSidecarBatchAgainstBinding = source_binding.validateBatchAgainstBinding;
+pub const validateSidecarBatchSnapshotAgainstBinding = source_binding.validateBatchSnapshotAgainstBinding;
+pub const validateSidecarCandidateRowRefsAgainstBinding = source_binding.validateCandidateRowRefsAgainstBinding;
 pub const sameSidecarSourceSnapshot = source_binding.sameSourceSnapshot;
 pub const sidecarRowRefKeyAlloc = source_binding.rowRefKeyAlloc;
 pub const sidecarRowRefKindForSourceKind = source_binding.rowRefKindForSourceKind;
@@ -51,6 +53,8 @@ test "serverless segment module compiles" {
     _ = decodeAlloc;
     _ = sidecarBindingFromSnapshot;
     _ = validateSidecarBatchAgainstBinding;
+    _ = validateSidecarBatchSnapshotAgainstBinding;
+    _ = validateSidecarCandidateRowRefsAgainstBinding;
     _ = sameSidecarSourceSnapshot;
     _ = sidecarRowRefKeyAlloc;
     _ = sidecarRowRefKindForSourceKind;

@@ -164,6 +164,7 @@ pub const planProjectedLakeScanAlloc = lake_scan_plan.planProjectedScanAlloc;
 pub const validateLakeBindingInventory = lake_scan_plan.validateBindingInventory;
 pub const executeLakeRowsGroupByAlloc = lake_rows.executeGroupByAlloc;
 pub const hydrateLakeRowsAlloc = lake_rows.hydrateRowsAlloc;
+pub const hydrateLakeRowsForBindingAlloc = lake_rows.hydrateRowsForBindingAlloc;
 pub const scanLakeRowsAlloc = lake_rows.scanRowsAlloc;
 pub const searchIndexedPlanAlloc = indexed_reader.searchPlanAlloc;
 pub const searchIndexedPlanWithStatsAlloc = indexed_reader.searchPlanAllocWithStats;
@@ -326,6 +327,7 @@ test "serverless query module compiles" {
     _ = validateLakeBindingInventory;
     _ = executeLakeRowsGroupByAlloc;
     _ = hydrateLakeRowsAlloc;
+    _ = hydrateLakeRowsForBindingAlloc;
     _ = scanLakeRowsAlloc;
     _ = searchIndexedPlanAlloc;
     _ = searchIndexedPlanWithStatsAlloc;
