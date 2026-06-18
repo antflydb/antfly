@@ -1196,6 +1196,13 @@ fn postingBackendDeltaRecordLessThan(_: void, lhs: vectorindex_posting.PostingDe
     return lhs.vector_id < rhs.vector_id;
 }
 
+fn deinitOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
+    for (values) |maybe_value| {
+        if (maybe_value) |value| alloc.free(value);
+    }
+    alloc.free(values);
+}
+
 fn nextHbcClockVictim(
     clock_keys: []u64,
     clock_refs: []bool,
@@ -3623,6 +3630,25 @@ pub const HBCIndex = struct {
             if (try runtime.store.pendingBaseDataAlloc(self.alloc, posting_id)) |data| return data;
         }
         return (try runtime.store.snapshot().loadBaseData(self.alloc, posting_id)) orelse error.NotFound;
+    }
+
+    pub fn loadPostingBackendBaseDataBatch(self: *HBCIndex, txn: anytype, alloc: Allocator, posting_ids: []const u64) ![]?[]u8 {
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        const snapshot = runtime.store.snapshot();
+        const loaded = try snapshot.loadBaseDataBatchAlloc(alloc, posting_ids);
+        errdefer deinitOptionalOwnedBytes(alloc, loaded);
+
+        if (runtime.store.pendingPointEntries() != 0) {
+            for (posting_ids, 0..) |posting_id, i| {
+                const pending = (try runtime.store.pendingBaseDataAlloc(alloc, posting_id)) orelse continue;
+                if (loaded[i]) |committed| alloc.free(committed);
+                loaded[i] = pending;
+            }
+        }
+        return loaded;
     }
 
     pub fn loadPostingBackendCentroidDirectoryRecord(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) !vectorindex_posting.OwnedCentroidDirectoryRecord {

@@ -879,6 +879,58 @@ pub const LazyDirectorySnapshot = struct {
         return try self.readLatestPointValueAlloc(alloc, posting_id, .base);
     }
 
+    pub fn loadBaseDataBatchAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_ids: []const PostingId) ![]?[]u8 {
+        const out = try alloc.alloc(?[]u8, posting_ids.len);
+        @memset(out, null);
+        errdefer deinitOptionalByteSlices(alloc, out);
+        if (posting_ids.len == 0) return out;
+
+        const sorted_by_segment_id = self.manifest.segments_sorted_by_segment_id;
+        var best_segment_ids: []u64 = &.{};
+        if (!sorted_by_segment_id) {
+            best_segment_ids = try alloc.alloc(u64, posting_ids.len);
+            @memset(best_segment_ids, 0);
+        }
+        defer if (!sorted_by_segment_id) alloc.free(best_segment_ids);
+
+        var segment_index = self.manifest.segments.len;
+        while (segment_index > 0) {
+            segment_index -= 1;
+            const entry = self.manifest.segments[segment_index];
+            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+
+            var has_candidate = false;
+            for (posting_ids, 0..) |posting_id, i| {
+                if (sorted_by_segment_id and out[i] != null) continue;
+                if (!sorted_by_segment_id and best_segment_ids[i] >= entry.meta.segment_id) continue;
+                if (!entry.meta.mayContainPosting(posting_id)) continue;
+                has_candidate = true;
+                break;
+            }
+            if (!has_candidate) continue;
+
+            const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
+            var stack_index: [stack_index_max_bytes]u8 = undefined;
+            const index_data = try readSegmentIndexWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, &stack_index);
+            defer index_data.deinit(alloc);
+
+            for (posting_ids, 0..) |posting_id, i| {
+                if (sorted_by_segment_id and out[i] != null) continue;
+                if (!sorted_by_segment_id and best_segment_ids[i] >= entry.meta.segment_id) continue;
+                if (!entry.meta.mayContainPosting(posting_id)) continue;
+                const found = (try pointIndexEntryFromIndexData(index_data.data, entry.meta.entry_count, posting_id, .base)) orelse continue;
+                const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
+                if (!sorted_by_segment_id) {
+                    if (out[i]) |previous| alloc.free(previous);
+                }
+                out[i] = value;
+                if (!sorted_by_segment_id) best_segment_ids[i] = entry.meta.segment_id;
+            }
+        }
+
+        return out;
+    }
+
     pub fn loadCentroidDirectoryRecord(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedCentroidDirectoryRecord {
         const centroid_data = (try self.readLatestPointValueAlloc(alloc, posting_id, .centroid_directory)) orelse return null;
         defer alloc.free(centroid_data);
@@ -4184,6 +4236,13 @@ fn deinitCentroidRecordCandidates(alloc: Allocator, map: *std.AutoHashMapUnmanag
     while (iter.next()) |entry| entry.value_ptr.record.deinit(alloc);
 }
 
+fn deinitOptionalByteSlices(alloc: Allocator, values: []?[]u8) void {
+    for (values) |maybe_value| {
+        if (maybe_value) |value| alloc.free(value);
+    }
+    alloc.free(values);
+}
+
 fn centroidRecordCandidatesToOwnedSlice(
     alloc: Allocator,
     map: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
@@ -6755,6 +6814,15 @@ pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
     const header = (try snapshot.loadBaseHeader(alloc, 7)).?;
     try std.testing.expectEqual(@as(u64, 2), header.generation);
     try std.testing.expectEqual(@as(usize, 2), header.member_count);
+
+    const batch_ids = [_]PostingId{ 7, 8 };
+    const batch = try snapshot.loadBaseDataBatchAlloc(alloc, &batch_ids);
+    defer deinitOptionalByteSlices(alloc, batch);
+    const batch_base = batch[0] orelse return error.TestExpectedEqual;
+    const batch_header = try posting.PostingFormat.decodeBaseHeader(batch_base);
+    try std.testing.expectEqual(@as(u64, 2), batch_header.generation);
+    try std.testing.expectEqual(@as(usize, 2), batch_header.member_count);
+    try std.testing.expect(batch[1] == null);
 
     var centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
     defer centroid.deinit(alloc);

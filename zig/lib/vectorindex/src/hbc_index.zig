@@ -33,6 +33,7 @@ const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_search_probe_stack_capacity = 128;
+const flat_centroid_posting_prefetch_stack_capacity = 512;
 const bulk_parent_child_ids_stack_capacity = 256;
 
 fn debugHitFromApprox(item: search_results.ApproxSearchResult) search_types.DebugHit {
@@ -43,6 +44,13 @@ fn debugHitFromApprox(item: search_results.ApproxSearchResult) search_types.Debu
         .lower_bound = item.distance - item.error_bound,
         .upper_bound = item.distance + item.error_bound,
     };
+}
+
+fn deinitOptionalBaseDataBatch(alloc: Allocator, values: []?[]u8) void {
+    for (values) |maybe_value| {
+        if (maybe_value) |value| alloc.free(value);
+    }
+    alloc.free(values);
 }
 
 fn debugPairFromApprox(left: search_results.ApproxSearchResult, right: search_results.ApproxSearchResult) search_types.DebugPair {
@@ -2482,6 +2490,82 @@ pub fn classifyNodeForSplit(
     return try classifyNodeForSplitInTxn(self, &txn, node_id, split_key, is_not_found);
 }
 
+fn prefetchFlatProbePostingMembers(
+    self: anytype,
+    txn: anytype,
+    probes: []const spfresh_index.FlatCentroidProbe,
+    scratch: anytype,
+    profile: *search_types.SearchProfile,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+) !void {
+    const Index = comptime childType(@TypeOf(self));
+    const Scratch = comptime childType(@TypeOf(scratch));
+    if (comptime !@hasDecl(Index, "loadPostingBackendBaseDataBatch")) return;
+    if (comptime !@hasDecl(Scratch, "cachedCurrentPostingMembers") or
+        !@hasDecl(Scratch, "notePostingMemberCacheMiss") or
+        !@hasDecl(Scratch, "cachePostingMembers"))
+    {
+        return;
+    }
+    if (self.config.posting_storage_mode != .base_delta or self.config.posting_backend != .segments) return;
+    if (!scratch.posting_member_cache_admission_enabled or
+        scratch.max_posting_member_cache_bytes == 0 or
+        scratch.max_posting_member_cache_entry_bytes == 0)
+    {
+        return;
+    }
+
+    var ids_stack: [flat_centroid_posting_prefetch_stack_capacity]u64 = undefined;
+    var positions_stack: [flat_centroid_posting_prefetch_stack_capacity]usize = undefined;
+    const use_stack = probes.len <= ids_stack.len;
+    const ids = if (use_stack)
+        ids_stack[0..probes.len]
+    else
+        try self.alloc.alloc(u64, probes.len);
+    defer if (!use_stack) self.alloc.free(ids);
+    const positions = if (use_stack)
+        positions_stack[0..probes.len]
+    else
+        try self.alloc.alloc(usize, probes.len);
+    defer if (!use_stack) self.alloc.free(positions);
+
+    var prefetch_count: usize = 0;
+    for (probes, 0..) |probe, i| {
+        if (scratch.cachedCurrentPostingMembers(probe.posting_id, probe.state.mutation_version, 0) != null) continue;
+        try scratch.notePostingMemberCacheMiss(self.alloc, probe.posting_id);
+        ids[prefetch_count] = probe.posting_id;
+        positions[prefetch_count] = i;
+        prefetch_count += 1;
+    }
+    if (prefetch_count == 0) return;
+
+    const prefetch_start = now_fn_u64();
+    const loaded = try self.loadPostingBackendBaseDataBatch(txn, self.alloc, ids[0..prefetch_count]);
+    defer deinitOptionalBaseDataBatch(self.alloc, loaded);
+
+    for (loaded, 0..) |maybe_base_data, i| {
+        const base_data = maybe_base_data orelse continue;
+        const probe = probes[positions[i]];
+        const header = try posting.PostingFormat.decodeBaseHeader(base_data);
+        if (header.posting_id != probe.posting_id) return error.Corrupted;
+        if (header.generation < probe.state.mutation_version) continue;
+
+        const decode_start = now_fn_u64();
+        _ = try posting.PostingFormat.decodeBaseIntoScratch(self.alloc, scratch, base_data);
+        profile.posting_base_decode_ns += elapsed_fn_u64(decode_start);
+        profile.posting_base_decode_members += @intCast(header.member_count);
+
+        const members = scratch.member_ids[0..header.member_count];
+        const result = try scratch.cachePostingMembers(self.alloc, probe.posting_id, header.generation, probe.state.mutation_version, 0, members);
+        if (result.inserted) profile.posting_overlay_cache_misses += 1;
+        profile.posting_overlay_cache_evictions += result.evictions;
+        profile.posting_overlay_cache_admission_skips += result.admission_skips;
+        profile.posting_overlay_cache_member_bytes = result.member_bytes;
+    }
+    profile.posting_overlay_ns += elapsed_fn_u64(prefetch_start);
+}
+
 pub fn search(self: anytype, query: []const f32, k: usize, now_fn_u64: fn () u64, elapsed_fn_u64: fn (u64) u64) !search_results.SearchResults {
     const profiled = try searchProfiledRequest(self, .{ .query = query, .k = k }, now_fn_u64, elapsed_fn_u64);
     return profiled.results;
@@ -2599,6 +2683,8 @@ pub fn searchProfiledRequest(
             now_fn_u64,
             elapsed_fn_u64,
         );
+
+        try prefetchFlatProbePostingMembers(self, &txn, probes[0..probe_count], scratch, &profile, now_fn_u64, elapsed_fn_u64);
 
         const packed_bulk_ingest_session = self.config.posting_storage_mode == .packed_hbc and hasOpenBulkIngestSession(self);
         var flat_leaves_scored: usize = 0;
