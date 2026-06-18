@@ -878,6 +878,11 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
         } else if (std.mem.eql(u8, arg, "--ha-token-env")) {
             command_start += 1;
             options.remote_token_env = try value(argv, &command_start, "--ha-token-env");
+        } else if (std.mem.eql(u8, arg, "--ha-token") or
+            std.mem.eql(u8, arg, "--token") or
+            std.mem.eql(u8, arg, "--ha-token-file"))
+        {
+            return error.HAAdminRawTokenFlagUnsupported;
         } else if (std.mem.eql(u8, arg, "--primary-log")) {
             command_start += 1;
             options.primary_log = try value(argv, &command_start, "--primary-log");
@@ -1071,6 +1076,29 @@ test "ha cmd validates remote bearer token env name" {
     }));
     try std.testing.expectError(error.HAAdminTokenMissing, resolveRemoteBearerToken(alloc, .{
         .remote_token_env = "ANTFLY_HA_ADMIN_TOKEN_SHOULD_NOT_EXIST",
+    }));
+}
+
+test "ha cmd rejects raw bearer token argv flags" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.HAAdminRawTokenFlagUnsupported, parseLocalArgs(alloc, &.{
+        "--ha-url",   "http://127.0.0.1:8081",
+        "--ha-token", "secret-token",
+        "--",         "status",
+        "primary",
+    }));
+    try std.testing.expectError(error.HAAdminRawTokenFlagUnsupported, parseLocalArgs(alloc, &.{
+        "--ha-url", "http://127.0.0.1:8081",
+        "--token",  "secret-token",
+        "--",       "status",
+        "primary",
+    }));
+    try std.testing.expectError(error.HAAdminRawTokenFlagUnsupported, parseLocalArgs(alloc, &.{
+        "--ha-url",        "http://127.0.0.1:8081",
+        "--ha-token-file", "/run/secrets/ha-token",
+        "--",              "status",
+        "primary",
     }));
 }
 
