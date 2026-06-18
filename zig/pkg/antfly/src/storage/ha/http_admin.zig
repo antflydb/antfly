@@ -204,8 +204,7 @@ pub const Server = struct {
         const token = self.auth.bearer_token orelse return true;
         if (token.len == 0) return true;
         const authorization = req.authorization orelse req.header("authorization") orelse return false;
-        if (!std.mem.startsWith(u8, authorization, "Bearer ")) return false;
-        return std.mem.eql(u8, authorization["Bearer ".len..], token);
+        return bearerAuthorizationMatches(token, authorization);
     }
 
     fn replicationSlotNameFromPath(self: *Server, path: []const u8, suffix: []const u8) !?[]u8 {
@@ -917,6 +916,23 @@ pub const Server = struct {
         return null;
     }
 };
+
+const bearer_prefix = "Bearer ";
+
+fn bearerAuthorizationMatches(expected_token: []const u8, authorization: []const u8) bool {
+    if (!std.mem.startsWith(u8, authorization, bearer_prefix)) return false;
+    const provided_token = authorization[bearer_prefix.len..];
+    return timingSafeEql(expected_token, provided_token);
+}
+
+fn timingSafeEql(expected: []const u8, provided: []const u8) bool {
+    if (expected.len != provided.len) return false;
+    var diff: u8 = 0;
+    for (expected, provided) |expected_byte, provided_byte| {
+        diff |= expected_byte ^ provided_byte;
+    }
+    return diff == 0;
+}
 
 fn legacyCommandEndpointAllowed(command: admin_cli.Command, output: admin_cli.OutputFormat) bool {
     if (output == .prometheus) return false;
@@ -2571,6 +2587,16 @@ test "storage.ha http admin enforces optional bearer token on typed admin routes
     defer authorized.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), authorized.status);
     try expectContains(authorized.body, "PrimaryUnavailable");
+}
+
+test "storage.ha http admin bearer authorization requires exact token" {
+    try std.testing.expect(bearerAuthorizationMatches("secret-token", "Bearer secret-token"));
+    try std.testing.expect(!bearerAuthorizationMatches("secret-token", "bearer secret-token"));
+    try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Token secret-token"));
+    try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-xoken"));
+    try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-token "));
+    try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret"));
+    try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-token-extra"));
 }
 
 test "storage.ha http admin rejects invalid fence request identity and bounds" {
