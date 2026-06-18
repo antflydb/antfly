@@ -572,7 +572,9 @@ class TestAntflyClient:
             ]
         }
         assert RowsWhereBranchAtom.from_dict(branch_atom.to_dict()).op == RowsWhereBranchAtomOp.GT
-        assert RowsWhereBranchAtom.from_dict(structured_branch_atom.to_dict()).op == RowsWhereBranchAtomOp.ARRAY_CONTAINS
+        assert (
+            RowsWhereBranchAtom.from_dict(structured_branch_atom.to_dict()).op == RowsWhereBranchAtomOp.ARRAY_CONTAINS
+        )
         assert RowsWhereBranchAll.from_dict(branch_all.to_dict()).all_[0].field == "tier"
         assert RowsWhereBranchAll.from_dict(branch_all.to_dict()).all_[1].op == RowsWhereAtomOp.JSON_PATH_EQ
 
