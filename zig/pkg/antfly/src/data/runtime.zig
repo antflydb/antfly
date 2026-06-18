@@ -1511,6 +1511,33 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     EndOfStream,
     UnexpectedHttpStatus,
     NotListening,
+    UnsupportedReplicationFormat,
+    ReplicationResponseLsnMismatch,
+    ReplicationResponseEndOfWalMismatch,
+    ReplicationFrameLsnMismatch,
+    UnexpectedRecordLsn,
+    UnexpectedPreviousLsn,
+    RecordAlreadyReceived,
+    ConflictingReceivedRecord,
+    MissingReceivedRecord,
+    WrongCluster,
+    WrongShard,
+    WrongTable,
+    WrongTimeline,
+    WrongEpoch,
+    InvalidTimelineSwitch,
+    HAReplicationRecordMissingTableId,
+    HAReplicationRecordMissingShardId,
+    HAReplicationRecordUnknownTable,
+    HAReplicationRecordUnknownShard,
+    HAReplicationRecordApplyUnsupported,
+    UnsupportedBatchMutationCodec,
+    UnsupportedBatchMutationPayloadVersion,
+    UnsupportedRecordKind,
+    UnsupportedPayloadCodec,
+    InvalidMagic,
+    HeaderCrcMismatch,
+    PayloadCrcMismatch,
     Other,
 };
 
@@ -1523,6 +1550,33 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.EndOfStream => .EndOfStream,
         error.UnexpectedHttpStatus => .UnexpectedHttpStatus,
         error.NotListening => .NotListening,
+        error.UnsupportedReplicationFormat => .UnsupportedReplicationFormat,
+        error.ReplicationResponseLsnMismatch => .ReplicationResponseLsnMismatch,
+        error.ReplicationResponseEndOfWalMismatch => .ReplicationResponseEndOfWalMismatch,
+        error.ReplicationFrameLsnMismatch => .ReplicationFrameLsnMismatch,
+        error.UnexpectedRecordLsn => .UnexpectedRecordLsn,
+        error.UnexpectedPreviousLsn => .UnexpectedPreviousLsn,
+        error.RecordAlreadyReceived => .RecordAlreadyReceived,
+        error.ConflictingReceivedRecord => .ConflictingReceivedRecord,
+        error.MissingReceivedRecord => .MissingReceivedRecord,
+        error.WrongCluster => .WrongCluster,
+        error.WrongShard => .WrongShard,
+        error.WrongTable => .WrongTable,
+        error.WrongTimeline => .WrongTimeline,
+        error.WrongEpoch => .WrongEpoch,
+        error.InvalidTimelineSwitch => .InvalidTimelineSwitch,
+        error.HAReplicationRecordMissingTableId => .HAReplicationRecordMissingTableId,
+        error.HAReplicationRecordMissingShardId => .HAReplicationRecordMissingShardId,
+        error.HAReplicationRecordUnknownTable => .HAReplicationRecordUnknownTable,
+        error.HAReplicationRecordUnknownShard => .HAReplicationRecordUnknownShard,
+        error.HAReplicationRecordApplyUnsupported => .HAReplicationRecordApplyUnsupported,
+        error.UnsupportedBatchMutationCodec => .UnsupportedBatchMutationCodec,
+        error.UnsupportedBatchMutationPayloadVersion => .UnsupportedBatchMutationPayloadVersion,
+        error.UnsupportedRecordKind => .UnsupportedRecordKind,
+        error.UnsupportedPayloadCodec => .UnsupportedPayloadCodec,
+        error.InvalidMagic => .InvalidMagic,
+        error.HeaderCrcMismatch => .HeaderCrcMismatch,
+        error.PayloadCrcMismatch => .PayloadCrcMismatch,
         else => .Other,
     };
 }
@@ -1537,7 +1591,86 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .EndOfStream => "EndOfStream",
         .UnexpectedHttpStatus => "UnexpectedHttpStatus",
         .NotListening => "NotListening",
+        .UnsupportedReplicationFormat => "UnsupportedReplicationFormat",
+        .ReplicationResponseLsnMismatch => "ReplicationResponseLsnMismatch",
+        .ReplicationResponseEndOfWalMismatch => "ReplicationResponseEndOfWalMismatch",
+        .ReplicationFrameLsnMismatch => "ReplicationFrameLsnMismatch",
+        .UnexpectedRecordLsn => "UnexpectedRecordLsn",
+        .UnexpectedPreviousLsn => "UnexpectedPreviousLsn",
+        .RecordAlreadyReceived => "RecordAlreadyReceived",
+        .ConflictingReceivedRecord => "ConflictingReceivedRecord",
+        .MissingReceivedRecord => "MissingReceivedRecord",
+        .WrongCluster => "WrongCluster",
+        .WrongShard => "WrongShard",
+        .WrongTable => "WrongTable",
+        .WrongTimeline => "WrongTimeline",
+        .WrongEpoch => "WrongEpoch",
+        .InvalidTimelineSwitch => "InvalidTimelineSwitch",
+        .HAReplicationRecordMissingTableId => "HAReplicationRecordMissingTableId",
+        .HAReplicationRecordMissingShardId => "HAReplicationRecordMissingShardId",
+        .HAReplicationRecordUnknownTable => "HAReplicationRecordUnknownTable",
+        .HAReplicationRecordUnknownShard => "HAReplicationRecordUnknownShard",
+        .HAReplicationRecordApplyUnsupported => "HAReplicationRecordApplyUnsupported",
+        .UnsupportedBatchMutationCodec => "UnsupportedBatchMutationCodec",
+        .UnsupportedBatchMutationPayloadVersion => "UnsupportedBatchMutationPayloadVersion",
+        .UnsupportedRecordKind => "UnsupportedRecordKind",
+        .UnsupportedPayloadCodec => "UnsupportedPayloadCodec",
+        .InvalidMagic => "InvalidMagic",
+        .HeaderCrcMismatch => "HeaderCrcMismatch",
+        .PayloadCrcMismatch => "PayloadCrcMismatch",
         .Other => "Other",
+    };
+}
+
+fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        error.NotListening,
+        error.UnsupportedReplicationFormat,
+        error.InternalReplicationDidNotAdvance,
+        error.ReplicationResponseLsnMismatch,
+        error.ReplicationResponseEndOfWalMismatch,
+        error.ReplicationFrameLsnMismatch,
+        error.UnexpectedRecordLsn,
+        error.UnexpectedPreviousLsn,
+        error.RecordAlreadyReceived,
+        error.ConflictingReceivedRecord,
+        error.MissingReceivedRecord,
+        error.WrongCluster,
+        error.WrongShard,
+        error.WrongTable,
+        error.WrongTimeline,
+        error.WrongEpoch,
+        error.NonMonotonicTimeline,
+        error.InvalidTimelineSwitch,
+        error.TimelineSwitchRequiresAppliedProgress,
+        error.HAReplicationRecordMissingTableId,
+        error.HAReplicationRecordMissingShardId,
+        error.HAReplicationRecordUnknownTable,
+        error.HAReplicationRecordUnknownShard,
+        error.HAReplicationRecordApplyUnsupported,
+        error.NotBatchMutationRecord,
+        error.UnsupportedBatchMutationCodec,
+        error.UnsupportedBatchMutationPayloadVersion,
+        error.NotMetadataMutationRecord,
+        error.UnsupportedMetadataMutationCodec,
+        error.UnsupportedMetadataMutationPayloadVersion,
+        error.UnsupportedMetadataMutationKind,
+        error.UnsupportedRecordKind,
+        error.UnsupportedPayloadCodec,
+        error.UnsupportedVersion,
+        error.UnsupportedHeaderLength,
+        error.InvalidMagic,
+        error.HeaderCrcMismatch,
+        error.PayloadCrcMismatch,
+        error.TrailingBytes,
+        => true,
+        else => false,
     };
 }
 
@@ -2397,17 +2530,8 @@ pub const DataServer = struct {
             self.runHAStandbyReplicationRound() catch |err| {
                 _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
                 self.recordHAStandbyReplicationError(err);
-                switch (err) {
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    error.UnexpectedHttpStatus,
-                    error.NotListening,
-                    => std.log.warn("HA standby replication round skipped err={}", .{err}),
-                    else => return err,
-                }
+                if (!isNonFatalHAStandbyReplicationError(err)) return err;
+                std.log.warn("HA standby replication round skipped err={}", .{err});
                 break :blk false;
             };
             break :blk true;
@@ -15164,6 +15288,150 @@ test "data runtime records HA standby replication round failures" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_failures_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_attempt_ns ") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_success_ns 0\n") != null);
+}
+
+test "data runtime records HA standby apply failures without stopping run round" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    const identity: antfly.ha.primary.Identity = .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try antfly.ha.effects.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:missing-table", .value = "{\"title\":\"missing-table\"}" }},
+        .sync_level = .write,
+    }, .{});
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var primary_internal = antfly.ha.http_internal.Server.init(alloc, &primary);
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .options = .{ .max_records = 1 },
+                .executor = primary_internal.executor(),
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+
+    try server.runRound();
+    try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+    try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_last_success_ns.load(.acquire));
+
+    const progress = standby.currentProgress();
+    try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), progress.applied_lsn);
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+
+    var admin_status = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_standby_status,
+    });
+    defer admin_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"HAReplicationRecordMissingTableId\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":1") != null);
 }
 
 test "data runtime lsm maintenance scheduler defers under resource pressure" {

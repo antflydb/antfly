@@ -634,6 +634,8 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
         .max_retention_lag_lsn = max_retention_lag_lsn,
         .retention_oldest_restart_lsn = try u64FromI64(snapshot.retention.oldest_restart_lsn),
         .retention_retained_lsn_count = try u64FromI64(snapshot.retention.retained_lsn_count),
+        .retention_retained_byte_count = try u64FromI64(snapshot.retention.retained_byte_count),
+        .retention_retained_age_ns = try u64FromI64(snapshot.retention.retained_age_ns),
         .retention_active_slots = try u64FromI64(snapshot.retention.active_slots),
         .retention_reseed_recommended = try u64FromI64(snapshot.retention.reseed_recommended),
         .durability_configured = boolGauge(durability != null),
