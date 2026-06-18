@@ -238,6 +238,7 @@ pub const SequenceOwnedBy = ddl_plan.SequenceOwnedBy;
 pub const SubscriptionCatalogPlan = ddl_plan.SubscriptionCatalogPlan;
 pub const TableCloneOptions = ddl_plan.TableCloneOptions;
 pub const TableClonePlan = ddl_plan.TableClonePlan;
+pub const parseCreateTableCloneCatalogTailAlloc = grammar.parseCreateTableCloneCatalogTailAlloc;
 pub const TablePartitionBounds = ddl_plan.TablePartitionBounds;
 pub const TablePartitionCatalogPlan = ddl_plan.TablePartitionCatalogPlan;
 pub const TablePartitionMethod = ddl_plan.TablePartitionMethod;

@@ -1109,7 +1109,8 @@ comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
 drop-catalog grammar for `DROP TABLE`, `DROP TABLE IF EXISTS`, `DROP INDEX`,
 `DROP INDEX CONCURRENTLY`, `DROP VIEW`, and `DROP MATERIALIZED VIEW`,
 view catalog grammar for `CREATE VIEW`, `CREATE MATERIALIZED VIEW`,
-`ALTER VIEW ... RENAME TO`, and `REFRESH MATERIALIZED VIEW`,
+`ALTER VIEW ... RENAME TO`, `REFRESH MATERIALIZED VIEW`, and table-clone
+grammar for `CREATE TABLE ... (LIKE source INCLUDING ...)`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -4598,7 +4599,8 @@ target schema, honor the `IF NOT EXISTS` target identity check before scheduling
 work, create the table generation with the requested target lifetime, run a
 bounded insert-source or backfill job from the typed source query, record
 progress by owner range, and promote the populated generation atomically.
-`CREATE TABLE ... (LIKE source INCLUDING ...)` lowers to a native
+`CREATE TABLE ... (LIKE source INCLUDING ...)` parses in the SQL adapter
+grammar and lowers to a native
 `table_clone` catalog intent with explicit target table, source table,
 `IF NOT EXISTS`, and clone-option metadata for columns, defaults, generated
 expressions, checks, constraints, indexes, periods, and update policies. The

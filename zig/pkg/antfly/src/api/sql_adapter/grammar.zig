@@ -518,6 +518,9 @@ pub const DropIndexSyntax = struct {
     }
 };
 
+pub const TableClonePlan = ddl_plan.TableClonePlan;
+pub const TableCloneOptions = ddl_plan.TableCloneOptions;
+
 pub const CreateViewSyntax = struct {
     view_name: []const u8,
     source_table_name: []const u8,
@@ -2427,6 +2430,90 @@ pub fn parseDropIndexCatalogTailAlloc(
     try parseAdapterNoopStatementEnd(cursor);
     index_transferred = true;
     return .{ .index_name = index_name, .if_exists = if_exists };
+}
+
+pub fn parseCreateTableCloneCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !TableClonePlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("temporary") or cursor.matchKeyword("temp") or cursor.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("table");
+    const if_not_exists = try parseOptionalIfNotExists(cursor);
+
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_name_transferred = false;
+    errdefer if (!table_name_transferred) alloc.free(table_name);
+    try cursor.expectToken(.lparen);
+    try cursor.expectKeyword("like");
+    const source_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var source_transferred = false;
+    errdefer if (!source_transferred) alloc.free(source_table_name);
+
+    var options: TableCloneOptions = .{};
+    while (!cursor.atEnd() and !cursor.peekKind(.rparen)) {
+        const include = if (cursor.matchKeyword("including"))
+            true
+        else if (cursor.matchKeyword("excluding"))
+            false
+        else
+            return error.UnsupportedSqlShape;
+        try parseTableCloneOption(cursor, &options, include);
+    }
+    try cursor.expectToken(.rparen);
+    try parseAdapterNoopStatementEnd(cursor);
+
+    table_name_transferred = true;
+    source_transferred = true;
+    return .{
+        .table_name = table_name,
+        .source_table_name = source_table_name,
+        .if_not_exists = if_not_exists,
+        .options = options,
+    };
+}
+
+fn parseTableCloneOption(cursor: parser.Cursor, options: *TableCloneOptions, include: bool) !void {
+    if (cursor.matchKeyword("all")) {
+        options.* = if (include) TableCloneOptions.includingAll() else .{};
+        return;
+    }
+    if (cursor.matchKeyword("defaults")) {
+        options.defaults = include;
+        return;
+    }
+    if (cursor.matchKeyword("generated")) {
+        options.generated = include;
+        return;
+    }
+    if (cursor.matchKeyword("constraints")) {
+        options.checks = include;
+        options.constraints = include;
+        return;
+    }
+    if (cursor.matchKeyword("indexes")) {
+        options.indexes = include;
+        return;
+    }
+    if (cursor.matchKeyword("periods")) {
+        options.periods = include;
+        return;
+    }
+    if (cursor.matchKeyword("update")) {
+        try cursor.expectKeyword("policies");
+        options.update_policies = include;
+        return;
+    }
+    if (cursor.matchKeyword("comments") or
+        cursor.matchKeyword("storage") or
+        cursor.matchKeyword("statistics") or
+        cursor.matchKeyword("compression") or
+        cursor.matchKeyword("identity"))
+    {
+        return;
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn parseCreateViewCatalogTailAlloc(
@@ -4731,6 +4818,42 @@ test "sql adapter grammar parses drop table and index catalog tails" {
     defer lexer.freeTokens(alloc, &multi_table_tokens);
     var multi_table_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseDropTableCatalogTailAlloc(alloc, multi_table_tokens.items, &multi_table_pos));
+}
+
+test "sql adapter grammar parses table clone catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var clone_tokens = try lexer.tokenizeAlloc(alloc, "TABLE IF NOT EXISTS public.usage_records_copy (LIKE public.usage_records INCLUDING ALL EXCLUDING COMMENTS EXCLUDING INDEXES INCLUDING UPDATE POLICIES);");
+    defer lexer.freeTokens(alloc, &clone_tokens);
+    var clone_pos: usize = 0;
+    var clone = try parseCreateTableCloneCatalogTailAlloc(alloc, clone_tokens.items, &clone_pos);
+    defer clone.deinit(alloc);
+    try std.testing.expectEqual(clone_tokens.items.len, clone_pos);
+    try std.testing.expectEqualStrings("usage_records_copy", clone.table_name);
+    try std.testing.expectEqualStrings("usage_records", clone.source_table_name);
+    try std.testing.expect(clone.if_not_exists);
+    try std.testing.expect(clone.options.defaults);
+    try std.testing.expect(clone.options.generated);
+    try std.testing.expect(clone.options.checks);
+    try std.testing.expect(clone.options.constraints);
+    try std.testing.expect(!clone.options.indexes);
+    try std.testing.expect(clone.options.periods);
+    try std.testing.expect(clone.options.update_policies);
+
+    var minimal_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records_copy (LIKE usage_records);");
+    defer lexer.freeTokens(alloc, &minimal_tokens);
+    var minimal_pos: usize = 0;
+    var minimal = try parseCreateTableCloneCatalogTailAlloc(alloc, minimal_tokens.items, &minimal_pos);
+    defer minimal.deinit(alloc);
+    try std.testing.expectEqual(minimal_tokens.items.len, minimal_pos);
+    try std.testing.expect(!minimal.if_not_exists);
+    try std.testing.expect(!minimal.options.defaults);
+    try std.testing.expect(!minimal.options.constraints);
+
+    var temporary_tokens = try lexer.tokenizeAlloc(alloc, "TEMPORARY TABLE usage_records_copy (LIKE usage_records);");
+    defer lexer.freeTokens(alloc, &temporary_tokens);
+    var temporary_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTableCloneCatalogTailAlloc(alloc, temporary_tokens.items, &temporary_pos));
 }
 
 test "sql adapter grammar parses view catalog tails" {

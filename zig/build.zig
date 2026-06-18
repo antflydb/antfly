@@ -3828,6 +3828,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter grammar parses domain catalog tails",
             "sql adapter grammar parses comment metadata catalog tails",
             "sql adapter grammar parses drop table and index catalog tails",
+            "sql adapter grammar parses table clone catalog tails",
             "sql adapter grammar parses view catalog tails",
             "derive initial ranges",
             "table catalog identity",
