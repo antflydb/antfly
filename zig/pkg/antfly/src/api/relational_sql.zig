@@ -4352,29 +4352,11 @@ const Parser = struct {
     }
 
     fn parseIdentifierListAlloc(self: *@This()) ![]const []const u8 {
-        var out = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (out.items) |item| self.alloc.free(item);
-            out.deinit(self.alloc);
-        }
-        while (true) {
-            try out.append(self.alloc, try self.parseIdentifierOwned());
-            if (self.match(.comma) == null) break;
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try sql_adapter.parseIdentifierListAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseSqlObjectIdentifierListAlloc(self: *@This()) ![]const []const u8 {
-        var out = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (out.items) |item| self.alloc.free(item);
-            out.deinit(self.alloc);
-        }
-        while (true) {
-            try out.append(self.alloc, try self.parseSqlObjectIdentifierOwned());
-            if (self.match(.comma) == null) break;
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try sql_adapter.parseSqlObjectIdentifierListAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseSqlOperatorNameOwned(self: *@This()) ![]const u8 {
@@ -34455,18 +34437,15 @@ const Parser = struct {
     }
 
     fn parseIdentifierOwned(self: *@This()) ![]const u8 {
-        const token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        return try self.alloc.dupe(u8, token.text);
+        return try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseSqlObjectIdentifierOwned(self: *@This()) ![]const u8 {
-        const token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        return try normalizeSqlObjectIdentifierAlloc(self.alloc, token.text);
+        return try sql_adapter.parseSqlObjectIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseSqlTableReferenceIdentifierOwned(self: *@This()) ![]const u8 {
-        _ = self.matchKeyword("only");
-        return try self.parseSqlObjectIdentifierOwned();
+        return try sql_adapter.parseSqlTableReferenceIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseJsonPathOwned(self: *@This()) ![]const u8 {

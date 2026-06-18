@@ -348,6 +348,67 @@ pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: [
     return try alloc.dupe(u8, object_name);
 }
 
+pub fn parseIdentifierOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, token.text);
+}
+
+pub fn parseIdentifierListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (out.items) |item| alloc.free(item);
+        out.deinit(alloc);
+    }
+    while (true) {
+        try out.append(alloc, try parseIdentifierOwnedAlloc(alloc, tokens, pos));
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseSqlObjectIdentifierOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
+    return try normalizeSqlObjectIdentifierAlloc(alloc, token.text);
+}
+
+pub fn parseSqlObjectIdentifierListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (out.items) |item| alloc.free(item);
+        out.deinit(alloc);
+    }
+    while (true) {
+        try out.append(alloc, try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos));
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseSqlTableReferenceIdentifierOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    _ = parser.matchKeyword(tokens, pos, "only");
+    return try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+}
+
 fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
     if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
     const path = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
@@ -888,4 +949,48 @@ test "sql adapter grammar normalizes public object identifiers" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, ".usage_records"));
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public."));
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public.analytics.usage_records"));
+}
+
+test "sql adapter grammar parses owned identifiers and normalized object lists" {
+    const alloc = std.testing.allocator;
+
+    var identifiers = try lexer.tokenizeAlloc(alloc, "tenant_id, order_id, status");
+    defer lexer.freeTokens(alloc, &identifiers);
+    var identifier_pos: usize = 0;
+    const identifier_list = try parseIdentifierListAlloc(alloc, identifiers.items, &identifier_pos);
+    defer {
+        for (identifier_list) |item| alloc.free(item);
+        alloc.free(identifier_list);
+    }
+    try std.testing.expectEqual(identifiers.items.len, identifier_pos);
+    try std.testing.expectEqual(@as(usize, 3), identifier_list.len);
+    try std.testing.expectEqualStrings("tenant_id", identifier_list[0]);
+    try std.testing.expectEqualStrings("order_id", identifier_list[1]);
+    try std.testing.expectEqualStrings("status", identifier_list[2]);
+
+    var objects = try lexer.tokenizeAlloc(alloc, "public.usage_records, tenant_1.audit_records");
+    defer lexer.freeTokens(alloc, &objects);
+    var object_pos: usize = 0;
+    const object_list = try parseSqlObjectIdentifierListAlloc(alloc, objects.items, &object_pos);
+    defer {
+        for (object_list) |item| alloc.free(item);
+        alloc.free(object_list);
+    }
+    try std.testing.expectEqual(objects.items.len, object_pos);
+    try std.testing.expectEqual(@as(usize, 2), object_list.len);
+    try std.testing.expectEqualStrings("usage_records", object_list[0]);
+    try std.testing.expectEqualStrings("tenant_1.audit_records", object_list[1]);
+
+    var table_ref = try lexer.tokenizeAlloc(alloc, "ONLY public.usage_records");
+    defer lexer.freeTokens(alloc, &table_ref);
+    var table_pos: usize = 0;
+    const table_name = try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, table_ref.items, &table_pos);
+    defer alloc.free(table_name);
+    try std.testing.expectEqual(table_ref.items.len, table_pos);
+    try std.testing.expectEqualStrings("usage_records", table_name);
+
+    var invalid = try lexer.tokenizeAlloc(alloc, "usage_records,");
+    defer lexer.freeTokens(alloc, &invalid);
+    var invalid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseIdentifierListAlloc(alloc, invalid.items, &invalid_pos));
 }
