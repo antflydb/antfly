@@ -3642,6 +3642,7 @@ pub const HBCIndex = struct {
         const runtime = try self.postingSegmentRuntime();
         const committed = try runtime.store.snapshot().loadDeltaTail(self.alloc, posting_id);
         errdefer self.alloc.free(committed);
+        if (runtime.store.pendingDeltaRecords() == 0) return committed;
         const pending = try runtime.store.pendingDeltaTailAlloc(self.alloc, posting_id, null);
         defer self.alloc.free(pending);
         if (pending.len == 0) return committed;
@@ -3659,6 +3660,7 @@ pub const HBCIndex = struct {
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         var out = try runtime.store.snapshot().deltaTailStats(self.alloc, posting_id, base_generation);
+        if (runtime.store.pendingDeltaRecords() == 0) return out;
         const pending = try runtime.store.pendingDeltaTailStats(posting_id, base_generation);
         out.records += pending.records;
         out.records_after_generation += pending.records_after_generation;
@@ -3707,12 +3709,14 @@ pub const HBCIndex = struct {
             base_generation,
             scratch,
         );
-        _ = try runtime.store.appendPendingDeltaTailIntoScratchWithStats(
-            alloc,
-            posting_id,
-            base_generation,
-            scratch,
-        );
+        if (runtime.store.pendingDeltaRecords() != 0) {
+            _ = try runtime.store.appendPendingDeltaTailIntoScratchWithStats(
+                alloc,
+                posting_id,
+                base_generation,
+                scratch,
+            );
+        }
         return try applyPostingSegmentDeltaScratchIntoScratch(
             alloc,
             scratch,
@@ -3735,7 +3739,9 @@ pub const HBCIndex = struct {
             defer pending_base.deinit(self.alloc);
             scratch.resetDeltaRecords();
             _ = try snapshot.appendDeltaTailAfterGenerationIntoScratchWithStats(self.alloc, posting_id, pending_base.generation, &scratch);
-            _ = try runtime.store.appendPendingDeltaTailIntoScratchWithStats(self.alloc, posting_id, pending_base.generation, &scratch);
+            if (runtime.store.pendingDeltaRecords() != 0) {
+                _ = try runtime.store.appendPendingDeltaTailIntoScratchWithStats(self.alloc, posting_id, pending_base.generation, &scratch);
+            }
             const member_count = try materializePostingSegmentFoldScratchIntoMembers(
                 self.alloc,
                 &scratch,
@@ -3751,7 +3757,9 @@ pub const HBCIndex = struct {
         var member_count = base_header.member_count;
         scratch.resetDeltaRecords();
         _ = try snapshot.appendDeltaTailAfterGenerationIntoScratchWithStats(self.alloc, posting_id, base_header.generation, &scratch);
-        _ = try runtime.store.appendPendingDeltaTailIntoScratchWithStats(self.alloc, posting_id, base_header.generation, &scratch);
+        if (runtime.store.pendingDeltaRecords() != 0) {
+            _ = try runtime.store.appendPendingDeltaTailIntoScratchWithStats(self.alloc, posting_id, base_header.generation, &scratch);
+        }
         _ = try applyPostingSegmentDeltaScratchIntoScratch(
             self.alloc,
             &scratch,
@@ -3794,15 +3802,17 @@ pub const HBCIndex = struct {
             base_header.generation,
             &scratch,
         );
-        accumulatePostingSegmentDeltaTailStats(
-            &tail_stats,
-            try runtime.store.appendPendingDeltaTailIntoScratchWithStats(
-                self.alloc,
-                posting_id,
-                base_header.generation,
-                &scratch,
-            ),
-        );
+        if (runtime.store.pendingDeltaRecords() != 0) {
+            accumulatePostingSegmentDeltaTailStats(
+                &tail_stats,
+                try runtime.store.appendPendingDeltaTailIntoScratchWithStats(
+                    self.alloc,
+                    posting_id,
+                    base_header.generation,
+                    &scratch,
+                ),
+            );
+        }
         if (!postingSegmentTailShouldFold(base_header.member_count, tail_stats, options) or
             postingSegmentTailExceedsMaterializedLimit(base_header.member_count, tail_stats, options))
         {
