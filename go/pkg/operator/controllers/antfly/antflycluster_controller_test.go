@@ -5126,6 +5126,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 			observedTypedURL = req.URL.String()
 			query := req.URL.Query()
 			g.Expect(query.Get("max_lag_lsn")).To(Equal("50"))
+			g.Expect(query.Get("max_retained_bytes")).To(Equal("4096"))
 			g.Expect(query.Get("sync_mode")).To(Equal("remote-apply"))
 			g.Expect(query.Get("sync_selection")).To(Equal("first"))
 			g.Expect(query.Get("sync_required")).To(Equal("1"))
@@ -5146,7 +5147,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 				Admin: &antflyv1.HAAdminSpec{
 					PrimaryURL: "http://primary-ha.default.svc:8081",
 				},
-				Retention: &antflyv1.HARetentionPolicy{MaxLagLSN: 50},
+				Retention: &antflyv1.HARetentionPolicy{MaxLagLSN: 50, MaxRetainedBytes: 4096},
 				SyncPolicy: &antflyv1.HASyncPolicy{
 					Mode:          antflyv1.HADurabilityModeRemoteApply,
 					Selection:     antflyv1.HAStandbySelectionFirst,
@@ -7937,7 +7938,8 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			},
 		},
 		Retention: &antflyv1.HARetentionPolicy{
-			MaxLagLSN: 50,
+			MaxLagLSN:        50,
+			MaxRetainedBytes: 4096,
 		},
 		SyncPolicy: &antflyv1.HASyncPolicy{
 			Mode:          antflyv1.HADurabilityModeRemoteApply,
@@ -7961,6 +7963,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/primary.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-lag-lsn 50`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-retained-bytes 4096`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-cluster-id 100`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-shard-id 10`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-table-id 20`))
@@ -8011,6 +8014,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/custom/former-primary.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-lag-lsn`))
+	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-retained-bytes`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-upstream-url 'http://primary.default.svc:8080'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-slot 'standby-a'`))
 	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{

@@ -66,6 +66,7 @@ const CliConfig = struct {
     ha_former_primary_log: ?[]const u8 = null,
     ha_admin_token_env: ?[]const u8 = null,
     ha_retention_max_lag_lsn: ?u64 = null,
+    ha_retention_max_retained_bytes: ?u64 = null,
     ha_sync_mode: ?antfly.ha.primary.DurabilityMode = null,
     ha_sync_selection: ?antfly.ha.primary.StandbySelection = null,
     ha_sync_required: ?usize = null,
@@ -1846,6 +1847,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_retention_max_lag_lsn = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-retention-max-retained-bytes")) {
+            cfg.ha_retention_max_retained_bytes = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-sync-mode")) {
             cfg.ha_sync_mode = try parseHASyncDurabilityMode(args.next() orelse return error.InvalidArguments);
             continue;
@@ -2087,7 +2092,8 @@ fn haSyncPolicyRequested(cli: CliConfig) bool {
 }
 
 fn haRetentionPolicyRequested(cli: CliConfig) bool {
-    return cli.ha_retention_max_lag_lsn != null;
+    return cli.ha_retention_max_lag_lsn != null or
+        cli.ha_retention_max_retained_bytes != null;
 }
 
 fn validateHARole(cli: CliConfig) !void {
@@ -2158,7 +2164,10 @@ fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPol
 fn haRetentionPolicyFromCli(cli: CliConfig) !antfly.ha.slot_store.RetentionPolicy {
     if (!haRetentionPolicyRequested(cli)) return .{};
     if (!haPrimaryRequested(cli)) return error.HARetentionPolicyRequiresPrimary;
-    return .{ .max_lag_lsn = cli.ha_retention_max_lag_lsn.? };
+    return .{
+        .max_lag_lsn = cli.ha_retention_max_lag_lsn orelse 0,
+        .max_retained_bytes = cli.ha_retention_max_retained_bytes orelse 0,
+    };
 }
 
 fn validateHASyncPolicy(policy: antfly.ha.primary.SyncPolicy) !void {
@@ -2360,6 +2369,7 @@ fn printUsage() void {
         \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
         \\  --ha-admin-token-env <name>           Require Authorization: Bearer token from this environment variable for /admin/v1/ha
         \\  --ha-retention-max-lag-lsn <n>        HA primary marks slots reseed-required after this LSN retention lag
+        \\  --ha-retention-max-retained-bytes <n> HA primary marks oldest slots reseed-required above this retained WAL byte cap
         \\  --ha-sync-mode <mode>                 HA primary sync mode: async, remote-write, remote-apply
         \\  --ha-sync-selection <selection>       HA sync standby selection: any, first, all
         \\  --ha-sync-required <n>                HA sync required standby acknowledgements
@@ -2664,6 +2674,8 @@ test "parse cli accepts HA primary runtime flags" {
         "ANTFLY_HA_ADMIN_TOKEN",
         "--ha-retention-max-lag-lsn",
         "500",
+        "--ha-retention-max-retained-bytes",
+        "8192",
         "--ha-cluster-id",
         "100",
         "--ha-shard-id",
@@ -2686,6 +2698,7 @@ test "parse cli accepts HA primary runtime flags" {
     try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_former_primary_log.?);
     try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cfg.ha_admin_token_env.?);
     try std.testing.expectEqual(@as(u64, 500), cfg.ha_retention_max_lag_lsn.?);
+    try std.testing.expectEqual(@as(u64, 8192), cfg.ha_retention_max_retained_bytes.?);
     try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
@@ -2751,6 +2764,8 @@ test "parse cli accepts HA primary retention policy flags" {
         "/tmp/ha-fence.wal",
         "--ha-retention-max-lag-lsn",
         "50",
+        "--ha-retention-max-retained-bytes",
+        "4096",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
@@ -2759,6 +2774,7 @@ test "parse cli accepts HA primary retention policy flags" {
     try validateHARole(cfg);
     const retention_policy = try haRetentionPolicyFromCli(cfg);
     try std.testing.expectEqual(@as(u64, 50), retention_policy.max_lag_lsn);
+    try std.testing.expectEqual(@as(u64, 4096), retention_policy.max_retained_bytes);
 }
 
 test "parse cli accepts HA standby runtime flags" {
@@ -2898,6 +2914,9 @@ test "swarm HA runtime rejects ambiguous role flags" {
     }));
     try std.testing.expectError(error.HARetentionPolicyRequiresPrimary, validateHARole(.{
         .ha_retention_max_lag_lsn = 50,
+    }));
+    try std.testing.expectError(error.HARetentionPolicyRequiresPrimary, validateHARole(.{
+        .ha_retention_max_retained_bytes = 4096,
     }));
     try std.testing.expectError(error.InvalidHARetentionPolicy, parsePositiveU64("0"));
     try std.testing.expectError(error.HASyncPolicyRequiresPrimary, validateHARole(.{

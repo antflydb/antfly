@@ -833,6 +833,11 @@ type HARetentionPolicy struct {
 	// Zero disables the cap.
 	// +optional
 	MaxLagLSN uint64 `json:"maxLagLSN,omitempty"`
+
+	// MaxRetainedBytes marks oldest standbys for reseed when retained WAL bytes exceed this cap.
+	// Zero disables the cap.
+	// +optional
+	MaxRetainedBytes uint64 `json:"maxRetainedBytes,omitempty"`
 }
 
 // HAAutomaticFailoverPolicy configures automatic standby promotion.

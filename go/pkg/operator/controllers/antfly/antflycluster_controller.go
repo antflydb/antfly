@@ -224,6 +224,9 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
 			appendHAUint("--ha-retention-max-lag-lsn", ha.Retention.MaxLagLSN)
 		}
+		if ha.Retention != nil && ha.Retention.MaxRetainedBytes > 0 {
+			appendHAUint("--ha-retention-max-retained-bytes", ha.Retention.MaxRetainedBytes)
+		}
 		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
@@ -6293,6 +6296,9 @@ func haPrimaryStatusParams(ha *antflyv1.HighAvailabilitySpec) *adminsdk.HAPrimar
 	}
 	if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
 		params.MaxLagLsn = ha.Retention.MaxLagLSN
+	}
+	if ha.Retention != nil && ha.Retention.MaxRetainedBytes > 0 {
+		params.MaxRetainedBytes = ha.Retention.MaxRetainedBytes
 	}
 	if ha.SyncPolicy != nil && ha.SyncPolicy.Mode != "" && ha.SyncPolicy.Mode != antflyv1.HADurabilityModeAsync {
 		params.SyncMode = haAdminSyncModeParam(ha.SyncPolicy.Mode)

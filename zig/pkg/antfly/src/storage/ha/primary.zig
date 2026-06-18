@@ -319,6 +319,19 @@ pub const Primary = struct {
     ) !slot_store.RetentionSnapshot {
         var snapshot = try self.slots.retentionSnapshotForTimeline(self.lastLsn(), self.identity.timeline_id, policy);
         snapshot.retained_byte_count = try self.retainedByteCount(snapshot);
+        while (policy.max_retained_bytes > 0 and
+            snapshot.retained_byte_count > policy.max_retained_bytes and
+            snapshot.active_slots > 0 and
+            snapshot.retained_lsn_count > 0)
+        {
+            const marked = try self.slots.markActiveSlotsAtRestartLsnForTimeline(
+                self.identity.timeline_id,
+                snapshot.oldest_restart_lsn,
+            );
+            if (marked == 0) break;
+            snapshot = try self.slots.retentionSnapshotForTimeline(self.lastLsn(), self.identity.timeline_id, policy);
+            snapshot.retained_byte_count = try self.retainedByteCount(snapshot);
+        }
         return snapshot;
     }
 
@@ -853,6 +866,36 @@ test "storage.ha primary begins base backup with slot retention pin" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(replication_record.RecordKind.backup_start, entries[0].record.kind);
     try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"manifest_id\":\"manifest-1\"") != null);
+}
+
+test "storage.ha primary marks oldest slots when retained byte cap is exceeded" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "retention-byte-cap");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one-one-one-one-one-one" });
+    _ = try primary.append(.{ .payload = "two-two-two-two-two-two" });
+    _ = try primary.append(.{ .payload = "three-three-three-three" });
+    try primary.createSlot("old", 1);
+    try primary.createSlot("current", 3);
+
+    const uncapped = try primary.retentionSnapshot(.{});
+    const current_only_bytes = try primary.log.encodedByteCount(3, primary.lastLsn());
+    try std.testing.expect(uncapped.retained_byte_count > current_only_bytes);
+
+    const capped = try primary.retentionSnapshot(.{ .max_retained_bytes = current_only_bytes });
+    try std.testing.expect(capped.retained_byte_count <= current_only_bytes);
+    try std.testing.expectEqual(@as(usize, 1), capped.active_slots);
+    try std.testing.expectEqual(@as(usize, 1), capped.reseed_recommended);
+    try std.testing.expectEqual(@as(u64, 3), capped.oldest_restart_lsn);
+
+    const old = primary.slot("old") orelse return error.TestExpectedEqual;
+    const current = primary.slot("current") orelse return error.TestExpectedEqual;
+    try std.testing.expect(old.reseed_required);
+    try std.testing.expect(!current.reseed_required);
 }
 
 test "storage.ha primary rejects base backup over healthy existing slot" {

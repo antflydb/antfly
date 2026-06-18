@@ -298,6 +298,9 @@ fn parseSlot(cursor: *Cursor) !Command {
             if (std.mem.eql(u8, arg, "--max-lag-lsn")) {
                 _ = cursor.next();
                 command.retention_policy.max_lag_lsn = try parseU64(try cursor.value("--max-lag-lsn"));
+            } else if (std.mem.eql(u8, arg, "--max-retained-bytes")) {
+                _ = cursor.next();
+                command.retention_policy.max_retained_bytes = try parseU64(try cursor.value("--max-retained-bytes"));
             } else {
                 break;
             }
@@ -519,6 +522,9 @@ fn parseStatus(alloc: Allocator, cursor: *Cursor, owned_standby_names: *[]const 
             if (std.mem.eql(u8, arg, "--max-lag-lsn")) {
                 _ = cursor.next();
                 command.retention_policy.max_lag_lsn = try parseU64(try cursor.value("--max-lag-lsn"));
+            } else if (std.mem.eql(u8, arg, "--max-retained-bytes")) {
+                _ = cursor.next();
+                command.retention_policy.max_retained_bytes = try parseU64(try cursor.value("--max-retained-bytes"));
             } else if (std.mem.eql(u8, arg, "--view")) {
                 _ = cursor.next();
                 command.view = try parseStatusView(try cursor.value("--view"));
@@ -805,6 +811,9 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--max-lag-lsn")) {
             _ = cursor.next();
             command.spec.retention_policy.max_lag_lsn = try parseU64(try cursor.value("--max-lag-lsn"));
+        } else if (std.mem.eql(u8, arg, "--max-retained-bytes")) {
+            _ = cursor.next();
+            command.spec.retention_policy.max_retained_bytes = try parseU64(try cursor.value("--max-retained-bytes"));
         } else if (std.mem.eql(u8, arg, "--auto-failover")) {
             _ = cursor.next();
             command.spec.auto_failover.enabled = true;
@@ -1459,9 +1468,10 @@ test "storage.ha admin cli parses slot lifecycle commands" {
     try std.testing.expectEqual(admin.SlotAction.pause, pause.command.slot.action);
     try std.testing.expectEqualStrings("standby-a", pause.command.slot.request.slot_name);
 
-    var list = try parse(alloc, &.{ "slot", "list", "--max-lag-lsn", "50" });
+    var list = try parse(alloc, &.{ "slot", "list", "--max-lag-lsn", "50", "--max-retained-bytes", "4096" });
     defer list.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 50), list.command.slot_list.retention_policy.max_lag_lsn);
+    try std.testing.expectEqual(@as(u64, 4096), list.command.slot_list.retention_policy.max_retained_bytes);
 }
 
 test "storage.ha admin cli parses standby seed commands" {
@@ -1485,21 +1495,23 @@ test "storage.ha admin cli parses standby seed commands" {
 test "storage.ha admin cli parses primary status with sync policy" {
     const alloc = std.testing.allocator;
     var plan = try parse(alloc, &.{
-        "status",           "primary",
-        "--view",           "metrics",
-        "--max-lag-lsn",    "50",
-        "--sync-mode",      "remote-apply",
-        "--sync-selection", "first",
-        "--sync-required",  "2",
-        "--sync-standby",   "a",
-        "--sync-standby",   "b",
-        "--sync-failure",   "fail-closed",
+        "status",               "primary",
+        "--view",               "metrics",
+        "--max-lag-lsn",        "50",
+        "--max-retained-bytes", "4096",
+        "--sync-mode",          "remote-apply",
+        "--sync-selection",     "first",
+        "--sync-required",      "2",
+        "--sync-standby",       "a",
+        "--sync-standby",       "b",
+        "--sync-failure",       "fail-closed",
     });
     defer plan.deinit(alloc);
 
     const command = plan.command.primary_status;
     try std.testing.expectEqual(StatusView.metrics, command.view);
     try std.testing.expectEqual(@as(u64, 50), command.retention_policy.max_lag_lsn);
+    try std.testing.expectEqual(@as(u64, 4096), command.retention_policy.max_retained_bytes);
     const policy = command.sync_policy.?;
     try std.testing.expectEqual(primary_mod.DurabilityMode.remote_apply, policy.mode);
     try std.testing.expectEqual(primary_mod.StandbySelection.first, policy.selection);
@@ -1524,6 +1536,7 @@ test "storage.ha admin cli parses operator plan command" {
         "standby-b",                            "--standby-admin-url",
         "http://standby-b-ha.default.svc:8081", "--standby-drop-slot",
         "--max-lag-lsn",                        "50",
+        "--max-retained-bytes",                 "4096",
         "--sync-mode",                          "remote-apply",
         "--sync-standby",                       "standby-a",
         "--auto-failover",                      "--fencing-authority",
@@ -1572,6 +1585,7 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expect(!command.spec.standbys[1].desired);
     try std.testing.expect(command.spec.standbys[1].drop_slot_on_removal);
     try std.testing.expectEqual(@as(u64, 50), command.spec.retention_policy.max_lag_lsn);
+    try std.testing.expectEqual(@as(u64, 4096), command.spec.retention_policy.max_retained_bytes);
     try std.testing.expect(command.spec.auto_failover.enabled);
     try std.testing.expectEqual(operator.FencingAuthority.kubernetes_lease, command.spec.auto_failover.fencing_authority);
     try std.testing.expectEqual(@as(u64, 2), command.spec.auto_failover.maximum_lag_lsn);
@@ -1608,6 +1622,8 @@ test "storage.ha admin cli renders versioned json command plan" {
         "metrics",
         "--max-lag-lsn",
         "50",
+        "--max-retained-bytes",
+        "4096",
         "--sync-mode",
         "remote-apply",
         "--sync-selection",
@@ -1627,6 +1643,7 @@ test "storage.ha admin cli renders versioned json command plan" {
     try expectContains(rendered, "\"primary_status\"");
     try expectContains(rendered, "\"view\":\"metrics\"");
     try expectContains(rendered, "\"max_lag_lsn\":50");
+    try expectContains(rendered, "\"max_retained_bytes\":4096");
     try expectContains(rendered, "\"mode\":\"remote_apply\"");
     try expectContains(rendered, "\"selection\":\"first\"");
     try expectContains(rendered, "\"failure_policy\":\"degrade_to_async\"");

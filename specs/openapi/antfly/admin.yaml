@@ -32,6 +32,14 @@ paths:
             type: integer
             format: uint64
             minimum: 0
+        - name: max_retained_bytes
+          in: query
+          required: false
+          description: Mark oldest slots reseed-recommended when retained WAL bytes exceed this cap.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
         - name: sync_mode
           in: query
           required: false

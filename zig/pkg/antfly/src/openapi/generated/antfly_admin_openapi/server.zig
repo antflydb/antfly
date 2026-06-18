@@ -9,6 +9,8 @@ const types = @import("types.zig");
 pub const GetHAPrimaryStatusParams = struct {
     /// Mark slots reseed-recommended after this many retained LSNs.
     max_lag_lsn: ?[]const u8 = null,
+    /// Mark oldest slots reseed-recommended when retained WAL bytes exceed this cap.
+    max_retained_bytes: ?[]const u8 = null,
     /// Optional synchronous durability mode to evaluate.
     sync_mode: ?[]const u8 = null,
     /// How named standbys satisfy the synchronous policy.
@@ -231,6 +233,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = GetHAPrimaryStatusParams{
                 .max_lag_lsn = ctx.query("max_lag_lsn"),
+                .max_retained_bytes = ctx.query("max_retained_bytes"),
                 .sync_mode = ctx.query("sync_mode"),
                 .sync_selection = ctx.query("sync_selection"),
                 .sync_required = ctx.query("sync_required"),

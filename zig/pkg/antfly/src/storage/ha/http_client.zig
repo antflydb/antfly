@@ -55,6 +55,7 @@ pub fn ParsedOutput(comptime T: type) type {
 
 pub const PrimaryStatusOptions = struct {
     max_lag_lsn: ?u64 = null,
+    max_retained_bytes: ?u64 = null,
     sync_policy: ?primary_mod.SyncPolicy = null,
 };
 
@@ -135,6 +136,9 @@ pub const Client = struct {
         defer self.alloc.free(uri);
         if (options.max_lag_lsn) |max_lag_lsn| {
             uri = try appendQueryU64(self.alloc, uri, "max_lag_lsn", max_lag_lsn);
+        }
+        if (options.max_retained_bytes) |max_retained_bytes| {
+            uri = try appendQueryU64(self.alloc, uri, "max_retained_bytes", max_retained_bytes);
         }
         if (options.sync_policy) |sync_policy| {
             uri = try appendQuerySyncPolicy(self.alloc, uri, sync_policy);

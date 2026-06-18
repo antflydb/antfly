@@ -219,12 +219,19 @@ pub const Server = struct {
             uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA primary status request")
         else
             0;
+        const max_retained_bytes = if (queryValue(query, "max_retained_bytes")) |raw|
+            uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA primary status request")
+        else
+            0;
         var sync = buildSyncPolicyFromQuery(self.alloc, query) catch
             return try textResponse(self.alloc, 400, "invalid HA primary status request");
         errdefer sync.deinit(self.alloc);
         defer sync.deinit(self.alloc);
 
-        var snapshot = ha_admin.primaryStatus(self.alloc, primary, .{ .max_lag_lsn = max_lag_lsn }, sync.policy) catch |err| {
+        var snapshot = ha_admin.primaryStatus(self.alloc, primary, .{
+            .max_lag_lsn = max_lag_lsn,
+            .max_retained_bytes = max_retained_bytes,
+        }, sync.policy) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer snapshot.deinit(self.alloc);

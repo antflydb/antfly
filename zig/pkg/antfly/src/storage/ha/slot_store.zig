@@ -78,6 +78,7 @@ pub const SlotState = struct {
 
 pub const RetentionPolicy = struct {
     max_lag_lsn: u64 = 0,
+    max_retained_bytes: u64 = 0,
 };
 
 pub const RetentionSnapshot = struct {
@@ -190,6 +191,31 @@ pub const SlotStore = struct {
         var next = current;
         next.reseed_required = true;
         try self.createOrUpdate(next);
+    }
+
+    pub fn markActiveSlotsAtRestartLsnForTimeline(
+        self: *SlotStore,
+        timeline_id: u64,
+        restart_lsn: u64,
+    ) !usize {
+        var mark_reseed: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (mark_reseed.items) |name| self.alloc.free(name);
+            mark_reseed.deinit(self.alloc);
+        }
+
+        for (self.slots.items) |slot| {
+            if (!slot.state.active) continue;
+            if (slot.state.reseed_required) continue;
+            if (slot.state.timeline_id != timeline_id) continue;
+            if (slot.state.restart_lsn != restart_lsn) continue;
+            const name = try self.alloc.dupe(u8, slot.state.name);
+            errdefer self.alloc.free(name);
+            try mark_reseed.append(self.alloc, name);
+        }
+
+        for (mark_reseed.items) |name| try self.markReseedRequired(name);
+        return mark_reseed.items.len;
     }
 
     pub fn pause(self: *SlotStore, name: []const u8) !void {
@@ -800,6 +826,36 @@ test "storage.ha slot store marks slots for reseed when lag cap is exceeded" {
     try std.testing.expectEqual(@as(usize, 1), after_mark.reseed_recommended);
     try std.testing.expectEqual(@as(usize, 1), after_mark.active_slots);
     try std.testing.expectEqual(@as(u64, 9), after_mark.oldest_restart_lsn);
+}
+
+test "storage.ha slot store marks active slots at restart lsn for timeline" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "reseed-restart-lsn");
+    defer alloc.free(path);
+
+    var store = try SlotStore.open(alloc, path.ptr, .{});
+    defer store.close();
+    try store.createOrUpdate(.{ .name = "old-a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
+    try store.createOrUpdate(.{ .name = "old-b", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
+    try store.createOrUpdate(.{ .name = "new", .timeline_id = 1, .restart_lsn = 7, .received_lsn = 9, .applied_lsn = 7, .safe_read_lsn = 7 });
+    try store.createOrUpdate(.{ .name = "old-timeline", .timeline_id = 2, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
+    try store.createOrUpdate(.{ .name = "paused", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
+    try store.pause("paused");
+
+    const marked = try store.markActiveSlotsAtRestartLsnForTimeline(1, 4);
+    try std.testing.expectEqual(@as(usize, 2), marked);
+    try std.testing.expect((store.get("old-a") orelse return error.TestExpectedEqual).reseed_required);
+    try std.testing.expect((store.get("old-b") orelse return error.TestExpectedEqual).reseed_required);
+    try std.testing.expect(!(store.get("new") orelse return error.TestExpectedEqual).reseed_required);
+    try std.testing.expect(!(store.get("old-timeline") orelse return error.TestExpectedEqual).reseed_required);
+    try std.testing.expect(!(store.get("paused") orelse return error.TestExpectedEqual).reseed_required);
+
+    {
+        var reopened = try SlotStore.open(alloc, path.ptr, .{});
+        defer reopened.close();
+        try std.testing.expect((reopened.get("old-a") orelse return error.TestExpectedEqual).reseed_required);
+        try std.testing.expect((reopened.get("old-b") orelse return error.TestExpectedEqual).reseed_required);
+    }
 }
 
 test "storage.ha slot store drops slots and releases retention" {
