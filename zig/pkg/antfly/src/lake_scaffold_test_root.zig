@@ -32,6 +32,7 @@ pub const algebraic_segment = @import("serverless/algebraic_segment/mod.zig");
 pub const external_source = @import("serverless/external_source/mod.zig");
 pub const external_source_catalog_binding = @import("serverless/external_source/catalog_binding.zig");
 pub const external_source_object_snapshot = @import("serverless/external_source/object_snapshot.zig");
+pub const external_source_iceberg_metadata = @import("serverless/external_source/iceberg_metadata.zig");
 pub const lake_rows_query = @import("serverless/query/lake_rows.zig");
 pub const lake_explain_query = @import("serverless/query/lake_explain.zig");
 pub const lake_cache_query = @import("serverless/query/lake_cache.zig");
@@ -63,6 +64,7 @@ test {
     _ = external_source;
     _ = external_source_catalog_binding;
     _ = external_source_object_snapshot;
+    _ = external_source_iceberg_metadata;
     _ = lake_rows_query;
     _ = lake_explain_query;
     _ = lake_cache_query;
