@@ -7765,7 +7765,7 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 
 	container := sts.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Args).To(HaveLen(1))
-	g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path /run/antfly/secrets/secrets.json"))
+	g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path '/run/antfly/secrets/secrets.json'"))
 	g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
 		Name:  antflySecretStoreEnvVar,
 		Value: "/run/antfly/secrets/secrets.json",
@@ -7931,6 +7931,15 @@ func TestSwarmHAArgsShellQuotesRuntimeValues(t *testing.T) {
 	g.Expect(args).NotTo(ContainSubstring(`"standby-$(touch /tmp/pwned)"`))
 }
 
+func TestSecretStoreArgShellQuotesPath(t *testing.T) {
+	g := NewWithT(t)
+
+	arg := secretStoreArg(&antflyv1.SecretStoreSpec{Path: "/run/antfly/'secrets$(touch /tmp/pwned)"})
+
+	g.Expect(arg).To(ContainSubstring(`--secret-store-path '/run/antfly/'\''secrets$(touch /tmp/pwned)'`))
+	g.Expect(arg).NotTo(ContainSubstring(`"/run/antfly/'secrets$(touch /tmp/pwned)"`))
+}
+
 func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 	g := NewWithT(t)
 
@@ -7987,7 +7996,7 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 
 		container := sts.Spec.Template.Spec.Containers[0]
 		g.Expect(container.Args).To(HaveLen(1))
-		g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path /run/antfly/secrets/secrets.json"))
+		g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path '/run/antfly/secrets/secrets.json'"))
 		g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
 			Name:  antflySecretStoreEnvVar,
 			Value: "/run/antfly/secrets/secrets.json",

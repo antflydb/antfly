@@ -168,7 +168,7 @@ func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 	if store == nil {
 		return ""
 	}
-	return fmt.Sprintf(" \\\n  --secret-store-path %s", secretStorePath(store))
+	return fmt.Sprintf(" \\\n  --secret-store-path %s", shellQuoteArg(secretStorePath(store)))
 }
 
 func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
