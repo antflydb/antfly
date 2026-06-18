@@ -584,6 +584,25 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert read_check["decision"]["action"] == "serve_standby"
     assert read_check["decision"]["serve_lsn"] >= first_lsn
+    at_least_read_check = ha_cluster.standby.admin_post(
+        "/read/check",
+        {"consistency": "at_least_lsn", "required_lsn": first_lsn},
+    )
+    assert at_least_read_check["decision"]["action"] == "serve_standby"
+    assert at_least_read_check["decision"]["consistency"] == "at_least_lsn"
+    assert at_least_read_check["decision"]["serve_lsn"] >= first_lsn
+    future_read_check = ha_cluster.standby.admin_post(
+        "/read/check",
+        {"consistency": "at_least_lsn", "required_lsn": first_lsn + 1},
+    )
+    assert future_read_check["decision"]["action"] == "wait_for_apply"
+    assert future_read_check["decision"]["missing_lsn_count"] == 1
+    primary_read_check = ha_cluster.standby.admin_post(
+        "/read/check",
+        {"consistency": "primary", "required_lsn": first_lsn},
+    )
+    assert primary_read_check["decision"]["action"] == "route_to_primary"
+    assert primary_read_check["decision"]["serve_lsn"] is None
     first_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:first")
     assert first_doc["title"] == "first"
 
