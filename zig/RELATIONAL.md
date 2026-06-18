@@ -5214,7 +5214,11 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `zig build sql-api-parity-fixture-check` through `make generated-check`; the
    checked-in JSON fixture is generated output. This gate should keep expanding
    before broad syntax expansion so new support is measured against
-   representative workloads.
+   representative workloads. Pure SQL/data-driven examples, including scalar
+   numeric functions, extremum expressions, text length/trim/replace/regexp,
+   string construction/splitting/position/padding, hashing, prefix/suffix tests,
+   and character-code expressions, belong in the source fixture instead of the
+   embedded Zig seed list.
 
 2. **DDL and migration compiler.**
    Compile native migration intent into Antfly schema mutations rather than replaying
@@ -6131,7 +6135,10 @@ schema changes and fixture membership changes must still be explicit and
 regenerated through the fixture-promotion step rather than silently parsed as
 the current contract. The source fixture carries `source_format` and an
 `entries` array parsed by `corpus.zig`; it is input data, while
-`sql_api_parity_corpus.json` is generated output.
+`sql_api_parity_corpus.json` is generated output. Source fixture entries should
+cover portable SQL/data examples directly, including scalar and text expression
+queries, while the embedded Zig seed corpus is reserved for cases that need
+local helper setup or in-process fixture construction.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 
