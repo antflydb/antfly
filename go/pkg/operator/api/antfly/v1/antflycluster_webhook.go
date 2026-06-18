@@ -3,6 +3,7 @@ package v1
 import (
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -24,6 +25,9 @@ var (
 	// envVarNamePattern accepts shell-safe environment variable names accepted by
 	// the Zig HA CLI/runtime token resolvers.
 	envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// haIdentifierPattern matches HA node IDs and slot names accepted by the Zig
+	// HA runtime validators.
+	haIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 )
 
 // ValidateCreate validates the cluster configuration when creating a new cluster.
@@ -1151,6 +1155,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 		if standby.Name != name {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name must not have leading or trailing whitespace", i))
+		} else if !validHAIdentifier(name) {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name must be a valid HA identifier", i))
 		}
 		if _, exists := names[name]; exists {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name %q is duplicated", i, name))
@@ -1161,6 +1167,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not be whitespace", i))
 		} else if standby.SlotName != "" && standby.SlotName != slotName {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not have leading or trailing whitespace", i))
+		} else if standby.SlotName != "" && !validHAIdentifier(slotName) {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must be a valid HA identifier", i))
 		}
 		if slotName == "" {
 			slotName = name
@@ -1173,8 +1181,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 		errors = append(errors, validateHAAdminURL(standby.AdminURL, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL", i))...)
 		errors = append(errors, validateHARouteSelector(standby.RouteSelector, fmt.Sprintf("spec.highAvailability.standbys[%d].routeSelector", i))...)
-		errors = append(errors, validateHAOptionalTrimmedString(standby.SeedManifestPath, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath", i))...)
-		errors = append(errors, validateHAOptionalTrimmedString(standby.SeedContentRoot, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot", i))...)
+		errors = append(errors, validateHAOptionalPath(standby.SeedManifestPath, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath", i))...)
+		errors = append(errors, validateHAOptionalPath(standby.SeedContentRoot, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot", i))...)
 		if strings.TrimSpace(standby.SeedContentRoot) != "" && strings.TrimSpace(standby.SeedManifestPath) == "" {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedContentRoot is set", i))
 		}
@@ -1238,6 +1246,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID is required")
 		} else if identity.CurrentPrimaryID != strings.TrimSpace(identity.CurrentPrimaryID) {
 			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID must not have leading or trailing whitespace")
+		} else if !validHAIdentifier(identity.CurrentPrimaryID) {
+			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID must be a valid HA identifier")
 		}
 	}
 
@@ -1282,6 +1292,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 				}
 				if name != trimmedName {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] must not have leading or trailing whitespace", i))
+				} else if !validHAIdentifier(trimmedName) {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] must be a valid HA identifier", i))
 				}
 				if first, exists := seenSyncNames[trimmedName]; exists {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q duplicates standbyNames[%d]", i, trimmedName, first))
@@ -1335,11 +1347,15 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 }
 
 func validateHAAdminURL(raw string, fieldPath string) []string {
-	if strings.TrimSpace(raw) == "" {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		if raw != "" {
 			return []string{fmt.Sprintf("%s must not be whitespace", fieldPath)}
 		}
 		return nil
+	}
+	if raw != trimmed {
+		return []string{fmt.Sprintf("%s must not have leading or trailing whitespace", fieldPath)}
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -1371,8 +1387,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 			errors = append(errors, "spec.highAvailability.runtime.standby may only be set when runtime.role is Standby")
 		}
 		if primary := runtime.Primary; primary != nil {
-			errors = append(errors, validateHAOptionalTrimmedString(primary.LogPath, "spec.highAvailability.runtime.primary.logPath")...)
-			errors = append(errors, validateHAOptionalTrimmedString(primary.SlotsPath, "spec.highAvailability.runtime.primary.slotsPath")...)
+			errors = append(errors, validateHAOptionalPath(primary.LogPath, "spec.highAvailability.runtime.primary.logPath")...)
+			errors = append(errors, validateHAOptionalPath(primary.SlotsPath, "spec.highAvailability.runtime.primary.slotsPath")...)
 		}
 	case HARuntimeRoleStandby:
 		if nodeID != "" && currentPrimaryID != "" && nodeID == currentPrimaryID {
@@ -1382,8 +1398,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 			errors = append(errors, "spec.highAvailability.runtime.primary may only be set when runtime.role is Primary")
 		}
 		if standby := runtime.Standby; standby != nil {
-			errors = append(errors, validateHAOptionalTrimmedString(standby.LogPath, "spec.highAvailability.runtime.standby.logPath")...)
-			errors = append(errors, validateHAOptionalTrimmedString(standby.ProgressPath, "spec.highAvailability.runtime.standby.progressPath")...)
+			errors = append(errors, validateHAOptionalPath(standby.LogPath, "spec.highAvailability.runtime.standby.logPath")...)
+			errors = append(errors, validateHAOptionalPath(standby.ProgressPath, "spec.highAvailability.runtime.standby.progressPath")...)
 			errors = append(errors, validateHAAdminURL(standby.UpstreamURL, "spec.highAvailability.runtime.standby.upstreamURL")...)
 			slotName := strings.TrimSpace(standby.SlotName)
 			upstreamURL := strings.TrimSpace(standby.UpstreamURL)
@@ -1391,6 +1407,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must not be whitespace")
 			} else if standby.SlotName != "" && standby.SlotName != slotName {
 				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must not have leading or trailing whitespace")
+			} else if standby.SlotName != "" && !validHAIdentifier(slotName) {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must be a valid HA identifier")
 			}
 			if upstreamURL != "" && slotName == "" {
 				errors = append(errors, "spec.highAvailability.runtime.standby.slotName is required when upstreamURL is set")
@@ -1406,9 +1424,11 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 		errors = append(errors, "spec.highAvailability.runtime.nodeID is required")
 	} else if runtime.NodeID != nodeID {
 		errors = append(errors, "spec.highAvailability.runtime.nodeID must not have leading or trailing whitespace")
+	} else if !validHAIdentifier(nodeID) {
+		errors = append(errors, "spec.highAvailability.runtime.nodeID must be a valid HA identifier")
 	}
-	errors = append(errors, validateHAOptionalTrimmedString(runtime.FencePath, "spec.highAvailability.runtime.fencePath")...)
-	errors = append(errors, validateHAOptionalTrimmedString(runtime.FormerPrimaryLogPath, "spec.highAvailability.runtime.formerPrimaryLogPath")...)
+	errors = append(errors, validateHAOptionalPath(runtime.FencePath, "spec.highAvailability.runtime.fencePath")...)
+	errors = append(errors, validateHAOptionalPath(runtime.FormerPrimaryLogPath, "spec.highAvailability.runtime.formerPrimaryLogPath")...)
 	if strings.TrimSpace(runtime.AdminTokenEnvVar) == "" && runtime.AdminTokenEnvVar != "" {
 		errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar must not be whitespace")
 	}
@@ -1457,6 +1477,23 @@ func validateHAOptionalTrimmedString(value string, fieldPath string) []string {
 		return []string{fmt.Sprintf("%s must not have leading or trailing whitespace", fieldPath)}
 	}
 	return nil
+}
+
+func validateHAOptionalPath(value string, fieldPath string) []string {
+	if errors := validateHAOptionalTrimmedString(value, fieldPath); len(errors) > 0 || strings.TrimSpace(value) == "" {
+		return errors
+	}
+	if !filepath.IsAbs(value) {
+		return []string{fmt.Sprintf("%s must be an absolute normalized path", fieldPath)}
+	}
+	if filepath.Clean(value) != value {
+		return []string{fmt.Sprintf("%s must be an absolute normalized path", fieldPath)}
+	}
+	return nil
+}
+
+func validHAIdentifier(value string) bool {
+	return haIdentifierPattern.MatchString(value)
 }
 
 func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySpec) []string {

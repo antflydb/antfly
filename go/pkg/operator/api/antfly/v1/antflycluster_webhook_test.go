@@ -1967,6 +1967,48 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL: " http://primary-ha.default.svc:8081 ",
+		},
+		Standbys: []HAStandbySpec{{
+			Name:     "standby-a",
+			AdminURL: " http://standby-a-ha.default.svc:8081 ",
+		}},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRoleStandby,
+			NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{
+				SlotName:    "standby-a",
+				UpstreamURL: " http://primary-ha.default.svc:8081 ",
+			},
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded HA admin URLs to be rejected")
+	}
+	for _, want := range []string{
+		"admin.primaryURL must not have leading or trailing whitespace",
+		"standbys[0].adminURL must not have leading or trailing whitespace",
+		"runtime.standby.upstreamURL must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected padded admin URL error %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
@@ -2040,6 +2082,48 @@ func TestValidateCreate_HighAvailabilityRejectsWhitespacePaddedIdentityFields(t 
 		"identity.currentPrimaryID must not have leading or trailing whitespace",
 		"runtime.nodeID must not have leading or trailing whitespace",
 		"syncPolicy.standbyNames[0] must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidIdentifiers(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:     "standby a",
+			SlotName: "slot a",
+		}},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "primary a",
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{"standby a"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA identifiers to be rejected")
+	}
+	for _, want := range []string{
+		"standbys[0].name must be a valid HA identifier",
+		"standbys[0].slotName must be a valid HA identifier",
+		"identity.currentPrimaryID must be a valid HA identifier",
+		"runtime.nodeID must be a valid HA identifier",
+		"syncPolicy.standbyNames[0] must be a valid HA identifier",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("expected validation error containing %q, got: %v", want, err)
@@ -2211,6 +2295,67 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedRuntimePaths(t *testing.T) 
 	for _, want := range []string{
 		"runtime.standby.logPath must not have leading or trailing whitespace",
 		"runtime.standby.progressPath must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedRuntimePaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:                 HARuntimeRolePrimary,
+			NodeID:               "primary-a",
+			FencePath:            "ha/fence.wal",
+			FormerPrimaryLogPath: "/antflydb/ha/../primary.wal",
+			Primary: &HAPrimaryRuntimeSpec{
+				LogPath:   "ha/primary.wal",
+				SlotsPath: "/antflydb/ha//slots",
+			},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected relative and non-normalized HA primary runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.primary.logPath must be an absolute normalized path",
+		"runtime.primary.slotsPath must be an absolute normalized path",
+		"runtime.fencePath must be an absolute normalized path",
+		"runtime.formerPrimaryLogPath must be an absolute normalized path",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "primary-a"
+	cluster.Spec.HighAvailability.Runtime = &HARuntimeSpec{
+		Role:      HARuntimeRoleStandby,
+		NodeID:    "standby-a",
+		FencePath: "/antflydb/ha/fence.wal",
+		Standby: &HAStandbyRuntimeSpec{
+			LogPath:      "ha/standby.wal",
+			ProgressPath: "/antflydb/ha/../progress.wal",
+		},
+	}
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected relative and non-normalized HA standby runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.standby.logPath must be an absolute normalized path",
+		"runtime.standby.progressPath must be an absolute normalized path",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("expected validation error containing %q, got: %v", want, err)
@@ -2886,6 +3031,31 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedSeedPaths(t *testing.T) {
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("expected padded seed path error %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedSeedPaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:             "standby-a",
+			SeedManifestPath: "backup/base-standby-a/manifest.json",
+			SeedContentRoot:  "/backup/base-standby-a/../base-standby-a",
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected relative and non-normalized seed path validation errors")
+	}
+	for _, want := range []string{
+		"standbys[0].seedManifestPath must be an absolute normalized path",
+		"standbys[0].seedContentRoot must be an absolute normalized path",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected seed path validation error %q, got: %v", want, err)
 		}
 	}
 }

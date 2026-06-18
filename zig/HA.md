@@ -514,8 +514,10 @@ whitespace, because those values become durable node identity, WAL path, fence,
 slot, URL, or token-env configuration. Field-specific validators should layer
 type checks on top of the shared classifier:
 
-- paths must pass path-specific safety rules such as absolute or storage-root
-  bounded paths where appropriate;
+- paths must pass path-specific safety rules: absolute, normalized, and bounded
+  to an allowed storage root where appropriate. Do not accept paths whose raw
+  value changes after normalization, escapes through `..`, or points outside
+  the configured HA data/backup root;
 - node ids and slot names must have restricted character sets and bounded
   lengths;
 - token environment names must pass environment-variable-name validation;
@@ -588,6 +590,11 @@ Treat these review points as acceptance gates, not follow-up polish:
 - `classifyHAString` can land before the full HA runtime, but it must preserve
   field-specific errors and never silently trim durable HA identity, WAL path,
   fence, slot, URL, or token-env configuration.
+- The shared string validator should be a classifier, not a catch-all
+  `validateHAString` that decides every field's type rules. Each caller should
+  translate `ok`, `missing`, or `padded` into the right field-specific HA error,
+  then run type-specific validation for paths, node ids, slot names, token env
+  vars, and URLs.
 - `test_standby.py` must prove a real primary/standby process path, not just
   argument validation.
 - Zig simulation coverage must own crash, replay, partition, promotion, rejoin,
@@ -612,6 +619,13 @@ flow:
 6. restart the standby and verify local received-WAL replay plus stream resume;
 7. later, fence and promote the standby, then verify the old primary rejects
    writes or must rejoin through rewind/reseed.
+
+The first version of `test_standby.py` should stop at the black-box async path
+if promotion is not wired yet, but it should still be a real process test:
+primary process, standby process, durable directories, admin API or CLI setup,
+client writes, standby catch-up observation, standby restart, and read-only
+verification. Whitespace or argument-validation coverage belongs in unit tests;
+it is not enough evidence for HA.
 
 The Zig simulation tests should carry most of the correctness burden because
 they can explore interleavings that are expensive or flaky in process e2e. Add
@@ -910,6 +924,15 @@ The remaining work before this mode has the bulk of Postgres-style HA parity is:
   replay failure, and reseed requirements;
 - crash, partition, and replay simulation coverage plus real process e2e and
   operator e2e coverage.
+
+This list is intentionally larger than "stream a WAL record to another process".
+The production gate should require the main failure paths to be implemented,
+tested, observable, and documented before Antfly advertises bulk Postgres-style
+HA parity. The minimum feature set is async streaming plus deterministic replay,
+base backup and reseed, slots and WAL retention accounting, explicit read-only
+standby behavior, fenced promotion, former-primary repair or reseed, generated
+admin clients, operator workflows, crash/simulation coverage, and real-process
+e2e coverage.
 
 For bulk Postgres-style HA parity beyond the first production target, the large
 remaining areas are `pg_rewind`-style former-primary repair depth, richer
