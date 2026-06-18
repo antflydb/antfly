@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -1578,13 +1579,13 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	degraded := haSyncPolicyDegraded(ha, plan)
 	if degraded {
 		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionTrue, antflyv1.ReasonHASyncPolicyUnsatisfied, "Synchronous HA policy is not currently satisfied")
-	} else if haPrimaryAdminUnavailable(cluster.Status.HAStatus) {
+	} else if haPrimaryAdminObservationFailed(cluster.Status.HAStatus) {
 		setHACondition(
 			cluster,
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
 			haAdminStatusUnavailableReason(cluster, antflyv1.ReasonHAPrimaryAdminUnavailable),
-			fmt.Sprintf("Primary HA admin endpoint is unreachable: %s", strings.TrimSpace(cluster.Status.HAStatus.PrimaryAdminLastError)),
+			fmt.Sprintf("Primary HA admin endpoint cannot be observed: %s", strings.TrimSpace(cluster.Status.HAStatus.PrimaryAdminLastError)),
 		)
 	} else {
 		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionFalse, antflyv1.ReasonHASyncPolicySatisfied, "Synchronous HA policy is satisfied or not configured")
@@ -1861,7 +1862,14 @@ func haAutomaticFailoverFencingAuthoritySupported(ha *antflyv1.HighAvailabilityS
 }
 
 func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {
-	return status != nil && !status.PrimaryAdminReachable && status.PrimaryAdminLastError != ""
+	if !haPrimaryAdminObservationFailed(status) {
+		return false
+	}
+	return status.PrimaryAdminStatusCode != http.StatusUnauthorized
+}
+
+func haPrimaryAdminObservationFailed(status *antflyv1.HAStatus) bool {
+	return status != nil && !status.PrimaryAdminReachable && strings.TrimSpace(status.PrimaryAdminLastError) != ""
 }
 
 func haPromotionBoundaryReady(status *antflyv1.HAStatus) bool {

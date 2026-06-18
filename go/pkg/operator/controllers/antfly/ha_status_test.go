@@ -2128,7 +2128,21 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	}
 
 	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "get HA primary status returned status 401: missing bearer token"
+	cluster.Status.HAStatus.PrimaryAdminStatusCode = http.StatusUnauthorized
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked when primary admin observation is unauthorized")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAPrimaryStillReachable {
+		t.Fatalf("expected primary-still-reachable condition for unauthorized primary admin observation, got %#v", failover)
+	}
+
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
 	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin connection refused"
+	cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
 	observedPrimaryLSN := cluster.Status.HAStatus.PrimaryLSN
 	cluster.Status.HAStatus.PrimaryLSN = 0
 	reconciler.updateHAStatusAndConditions(cluster)
