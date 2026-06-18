@@ -1723,6 +1723,78 @@ func TestExecuteHAPlannedActionTypedUsesAdminSDKForReplicationSlotCreate(t *test
 	}
 }
 
+func TestExecuteHAPlannedActionTypedRequiresExpectedAdminNodeEvidence(t *testing.T) {
+	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
+
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"schema_version": uint32(1),
+			"action": map[string]any{
+				"action_id":   "replication_slot_create:standby-a",
+				"action_kind": "replication_slot_create",
+				"target":      "standby-a",
+				"state":       "applied",
+				"node_id":     "standby-a",
+			},
+			"slot_action": "create",
+			"slot": map[string]any{
+				"slot_name":       "standby-a",
+				"timeline_id":     uint64(4),
+				"restart_lsn":     uint64(12),
+				"received_lsn":    uint64(12),
+				"applied_lsn":     uint64(12),
+				"safe_read_lsn":   uint64(12),
+				"active":          true,
+				"reseed_required": false,
+				"current_lsn":     uint64(12),
+			},
+		})
+	}))
+	defer server.Close()
+
+	baseAction := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionCreateSlot),
+		Executor:    string(haActionExecutorAdminAPI),
+		StandbyName: "standby-a",
+		SlotName:    "standby-a",
+		TargetLSN:   12,
+		AdminURL:    server.URL,
+		AdminMethod: http.MethodPost,
+		AdminPath:   haAdminReplicationSlotsPath,
+	}
+
+	missingNode := baseAction
+	handled, err := (&AntflyClusterReconciler{}).executeHAPlannedActionTyped(context.Background(), haCluster(), &missingNode)
+	if err == nil || !strings.Contains(err.Error(), "requires adminNodeID") {
+		t.Fatalf("expected missing adminNodeID error, got %v", err)
+	}
+	if !handled {
+		t.Fatal("expected direct admin action with missing adminNodeID to be handled as an error")
+	}
+	if called {
+		t.Fatal("expected missing adminNodeID to fail before making an HTTP request")
+	}
+	if missingNode.AdminResult != nil {
+		t.Fatalf("expected missing adminNodeID to leave no admin result, got %#v", missingNode.AdminResult)
+	}
+
+	wrongNode := baseAction
+	wrongNode.AdminNodeID = "primary-a"
+	handled, err = (&AntflyClusterReconciler{}).executeHAPlannedActionTyped(context.Background(), haCluster(), &wrongNode)
+	if err == nil || !strings.Contains(err.Error(), "typed result evidence") {
+		t.Fatalf("expected wrong-node receipt error, got %v", err)
+	}
+	if !handled {
+		t.Fatal("expected wrong-node direct admin action to be handled as an error")
+	}
+	if wrongNode.AdminResult != nil {
+		t.Fatalf("expected wrong-node receipt to be discarded, got %#v", wrongNode.AdminResult)
+	}
+}
+
 func TestExecuteHAPlannedActionTypedAppliesAdminSDKPromotionReceipt(t *testing.T) {
 	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
 
