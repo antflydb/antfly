@@ -31,6 +31,8 @@ const quantizer_mod = @import("antfly_vector").quantizer;
 const rabitq = @import("antfly_vector").rabitq;
 const vec = @import("antfly_vector").vector;
 
+const hilbert_coord_stack_capacity = 2048;
+
 fn debugHitFromApprox(item: search_results.ApproxSearchResult) search_types.DebugHit {
     return .{
         .id = item.vector_id,
@@ -8169,8 +8171,13 @@ pub fn bulkBuildExternalSequentialTxnOptions(
             defer self.alloc.free(entries);
             const embeddings = try self.alloc.alloc(u8, count * embedding_len);
             defer self.alloc.free(embeddings);
-            const coords = try self.alloc.alloc(u32, hilbert.dimension);
-            defer self.alloc.free(coords);
+            var coords_stack: [hilbert_coord_stack_capacity]u32 = undefined;
+            const use_coords_stack = hilbert.dimension <= coords_stack.len;
+            const coords = if (use_coords_stack)
+                coords_stack[0..hilbert.dimension]
+            else
+                try self.alloc.alloc(u32, hilbert.dimension);
+            defer if (!use_coords_stack) self.alloc.free(coords);
 
             var offset: usize = 0;
             while (offset < count) {
@@ -8344,8 +8351,13 @@ pub fn buildBulkHilbertSeeded(
     const embedding_len = hilbert.byteLen();
     const embeddings = try self.alloc.alloc(u8, inputs.len * embedding_len);
     defer self.alloc.free(embeddings);
-    const coords = try self.alloc.alloc(u32, hilbert.dimension);
-    defer self.alloc.free(coords);
+    var coords_stack: [hilbert_coord_stack_capacity]u32 = undefined;
+    const use_coords_stack = hilbert.dimension <= coords_stack.len;
+    const coords = if (use_coords_stack)
+        coords_stack[0..hilbert.dimension]
+    else
+        try self.alloc.alloc(u32, hilbert.dimension);
+    defer if (!use_coords_stack) self.alloc.free(coords);
 
     for (inputs, 0..) |input, i| {
         const embedding = embeddings[i * embedding_len ..][0..embedding_len];
@@ -9960,8 +9972,13 @@ fn splitVectorSetHilbert(
     const embedding_len = hilbert.byteLen();
     const embeddings = try self.alloc.alloc(u8, count * embedding_len);
     defer self.alloc.free(embeddings);
-    const coords = try self.alloc.alloc(u32, hilbert.dimension);
-    defer self.alloc.free(coords);
+    var coords_stack: [hilbert_coord_stack_capacity]u32 = undefined;
+    const use_coords_stack = hilbert.dimension <= coords_stack.len;
+    const coords = if (use_coords_stack)
+        coords_stack[0..hilbert.dimension]
+    else
+        try self.alloc.alloc(u32, hilbert.dimension);
+    defer if (!use_coords_stack) self.alloc.free(coords);
 
     for (0..count) |i| {
         const embedding = embeddings[i * embedding_len ..][0..embedding_len];
