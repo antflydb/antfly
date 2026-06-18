@@ -2575,6 +2575,238 @@
         }
       ],
       "sql": "SELECT id, convert_from($1, 'UTF8')::jsonb AS decoded FROM usage_records WHERE jsonb_typeof(convert_from($1, 'UTF8')::jsonb) = 'object' ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression null-safe distinct predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "string": "ada@example.test"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) IS NOT DISTINCT FROM $1 AND metadata->>'source' IS DISTINCT FROM 'internal' ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression in predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "string": "ada@example.test"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) IN ($1, 'grace@example.test') ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression or predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "string": "ada@example.test"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) = $1 OR upper(email) = 'GRACE@EXAMPLE.TEST' AND lower(email) != 'blocked@example.test' ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table parenthesized expression or predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "string": "ada@example.test"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE (lower(email) = $1) OR (upper(email) = 'GRACE@EXAMPLE.TEST' AND lower(email) != 'blocked@example.test') ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table mixed scalar expression or predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "string": "ada@example.test"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE id = 'u1' OR lower(email) = $1 ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression all or predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "json": "[\"ada@example.test\",\"ada@example.test\"]"
+        },
+        {
+          "json": "[\"BLOCKED@EXAMPLE.TEST\",\"SYSTEM@EXAMPLE.TEST\"]"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) = ALL($1::text[]) OR upper(email) <> ALL($2::text[]) ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression not in predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_not_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "string": "ada@example.test"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) NOT IN ($1, 'grace@example.test') ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table parenthesized expression not in predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_not_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "string": "ada@example.test"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE NOT (lower(email) IN ($1, 'grace@example.test')) ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression all negative membership query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_not_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "json": "[\"ada@example.test\",\"grace@example.test\"]"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) <> ALL($1::text[]) ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression any predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE lower(email) = ANY(ARRAY['ada@example.test','grace@example.test']::text[]) ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression some predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "json": "[\"ada@example.test\",\"grace@example.test\"]"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) = SOME($1::text[]) ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression any inequality predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "json": "[\"ada@example.test\",\"grace@example.test\"]"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) != ANY($1::text[]) ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "single table expression all equality predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 2,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "params": [
+        {
+          "json": "[\"ada@example.test\",\"ada@example.test\"]"
+        }
+      ],
+      "sql": "SELECT id FROM usage_records WHERE lower(email) = ALL($1::text[]) ORDER BY id ASC LIMIT 5"
     }
   ]
 }
