@@ -99,15 +99,46 @@ pub const ObjectRangeReader = struct {
     }
 };
 
+const object_range_cache_lane_count = std.meta.fields(range_io.CacheLane).len;
+
+pub const ObjectRangeCacheLaneStats = struct {
+    hits: usize = 0,
+    misses: usize = 0,
+    stored_bytes: usize = 0,
+    rejected_bytes: usize = 0,
+};
+
 pub const ObjectRangeCacheStats = struct {
     hits: usize = 0,
     misses: usize = 0,
     stored_bytes: usize = 0,
+    rejected_bytes: usize = 0,
+    lanes: [object_range_cache_lane_count]ObjectRangeCacheLaneStats = [_]ObjectRangeCacheLaneStats{.{}} ** object_range_cache_lane_count,
+
+    pub fn lane(self: ObjectRangeCacheStats, cache_lane: range_io.CacheLane) ObjectRangeCacheLaneStats {
+        return self.lanes[@intFromEnum(cache_lane)];
+    }
+};
+
+pub const ObjectRangeCachePolicy = struct {
+    max_bytes_by_lane: [object_range_cache_lane_count]?usize = [_]?usize{null} ** object_range_cache_lane_count,
+
+    pub fn withLaneLimit(cache_lane: range_io.CacheLane, max_bytes: usize) ObjectRangeCachePolicy {
+        var policy = ObjectRangeCachePolicy{};
+        policy.max_bytes_by_lane[@intFromEnum(cache_lane)] = max_bytes;
+        return policy;
+    }
+
+    pub fn admits(self: ObjectRangeCachePolicy, cache_lane: range_io.CacheLane, current_bytes: usize, new_bytes: usize) bool {
+        const limit = self.max_bytes_by_lane[@intFromEnum(cache_lane)] orelse return true;
+        return current_bytes <= limit and new_bytes <= limit - current_bytes;
+    }
 };
 
 pub const ObjectRangeCache = struct {
     entries: std.StringHashMapUnmanaged([]u8) = .empty,
     stats: ObjectRangeCacheStats = .{},
+    policy: ObjectRangeCachePolicy = .{},
 
     pub fn deinit(self: *ObjectRangeCache, alloc: Allocator) void {
         var iter = self.entries.iterator();
@@ -123,12 +154,18 @@ pub const ObjectRangeCache = struct {
         return self.stats;
     }
 
+    fn currentBytesForLane(self: ObjectRangeCache, cache_lane: range_io.CacheLane) usize {
+        const lane_stats = self.stats.lane(cache_lane);
+        return lane_stats.stored_bytes;
+    }
+
     pub fn readAlloc(
         self: *ObjectRangeCache,
         alloc: Allocator,
         reader: ObjectRangeReader,
         read: range_io.RangeRead,
     ) ![]u8 {
+        const cache_lane = read.cacheLane();
         const cache_key = try read.cacheKeyAlloc(alloc);
         if (self.entries.get(cache_key)) |cached| {
             const read_len: usize = std.math.cast(usize, read.range.len) orelse {
@@ -140,13 +177,21 @@ pub const ObjectRangeCache = struct {
                 return error.InvalidLakeRangeRead;
             }
             self.stats.hits += 1;
+            self.stats.lanes[@intFromEnum(cache_lane)].hits += 1;
             alloc.free(cache_key);
             return try alloc.dupe(u8, cached);
         }
 
         self.stats.misses += 1;
+        self.stats.lanes[@intFromEnum(cache_lane)].misses += 1;
         const bytes = try readObjectRangeAlloc(alloc, reader, read);
         errdefer alloc.free(bytes);
+        if (!self.policy.admits(cache_lane, self.currentBytesForLane(cache_lane), bytes.len)) {
+            self.stats.rejected_bytes += bytes.len;
+            self.stats.lanes[@intFromEnum(cache_lane)].rejected_bytes += bytes.len;
+            alloc.free(cache_key);
+            return bytes;
+        }
         const stored = try alloc.dupe(u8, bytes);
         errdefer alloc.free(stored);
         self.entries.put(alloc, cache_key, stored) catch |err| {
@@ -154,6 +199,7 @@ pub const ObjectRangeCache = struct {
             return err;
         };
         self.stats.stored_bytes += stored.len;
+        self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes += stored.len;
         return bytes;
     }
 };
@@ -4678,6 +4724,155 @@ test "parquet object range cache rejects corrupted cached range lengths" {
     const stats = cache.statsSnapshot();
     try std.testing.expectEqual(@as(usize, 0), stats.hits);
     try std.testing.expectEqual(@as(usize, 0), stats.misses);
+}
+
+test "parquet object range cache accounts bytes by cache lane" {
+    const alloc = std.testing.allocator;
+    var cache = ObjectRangeCache{};
+    defer cache.deinit(alloc);
+
+    const CountingReader = struct {
+        body: []const u8,
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            self.read_count += 1;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var reader = CountingReader{ .body = "abcdefghijklmnopqrstuvwxyz" };
+    const object = range_io.ObjectRef{
+        .bucket = "bucket",
+        .key = "events/part-a.parquet",
+        .byte_len = 26,
+        .version = .{ .etag = "etag-a" },
+    };
+    const metadata_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 0, .len = 4 },
+        .purpose = .parquet_footer,
+    };
+    const chunk_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 8, .len = 6 },
+        .purpose = .parquet_column_chunk,
+        .decoded_column_id = "amount",
+    };
+
+    const metadata_first = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_first);
+    const chunk_first = try cache.readAlloc(alloc, reader.reader(), chunk_read);
+    defer alloc.free(chunk_first);
+    const metadata_second = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_second);
+    const chunk_second = try cache.readAlloc(alloc, reader.reader(), chunk_read);
+    defer alloc.free(chunk_second);
+
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 2), reader.read_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.misses);
+    try std.testing.expectEqual(@as(usize, 2), stats.hits);
+    try std.testing.expectEqual(@as(usize, 10), stats.stored_bytes);
+    try std.testing.expectEqual(@as(usize, 4), stats.lane(.metadata).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.metadata).misses);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.metadata).hits);
+    try std.testing.expectEqual(@as(usize, 6), stats.lane(.compressed_range).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.compressed_range).misses);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.compressed_range).hits);
+}
+
+test "parquet object range cache applies lane admission limits independently" {
+    const alloc = std.testing.allocator;
+    var cache = ObjectRangeCache{
+        .policy = ObjectRangeCachePolicy.withLaneLimit(.broad_scan_scratch, 0),
+    };
+    defer cache.deinit(alloc);
+
+    const CountingReader = struct {
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.read_count += 1;
+            const bytes = try a.alloc(u8, len);
+            @memset(bytes, 'x');
+            return bytes;
+        }
+    };
+    var reader = CountingReader{};
+    const object = range_io.ObjectRef{
+        .bucket = "bucket",
+        .key = "events/scan.tmp",
+        .byte_len = 64,
+        .version = .{ .etag = "etag-a" },
+    };
+    const scratch_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 0, .len = 8 },
+        .purpose = .broad_scan_scratch,
+    };
+    const metadata_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 8, .len = 4 },
+        .purpose = .parquet_footer,
+    };
+
+    const scratch_first = try cache.readAlloc(alloc, reader.reader(), scratch_read);
+    defer alloc.free(scratch_first);
+    const scratch_second = try cache.readAlloc(alloc, reader.reader(), scratch_read);
+    defer alloc.free(scratch_second);
+    const metadata_first = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_first);
+    const metadata_second = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_second);
+
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 3), reader.read_count);
+    try std.testing.expectEqual(@as(usize, 3), stats.misses);
+    try std.testing.expectEqual(@as(usize, 1), stats.hits);
+    try std.testing.expectEqual(@as(usize, 4), stats.stored_bytes);
+    try std.testing.expectEqual(@as(usize, 16), stats.rejected_bytes);
+    try std.testing.expectEqual(@as(usize, 0), stats.lane(.broad_scan_scratch).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 16), stats.lane(.broad_scan_scratch).rejected_bytes);
+    try std.testing.expectEqual(@as(usize, 2), stats.lane(.broad_scan_scratch).misses);
+    try std.testing.expectEqual(@as(usize, 4), stats.lane(.metadata).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.metadata).hits);
 }
 
 test "parquet object range rows query filters on unprojected column" {
