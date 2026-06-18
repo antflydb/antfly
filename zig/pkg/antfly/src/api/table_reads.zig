@@ -17568,6 +17568,25 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqualStrings("{\"amount\":20}", json_path_exists_result.rows[0]);
     try std.testing.expectEqualStrings("{\"amount\":30}", json_path_exists_result.rows[1]);
 
+    const json_extract = [_]db_mod.types.RelationalRowsJsonExtractProjection{
+        .{ .output = "tier", .field = "attrs", .path = "tier", .as_text = true },
+        .{ .output = "flags", .field = "attrs", .path = "flags" },
+    };
+    var json_extract_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select_all = false,
+            .json_extract = json_extract[0..],
+            .limit = 5,
+        },
+    }, .read_index)).?;
+    defer json_extract_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 10), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), json_extract_result.total);
+    try std.testing.expectEqual(@as(usize, 2), json_extract_result.rows.len);
+    try std.testing.expectEqualStrings("{\"tier\":\"gold\",\"flags\":{\"vip\":true}}", json_extract_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tier\":\"silver\",\"flags\":{\"vip\":false}}", json_extract_result.rows[1]);
+
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },
         .{ .name = "sum_amount", .op = .sum, .field = "amount" },
@@ -17579,7 +17598,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 10), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 11), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
