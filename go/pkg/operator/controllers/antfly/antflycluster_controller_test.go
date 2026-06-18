@@ -4438,6 +4438,244 @@ func TestHAPromotionSDKResultPreservesRequiredEvidence(t *testing.T) {
 	g.Expect(haActionHasRequiredAdminResult(action)).To(BeTrue())
 }
 
+func TestHAAdminSDKActionResultsSatisfyOperatorEvidenceGates(t *testing.T) {
+	g := NewWithT(t)
+
+	directPrimaryAction := func(kind haActionKind) antflyv1.HAPlannedActionStatus {
+		return antflyv1.HAPlannedActionStatus{
+			Kind:         string(kind),
+			StandbyName:  "standby-a",
+			TargetLSN:    5,
+			AdminJobName: haAdminDirectAPIName,
+			AdminNodeID:  "primary-a",
+		}
+	}
+	receipt := func(kind adminsdk.HAActionReceiptActionKind, target, state, nodeID string) adminsdk.HAActionReceipt {
+		return adminsdk.HAActionReceipt{
+			ActionId:   string(kind) + ":" + target,
+			ActionKind: kind,
+			Target:     target,
+			State:      adminsdk.HAActionReceiptState(state),
+			NodeId:     nodeID,
+		}
+	}
+
+	slotAction := directPrimaryAction(haActionCreateSlot)
+	slot := haAdminActionResultFromReplicationSlotSDK(adminsdk.HAReplicationSlotActionResponse{
+		SchemaVersion: 1,
+		Action:        receipt(adminsdk.HAActionKindReplicationSlotCreate, "standby-a", string(adminsdk.HAActionStateApplied), "primary-a"),
+		SlotAction:    adminsdk.HAReplicationSlotActionCreate,
+		Slot: adminsdk.HAReplicationSlot{
+			SlotName:       "standby-a",
+			TimelineId:     4,
+			RestartLsn:     5,
+			ReceivedLsn:    5,
+			AppliedLsn:     5,
+			SafeReadLsn:    5,
+			Active:         true,
+			ReseedRequired: false,
+			CurrentLsn:     5,
+		},
+	})
+	g.Expect(requireHADirectAdminActionResultStatus(&slotAction, slot)).To(Succeed())
+	g.Expect(slotAction.AdminResult.SlotAction).To(Equal("create"))
+	g.Expect(slotAction.AdminResult.ActionNodeID).To(Equal("primary-a"))
+
+	seedAction := directPrimaryAction(haActionSeedStandby)
+	seedBegin := haAdminActionResultFromBaseBackupBeginSDK(adminsdk.HABaseBackupBeginResponse{
+		SchemaVersion:  1,
+		Action:         receipt(adminsdk.HAActionKindBaseBackupBegin, "base-standby-a-5", string(adminsdk.HAActionStateApplied), "primary-a"),
+		SlotName:       "standby-a",
+		ManifestId:     "base-standby-a-5",
+		BackupLsn:      5,
+		StartRecordLsn: 6,
+	})
+	g.Expect(requireHADirectAdminActionResultStatus(&seedAction, seedBegin)).To(Succeed())
+	g.Expect(seedAction.AdminResult.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(seedAction.AdminResult.StartRecordLSN).To(Equal(uint64(6)))
+
+	finishAction := directPrimaryAction(haActionFinishStandbySeed)
+	seedFinish := haAdminActionResultFromBaseBackupFinishSDK(adminsdk.HABaseBackupFinishResponse{
+		SchemaVersion: 1,
+		Action:        receipt(adminsdk.HAActionKindBaseBackupFinish, "base-standby-a-5", string(adminsdk.HAActionStateApplied), "primary-a"),
+		ManifestId:    "base-standby-a-5",
+		BackupLsn:     5,
+		EndRecordLsn:  7,
+	})
+	g.Expect(requireHADirectAdminActionResultStatus(&finishAction, seedFinish)).To(Succeed())
+	g.Expect(finishAction.AdminResult.EndRecordLSN).To(Equal(uint64(7)))
+
+	bootstrapAction := directPrimaryAction(haActionBootstrapStandbySeed)
+	bootstrapAction.AdminNodeID = "standby-a"
+	bootstrap := haAdminActionResultFromStandbyBootstrapSDK(adminsdk.HAStandbyBootstrapResponse{
+		SchemaVersion: 1,
+		Action:        receipt(adminsdk.HAActionKindStandbyBootstrap, "base-standby-a-5", string(adminsdk.HAActionStateApplied), "standby-a"),
+		ManifestId:    "base-standby-a-5",
+		BackupLsn:     5,
+		CheckpointLsn: 7,
+	})
+	g.Expect(requireHADirectAdminActionResultStatus(&bootstrapAction, bootstrap)).To(Succeed())
+	g.Expect(bootstrapAction.AdminResult.CheckpointLSN).To(Equal(uint64(7)))
+
+	promoteAction := antflyv1.HAPlannedActionStatus{
+		Kind:         string(haActionAssessPromotion),
+		StandbyName:  "standby-a",
+		TargetLSN:    12,
+		AdminJobName: haAdminDirectAPIName,
+		AdminNodeID:  "standby-a",
+	}
+	promotionAssess := haAdminActionResultFromPromotionAssessSDK(adminsdk.HAPromotionAssessResponse{
+		SchemaVersion: 1,
+		Action:        receipt(adminsdk.HAActionKindPromotionAssess, "standby-a", string(adminsdk.HAActionStateAssessed), "standby-a"),
+		Assessment: adminsdk.HAPromotionAssessment{
+			RequiredLsn:        12,
+			ReceivedLsn:        12,
+			AppliedLsn:         12,
+			HasRequiredLsn:     true,
+			CaughtUpToReceived: true,
+			FencingConfirmed:   true,
+			Force:              false,
+			Mode:               adminsdk.HAPromotionModeSafe,
+			DataLossPossible:   false,
+			Safe:               true,
+			RequiresFencing:    false,
+			RequiresForce:      false,
+			CanPromote:         true,
+		},
+	})
+	g.Expect(requireHADirectPromotionAssessmentResultStatus(&promoteAction, promotionAssess)).To(Succeed())
+	g.Expect(promoteAction.AdminResult.PromotionMode).To(Equal("safe"))
+
+	fenceCluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+	}
+	fenceAction := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionAcquireFence),
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceGeneration: 3,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminNodeID:     "standby-a",
+	}
+	fence := haAdminActionResultFromFenceSDK(adminsdk.HAFenceResponse{
+		SchemaVersion: 1,
+		Action:        receipt(adminsdk.HAActionKindFenceAcquire, "standby-a", string(adminsdk.HAActionStateApplied), "standby-a"),
+		Receipt: adminsdk.HAFenceReceipt{
+			Generation:       3,
+			Token:            "ha-fence-token",
+			Identity:         adminsdk.HAIdentity{ClusterId: 100, ShardId: 10, TableId: 20, TimelineId: 5, Epoch: 7},
+			OldPrimaryId:     "primary-a",
+			PromotedNodeId:   "standby-a",
+			ParentTimelineId: 4,
+			ParentEpoch:      6,
+			NewTimelineId:    5,
+			NewEpoch:         7,
+			RequiredLsn:      12,
+			ObservedLsn:      12,
+			Forced:           false,
+			Reason:           "LeaseAcquired",
+		},
+	})
+	g.Expect(requireHADirectFenceAcquireResultStatus(fenceCluster, &fenceAction, fence)).To(Succeed())
+	g.Expect(fenceAction.AdminResult.FenceToken).To(Equal("ha-fence-token"))
+}
+
+func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					ClusterID:         100,
+					ShardID:           10,
+					TableID:           20,
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  4,
+					ParentEpoch:       6,
+					NewTimelineID:     5,
+					NewEpoch:          7,
+					SwitchLSN:         12,
+					RequiredLSN:       12,
+					ObservedLSN:       12,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   3,
+					FenceToken:        "ha-fence-token",
+				},
+			},
+		},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionRewindFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 3,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminNodeID:     "primary-a",
+	}
+	response := adminsdk.HARejoinAssessResponse{
+		SchemaVersion: 1,
+		Action: adminsdk.HAActionReceipt{
+			ActionId:   "rejoin_rewind:primary-a",
+			ActionKind: adminsdk.HAActionKindRejoinRewind,
+			Target:     "primary-a",
+			State:      adminsdk.HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		Assessment: adminsdk.HARejoinAssessment{
+			Action:            adminsdk.HARejoinActionRewind,
+			Reason:            adminsdk.HARejoinReasonParentTimelineRetained,
+			FormerNodeId:      "primary-a",
+			TargetTimelineId:  5,
+			TargetEpoch:       7,
+			ParentClusterId:   100,
+			ParentShardId:     10,
+			ParentTableId:     20,
+			ParentTimelineId:  4,
+			ParentEpoch:       6,
+			ForkLsn:           12,
+			FormerLastLsn:     13,
+			RetainedFromLsn:   8,
+			DataLossDiscarded: true,
+		},
+		Rewind: adminsdk.HARejoinRewindResult{
+			NodeId:            "primary-a",
+			ForkLsn:           12,
+			PreviousLastLsn:   13,
+			CurrentLastLsn:    12,
+			NextLsn:           13,
+			DiscardedLsnCount: 1,
+			TargetTimelineId:  5,
+			TargetEpoch:       7,
+			DataLossDiscarded: true,
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{}
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(cluster, &action, response)).To(BeTrue())
+	g.Expect(action.AdminResult).NotTo(BeNil())
+	g.Expect(action.AdminResult.RejoinAction).To(Equal("rewind"))
+	g.Expect(action.AdminResult.RewindExecuted).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionRewindFormerPrimary)))
+}
+
 func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
