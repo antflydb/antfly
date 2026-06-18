@@ -23,6 +23,7 @@ const artifact_ref = @import("../manifest/artifact_ref.zig");
 const base_source = @import("../manifest/base_source.zig");
 const lake_promotion = @import("../build/lake_promotion.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
+const lake_cache = @import("lake_cache.zig");
 const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
 
 pub const Operation = enum {
@@ -47,6 +48,7 @@ pub const Request = struct {
     sidecar_policy: lake_sidecar_selection.Policy = .{},
     operation: Operation,
     projected_column_count: u16 = 0,
+    cache_budget: lake_cache.Budget = .{},
     observation: ?lake_promotion.Observation = null,
     thresholds: lake_promotion.Thresholds = .{},
 };
@@ -75,6 +77,7 @@ pub const Plan = struct {
     projected_column_count: u16 = 0,
     cache_class: CacheClass,
     accounting: ArtifactAccounting,
+    cache_accounting: lake_cache.Accounting = .{},
     sidecar_selection: SidecarSelectionAccounting = .{},
     recommendation: lake_promotion.Recommendation = .{ .kind = .none },
 };
@@ -85,6 +88,7 @@ pub fn explain(request: Request) !Plan {
     for (request.artifacts) |artifact| {
         try accountArtifact(&accounting, artifact);
     }
+    const cache_accounting = try lake_cache.accountArtifacts(request.artifacts, request.cache_budget);
     try validateBaseSourceArtifacts(request.base_source, request.artifacts);
     try validateSidecarDeclarations(request.artifacts, request.sidecars);
     const sidecar_selection = try summarizeSidecarSelection(
@@ -103,6 +107,7 @@ pub fn explain(request: Request) !Plan {
         .projected_column_count = request.projected_column_count,
         .cache_class = chooseCacheClass(request.operation, request.base_source, accounting),
         .accounting = accounting,
+        .cache_accounting = cache_accounting,
         .sidecar_selection = sidecar_selection,
         .recommendation = if (request.observation) |observation|
             lake_promotion.recommend(observation, request.thresholds)
@@ -276,6 +281,9 @@ test "lake explain accounts for Antfly row fragments and stats" {
     try std.testing.expectEqual(@as(u32, 1), plan.accounting.row_fragment_stats_count);
     try std.testing.expectEqual(@as(u32, 1), plan.accounting.algebraic_segment_count);
     try std.testing.expectEqual(@as(u64, 1408), plan.accounting.manifest_accounted_bytes);
+    try std.testing.expectEqual(@as(u64, 384), plan.cache_accounting.pinned_bytes);
+    try std.testing.expectEqual(@as(u64, 1024), plan.cache_accounting.payload_bytes);
+    try std.testing.expectEqual(@as(u64, 1408), plan.cache_accounting.total_bytes);
     try std.testing.expectEqual(@as(u16, 2), plan.projected_column_count);
 }
 
@@ -297,6 +305,11 @@ test "lake explain validates external metadata artifacts and promotion advice" {
         .artifacts = &artifacts,
         .operation = .hydrate,
         .projected_column_count = 3,
+        .cache_budget = .{
+            .max_pinned_bytes = 2048,
+            .max_payload_bytes = 256,
+            .max_total_bytes = 4096,
+        },
         .observation = .{
             .source_kind = .external_iceberg,
             .scanned_rows = 20_000,
@@ -310,6 +323,11 @@ test "lake explain validates external metadata artifacts and promotion advice" {
     try std.testing.expectEqual(CacheClass.external_metadata, plan.cache_class);
     try std.testing.expectEqual(@as(u32, 1), plan.accounting.external_metadata_count);
     try std.testing.expectEqual(@as(u32, 1), plan.accounting.search_sidecar_count);
+    try std.testing.expectEqual(@as(u64, 4096), plan.cache_accounting.external_metadata_bytes);
+    try std.testing.expectEqual(@as(u64, 512), plan.cache_accounting.search_sidecar_bytes);
+    try std.testing.expect(plan.cache_accounting.over_pinned_budget);
+    try std.testing.expect(plan.cache_accounting.over_payload_budget);
+    try std.testing.expect(plan.cache_accounting.over_total_budget);
     try std.testing.expectEqual(lake_promotion.RecommendationKind.promote_external_to_row_fragment, plan.recommendation.kind);
 }
 
