@@ -18,6 +18,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const external_source = @import("../external_source/types.zig");
 const rowsource_bridge = @import("../external_source/rowsource_bridge.zig");
+const parquet_footer = @import("lake_parquet_footer.zig");
+const parquet_metadata = @import("lake_parquet_metadata.zig");
 const parquet_page = @import("lake_parquet_page.zig");
 const range_io = @import("lake_range_io.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
@@ -89,6 +91,17 @@ pub const ObjectRangeRowGroupPlan = struct {
 
     pub fn deinit(self: *ObjectRangeRowGroupPlan, alloc: Allocator) void {
         alloc.free(self.row_groups);
+        self.* = undefined;
+    }
+};
+
+pub const DiscoveredObjectRangeRowGroupPlan = struct {
+    inventory: external_source.Inventory,
+    row_group_plan: ObjectRangeRowGroupPlan,
+
+    pub fn deinit(self: *DiscoveredObjectRangeRowGroupPlan, alloc: Allocator) void {
+        self.row_group_plan.deinit(alloc);
+        self.inventory.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -504,6 +517,67 @@ pub fn planSupportedI64ObjectRangeRowGroupsAlloc(
     return try planObjectRangeRowGroupsAlloc(alloc, inventory, projected_columns, .supported_i64);
 }
 
+pub fn discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+    alloc: Allocator,
+    reader: ObjectRangeReader,
+    raw_inventory: external_source.Inventory,
+    projected_columns: []const []const u8,
+    footer_probe_bytes: u64,
+) !DiscoveredObjectRangeRowGroupPlan {
+    try raw_inventory.validate();
+    if (raw_inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+    if (raw_inventory.files.len == 0) return error.InvalidParquetRowGroupBatch;
+    if (footer_probe_bytes == 0) return error.InvalidLakeRangeRead;
+
+    const footers = try alloc.alloc(parquet_metadata.FileFooter, raw_inventory.files.len);
+    errdefer alloc.free(footers);
+    var initialized_footers: usize = 0;
+    errdefer {
+        for (footers[0..initialized_footers]) |*entry| entry.footer.deinit(alloc);
+    }
+
+    for (raw_inventory.files, 0..) |file, idx| {
+        const object = try range_io.objectRefForExternalFileUri(file);
+        const tail_read = try range_io.planParquetFooterRead(object, footer_probe_bytes);
+        const tail_len: usize = std.math.cast(usize, tail_read.range.len) orelse return error.InvalidLakeRangeRead;
+        const tail = try reader.readAlloc(alloc, tail_read.object.bucket, tail_read.object.key, tail_read.range.offset, tail_len);
+        defer alloc.free(tail);
+        if (tail.len != tail_len) return error.InvalidLakeRangeRead;
+
+        const preflight = try parquet_footer.parseFooterPreflight(object.byte_len, tail_read.range.offset, tail);
+        const metadata_bytes = if (preflight.metadataSlice(tail)) |slice|
+            try alloc.dupe(u8, slice)
+        else blk: {
+            const read = try parquet_footer.planFooterMetadataRead(object, tail_read.range.offset, tail);
+            const read_len: usize = std.math.cast(usize, read.range.len) orelse return error.InvalidLakeRangeRead;
+            const bytes = try reader.readAlloc(alloc, read.object.bucket, read.object.key, read.range.offset, read_len);
+            errdefer alloc.free(bytes);
+            if (bytes.len != read_len) return error.InvalidLakeRangeRead;
+            break :blk bytes;
+        };
+        defer alloc.free(metadata_bytes);
+
+        footers[idx] = .{
+            .file_id = file.file_id,
+            .footer = try parquet_metadata.parseFooterMetadataAlloc(alloc, metadata_bytes, file.byte_len),
+        };
+        initialized_footers += 1;
+    }
+
+    var enriched = try parquet_metadata.enrichInventoryFilesWithFootersAlloc(alloc, raw_inventory, footers);
+    errdefer enriched.deinit(alloc);
+    var row_group_plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, enriched, projected_columns);
+    errdefer row_group_plan.deinit(alloc);
+
+    for (footers[0..initialized_footers]) |*entry| entry.footer.deinit(alloc);
+    alloc.free(footers);
+
+    return .{
+        .inventory = enriched,
+        .row_group_plan = row_group_plan,
+    };
+}
+
 const RowGroupPlanValidation = enum {
     none,
     supported_i64,
@@ -626,6 +700,10 @@ fn appendI32(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: i32) !vo
     try appendZigzag(out, alloc, value);
 }
 
+fn appendI64(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: i64) !void {
+    try appendZigzag(out, alloc, value);
+}
+
 fn appendZigzag(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: anytype) !void {
     const Int = @TypeOf(value);
     const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(Int));
@@ -640,6 +718,34 @@ fn appendVarint(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: anyty
         remaining >>= 7;
     }
     try out.append(alloc, @intCast(remaining));
+}
+
+fn appendListHeader(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, elem_type: enum(u4) {
+    stop = 0,
+    boolean_true = 1,
+    boolean_false = 2,
+    byte = 3,
+    i16 = 4,
+    i32 = 5,
+    i64 = 6,
+    double = 7,
+    binary = 8,
+    list = 9,
+    set = 10,
+    map = 11,
+    struct_ = 12,
+}, len: usize) !void {
+    if (len < 15) {
+        try out.append(alloc, (@as(u8, @intCast(len)) << 4) | @as(u8, @intFromEnum(elem_type)));
+    } else {
+        try out.append(alloc, 0xf0 | @as(u8, @intFromEnum(elem_type)));
+        try appendVarint(out, alloc, len);
+    }
+}
+
+fn appendBinary(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, bytes: []const u8) !void {
+    try appendVarint(out, alloc, bytes.len);
+    try out.appendSlice(alloc, bytes);
 }
 
 fn appendPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const i64) !void {
@@ -754,6 +860,72 @@ fn appendDictionaryI64DataPage(
 
     try out.append(alloc, bit_width);
     try out.appendSlice(alloc, encoded_indexes);
+}
+
+fn appendSingleColumnFooterMetadata(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    column_id: []const u8,
+    row_count: usize,
+    column_offset: usize,
+    compressed_len: usize,
+    uncompressed_len: usize,
+    encoding: i32,
+    compression_codec: i32,
+) !void {
+    var file_prev: i16 = 0;
+    try appendField(out, alloc, &file_prev, 1, .i32);
+    try appendI32(out, alloc, 1);
+    try appendField(out, alloc, &file_prev, 3, .i64);
+    try appendI64(out, alloc, @intCast(row_count));
+    try appendField(out, alloc, &file_prev, 4, .list);
+    try appendListHeader(out, alloc, .struct_, 1);
+
+    var rg_prev: i16 = 0;
+    try appendField(out, alloc, &rg_prev, 1, .list);
+    try appendListHeader(out, alloc, .struct_, 1);
+
+    var chunk_prev: i16 = 0;
+    try appendField(out, alloc, &chunk_prev, 2, .i64);
+    try appendI64(out, alloc, @intCast(column_offset));
+    try appendField(out, alloc, &chunk_prev, 3, .struct_);
+
+    var meta_prev: i16 = 0;
+    try appendField(out, alloc, &meta_prev, 1, .i32);
+    try appendI32(out, alloc, 1);
+    try appendField(out, alloc, &meta_prev, 2, .list);
+    try appendListHeader(out, alloc, .i32, 1);
+    try appendI32(out, alloc, encoding);
+    try appendField(out, alloc, &meta_prev, 3, .list);
+    try appendListHeader(out, alloc, .binary, 1);
+    try appendBinary(out, alloc, column_id);
+    try appendField(out, alloc, &meta_prev, 4, .i32);
+    try appendI32(out, alloc, compression_codec);
+    try appendField(out, alloc, &meta_prev, 6, .i64);
+    try appendI64(out, alloc, @intCast(uncompressed_len));
+    try appendField(out, alloc, &meta_prev, 7, .i64);
+    try appendI64(out, alloc, @intCast(compressed_len));
+    try appendField(out, alloc, &meta_prev, 9, .i64);
+    try appendI64(out, alloc, @intCast(column_offset));
+    try appendStop(out, alloc);
+
+    try appendStop(out, alloc);
+    try appendField(out, alloc, &rg_prev, 2, .i64);
+    try appendI64(out, alloc, @intCast(uncompressed_len));
+    try appendField(out, alloc, &rg_prev, 3, .i64);
+    try appendI64(out, alloc, @intCast(row_count));
+    try appendField(out, alloc, &rg_prev, 5, .i64);
+    try appendI64(out, alloc, @intCast(column_offset));
+    try appendStop(out, alloc);
+
+    try appendStop(out, alloc);
+}
+
+fn appendParquetTrailer(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, metadata_len: usize) !void {
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(metadata_len), .little);
+    try out.appendSlice(alloc, &len_buf);
+    try out.appendSlice(alloc, "PAR1");
 }
 
 fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?i64) !void {
