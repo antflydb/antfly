@@ -4949,6 +4949,330 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
     }
 };
 
+pub const ExternalLakeObjectStoreResolver = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        open_parquet_prefix: *const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            binding: external_binding_api.Binding,
+            options: ExternalObjectStorageLakeRowsSourceOptions,
+        ) anyerror!object_store_support.OpenedObjectStore,
+    };
+
+    pub fn openParquetPrefixAlloc(
+        self: ExternalLakeObjectStoreResolver,
+        alloc: std.mem.Allocator,
+        binding: external_binding_api.Binding,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !object_store_support.OpenedObjectStore {
+        return try self.vtable.open_parquet_prefix(self.ptr, alloc, binding, options);
+    }
+};
+
+pub const RemoteUriExternalLakeObjectStoreResolver = struct {
+    pub fn resolver(self: *@This()) ExternalLakeObjectStoreResolver {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .open_parquet_prefix = openParquetPrefix,
+            },
+        };
+    }
+
+    fn openParquetPrefix(
+        _: *anyopaque,
+        alloc: std.mem.Allocator,
+        binding: external_binding_api.Binding,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !object_store_support.OpenedObjectStore {
+        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+        if (binding.credential_ref != null) return error.UnsupportedExternalLakeCredentialRef;
+        return try object_store_support.OpenedObjectStore.initRemoteUri(
+            alloc,
+            binding.source_uri,
+            options.file_bucket,
+        );
+    }
+};
+
+pub const ExternalLakeRoutingTableReadSource = struct {
+    base: TableReadSource,
+    resolver: ExternalLakeObjectStoreResolver,
+    options: ExternalObjectStorageLakeRowsSourceOptions = .{},
+
+    pub fn init(
+        base: TableReadSource,
+        resolver: ExternalLakeObjectStoreResolver,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) ExternalLakeRoutingTableReadSource {
+        return .{
+            .base = base,
+            .resolver = resolver,
+            .options = options,
+        };
+    }
+
+    pub fn source(self: *@This()) TableReadSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+                .preflight_query = preflightQuery,
+                .preflight_query_group_local = preflightQueryGroupLocal,
+                .lookup_group_local = lookupGroupLocal,
+                .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
+                .relational_temporal_unique_owner_lookup = relationalTemporalUniqueOwnerLookup,
+                .relational_temporal_unique_overlap_owner_lookup = relationalTemporalUniqueOverlapOwnerLookup,
+                .relational_temporal_unique_owner_lookup_group_local = relationalTemporalUniqueOwnerLookupGroupLocal,
+                .relational_temporal_unique_overlap_owner_lookup_group_local = relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
+                .rows_query_plan = rowsQueryPlan,
+                .rows_aggregate_plan = rowsAggregatePlan,
+                .lake_rows_scan = lakeRowsScan,
+                .rows_window_plan = rowsWindowPlan,
+                .rows_join_plan = rowsJoinPlan,
+                .rows_lateral_plan = rowsLateralPlan,
+                .relational_rows_source_group_local = relationalRowsSourceGroupLocal,
+                .scan_group_local = scanGroupLocal,
+                .query_group_local = queryGroupLocal,
+                .search_result_group_local = searchResultGroupLocal,
+                .text_stats_group_local = textStatsGroupLocal,
+                .algebraic_partials_group_local = algebraicPartialsGroupLocal,
+                .join_partition_group_local = joinPartitionGroupLocal,
+                .join_rows_group_local = joinRowsGroupLocal,
+                .join_unmatched_group_local = joinUnmatchedGroupLocal,
+                .join_finalize_group_local = joinFinalizeGroupLocal,
+                .join_job_state_group_local = joinJobStateGroupLocal,
+                .graph_expand_group_local = graphExpandGroupLocal,
+                .graph_hydrate_group_local = graphHydrateGroupLocal,
+                .graph_edges_group_local = graphEdgesGroupLocal,
+                .local_runtime_statuses = localRuntimeStatuses,
+                .lsm_storage_stats = lsmStorageStats,
+                .document_artifact_manifest = documentArtifactManifest,
+                .document_artifact_manifests = documentArtifactManifests,
+                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+                .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+            },
+        };
+    }
+
+    fn openedLakeSourceAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+    ) !OpenedExternalObjectStorageLakeRowsSource {
+        if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+        const opened_store = try self.resolver.openParquetPrefixAlloc(alloc, binding, self.options);
+        return try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+            alloc,
+            runtime_schema,
+            opened_store,
+            self.options,
+        );
+    }
+
+    fn lookup(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.lookup(alloc, table_name, key, opts, consistency);
+    }
+
+    fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.scan(alloc, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.query(alloc, table_name, req, consistency);
+    }
+
+    fn preflightQuery(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, max_work: u32) !?db_mod.RuntimePreflightSummary {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.preflightQuery(alloc, table_name, req, consistency, max_work);
+    }
+
+    fn preflightQueryGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, max_work: u32) !?db_mod.RuntimePreflightSummary {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.preflightQueryGroupLocal(alloc, group_id, table_name, req, consistency, max_work);
+    }
+
+    fn lookupGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    fn relationalUniqueOwnerLookup(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, constraint_name: []const u8, encoded_value: []const u8, consistency: raft_mod.ReadConsistency) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.relationalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, consistency);
+    }
+
+    fn relationalTemporalUniqueOwnerLookup(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, constraint_name: []const u8, encoded_value: []const u8, encoded_point: []const u8, consistency: raft_mod.ReadConsistency) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.relationalTemporalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, encoded_point, consistency);
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookup(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, constraint_name: []const u8, encoded_value: []const u8, encoded_start: []const u8, encoded_end: []const u8, consistency: raft_mod.ReadConsistency) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.relationalTemporalUniqueOverlapOwnerLookup(alloc, table_name, constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+    }
+
+    fn relationalTemporalUniqueOwnerLookupGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, constraint_name: []const u8, encoded_value: []const u8, encoded_point: []const u8, consistency: raft_mod.ReadConsistency) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.relationalTemporalUniqueOwnerLookupGroupLocal(alloc, group_id, table_name, constraint_name, encoded_value, encoded_point, consistency);
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookupGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, constraint_name: []const u8, encoded_value: []const u8, encoded_start: []const u8, encoded_end: []const u8, consistency: raft_mod.ReadConsistency) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.relationalTemporalUniqueOverlapOwnerLookupGroupLocal(alloc, group_id, table_name, constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+    }
+
+    fn rowsQueryPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsQueryPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source == null) return try self.base.rowsQueryPlan(alloc, table_name, runtime_schema, plan, consistency);
+        var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
+        defer lake_source.deinit();
+        return try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsAggregatePlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsAggregatePlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsAggregateResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source == null) return try self.base.rowsAggregatePlan(alloc, table_name, runtime_schema, plan, consistency);
+        var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
+        defer lake_source.deinit();
+        return try lake_source.source().rowsAggregatePlan(alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn lakeRowsScan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, request: serverless_query.LakeRowsScanRequest, consistency: raft_mod.ReadConsistency) !?serverless_query.LakeRowsScanResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source == null) return try self.base.lakeRowsScan(alloc, table_name, runtime_schema, request, consistency);
+        var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
+        defer lake_source.deinit();
+        return try lake_source.source().lakeRowsScan(alloc, table_name, runtime_schema, request, consistency);
+    }
+
+    fn rowsWindowPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsWindowPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsWindowResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.rowsWindowPlan(alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsJoinPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsJoinPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.rowsJoinPlan(alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsLateralPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsLateralPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.rowsLateralPlan(alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn relationalRowsSourceGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, schema_json: []const u8, topology_epoch: u64, req: db_mod.types.RelationalRowsQueryRequest, doc_key_range: db_mod.types.RelationalRowsDocKeyRange, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.relationalRowsSourceGroupLocal(alloc, group_id, table_name, schema_json, topology_epoch, req, doc_key_range, consistency);
+    }
+
+    fn scanGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.scanGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn queryGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.queryGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn searchResultGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.searchResultGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn textStatsGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.textStatsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn algebraicPartialsGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.algebraicPartialsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn joinPartitionGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinPartitionGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn joinRowsGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinRowsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn joinUnmatchedGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinUnmatchedGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn joinFinalizeGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinFinalizeGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn joinJobStateGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinJobStateGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn graphExpandGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.graphExpandGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphHydrateGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphHydrateRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphHydrateResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphEdgesGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphEdgesRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphEdgesResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn localRuntimeStatuses(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.localRuntimeStatuses(alloc, table_name);
+    }
+
+    fn lsmStorageStats(ptr: *anyopaque, table_name: []const u8) !?LsmStorageStats {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.lsmStorageStats(table_name);
+    }
+
+    fn documentArtifactManifest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifests(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, doc_key: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.documentArtifactManifests(alloc, table_name, doc_key, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifestsGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, doc_key: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency);
+    }
+};
+
 pub fn executePinnedExternalLakeRowsScanAlloc(
     alloc: std.mem.Allocator,
     runtime_schema: storage_schema.TableSchema,
@@ -16761,6 +17085,121 @@ test "opened object storage lake source owns store and pins parquet prefix inven
     try std.testing.expect(std.mem.startsWith(u8, opened_source.owned_source.inventory.snapshot_id, "sha256:"));
     try std.testing.expectEqual(@as(usize, 2), opened_source.owned_source.inventory.files.len);
     _ = opened_source.source();
+}
+
+test "external lake routing source resolves object store for external row plans" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const external_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+    const local_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+    };
+
+    const FakeBase = struct {
+        rows_query_count: u32 = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?LookupResponse {
+            return error.UnexpectedBaseLookup;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?ScanResponse {
+            return error.UnexpectedBaseScan;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedBaseQuery;
+        }
+
+        fn rowsQueryPlan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: storage_schema.TableSchema, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rows_query_count += 1;
+            return error.BaseRowsQueryReached;
+        }
+    };
+
+    const FakeResolver = struct {
+        memory: *object_storage_api.MemoryObjectStorage,
+        open_count: u32 = 0,
+
+        fn resolver(self: *@This()) ExternalLakeObjectStoreResolver {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .open_parquet_prefix = openParquetPrefix,
+                },
+            };
+        }
+
+        fn openParquetPrefix(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            binding: external_binding_api.Binding,
+            _: ExternalObjectStorageLakeRowsSourceOptions,
+        ) !object_store_support.OpenedObjectStore {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.open_count += 1;
+            try std.testing.expectEqual(external_source_api.Format.parquet, binding.format);
+            try std.testing.expectEqualStrings("s3://bucket/events", binding.source_uri);
+            return try object_store_support.OpenedObjectStore.initWithClient(
+                inner_alloc,
+                self.memory.client(),
+                "bucket",
+                "events",
+            );
+        }
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put.deinit(alloc);
+
+    var base = FakeBase{};
+    var resolver = FakeResolver{ .memory = &memory };
+    var routed = ExternalLakeRoutingTableReadSource.init(base.source(), resolver.resolver(), .{});
+    var source = routed.source();
+    const projection = [_][]const u8{"amount"};
+    const plan = db_mod.types.RelationalRowsQueryPlan{
+        .query = .{
+            .select = projection[0..],
+            .select_all = false,
+        },
+    };
+
+    try std.testing.expectError(error.InvalidParquetRowGroupBatch, source.rowsQueryPlan(alloc, "events", external_schema, plan, .read_index));
+    try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base.rows_query_count);
+
+    try std.testing.expectError(error.BaseRowsQueryReached, source.rowsQueryPlan(alloc, "events", local_schema, plan, .read_index));
+    try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 1), base.rows_query_count);
 }
 
 test "lowered sql cross-table read plans execute through routed scans" {

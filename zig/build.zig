@@ -4141,6 +4141,7 @@ pub fn build(b: *std.Build) void {
             "object storage pinned external lake source routes row plans through scanner",
             "owned object storage lake source discovers and pins parquet prefix inventory",
             "opened object storage lake source owns store and pins parquet prefix inventory",
+            "external lake routing source resolves object store for external row plans",
             "lowered sql cross-table read plans execute through routed scans",
             "lowered sql insert source plans build batches from routed scans",
             "lowered sql merge mutation plans build batches from routed scans",

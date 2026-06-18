@@ -203,6 +203,20 @@ pub const TransactionIsolationLevel = sql_adapter.TransactionIsolationLevel;
 pub const TransactionAccessMode = sql_adapter.TransactionAccessMode;
 pub const AdvisoryLockPlan = sql_adapter.AdvisoryLockPlan;
 pub const AdvisoryLockAction = sql_adapter.AdvisoryLockAction;
+pub const DatabaseCatalogPlan = sql_adapter.DatabaseCatalogPlan;
+pub const CreateDatabasePlan = sql_adapter.CreateDatabasePlan;
+pub const AlterDatabasePlan = sql_adapter.AlterDatabasePlan;
+pub const DatabaseAlterOperation = sql_adapter.DatabaseAlterOperation;
+pub const DatabaseSetParameterOperation = sql_adapter.DatabaseSetParameterOperation;
+pub const DropDatabasePlan = sql_adapter.DropDatabasePlan;
+pub const TablespaceCatalogPlan = sql_adapter.TablespaceCatalogPlan;
+pub const CreateTablespacePlan = sql_adapter.CreateTablespacePlan;
+pub const RenameTablespacePlan = sql_adapter.RenameTablespacePlan;
+pub const DropTablespacePlan = sql_adapter.DropTablespacePlan;
+pub const NotificationChannelPlan = sql_adapter.NotificationChannelPlan;
+pub const ListenNotificationPlan = sql_adapter.ListenNotificationPlan;
+pub const NotifyNotificationPlan = sql_adapter.NotifyNotificationPlan;
+pub const UnlistenNotificationPlan = sql_adapter.UnlistenNotificationPlan;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -394,21 +408,6 @@ pub const IdentityAllocatorSpec = struct {
     }
 };
 
-pub const DatabaseCatalogPlan = union(enum) {
-    create: CreateDatabasePlan,
-    alter: AlterDatabasePlan,
-    drop: DropDatabasePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .alter => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
 const PrivilegeChangeAction = enum {
     grant,
     revoke,
@@ -584,150 +583,6 @@ pub const RowSecurityCurrentSettingPredicate = struct {
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.field);
         alloc.free(self.setting_name);
-        self.* = undefined;
-    }
-};
-
-pub const CreateDatabasePlan = struct {
-    database_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.database_name);
-        self.* = undefined;
-    }
-};
-
-pub const AlterDatabasePlan = struct {
-    database_name: []const u8,
-    operations: []const DatabaseAlterOperation = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.database_name);
-        freeDatabaseAlterOperations(alloc, self.operations);
-        self.* = undefined;
-    }
-};
-
-pub const DatabaseAlterOperation = union(enum) {
-    set_parameter: DatabaseSetParameterOperation,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .set_parameter => |operation| operation.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const DatabaseSetParameterOperation = struct {
-    name: []const u8,
-    value_json: []const u8,
-
-    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.name);
-        alloc.free(self.value_json);
-    }
-};
-
-pub const DropDatabasePlan = struct {
-    database_name: []const u8,
-    if_exists: bool = false,
-    force: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.database_name);
-        self.* = undefined;
-    }
-};
-
-pub const TablespaceCatalogPlan = union(enum) {
-    create: CreateTablespacePlan,
-    rename: RenameTablespacePlan,
-    drop: DropTablespacePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .rename => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateTablespacePlan = struct {
-    tablespace_name: []const u8,
-    location_json: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.tablespace_name);
-        alloc.free(self.location_json);
-        self.* = undefined;
-    }
-};
-
-pub const RenameTablespacePlan = struct {
-    tablespace_name: []const u8,
-    new_tablespace_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.tablespace_name);
-        alloc.free(self.new_tablespace_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropTablespacePlan = struct {
-    tablespace_name: []const u8,
-    if_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.tablespace_name);
-        self.* = undefined;
-    }
-};
-
-pub const NotificationChannelPlan = union(enum) {
-    listen: ListenNotificationPlan,
-    notify: NotifyNotificationPlan,
-    unlisten: UnlistenNotificationPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .listen => |*plan| plan.deinit(alloc),
-            .notify => |*plan| plan.deinit(alloc),
-            .unlisten => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const ListenNotificationPlan = struct {
-    channel_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.channel_name);
-        self.* = undefined;
-    }
-};
-
-pub const NotifyNotificationPlan = struct {
-    channel_name: []const u8,
-    payload_json: ?[]const u8 = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.channel_name);
-        if (self.payload_json) |payload| alloc.free(payload);
-        self.* = undefined;
-    }
-};
-
-pub const UnlistenNotificationPlan = struct {
-    channel_name: ?[]const u8 = null,
-    all: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.channel_name) |channel_name| alloc.free(channel_name);
         self.* = undefined;
     }
 };
@@ -41043,18 +40898,6 @@ fn freeDomainAlterOperations(alloc: std.mem.Allocator, operations: []const Domai
 }
 
 fn clearDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
-    for (operations) |operation_const| {
-        var operation = operation_const;
-        operation.deinit(alloc);
-    }
-}
-
-fn freeDatabaseAlterOperations(alloc: std.mem.Allocator, operations: []const DatabaseAlterOperation) void {
-    clearDatabaseAlterOperations(alloc, operations);
-    if (operations.len > 0) alloc.free(operations);
-}
-
-fn clearDatabaseAlterOperations(alloc: std.mem.Allocator, operations: []const DatabaseAlterOperation) void {
     for (operations) |operation_const| {
         var operation = operation_const;
         operation.deinit(alloc);

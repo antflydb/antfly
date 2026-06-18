@@ -628,6 +628,165 @@ pub const SequenceAlterOperation = union(enum) {
     set_owned_by: SequenceOwnedBy,
 };
 
+pub const DatabaseCatalogPlan = union(enum) {
+    create: CreateDatabasePlan,
+    alter: AlterDatabasePlan,
+    drop: DropDatabasePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .alter => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateDatabasePlan = struct {
+    database_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.database_name);
+        self.* = undefined;
+    }
+};
+
+pub const AlterDatabasePlan = struct {
+    database_name: []const u8,
+    operations: []const DatabaseAlterOperation = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.database_name);
+        freeDatabaseAlterOperations(alloc, self.operations);
+        self.* = undefined;
+    }
+};
+
+pub const DatabaseAlterOperation = union(enum) {
+    set_parameter: DatabaseSetParameterOperation,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .set_parameter => |operation| operation.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const DatabaseSetParameterOperation = struct {
+    name: []const u8,
+    value_json: []const u8,
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.value_json);
+    }
+};
+
+pub const DropDatabasePlan = struct {
+    database_name: []const u8,
+    if_exists: bool = false,
+    force: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.database_name);
+        self.* = undefined;
+    }
+};
+
+pub const TablespaceCatalogPlan = union(enum) {
+    create: CreateTablespacePlan,
+    rename: RenameTablespacePlan,
+    drop: DropTablespacePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .rename => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateTablespacePlan = struct {
+    tablespace_name: []const u8,
+    location_json: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.tablespace_name);
+        alloc.free(self.location_json);
+        self.* = undefined;
+    }
+};
+
+pub const RenameTablespacePlan = struct {
+    tablespace_name: []const u8,
+    new_tablespace_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.tablespace_name);
+        alloc.free(self.new_tablespace_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropTablespacePlan = struct {
+    tablespace_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.tablespace_name);
+        self.* = undefined;
+    }
+};
+
+pub const NotificationChannelPlan = union(enum) {
+    listen: ListenNotificationPlan,
+    notify: NotifyNotificationPlan,
+    unlisten: UnlistenNotificationPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .listen => |*plan| plan.deinit(alloc),
+            .notify => |*plan| plan.deinit(alloc),
+            .unlisten => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ListenNotificationPlan = struct {
+    channel_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.channel_name);
+        self.* = undefined;
+    }
+};
+
+pub const NotifyNotificationPlan = struct {
+    channel_name: []const u8,
+    payload_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.channel_name);
+        if (self.payload_json) |payload| alloc.free(payload);
+        self.* = undefined;
+    }
+};
+
+pub const UnlistenNotificationPlan = struct {
+    channel_name: ?[]const u8 = null,
+    all: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.channel_name) |channel_name| alloc.free(channel_name);
+        self.* = undefined;
+    }
+};
+
 pub const AdvisoryLockPlan = struct {
     action: AdvisoryLockAction,
     key1: i64,
@@ -657,6 +816,14 @@ fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlter
 
 fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const SequenceAlterOperation) void {
     for (operations) |operation| freeSequenceAlterOperation(alloc, operation);
+}
+
+fn freeDatabaseAlterOperations(alloc: std.mem.Allocator, operations: []const DatabaseAlterOperation) void {
+    for (operations) |operation| {
+        var mutable = operation;
+        mutable.deinit(alloc);
+    }
+    if (operations.len > 0) alloc.free(operations);
 }
 
 test "SQL adapter DDL enum plans own nested values" {
@@ -892,4 +1059,31 @@ test "SQL adapter DDL sequence plans own options and operations" {
         .cascade = true,
     } };
     drop.deinit(alloc);
+}
+
+test "SQL adapter DDL database tablespace and notification plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var database_ops = try alloc.alloc(DatabaseAlterOperation, 1);
+    database_ops[0] = .{ .set_parameter = .{
+        .name = try alloc.dupe(u8, "search_path"),
+        .value_json = try alloc.dupe(u8, "\"public\""),
+    } };
+    var database: DatabaseCatalogPlan = .{ .alter = .{
+        .database_name = try alloc.dupe(u8, "analytics"),
+        .operations = database_ops,
+    } };
+    database.deinit(alloc);
+
+    var tablespace: TablespaceCatalogPlan = .{ .create = .{
+        .tablespace_name = try alloc.dupe(u8, "fastspace"),
+        .location_json = try alloc.dupe(u8, "\"s3://bucket/tablespaces/fastspace\""),
+    } };
+    tablespace.deinit(alloc);
+
+    var notification: NotificationChannelPlan = .{ .notify = .{
+        .channel_name = try alloc.dupe(u8, "catalog_events"),
+        .payload_json = try alloc.dupe(u8, "{\"event\":\"reload\"}"),
+    } };
+    notification.deinit(alloc);
 }

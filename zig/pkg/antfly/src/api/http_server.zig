@@ -20440,7 +20440,7 @@ test "api http server serves database and namespace catalog routes" {
             .name = "events",
             .database_name = "tenant_ops",
             .namespace_name = "analytics",
-            .indexes_json = "{}",
+            .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"}}",
         },
         ad_hoc_table: metadata_table_manager.TableRecord = .{
             .table_id = tables_api.deriveQualifiedTableId("tenant_ops", "analytics", "new_events"),
@@ -20461,6 +20461,7 @@ test "api http server serves database and namespace catalog routes" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl = applyRelationalSqlDdl,
+                    .apply_database_catalog_plan = applyDatabaseCatalogPlan,
                     .create_namespace = createNamespace,
                     .drop_namespace = dropNamespace,
                     .create_catalog_table = createCatalogTable,
@@ -20530,6 +20531,30 @@ test "api http server serves database and namespace catalog routes" {
                 return applied;
             }
             return error.UnsupportedSqlShape;
+        }
+
+        fn applyDatabaseCatalogPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) !tables_api.AppliedRelationalSqlDdlRecord {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (plan) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("tenant_ops", create.database_name);
+                    if (self.tenant_created) return error.DatabaseAlreadyExists;
+                    self.tenant_created = true;
+                    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+                    applied.created_database = true;
+                    return applied;
+                },
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("tenant_ops", drop.database_name);
+                    if (!self.tenant_created) return error.DatabaseNotFound;
+                    if (self.analytics_created) return error.DatabaseNotEmpty;
+                    self.tenant_created = false;
+                    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+                    applied.dropped_database = true;
+                    return applied;
+                },
+                .alter => return error.UnsupportedSqlShape,
+            }
         }
 
         fn createNamespace(ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) !void {

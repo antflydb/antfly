@@ -313,12 +313,19 @@ CLI table commands emit the same OpenAPI requests as hand-written HTTP calls.
 Qualified table grants do not leak across databases or namespaces.
 ```
 
-Until table query/write/storage APIs accept native catalog targets, A2A
-non-default table execution remains fail-closed. Agent cards may advertise the
-default catalog scope, and task handlers must reject explicit non-default
+Explicit REST subroutes and MCP table tools should resolve
+`database.namespace.table` before they delegate into legacy table storage paths.
+Until query/write/storage APIs accept native catalog targets end to end, that
+bridge must be fail-closed: delegation is allowed only when the qualified
+catalog table maps to a unique physical table name. Duplicate bare table names
+across catalogs must return an explicit unsupported/ambiguous error rather than
+falling back to `default.public`.
+
+A2A non-default table execution should remain fail-closed until its task
+handlers use the same catalog-aware table I/O path. Agent cards may advertise
+the default catalog scope, and task handlers must reject explicit non-default
 database or namespace targets rather than silently resolving them against
-`default.public`. Enabling non-default A2A execution requires the same
-catalog-aware table I/O path used by explicit REST subroutes.
+`default.public`.
 
 ### Integration Contract by Surface
 
