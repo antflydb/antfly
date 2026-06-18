@@ -1383,6 +1383,51 @@ fn copyNodeMemberVectorsFromSource(
     return out;
 }
 
+const SplitMemberVectorCopies = struct {
+    left: []f32,
+    right: []f32,
+};
+
+fn copySplitMemberVectorsFromSourceOrder(
+    self: anytype,
+    left_node: *const types.Node,
+    right_node: *const types.Node,
+    source_ids: []const u64,
+    source_vectors: []const f32,
+) !?SplitMemberVectorCopies {
+    if (!left_node.is_leaf or !right_node.is_leaf) return error.InvalidArgument;
+    const dims: usize = @intCast(self.metadata.dims);
+    if (source_vectors.len < source_ids.len * dims) return error.InvalidArgument;
+
+    const left = try self.alloc.alloc(f32, left_node.members.len * dims);
+    errdefer self.alloc.free(left);
+    const right = try self.alloc.alloc(f32, right_node.members.len * dims);
+    errdefer self.alloc.free(right);
+
+    var left_index: usize = 0;
+    var right_index: usize = 0;
+    for (source_ids, 0..) |source_id, source_index| {
+        const src = source_vectors[source_index * dims ..][0..dims];
+        if (left_index < left_node.members.len and left_node.members[left_index] == source_id) {
+            @memcpy(left[left_index * dims ..][0..dims], src);
+            left_index += 1;
+            continue;
+        }
+        if (right_index < right_node.members.len and right_node.members[right_index] == source_id) {
+            @memcpy(right[right_index * dims ..][0..dims], src);
+            right_index += 1;
+        }
+    }
+
+    if (left_index == left_node.members.len and right_index == right_node.members.len) {
+        return .{ .left = left, .right = right };
+    }
+
+    self.alloc.free(left);
+    self.alloc.free(right);
+    return null;
+}
+
 fn copyMemberVectorsFromSourceOrder(
     out: []f32,
     member_ids: []const u64,
@@ -1413,6 +1458,58 @@ test "copy member vectors from source order copies ordered subsequences only" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6 }, &out);
 
     try std.testing.expect(!copyMemberVectorsFromSourceOrder(&out, &.{ 30, 10 }, &source_ids, &source_vectors, 2));
+}
+
+test "copy split member vectors from source order copies both sides in one pass" {
+    const MockIndex = struct {
+        alloc: Allocator,
+        metadata: struct { dims: u32 },
+    };
+
+    var mock = MockIndex{
+        .alloc = std.testing.allocator,
+        .metadata = .{ .dims = 2 },
+    };
+    var left_members = [_]u64{ 10, 30 };
+    var right_members = [_]u64{20};
+    const source_ids = [_]u64{ 10, 20, 30 };
+    const source_vectors = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const left = types.Node{
+        .id = 1,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = &.{},
+        .children = &.{},
+        .members = &left_members,
+    };
+    const right = types.Node{
+        .id = 2,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = &.{},
+        .children = &.{},
+        .members = &right_members,
+    };
+
+    const copies = (try copySplitMemberVectorsFromSourceOrder(&mock, &left, &right, &source_ids, &source_vectors)).?;
+    defer std.testing.allocator.free(copies.left);
+    defer std.testing.allocator.free(copies.right);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6 }, copies.left);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, copies.right);
+
+    var reordered_members = [_]u64{ 30, 10 };
+    const reordered_left = types.Node{
+        .id = 3,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = &.{},
+        .children = &.{},
+        .members = &reordered_members,
+    };
+    try std.testing.expect(try copySplitMemberVectorsFromSourceOrder(&mock, &reordered_left, &right, &source_ids, &source_vectors) == null);
 }
 
 pub fn saveNodeBodyWithAddedVector(
@@ -6550,8 +6647,13 @@ pub fn splitLeafWithOptions(
     var right_vectors: []f32 = &.{};
     defer if (right_vectors.len > 0) self.alloc.free(right_vectors);
     if (publish_known_quantized_now) {
-        left_vectors = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
-        right_vectors = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
+        if (try copySplitMemberVectorsFromSourceOrder(self, &left_node, &right_node, leaf.members, vec_data)) |copies| {
+            left_vectors = copies.left;
+            right_vectors = copies.right;
+        } else {
+            left_vectors = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
+            right_vectors = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
+        }
     }
 
     if (splitting_root) {
