@@ -3134,6 +3134,25 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 		t.Fatalf("expected route planned action for stale fence generation, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 
+	cluster.Status.HAStatus.PrimaryRoute.FenceAuthority = ""
+	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 5
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	route = cluster.Status.HAStatus.PrimaryRoute
+	if !route.Stale ||
+		route.Action != string(haActionUpdatePrimaryRoute) ||
+		route.Reason != "PrimaryRouteFenceAuthorityStale" ||
+		route.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		route.FenceGeneration != 5 {
+		t.Fatalf("expected route update for missing fence authority, got %#v", route)
+	}
+	routeAction, ok = haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionUpdatePrimaryRoute)
+	if !ok ||
+		routeAction.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		routeAction.FenceGeneration != 5 {
+		t.Fatalf("expected route planned action for missing fence authority, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+
 	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 5
 	cluster.Status.HAStatus.PrimaryRoute.FenceAuthority = antflyv1.HAFencingAuthorityStorageFence
 	reconciler.updateHAStatusAndConditions(cluster)

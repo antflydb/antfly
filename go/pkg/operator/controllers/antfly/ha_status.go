@@ -2059,13 +2059,13 @@ func haEvaluatePrimaryRoute(cluster *antflyv1.AntflyCluster, status *antflyv1.HA
 		}
 	}
 	evaluation.Stale = evaluation.CurrentTarget != evaluation.DesiredTarget ||
-		(evaluation.FenceAuthority != "" && currentFenceAuthority != "" && currentFenceAuthority != evaluation.FenceAuthority) ||
+		(evaluation.FenceAuthority != "" && currentFenceAuthority != evaluation.FenceAuthority) ||
 		(evaluation.FenceGeneration > 0 && currentFenceGeneration < evaluation.FenceGeneration)
 	if evaluation.Stale {
 		evaluation.Action = string(haActionUpdatePrimaryRoute)
 		if evaluation.CurrentTarget != evaluation.DesiredTarget {
 			evaluation.Reason = "PrimaryRouteTargetChanged"
-		} else if evaluation.FenceAuthority != "" && currentFenceAuthority != "" && currentFenceAuthority != evaluation.FenceAuthority {
+		} else if evaluation.FenceAuthority != "" && currentFenceAuthority != evaluation.FenceAuthority {
 			evaluation.Reason = "PrimaryRouteFenceAuthorityStale"
 		} else {
 			evaluation.Reason = "PrimaryRouteFenceGenerationStale"
