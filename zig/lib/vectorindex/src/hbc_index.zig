@@ -5002,8 +5002,13 @@ pub fn insertWithMetadata(
 ) !void {
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
-    const transformed_vector = try self.alloc.alloc(f32, self.config.dims);
-    defer self.alloc.free(transformed_vector);
+    var transformed_vector_stack: [4096]f32 = undefined;
+    const use_stack_transformed = self.config.dims <= transformed_vector_stack.len;
+    const transformed_vector = if (use_stack_transformed)
+        transformed_vector_stack[0..self.config.dims]
+    else
+        try self.alloc.alloc(f32, self.config.dims);
+    defer if (!use_stack_transformed) self.alloc.free(transformed_vector);
     try insertWithMetadataTxn(self, &txn, vector_id, vector_data, metadata_value, transformed_vector, now_fn_u64, elapsed_fn_u64);
     try runAutoPostingMaintenanceTxn(self, &txn);
     const flush_start = now_fn_u64();

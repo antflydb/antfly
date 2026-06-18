@@ -846,6 +846,7 @@ implementations cleanly:
    refresh also use stack-backed paired vector scratch for common dimensions,
    falling back to one combined heap allocation instead of two. `SearchScratch`
    also slabs the fixed transformed-query, centroid, and vector work buffers,
+   and single-vector inserts use stack-backed transform scratch when possible,
    posting-delta tail cache entries slab their sequence/id/op arrays, and
    query/fold overlay append IDs plus live flags share one backing allocation.
    Fold compact delta IDs plus ops are likewise slabbed.
