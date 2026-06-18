@@ -3022,7 +3022,10 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     if (request.array_any.len != 0 or request.array_contains.len != 0 or request.array_eq.len != 0 or request.in_predicates.len != 0) return error.UnsupportedRowsQuery;
     if (request.json_contains.len != 0 or request.json_path_eq.len != 0 or request.json_path_exists.len != 0 or request.text_patterns.len != 0) return error.UnsupportedRowsQuery;
     if (request.or_predicates.len != 0 or request.not_predicates.len != 0 or request.access_or_predicates.len != 0 or request.access_not_predicates.len != 0) return error.UnsupportedRowsQuery;
-    if (request.expression_predicates.len != 0 or request.expression_or_predicates.len != 0 or request.expression_not_predicates.len != 0 or request.expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
+    if (request.expression_or_predicates.len != 0 or request.expression_not_predicates.len != 0 or request.expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
+    for (request.expression_predicates) |condition| {
+        try validateRowsExpressionConditionTypes(alloc, schema, condition.lhs, condition.op, condition.rhs);
+    }
     if (request.predicates.len > 1) return error.UnsupportedRowsQuery;
     for (request.order_by) |order| {
         if (order.expression != null) return error.UnsupportedRowsQuery;
@@ -3053,7 +3056,7 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     const scan = lake_rows.ScanRequest{
         .projected_columns = projected_columns,
         .predicate = predicate,
-        .limit = if (request.order_by.len == 0) if (request.limit) |limit| @as(usize, limit) else null else null,
+        .limit = if (request.order_by.len == 0 and request.expression_predicates.len == 0) if (request.limit) |limit| @as(usize, limit) else null else null,
     };
     return .{
         .request = scan,
@@ -3067,7 +3070,22 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
     request: OwnedRowsQueryRequest,
     result: lake_rows.ScanResult,
 ) !OwnedRowsQueryResult {
-    var ordered_rows = result.rows;
+    var filtered_rows: []lake_rows.ProjectedRow = result.rows;
+    var owns_filtered_rows = false;
+    if (request.expression_predicates.len != 0) {
+        var filtered = std.ArrayListUnmanaged(lake_rows.ProjectedRow).empty;
+        errdefer filtered.deinit(alloc);
+        for (result.rows) |row| {
+            if (try lakeRowsQueryExpressionPredicatesMatchAlloc(alloc, request.expression_predicates, row)) {
+                try filtered.append(alloc, row);
+            }
+        }
+        filtered_rows = try filtered.toOwnedSlice(alloc);
+        owns_filtered_rows = true;
+    }
+    defer if (owns_filtered_rows) alloc.free(filtered_rows);
+
+    var ordered_rows = filtered_rows;
     if (request.order_by.len > 0) {
         std.sort.pdq(lake_rows.ProjectedRow, ordered_rows, LakeRowsQuerySortContext{ .order_by = request.order_by }, lakeProjectedRowLessThan);
     }
@@ -3091,7 +3109,7 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
 
     return .{
         .rows = try rows.toOwnedSlice(alloc),
-        .total = result.total,
+        .total = if (request.expression_predicates.len == 0) result.total else @intCast(filtered_rows.len),
     };
 }
 
@@ -3177,6 +3195,9 @@ fn lakeRowsProjectedColumnsAlloc(
         const column = findRelationalColumn(schema.relational_columns, order.field) orelse return error.InvalidRowsRequest;
         try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
     }
+    for (request.expression_predicates) |condition| {
+        try appendLakeRowsExpressionConditionProjectedColumnsAlloc(alloc, &columns, condition);
+    }
     return try columns.toOwnedSlice(alloc);
 }
 
@@ -3246,6 +3267,18 @@ fn validateLakeRowsAggregateRequestSupported(
             const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
             if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidRowsRequest;
         }
+        for (aggregation.filter_json_contains) |predicate| {
+            const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
+            if (column.field_type != .json) return error.InvalidRowsRequest;
+        }
+        for (aggregation.filter_json_path_eq) |predicate| {
+            const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
+            if (column.field_type != .json) return error.InvalidRowsRequest;
+        }
+        for (aggregation.filter_json_path_exists) |predicate| {
+            const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
+            if (column.field_type != .json) return error.InvalidRowsRequest;
+        }
         for (aggregation.filter_expressions) |condition| {
             try validateRowsExpressionConditionTypes(alloc, schema, condition.lhs, condition.op, condition.rhs);
         }
@@ -3268,7 +3301,6 @@ fn validateLakeRowsAggregateShapeSupported(request: OwnedRowsAggregateRequest) !
         if (aggregation.field != null and aggregation.expression != null) return error.InvalidRowsRequest;
         if (aggregation.array_order_by.len != 0 or aggregation.string_delimiter != null) return error.UnsupportedRowsQuery;
         if (aggregation.filter_array_any.len != 0 or aggregation.filter_array_contains.len != 0 or aggregation.filter_array_eq.len != 0) return error.UnsupportedRowsQuery;
-        if (aggregation.filter_json_contains.len != 0 or aggregation.filter_json_path_eq.len != 0 or aggregation.filter_json_path_exists.len != 0) return error.UnsupportedRowsQuery;
         if (aggregation.filter_expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
         if (aggregation.filter_any.len != 0 or aggregation.filter_not.len != 0) return error.UnsupportedRowsQuery;
         switch (aggregation.op) {
@@ -3317,6 +3349,15 @@ fn lakeRowsAggregateProjectedColumnsAlloc(
             try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
         }
         for (aggregation.filter_text_patterns) |predicate| {
+            try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
+        }
+        for (aggregation.filter_json_contains) |predicate| {
+            try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
+        }
+        for (aggregation.filter_json_path_eq) |predicate| {
+            try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
+        }
+        for (aggregation.filter_json_path_exists) |predicate| {
             try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
         }
         for (aggregation.filter_expressions) |condition| {
@@ -3792,6 +3833,15 @@ fn lakeRowsAggregateFilterMatchesAlloc(
     for (aggregation.filter_text_patterns) |predicate| {
         if (!try lakeRowsTextPatternPredicateMatchesAlloc(alloc, row, predicate)) return false;
     }
+    for (aggregation.filter_json_contains) |predicate| {
+        if (!try lakeRowsJsonContainsPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
+    for (aggregation.filter_json_path_eq) |predicate| {
+        if (!try lakeRowsJsonPathEqPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
+    for (aggregation.filter_json_path_exists) |predicate| {
+        if (!try lakeRowsJsonPathExistsPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
     for (aggregation.filter_expressions) |condition| {
         if (!try lakeRowsExpressionConditionMatchesAlloc(alloc, row, condition)) return false;
     }
@@ -3843,6 +3893,17 @@ fn lakeRowsTextPatternPredicateMatchesAlloc(
     return if (predicate.negated) !matched else matched;
 }
 
+fn lakeRowsQueryExpressionPredicatesMatchAlloc(
+    alloc: std.mem.Allocator,
+    conditions: []const db_mod.types.RelationalRowsExpressionCondition,
+    row: lake_rows.ProjectedRow,
+) !bool {
+    for (conditions) |condition| {
+        if (!try lakeRowsExpressionConditionMatchesAlloc(alloc, row, condition)) return false;
+    }
+    return true;
+}
+
 fn lakeRowsExpressionConditionMatchesAlloc(
     alloc: std.mem.Allocator,
     row: lake_rows.ProjectedRow,
@@ -3853,6 +3914,42 @@ fn lakeRowsExpressionConditionMatchesAlloc(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     return try expressionConditionMatches(alloc, parsed.value, condition);
+}
+
+fn lakeRowsJsonContainsPredicateMatchesAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    predicate: db_mod.types.RelationalRowsJsonContainsPredicate,
+) !bool {
+    const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+    defer alloc.free(row_json);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return try queryJsonContainsPredicatePasses(alloc, parsed.value, predicate);
+}
+
+fn lakeRowsJsonPathEqPredicateMatchesAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    predicate: db_mod.types.RelationalRowsJsonPathEqPredicate,
+) !bool {
+    const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+    defer alloc.free(row_json);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return try queryJsonPathEqPredicatePasses(alloc, parsed.value, predicate);
+}
+
+fn lakeRowsJsonPathExistsPredicateMatchesAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    predicate: db_mod.types.RelationalRowsJsonPathExistsPredicate,
+) !bool {
+    const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+    defer alloc.free(row_json);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return queryJsonPathExistsPredicatePasses(parsed.value, predicate);
 }
 
 fn lakeRowsRelationalCheckMatchesAlloc(
@@ -17029,6 +17126,112 @@ test "relational rows lake bridge supports field ordering before query limit" {
     try std.testing.expectEqualStrings("{\"amount\":30}", result.rows[1]);
 }
 
+test "relational rows lake bridge lowers expression predicates to residual scan columns" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    const select = [_][]const u8{"amount"};
+    const lower_status_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+        .field_source = .row,
+    }};
+    const open_status_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"open\"",
+    }};
+    const expression_predicates = [_]db_mod.types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .lower, .operands = &lower_status_operands },
+        .op = .eq,
+        .rhs = &open_status_rhs,
+    }};
+    const request = OwnedRowsQueryRequest{
+        .select_all = false,
+        .select = &select,
+        .expression_predicates = &expression_predicates,
+        .limit = 3,
+    };
+
+    var lake_request = try buildLakeRowsScanRequestForRowsQueryAlloc(alloc, schema, request);
+    defer lake_request.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?usize, null), lake_request.request.limit);
+    try std.testing.expectEqual(@as(usize, 2), lake_request.request.projected_columns.len);
+    try std.testing.expectEqualStrings("amount", lake_request.request.projected_columns[0]);
+    try std.testing.expectEqualStrings("status", lake_request.request.projected_columns[1]);
+}
+
+test "relational rows lake bridge applies expression predicates before query limit" {
+    const alloc = std.testing.allocator;
+    const amount_0 = @constCast("amount"[0..]);
+    const status_0 = @constCast("status"[0..]);
+    const closed_0 = @constCast("closed"[0..]);
+    const amount_1 = @constCast("amount"[0..]);
+    const status_1 = @constCast("status"[0..]);
+    const open_1 = @constCast("OPEN"[0..]);
+    const amount_2 = @constCast("amount"[0..]);
+    const status_2 = @constCast("status"[0..]);
+    const open_2 = @constCast("open"[0..]);
+    var cells_0 = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_0, .value = .{ .i64 = 10 } },
+        .{ .name = status_0, .value = .{ .bytes = closed_0 } },
+    };
+    var cells_1 = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_1, .value = .{ .i64 = 20 } },
+        .{ .name = status_1, .value = .{ .bytes = open_1 } },
+    };
+    var cells_2 = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_2, .value = .{ .i64 = 30 } },
+        .{ .name = status_2, .value = .{ .bytes = open_2 } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 0 } }, .cells = &cells_0 },
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 1 } }, .cells = &cells_1 },
+        .{ .row_ref = .{ .external = .{ .source_id = "events", .snapshot_id = "snap", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 2 } }, .cells = &cells_2 },
+    };
+    const select = [_][]const u8{"amount"};
+    const lower_status_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+        .field_source = .row,
+    }};
+    const open_status_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"open\"",
+    }};
+    const expression_predicates = [_]db_mod.types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .lower, .operands = &lower_status_operands },
+        .op = .eq,
+        .rhs = &open_status_rhs,
+    }};
+    const request = OwnedRowsQueryRequest{
+        .select_all = false,
+        .select = &select,
+        .expression_predicates = &expression_predicates,
+        .limit = 1,
+    };
+
+    var result = try buildRowsQueryResultFromLakeRowsAlloc(
+        alloc,
+        request,
+        .{
+            .rows = &projected,
+            .total = 3,
+        },
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":20}", result.rows[0]);
+}
+
 test "relational rows lake bridge formats projected cells as public rows result" {
     const alloc = std.testing.allocator;
     const amount_name = @constCast("amount"[0..]);
@@ -17068,6 +17271,7 @@ test "relational rows lake bridge lowers supported aggregate to scan request" {
         .{ .name = "discount", .path = "discount", .field_type = .numeric },
         .{ .name = "rank", .path = "rank", .field_type = .numeric },
         .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "attrs", .path = "attrs", .field_type = .json },
         .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
     };
     const schema = runtime_schema.TableSchema{
@@ -17097,6 +17301,10 @@ test "relational rows lake bridge lowers supported aggregate to scan request" {
         .pattern = "op%",
         .case_insensitive = true,
     }};
+    const api_attrs_filter = [_]db_mod.types.RelationalRowsJsonContainsPredicate{.{
+        .field = "attrs",
+        .value_json = "{\"source\":\"api\"}",
+    }};
     const lower_status_operands = [_]db_mod.types.RelationalRowsExpression{.{
         .kind = .field,
         .field = "status",
@@ -17118,6 +17326,7 @@ test "relational rows lake bridge lowers supported aggregate to scan request" {
         .{ .name = "net_amount", .op = .sum, .expression = net_amount_expression },
         .{ .name = "rank_two_amount", .op = .sum, .field = "amount", .filter_in_predicates = &rank_two_filter },
         .{ .name = "open_amount", .op = .sum, .field = "amount", .filter_text_patterns = &open_status_filter },
+        .{ .name = "api_attrs_amount", .op = .sum, .field = "amount", .filter_json_contains = &api_attrs_filter },
         .{ .name = "open_expr_amount", .op = .sum, .field = "amount", .filter_expressions = &open_status_expression_filter },
     };
     const request = OwnedRowsAggregateRequest{
@@ -17128,13 +17337,14 @@ test "relational rows lake bridge lowers supported aggregate to scan request" {
     var lake_request = try buildLakeRowsScanRequestForRowsAggregateAlloc(alloc, schema, request);
     defer lake_request.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 6), lake_request.request.projected_columns.len);
+    try std.testing.expectEqual(@as(usize, 7), lake_request.request.projected_columns.len);
     try std.testing.expectEqualStrings("amount", lake_request.request.projected_columns[0]);
     try std.testing.expectEqualStrings("created_at", lake_request.request.projected_columns[1]);
     try std.testing.expectEqualStrings("discount", lake_request.request.projected_columns[2]);
     try std.testing.expectEqualStrings("rank", lake_request.request.projected_columns[3]);
     try std.testing.expectEqualStrings("status", lake_request.request.projected_columns[4]);
-    try std.testing.expectEqualStrings("tenant", lake_request.request.projected_columns[5]);
+    try std.testing.expectEqualStrings("attrs", lake_request.request.projected_columns[5]);
+    try std.testing.expectEqualStrings("tenant", lake_request.request.projected_columns[6]);
     try std.testing.expect(lake_request.request.limit == null);
     try std.testing.expect(lake_request.request.predicate != null);
     try std.testing.expectEqual(lake_rows.PredicateOp.eq_bytes, lake_request.request.predicate.?.op);
@@ -17242,33 +17452,42 @@ test "relational rows lake bridge applies scalar aggregate filters" {
     const rank_name_0 = @constCast("rank"[0..]);
     const status_name_0 = @constCast("status"[0..]);
     const status_value_0 = @constCast("closed"[0..]);
+    const attrs_name_0 = @constCast("attrs"[0..]);
+    const attrs_value_0 = @constCast("{\"source\":\"batch\"}"[0..]);
     const tenant_name_1 = @constCast("tenant"[0..]);
     const amount_name_1 = @constCast("amount"[0..]);
     const rank_name_1 = @constCast("rank"[0..]);
     const status_name_1 = @constCast("status"[0..]);
     const status_value_1 = @constCast("Open"[0..]);
+    const attrs_name_1 = @constCast("attrs"[0..]);
+    const attrs_value_1 = @constCast("{\"source\":\"api\",\"flags\":[\"open\"]}"[0..]);
     const tenant_name_2 = @constCast("tenant"[0..]);
     const amount_name_2 = @constCast("amount"[0..]);
     const rank_name_2 = @constCast("rank"[0..]);
     const status_name_2 = @constCast("status"[0..]);
     const status_value_2 = @constCast("pending"[0..]);
+    const attrs_name_2 = @constCast("attrs"[0..]);
+    const attrs_value_2 = @constCast("{\"source\":\"api\"}"[0..]);
     var cells_0 = [_]lake_rows.ProjectedCell{
         .{ .name = tenant_name_0, .value = .{ .i64 = 7 } },
         .{ .name = amount_name_0, .value = .{ .i64 = 10 } },
         .{ .name = rank_name_0, .value = .{ .i64 = 1 } },
         .{ .name = status_name_0, .value = .{ .bytes = status_value_0 } },
+        .{ .name = attrs_name_0, .value = .{ .json = attrs_value_0 } },
     };
     var cells_1 = [_]lake_rows.ProjectedCell{
         .{ .name = tenant_name_1, .value = .{ .i64 = 8 } },
         .{ .name = amount_name_1, .value = .{ .i64 = 20 } },
         .{ .name = rank_name_1, .value = .{ .i64 = 3 } },
         .{ .name = status_name_1, .value = .{ .bytes = status_value_1 } },
+        .{ .name = attrs_name_1, .value = .{ .json = attrs_value_1 } },
     };
     var cells_2 = [_]lake_rows.ProjectedCell{
         .{ .name = tenant_name_2, .value = .{ .i64 = 8 } },
         .{ .name = amount_name_2, .value = .{ .i64 = 30 } },
         .{ .name = rank_name_2, .value = .{ .i64 = 2 } },
         .{ .name = status_name_2, .value = .{ .bytes = status_value_2 } },
+        .{ .name = attrs_name_2, .value = .{ .json = attrs_value_2 } },
     };
     var projected = [_]lake_rows.ProjectedRow{
         .{ .row_ref = .{ .relational_key = "row:1" }, .cells = &cells_0 },
@@ -17302,6 +17521,19 @@ test "relational rows lake bridge applies scalar aggregate filters" {
         .case_insensitive = true,
         .negated = true,
     }};
+    const api_attrs_filter = [_]db_mod.types.RelationalRowsJsonContainsPredicate{.{
+        .field = "attrs",
+        .value_json = "{\"source\":\"api\"}",
+    }};
+    const source_api_filter = [_]db_mod.types.RelationalRowsJsonPathEqPredicate{.{
+        .field = "attrs",
+        .path = "source",
+        .value_json = "\"api\"",
+    }};
+    const flags_exists_filter = [_]db_mod.types.RelationalRowsJsonPathExistsPredicate{.{
+        .field = "attrs",
+        .path = "flags",
+    }};
     const lower_status_operands = [_]db_mod.types.RelationalRowsExpression{.{
         .kind = .field,
         .field = "status",
@@ -17323,6 +17555,9 @@ test "relational rows lake bridge applies scalar aggregate filters" {
         .{ .name = "rank_not_two_amount_sum", .op = .sum, .field = "amount", .filter_in_predicates = &rank_not_two_filter },
         .{ .name = "open_amount_sum", .op = .sum, .field = "amount", .filter_text_patterns = &open_status_filter },
         .{ .name = "not_open_amount_sum", .op = .sum, .field = "amount", .filter_text_patterns = &not_open_status_filter },
+        .{ .name = "api_attrs_amount_sum", .op = .sum, .field = "amount", .filter_json_contains = &api_attrs_filter },
+        .{ .name = "source_api_amount_sum", .op = .sum, .field = "amount", .filter_json_path_eq = &source_api_filter },
+        .{ .name = "flags_amount_sum", .op = .sum, .field = "amount", .filter_json_path_exists = &flags_exists_filter },
         .{ .name = "open_expr_amount_sum", .op = .sum, .field = "amount", .filter_expressions = &open_status_expression_filter },
     };
     const request = OwnedRowsAggregateRequest{
@@ -17338,8 +17573,8 @@ test "relational rows lake bridge applies scalar aggregate filters" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"large_amount_sum\":0,\"rank_two_amount_sum\":0,\"rank_not_two_amount_sum\":10,\"open_amount_sum\":0,\"not_open_amount_sum\":10,\"open_expr_amount_sum\":0}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"large_amount_sum\":50,\"rank_two_amount_sum\":30,\"rank_not_two_amount_sum\":20,\"open_amount_sum\":20,\"not_open_amount_sum\":30,\"open_expr_amount_sum\":20}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"large_amount_sum\":0,\"rank_two_amount_sum\":0,\"rank_not_two_amount_sum\":10,\"open_amount_sum\":0,\"not_open_amount_sum\":10,\"api_attrs_amount_sum\":0,\"source_api_amount_sum\":0,\"flags_amount_sum\":0,\"open_expr_amount_sum\":0}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"large_amount_sum\":50,\"rank_two_amount_sum\":30,\"rank_not_two_amount_sum\":20,\"open_amount_sum\":20,\"not_open_amount_sum\":30,\"api_attrs_amount_sum\":50,\"source_api_amount_sum\":50,\"flags_amount_sum\":20,\"open_expr_amount_sum\":20}", result.rows[1]);
 }
 
 test "relational rows lake bridge folds expression aggregates" {
