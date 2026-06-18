@@ -1648,6 +1648,24 @@ components:
           type: string
           nullable: true
           description: Last local standby replication pull or apply error observed by the node-local runtime.
+        last_attempt_ns:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Monotonic nanosecond timestamp for the most recent local standby replication attempt.
+        last_success_ns:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Monotonic nanosecond timestamp for the most recent successful local standby replication round.
+        replication_failures_total:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Local standby replication rounds that exited early with an error.
         unapplied_lsn_count:
           type: integer
           format: uint64

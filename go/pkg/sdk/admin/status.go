@@ -82,20 +82,23 @@ type haDurabilityStatusJSON struct {
 }
 
 type haStandbyStatusJSON struct {
-	Role               string              `json:"role"`
-	NodeID             string              `json:"node_id"`
-	Identity           haAdminIdentityJSON `json:"identity"`
-	ReceivedLSN        *uint64             `json:"received_lsn"`
-	AppliedLSN         *uint64             `json:"applied_lsn"`
-	SafeReadLSN        *uint64             `json:"safe_read_lsn"`
-	UpstreamLSN        *uint64             `json:"upstream_lsn"`
-	WriteLagLSN        *uint64             `json:"write_lag_lsn"`
-	ReceiveLagLSN      *uint64             `json:"receive_lag_lsn"`
-	ApplyLagLSN        *uint64             `json:"apply_lag_lsn"`
-	LastError          *string             `json:"last_error"`
-	UnappliedLSNCount  *uint64             `json:"unapplied_lsn_count"`
-	CaughtUpToReceived *bool               `json:"caught_up_to_received"`
-	CanServeSafeReads  *bool               `json:"can_serve_safe_reads"`
+	Role                     string              `json:"role"`
+	NodeID                   string              `json:"node_id"`
+	Identity                 haAdminIdentityJSON `json:"identity"`
+	ReceivedLSN              *uint64             `json:"received_lsn"`
+	AppliedLSN               *uint64             `json:"applied_lsn"`
+	SafeReadLSN              *uint64             `json:"safe_read_lsn"`
+	UpstreamLSN              *uint64             `json:"upstream_lsn"`
+	WriteLagLSN              *uint64             `json:"write_lag_lsn"`
+	ReceiveLagLSN            *uint64             `json:"receive_lag_lsn"`
+	ApplyLagLSN              *uint64             `json:"apply_lag_lsn"`
+	LastError                *string             `json:"last_error"`
+	LastAttemptNs            *uint64             `json:"last_attempt_ns"`
+	LastSuccessNs            *uint64             `json:"last_success_ns"`
+	ReplicationFailuresTotal *uint64             `json:"replication_failures_total"`
+	UnappliedLSNCount        *uint64             `json:"unapplied_lsn_count"`
+	CaughtUpToReceived       *bool               `json:"caught_up_to_received"`
+	CanServeSafeReads        *bool               `json:"can_serve_safe_reads"`
 }
 
 type ParsedHAPrimaryStatus struct {
@@ -265,20 +268,23 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 	return &HAStandbyStatusResponse{
 		SchemaVersion: schemaVersion,
 		Snapshot: HAStandbySnapshot{
-			Role:               HAStandbySnapshotRoleStandby,
-			NodeId:             nodeID,
-			Identity:           haIdentityFromStatusJSON(snapshot.Identity),
-			ReceivedLsn:        haUint64StatusValue(snapshot.ReceivedLSN),
-			AppliedLsn:         haUint64StatusValue(snapshot.AppliedLSN),
-			SafeReadLsn:        haUint64StatusValue(snapshot.SafeReadLSN),
-			UpstreamLsn:        haUint64StatusValue(snapshot.UpstreamLSN),
-			WriteLagLsn:        haUint64StatusValue(snapshot.WriteLagLSN),
-			ReceiveLagLsn:      haUint64StatusValue(snapshot.ReceiveLagLSN),
-			ApplyLagLsn:        haUint64StatusValue(snapshot.ApplyLagLSN),
-			LastError:          haStringStatusValue(snapshot.LastError),
-			UnappliedLsnCount:  haUint64StatusValue(snapshot.UnappliedLSNCount),
-			CaughtUpToReceived: haBoolStatusValue(snapshot.CaughtUpToReceived),
-			CanServeSafeReads:  haBoolStatusValue(snapshot.CanServeSafeReads),
+			Role:                     HAStandbySnapshotRoleStandby,
+			NodeId:                   nodeID,
+			Identity:                 haIdentityFromStatusJSON(snapshot.Identity),
+			ReceivedLsn:              haUint64StatusValue(snapshot.ReceivedLSN),
+			AppliedLsn:               haUint64StatusValue(snapshot.AppliedLSN),
+			SafeReadLsn:              haUint64StatusValue(snapshot.SafeReadLSN),
+			UpstreamLsn:              haUint64StatusValue(snapshot.UpstreamLSN),
+			WriteLagLsn:              haUint64StatusValue(snapshot.WriteLagLSN),
+			ReceiveLagLsn:            haUint64StatusValue(snapshot.ReceiveLagLSN),
+			ApplyLagLsn:              haUint64StatusValue(snapshot.ApplyLagLSN),
+			LastError:                haStringStatusValue(snapshot.LastError),
+			LastAttemptNs:            haUint64StatusValue(snapshot.LastAttemptNs),
+			LastSuccessNs:            haUint64StatusValue(snapshot.LastSuccessNs),
+			ReplicationFailuresTotal: haUint64StatusValue(snapshot.ReplicationFailuresTotal),
+			UnappliedLsnCount:        haUint64StatusValue(snapshot.UnappliedLSNCount),
+			CaughtUpToReceived:       haBoolStatusValue(snapshot.CaughtUpToReceived),
+			CanServeSafeReads:        haBoolStatusValue(snapshot.CanServeSafeReads),
 		},
 	}, nil
 }

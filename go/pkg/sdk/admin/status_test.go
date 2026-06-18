@@ -132,6 +132,9 @@ func TestHAStatusParserAcceptsLegacyStandbyEnvelope(t *testing.T) {
 	if snapshot.LastError != "ConnectionRefused" {
 		t.Fatalf("LastError = %q, want ConnectionRefused", snapshot.LastError)
 	}
+	if snapshot.LastAttemptNs != 1000 || snapshot.LastSuccessNs != 900 || snapshot.ReplicationFailuresTotal != 3 {
+		t.Fatalf("standby replication watermarks = attempt %d success %d failures %d, want 1000/900/3", snapshot.LastAttemptNs, snapshot.LastSuccessNs, snapshot.ReplicationFailuresTotal)
+	}
 }
 
 func TestHAStatusParserRejectsMissingStandbySafeReadFlag(t *testing.T) {
@@ -471,6 +474,9 @@ func haGeneratedStandbyStatusJSON() string {
 			"receive_lag_lsn":0,
 			"apply_lag_lsn":1,
 			"last_error":"ConnectionRefused",
+			"last_attempt_ns":1000,
+			"last_success_ns":900,
+			"replication_failures_total":3,
 			"unapplied_lsn_count":1,
 			"caught_up_to_received":false,
 			"can_serve_safe_reads":true
@@ -556,6 +562,9 @@ func haLegacyStandbyStatusJSON() string {
 				"receive_lag_lsn":0,
 			"apply_lag_lsn":1,
 			"last_error":"ConnectionRefused",
+			"last_attempt_ns":1000,
+			"last_success_ns":900,
+			"replication_failures_total":3,
 			"unapplied_lsn_count":1,
 			"caught_up_to_received":false,
 			"can_serve_safe_reads":true

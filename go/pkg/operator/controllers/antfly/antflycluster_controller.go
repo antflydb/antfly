@@ -6560,6 +6560,9 @@ func haObservedStandbyStatusFromAdminSDK(response adminsdk.HAStandbyStatusRespon
 	status.ReceiveLagLSN = snapshot.ReceiveLagLsn
 	status.ApplyLagLSN = snapshot.ApplyLagLsn
 	status.LastError = strings.TrimSpace(snapshot.LastError)
+	status.LastAttemptNs = snapshot.LastAttemptNs
+	status.LastSuccessNs = snapshot.LastSuccessNs
+	status.ReplicationFailuresTotal = snapshot.ReplicationFailuresTotal
 	if status.LastError != "" {
 		status.Status = "unhealthy"
 	} else if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
@@ -6716,6 +6719,9 @@ func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandby
 		existing.UnappliedLSNCount = observed.UnappliedLSNCount
 		existing.CaughtUpToReceived = observed.CaughtUpToReceived
 		existing.CanServeSafeReads = observed.CanServeSafeReads
+		existing.LastAttemptNs = observed.LastAttemptNs
+		existing.LastSuccessNs = observed.LastSuccessNs
+		existing.ReplicationFailuresTotal = observed.ReplicationFailuresTotal
 		if observed.Status != "" {
 			existing.Status = observed.Status
 		}

@@ -59,9 +59,24 @@ pub const Server = struct {
     pub const StandbyStatusExtras = struct {
         ptr: *anyopaque,
         last_error: *const fn (ptr: *anyopaque) ?[]const u8,
+        last_attempt_ns: *const fn (ptr: *anyopaque) ?u64,
+        last_success_ns: *const fn (ptr: *anyopaque) ?u64,
+        replication_failures_total: *const fn (ptr: *anyopaque) ?u64,
 
         pub fn lastError(self: StandbyStatusExtras) ?[]const u8 {
             return self.last_error(self.ptr);
+        }
+
+        pub fn lastAttemptNs(self: StandbyStatusExtras) ?u64 {
+            return self.last_attempt_ns(self.ptr);
+        }
+
+        pub fn lastSuccessNs(self: StandbyStatusExtras) ?u64 {
+            return self.last_success_ns(self.ptr);
+        }
+
+        pub fn replicationFailuresTotal(self: StandbyStatusExtras) ?u64 {
+            return self.replication_failures_total(self.ptr);
         }
     };
 
@@ -271,6 +286,9 @@ pub const Server = struct {
         var snapshot = ha_admin.standbyStatus(standby, upstream_lsn);
         if (self.auth.standby_status_extras) |extras| {
             snapshot.last_error = extras.lastError();
+            snapshot.last_attempt_ns = extras.lastAttemptNs();
+            snapshot.last_success_ns = extras.lastSuccessNs();
+            snapshot.replication_failures_total = extras.replicationFailuresTotal();
         }
         return try self.handleTypedJson(admin_api.HAStandbyStatusResponse{
             .schema_version = 1,
@@ -1127,6 +1145,9 @@ fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot, node_id: []const u
         .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
         .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
         .last_error = snapshot.last_error,
+        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| try adminI64(value) else null,
+        .last_success_ns = if (snapshot.last_success_ns) |value| try adminI64(value) else null,
+        .replication_failures_total = if (snapshot.replication_failures_total) |value| try adminI64(value) else null,
         .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
         .caught_up_to_received = snapshot.caught_up_to_received,
         .can_serve_safe_reads = snapshot.can_serve_safe_reads,

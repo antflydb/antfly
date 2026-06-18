@@ -518,6 +518,8 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_waits_total", "counter", "HA synchronous commit waits observed by this data runtime", ds.ha_primary_mirror_sync_wait_count.load(.acquire));
         try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_degraded_total", "counter", "HA synchronous commit decisions degraded to async by policy", ds.ha_primary_mirror_sync_degraded_count.load(.acquire));
         try health_metrics.appendPromMetric(writer, "antfly_ha_standby_replication_failures_total", "counter", "HA standby replication rounds that exited early with an error", ds.ha_standby_replication_failure_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_standby_replication_last_attempt_ns", "gauge", "Monotonic timestamp for the most recent HA standby replication attempt", ds.ha_standby_replication_last_attempt_ns.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_standby_replication_last_success_ns", "gauge", "Monotonic timestamp for the most recent successful HA standby replication round", ds.ha_standby_replication_last_success_ns.load(.acquire));
 
         if (standby) |handle| {
             const upstream_lsn = if (ds.ha_cfg.standby_replication != null)
@@ -1843,6 +1845,8 @@ pub const DataServer = struct {
     ha_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_failure_count: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HAStandbyReplicationErrorCode.none)),
+    ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -2170,6 +2174,7 @@ pub const DataServer = struct {
     fn runHAStandbyReplicationRound(self: *DataServer) !void {
         const cfg = self.ha_cfg.standby_replication orelse return;
         const executor = try self.haStandbyReplicationExecutor(cfg);
+        self.recordHAStandbyReplicationAttempt();
         if (cfg.catch_up_until_end_of_wal) {
             _ = try self.replicateHAStandbyUntilCaughtUp(
                 executor,
@@ -2185,6 +2190,7 @@ pub const DataServer = struct {
                 cfg.options,
             );
         }
+        self.recordHAStandbyReplicationSuccess();
     }
 
     fn haStandbyReplicationExecutor(
@@ -2263,6 +2269,9 @@ pub const DataServer = struct {
                     .standby_status_extras = .{
                         .ptr = self,
                         .last_error = haStandbyReplicationLastErrorCallback,
+                        .last_attempt_ns = haStandbyReplicationLastAttemptNsCallback,
+                        .last_success_ns = haStandbyReplicationLastSuccessNsCallback,
+                        .replication_failures_total = haStandbyReplicationFailuresTotalCallback,
                     },
                 });
                 api_server_cfg.ha_admin_executor = self.ha_admin_server.?.executor();
@@ -2575,6 +2584,14 @@ pub const DataServer = struct {
         self.ha_standby_replication_last_error.store(@intFromEnum(HAStandbyReplicationErrorCode.none), .release);
     }
 
+    fn recordHAStandbyReplicationAttempt(self: *DataServer) void {
+        self.ha_standby_replication_last_attempt_ns.store(platform_time.monotonicNs(), .release);
+    }
+
+    fn recordHAStandbyReplicationSuccess(self: *DataServer) void {
+        self.ha_standby_replication_last_success_ns.store(platform_time.monotonicNs(), .release);
+    }
+
     fn recordHAStandbyReplicationError(self: *DataServer, err: anyerror) void {
         self.ha_standby_replication_last_error.store(@intFromEnum(haStandbyReplicationErrorCode(err)), .release);
     }
@@ -2587,6 +2604,35 @@ pub const DataServer = struct {
     fn haStandbyReplicationLastErrorCallback(ptr: *anyopaque) ?[]const u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.haStandbyReplicationLastError();
+    }
+
+    fn haStandbyReplicationLastAttemptNs(self: *DataServer) ?u64 {
+        const value = self.ha_standby_replication_last_attempt_ns.load(.acquire);
+        return if (value == 0) null else value;
+    }
+
+    fn haStandbyReplicationLastAttemptNsCallback(ptr: *anyopaque) ?u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationLastAttemptNs();
+    }
+
+    fn haStandbyReplicationLastSuccessNs(self: *DataServer) ?u64 {
+        const value = self.ha_standby_replication_last_success_ns.load(.acquire);
+        return if (value == 0) null else value;
+    }
+
+    fn haStandbyReplicationLastSuccessNsCallback(ptr: *anyopaque) ?u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationLastSuccessNs();
+    }
+
+    fn haStandbyReplicationFailuresTotal(self: *DataServer) ?u64 {
+        return self.ha_standby_replication_failure_count.load(.acquire);
+    }
+
+    fn haStandbyReplicationFailuresTotalCallback(ptr: *anyopaque) ?u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationFailuresTotal();
     }
 
     fn densePostingMaintenanceDue(self: *DataServer, now_ns: u64) bool {
@@ -14387,10 +14433,22 @@ test "data server pulls and applies HA standby replication through internal HTTP
     const progress = standby.currentProgress();
     try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), progress.applied_lsn);
+    try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
+    try std.testing.expect(server.ha_standby_replication_last_success_ns.load(.acquire) > 0);
 
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+
+    var admin_status = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_standby_status,
+    });
+    defer admin_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_success_ns\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":0") != null);
 
     var health = HealthSource{ .data_server = &server };
     var writer_buf: [262144]u8 = undefined;
@@ -14402,6 +14460,8 @@ test "data server pulls and applies HA standby replication through internal HTTP
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_applied_lsn 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_upstream_configured 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_caught_up_to_received 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_attempt_ns ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_success_ns ") != null);
 
     var lookup = (try server.read_source.source().lookupGroupLocal(
         alloc,
@@ -14530,6 +14590,8 @@ test "data runtime records HA standby replication round failures" {
 
     try server.runRound();
     try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+    try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_last_success_ns.load(.acquire));
 
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
@@ -14538,6 +14600,8 @@ test "data runtime records HA standby replication round failures" {
     defer admin_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);
     try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"ConnectionRefused\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":1") != null);
 
     var health = HealthSource{ .data_server = &server };
     var writer_buf: [262144]u8 = undefined;
@@ -14546,6 +14610,8 @@ test "data runtime records HA standby replication round failures" {
     const metrics = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_failures_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_attempt_ns ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_success_ns 0\n") != null);
 }
 
 test "data runtime lsm maintenance scheduler defers under resource pressure" {

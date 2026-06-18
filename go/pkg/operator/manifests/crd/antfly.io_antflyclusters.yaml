@@ -3729,7 +3729,7 @@ spec:
                         description: |-
                           FormerPrimaryLogPath is the durable HA replication log used by former-primary rewind admin workflows.
                           Set this on nodes that may need to rejoin after failover; for a primary this is usually the same path
-                          as primary.logPath.
+                          as primary.logPath, and the Swarm runtime wiring defaults it to primary.logPath when omitted.
                         type: string
                       nodeID:
                         description: NodeID is the logical HA node id used in typed
@@ -9326,14 +9326,23 @@ spec:
                           type: boolean
                         caughtUpToReceived:
                           type: boolean
+                        lastAttemptNs:
+                          format: int64
+                          type: integer
                         lastError:
                           type: string
+                        lastSuccessNs:
+                          format: int64
+                          type: integer
                         name:
                           type: string
                         receiveLagLSN:
                           format: int64
                           type: integer
                         receivedLSN:
+                          format: int64
+                          type: integer
+                        replicationFailuresTotal:
                           format: int64
                           type: integer
                         reseedRequired:

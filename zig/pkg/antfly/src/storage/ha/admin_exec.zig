@@ -553,6 +553,9 @@ fn adminStandbySnapshot(snapshot: status.StandbySnapshot, node_id: []const u8) !
         .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
         .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
         .last_error = snapshot.last_error,
+        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| try adminI64(value) else null,
+        .last_success_ns = if (snapshot.last_success_ns) |value| try adminI64(value) else null,
+        .replication_failures_total = if (snapshot.replication_failures_total) |value| try adminI64(value) else null,
         .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
         .caught_up_to_received = snapshot.caught_up_to_received,
         .can_serve_safe_reads = snapshot.can_serve_safe_reads,
@@ -1484,6 +1487,10 @@ fn appendStandbySnapshotLines(
     try appendOptionalU64Line(alloc, out, "write_lag_lsn", snapshot.write_lag_lsn);
     try appendOptionalU64Line(alloc, out, "receive_lag_lsn", snapshot.receive_lag_lsn);
     try appendOptionalU64Line(alloc, out, "apply_lag_lsn", snapshot.apply_lag_lsn);
+    try appendOptionalLine(alloc, out, "last_error", snapshot.last_error);
+    try appendOptionalU64Line(alloc, out, "last_attempt_ns", snapshot.last_attempt_ns);
+    try appendOptionalU64Line(alloc, out, "last_success_ns", snapshot.last_success_ns);
+    try appendOptionalU64Line(alloc, out, "replication_failures_total", snapshot.replication_failures_total);
     try appendU64Line(alloc, out, "unapplied_lsn_count", snapshot.unapplied_lsn_count);
     try appendBoolLine(alloc, out, "caught_up_to_received", snapshot.caught_up_to_received);
     try appendBoolLine(alloc, out, "can_serve_safe_reads", snapshot.can_serve_safe_reads);

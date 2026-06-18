@@ -1614,6 +1614,12 @@ type HAStandbyStatus struct {
 	Status string `json:"status,omitempty"`
 
 	LastError string `json:"lastError,omitempty"`
+
+	LastAttemptNs uint64 `json:"lastAttemptNs,omitempty"`
+
+	LastSuccessNs uint64 `json:"lastSuccessNs,omitempty"`
+
+	ReplicationFailuresTotal uint64 `json:"replicationFailuresTotal,omitempty"`
 }
 
 // HASyncStatus reports the current synchronous durability policy state.

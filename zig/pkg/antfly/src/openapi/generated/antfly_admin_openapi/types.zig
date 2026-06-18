@@ -289,6 +289,12 @@ pub const HAStandbySnapshot = struct {
     apply_lag_lsn: ?i64 = null,
     /// Last local standby replication pull or apply error observed by the node-local runtime.
     last_error: ?[]const u8 = null,
+    /// Monotonic nanosecond timestamp for the most recent local standby replication attempt.
+    last_attempt_ns: ?i64 = null,
+    /// Monotonic nanosecond timestamp for the most recent successful local standby replication round.
+    last_success_ns: ?i64 = null,
+    /// Local standby replication rounds that exited early with an error.
+    replication_failures_total: ?i64 = null,
     unapplied_lsn_count: i64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,
