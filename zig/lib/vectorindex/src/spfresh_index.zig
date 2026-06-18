@@ -34,6 +34,7 @@ pub const FlatCentroidBlock = struct {
     radius: f32 = 0,
     radii: []f32,
     centroids: []f32,
+    centroid_measures: []f32,
     quantized: proto.RaBitQuantizedVectorSet,
 
     fn deinit(self: *FlatCentroidBlock, alloc: std.mem.Allocator) void {
@@ -44,6 +45,7 @@ pub const FlatCentroidBlock = struct {
         alloc.free(self.centroid);
         alloc.free(self.radii);
         alloc.free(self.centroids);
+        alloc.free(self.centroid_measures);
         self.quantized.deinit(alloc);
         self.* = undefined;
     }
@@ -468,6 +470,12 @@ fn appendFlatCentroidBlock(
     errdefer self.alloc.free(owned_radii);
     const owned_centroids = try self.alloc.dupe(f32, centroids);
     errdefer self.alloc.free(owned_centroids);
+    const centroid_measures = try self.alloc.alloc(f32, posting_ids.len);
+    errdefer self.alloc.free(centroid_measures);
+    for (0..posting_ids.len) |i| {
+        const centroid = centroids[i * dims ..][0..dims];
+        centroid_measures[i] = vec.vectorMeasureForMetric(centroid, self.config.metric);
+    }
     const block_centroid = try self.alloc.alloc(f32, dims);
     errdefer self.alloc.free(block_centroid);
     @memset(block_centroid, 0);
@@ -495,6 +503,7 @@ fn appendFlatCentroidBlock(
         .radius = block_radius,
         .radii = owned_radii,
         .centroids = owned_centroids,
+        .centroid_measures = centroid_measures,
         .quantized = quantized,
     });
 }
@@ -1006,7 +1015,13 @@ pub fn selectFlatRabitqPostings(
             for (candidates) |candidate| {
                 if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
                 const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
-                const distance = vec.distanceToQuery(query, query_measure, centroid, self.config.metric);
+                const distance = vec.distanceToQueryWithCandidateMeasure(
+                    query,
+                    query_measure,
+                    centroid,
+                    block.centroid_measures[candidate.entry_index],
+                    self.config.metric,
+                );
                 scored_candidates += 1;
                 probe_collector.insert(.{
                     .posting_id = candidate.posting_id,
@@ -1024,7 +1039,7 @@ pub fn selectFlatRabitqPostings(
             profile.centroid_directory_posting_centroids_scored += @intCast(count);
             for (0..count) |i| {
                 const centroid = block.centroids[i * dims ..][0..dims];
-                distances[i] = vec.distanceToQuery(query, query_measure, centroid, self.config.metric);
+                distances[i] = vec.distanceToQueryWithCandidateMeasure(query, query_measure, centroid, block.centroid_measures[i], self.config.metric);
                 error_bounds[i] = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
             }
             for (block.posting_ids, 0..) |posting_id, i| {

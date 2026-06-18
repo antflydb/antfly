@@ -391,6 +391,35 @@ pub fn distanceToQuery(query: []const f32, query_measure: f32, candidate: []cons
     };
 }
 
+/// Compute the distance from a fixed query using precomputed query and
+/// candidate measures. For `.l2_squared`, measures are squared norms. For
+/// `.cosine`, measures are vector norms. For `.inner_product`, measures are
+/// ignored.
+pub fn distanceToQueryWithCandidateMeasure(
+    query: []const f32,
+    query_measure: f32,
+    candidate: []const f32,
+    candidate_measure: f32,
+    metric: DistanceMetric,
+) f32 {
+    return switch (metric) {
+        .l2_squared => @max(0.0, query_measure + candidate_measure - 2.0 * dot(query, candidate)),
+        .inner_product => -dot(query, candidate),
+        .cosine => blk: {
+            if (query_measure == 0.0 or candidate_measure == 0.0) break :blk 1.0;
+            break :blk 1.0 - dot(query, candidate) / (query_measure * candidate_measure);
+        },
+    };
+}
+
+pub fn vectorMeasureForMetric(v: []const f32, metric: DistanceMetric) f32 {
+    return switch (metric) {
+        .l2_squared => dot(v, v),
+        .inner_product => 0,
+        .cosine => norm(v),
+    };
+}
+
 /// Compute cosine similarity between two vectors.
 pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
     const na = norm(a);
@@ -522,6 +551,21 @@ test "dot product" {
 test "norm" {
     const v = [_]f32{ 3.0, 4.0 };
     try std.testing.expectApproxEqAbs(norm(&v), 5.0, 1e-6);
+}
+
+test "distance to query with candidate measure matches direct distance" {
+    const query = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const candidate = [_]f32{ 4.0, 3.0, 2.0, 1.0 };
+
+    inline for (.{ DistanceMetric.l2_squared, DistanceMetric.inner_product, DistanceMetric.cosine }) |metric| {
+        const query_measure = vectorMeasureForMetric(&query, metric);
+        const candidate_measure = vectorMeasureForMetric(&candidate, metric);
+        try std.testing.expectApproxEqAbs(
+            distanceToQuery(&query, query_measure, &candidate, metric),
+            distanceToQueryWithCandidateMeasure(&query, query_measure, &candidate, candidate_measure, metric),
+            1e-5,
+        );
+    }
 }
 
 test "subTo" {
