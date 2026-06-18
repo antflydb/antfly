@@ -2387,8 +2387,19 @@ pub const PostingStore = struct {
         live: []bool,
     };
 
+    const CompactDeltaStorageViews = struct {
+        ids: []VectorId,
+        ops: []PostingDeltaOp,
+    };
+
     fn allocateAppendStorage(alloc: std.mem.Allocator, capacity: usize) ![]u64 {
         const bytes = appendStorageByteLen(capacity);
+        const words = (bytes + @sizeOf(u64) - 1) / @sizeOf(u64);
+        return try alloc.alloc(u64, words);
+    }
+
+    fn allocateCompactDeltaStorage(alloc: std.mem.Allocator, capacity: usize) ![]u64 {
+        const bytes = compactDeltaStorageByteLen(capacity);
         const words = (bytes + @sizeOf(u64) - 1) / @sizeOf(u64);
         return try alloc.alloc(u64, words);
     }
@@ -2402,12 +2413,30 @@ pub const PostingStore = struct {
         return alignForward(offset, @alignOf(u64));
     }
 
+    fn compactDeltaStorageByteLen(capacity: usize) usize {
+        var offset: usize = 0;
+        offset = alignForward(offset, @alignOf(VectorId));
+        offset += capacity * @sizeOf(VectorId);
+        offset = alignForward(offset, @alignOf(PostingDeltaOp));
+        offset += capacity * @sizeOf(PostingDeltaOp);
+        return alignForward(offset, @alignOf(u64));
+    }
+
     fn carveAppendStorage(storage: []u64, capacity: usize) AppendStorageViews {
         const bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
         var offset: usize = 0;
         return .{
             .ids = carveAppendStorageSlice(VectorId, bytes, &offset, capacity),
             .live = carveAppendStorageSlice(bool, bytes, &offset, capacity),
+        };
+    }
+
+    fn carveCompactDeltaStorage(storage: []u64, capacity: usize) CompactDeltaStorageViews {
+        const bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
+        var offset: usize = 0;
+        return .{
+            .ids = carveAppendStorageSlice(VectorId, bytes, &offset, capacity),
+            .ops = carveAppendStorageSlice(PostingDeltaOp, bytes, &offset, capacity),
         };
     }
 
@@ -2428,6 +2457,7 @@ pub const PostingStore = struct {
     pub const FoldScratch = struct {
         delta_records: []PostingDeltaRecord = &.{},
         delta_record_count: usize = 0,
+        compact_delta_storage: []u64 = &.{},
         compact_delta_ids: []VectorId = &.{},
         compact_delta_ops: []PostingDeltaOp = &.{},
         compact_delta_count: usize = 0,
@@ -2472,8 +2502,15 @@ pub const PostingStore = struct {
                 const current_capacity = @min(self.compact_delta_ids.len, self.compact_delta_ops.len);
                 const doubled = current_capacity *| 2;
                 const capacity = @max(needed, @max(doubled, @as(usize, 8)));
-                self.compact_delta_ids = try alloc.realloc(self.compact_delta_ids, capacity);
-                self.compact_delta_ops = try alloc.realloc(self.compact_delta_ops, capacity);
+                const replacement = try allocateCompactDeltaStorage(alloc, capacity);
+                errdefer alloc.free(replacement);
+                const views = carveCompactDeltaStorage(replacement, capacity);
+                @memcpy(views.ids[0..self.compact_delta_ids.len], self.compact_delta_ids);
+                @memcpy(views.ops[0..self.compact_delta_ops.len], self.compact_delta_ops);
+                alloc.free(self.compact_delta_storage);
+                self.compact_delta_storage = replacement;
+                self.compact_delta_ids = views.ids;
+                self.compact_delta_ops = views.ops;
             }
         }
 
@@ -2558,9 +2595,9 @@ pub const PostingStore = struct {
             self.appended_live = &.{};
             if (self.bytes() <= max_retained_bytes) return;
 
-            alloc.free(self.compact_delta_ids);
+            alloc.free(self.compact_delta_storage);
+            self.compact_delta_storage = &.{};
             self.compact_delta_ids = &.{};
-            alloc.free(self.compact_delta_ops);
             self.compact_delta_ops = &.{};
             self.compact_delta_count = 0;
             if (self.bytes() <= max_retained_bytes) return;
@@ -2572,8 +2609,7 @@ pub const PostingStore = struct {
 
         pub fn bytes(self: *const FoldScratch) u64 {
             return byteLen(self.delta_records) +
-                byteLen(self.compact_delta_ids) +
-                byteLen(self.compact_delta_ops) +
+                byteLen(self.compact_delta_storage) +
                 byteLen(self.encoded_base) +
                 byteLen(self.member_ids) +
                 approximateHashMapBytes(self.removed_members.capacity(), @sizeOf(VectorId), 0) +
@@ -2583,8 +2619,7 @@ pub const PostingStore = struct {
 
         pub fn deinit(self: *FoldScratch, alloc: std.mem.Allocator) void {
             alloc.free(self.delta_records);
-            alloc.free(self.compact_delta_ids);
-            alloc.free(self.compact_delta_ops);
+            alloc.free(self.compact_delta_storage);
             alloc.free(self.encoded_base);
             alloc.free(self.member_ids);
             self.removed_members.deinit(alloc);
@@ -5175,10 +5210,21 @@ test "posting fold scratch grows compact delta buffers geometrically" {
     try scratch.ensureCompactDeltaCapacity(alloc, 1);
     try std.testing.expectEqual(@as(usize, 8), scratch.compact_delta_ids.len);
     try std.testing.expectEqual(scratch.compact_delta_ids.len, scratch.compact_delta_ops.len);
+    try std.testing.expect(scratch.compact_delta_storage.len > scratch.compact_delta_ids.len);
+    try std.testing.expectEqual(scratch.compact_delta_storage[0..8].ptr, scratch.compact_delta_ids.ptr);
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{
+        .sequence = 1,
+        .op = .replace,
+        .vector_id = 42,
+    });
 
     try scratch.ensureCompactDeltaCapacity(alloc, 9);
     try std.testing.expectEqual(@as(usize, 16), scratch.compact_delta_ids.len);
     try std.testing.expectEqual(scratch.compact_delta_ids.len, scratch.compact_delta_ops.len);
+    try std.testing.expect(scratch.compact_delta_storage.len > scratch.compact_delta_ids.len);
+    try std.testing.expectEqual(scratch.compact_delta_storage[0..16].ptr, scratch.compact_delta_ids.ptr);
+    try std.testing.expectEqual(@as(u64, 42), scratch.compact_delta_ids[0]);
+    try std.testing.expectEqual(PostingDeltaOp.replace, scratch.compact_delta_ops[0]);
 }
 
 test "posting fold scratch grows delta record buffer geometrically" {
