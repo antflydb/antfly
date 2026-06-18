@@ -796,6 +796,9 @@ pub const Server = struct {
         const retained_from_lsn = uint64FromJson(parsed.value.retained_from_lsn) catch {
             return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
         };
+        if (!validation.isIdentifier(parsed.value.node_id)) {
+            return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
+        }
         const receipt = if (parsed.value.receipt) |value|
             adminFenceReceiptFromOpenApi(value) catch {
                 return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
@@ -2610,6 +2613,40 @@ test "storage.ha http admin rejects invalid rejoin fence receipt" {
 
     try std.testing.expectEqual(@as(u16, 400), response.status);
     try expectContains(response.body, "invalid HA rejoin assessment request");
+}
+
+test "storage.ha http admin rejects invalid rejoin node identifiers" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    const invalid_node_ids = [_][]const u8{
+        "",
+        " primary-a",
+        "primary-a ",
+        "primary/a",
+        "primary a",
+    };
+
+    for (invalid_node_ids) |node_id| {
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"node_id\":\"{s}\",\"identity\":{{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1}},\"last_lsn\":2,\"retained_from_lsn\":0}}",
+            .{node_id},
+        );
+        defer alloc.free(body);
+
+        var response = try server.handle(.{
+            .method = .POST,
+            .uri = admin_api.routes.ha_rejoin_assess,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer response.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+        try expectContains(response.body, "invalid HA rejoin assessment request");
+    }
 }
 
 test "storage.ha http admin enforces optional bearer token on typed admin routes" {
