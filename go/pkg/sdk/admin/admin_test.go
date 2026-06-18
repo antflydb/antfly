@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
+	"github.com/getkin/kin-openapi/openapi3"
 )
 
 func TestInternalClientGetMetadataStatusSendsToken(t *testing.T) {
@@ -575,6 +577,62 @@ func TestHAClientGeneratedSpecIsDedicatedAdminAPI(t *testing.T) {
 	if req.Method != http.MethodGet || req.URL.Path != HAPrimaryStatusPath {
 		t.Fatalf("generated primary status request = %s %s, want GET %s", req.Method, req.URL.Path, HAPrimaryStatusPath)
 	}
+
+	sourceSpec := loadSourceAdminOpenAPISpec(t)
+	sourceOperations := haOpenAPIOperations(sourceSpec)
+	generatedOperations := haOpenAPIOperations(spec)
+	for key, sourceOperationID := range sourceOperations {
+		generatedOperationID, ok := generatedOperations[key]
+		if !ok {
+			t.Fatalf("source admin OpenAPI operation %s is missing from generated Go admin spec", key)
+		}
+		if !strings.EqualFold(generatedOperationID, sourceOperationID) {
+			t.Fatalf("generated Go admin operation %s has operationId %q, want generated form of %q", key, generatedOperationID, sourceOperationID)
+		}
+	}
+	for key := range generatedOperations {
+		if _, ok := sourceOperations[key]; !ok {
+			t.Fatalf("generated Go admin spec contains operation %s that is missing from source admin OpenAPI spec", key)
+		}
+	}
+}
+
+func loadSourceAdminOpenAPISpec(t *testing.T) *openapi3.T {
+	t.Helper()
+
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test file")
+	}
+	specPath := filepath.Clean(filepath.Join(filepath.Dir(file), "../../../../specs/openapi/antfly/admin.yaml"))
+	if _, err := os.Stat(specPath); err != nil {
+		t.Fatalf("stat source admin OpenAPI spec %s: %v", specPath, err)
+	}
+	loader := openapi3.NewLoader()
+	spec, err := loader.LoadFromFile(specPath)
+	if err != nil {
+		t.Fatalf("load source admin OpenAPI spec %s: %v", specPath, err)
+	}
+	return spec
+}
+
+func haOpenAPIOperations(spec *openapi3.T) map[string]string {
+	operations := map[string]string{}
+	if spec == nil || spec.Paths == nil {
+		return operations
+	}
+	for path, pathItem := range spec.Paths.Map() {
+		if pathItem == nil {
+			continue
+		}
+		for method, operation := range pathItem.Operations() {
+			if operation == nil {
+				continue
+			}
+			operations[strings.ToUpper(method)+" "+path] = operation.OperationID
+		}
+	}
+	return operations
 }
 
 func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
