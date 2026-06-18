@@ -1013,16 +1013,7 @@ pub const LazyDirectorySnapshot = struct {
         const base = try posting.PostingFormat.materializeBaseMembersIntoScratch(alloc, scratch, found_base_data);
         var member_count = base.member_count;
 
-        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base.header.generation, scratch);
-        const records = scratch.deltaRecordsMut();
-        if (records.len == 0) return member_count;
-
-        sortPostingDeltaRecordsIfNeeded(records);
-
-        try scratch.ensureMemberIdCapacity(alloc, member_count + posting.PostingFormat.liveDeltaRecordCount(records));
-        for (records) |record| {
-            posting.PostingFormat.applyDeltaRecordToScratch(scratch, &member_count, record);
-        }
+        _ = try self.applyDeltaTailAfterGenerationIntoScratch(alloc, posting_id, scratch, &member_count, base.header.generation, false);
         return member_count;
     }
 
@@ -6837,6 +6828,53 @@ test "posting segment lazy materialization sizes member scratch by live deltas" 
     try std.testing.expectEqual(@as(usize, 1), member_count);
     try std.testing.expectEqualSlices(posting.VectorId, &.{20}, scratch.member_ids[0..member_count]);
     try std.testing.expect(scratch.member_ids.len >= 2);
+}
+
+test "posting segment lazy materialization uses adaptive overlay replay for large tails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_members = [_]posting.VectorId{ 10, 20, 30, 40, 50, 60 };
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &base_members,
+    });
+    defer alloc.free(base);
+    var base_writer = Writer.init(alloc);
+    defer base_writer.deinit();
+    try base_writer.appendBase(7, base);
+    var committed_base = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &base_writer, .{});
+    defer committed_base.deinit(alloc);
+
+    const records = [_]posting.PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = (@as(u64, 2) << 32) | 2, .op = .insert, .vector_id = 70 },
+        .{ .sequence = (@as(u64, 2) << 32) | 3, .op = .replace, .vector_id = 30 },
+        .{ .sequence = (@as(u64, 2) << 32) | 4, .op = .tombstone, .vector_id = 999 },
+        .{ .sequence = (@as(u64, 2) << 32) | 5, .op = .insert, .vector_id = 80 },
+        .{ .sequence = (@as(u64, 2) << 32) | 6, .op = .tombstone, .vector_id = 10 },
+        .{ .sequence = (@as(u64, 2) << 32) | 7, .op = .insert, .vector_id = 90 },
+        .{ .sequence = (@as(u64, 2) << 32) | 8, .op = .replace, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 2) << 32) | 9, .op = .insert, .vector_id = 100 },
+    };
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &records);
+    defer alloc.free(delta);
+    var delta_writer = Writer.init(alloc);
+    defer delta_writer.deinit();
+    try delta_writer.appendDelta(7, records[0].sequence, delta);
+    var committed_delta = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &delta_writer, .{});
+    defer committed_delta.deinit(alloc);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const member_count = (try lazy.snapshot().materializeMembersIntoScratch(alloc, 7, &scratch)).?;
+
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 50, 60, 70, 30, 80, 90, 40, 100 }, scratch.member_ids[0..member_count]);
 }
 
 test "posting segment lazy directory store uses newest point records by segment id" {
