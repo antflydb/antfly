@@ -110,7 +110,8 @@ Current status:
   value is newer than the base generation while still validating every encoded
   record. The same key-boundary fast path is now used by LSM delta replay for
   fold/materialization and latest-op scans, so all-live tail values do not pay a
-  generation test on every decoded record.
+  generation test on every decoded record. Committed segment catalog replay uses
+  the same min-sequence shortcut for all-live delta values.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
@@ -1029,20 +1030,20 @@ implementations cleanly:
     for the one-vector case. Segment latest-member scans also coalesce matching
     delta values into one contiguous range read per segment before checking the
     target vector. That preserves the format's sequence contract across the
-    file/runtime boundary. Query scratch replay applies that
-    combined stream directly into retained member scratch, using sorted merge
-  for canonical bases and avoiding a second owned materialized member buffer
-  on pending-overlay reads while preserving canonical sorted output. Fold
-  replay for committed segment bases can now stream the same sorted delta
-  summary straight from the encoded base bytes into the replacement base
-  encoder, so large committed bases do not need a decoded member slice during
-  fold. Query replay, lazy snapshot replay, explicit materialization, and fold
-  replay all append segment delta records directly into retained scratch;
-  folds collect tail stats in that same pass. Pending segment delta entries now
-  use their min sequence to select all-record stats/replay/latest-op paths when
-  the whole value is newer than the base generation. This removes the duplicate
-  stats-then-replay scans, delta-location lists, and owned delta slices that
-  existed before. Segment delta-tail stats also read a posting's contiguous
+    file/runtime boundary. Query scratch replay applies that combined stream
+    directly into retained member scratch, using sorted merge for canonical bases
+    and avoiding a second owned materialized member buffer on pending-overlay
+    reads while preserving canonical sorted output. Fold replay for committed
+    segment bases can now stream the same sorted delta summary straight from the
+    encoded base bytes into the replacement base encoder, so large committed
+    bases do not need a decoded member slice during fold. Query replay, lazy
+    snapshot replay, explicit materialization, and fold replay all append segment
+    delta records directly into retained scratch; folds collect tail stats in
+    that same pass. Pending and committed segment delta entries now use their min
+    sequence to select all-record stats/replay/latest-op paths when the whole
+    value is newer than the base generation. This removes the duplicate
+    stats-then-replay scans, delta-location lists, and owned delta slices that
+    existed before. Segment delta-tail stats also read a posting's contiguous
     delta-value range once per segment instead of issuing one range read per
     delta value while still verifying each value checksum. Fold scratch release
     now resets transient replay state and

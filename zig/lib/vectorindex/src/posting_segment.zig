@@ -744,6 +744,11 @@ pub const Catalog = struct {
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
                 if (min_generation) |generation| {
+                    if (posting.PostingFormat.deltaSequenceGeneration(delta_value.sequence) > generation) {
+                        try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
+                        while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
+                        continue;
+                    }
                     var reserved = false;
                     while (try delta_iter.next()) |record| {
                         if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
@@ -779,6 +784,11 @@ pub const Catalog = struct {
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
                 if (min_generation) |generation| {
+                    if (posting.PostingFormat.deltaSequenceGeneration(delta_value.sequence) > generation) {
+                        try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
+                        while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
+                        continue;
+                    }
                     var reserved = false;
                     while (try delta_iter.next()) |record| {
                         if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
@@ -998,7 +1008,14 @@ pub const LazyDirectorySnapshot = struct {
                 delta_index -= 1;
                 const found = try deltaIndexEntryFromRange(index_data, range, delta_index);
                 const value = try deltaValueFromEntryRange(range, found);
-                try latestDeltaValueRecordAfterGenerationForMember(value, vector_id, base_generation, &best_sequence, &best_record);
+                try latestDeltaValueRecordAfterGenerationForMember(
+                    value,
+                    vector_id,
+                    base_generation,
+                    posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
+                    &best_sequence,
+                    &best_record,
+                );
             }
         }
         return best_record;
@@ -3774,6 +3791,7 @@ fn latestDeltaValueRecordAfterGenerationForMember(
     value: []const u8,
     vector_id: posting.VectorId,
     base_generation: u64,
+    all_records_after_generation: bool,
     best_sequence: *u64,
     best_record: *?posting.PostingDeltaRecord,
 ) !void {
@@ -3783,7 +3801,7 @@ fn latestDeltaValueRecordAfterGenerationForMember(
     var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
     while (try iterator.next()) |record| {
         if (record.vector_id != vector_id) continue;
-        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+        if (!all_records_after_generation and posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
         if (record.sequence > value_best_sequence or (value_best_record != null and record.sequence == value_best_sequence)) {
             value_best_sequence = record.sequence;
             value_best_record = record;
