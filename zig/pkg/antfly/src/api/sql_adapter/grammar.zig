@@ -457,6 +457,28 @@ pub const DropIndexSyntax = struct {
     }
 };
 
+pub const DropViewSyntax = struct {
+    view_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.view_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropMaterializedViewSyntax = struct {
+    view_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.view_name));
+        self.* = undefined;
+    }
+};
+
 pub const PrivilegeChangeActionSyntax = enum {
     grant,
     revoke,
@@ -2089,6 +2111,53 @@ pub fn parseDropIndexCatalogTailAlloc(
     try parseAdapterNoopStatementEnd(cursor);
     index_transferred = true;
     return .{ .index_name = index_name, .if_exists = if_exists };
+}
+
+pub fn parseDropViewCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropViewSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("view");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const view_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var view_transferred = false;
+    errdefer if (!view_transferred) alloc.free(view_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    view_transferred = true;
+    return .{ .view_name = view_name, .if_exists = if_exists, .cascade = cascade };
+}
+
+pub fn parseDropMaterializedViewCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropMaterializedViewSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("materialized");
+    try cursor.expectKeyword("view");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const view_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var view_transferred = false;
+    errdefer if (!view_transferred) alloc.free(view_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    view_transferred = true;
+    return .{ .view_name = view_name, .if_exists = if_exists, .cascade = cascade };
 }
 
 pub fn parseCreateRoleCatalogTailAlloc(
@@ -4020,6 +4089,35 @@ test "sql adapter grammar parses drop table and index catalog tails" {
     defer lexer.freeTokens(alloc, &multi_table_tokens);
     var multi_table_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseDropTableCatalogTailAlloc(alloc, multi_table_tokens.items, &multi_table_pos));
+}
+
+test "sql adapter grammar parses view drop catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var drop_view_tokens = try lexer.tokenizeAlloc(alloc, "VIEW IF EXISTS public.active_accounts CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_view_tokens);
+    var drop_view_pos: usize = 0;
+    var drop_view = try parseDropViewCatalogTailAlloc(alloc, drop_view_tokens.items, &drop_view_pos);
+    defer drop_view.deinit(alloc);
+    try std.testing.expectEqual(drop_view_tokens.items.len, drop_view_pos);
+    try std.testing.expectEqualStrings("active_accounts", drop_view.view_name);
+    try std.testing.expect(drop_view.if_exists);
+    try std.testing.expect(drop_view.cascade);
+
+    var drop_mv_tokens = try lexer.tokenizeAlloc(alloc, "MATERIALIZED VIEW IF EXISTS public.account_rollups RESTRICT;");
+    defer lexer.freeTokens(alloc, &drop_mv_tokens);
+    var drop_mv_pos: usize = 0;
+    var drop_mv = try parseDropMaterializedViewCatalogTailAlloc(alloc, drop_mv_tokens.items, &drop_mv_pos);
+    defer drop_mv.deinit(alloc);
+    try std.testing.expectEqual(drop_mv_tokens.items.len, drop_mv_pos);
+    try std.testing.expectEqualStrings("account_rollups", drop_mv.view_name);
+    try std.testing.expect(drop_mv.if_exists);
+    try std.testing.expect(!drop_mv.cascade);
+
+    var multi_view_tokens = try lexer.tokenizeAlloc(alloc, "VIEW active_accounts, inactive_accounts;");
+    defer lexer.freeTokens(alloc, &multi_view_tokens);
+    var multi_view_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDropViewCatalogTailAlloc(alloc, multi_view_tokens.items, &multi_view_pos));
 }
 
 test "sql adapter grammar parses authorization catalog tails" {

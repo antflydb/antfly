@@ -4024,23 +4024,15 @@ const Parser = struct {
     }
 
     fn parseDropMaterializedViewDdl(self: *@This()) !DropMaterializedViewPlan {
-        try self.expectKeyword("materialized");
-        try self.expectKeyword("view");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const view_name = try self.parseSqlObjectIdentifierOwned();
-        var view_transferred = false;
-        errdefer if (!view_transferred) self.alloc.free(view_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        view_transferred = true;
-        return .{ .view_name = view_name, .if_exists = if_exists, .cascade = cascade };
+        var syntax = try sql_adapter.parseDropMaterializedViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .view_name = syntax.view_name,
+            .if_exists = syntax.if_exists,
+            .cascade = syntax.cascade,
+        };
     }
 
     fn parseCreateViewDdl(self: *@This(), replace_existing: bool) !CreateViewPlan {
@@ -4177,22 +4169,15 @@ const Parser = struct {
     }
 
     fn parseDropViewDdl(self: *@This()) !DropViewPlan {
-        try self.expectKeyword("view");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const view_name = try self.parseSqlObjectIdentifierOwned();
-        var view_transferred = false;
-        errdefer if (!view_transferred) self.alloc.free(view_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        view_transferred = true;
-        return .{ .view_name = view_name, .if_exists = if_exists, .cascade = cascade };
+        var syntax = try sql_adapter.parseDropViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .view_name = syntax.view_name,
+            .if_exists = syntax.if_exists,
+            .cascade = syntax.cascade,
+        };
     }
 
     fn parseDropTableDdl(self: *@This()) !DropTablePlan {
