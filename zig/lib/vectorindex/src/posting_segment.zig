@@ -41,6 +41,7 @@ const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
 const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const stack_index_max_bytes: usize = 64 * 1024;
 const stack_delta_value_range_max_bytes: usize = 64 * 1024;
+const stack_centroid_value_range_max_bytes: usize = 64 * 1024;
 
 pub const segment_directory = "postings";
 pub const default_manifest_path = "postings/manifest.afpm";
@@ -3847,8 +3848,9 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
     defer file.close(io);
 
     var reader = file.reader(io, &.{});
-    var range_scratch = std.ArrayListUnmanaged(u8).empty;
-    defer range_scratch.deinit(alloc);
+    var stack_values: [stack_centroid_value_range_max_bytes]u8 = undefined;
+    var heap_values = std.ArrayListUnmanaged(u8).empty;
+    defer heap_values.deinit(alloc);
 
     var index: usize = 0;
     while (index < entry.meta.entry_count) {
@@ -3860,8 +3862,12 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
 
         const range = try centroidDirectoryIndexRange(index_data.data, entry.meta, index);
         const range_len = range.end - range.offset;
-        try range_scratch.resize(alloc, range_len);
-        const bytes = range_scratch.items;
+        const bytes = if (range_len <= stack_values.len) blk: {
+            break :blk stack_values[0..range_len];
+        } else blk: {
+            try heap_values.resize(alloc, range_len);
+            break :blk heap_values.items;
+        };
         try reader.seekTo(@intCast(range.offset));
         reader.interface.readSliceAll(bytes) catch |err| switch (err) {
             error.EndOfStream => return error.CorruptedPostingSegment,
