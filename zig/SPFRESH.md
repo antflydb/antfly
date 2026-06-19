@@ -1276,7 +1276,9 @@ implementations cleanly:
     use segment-level min-delta metadata to take that path for every matching
     value in an all-live segment. Delta-tail readers and lower-level segment
     delta helper functions skip base-only and centroid-only segment files from
-    manifest metadata before opening or reading their indexes.
+    manifest metadata before opening or reading their indexes; lazy snapshot
+    delta wrappers apply the same skip before segment byte-limit checks, so an
+    irrelevant oversized base-only segment cannot fail a delta-only operation.
     Allocation-returning delta loads, stats reads, and scratch replay now all
     skip segment bytes entirely when
     manifest max-sequence metadata proves the requested base generation already

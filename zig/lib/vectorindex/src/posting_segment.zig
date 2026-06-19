@@ -1386,6 +1386,7 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readDeltaRecordsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+        if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) return try alloc.alloc(posting.PostingDeltaRecord, 0);
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         return try readSegmentDeltaRecordsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -1402,6 +1403,7 @@ pub const LazyDirectorySnapshot = struct {
         records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
         stats: *posting.PostingDeltaTailStats,
     ) !void {
+        if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) return;
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         try readSegmentDeltaRecordsWithStatsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -1418,6 +1420,7 @@ pub const LazyDirectorySnapshot = struct {
         scratch: anytype,
         stats: *posting.PostingDeltaTailStats,
     ) !void {
+        if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) return;
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         try readSegmentDeltaRecordsIntoScratchWithStatsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -1426,6 +1429,7 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readDeltaTailStatsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
+        if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) return .{};
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         return try readSegmentDeltaTailStatsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -6081,6 +6085,52 @@ pub fn testSegmentDeltaReadersSkipBaseOnlyCorruption() !void {
     try std.testing.expectEqual(@as(usize, 0), tail_stats.records);
 }
 
+pub fn testLazyDeltaReadersSkipBaseOnlyBeforeByteLimit() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(7, base);
+    var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
+    defer committed.deinit(alloc);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{
+        .max_segment_bytes = committed.entry.meta.byte_len - 1,
+    });
+    defer lazy.deinit(alloc);
+    const snapshot = lazy.snapshot();
+
+    const records = try snapshot.readDeltaRecordsAlloc(alloc, lazy.manifest.segments[0], 7, null);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 0), records.len);
+
+    var records_with_stats = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+    defer records_with_stats.deinit(alloc);
+    var stats = posting.PostingDeltaTailStats{};
+    try snapshot.readDeltaRecordsWithStatsAlloc(alloc, lazy.manifest.segments[0], 7, null, &records_with_stats, &stats);
+    try std.testing.expectEqual(@as(usize, 0), records_with_stats.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stats.records);
+
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+    var scratch_stats = posting.PostingDeltaTailStats{};
+    try snapshot.readDeltaRecordsIntoScratchWithStatsAlloc(alloc, lazy.manifest.segments[0], 7, 0, &scratch, &scratch_stats);
+    try std.testing.expectEqual(@as(usize, 0), scratch.deltaRecords().len);
+    try std.testing.expectEqual(@as(usize, 0), scratch_stats.records);
+
+    const tail_stats = try snapshot.readDeltaTailStatsAlloc(alloc, lazy.manifest.segments[0], 7, 0);
+    try std.testing.expectEqual(@as(usize, 0), tail_stats.records);
+}
+
 pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
     const candidates = [_]DeltaCandidate{
         .{ .posting_id = 7, .segment_id = 1, .record = .{ .sequence = 10, .op = .insert, .vector_id = 100 } },
@@ -8909,6 +8959,10 @@ test "posting segment delta paths skip segments without delta metadata" {
 
 test "posting segment delta readers skip base-only segment corruption" {
     try testSegmentDeltaReadersSkipBaseOnlyCorruption();
+}
+
+test "posting segment lazy delta readers skip base-only segment before byte limit" {
+    try testLazyDeltaReadersSkipBaseOnlyBeforeByteLimit();
 }
 
 test "posting segment retained delta candidate count deduplicates sequences" {
