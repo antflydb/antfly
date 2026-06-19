@@ -4927,7 +4927,9 @@ than PR unit coverage:
   graph-shape and active-generation
   proof: total actual and expected graph nodes/edges, source/sink/authority
   nodes, sink/cycle/bipartite/authority-self edge components, maximum observed
-  out-degree, total active mutation writes, and total active generation delta.
+  out-degree, total successful-generation repeats and delta, min/max
+  per-family successful-generation repeat and delta counts, total active
+  mutation writes, and total active generation delta.
   Those totals are verified against the configured document count, fanout,
   active mutation count, and degree/PageRank/eigenvector/HITS family mix, so
   promotion tooling can prove from the final row that the run exercised the

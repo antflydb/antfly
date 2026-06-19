@@ -18,6 +18,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const external_binding = @import("../external_source/catalog_binding.zig");
 const external_source = @import("../external_source/types.zig");
+const algebraic_segment = @import("../algebraic_segment/mod.zig");
 const rowsource_bridge = @import("../external_source/rowsource_bridge.zig");
 const parquet_footer = @import("lake_parquet_footer.zig");
 const parquet_metadata = @import("lake_parquet_metadata.zig");
@@ -574,6 +575,15 @@ pub const ObjectRangeRowsQueryRequest = struct {
     desired_sidecars: []const lake_sidecar_selection.DesiredSidecar = &.{},
     sidecar_policy: lake_sidecar_selection.Policy = .{},
     candidates: []const lake_rows.SidecarCandidateSet = &.{},
+};
+
+pub const ObjectRangeExpressionAggregateRequest = struct {
+    binding: ?external_binding.Binding = null,
+    reader: ObjectRangeReader,
+    cache: ?*ObjectRangeCache = null,
+    inventory: external_source.Inventory,
+    aggregate: lake_rows.ExpressionAggregateRequest,
+    coalesce_options: range_io.CoalesceOptions = .{},
 };
 
 pub const OwnedBatch = struct {
@@ -1479,6 +1489,60 @@ pub fn querySupportedI64ObjectRangeRowsAlloc(
     return try lake_rows.scanRowsAlloc(alloc, source.rowSource(), scan_request);
 }
 
+pub fn executeSupportedI64ObjectRangeExpressionAggregatesAlloc(
+    alloc: Allocator,
+    request: ObjectRangeExpressionAggregateRequest,
+) !lake_rows.ExpressionAggregateResult {
+    const maybe_binding = request.binding;
+    if (maybe_binding) |binding| {
+        try lake_scan_plan.validateBindingInventory(binding, request.inventory);
+    } else {
+        try request.inventory.validate();
+        if (request.inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+    }
+
+    const scan_columns = try expressionAggregateScanColumnsAlloc(alloc, request.aggregate.expressions);
+    defer alloc.free(scan_columns);
+    if (scan_columns.len == 0) return error.UnsupportedLakeRowsExpressionAggregate;
+
+    var row_group_plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, request.inventory, scan_columns);
+    defer row_group_plan.deinit(alloc);
+
+    if (row_group_plan.row_groups.len == 0) {
+        const EmptySource = struct {
+            fn next(_: *anyopaque, _: Allocator) !?rowsource.ColumnBatch {
+                return null;
+            }
+        };
+        var dummy: u8 = 0;
+        const source = rowsource.Source{
+            .kind = sourceKindForInventoryFormat(request.inventory.format),
+            .ctx = &dummy,
+            .next_batch = EmptySource.next,
+        };
+        return try lake_rows.executeExpressionAggregatesAlloc(alloc, source, request.aggregate, null);
+    }
+
+    var source = if (request.cache) |cache|
+        try ObjectRangeRowGroupSource.initWithCacheAndCoalesceOptions(
+            request.reader,
+            cache,
+            request.inventory,
+            row_group_plan.row_groups,
+            request.coalesce_options,
+        )
+    else
+        try ObjectRangeRowGroupSource.initWithCoalesceOptions(
+            request.reader,
+            request.inventory,
+            row_group_plan.row_groups,
+            request.coalesce_options,
+        );
+    defer source.deinit(alloc);
+
+    return try lake_rows.executeExpressionAggregatesAlloc(alloc, source.rowSource(), request.aggregate, null);
+}
+
 fn rowsQueryScanColumnsAlloc(
     alloc: Allocator,
     projected_columns: []const []const u8,
@@ -1502,6 +1566,30 @@ fn rowsQueryScanColumnsAlloc(
         scan_columns[projected_columns.len] = predicate.?.column;
     }
     return scan_columns;
+}
+
+fn expressionAggregateScanColumnsAlloc(
+    alloc: Allocator,
+    expressions: []const algebraic_segment.ExpressionSpec,
+) ![][]const u8 {
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer columns.deinit(alloc);
+    for (expressions) |expression| {
+        if (expression.op == .count) continue;
+        if (expression.value_column.len == 0) return error.InvalidLakeRowsQuery;
+        if (!containsColumn(columns.items, expression.value_column)) {
+            try columns.append(alloc, expression.value_column);
+        }
+    }
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn sourceKindForInventoryFormat(format: external_source.Format) rowsource.SourceKind {
+    return switch (format) {
+        .parquet => .external_parquet,
+        .iceberg => .external_iceberg,
+        .lance => .external_lance,
+    };
 }
 
 fn containsColumn(columns: []const []const u8, column: []const u8) bool {

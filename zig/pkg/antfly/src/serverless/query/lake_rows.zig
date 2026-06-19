@@ -237,6 +237,9 @@ pub fn executeGroupByAlloc(
     materialized: ?*const algebraic_segment.Reader,
 ) !GroupByResult {
     try validateRequest(request);
+    if (materialized != null and request.materialized_source == null) {
+        return error.LakeRowsMaterializedSourceRequired;
+    }
     if (request.materialized_source) |required| {
         if (required.kind != source.kind) return error.LakeRowsMaterializedSourceMismatch;
     }
@@ -255,6 +258,9 @@ pub fn executeExpressionAggregatesAlloc(
     materialized: ?*const algebraic_segment.ExpressionReader,
 ) !ExpressionAggregateResult {
     try validateExpressionAggregateRequest(request);
+    if (materialized != null and request.materialized_source == null) {
+        return error.LakeRowsMaterializedSourceRequired;
+    }
     if (request.materialized_source) |required| {
         if (required.kind != source.kind) return error.LakeRowsMaterializedSourceMismatch;
     }
@@ -1100,6 +1106,52 @@ test "lake rows group-by can use algebraic segment materialization" {
     try std.testing.expectEqual(.algebraic_segment, result.source);
 }
 
+test "lake rows group-by requires source contract for algebraic materialization" {
+    const alloc = std.testing.allocator;
+    var segment = algebraic_segment.Segment{
+        .source = .{
+            .kind = .serverless_fragment,
+            .snapshot_id = try alloc.dupe(u8, "manifest-1"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "orders"),
+        },
+        .aggregate = .{
+            .group_column = try alloc.dupe(u8, "tenant"),
+            .value_column = try alloc.dupe(u8, "amount"),
+            .op = .sum_i64,
+            .groups = try alloc.alloc(algebraic_segment.GroupFold, 1),
+        },
+    };
+    defer segment.deinit(alloc);
+    segment.aggregate.groups[0] = .{
+        .key = try alloc.dupe(u8, "t1"),
+        .value = .{ .sum_i64 = 42 },
+    };
+
+    const encoded = try algebraic_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+    var reader = try algebraic_segment.Reader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+
+    const EmptySource = struct {
+        fn next(_: *anyopaque, _: Allocator) !?rowsource.ColumnBatch {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const source = rowsource.Source{
+        .kind = .serverless_fragment,
+        .ctx = &dummy,
+        .next_batch = EmptySource.next,
+    };
+
+    try std.testing.expectError(error.LakeRowsMaterializedSourceRequired, executeGroupByAlloc(alloc, source, .{
+        .group_column = "tenant",
+        .value_column = "amount",
+        .op = .sum_i64,
+    }, &reader));
+}
+
 test "lake rows group-by rejects stale algebraic materialization source" {
     const alloc = std.testing.allocator;
     const local = @import("../../storage/rowsource/local.zig");
@@ -1221,6 +1273,47 @@ test "lake rows expression aggregates can use algebraic materialization" {
     try std.testing.expectEqual(@as(u64, 3), result.find("row_count").?.count);
     try std.testing.expectEqual(@as(i64, 42), result.find("amount_sum").?.sum_i64);
     try std.testing.expectEqual(.algebraic_expression, result.source);
+}
+
+test "lake rows expression aggregates require source contract for algebraic materialization" {
+    const alloc = std.testing.allocator;
+    var materialization = algebraic_segment.ExpressionMaterialization{
+        .source = .{
+            .kind = .serverless_fragment,
+            .snapshot_id = try alloc.dupe(u8, "manifest-1"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "orders"),
+        },
+        .expressions = try alloc.alloc(algebraic_segment.ExpressionFold, 1),
+    };
+    defer materialization.deinit(alloc);
+    materialization.expressions[0] = .{
+        .name = try alloc.dupe(u8, "row_count"),
+        .op = .count,
+        .value = .{ .count = 3 },
+    };
+
+    const encoded = try algebraic_segment.encodeExpressionAlloc(alloc, materialization);
+    defer alloc.free(encoded);
+    var reader = try algebraic_segment.ExpressionReader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+
+    const EmptySource = struct {
+        fn next(_: *anyopaque, _: Allocator) !?rowsource.ColumnBatch {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const source = rowsource.Source{
+        .kind = .serverless_fragment,
+        .ctx = &dummy,
+        .next_batch = EmptySource.next,
+    };
+    const specs = [_]algebraic_segment.ExpressionSpec{.{ .name = "row_count", .op = .count }};
+
+    try std.testing.expectError(error.LakeRowsMaterializedSourceRequired, executeExpressionAggregatesAlloc(alloc, source, .{
+        .expressions = &specs,
+    }, &reader));
 }
 
 test "lake rows expression aggregates reject stale algebraic materialization source" {

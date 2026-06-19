@@ -216,6 +216,7 @@ pub const buildLakeParquetTestPlainI64AndByteArrayObjectAlloc = lake_parquet_row
 pub const planLakeParquetPlainI64ObjectRangeRowGroupsAlloc = lake_parquet_rowgroup.planRequiredPlainI64ObjectRangeRowGroupsAlloc;
 pub const planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc = lake_parquet_rowgroup.planSupportedI64ObjectRangeRowGroupsAlloc;
 pub const queryLakeParquetSupportedI64ObjectRangeRowsAlloc = lake_parquet_rowgroup.querySupportedI64ObjectRangeRowsAlloc;
+pub const executeLakeParquetSupportedI64ObjectRangeExpressionAggregatesAlloc = lake_parquet_rowgroup.executeSupportedI64ObjectRangeExpressionAggregatesAlloc;
 pub const discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc = lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc;
 pub const discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc = lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc;
 pub const planProjectedLakeScanAlloc = lake_scan_plan.planProjectedScanAlloc;
@@ -445,6 +446,7 @@ test "serverless query module compiles" {
     _ = LakeParquetTestPlainByteArrayColumn;
     _ = buildLakeParquetTestPlainI64AndByteArrayObjectAlloc;
     _ = queryLakeParquetSupportedI64ObjectRangeRowsAlloc;
+    _ = executeLakeParquetSupportedI64ObjectRangeExpressionAggregatesAlloc;
     _ = discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc;
     _ = discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc;
     _ = planProjectedLakeScanAlloc;

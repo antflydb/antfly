@@ -579,7 +579,6 @@ pub fn executeOperationsAlloc(
             .reuse => try makeExecutedOperation(alloc, operation, null, operation.artifact_id),
             .drop => blk: {
                 if (operation.artifact_id.len == 0) return error.InvalidLakeRebuildExecution;
-                try artifacts.delete(operation.artifact_id);
                 break :blk try makeExecutedOperation(alloc, operation, null, operation.artifact_id);
             },
             .rebuild => blk: {
@@ -594,6 +593,23 @@ pub fn executeOperationsAlloc(
     }
 
     return .{ .operations = executed };
+}
+
+pub fn deleteDroppedArtifactsAfterPublishAlloc(
+    artifacts: *artifact_store.ArtifactStore,
+    plan: OperationPlan,
+    executed: ExecutionResult,
+) !void {
+    for (plan.operations) |operation| {
+        if (operation.action != .drop) continue;
+        if (operation.artifact_id.len == 0) return error.InvalidLakeRebuildExecution;
+        const result = executed.find(operation.name) orelse return error.InvalidLakeRebuildReconciliation;
+        if (result.action != .drop) return error.InvalidLakeRebuildReconciliation;
+        if (!std.mem.eql(u8, result.artifact_id, operation.artifact_id)) {
+            return error.InvalidLakeRebuildReconciliation;
+        }
+        try artifacts.delete(operation.artifact_id);
+    }
 }
 
 pub fn reconcileExecutedOperationsAlloc(
@@ -2318,6 +2334,50 @@ test "lake rebuild operation planner preserves reuse and drop artifacts" {
     try std.testing.expectEqual(Action.drop, drop.action);
     try std.testing.expect(drop.builder_kind == null);
     try std.testing.expectEqualStrings("graph-1", drop.artifact_id);
+}
+
+test "lake rebuild drop cleanup waits until after manifest publication" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryArtifactStore.init(alloc);
+    var artifacts = memory.artifactStore();
+    defer artifacts.deinit();
+
+    var old_meta = try artifacts.put("old graph sidecar");
+    defer old_meta.deinit(alloc);
+
+    const graph_binding = source_binding.Binding{
+        .sidecar_kind = .graph,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "docs",
+        .snapshot_id = "parquet-12",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"edges"},
+        .index_config_hash = "sha256:graph",
+    };
+    const published = [_]PublishedArtifact{.{
+        .name = "docs.old_graph",
+        .binding = graph_binding,
+        .artifact = .{ .kind = .graph_segment, .name = "docs.old_graph", .artifact_id = old_meta.artifact_id, .byte_len = old_meta.byte_len, .checksum = old_meta.checksum },
+    }};
+    var plan = try planOperationsAlloc(alloc, &.{}, &published);
+    defer plan.deinit(alloc);
+
+    const batches = [_]rowsource.ColumnBatch{};
+    var source_provider = TestRowSourceProvider{ .source_kind = .external_parquet, .batches = &batches };
+    var executed = try executeOperationsAlloc(alloc, &artifacts, source_provider.provider(), plan);
+    defer executed.deinit(alloc);
+
+    const retained = try artifacts.getAlloc(old_meta.artifact_id);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("old graph sidecar", retained);
+
+    var reconciled = try reconcileExecutedOperationsAlloc(alloc, &published, plan, executed);
+    defer reconciled.deinit(alloc);
+    try std.testing.expect(reconciled.find("docs.old_graph") == null);
+
+    try deleteDroppedArtifactsAfterPublishAlloc(&artifacts, plan, executed);
+    try std.testing.expectError(error.ArtifactNotFound, artifacts.getAlloc(old_meta.artifact_id));
 }
 
 test "lake rebuild operation reconciliation publishes rebuilds and reuses while omitting drops" {

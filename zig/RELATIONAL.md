@@ -1092,9 +1092,13 @@ fixture with the same entry schema as the generated golden fixture. Corpus-wide
 coverage expectations live in
 `api/fixtures/sql_api_required_coverage.json`; those names resolve against the
 coverage accumulator by exact field name, so strengthening or relaxing a required
-coverage bucket is a fixture review instead of a Zig assertion edit. The parser
-requires that fixture to enumerate every boolean and counter accumulator field,
-which makes newly added coverage dimensions fail closed until they become
+coverage bucket is a fixture review instead of a Zig assertion edit. That file
+is the only SQL/API corpus completeness checklist; `corpus.zig` may compute
+coverage evidence from typed plan fingerprints, summaries, and structured
+fixture metadata, but it must not carry a second hand-written list of required
+buckets. The parser requires the fixture to enumerate every boolean and counter
+accumulator field, which makes newly added coverage dimensions fail closed until
+they become
 explicit review policy. Migration-equivalence coverage is explicit in that
 fixture: source-based insert/update/delete rewrites must stay represented as
 data-backfill buckets, and schema changes must retain separate buckets for
@@ -6338,8 +6342,11 @@ counter requirements, that both the source and generated corpus gates must
 satisfy. Required coverage names must stay strictly sorted by coverage-field
 name and enumerate every boolean and counter accumulator field, so review diffs
 show only intentional additions/removals and a new accumulator cannot be added
-without explicit pass/fail policy. Source fixture
-entries should
+without explicit pass/fail policy. The generated
+`sql_api_parity_corpus.json` remains output from
+`zig build sql-api-parity-fixture-promote` and should not be hand-edited; edit
+the source corpus or required-coverage policy, then promote/check the generated
+fixture. Source fixture entries should
 cover portable SQL/data examples directly, including scalar and text expression
 queries, date/time expression queries, and JSON expression-projection queries,
 expression-membership/null-safe predicate queries, scalar OR/membership

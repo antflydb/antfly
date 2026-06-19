@@ -16,6 +16,7 @@ const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
 const json_helpers = @import("json_helpers.zig");
+const algebraic_segment = @import("../serverless/algebraic_segment/mod.zig");
 const lake_rows = @import("../serverless/query/lake_rows.zig");
 const platform_time = @import("../platform/time.zig");
 const regex_mod = @import("antfly_regex");
@@ -108,6 +109,20 @@ pub const OwnedRowsLakeScanRequest = struct {
         for (self.projected_columns) |column| alloc.free(@constCast(column));
         if (self.projected_columns.len > 0) alloc.free(self.projected_columns);
         if (self.predicate_bytes_value) |value| alloc.free(@constCast(value));
+        self.* = undefined;
+    }
+};
+
+pub const OwnedRowsLakeExpressionAggregateRequest = struct {
+    request: lake_rows.ExpressionAggregateRequest,
+    expressions: []algebraic_segment.ExpressionSpec = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.expressions) |expression| {
+            alloc.free(expression.name);
+            if (expression.value_column.len != 0) alloc.free(expression.value_column);
+        }
+        if (self.expressions.len > 0) alloc.free(self.expressions);
         self.* = undefined;
     }
 };
@@ -3261,6 +3276,62 @@ pub fn buildLakeRowsScanRequestForRowsAggregateAlloc(
     };
 }
 
+pub fn buildLakeRowsExpressionAggregateRequestForRowsAggregateAlloc(
+    alloc: std.mem.Allocator,
+    request: OwnedRowsAggregateRequest,
+) !?OwnedRowsLakeExpressionAggregateRequest {
+    if (!lakeRowsExpressionAggregateFastPathSupported(request)) return null;
+
+    const expressions = try alloc.alloc(algebraic_segment.ExpressionSpec, request.aggregations.len);
+    errdefer alloc.free(expressions);
+    var initialized: usize = 0;
+    errdefer {
+        for (expressions[0..initialized]) |expression| {
+            alloc.free(expression.name);
+            if (expression.value_column.len != 0) alloc.free(expression.value_column);
+        }
+    }
+
+    for (request.aggregations, expressions) |aggregation, *out| {
+        out.* = .{
+            .name = try alloc.dupe(u8, aggregation.name),
+            .value_column = if (aggregation.field) |field| try alloc.dupe(u8, field) else &.{},
+            .op = try lakeRowsAggregateOpToAlgebraicOp(aggregation),
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .request = .{ .expressions = expressions },
+        .expressions = expressions,
+    };
+}
+
+pub fn buildRowsAggregateResultFromLakeRowsExpressionAggregatesAlloc(
+    alloc: std.mem.Allocator,
+    request: OwnedRowsAggregateRequest,
+    result: lake_rows.ExpressionAggregateResult,
+) !OwnedRowsAggregateResult {
+    if (!lakeRowsExpressionAggregateFastPathSupported(request)) return error.UnsupportedRowsQuery;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (request.aggregations, 0..) |aggregation, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(aggregation.name, .{})});
+        const value = result.find(aggregation.name) orelse return error.InvalidRowsRequest;
+        try writeLakeExpressionAggregateValueJson(writer, aggregation, value);
+    }
+    try writer.writeByte('}');
+
+    const rows = try alloc.alloc([]const u8, 1);
+    errdefer alloc.free(rows);
+    rows[0] = try out.toOwnedSlice();
+    return .{ .rows = rows, .total_groups = 1 };
+}
+
 pub fn buildRowsAggregateResultFromLakeRowsAlloc(
     alloc: std.mem.Allocator,
     request: OwnedRowsAggregateRequest,
@@ -3316,6 +3387,108 @@ pub fn buildRowsAggregateResultFromLakeRowsAlloc(
         .rows = try rows.toOwnedSlice(alloc),
         .total_groups = total_groups,
     };
+}
+
+fn lakeRowsExpressionAggregateFastPathSupported(request: OwnedRowsAggregateRequest) bool {
+    if (request.group_by.len != 0 or request.group_expressions.len != 0) return false;
+    if (request.having_predicates.len != 0 or request.having_expressions.len != 0 or request.having_any.len != 0 or request.having_not.len != 0) return false;
+    if (request.order_by.len != 0 or request.offset != 0) return false;
+    if (request.limit != null and request.limit.? == 0) return false;
+    if (!lakeRowsExpressionAggregateSourceFastPathSupported(request.source)) return false;
+    if (request.aggregations.len == 0) return false;
+
+    for (request.aggregations) |aggregation| {
+        if (aggregation.name.len == 0) return false;
+        if (aggregation.distinct) return false;
+        if (aggregation.expression != null) return false;
+        if (aggregation.array_order_by.len != 0 or aggregation.string_delimiter != null) return false;
+        if (aggregation.filter_predicates.len != 0 or
+            aggregation.filter_array_any.len != 0 or
+            aggregation.filter_array_contains.len != 0 or
+            aggregation.filter_array_eq.len != 0 or
+            aggregation.filter_in_predicates.len != 0 or
+            aggregation.filter_json_contains.len != 0 or
+            aggregation.filter_json_path_eq.len != 0 or
+            aggregation.filter_json_path_exists.len != 0 or
+            aggregation.filter_text_patterns.len != 0 or
+            aggregation.filter_expressions.len != 0 or
+            aggregation.filter_expression_array_contains.len != 0 or
+            aggregation.filter_any.len != 0 or
+            aggregation.filter_not.len != 0) return false;
+        switch (aggregation.op) {
+            .count => if (aggregation.field != null) return false,
+            .sum, .min, .max, .avg => if (aggregation.field == null) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn lakeRowsExpressionAggregateSourceFastPathSupported(source: db_mod.types.RelationalRowsQueryRequest) bool {
+    return source.source_cte.len == 0 and
+        source.row_claim == null and
+        source.doc_key_range == null and
+        source.limit == null and
+        source.offset == 0 and
+        source.select_all and
+        source.select.len == 0 and
+        source.order_by.len == 0 and
+        source.distinct_on.len == 0 and
+        source.distinct_on_expressions.len == 0 and
+        source.json_extract.len == 0 and
+        source.array_length.len == 0 and
+        source.coalesce.len == 0 and
+        source.field_aliases.len == 0 and
+        source.expressions.len == 0 and
+        source.predicates.len == 0 and
+        source.array_any.len == 0 and
+        source.array_contains.len == 0 and
+        source.array_eq.len == 0 and
+        source.in_predicates.len == 0 and
+        source.json_contains.len == 0 and
+        source.json_path_eq.len == 0 and
+        source.json_path_exists.len == 0 and
+        source.or_predicates.len == 0 and
+        source.not_predicates.len == 0 and
+        source.access_or_predicates.len == 0 and
+        source.access_not_predicates.len == 0 and
+        source.text_patterns.len == 0 and
+        source.expression_predicates.len == 0 and
+        source.expression_or_predicates.len == 0 and
+        source.expression_not_predicates.len == 0 and
+        source.expression_array_contains.len == 0;
+}
+
+fn lakeRowsAggregateOpToAlgebraicOp(aggregation: db_mod.types.RelationalRowsAggregateSpec) !algebraic_segment.AggregateOp {
+    return switch (aggregation.op) {
+        .count => .count,
+        .sum => .sum_i64,
+        .min => .min_i64,
+        .max => .max_i64,
+        .avg => .avg_i64,
+        else => error.UnsupportedRowsQuery,
+    };
+}
+
+fn writeLakeExpressionAggregateValueJson(
+    writer: *std.Io.Writer,
+    aggregation: db_mod.types.RelationalRowsAggregateSpec,
+    value: algebraic_segment.AggregateValue,
+) !void {
+    switch (aggregation.op) {
+        .count => try writer.print("{d}", .{value.count}),
+        .sum => try writer.print("{d}", .{value.sum_i64}),
+        .min => try writer.print("{d}", .{value.min_i64}),
+        .max => try writer.print("{d}", .{value.max_i64}),
+        .avg => {
+            if (value.avg_i64.count == 0) {
+                try writer.writeAll("null");
+            } else {
+                try std.json.Stringify.value(@as(f64, @floatFromInt(value.avg_i64.sum_i64)) / @as(f64, @floatFromInt(value.avg_i64.count)), .{}, writer);
+            }
+        },
+        else => return error.UnsupportedRowsQuery,
+    }
 }
 
 fn lakeRowsAggregateHavingPassesAlloc(

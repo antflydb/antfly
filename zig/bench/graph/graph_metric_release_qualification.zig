@@ -382,6 +382,10 @@ const ReleaseSummary = struct {
     max_observed_graph_max_out_degree: usize = 0,
     total_successful_generation_repeats: usize = 0,
     total_successful_generation_delta: u64 = 0,
+    min_observed_successful_generation_repeats: usize = 0,
+    max_observed_successful_generation_repeats: usize = 0,
+    min_observed_successful_generation_delta: u64 = 0,
+    max_observed_successful_generation_delta: u64 = 0,
     total_active_mutation_writes: usize = 0,
     total_active_generation_delta: u64 = 0,
     total_ticks: usize = 0,
@@ -600,6 +604,16 @@ const ReleaseSummary = struct {
         self.max_observed_graph_max_out_degree = @max(self.max_observed_graph_max_out_degree, result.graph_max_out_degree);
         self.total_successful_generation_repeats += result.successful_generation_repeats;
         self.total_successful_generation_delta += result.successful_generation_delta;
+        self.min_observed_successful_generation_repeats = if (first)
+            result.successful_generation_repeats
+        else
+            @min(self.min_observed_successful_generation_repeats, result.successful_generation_repeats);
+        self.max_observed_successful_generation_repeats = @max(self.max_observed_successful_generation_repeats, result.successful_generation_repeats);
+        self.min_observed_successful_generation_delta = if (first)
+            result.successful_generation_delta
+        else
+            @min(self.min_observed_successful_generation_delta, result.successful_generation_delta);
+        self.max_observed_successful_generation_delta = @max(self.max_observed_successful_generation_delta, result.successful_generation_delta);
         self.total_active_mutation_writes += result.active_mutation_writes;
         self.total_active_generation_delta += result.active_generation_delta;
         self.total_ticks += result.ticks;
@@ -2058,6 +2072,8 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
     const expected_graph_edges = non_hits_families * (cfg.docs * cfg.fanout) +
         summary.hits_families_run * (cfg.docs * cfg.fanout + cfg.fanout);
     const expected_successful_generation_delta: u64 = @intCast(summary.total_successful_generation_repeats);
+    const expected_successful_generation_repeats_per_family = cfg.successful_generation_repeats;
+    const expected_successful_generation_delta_per_family: u64 = @intCast(cfg.successful_generation_repeats);
     const expected_active_generation_delta: u64 = @intCast(summary.families_run * cfg.active_mutation_writes);
     if (summary.total_graph_nodes != expected_graph_nodes or
         summary.total_graph_expected_nodes != expected_graph_nodes or
@@ -2073,6 +2089,10 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
         (summary.families_run != 0 and summary.max_observed_graph_max_out_degree != cfg.fanout) or
         summary.total_successful_generation_repeats != summary.families_run * cfg.successful_generation_repeats or
         summary.total_successful_generation_delta != expected_successful_generation_delta or
+        summary.min_observed_successful_generation_repeats != expected_successful_generation_repeats_per_family or
+        summary.max_observed_successful_generation_repeats != expected_successful_generation_repeats_per_family or
+        summary.min_observed_successful_generation_delta != expected_successful_generation_delta_per_family or
+        summary.max_observed_successful_generation_delta != expected_successful_generation_delta_per_family or
         summary.total_active_mutation_writes != summary.families_run * cfg.active_mutation_writes or
         summary.total_active_generation_delta != expected_active_generation_delta)
     {
@@ -7477,10 +7497,16 @@ fn configuredPromotionSuccessfulGenerationFloor(cfg: Config) bool {
 }
 
 fn observedPromotionSuccessfulGenerationFloor(cfg: Config, summary: ReleaseSummary) bool {
+    const promotion_floor_successful_generation_delta: u64 = @intCast(promotion_floor_successful_generation_repeats);
+    const successful_generation_delta: u64 = @intCast(cfg.successful_generation_repeats);
     return configuredPromotionSuccessfulGenerationFloor(cfg) and
         summary.families_run != 0 and
         summary.total_successful_generation_repeats == summary.families_run * cfg.successful_generation_repeats and
         summary.total_successful_generation_delta == summary.total_successful_generation_repeats and
+        summary.min_observed_successful_generation_repeats >= promotion_floor_successful_generation_repeats and
+        summary.max_observed_successful_generation_repeats == cfg.successful_generation_repeats and
+        summary.min_observed_successful_generation_delta >= promotion_floor_successful_generation_delta and
+        summary.max_observed_successful_generation_delta == successful_generation_delta and
         summary.total_scheduler_builds_started == summary.families_run + summary.total_successful_generation_repeats and
         summary.total_scheduler_published == summary.families_run + summary.total_successful_generation_repeats and
         summary.total_fresh_storage_job_namespace_records == 0 and
@@ -7847,8 +7873,8 @@ fn emitReleaseSummary(out: anytype, cfg: Config, summary: ReleaseSummary) !void 
         .{ cfg.docs, cfg.fanout, cfg.top_k, cfg.synthetic_fan_in_shards, cfg.synthetic_fan_in_active_shards, cfg.active_mutation_writes, cfg.workers, cfg.max_ticks, cfg.max_rounds_per_tick, cfg.max_metrics_per_round, cfg.max_pages_per_round, cfg.max_iterations, cfg.successful_generation_repeats, cfg.failure_repeats, cfg.max_failure_diagnostics, cfg.max_status_pages, cfg.reopen_between_ticks, cfg.tolerance, promotionProfileFloorEnforced(cfg), promotion_floor_docs, promotion_floor_fanout, promotion_floor_top_k, promotion_floor_synthetic_fan_in_shards, promotion_floor_synthetic_fan_in_active_shards, promotion_floor_active_mutation_writes, promotion_floor_workers, promotion_floor_max_iterations, promotion_floor_successful_generation_repeats, promotion_floor_failure_repeats, promotion_floor_max_failure_diagnostics, promotion_floor_max_status_pages },
     );
     try out.print(
-        ",\"total_graph_nodes\":{d},\"total_graph_expected_nodes\":{d},\"total_graph_edges\":{d},\"total_graph_expected_edges\":{d},\"total_graph_source_nodes\":{d},\"total_graph_sink_nodes\":{d},\"total_graph_authority_nodes\":{d},\"total_graph_sink_edges\":{d},\"total_graph_cycle_edges\":{d},\"total_graph_bipartite_edges\":{d},\"total_graph_authority_self_edges\":{d},\"max_observed_graph_max_out_degree\":{d},\"total_successful_generation_repeats\":{d},\"total_successful_generation_delta\":{d},\"total_active_mutation_writes\":{d},\"total_active_generation_delta\":{d}",
-        .{ summary.total_graph_nodes, summary.total_graph_expected_nodes, summary.total_graph_edges, summary.total_graph_expected_edges, summary.total_graph_source_nodes, summary.total_graph_sink_nodes, summary.total_graph_authority_nodes, summary.total_graph_sink_edges, summary.total_graph_cycle_edges, summary.total_graph_bipartite_edges, summary.total_graph_authority_self_edges, summary.max_observed_graph_max_out_degree, summary.total_successful_generation_repeats, summary.total_successful_generation_delta, summary.total_active_mutation_writes, summary.total_active_generation_delta },
+        ",\"total_graph_nodes\":{d},\"total_graph_expected_nodes\":{d},\"total_graph_edges\":{d},\"total_graph_expected_edges\":{d},\"total_graph_source_nodes\":{d},\"total_graph_sink_nodes\":{d},\"total_graph_authority_nodes\":{d},\"total_graph_sink_edges\":{d},\"total_graph_cycle_edges\":{d},\"total_graph_bipartite_edges\":{d},\"total_graph_authority_self_edges\":{d},\"max_observed_graph_max_out_degree\":{d},\"total_successful_generation_repeats\":{d},\"total_successful_generation_delta\":{d},\"min_observed_successful_generation_repeats\":{d},\"max_observed_successful_generation_repeats\":{d},\"min_observed_successful_generation_delta\":{d},\"max_observed_successful_generation_delta\":{d},\"total_active_mutation_writes\":{d},\"total_active_generation_delta\":{d}",
+        .{ summary.total_graph_nodes, summary.total_graph_expected_nodes, summary.total_graph_edges, summary.total_graph_expected_edges, summary.total_graph_source_nodes, summary.total_graph_sink_nodes, summary.total_graph_authority_nodes, summary.total_graph_sink_edges, summary.total_graph_cycle_edges, summary.total_graph_bipartite_edges, summary.total_graph_authority_self_edges, summary.max_observed_graph_max_out_degree, summary.total_successful_generation_repeats, summary.total_successful_generation_delta, summary.min_observed_successful_generation_repeats, summary.max_observed_successful_generation_repeats, summary.min_observed_successful_generation_delta, summary.max_observed_successful_generation_delta, summary.total_active_mutation_writes, summary.total_active_generation_delta },
     );
     try out.print(
         ",\"max_allowed_total_ticks\":{d},\"total_ticks\":{d},\"total_budget_exhausted_families\":{d},\"total_combined_sweeps\":{d},\"total_coordinator_sweeps\":{d},\"total_worker_pool_sweeps\":{d},\"max_allowed_scheduler_metrics_scanned\":{d},\"total_scheduler_metrics_scanned\":{d},\"total_scheduler_active_builds\":{d},\"expected_total_scheduler_builds_started\":{d},\"total_scheduler_builds_started\":{d},\"total_scheduler_worker_steps\":{d},\"total_scheduler_coordinator_decisions\":{d},\"total_scheduler_coordinator_steps\":{d},\"max_allowed_scheduler_pages_claimed\":{d},\"total_scheduler_pages_claimed\":{d},\"total_scheduler_pages_completed\":{d},\"total_scheduler_phases_advanced\":{d},\"expected_total_scheduler_published\":{d},\"total_scheduler_published\":{d},\"expected_total_scheduler_failed_builds\":{d},\"total_scheduler_failed_builds\":{d},\"max_allowed_scheduler_rounds_executed\":{d},\"total_scheduler_rounds_executed\":{d}",

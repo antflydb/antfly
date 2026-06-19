@@ -1352,6 +1352,14 @@ pub const TableReadSource = struct {
             request: serverless_query.LakeRowsScanRequest,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?serverless_query.LakeRowsScanResult = null,
+        lake_rows_expression_aggregates: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            request: serverless_query.LakeRowsExpressionAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?serverless_query.LakeRowsExpressionAggregateResult = null,
         rows_window_plan: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1671,6 +1679,18 @@ pub const TableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?serverless_query.LakeRowsScanResult {
         const fn_ptr = self.vtable.lake_rows_scan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, request, consistency);
+    }
+
+    pub fn lakeRowsExpressionAggregates(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        request: serverless_query.LakeRowsExpressionAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?serverless_query.LakeRowsExpressionAggregateResult {
+        const fn_ptr = self.vtable.lake_rows_expression_aggregates orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, request, consistency);
     }
 
@@ -4818,6 +4838,24 @@ fn rowsAggregatePlanFromLakeScanAlloc(
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsAggregateResult {
     if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
+    var maybe_expression_request = try relational_rows_api.buildLakeRowsExpressionAggregateRequestForRowsAggregateAlloc(alloc, plan.aggregate);
+    if (maybe_expression_request) |*expression_request| {
+        defer expression_request.deinit(alloc);
+        const expression_result = source.lakeRowsExpressionAggregates(alloc, table_name, runtime_schema, expression_request.request, consistency) catch |err| switch (err) {
+            error.UnsupportedOperation,
+            error.UnsupportedRowsQuery,
+            error.UnsupportedLakeRowsExpressionAggregate,
+            error.EmptyLakeRowsExpressionAggregate,
+            => null,
+            else => return err,
+        };
+        if (expression_result) |value| {
+            var owned_value = value;
+            defer owned_value.deinit(alloc);
+            return try relational_rows_api.buildRowsAggregateResultFromLakeRowsExpressionAggregatesAlloc(alloc, plan.aggregate, owned_value);
+        }
+    }
+
     var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsAggregateAlloc(alloc, runtime_schema, plan.aggregate);
     defer lake_request.deinit(alloc);
 
