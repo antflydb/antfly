@@ -31,6 +31,29 @@ Recommended position:
 - Allow async and synchronous standby durability policies.
 - Require fencing for automatic promotion.
 
+Latest review decisions:
+
+- Keep HA string validation shared only at the missing/padded classification
+  layer. Replace `paddedHAString` with a small `classifyHAString` helper, but
+  keep field-specific errors and type-specific validation for paths, node ids,
+  slot names, token environment variables, and URLs.
+- Add `test_standby.py` as a real-process Zig e2e once the admin API and
+  runtime wiring are usable. The test should cover primary startup, slot
+  creation, standby seed/startup, primary writes, standby catch-up, read-only
+  behavior, standby restart/replay resume, and later fenced promotion plus
+  old-primary write rejection.
+- Integrate HA with Zig simulation tests before treating the mode as safe.
+  Simulation coverage should exercise receive/apply crash windows, sync-ack
+  crashes, duplicate/gap/out-of-order WAL, fenced and unfenced promotion,
+  old-primary rejoin/rewind/reseed, WAL expiry, and timeline propagation.
+- Do not call the design production grade, or claim bulk Postgres-style HA
+  parity, until runtime wiring, generated `/admin/v1/ha` Zig and Go clients,
+  `go/pkg/operator` integration through the Go SDK wrapper, real base backup,
+  sync commit, fencing, promotion/timeline/former-primary repair, standby
+  freshness, WAL retention/reseed, auth, audit, metrics, runbooks,
+  compatibility tests, crash/e2e/operator coverage, and optional Postgres-like
+  archive/PITR or relay-replica decisions are explicit.
+
 The closest design model is Postgres physical standby operation: base backup,
 WAL streaming, replication slots, timelines, synchronous commit modes, and
 rewind/reseed after failover. CockroachDB is still useful as a source of design
