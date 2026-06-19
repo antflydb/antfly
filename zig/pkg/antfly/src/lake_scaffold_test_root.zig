@@ -45,6 +45,7 @@ pub const lake_parquet_page = @import("serverless/query/lake_parquet_page.zig");
 pub const lake_parquet_rowgroup = @import("serverless/query/lake_parquet_rowgroup.zig");
 pub const lake_scan_plan = @import("serverless/query/lake_scan_plan.zig");
 pub const lake_object_reader = @import("serverless/query/lake_object_reader.zig");
+pub const lake_iceberg_deletes = @import("serverless/query/lake_iceberg_deletes.zig");
 pub const sidecar_source_binding = @import("serverless/segment/source_binding.zig");
 pub const sidecar_manifest = @import("serverless/segment/sidecar_manifest.zig");
 pub const manifest_artifact_ref = @import("serverless/manifest/artifact_ref.zig");
@@ -83,6 +84,7 @@ test {
     _ = lake_parquet_rowgroup;
     _ = lake_scan_plan;
     _ = lake_object_reader;
+    _ = lake_iceberg_deletes;
     _ = sidecar_source_binding;
     _ = sidecar_manifest;
     _ = manifest_artifact_ref;
