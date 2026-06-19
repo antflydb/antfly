@@ -192,13 +192,11 @@ fn detectEngine(allocator: Allocator, path: []const u8) !?EngineKind {
 }
 
 fn nativeVacuumReport(handle: *Handle) !VacuumReport {
-    if (handle.native_docstore.?.file.read_only) return error.ReadOnly;
-
-    const report = try handle.native_docstore.?.file.check();
+    const report = try handle.native_docstore.?.vacuum();
     return .{
-        .before_size = report.file_size,
-        .after_size = report.file_size,
-        .reclaimed_bytes = 0,
+        .before_size = report.before_size,
+        .after_size = report.after_size,
+        .reclaimed_bytes = report.reclaimed_bytes,
         .live_file_count = report.live_file_count,
         .live_bytes = report.live_bytes,
     };

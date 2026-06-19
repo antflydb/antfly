@@ -61,6 +61,13 @@ pub const Store = struct {
         return try backend_erased.storeFrom(allocator, self.backendStore());
     }
 
+    pub fn vacuum(self: *Store) !native.VacuumReport {
+        if (self.read_only) return error.ReadOnly;
+        lockStore(self);
+        defer self.mutex.unlock();
+        return try self.file.vacuum();
+    }
+
     const NativeBackendStore = backend_adapter.Store(Store, Txn, Txn, Txn, .{
         .capabilities = capabilities,
         .begin_read = beginRead,

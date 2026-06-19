@@ -393,3 +393,88 @@ test "embedded db openLite query_readonly rejects writes" {
         .sync_level = .write,
     }));
 }
+
+test "embedded db openLite persists schema json in aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite-schema.aflite");
+    defer alloc.free(path);
+
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+
+    {
+        var db = try DB.openLite(alloc, path, .{});
+        defer db.close();
+
+        try db.setSchemaJson(alloc, schema_json);
+        _ = try db.vacuumLite();
+    }
+
+    {
+        var reopened = try DB.openLite(alloc, path, .{
+            .open_mode = .status_only,
+        });
+        defer reopened.close();
+
+        const loaded = (try reopened.getSchemaJson(alloc)) orelse return error.MissingLiteSchemaJson;
+        defer alloc.free(loaded);
+        try std.testing.expectEqualStrings(schema_json, loaded);
+    }
+}
+
+test "embedded db openLite persists index and enrichment catalogs in aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite-catalogs.aflite");
+    defer alloc.free(path);
+
+    {
+        var db = try DB.openLite(alloc, path, .{});
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "body_chunks_v1",
+            .kind = .chunk,
+            .field = "body",
+            .chunk_size = 128,
+            .chunk_overlap = 16,
+        });
+        try db.addIndex(.{
+            .name = "ft_body",
+            .kind = .full_text,
+            .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+        });
+        _ = try db.vacuumLite();
+    }
+
+    {
+        var reopened = try DB.openLite(alloc, path, .{
+            .open_mode = .status_only,
+        });
+        defer reopened.close();
+
+        const indexes = try reopened.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, indexes);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings("ft_body", indexes[0].name);
+        try std.testing.expectEqual(types.IndexKind.full_text, indexes[0].kind);
+        try std.testing.expectEqualStrings("{\"chunk_name\":\"body_chunks_v1\"}", indexes[0].config_json);
+
+        const enrichments = try reopened.listEnrichments(alloc);
+        defer types.freeEnrichmentConfigs(alloc, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
+        try std.testing.expectEqual(types.EnrichmentKind.chunk, enrichments[0].kind);
+        try std.testing.expectEqualStrings("body", enrichments[0].field);
+        try std.testing.expectEqual(@as(u32, 128), enrichments[0].chunk_size);
+        try std.testing.expectEqual(@as(u32, 16), enrichments[0].chunk_overlap);
+    }
+}
