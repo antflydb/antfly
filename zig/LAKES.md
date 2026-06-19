@@ -542,6 +542,10 @@ Freshly published Parquet and Iceberg inventories are expected to be
 footer-enriched before their inventory artifact is written. Scan-time footer
 discovery remains as compatibility and explain behavior for older or manually
 constructed inventories that contain file identities but no row-group metadata.
+Publication also fails closed on malformed Parquet footers before writing the
+inventory artifact, so a catalog `.current` pin cannot advance to a durable
+Antfly manifest unless every discovered data file satisfies the scanner's
+footer contract.
 
 The concrete work left for the data-lake path is therefore:
 

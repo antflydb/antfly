@@ -444,6 +444,42 @@ test "remote uri publication resolver pins parquet inventory into artifact store
     try std.testing.expectEqualStrings("amount", decoded.files[0].row_groups[0].column_chunks[0].column_id);
 }
 
+test "remote uri publication resolver rejects invalid parquet before publishing inventory artifact" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("antfly");
+    var put = try client.putObject("antfly", "events/data-0001.parquet", "not-parquet", .{});
+    defer put.deinit(alloc);
+
+    var opened_store = try object_store_support.OpenedObjectStore.initWithClient(alloc, client, "antfly", "events");
+    defer opened_store.deinit();
+    var object_resolver = StaticObjectStoreResolver{ .opened_store = opened_store };
+
+    var artifact_impl = MemoryArtifactStore.init(alloc);
+    defer artifact_impl.deinit();
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+
+    var publication = Resolver.init(&artifacts, object_resolver.resolver(), .{
+        .object_uri_base = "object://antfly/events",
+    });
+    try std.testing.expectError(error.InvalidParquetFooterMagic, publication.planResolver().resolveAlloc(alloc, .{
+        .namespace = "events",
+        .table_name = "events",
+        .binding = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "file:///tmp/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+            .write_policy = .read_only,
+        },
+    }));
+    try std.testing.expect(artifact_impl.bytes == null);
+}
+
 test "remote uri publication resolver pins iceberg data object identity into artifact store" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
