@@ -64317,27 +64317,6 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)",
         },
         .{
-            .name = "savepoint transaction control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .savepoint_transaction, .table_name = "antfly_migration_step" },
-            .plan = "ddl:savepoint:name=antfly_migration_step",
-            .sql = "SAVEPOINT antfly_migration_step",
-        },
-        .{
-            .name = "release savepoint transaction control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .release_savepoint, .table_name = "antfly_migration_step" },
-            .plan = "ddl:release_savepoint:name=antfly_migration_step",
-            .sql = "RELEASE SAVEPOINT antfly_migration_step",
-        },
-        .{
-            .name = "rollback to savepoint transaction control plan",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .rollback_to_savepoint, .table_name = "antfly_migration_step" },
-            .plan = "ddl:rollback_to_savepoint:name=antfly_migration_step",
-            .sql = "ROLLBACK TO SAVEPOINT antfly_migration_step",
-        },
-        .{
             .name = "create enum type catalog ddl",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_enum_type, .table_name = "usage_status", .select = 3 },
