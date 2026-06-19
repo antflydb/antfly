@@ -4254,6 +4254,7 @@ pub const AppParityCorpusCoverage = struct {
     read_join_cross_table_source_schema_classifier: bool = false,
     read_lateral_cross_table_source_schema_classifier: bool = false,
     read_set_operation_cross_table_except_classifier: bool = false,
+    read_set_operation_cross_table_intersect_classifier: bool = false,
     read_set_operation_cross_table_source_schema_classifier: bool = false,
     query: bool = false,
     aggregate: bool = false,
@@ -4360,6 +4361,7 @@ pub const AppParityCorpusCoverage = struct {
     read_join_cross_table_source_schema: bool = false,
     read_lateral_cross_table_source_schema: bool = false,
     read_set_operation_cross_table_except: bool = false,
+    read_set_operation_cross_table_intersect: bool = false,
     read_set_operation_cross_table_source_schema: bool = false,
     merge_cross_table_source_schema: bool = false,
     scalar_membership: bool = false,
@@ -5498,6 +5500,11 @@ pub const AppParityCorpusCoverage = struct {
                     (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
                         entry.source_schema_json.len > 0 and
                         sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "except") and
+                        setOperationPlanHasRightTable(entry.plan, "archived_records"));
+                self.read_set_operation_cross_table_intersect_classifier = self.read_set_operation_cross_table_intersect_classifier or
+                    (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
+                        entry.source_schema_json.len > 0 and
+                        sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "intersect") and
                         setOperationPlanHasRightTable(entry.plan, "archived_records"));
                 self.read_cte_query_expression = self.read_cte_query_expression or
                     (is_read_query and has_read_query_expression);
@@ -6674,6 +6681,11 @@ pub const AppParityCorpusCoverage = struct {
             (entry.family == .read and
                 entry.source_schema_json.len > 0 and
                 sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "except") and
+                setOperationPlanHasRightTable(entry.plan, "archived_records"));
+        self.read_set_operation_cross_table_intersect = self.read_set_operation_cross_table_intersect or
+            (entry.family == .read and
+                entry.source_schema_json.len > 0 and
+                sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "intersect") and
                 setOperationPlanHasRightTable(entry.plan, "archived_records"));
         self.merge_cross_table_source_schema = self.merge_cross_table_source_schema or
             (entry.family == .merge_mutation and

@@ -19759,7 +19759,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     );
     defer lowered_distinct.deinit(alloc);
     switch (lowered_distinct) {
-        .set_operation => |set_operation| try std.testing.expectEqualStrings("union_distinct", @tagName(set_operation.operation)),
+        .query => |query| try std.testing.expectEqual(@as(usize, 2), query.plan.query.or_predicates.len),
         else => return error.TestUnexpectedResult,
     }
 
@@ -19775,9 +19775,9 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     )).?;
     defer distinct_result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), fake_distinct.scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake_distinct.scan_calls);
     switch (distinct_result) {
-        .set_operation => |query_result| {
+        .query => |query_result| {
             try std.testing.expectEqual(@as(u32, 3), query_result.total);
             try std.testing.expectEqual(@as(usize, 3), query_result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
@@ -19795,7 +19795,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     );
     defer lowered_intersect.deinit(alloc);
     switch (lowered_intersect) {
-        .set_operation => |set_operation| try std.testing.expectEqualStrings("intersect", @tagName(set_operation.operation)),
+        .query => |query| try std.testing.expectEqual(@as(usize, 2), query.plan.query.predicates.len),
         else => return error.TestUnexpectedResult,
     }
 
@@ -19811,9 +19811,9 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     )).?;
     defer intersect_result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), fake_intersect.scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake_intersect.scan_calls);
     switch (intersect_result) {
-        .set_operation => |query_result| {
+        .query => |query_result| {
             try std.testing.expectEqual(@as(u32, 1), query_result.total);
             try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
@@ -20064,6 +20064,42 @@ test "lowered sql set operation plans route cross table branches through catalog
             try std.testing.expectEqual(@as(u32, 1), query_result.total);
             try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_intersect = try relational_sql_api.lowerReadPlanWithCatalogAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM archived_records WHERE status = 'deleted'",
+        usage_schema,
+        &.{},
+        catalog.iface(),
+    );
+    defer lowered_intersect.deinit(alloc);
+    switch (lowered_intersect) {
+        .set_operation => |set_operation| try std.testing.expectEqualStrings("intersect", @tagName(set_operation.operation)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var fake_intersect = FakeSource{};
+    var intersect_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake_intersect.source(),
+        catalog.iface(),
+        "usage_records",
+        usage_schema,
+        lowered_intersect,
+        .read_index,
+    )).?;
+    defer intersect_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), fake_intersect.usage_scans);
+    try std.testing.expectEqual(@as(usize, 1), fake_intersect.archived_scans);
+    switch (intersect_result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 1), query_result.total);
+            try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\"}", query_result.rows[0]);
         },
         else => return error.TestUnexpectedResult,
     }

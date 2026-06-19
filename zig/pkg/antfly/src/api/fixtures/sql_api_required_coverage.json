@@ -559,6 +559,8 @@
     "read_row_lock_share",
     "read_set_operation_cross_table_except",
     "read_set_operation_cross_table_except_classifier",
+    "read_set_operation_cross_table_intersect",
+    "read_set_operation_cross_table_intersect_classifier",
     "read_set_operation_cross_table_source_schema",
     "read_set_operation_cross_table_source_schema_classifier",
     "read_set_operation_order_limit",
