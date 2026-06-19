@@ -6196,283 +6196,6 @@
       "sql": "DROP VIEW usage_records_v"
     },
     {
-      "name": "create materialized view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_materialized_view",
-        "table_name": "usage_records_mv",
-        "select": 2
-      },
-      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=false:if_not_exists=false:populate=true",
-      "sql": "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id, status FROM usage_records"
-    },
-    {
-      "name": "create materialized view column list catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_materialized_view",
-        "table_name": "usage_records_mv",
-        "select": 2
-      },
-      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=false:if_not_exists=false:populate=true",
-      "sql": "CREATE MATERIALIZED VIEW usage_records_mv(record_id, record_status) AS SELECT id, status FROM usage_records"
-    },
-    {
-      "name": "create materialized view select alias catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_materialized_view",
-        "table_name": "usage_records_mv",
-        "select": 2
-      },
-      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=false:if_not_exists=false:populate=true",
-      "sql": "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id AS record_id, status record_status FROM usage_records"
-    },
-    {
-      "name": "create or replace materialized view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_materialized_view",
-        "table_name": "usage_records_mv",
-        "select": 2
-      },
-      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=true:if_not_exists=false:populate=false",
-      "sql": "CREATE OR REPLACE MATERIALIZED VIEW usage_records_mv AS SELECT id, status FROM usage_records WITH NO DATA"
-    },
-    {
-      "name": "create or replace materialized view if not exists catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_materialized_view",
-        "table_name": "usage_records_mv",
-        "select": 2
-      },
-      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=true:if_not_exists=true:populate=true",
-      "sql": "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS usage_records_mv AS SELECT id, status FROM usage_records"
-    },
-    {
-      "name": "refresh materialized view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "refresh_materialized_view",
-        "table_name": "usage_records_mv"
-      },
-      "plan": "ddl:refresh_materialized_view:view=usage_records_mv:concurrently=false:populate=true",
-      "sql": "REFRESH MATERIALIZED VIEW usage_records_mv"
-    },
-    {
-      "name": "drop materialized view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "drop_materialized_view",
-        "table_name": "usage_records_mv"
-      },
-      "plan": "ddl:drop_materialized_view:view=usage_records_mv:if_exists=false",
-      "sql": "DROP MATERIALIZED VIEW usage_records_mv"
-    },
-    {
-      "name": "temporary table lifetime ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "relation_lifetime",
-        "table_name": "usage_session_records",
-        "select": 2
-      },
-      "plan": "ddl:relation_lifetime:kind=temporary:table=usage_session_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
-      "sql": "CREATE TEMP TABLE usage_session_records (id uuid PRIMARY KEY, status text)"
-    },
-    {
-      "name": "temporary table if not exists lifetime ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "relation_lifetime",
-        "table_name": "usage_session_records",
-        "select": 2
-      },
-      "plan": "ddl:relation_lifetime:kind=temporary:table=usage_session_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
-      "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_records (id uuid PRIMARY KEY, status text)"
-    },
-    {
-      "name": "unlogged table lifetime ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "relation_lifetime",
-        "table_name": "usage_ingest_records",
-        "select": 2
-      },
-      "plan": "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
-      "sql": "CREATE UNLOGGED TABLE usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)"
-    },
-    {
-      "name": "unlogged table if not exists lifetime ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "relation_lifetime",
-        "table_name": "usage_ingest_records",
-        "select": 2
-      },
-      "plan": "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
-      "sql": "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)"
-    },
-    {
-      "name": "create table as select relation population plan",
-      "family": "relation_population",
-      "summary": {
-        "table_name": "usage_archive"
-      },
-      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
-      "sql": "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
-    },
-    {
-      "name": "create table if not exists as select relation population plan",
-      "family": "relation_population",
-      "summary": {
-        "table_name": "usage_archive"
-      },
-      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
-      "sql": "CREATE TABLE IF NOT EXISTS usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
-    },
-    {
-      "name": "create temp table as select relation population plan",
-      "family": "relation_population",
-      "summary": {
-        "table_name": "usage_session_archive"
-      },
-      "plan": "relation_population:mode=create_table_as:target=usage_session_archive:lifetime=temporary:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
-      "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
-    },
-    {
-      "name": "create unlogged table as select relation population plan",
-      "family": "relation_population",
-      "summary": {
-        "table_name": "usage_ingest_archive"
-      },
-      "plan": "relation_population:mode=create_table_as:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
-      "sql": "CREATE UNLOGGED TABLE usage_ingest_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
-    },
-    {
-      "name": "create table like clone ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "table_clone",
-        "table_name": "usage_records_copy"
-      },
-      "plan": "ddl:table_clone:table=usage_records_copy:source=usage_records:if_not_exists=false:columns=true:defaults=true:generated=true:checks=true:constraints=true:indexes=true:periods=true:update_policies=true",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
-      "sql": "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)"
-    },
-    {
-      "name": "copy from bulk import ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "copy_from",
-        "table_name": "usage_records",
-        "operations": 2
-      },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
-    },
-    {
-      "name": "copy to bulk export ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "copy_to",
-        "table_name": "usage_records",
-        "operations": 2
-      },
-      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv",
-      "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv)"
-    },
-    {
-      "name": "create function catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_function",
-        "table_name": "audit_changes",
-        "operations": 0
-      },
-      "plan": "ddl:create_function:name=audit_changes:args=0:replace=false:returns=trigger:language=plpgsql",
-      "sql": "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql"
-    },
-    {
-      "name": "drop function catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "drop_function",
-        "table_name": "audit_changes",
-        "operations": 0
-      },
-      "plan": "ddl:drop_function:name=audit_changes:args=0:if_exists=false",
-      "sql": "DROP FUNCTION audit_changes()"
-    },
-    {
-      "name": "create procedure catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_procedure",
-        "table_name": "rotate_usage",
-        "operations": 0
-      },
-      "plan": "ddl:create_procedure:name=rotate_usage:args=0:replace=false:returns=:language=plpgsql",
-      "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql"
-    },
-    {
-      "name": "drop procedure catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "drop_procedure",
-        "table_name": "rotate_usage",
-        "operations": 0
-      },
-      "plan": "ddl:drop_procedure:name=rotate_usage:args=0:if_exists=false",
-      "sql": "DROP PROCEDURE rotate_usage()"
-    },
-    {
-      "name": "partitioned table create catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_partitioned_table",
-        "table_name": "usage_events",
-        "select": 3,
-        "operations": 1
-      },
-      "plan": "ddl:create_partitioned_table:table=usage_events:columns=3:method=range:keys=1",
-      "sql": "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at)"
-    },
-    {
-      "name": "partition table create catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_table_partition",
-        "table_name": "usage_events_2026",
-        "operations": 0
-      },
-      "plan": "ddl:create_table_partition:table=usage_events_2026:parent=usage_events:lower=\"2026-01-01\":upper=\"2027-01-01\"",
-      "sql": "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
-    },
-    {
-      "name": "partition attach catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "attach_table_partition",
-        "table_name": "usage_events",
-        "operations": 0
-      },
-      "plan": "ddl:attach_table_partition:parent=usage_events:partition=usage_events_2026:lower=\"2026-01-01\":upper=\"2027-01-01\"",
-      "sql": "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
-    },
-    {
-      "name": "partition detach catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "detach_table_partition",
-        "table_name": "usage_events",
-        "operations": 0
-      },
-      "plan": "ddl:detach_table_partition:parent=usage_events:partition=usage_events_2026",
-      "sql": "ALTER TABLE usage_events DETACH PARTITION usage_events_2026"
-    },
-    {
       "name": "point update joined source routes to claimed joined mutation source",
       "family": "update_joined_source",
       "summary": {
@@ -10781,6 +10504,283 @@
       },
       "plan": "ddl:drop_role:role=app_writer:if_exists=false",
       "sql": "DROP ROLE app_writer"
+    },
+    {
+      "name": "create materialized view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_materialized_view",
+        "table_name": "usage_records_mv",
+        "select": 2
+      },
+      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=false:if_not_exists=false:populate=true",
+      "sql": "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id, status FROM usage_records"
+    },
+    {
+      "name": "create materialized view column list catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_materialized_view",
+        "table_name": "usage_records_mv",
+        "select": 2
+      },
+      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=false:if_not_exists=false:populate=true",
+      "sql": "CREATE MATERIALIZED VIEW usage_records_mv(record_id, record_status) AS SELECT id, status FROM usage_records"
+    },
+    {
+      "name": "create materialized view select alias catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_materialized_view",
+        "table_name": "usage_records_mv",
+        "select": 2
+      },
+      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=false:if_not_exists=false:populate=true",
+      "sql": "CREATE MATERIALIZED VIEW usage_records_mv AS SELECT id AS record_id, status record_status FROM usage_records"
+    },
+    {
+      "name": "create or replace materialized view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_materialized_view",
+        "table_name": "usage_records_mv",
+        "select": 2
+      },
+      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=true:if_not_exists=false:populate=false",
+      "sql": "CREATE OR REPLACE MATERIALIZED VIEW usage_records_mv AS SELECT id, status FROM usage_records WITH NO DATA"
+    },
+    {
+      "name": "create or replace materialized view if not exists catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_materialized_view",
+        "table_name": "usage_records_mv",
+        "select": 2
+      },
+      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=true:if_not_exists=true:populate=true",
+      "sql": "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS usage_records_mv AS SELECT id, status FROM usage_records"
+    },
+    {
+      "name": "refresh materialized view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "refresh_materialized_view",
+        "table_name": "usage_records_mv"
+      },
+      "plan": "ddl:refresh_materialized_view:view=usage_records_mv:concurrently=false:populate=true",
+      "sql": "REFRESH MATERIALIZED VIEW usage_records_mv"
+    },
+    {
+      "name": "drop materialized view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_materialized_view",
+        "table_name": "usage_records_mv"
+      },
+      "plan": "ddl:drop_materialized_view:view=usage_records_mv:if_exists=false",
+      "sql": "DROP MATERIALIZED VIEW usage_records_mv"
+    },
+    {
+      "name": "temporary table lifetime ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "relation_lifetime",
+        "table_name": "usage_session_records",
+        "select": 2
+      },
+      "plan": "ddl:relation_lifetime:kind=temporary:table=usage_session_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
+      "sql": "CREATE TEMP TABLE usage_session_records (id uuid PRIMARY KEY, status text)"
+    },
+    {
+      "name": "temporary table if not exists lifetime ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "relation_lifetime",
+        "table_name": "usage_session_records",
+        "select": 2
+      },
+      "plan": "ddl:relation_lifetime:kind=temporary:table=usage_session_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+      "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_records (id uuid PRIMARY KEY, status text)"
+    },
+    {
+      "name": "unlogged table lifetime ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "relation_lifetime",
+        "table_name": "usage_ingest_records",
+        "select": 2
+      },
+      "plan": "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
+      "sql": "CREATE UNLOGGED TABLE usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)"
+    },
+    {
+      "name": "unlogged table if not exists lifetime ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "relation_lifetime",
+        "table_name": "usage_ingest_records",
+        "select": 2
+      },
+      "plan": "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+      "sql": "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)"
+    },
+    {
+      "name": "create table as select relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_archive"
+      },
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "create table if not exists as select relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_archive"
+      },
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "CREATE TABLE IF NOT EXISTS usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "create temp table as select relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_session_archive"
+      },
+      "plan": "relation_population:mode=create_table_as:target=usage_session_archive:lifetime=temporary:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "create unlogged table as select relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_ingest_archive"
+      },
+      "plan": "relation_population:mode=create_table_as:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "CREATE UNLOGGED TABLE usage_ingest_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "create table like clone ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "table_clone",
+        "table_name": "usage_records_copy"
+      },
+      "plan": "ddl:table_clone:table=usage_records_copy:source=usage_records:if_not_exists=false:columns=true:defaults=true:generated=true:checks=true:constraints=true:indexes=true:periods=true:update_policies=true",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "sql": "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)"
+    },
+    {
+      "name": "copy from bulk import ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
+    },
+    {
+      "name": "copy to bulk export ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_to",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv",
+      "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv)"
+    },
+    {
+      "name": "create function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "audit_changes",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=audit_changes:args=0:replace=false:returns=trigger:language=plpgsql",
+      "sql": "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql"
+    },
+    {
+      "name": "drop function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_function",
+        "table_name": "audit_changes",
+        "operations": 0
+      },
+      "plan": "ddl:drop_function:name=audit_changes:args=0:if_exists=false",
+      "sql": "DROP FUNCTION audit_changes()"
+    },
+    {
+      "name": "create procedure catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_procedure",
+        "table_name": "rotate_usage",
+        "operations": 0
+      },
+      "plan": "ddl:create_procedure:name=rotate_usage:args=0:replace=false:returns=:language=plpgsql",
+      "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql"
+    },
+    {
+      "name": "drop procedure catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_procedure",
+        "table_name": "rotate_usage",
+        "operations": 0
+      },
+      "plan": "ddl:drop_procedure:name=rotate_usage:args=0:if_exists=false",
+      "sql": "DROP PROCEDURE rotate_usage()"
+    },
+    {
+      "name": "partitioned table create catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_partitioned_table",
+        "table_name": "usage_events",
+        "select": 3,
+        "operations": 1
+      },
+      "plan": "ddl:create_partitioned_table:table=usage_events:columns=3:method=range:keys=1",
+      "sql": "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at)"
+    },
+    {
+      "name": "partition table create catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_table_partition",
+        "table_name": "usage_events_2026",
+        "operations": 0
+      },
+      "plan": "ddl:create_table_partition:table=usage_events_2026:parent=usage_events:lower=\"2026-01-01\":upper=\"2027-01-01\"",
+      "sql": "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
+    },
+    {
+      "name": "partition attach catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "attach_table_partition",
+        "table_name": "usage_events",
+        "operations": 0
+      },
+      "plan": "ddl:attach_table_partition:parent=usage_events:partition=usage_events_2026:lower=\"2026-01-01\":upper=\"2027-01-01\"",
+      "sql": "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
+    },
+    {
+      "name": "partition detach catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "detach_table_partition",
+        "table_name": "usage_events",
+        "operations": 0
+      },
+      "plan": "ddl:detach_table_partition:parent=usage_events:partition=usage_events_2026",
+      "sql": "ALTER TABLE usage_events DETACH PARTITION usage_events_2026"
     }
   ]
 }
