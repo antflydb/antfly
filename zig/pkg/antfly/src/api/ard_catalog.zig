@@ -121,6 +121,7 @@ const default_skills_manifest_json = @embedFile("ard/default_skills.json");
 
 const DefaultSkillManifest = struct {
     slug: []const u8,
+    identifier_suffix: ?[]const u8 = null,
     url: []const u8,
     display_name: []const u8,
     description: []const u8,
@@ -2503,7 +2504,7 @@ fn parseDefaultSkills(alloc: std.mem.Allocator) !std.json.Parsed([]DefaultSkillM
 
 fn defaultSkillEntry(skill: DefaultSkillManifest) !Entry {
     return .{
-        .identifier_suffix = skill.slug,
+        .identifier_suffix = skill.identifier_suffix orelse skill.slug,
         .display_name = skill.display_name,
         .media_type = "application/ai-skill+md",
         .description = skill.description,
@@ -2799,6 +2800,8 @@ test "ARD catalog entries contain required value or reference fields" {
     _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:installed");
     _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:mcp");
     _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:skill:docs");
+    const builtin_skill_entry = try findCatalogEntryByIdentifierSuffix(parsed.value, ":skill:antfly-retrieval");
+    try std.testing.expectEqualStrings("/ard/v1/skills/antfly-retrieval", builtin_skill_entry.object.get("url").?.string);
     for (entries) |entry| {
         const object = entry.object;
         try std.testing.expect(object.get("identifier") != null);

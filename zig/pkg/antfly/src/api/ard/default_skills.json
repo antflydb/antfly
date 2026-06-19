@@ -1,6 +1,7 @@
 [
   {
     "slug": "antfly-query-builder",
+    "identifier_suffix": "skill:antfly-query-builder",
     "url": "/ard/v1/skills/antfly-query-builder",
     "display_name": "Antfly Query Builder",
     "description": "Translate user intent into Antfly table queries and query-builder requests.",
@@ -17,6 +18,7 @@
   },
   {
     "slug": "antfly-retrieval",
+    "identifier_suffix": "skill:antfly-retrieval",
     "url": "/ard/v1/skills/antfly-retrieval",
     "display_name": "Antfly Retrieval",
     "description": "Retrieve, rank, and synthesize context from Antfly tables.",
@@ -33,6 +35,7 @@
   },
   {
     "slug": "antfly-schema-design",
+    "identifier_suffix": "skill:antfly-schema-design",
     "url": "/ard/v1/skills/antfly-schema-design",
     "display_name": "Antfly Schema Design",
     "description": "Design Antfly tables, schemas, indexes, enrichments, and query processors.",
@@ -49,6 +52,7 @@
   },
   {
     "slug": "antfly-extension-management",
+    "identifier_suffix": "skill:antfly-extension-management",
     "url": "/ard/v1/skills/antfly-extension-management",
     "display_name": "Antfly Extension Management",
     "description": "Install, configure, enable, disable, and inspect Antfly extensions.",
