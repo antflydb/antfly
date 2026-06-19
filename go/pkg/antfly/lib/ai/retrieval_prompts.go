@@ -189,6 +189,16 @@ depth: 1
 `)
 	}
 
+	if toolsConfig.IsToolEnabled(ToolNameAggregate) {
+		sb.WriteString(`### Aggregate:
+<aggregate>
+table: optional_table_name
+aggregations: {"by_field":{"type":"terms","field":"field_name","size":10}}
+</aggregate>
+
+`)
+	}
+
 	// Describe available indexes
 	if len(availableIndexes) > 0 {
 		sb.WriteString("## Available Indexes\n\n")
@@ -237,6 +247,9 @@ depth: 1
 	}
 	if hasGraph && toolsConfig.IsToolEnabled(ToolNameGraphSearch) {
 		sb.WriteString("- Use graph_search to explore relationships between documents\n")
+	}
+	if toolsConfig.IsToolEnabled(ToolNameAggregate) {
+		sb.WriteString("- Use aggregate for counts, grouped buckets, statistics, histograms, and summary metrics\n")
 	}
 	if toolsConfig.IsToolEnabled(ToolNameClarification) {
 		sb.WriteString("- Use ask_clarification ONLY if the query is truly ambiguous\n")

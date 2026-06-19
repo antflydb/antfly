@@ -4,7 +4,7 @@ info:
   description: |
     OpenAPI specification for web search provider configuration.
 
-    Web search providers allow the chat agent to search external sources
+    Web search providers allow retrieval agents to search external sources
     when internal documents don't have the answer.
   version: "1.0.0"
 

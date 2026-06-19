@@ -737,30 +737,6 @@ func (t *TableApi) CreateIndex(
 	w.WriteHeader(http.StatusCreated)
 }
 
-func (t *TableApi) PutArtifactEnrichment(
-	w http.ResponseWriter,
-	r *http.Request,
-	tableName string,
-	artifactName string,
-) {
-	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
-		return
-	}
-	errorResponse(w, "artifact enrichment registration is not implemented", http.StatusNotImplemented)
-}
-
-func (t *TableApi) DeleteArtifactEnrichment(
-	w http.ResponseWriter,
-	r *http.Request,
-	tableName string,
-	artifactName string,
-) {
-	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
-		return
-	}
-	errorResponse(w, "artifact enrichment deletion is not implemented", http.StatusNotImplemented)
-}
-
 func (t *TableApi) LookupKey(w http.ResponseWriter, r *http.Request, tableName string, key string, params LookupKeyParams) {
 	defer func() { _ = r.Body.Close() }()
 	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeRead) {

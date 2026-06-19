@@ -275,7 +275,7 @@ components:
           description: "Custom guidance for confidence assessment approach"
           example: "Be conservative - only give high confidence if resources directly address the question"
 
-    # Chat Agent Types - Conversational RAG with tool calling
+    # Shared retrieval-agent message and tool types.
 
     ChatMessageRole:
       $ref: "../shared/generating.yaml#/components/schemas/ChatMessageRole"
@@ -295,7 +295,7 @@ components:
     ChatToolName:
       type: string
       description: |
-        Available tool names for the chat and retrieval agents.
+        Available tool names for retrieval agents.
         - add_filter: Add search filters (field constraints)
         - ask_clarification: Ask user for clarification
         - web_search: Search the web (requires web_search_connection or web_search_config)
@@ -319,7 +319,7 @@ components:
     ChatToolsConfig:
       type: object
       description: |
-        Configuration for chat agent tools.
+        Configuration for retrieval agent tools.
 
         If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
         available for the request. Explicit retrieval policies should use semantic_search

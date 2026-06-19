@@ -660,7 +660,7 @@ pub const EmbeddingsIndexConfig = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
-    /// Configuration for generating node summaries (enables tree navigation in AnswerAgent)
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
     template: ?[]const u8 = null,

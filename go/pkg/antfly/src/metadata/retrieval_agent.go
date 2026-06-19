@@ -401,6 +401,49 @@ func (e *retrievalToolExecutor) ExecuteGraphSearch(ctx context.Context, tableNam
 	return results, err
 }
 
+// ExecuteAggregate runs aggregations against the specified table.
+func (e *retrievalToolExecutor) ExecuteAggregate(ctx context.Context, table string, aggregations map[string]any, filters []ai.FilterSpec) (map[string]any, error) {
+	if table == "" {
+		table = e.defaultTable
+	}
+	if len(aggregations) == 0 {
+		return nil, fmt.Errorf("aggregations is required")
+	}
+
+	var typedAggregations map[string]AggregationRequest
+	raw, err := json.Marshal(aggregations)
+	if err != nil {
+		return nil, fmt.Errorf("marshal aggregations: %w", err)
+	}
+	if err := json.Unmarshal(raw, &typedAggregations); err != nil {
+		return nil, fmt.Errorf("invalid aggregations: %w", err)
+	}
+
+	var aggregateResult map[string]AggregationResult
+	_, err = e.emitStep(ctx, string(ai.ToolNameAggregate), fmt.Sprintf("Aggregating table '%s'", table), func() (map[string]any, error) {
+		queryReq := &QueryRequest{
+			Table:        table,
+			Aggregations: typedAggregations,
+			Count:        true,
+		}
+		applyFiltersToQuery(queryReq, append(e.appliedFilters, filters...), e.logger)
+
+		result := e.tableApi.runQuery(ctx, queryReq)
+		if result.Status != 200 {
+			return nil, fmt.Errorf("aggregate failed: %s", result.Error)
+		}
+		aggregateResult = result.Aggregations
+		return map[string]any{"table": table, "aggregations": len(aggregateResult)}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"table":        table,
+		"aggregations": aggregateResult,
+	}, nil
+}
+
 // ExecuteWebSearch runs a web search
 func (e *retrievalToolExecutor) ExecuteWebSearch(ctx context.Context, query string, numResults int) ([]map[string]any, error) {
 	if e.websearchProvider == nil {
@@ -982,8 +1025,8 @@ func effectiveRetrievalToolsConfig(req *RetrievalAgentRequest) (ai.ChatToolsConf
 }
 
 func validateChatToolsConfig(path string, config ai.ChatToolsConfig) error {
-	if config.MaxToolIterations != nil && *config.MaxToolIterations < 0 {
-		return fmt.Errorf("%s.max_tool_iterations must be non-negative", path)
+	if config.MaxToolIterations != nil && (*config.MaxToolIterations < 1 || *config.MaxToolIterations > 20) {
+		return fmt.Errorf("%s.max_tool_iterations must be between 1 and 20", path)
 	}
 	return nil
 }
@@ -1061,7 +1104,7 @@ func cloneEnabledTools(tools *[]ai.ChatToolName) *[]ai.ChatToolName {
 
 func effectiveToolIterations(req *RetrievalAgentRequest, toolsConfig ai.ChatToolsConfig) int {
 	iterations := req.MaxInternalIterations
-	if toolsConfig.MaxToolIterations != nil && *toolsConfig.MaxToolIterations > 0 && *toolsConfig.MaxToolIterations < iterations {
+	if toolsConfig.MaxToolIterations != nil && *toolsConfig.MaxToolIterations < iterations {
 		iterations = *toolsConfig.MaxToolIterations
 	}
 	return iterations
@@ -1098,6 +1141,9 @@ func structuredRetrievalToolCount(toolsConfig ai.ChatToolsConfig, availableIndex
 	if hasGraph && toolsConfig.IsToolEnabled(ai.ToolNameGraphSearch) {
 		count++
 	}
+	if toolsConfig.IsToolEnabled(ai.ToolNameAggregate) {
+		count++
+	}
 	return count
 }
 
@@ -1117,7 +1163,7 @@ func disabledRetrievalToolsForQuery(qr RetrievalQueryRequest, toolsConfig ai.Cha
 }
 
 func requiredRetrievalToolsForQuery(qr RetrievalQueryRequest) []ai.ChatToolName {
-	required := make([]ai.ChatToolName, 0, 5)
+	required := make([]ai.ChatToolName, 0, 6)
 	add := func(tool ai.ChatToolName) {
 		if !slices.Contains(required, tool) {
 			required = append(required, tool)
@@ -1131,6 +1177,9 @@ func requiredRetrievalToolsForQuery(qr RetrievalQueryRequest) []ai.ChatToolName 
 	}
 	if hasMetadataQueryFields(qr) {
 		add(ai.ToolNameFilter)
+	}
+	if len(qr.Aggregations) > 0 {
+		add(ai.ToolNameAggregate)
 	}
 	if qr.TreeSearch.Index != "" {
 		add(ai.ToolNameTreeSearch)
@@ -1149,9 +1198,19 @@ func hasMetadataQueryFields(qr RetrievalQueryRequest) bool {
 		len(qr.FilterQuery) > 0 ||
 		len(qr.ExclusionQuery) > 0 ||
 		len(qr.Query) > 0 ||
-		len(qr.Aggregations) > 0 ||
 		len(qr.OrderBy) > 0 ||
 		qr.Count
+}
+
+func retrievalQueryShouldExecute(qr RetrievalQueryRequest) bool {
+	return qr.SemanticSearch != "" ||
+		len(qr.Embeddings) > 0 ||
+		len(qr.FullTextSearch) > 0 ||
+		hasMetadataQueryFields(qr) ||
+		len(qr.Aggregations) > 0 ||
+		len(qr.GraphSearches) > 0 ||
+		qr.Join.RightTable != "" ||
+		qr.Analyses != nil
 }
 
 func formatToolNames(tools []ai.ChatToolName) string {
@@ -1260,8 +1319,7 @@ func (t *TableApi) ExecutePipeline(
 	var queryReqs []QueryRequest
 	queryIdxMap := make([]int, 0, len(req.Queries)) // maps queryReqs index → req.Queries index
 	for i, qr := range req.Queries {
-		hasSearchFields := qr.SemanticSearch != "" || len(qr.FullTextSearch) > 0 || len(qr.FilterQuery) > 0
-		if hasSearchFields {
+		if retrievalQueryShouldExecute(qr) {
 			queryReqs = append(queryReqs, *queryRequestFromRetrieval(&qr))
 			queryIdxMap = append(queryIdxMap, i)
 		}
@@ -1705,6 +1763,10 @@ func (t *TableApi) runAgenticWithStructuredOutput(
 				edgeType, _ := action.Arguments["edge_type"].(string)
 				direction, _ := action.Arguments["direction"].(string)
 				_, _ = executor.ExecuteGraphSearch(ctx, actionTable, index, startNode, edgeType, direction, 1)
+
+			case ai.ToolNameAggregate:
+				aggregations, _ := action.Arguments["aggregations"].(map[string]any)
+				_, _ = executor.ExecuteAggregate(ctx, actionTable, aggregations, nil)
 
 			case ai.ToolNameFilter:
 				field, _ := action.Arguments["field"].(string)

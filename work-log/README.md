@@ -44,8 +44,6 @@ This directory tracks major features and architectural changes in Antfly. Each d
 | Feature | Document | Summary |
 |---------|----------|---------|
 | RAG Streaming Evolution | [rag-streaming-evolution.md](completed/rag-streaming-evolution.md) | Token-by-token streaming, multi-table, parallel LLM |
-| Retrieval/Generation Agents | [retrieval-generation-agents.md](completed/retrieval-generation-agents.md) | DFA-based `/agents/retrieval` with tool calling |
-| Generation Mode | [generation-mode-feature.md](completed/generation-mode-feature.md) | `without_generation` flag for retrieval-only mode |
 | Link Processing | [link-processing.md](completed/link-processing.md) | Schema-aware link download: HTML, PDF, images |
 
 ### ML & Termite

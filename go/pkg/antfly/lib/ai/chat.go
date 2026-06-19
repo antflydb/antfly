@@ -44,6 +44,7 @@ const (
 	ToolNameFullTextSearch = ChatToolNameFullTextSearch
 	ToolNameTreeSearch     = ChatToolNameTreeSearch
 	ToolNameGraphSearch    = ChatToolNameGraphSearch
+	ToolNameAggregate      = ChatToolNameAggregate
 )
 
 // Static tool schemas for native tools (those that don't depend on runtime index names).
@@ -116,6 +117,22 @@ var (
 		},
 		"required": []string{"url"},
 	}
+
+	aggregateSchema = map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"table": map[string]any{
+				"type":        "string",
+				"description": "Optional table name. Defaults to the retrieval agent's primary table.",
+			},
+			"aggregations": map[string]any{
+				"type":                 "object",
+				"description":          "Aggregation requests keyed by caller-defined names. Values follow Antfly QueryRequest.aggregations, for example {\"by_author\":{\"type\":\"terms\",\"field\":\"author\",\"size\":10}}.",
+				"additionalProperties": true,
+			},
+		},
+		"required": []string{"aggregations"},
+	}
 )
 
 // Tool description constants shared between native and fallback paths.
@@ -124,20 +141,21 @@ const (
 	clarificationDescription = "Ask the user a clarifying question before searching. Use this when the query is ambiguous, missing important details, or could be interpreted multiple ways."
 	websearchDescription     = "Search the web for external information. Use this when the internal documents don't have the answer, or when the user explicitly asks for current/external information. Returns search results with titles, snippets, and URLs."
 	fetchDescription         = "Fetch and extract content from a URL. Supports web pages (extracts readable text), PDFs (extracts text), and plain text files. Use this to get detailed content from a specific URL, such as from web search results."
+	aggregateDescription     = "Execute aggregations over documents in a table. Use this for counts, grouped buckets, statistics, histograms, and other summary metrics. Use add_filter separately when the aggregation should be constrained to a subset of documents."
 )
 
 // defaultChatTools are the tools enabled when EnabledTools is nil/empty.
 var defaultChatTools = []ChatToolName{ToolNameFilter, ToolNameClarification}
 
-// indexTools are auto-enabled when EnabledTools is nil/empty.
-var indexTools = []ChatToolName{ToolNameSemanticSearch, ToolNameFullTextSearch, ToolNameTreeSearch, ToolNameGraphSearch}
+// retrievalTools are auto-enabled when EnabledTools is nil/empty.
+var retrievalTools = []ChatToolName{ToolNameSemanticSearch, ToolNameFullTextSearch, ToolNameTreeSearch, ToolNameGraphSearch, ToolNameAggregate}
 
 // IsToolEnabled checks if a specific tool is enabled in the config.
-// When EnabledTools is nil/empty, the default chat tools plus all index tools are enabled.
+// When EnabledTools is nil/empty, the default chat tools plus all retrieval tools are enabled.
 // When EnabledTools is explicitly set, only the listed tools are enabled.
 func (c ChatToolsConfig) IsToolEnabled(tool ChatToolName) bool {
 	if c.EnabledTools == nil || len(*c.EnabledTools) == 0 {
-		return slices.Contains(defaultChatTools, tool) || slices.Contains(indexTools, tool)
+		return slices.Contains(defaultChatTools, tool) || slices.Contains(retrievalTools, tool)
 	}
 	return slices.Contains(*c.EnabledTools, tool)
 }
@@ -735,6 +753,9 @@ func ParseStructuredOutput(text string) ([]ParsedToolAction, string, error) {
 	// Parse <graph_search> tags
 	actions, remainingText = parseTaggedActions(text, remainingText, "graph_search", ToolNameGraphSearch, actions, parseGraphSearchContent)
 
+	// Parse <aggregate> tags
+	actions, remainingText = parseTaggedActions(text, remainingText, "aggregate", ToolNameAggregate, actions, parseAggregateContent)
+
 	return actions, strings.TrimSpace(remainingText), nil
 }
 
@@ -978,6 +999,39 @@ func parseGraphSearchContent(content string) (ParsedToolAction, error) {
 	}, nil
 }
 
+func parseAggregateContent(content string) (ParsedToolAction, error) {
+	trimmed := strings.TrimSpace(content)
+	args := make(map[string]any)
+	if strings.HasPrefix(trimmed, "{") {
+		if err := json.Unmarshal([]byte(trimmed), &args); err != nil {
+			return ParsedToolAction{}, err
+		}
+	} else {
+		lines := strings.Split(trimmed, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if after, ok := strings.CutPrefix(line, "table:"); ok {
+				args["table"] = strings.TrimSpace(after)
+			} else if after, ok := strings.CutPrefix(line, "aggregations:"); ok {
+				var aggregations map[string]any
+				if err := json.Unmarshal([]byte(strings.TrimSpace(after)), &aggregations); err != nil {
+					return ParsedToolAction{}, err
+				}
+				args["aggregations"] = aggregations
+			}
+		}
+	}
+
+	if args["aggregations"] == nil {
+		return ParsedToolAction{}, fmt.Errorf("missing required aggregations field")
+	}
+
+	return ParsedToolAction{
+		ToolName:  ToolNameAggregate,
+		Arguments: args,
+	}, nil
+}
+
 // ChatContext holds the state for a chat conversation
 type ChatContext struct {
 	Messages       []ChatMessage
@@ -1137,6 +1191,8 @@ type RetrievalToolExecutor interface {
 	ExecuteTreeSearch(ctx context.Context, table string, index string, startNodes string, query string, maxDepth int, beamWidth int) ([]map[string]any, error)
 	// ExecuteGraphSearch runs a graph traversal search on the specified table
 	ExecuteGraphSearch(ctx context.Context, table string, index string, startNode string, edgeType string, direction string, depth int) ([]map[string]any, error)
+	// ExecuteAggregate runs aggregations against the specified table.
+	ExecuteAggregate(ctx context.Context, table string, aggregations map[string]any, filters []FilterSpec) (map[string]any, error)
 }
 
 // ChatToolRequest represents a parsed tool request from the model
@@ -1290,6 +1346,26 @@ func CreateNativeTools(g *genkit.Genkit, config ChatToolsConfig, executor ToolEx
 func CreateRetrievalTools(g *genkit.Genkit, config ChatToolsConfig, executor RetrievalToolExecutor, availableIndexes []IndexInfo) []ai.Tool {
 	// Start with the base chat tools (filter, clarification, web_search, fetch).
 	tools := CreateNativeTools(g, config, executor)
+
+	if config.IsToolEnabled(ToolNameAggregate) && executor != nil {
+		tools = append(tools, ai.NewTool[any, map[string]any](
+			string(ToolNameAggregate),
+			aggregateDescription,
+			func(ctx *ai.ToolContext, input any) (map[string]any, error) {
+				inputMap, ok := input.(map[string]any)
+				if !ok {
+					return nil, fmt.Errorf("invalid aggregate input type")
+				}
+				aggregations, ok := inputMap["aggregations"].(map[string]any)
+				if !ok || len(aggregations) == 0 {
+					return nil, fmt.Errorf("aggregations is required")
+				}
+				table, _ := inputMap["table"].(string)
+				return executor.ExecuteAggregate(ctx.Context, table, aggregations, nil)
+			},
+			ai.WithInputSchema(aggregateSchema),
+		))
+	}
 
 	// Build index-name-to-table lookup and group indexes by type (single pass)
 	indexTable := make(map[string]string, len(availableIndexes))
@@ -1472,6 +1548,10 @@ func CreateRetrievalTools(g *genkit.Genkit, config ChatToolsConfig, executor Ret
 // (used for structured output fallback with non-native tool providers)
 func RetrievalToolDefinitions(config ChatToolsConfig, availableIndexes []IndexInfo) []ai.ToolDefinition {
 	tools := ChatToolDefinitions(config)
+
+	if config.IsToolEnabled(ToolNameAggregate) {
+		tools = append(tools, ai.ToolDefinition{Name: string(ToolNameAggregate), Description: aggregateDescription, InputSchema: aggregateSchema})
+	}
 
 	aknnIndexes, fullTextIndexes, graphIndexes := groupIndexesByType(availableIndexes)
 

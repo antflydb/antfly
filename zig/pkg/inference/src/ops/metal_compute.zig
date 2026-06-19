@@ -140,6 +140,10 @@ fn traceMissingWeightDebug() bool {
     return getenvBool("TERMITE_METAL_TRACE_MISSING_WEIGHT");
 }
 
+fn traceKvCacheMiss() bool {
+    return getenvBool("TERMITE_METAL_TRACE_KV_CACHE_MISS");
+}
+
 fn prepareDecodeInputsDebug() bool {
     return getenvBool("TERMITE_METAL_PREPARE_DECODE_INPUTS_DEBUG");
 }
@@ -7722,7 +7726,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (try gatherPagedKvLayerFromStorageHost(allocator, storage, kv, token_count, layer_index)) |rows| {
                 return rows;
             }
-            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+            if (traceKvCacheMiss() and !storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
                 std.log.info(
                     "metal backend kv cache miss: no entry seq={d} layer={d} tokens={d} offset={d} source=0x{x}",
                     .{ kv.sequence_id, layer_index, token_count, kv.position_offset, key.source_ptr_id },
@@ -7731,7 +7735,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         };
         if (!backendEntryMatches(entry, token_count, kv.position_offset, entry.row_width, kvViewBlockSignature(kv))) {
-            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+            if (traceKvCacheMiss() and !storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
                 std.log.info(
                     "metal backend kv cache miss: shape/signature mismatch seq={d} layer={d} want_tokens={d} have_tokens={d} want_offset={d} have_offset={d} want_sig=0x{x} have_sig=0x{x} source=0x{x}",
                     .{ kv.sequence_id, layer_index, token_count, entry.token_count, kv.position_offset, entry.position_offset, kvViewBlockSignature(kv), entry.block_signature, key.source_ptr_id },

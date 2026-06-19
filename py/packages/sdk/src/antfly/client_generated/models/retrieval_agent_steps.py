@@ -41,7 +41,7 @@ class RetrievalAgentSteps:
             confidence (ConfidenceStepConfig | Unset): Configuration for confidence assessment. Evaluates answer quality and
                 resource relevance. Can use a model calibrated for scoring tasks.
             eval_ (EvalConfig | Unset): Configuration for inline evaluation of query results.
-                Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+                Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
     """
 
     classification: ClassificationStepConfig | Unset = UNSET

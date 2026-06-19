@@ -135,7 +135,7 @@ pub const ToolCallFunction = antfly_generating_openapi.ToolCallFunction;
 
 pub const ChatMessage = antfly_generating_openapi.ChatMessage;
 
-/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
+/// Available tool names for retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
 pub const ChatToolName = enum {
     add_filter,
     ask_clarification,
@@ -281,7 +281,7 @@ pub const ConfidenceStepConfig = struct {
     context: ?[]const u8 = null,
 };
 
-/// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
+/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
 pub const ChatToolsConfig = struct {
     /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
     enabled_tools: ?[]const ChatToolName = null,

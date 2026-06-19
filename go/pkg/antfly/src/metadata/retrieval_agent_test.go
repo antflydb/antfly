@@ -283,6 +283,33 @@ func TestEffectiveRetrievalToolsConfigKeepsEmptyIntersectionDisabled(t *testing.
 	assert.False(t, config.IsToolEnabled(ai.ToolNameFilter))
 }
 
+func TestEffectiveRetrievalToolsConfigRejectsOutOfRangeMaxToolIterations(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value int
+		path  string
+	}{
+		{name: "zero global", value: 0, path: "tools.max_tool_iterations"},
+		{name: "too large global", value: 21, path: "tools.max_tool_iterations"},
+		{name: "zero retrieval", value: 0, path: "steps.retrieval.tools.max_tool_iterations"},
+		{name: "too large retrieval", value: 21, path: "steps.retrieval.tools.max_tool_iterations"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &RetrievalAgentRequest{}
+			if tt.path == "tools.max_tool_iterations" {
+				req.Tools.MaxToolIterations = &tt.value
+			} else {
+				req.Steps.Retrieval.Tools.MaxToolIterations = &tt.value
+			}
+
+			_, err := effectiveRetrievalToolsConfig(req)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.path+" must be between 1 and 20")
+		})
+	}
+}
+
 func TestRetrievalQueryAllowedByTools(t *testing.T) {
 	fullTextOnly := []ai.ChatToolName{ai.ToolNameFullTextSearch}
 	config := ai.ChatToolsConfig{EnabledTools: &fullTextOnly}
@@ -323,6 +350,43 @@ func TestRetrievalQueryAllowedByToolsRequiresEveryQueryCapability(t *testing.T) 
 			"related": {},
 		},
 	}, config))
+}
+
+func TestRetrievalQueryAllowedByToolsTreatsAggregateAsFirstClassTool(t *testing.T) {
+	aggregateOnly := []ai.ChatToolName{ai.ToolNameAggregate}
+	filterOnly := []ai.ChatToolName{ai.ToolNameFilter}
+	filterAndAggregate := []ai.ChatToolName{ai.ToolNameFilter, ai.ToolNameAggregate}
+	aggregationQuery := RetrievalQueryRequest{
+		Table: "docs",
+		Aggregations: map[string]AggregationRequest{
+			"by_author": {
+				Type:  AggregationTypeTerms,
+				Field: "author",
+			},
+		},
+	}
+
+	assert.True(t, retrievalQueryAllowedByTools(aggregationQuery, ai.ChatToolsConfig{EnabledTools: &aggregateOnly}))
+	assert.False(t, retrievalQueryAllowedByTools(aggregationQuery, ai.ChatToolsConfig{EnabledTools: &filterOnly}))
+
+	aggregationWithFilter := aggregationQuery
+	aggregationWithFilter.FilterQuery = json.RawMessage(`{"query":"status:published"}`)
+	assert.False(t, retrievalQueryAllowedByTools(aggregationWithFilter, ai.ChatToolsConfig{EnabledTools: &aggregateOnly}))
+	assert.False(t, retrievalQueryAllowedByTools(aggregationWithFilter, ai.ChatToolsConfig{EnabledTools: &filterOnly}))
+	assert.True(t, retrievalQueryAllowedByTools(aggregationWithFilter, ai.ChatToolsConfig{EnabledTools: &filterAndAggregate}))
+}
+
+func TestRetrievalQueryShouldExecuteAggregateOnlyQuery(t *testing.T) {
+	assert.True(t, retrievalQueryShouldExecute(RetrievalQueryRequest{
+		Table: "docs",
+		Aggregations: map[string]AggregationRequest{
+			"by_author": {
+				Type:  AggregationTypeTerms,
+				Field: "author",
+			},
+		},
+	}))
+	assert.False(t, retrievalQueryShouldExecute(RetrievalQueryRequest{Table: "docs"}))
 }
 
 func TestExecutePipelineRejectsDisabledRetrievalTool(t *testing.T) {

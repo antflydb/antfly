@@ -14025,7 +14025,8 @@ components:
       description: Configuration for graph index type
       properties:
         summarizer:
-          description: Configuration for generating node summaries (enables tree navigation in AnswerAgent)
+          description: Configuration for generating node summaries (enables tree navigation in Retrieval
+            Agent)
           $ref: '#/components/schemas/GeneratorConfig'
         template:
           x-go-type-skip-optional-pointer: true
@@ -15090,7 +15091,7 @@ components:
     ChatToolName:
       type: string
       description: >
-        Available tool names for the chat and retrieval agents.
+        Available tool names for retrieval agents.
 
         - add_filter: Add search filters (field constraints)
 
@@ -15654,7 +15655,7 @@ components:
     ChatToolsConfig:
       type: object
       description: >
-        Configuration for chat agent tools.
+        Configuration for retrieval agent tools.
 
 
         If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
@@ -16011,7 +16012,7 @@ components:
       description: >
         Configuration for inline evaluation of query results.
 
-        Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+        Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
       properties:
         evaluators:
           type: array

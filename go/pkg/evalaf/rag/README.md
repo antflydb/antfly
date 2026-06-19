@@ -256,12 +256,12 @@ func evaluateAntflyRAG() {
 }
 ```
 
-### Evaluating Antfly's Answer Agent
+### Evaluating Antfly's Retrieval Agent
 
 ```go
 target := func(ctx context.Context, example eval.Example) (any, error) {
     resp, err := http.Post(
-        "http://localhost:3210/api/v1/agents/answer",
+        "http://localhost:3210/db/v1/agents/retrieval",
         "application/json",
         bytes.NewBuffer(agentRequest),
     )

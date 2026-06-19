@@ -19,7 +19,7 @@ T = TypeVar("T", bound="ChatToolsConfig")
 
 @_attrs_define
 class ChatToolsConfig:
-    """Configuration for chat agent tools.
+    """Configuration for retrieval agent tools.
 
     If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
     available for the request. Explicit retrieval policies should use semantic_search

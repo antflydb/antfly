@@ -131,11 +131,12 @@ pub const ClientGenerator = struct {
 
         try self.w.line("pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) @This() {{", .{});
         self.w.indent();
+        try self.w.line("defer resp.deinit();", .{});
         try self.w.line("if (resp.ok()) {{", .{});
         self.w.indent();
         try self.w.line("if (resp.body) |body| {{", .{});
         self.w.indent();
-        try self.w.line("const parsed = std.json.parseFromSlice(T, allocator, body, .{{}}) catch {{", .{});
+        try self.w.line("const parsed = std.json.parseFromSlice(T, allocator, body, .{{ .allocate = .alloc_always }}) catch {{", .{});
         self.w.indent();
         try self.w.line("return .{{ .status_code = resp.status.code, .allocator = allocator }};", .{});
         self.w.dedent();
@@ -167,6 +168,7 @@ pub const ClientGenerator = struct {
         try self.w.line("pub fn deinit(self: *@This()) void {{", .{});
         self.w.indent();
         try self.w.line("if (self.body) |b| self.allocator.free(b);", .{});
+        try self.w.line("if (self.content_type) |ct| self.allocator.free(ct);", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
         self.w.dedent();
@@ -265,7 +267,8 @@ pub const ClientGenerator = struct {
 
         // Return response
         if (is_raw) {
-            try self.w.line("return .{{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator }};", .{});
+            try self.w.line("defer resp.deinit();", .{});
+            try self.w.line("return .{{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator }};", .{});
         } else {
             try self.w.line("return ApiResponse({s}).fromResponse(self.allocator, &resp);", .{response_type.?});
         }

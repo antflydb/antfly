@@ -214,6 +214,8 @@ Rules:
 4. `max_tool_iterations` is bounded by the same production limits as `max_internal_iterations`.
 5. Web access requires explicit `web_search_connection` or `web_search_config` and should be constrained by production
    security controls.
+6. Aggregations are a separate capability from filters: aggregation requests require `aggregate`, filter fields require
+   `add_filter`, and filtered aggregations require both tools.
 6. Use `web_search`, not `websearch` or `search`.
 
 The Zig retrieval implementation currently enforces the narrowing policy through `ToolPolicy` in

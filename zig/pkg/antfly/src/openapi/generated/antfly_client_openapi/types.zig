@@ -2649,7 +2649,7 @@ pub const AlgebraicIndexStats = struct {
     active_progress_target_rows: ?i64 = null,
 };
 
-/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
+/// Available tool names for retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
 pub const ChatToolName = enum {
     add_filter,
     ask_clarification,
@@ -5320,7 +5320,7 @@ pub const QueryBuilderRequest = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
-    /// Configuration for generating node summaries (enables tree navigation in AnswerAgent)
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
     template: ?[]const u8 = null,
@@ -5339,7 +5339,7 @@ pub const ChainLink = struct {
     condition: ?ChainCondition = null,
 };
 
-/// Configuration for inline evaluation of query results. Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+/// Configuration for inline evaluation of query results. Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
 pub const EvalConfig = struct {
     /// List of evaluators to run
     evaluators: ?[]const EvaluatorName = null,
@@ -5681,7 +5681,7 @@ pub const VertexSearchConfig = struct {
     service: ?[]const u8 = null,
 };
 
-/// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
+/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
 pub const ChatToolsConfig = struct {
     /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
     enabled_tools: ?[]const ChatToolName = null,

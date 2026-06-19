@@ -87,7 +87,7 @@ const ToolPolicy = struct {
 
     fn explicitToolCount(self: ToolPolicy) ?usize {
         var count: usize = 0;
-        inline for (.{ .add_filter, .ask_clarification, .semantic_search, .full_text_search, .tree_search, .graph_search }) |tool| {
+        inline for (.{ .add_filter, .ask_clarification, .semantic_search, .full_text_search, .tree_search, .graph_search, .aggregate }) |tool| {
             if (self.isEnabled(tool)) count += 1;
         }
         if (self.globalEnabledTools() == null and self.retrievalEnabledTools() == null) return null;
@@ -2157,6 +2157,7 @@ fn requiredRetrievalTools(retrieval_query: RetrievalQueryRequest) RequiredRetrie
     if (retrieval_query.semantic_search != null or retrieval_query.embeddings != null) required.add(.semantic_search);
     if (retrieval_query.full_text_search != null) required.add(.full_text_search);
     if (hasMetadataRetrievalFields(retrieval_query)) required.add(.add_filter);
+    if (retrieval_query.aggregations != null) required.add(.aggregate);
     if (retrieval_query.tree_search != null) required.add(.tree_search);
     if (retrieval_query.graph_searches != null) required.add(.graph_search);
     if (required.len == 0) required.add(.add_filter);
@@ -2164,7 +2165,7 @@ fn requiredRetrievalTools(retrieval_query: RetrievalQueryRequest) RequiredRetrie
 }
 
 const RequiredRetrievalTools = struct {
-    buf: [5]generating_api_openapi.ChatToolName = undefined,
+    buf: [6]generating_api_openapi.ChatToolName = undefined,
     len: usize = 0,
 
     fn add(self: *@This(), tool: generating_api_openapi.ChatToolName) void {
@@ -2185,7 +2186,6 @@ fn hasMetadataRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
         retrieval_query.filter_prefix != null or
         retrieval_query.filter_query != null or
         retrieval_query.exclusion_query != null or
-        retrieval_query.aggregations != null or
         retrieval_query.order_by != null or
         (retrieval_query.count orelse false);
 }
@@ -7206,6 +7206,91 @@ test "retrieval agent agentic mode ignores disabled retrieval tools" {
     try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
     try std.testing.expectEqual(RetrievalStrategy.bm25, parsed.value.strategy_used.?);
     try std.testing.expectEqual(@as(i64, 1), parsed.value.tool_calls_made.?);
+    try std.testing.expectEqual(@as(usize, 1), runner.call_count);
+}
+
+test "retrieval agent treats aggregations as first-class tool capability" {
+    const FakeRunner = struct {
+        call_count: usize = 0,
+
+        fn ifaceWithState(self: *@This()) QueryRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            var parsed_query = try parseQueryRequestBody(alloc, query_json);
+            defer parsed_query.deinit();
+            try std.testing.expect(parsed_query.value.aggregations != null);
+            try std.testing.expect(parsed_query.value.filter_query == null);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                ),
+            };
+        }
+    };
+
+    var runner = FakeRunner{};
+    const allowed_body =
+        \\{"query":"count docs by author","stream":false,"tools":{"enabled_tools":["aggregate"]},"queries":[{"table":"docs","aggregations":{"by_author":{"type":"terms","field":"author","size":10}}}]}
+    ;
+    const encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, allowed_body);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqual(@as(usize, 1), runner.call_count);
+
+    const rejected_body =
+        \\{"query":"count docs by author","stream":false,"tools":{"enabled_tools":["add_filter"]},"queries":[{"table":"docs","aggregations":{"by_author":{"type":"terms","field":"author","size":10}}}]}
+    ;
+    try std.testing.expectError(error.UnsupportedRetrievalAgentRequest, executeJson(std.testing.allocator, runner.ifaceWithState(), null, rejected_body));
+}
+
+test "retrieval agent requires filter and aggregate tools for filtered aggregations" {
+    const FakeRunner = struct {
+        call_count: usize = 0,
+
+        fn ifaceWithState(self: *@This()) QueryRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            var parsed_query = try parseQueryRequestBody(alloc, query_json);
+            defer parsed_query.deinit();
+            try std.testing.expect(parsed_query.value.aggregations != null);
+            try std.testing.expect(parsed_query.value.filter_query != null);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                ),
+            };
+        }
+    };
+
+    var runner = FakeRunner{};
+    const aggregate_only_body =
+        \\{"query":"count active docs by author","stream":false,"tools":{"enabled_tools":["aggregate"]},"queries":[{"table":"docs","filter_query":{"query":"status:active"},"aggregations":{"by_author":{"type":"terms","field":"author","size":10}}}]}
+    ;
+    try std.testing.expectError(error.UnsupportedRetrievalAgentRequest, executeJson(std.testing.allocator, runner.ifaceWithState(), null, aggregate_only_body));
+
+    const filter_only_body =
+        \\{"query":"count active docs by author","stream":false,"tools":{"enabled_tools":["add_filter"]},"queries":[{"table":"docs","filter_query":{"query":"status:active"},"aggregations":{"by_author":{"type":"terms","field":"author","size":10}}}]}
+    ;
+    try std.testing.expectError(error.UnsupportedRetrievalAgentRequest, executeJson(std.testing.allocator, runner.ifaceWithState(), null, filter_only_body));
+
+    const allowed_body =
+        \\{"query":"count active docs by author","stream":false,"tools":{"enabled_tools":["add_filter","aggregate"]},"queries":[{"table":"docs","filter_query":{"query":"status:active"},"aggregations":{"by_author":{"type":"terms","field":"author","size":10}}}]}
+    ;
+    const encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, allowed_body);
+    defer std.testing.allocator.free(encoded);
     try std.testing.expectEqual(@as(usize, 1), runner.call_count);
 }
 

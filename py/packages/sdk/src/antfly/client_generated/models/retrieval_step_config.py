@@ -21,7 +21,7 @@ class RetrievalStepConfig:
     the top-level request tools policy when both are present.
 
         Attributes:
-            tools (ChatToolsConfig | Unset): Configuration for chat agent tools.
+            tools (ChatToolsConfig | Unset): Configuration for retrieval agent tools.
 
                 If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
                 available for the request. Explicit retrieval policies should use semantic_search

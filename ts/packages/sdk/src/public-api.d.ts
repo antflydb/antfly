@@ -7360,7 +7360,7 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
-            /** @description Configuration for generating node summaries (enables tree navigation in AnswerAgent) */
+            /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**
              * @description Handlebars template for generating summarizer input text.
@@ -7961,7 +7961,7 @@ export interface components {
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
         /**
-         * @description Available tool names for the chat and retrieval agents.
+         * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
          *     - web_search: Search the web (requires web_search_connection or web_search_config)
@@ -8386,7 +8386,7 @@ export interface components {
             timeout_seconds?: number;
         };
         /**
-         * @description Configuration for chat agent tools.
+         * @description Configuration for retrieval agent tools.
          *
          *     If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
          *     available for the request. Explicit retrieval policies should use semantic_search
@@ -8638,7 +8638,7 @@ export interface components {
         };
         /**
          * @description Configuration for inline evaluation of query results.
-         *     Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+         *     Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
          */
         EvalConfig: {
             /** @description List of evaluators to run */
