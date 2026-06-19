@@ -38536,10 +38536,11 @@ test "storage.ha db applies batch mutation records through replication session c
         for (replay_entries) |*entry| entry.deinit(alloc);
         alloc.free(replay_entries);
     }
-    try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
-    try std.testing.expectEqual(@as(u64, 2), replay_entries[0].sequence);
+    try std.testing.expectEqual(@as(usize, 2), replay_entries.len);
+    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
+    try std.testing.expectEqual(@as(u64, 2), replay_entries[1].sequence);
 
-    var replicated_effect_record = try change_journal_mod.decodeRecord(alloc, replay_entries[0].payload);
+    var replicated_effect_record = try change_journal_mod.decodeRecord(alloc, replay_entries[1].payload);
     defer replicated_effect_record.deinit();
     try std.testing.expectEqual(@as(u64, 2), replicated_effect_record.record.sequence);
     try std.testing.expectEqualStrings("doc:a", replicated_effect_record.record.changed_doc_keys[0]);
@@ -38559,7 +38560,7 @@ test "storage.ha db applies batch mutation records through replication session c
         for (replay_after_duplicates) |*entry| entry.deinit(alloc);
         alloc.free(replay_after_duplicates);
     }
-    try std.testing.expectEqual(@as(usize, 1), replay_after_duplicates.len);
+    try std.testing.expectEqual(@as(usize, 2), replay_after_duplicates.len);
 }
 
 test "storage.ha db persists applied replication marker across reopen" {
@@ -38605,10 +38606,13 @@ test "storage.ha db persists applied replication marker across reopen" {
     try reopened.applyHAReplicationRecord(entry.record);
     try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
 
-    try std.testing.expectError(
-        error.ReplayIndexUnavailable,
-        replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1),
-    );
+    const replay_entries = try replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1);
+    defer {
+        for (replay_entries) |*replay_entry| replay_entry.deinit(alloc);
+        alloc.free(replay_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
+    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
 }
 
 test "storage.ha db applies timeline switch as durable replication boundary" {
