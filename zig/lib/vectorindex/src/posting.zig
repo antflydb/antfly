@@ -753,7 +753,7 @@ pub const PostingFormat = struct {
         base_data: []const u8,
     ) !usize {
         var base_iter = try BaseMemberIterator.init(base_data);
-        stableSortCompactDeltaRecordsByVector(scratch);
+        sortCompactDeltaRecordsByVectorIfNeeded(scratch);
         try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + dedupedLiveSortedCompactDeltaRecordCount(scratch));
         const out = scratch.member_ids;
         var out_count: usize = 0;
@@ -877,6 +877,16 @@ pub const PostingFormat = struct {
             }
             scratch.compact_delta_ids[j] = id;
             scratch.compact_delta_ops[j] = op;
+        }
+    }
+
+    fn sortCompactDeltaRecordsByVectorIfNeeded(scratch: anytype) void {
+        var i: usize = 1;
+        while (i < scratch.compact_delta_count) : (i += 1) {
+            if (scratch.compact_delta_ids[i] < scratch.compact_delta_ids[i - 1]) {
+                stableSortCompactDeltaRecordsByVector(scratch);
+                return;
+            }
         }
     }
 
@@ -3652,13 +3662,23 @@ pub const PostingStore = struct {
         }
     }
 
+    fn sortCompactDeltaRecordsByVectorIfNeeded(scratch: *FoldScratch) void {
+        var i: usize = 1;
+        while (i < scratch.compact_delta_count) : (i += 1) {
+            if (scratch.compact_delta_ids[i] < scratch.compact_delta_ids[i - 1]) {
+                stableSortCompactDeltaRecordsByVector(scratch);
+                return;
+            }
+        }
+    }
+
     fn materializeSortedBaseWithCompactDeltaRecords(
         alloc: std.mem.Allocator,
         scratch: *FoldScratch,
         base_data: []const u8,
     ) !usize {
         var base_iter = try PostingFormat.BaseMemberIterator.init(base_data);
-        stableSortCompactDeltaRecordsByVector(scratch);
+        sortCompactDeltaRecordsByVectorIfNeeded(scratch);
         try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + PostingFormat.dedupedLiveSortedCompactDeltaRecordCount(scratch));
         const out = scratch.member_ids;
         var out_count: usize = 0;
@@ -4442,7 +4462,7 @@ pub const PostingStore = struct {
                 try PostingFormat.encodeBaseWithOverlayPlanWithBlockSize(&scratch, base_data, posting_id, next_generation, base_member_block_size.block_size);
         } else blk: {
             if (sort_base_members) {
-                stableSortCompactDeltaRecordsByVector(&scratch);
+                sortCompactDeltaRecordsByVectorIfNeeded(&scratch);
                 const base_member_block_size = try postingBaseMemberBlockSizeForCompactDeltaRecords(index, base_data, &scratch);
                 try scratch.ensureEncodedBaseCapacity(index.alloc, base_member_block_size.encoded_len);
                 break :blk try PostingFormat.encodeSortedBaseWithCompactDeltaRecords(&scratch, base_data, posting_id, next_generation, base_member_block_size.block_size);
@@ -8104,6 +8124,45 @@ test "posting compact base materialization sizes output scratch by deduped live 
     try std.testing.expectEqual(@as(usize, expected.len), out_count);
     try std.testing.expect(scratch.member_ids.len >= base_members.len);
     try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting compact delta record sort skips already ordered records" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureCompactDeltaCapacity(alloc, 3);
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 1, .op = .insert, .vector_id = 10 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 2, .op = .tombstone, .vector_id = 10 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 3, .op = .insert, .vector_id = 20 });
+
+    PostingFormat.sortCompactDeltaRecordsByVectorIfNeeded(&scratch);
+
+    try std.testing.expectEqual(@as(VectorId, 10), scratch.compact_delta_ids[0]);
+    try std.testing.expectEqual(PostingDeltaOp.insert, scratch.compact_delta_ops[0]);
+    try std.testing.expectEqual(@as(VectorId, 10), scratch.compact_delta_ids[1]);
+    try std.testing.expectEqual(PostingDeltaOp.tombstone, scratch.compact_delta_ops[1]);
+    try std.testing.expectEqual(@as(VectorId, 20), scratch.compact_delta_ids[2]);
+}
+
+test "posting compact delta record sort preserves duplicate record order" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureCompactDeltaCapacity(alloc, 3);
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 3, .op = .insert, .vector_id = 20 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 1, .op = .insert, .vector_id = 10 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 2, .op = .tombstone, .vector_id = 10 });
+
+    PostingFormat.sortCompactDeltaRecordsByVectorIfNeeded(&scratch);
+
+    try std.testing.expectEqual(@as(VectorId, 10), scratch.compact_delta_ids[0]);
+    try std.testing.expectEqual(PostingDeltaOp.insert, scratch.compact_delta_ops[0]);
+    try std.testing.expectEqual(@as(VectorId, 10), scratch.compact_delta_ids[1]);
+    try std.testing.expectEqual(PostingDeltaOp.tombstone, scratch.compact_delta_ops[1]);
+    try std.testing.expectEqual(@as(VectorId, 20), scratch.compact_delta_ids[2]);
+    try std.testing.expectEqual(PostingDeltaOp.insert, scratch.compact_delta_ops[2]);
 }
 
 test "posting sorted overlay block-size candidates use one-pass sizing" {

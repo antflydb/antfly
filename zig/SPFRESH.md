@@ -1136,7 +1136,9 @@ implementations cleanly:
     base instead of first copying them into compact id/op scratch. Direct
     delta-record merge replay also skips its stable vector-ordering pass when
     grouped records are already in vector-id order, and compact id/op fallback
-    replay now does the same before using its stable sort. Segment
+    replay now does the same before using its stable sort. Compact delta-record
+    scratch used by sorted materialization and fold sizing/encoding also skips
+    its stable vector-ordering pass when already ordered. Segment
     materialization calls a sequence-sorted replay helper after its own segment
     ordering pass so it does not rescan sequence order. Buffered segment replay
     now uses the same direct delta-record merge for small sorted tails instead
