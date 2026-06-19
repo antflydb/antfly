@@ -93,7 +93,25 @@ const FlatCentroidBlocksVectorSource = struct {
         return self.total_count;
     }
 
+    fn vectorInBlock(self: FlatCentroidBlocksVectorSource, block: *const FlatCentroidBlock, index: usize) []const f32 {
+        const entry_index = index - block.posting_offset;
+        return block.centroids[entry_index * self.dims ..][0..self.dims];
+    }
+
     pub fn vectorAt(self: FlatCentroidBlocksVectorSource, index: usize) []const f32 {
+        if (self.blocks.len != 0) {
+            const first_block_size = self.blocks[0].posting_ids.len;
+            if (first_block_size != 0) {
+                const block_index = index / first_block_size;
+                if (block_index < self.blocks.len) {
+                    const block = &self.blocks[block_index];
+                    const block_start = block.posting_offset;
+                    const block_end = block_start + block.posting_ids.len;
+                    if (index >= block_start and index < block_end) return self.vectorInBlock(block, index);
+                }
+            }
+        }
+
         var lo: usize = 0;
         var hi: usize = self.blocks.len;
         while (lo < hi) {
@@ -106,8 +124,7 @@ const FlatCentroidBlocksVectorSource = struct {
             } else if (index >= block_end) {
                 lo = mid + 1;
             } else {
-                const entry_index = index - block_start;
-                return block.centroids[entry_index * self.dims ..][0..self.dims];
+                return self.vectorInBlock(block, index);
             }
         }
         unreachable;
@@ -2420,6 +2437,96 @@ test "global posting quantized payload is only built for deterministic full bloc
 
     index.config.use_quantization = false;
     try std.testing.expect(!shouldBuildGlobalPostingQuantized(&index, 47, 5953));
+}
+
+test "flat centroid block vector source maps regular and irregular offsets" {
+    const ids_a = [_]u64{ 1, 2 };
+    const ids_b = [_]u64{3};
+    const centroids_a = [_]f32{
+        1, 2,
+        3, 4,
+    };
+    const centroids_b = [_]f32{
+        5, 6,
+    };
+    const regular_blocks = [_]FlatCentroidBlock{
+        .{
+            .posting_ids = ids_a[0..],
+            .parents = &.{},
+            .levels = &.{},
+            .states = &.{},
+            .posting_offset = 0,
+            .centroid = &.{},
+            .radii = &.{},
+            .centroids = centroids_a[0..],
+            .centroid_measures = &.{},
+            .quantized = .{},
+        },
+        .{
+            .posting_ids = ids_b[0..],
+            .parents = &.{},
+            .levels = &.{},
+            .states = &.{},
+            .posting_offset = 2,
+            .centroid = &.{},
+            .radii = &.{},
+            .centroids = centroids_b[0..],
+            .centroid_measures = &.{},
+            .quantized = .{},
+        },
+    };
+    const regular = FlatCentroidBlocksVectorSource{
+        .blocks = regular_blocks[0..],
+        .dims = 2,
+        .total_count = 3,
+    };
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2 }, regular.vectorAt(0));
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 3, 4 }, regular.vectorAt(1));
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 5, 6 }, regular.vectorAt(2));
+
+    const ids_c = [_]u64{4};
+    const ids_d = [_]u64{ 5, 6 };
+    const centroids_c = [_]f32{
+        7, 8,
+    };
+    const centroids_d = [_]f32{
+        9,  10,
+        11, 12,
+    };
+    const irregular_blocks = [_]FlatCentroidBlock{
+        .{
+            .posting_ids = ids_c[0..],
+            .parents = &.{},
+            .levels = &.{},
+            .states = &.{},
+            .posting_offset = 0,
+            .centroid = &.{},
+            .radii = &.{},
+            .centroids = centroids_c[0..],
+            .centroid_measures = &.{},
+            .quantized = .{},
+        },
+        .{
+            .posting_ids = ids_d[0..],
+            .parents = &.{},
+            .levels = &.{},
+            .states = &.{},
+            .posting_offset = 1,
+            .centroid = &.{},
+            .radii = &.{},
+            .centroids = centroids_d[0..],
+            .centroid_measures = &.{},
+            .quantized = .{},
+        },
+    };
+    const irregular = FlatCentroidBlocksVectorSource{
+        .blocks = irregular_blocks[0..],
+        .dims = 2,
+        .total_count = 3,
+    };
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 7, 8 }, irregular.vectorAt(0));
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 9, 10 }, irregular.vectorAt(1));
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 11, 12 }, irregular.vectorAt(2));
 }
 
 test "flat centroid block ordering uses widest centroid dimension" {
