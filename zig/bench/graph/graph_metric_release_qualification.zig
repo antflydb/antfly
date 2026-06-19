@@ -560,11 +560,17 @@ const ReleaseSummary = struct {
     max_observed_published_read_latency_ns: u64 = 0,
     max_observed_fresh_fail_latency_ns: u64 = 0,
     max_observed_fan_in_latency_ns: u64 = 0,
+    min_observed_storage_score_records: usize = 0,
     max_observed_storage_score_records: usize = 0,
+    min_observed_storage_metric_records: usize = 0,
     max_observed_storage_metric_records: usize = 0,
+    min_observed_storage_control_records: usize = 0,
     max_observed_storage_control_records: usize = 0,
+    min_observed_storage_attempt_records: usize = 0,
     max_observed_storage_attempt_records: usize = 0,
+    min_observed_storage_failure_records: usize = 0,
     max_observed_storage_failure_records: usize = 0,
+    min_observed_storage_event_records: usize = 0,
     max_observed_storage_event_records: usize = 0,
     max_observed_page_claims: usize = 0,
     max_observed_cleanup_ticks: usize = 0,
@@ -861,23 +867,47 @@ const ReleaseSummary = struct {
         self.max_observed_published_read_latency_ns = @max(self.max_observed_published_read_latency_ns, published_read_latency_ns);
         self.max_observed_fresh_fail_latency_ns = @max(self.max_observed_fresh_fail_latency_ns, fresh_fail_latency_ns);
         self.max_observed_fan_in_latency_ns = @max(self.max_observed_fan_in_latency_ns, fan_in_latency_ns);
+        self.min_observed_storage_score_records = if (first)
+            @min(result.fresh_storage_score_records, result.failed_storage_score_records)
+        else
+            @min(self.min_observed_storage_score_records, @min(result.fresh_storage_score_records, result.failed_storage_score_records));
         self.max_observed_storage_score_records = @max(
             self.max_observed_storage_score_records,
             @max(result.fresh_storage_score_records, result.failed_storage_score_records),
         );
+        self.min_observed_storage_metric_records = if (first)
+            @min(result.fresh_storage_metric_records, result.failed_storage_metric_records)
+        else
+            @min(self.min_observed_storage_metric_records, @min(result.fresh_storage_metric_records, result.failed_storage_metric_records));
         self.max_observed_storage_metric_records = @max(
             self.max_observed_storage_metric_records,
             @max(result.fresh_storage_metric_records, result.failed_storage_metric_records),
         );
+        self.min_observed_storage_control_records = if (first)
+            @min(result.fresh_storage_control_records, result.failed_storage_control_records)
+        else
+            @min(self.min_observed_storage_control_records, @min(result.fresh_storage_control_records, result.failed_storage_control_records));
         self.max_observed_storage_control_records = @max(
             self.max_observed_storage_control_records,
             @max(result.fresh_storage_control_records, result.failed_storage_control_records),
         );
+        self.min_observed_storage_attempt_records = if (first)
+            @min(result.fresh_storage_attempt_records, result.failed_storage_attempt_records)
+        else
+            @min(self.min_observed_storage_attempt_records, @min(result.fresh_storage_attempt_records, result.failed_storage_attempt_records));
         self.max_observed_storage_attempt_records = @max(
             self.max_observed_storage_attempt_records,
             @max(result.fresh_storage_attempt_records, result.failed_storage_attempt_records),
         );
+        self.min_observed_storage_failure_records = if (first)
+            result.failed_storage_failure_records
+        else
+            @min(self.min_observed_storage_failure_records, result.failed_storage_failure_records);
         self.max_observed_storage_failure_records = @max(self.max_observed_storage_failure_records, result.failed_storage_failure_records);
+        self.min_observed_storage_event_records = if (first)
+            result.failed_storage_event_records
+        else
+            @min(self.min_observed_storage_event_records, result.failed_storage_event_records);
         self.max_observed_storage_event_records = @max(self.max_observed_storage_event_records, result.failed_storage_event_records);
         self.max_observed_page_claims = @max(self.max_observed_page_claims, result.scheduler.pages_claimed);
         self.max_observed_cleanup_ticks = @max(self.max_observed_cleanup_ticks, result.cleanup_ticks);
@@ -2238,6 +2268,22 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
     }
     if (cfg.max_storage_event_records != 0 and summary.max_observed_storage_event_records > cfg.max_storage_event_records) {
         return error.GraphMetricReleaseQualificationStorageEventBudgetExceeded;
+    }
+    if (summary.families_run != 0 and
+        (summary.min_observed_storage_score_records == 0 or
+            summary.min_observed_storage_metric_records == 0 or
+            summary.min_observed_storage_control_records == 0 or
+            summary.min_observed_storage_attempt_records != 0 or
+            summary.max_observed_storage_attempt_records != 0 or
+            summary.min_observed_storage_failure_records == 0 or
+            summary.min_observed_storage_event_records == 0 or
+            summary.max_observed_storage_score_records < summary.min_observed_storage_score_records or
+            summary.max_observed_storage_metric_records < summary.min_observed_storage_metric_records or
+            summary.max_observed_storage_control_records < summary.min_observed_storage_control_records or
+            summary.max_observed_storage_failure_records < summary.min_observed_storage_failure_records or
+            summary.max_observed_storage_event_records < summary.min_observed_storage_event_records))
+    {
+        return error.GraphMetricReleaseQualificationStorageFootprintMismatch;
     }
     if (cfg.max_page_claims != 0 and summary.max_observed_page_claims > cfg.max_page_claims) {
         return error.GraphMetricReleaseQualificationPageClaimsBudgetExceeded;
@@ -7595,7 +7641,19 @@ fn observedRetainedStorageBudget(cfg: Config, summary: ReleaseSummary) bool {
         metric_slots * retained_metadata_records_per_metric;
     const expected_failed_metric_records = expected_fresh_metric_records + expected_failed_failure_records;
 
-    return summary.max_observed_storage_score_records <= cfg.max_storage_score_records and
+    return summary.min_observed_storage_score_records != 0 and
+        summary.min_observed_storage_metric_records != 0 and
+        summary.min_observed_storage_control_records != 0 and
+        summary.min_observed_storage_attempt_records == 0 and
+        summary.max_observed_storage_attempt_records == 0 and
+        summary.min_observed_storage_failure_records != 0 and
+        summary.min_observed_storage_event_records != 0 and
+        summary.max_observed_storage_score_records >= summary.min_observed_storage_score_records and
+        summary.max_observed_storage_metric_records >= summary.min_observed_storage_metric_records and
+        summary.max_observed_storage_control_records >= summary.min_observed_storage_control_records and
+        summary.max_observed_storage_failure_records >= summary.min_observed_storage_failure_records and
+        summary.max_observed_storage_event_records >= summary.min_observed_storage_event_records and
+        summary.max_observed_storage_score_records <= cfg.max_storage_score_records and
         summary.max_observed_storage_metric_records <= cfg.max_storage_metric_records and
         summary.max_observed_storage_control_records <= cfg.max_storage_control_records and
         summary.max_observed_storage_attempt_records <= cfg.max_storage_attempt_records and
@@ -7893,8 +7951,8 @@ fn emitReleaseSummary(out: anytype, cfg: Config, summary: ReleaseSummary) !void 
         .{ cfg.max_local_latency_ns, summary.total_local_latency_ns, summary.max_observed_local_latency_ns, cfg.max_planned_latency_ns, summary.total_planned_latency_ns, summary.max_observed_planned_latency_ns, cfg.max_cleanup_latency_ns, summary.max_observed_cleanup_latency_ns, cfg.max_published_read_latency_ns, summary.total_observed_published_read_latency_ns, summary.max_observed_published_read_latency_ns, cfg.max_fresh_fail_latency_ns, summary.total_observed_fresh_fail_latency_ns, summary.max_observed_fresh_fail_latency_ns, cfg.max_fan_in_latency_ns, summary.total_observed_fan_in_latency_ns, summary.max_observed_fan_in_latency_ns },
     );
     try out.print(
-        ",\"max_storage_score_records\":{d},\"max_observed_storage_score_records\":{d},\"max_storage_metric_records\":{d},\"max_observed_storage_metric_records\":{d},\"max_storage_control_records\":{d},\"max_observed_storage_control_records\":{d},\"max_storage_attempt_records\":{d},\"max_observed_storage_attempt_records\":{d},\"max_storage_failure_records\":{d},\"max_observed_storage_failure_records\":{d},\"max_storage_event_records\":{d},\"max_observed_storage_event_records\":{d}",
-        .{ cfg.max_storage_score_records, summary.max_observed_storage_score_records, cfg.max_storage_metric_records, summary.max_observed_storage_metric_records, cfg.max_storage_control_records, summary.max_observed_storage_control_records, cfg.max_storage_attempt_records, summary.max_observed_storage_attempt_records, cfg.max_storage_failure_records, summary.max_observed_storage_failure_records, cfg.max_storage_event_records, summary.max_observed_storage_event_records },
+        ",\"max_storage_score_records\":{d},\"min_observed_storage_score_records\":{d},\"max_observed_storage_score_records\":{d},\"max_storage_metric_records\":{d},\"min_observed_storage_metric_records\":{d},\"max_observed_storage_metric_records\":{d},\"max_storage_control_records\":{d},\"min_observed_storage_control_records\":{d},\"max_observed_storage_control_records\":{d},\"max_storage_attempt_records\":{d},\"min_observed_storage_attempt_records\":{d},\"max_observed_storage_attempt_records\":{d},\"max_storage_failure_records\":{d},\"min_observed_storage_failure_records\":{d},\"max_observed_storage_failure_records\":{d},\"max_storage_event_records\":{d},\"min_observed_storage_event_records\":{d},\"max_observed_storage_event_records\":{d}",
+        .{ cfg.max_storage_score_records, summary.min_observed_storage_score_records, summary.max_observed_storage_score_records, cfg.max_storage_metric_records, summary.min_observed_storage_metric_records, summary.max_observed_storage_metric_records, cfg.max_storage_control_records, summary.min_observed_storage_control_records, summary.max_observed_storage_control_records, cfg.max_storage_attempt_records, summary.min_observed_storage_attempt_records, summary.max_observed_storage_attempt_records, cfg.max_storage_failure_records, summary.min_observed_storage_failure_records, summary.max_observed_storage_failure_records, cfg.max_storage_event_records, summary.min_observed_storage_event_records, summary.max_observed_storage_event_records },
     );
     try out.print(
         ",\"max_page_claims\":{d},\"max_observed_page_claims\":{d},\"max_cleanup_ticks\":{d},\"max_observed_cleanup_ticks\":{d},\"max_rounds_executed\":{d},\"max_observed_rounds_executed\":{d},\"max_failure_retry_count\":{d},\"max_observed_failure_retry_count\":{d},\"max_worker_steps\":{d},\"max_observed_worker_steps\":{d},\"max_coordinator_steps\":{d},\"max_observed_coordinator_steps\":{d},\"min_families_run\":{d},\"min_split_worker_identities_with_progress\":{d},\"min_split_worker_identities_with_page_progress\":{d}",

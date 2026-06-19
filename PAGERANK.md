@@ -4982,7 +4982,12 @@ than PR unit coverage:
   expected totals are re-checked in the final row against the generated
   score-record count, the fixed per-metric metadata overhead, and retained
   failed diagnostic records, so storage-growth evidence cannot pass while
-  hiding extra metric namespace entries or unbounded control records.
+  hiding extra metric namespace entries or unbounded control records. The same
+  block now emits min/max observed retained score, metric, control, attempt,
+  failure, and event records; deployment-shaped retained-storage evidence stays
+  false unless every family retains nonzero score/metric/control/diagnostic
+  evidence, attempt namespaces are fully cleaned up, and the max bounds remain
+  within the configured ceilings.
   Failed-build
   diagnostic totals are included as status-level evidence too: total retry
   count, recent failure/event counts, retained expected-error records, retained
