@@ -79,6 +79,7 @@ fn openCredentialedBindingObjectStoreAlloc(
         ),
         .gcs => |value| try openCredentialedGcsPrefixAlloc(
             alloc,
+            options.secret_store,
             external_io,
             value.bucket,
             value.prefix,
@@ -137,6 +138,7 @@ fn openCredentialedS3PrefixAlloc(
 
 fn openCredentialedGcsPrefixAlloc(
     alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
     external_io: common_config.Config.ExternalIoConnectionConfig,
     bucket: []const u8,
     prefix: []const u8,
@@ -145,12 +147,41 @@ fn openCredentialedGcsPrefixAlloc(
     if (external_io.protocol != .gcs) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
     if (external_io.prefix) |allowed| try ensurePrefixAllowed(prefix, allowed);
-    return try object_store_support.OpenedObjectStore.initGcsUriWithOptions(
+    const bearer_token = try gcsBearerTokenFromHeadersAlloc(alloc, secret_store, external_io.headers);
+    defer if (bearer_token) |value| alloc.free(value);
+    return try object_store_support.OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(
         alloc,
         bucket,
         prefix,
+        bearer_token,
         .{ .ensure_bucket = !read_only },
     );
+}
+
+fn gcsBearerTokenFromHeadersAlloc(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    headers: std.StringArrayHashMapUnmanaged([]u8),
+) !?[]u8 {
+    const raw_authorization = headerValueIgnoreCase(headers, "Authorization") orelse return null;
+    const authorization = try common_secrets.resolveReferenceOwned(alloc, secret_store, raw_authorization);
+    errdefer alloc.free(authorization);
+    const trimmed = std.mem.trim(u8, authorization, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "Bearer ")) return error.UnsupportedExternalLakeCredentialRef;
+    const token = std.mem.trim(u8, trimmed["Bearer ".len..], " \t\r\n");
+    if (token.len == 0) return error.UnsupportedExternalLakeCredentialRef;
+    if (token.ptr == authorization.ptr and token.len == authorization.len) return authorization;
+    const owned = try alloc.dupe(u8, token);
+    alloc.free(authorization);
+    return owned;
+}
+
+fn headerValueIgnoreCase(headers: std.StringArrayHashMapUnmanaged([]u8), name: []const u8) ?[]const u8 {
+    var it = headers.iterator();
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) return entry.value_ptr.*;
+    }
+    return null;
 }
 
 fn ensureBucketAllowed(bucket: []const u8, allowed_buckets: []const []const u8) !void {
@@ -229,6 +260,112 @@ test "credentialed binding object store opens scoped filesystem source" {
         .file_bucket = "external-lake",
         .node_config = &cfg,
     }));
+}
+
+test "credentialed binding object store opens scoped gcs source with bearer token" {
+    const alloc = std.testing.allocator;
+    const cfg_json =
+        \\{
+        \\  "connections": {
+        \\    "prod-gcs-lake-read": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_read"],
+        \\      "external_io": {
+        \\        "protocol": "gcs",
+        \\        "buckets": ["lake-bucket"],
+        \\        "prefix": "events",
+        \\        "headers": {
+        \\          "Authorization": "Bearer test-token"
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try common_config.Config.parseFromSlice(alloc, cfg_json);
+    defer cfg.deinit();
+
+    var opened = try openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "gs://lake-bucket/events/2026",
+        .credential_ref = .{ .ref_id = "prod-gcs-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+    });
+    defer opened.deinit();
+
+    try std.testing.expectEqualStrings("lake-bucket", opened.bucket);
+    try std.testing.expectEqualStrings("events/2026", opened.prefix);
+    const gcs_client = opened.gcs_client orelse return error.TestExpectedEqual;
+    switch (gcs_client.cfg.auth) {
+        .bearer_token => |token| try std.testing.expectEqualStrings("test-token", token),
+        else => return error.TestExpectedEqual,
+    }
+
+    try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "gs://lake-bucket/other",
+        .credential_ref = .{ .ref_id = "prod-gcs-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+    }));
+}
+
+test "credentialed binding object store resolves gcs authorization secret" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const secret_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/gcs-secrets.json", .{tmp.sub_path});
+    defer alloc.free(secret_path);
+    var secret_store = try common_secrets.FileStore.init(alloc, secret_path);
+    defer secret_store.deinit();
+    var stored = try secret_store.put(alloc, "gcs.lake.authorization", "Bearer secret-token");
+    defer stored.deinit(alloc);
+
+    const cfg_json =
+        \\{
+        \\  "connections": {
+        \\    "prod-gcs-lake-read": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_read"],
+        \\      "external_io": {
+        \\        "protocol": "gcs",
+        \\        "buckets": ["lake-bucket"],
+        \\        "headers": {
+        \\          "authorization": "${secret:gcs.lake.authorization}"
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try common_config.Config.parseFromSliceWithSecrets(alloc, cfg_json, &secret_store);
+    defer cfg.deinit();
+
+    var opened = try openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "gs://lake-bucket/events",
+        .credential_ref = .{ .ref_id = "prod-gcs-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+        .secret_store = &secret_store,
+    });
+    defer opened.deinit();
+
+    const gcs_client = opened.gcs_client orelse return error.TestExpectedEqual;
+    switch (gcs_client.cfg.auth) {
+        .bearer_token => |token| try std.testing.expectEqualStrings("secret-token", token),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "credential-free binding object store opens read-only without creating file bucket" {

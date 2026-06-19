@@ -97,9 +97,23 @@ pub const OpenedObjectStore = struct {
         prefix: []const u8,
         options: OpenOptions,
     ) !OpenedObjectStore {
+        return try initGcsUriWithBearerTokenAndOptions(alloc, bucket, prefix, null, options);
+    }
+
+    pub fn initGcsUriWithBearerTokenAndOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        bearer_token: ?[]const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
         const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
-        const cfg = try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var cfg = if (bearer_token) |token|
+            try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(alloc, token, null)
+        else
+            try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        errdefer cfg.deinit(alloc);
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
 
         var owned_client = gcs.client();
