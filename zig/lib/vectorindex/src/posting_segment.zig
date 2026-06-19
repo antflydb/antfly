@@ -1166,25 +1166,24 @@ pub const LazyDirectorySnapshot = struct {
             const index_data = try readSegmentIndexWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, &stack_index);
             defer index_data.deinit(alloc);
 
-            const range = (try deltaIndexRange(index_data.data, entry.meta.entry_count, posting_id)) orelse continue;
             var value_scratch: [stack_delta_value_range_max_bytes]u8 = undefined;
+            const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, index_data.data, posting_id, &value_scratch)) orelse continue;
+            defer range.deinit(alloc);
+
             var delta_index = range.past_index;
             while (delta_index > range.first_index) {
                 delta_index -= 1;
                 const found = try deltaIndexEntryFromIndexData(index_data.data, delta_index);
                 if (best_record != null and found.sequence <= best_sequence) break;
-                {
-                    const value_buffer = try readSegmentEntryValueWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, found, &value_scratch);
-                    defer value_buffer.deinit(alloc);
-                    try latestDeltaValueRecordAfterGenerationForMember(
-                        value_buffer.data,
-                        vector_id,
-                        base_generation,
-                        posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
-                        &best_sequence,
-                        &best_record,
-                    );
-                }
+                const value = try deltaValueFromEntryRange(range, found);
+                try latestDeltaValueRecordAfterGenerationForMember(
+                    value,
+                    vector_id,
+                    base_generation,
+                    posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
+                    &best_sequence,
+                    &best_record,
+                );
             }
         }
         return best_record;
