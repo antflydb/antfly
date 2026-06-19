@@ -1457,11 +1457,19 @@ pub const HBCIndex = struct {
     };
 
     const RoutingScratch = struct {
+        routing_storage: []u64,
         estimate: quantizer_mod.RaBitQuantizer.EstimateScratch,
         child_ids: []u64,
         distances: []f32,
         error_bounds: []f32,
         competitive: []vectorindex_types.PriorityItem,
+
+        const StorageViews = struct {
+            child_ids: []u64,
+            distances: []f32,
+            error_bounds: []f32,
+            competitive: []vectorindex_types.PriorityItem,
+        };
 
         fn init(alloc: Allocator, dims: usize, initial_capacity: usize) !@This() {
             const capacity = @max(initial_capacity, 1);
@@ -1470,36 +1478,40 @@ pub const HBCIndex = struct {
                 var tmp = estimate;
                 tmp.deinit(alloc);
             }
-            const child_ids = try alloc.alloc(u64, capacity);
-            errdefer alloc.free(child_ids);
-            const distances = try alloc.alloc(f32, capacity);
-            errdefer alloc.free(distances);
-            const error_bounds = try alloc.alloc(f32, capacity);
-            errdefer alloc.free(error_bounds);
-            const competitive = try alloc.alloc(vectorindex_types.PriorityItem, capacity);
+            const routing_storage = try alloc.alloc(u64, routingStorageWordLen(capacity));
+            errdefer alloc.free(routing_storage);
+            const views = carveRoutingStorage(routing_storage, capacity);
             return .{
+                .routing_storage = routing_storage,
                 .estimate = estimate,
-                .child_ids = child_ids,
-                .distances = distances,
-                .error_bounds = error_bounds,
-                .competitive = competitive,
+                .child_ids = views.child_ids,
+                .distances = views.distances,
+                .error_bounds = views.error_bounds,
+                .competitive = views.competitive,
             };
         }
 
         pub fn ensureCapacity(self: *@This(), alloc: Allocator, needed: usize) !void {
             const capacity = @max(needed, 1);
-            if (self.child_ids.len < capacity) self.child_ids = try alloc.realloc(self.child_ids, capacity);
-            if (self.distances.len < capacity) self.distances = try alloc.realloc(self.distances, capacity);
-            if (self.error_bounds.len < capacity) self.error_bounds = try alloc.realloc(self.error_bounds, capacity);
-            if (self.competitive.len < capacity) self.competitive = try alloc.realloc(self.competitive, capacity);
+            if (self.child_ids.len >= capacity) return;
+            const replacement = try alloc.alloc(u64, routingStorageWordLen(capacity));
+            errdefer alloc.free(replacement);
+            const views = carveRoutingStorage(replacement, capacity);
+            copyRoutingSlice(u64, views.child_ids, self.child_ids);
+            copyRoutingSlice(f32, views.distances, self.distances);
+            copyRoutingSlice(f32, views.error_bounds, self.error_bounds);
+            copyRoutingSlice(vectorindex_types.PriorityItem, views.competitive, self.competitive);
+            alloc.free(self.routing_storage);
+            self.routing_storage = replacement;
+            self.child_ids = views.child_ids;
+            self.distances = views.distances;
+            self.error_bounds = views.error_bounds;
+            self.competitive = views.competitive;
         }
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             self.estimate.deinit(alloc);
-            alloc.free(self.child_ids);
-            alloc.free(self.distances);
-            alloc.free(self.error_bounds);
-            alloc.free(self.competitive);
+            alloc.free(self.routing_storage);
             self.* = undefined;
         }
 
@@ -1509,10 +1521,52 @@ pub const HBCIndex = struct {
                 @as(u64, @intCast(self.estimate.q2.len * @sizeOf(u64))) +
                 @as(u64, @intCast(self.estimate.q3.len * @sizeOf(u64))) +
                 @as(u64, @intCast(self.estimate.q4.len * @sizeOf(u64))) +
-                @as(u64, @intCast(self.child_ids.len * @sizeOf(u64))) +
-                @as(u64, @intCast(self.distances.len * @sizeOf(f32))) +
-                @as(u64, @intCast(self.error_bounds.len * @sizeOf(f32))) +
-                @as(u64, @intCast(self.competitive.len * @sizeOf(vectorindex_types.PriorityItem)));
+                @as(u64, @intCast(self.routing_storage.len * @sizeOf(u64)));
+        }
+
+        fn routingStorageWordLen(capacity: usize) usize {
+            const byte_count = routingStorageByteLen(capacity);
+            return std.math.divCeil(usize, byte_count, @sizeOf(u64)) catch unreachable;
+        }
+
+        fn routingStorageByteLen(capacity: usize) usize {
+            var offset: usize = 0;
+            addRoutingStorageSlice(u64, &offset, capacity);
+            addRoutingStorageSlice(f32, &offset, capacity);
+            addRoutingStorageSlice(f32, &offset, capacity);
+            addRoutingStorageSlice(vectorindex_types.PriorityItem, &offset, capacity);
+            return std.mem.alignForward(usize, offset, @alignOf(u64));
+        }
+
+        fn addRoutingStorageSlice(comptime T: type, offset: *usize, capacity: usize) void {
+            comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
+            offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+            offset.* += capacity * @sizeOf(T);
+        }
+
+        fn carveRoutingStorage(storage: []u64, capacity: usize) StorageViews {
+            const raw_bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
+            var offset: usize = 0;
+            return .{
+                .child_ids = carveRoutingStorageSlice(u64, raw_bytes, &offset, capacity),
+                .distances = carveRoutingStorageSlice(f32, raw_bytes, &offset, capacity),
+                .error_bounds = carveRoutingStorageSlice(f32, raw_bytes, &offset, capacity),
+                .competitive = carveRoutingStorageSlice(vectorindex_types.PriorityItem, raw_bytes, &offset, capacity),
+            };
+        }
+
+        fn carveRoutingStorageSlice(comptime T: type, raw_bytes: []align(@alignOf(u64)) u8, offset: *usize, capacity: usize) []T {
+            comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
+            offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+            const byte_len = capacity * @sizeOf(T);
+            const aligned: []align(@alignOf(T)) u8 = @alignCast(raw_bytes[offset.* .. offset.* + byte_len]);
+            const out = std.mem.bytesAsSlice(T, aligned);
+            offset.* += byte_len;
+            return out;
+        }
+
+        fn copyRoutingSlice(comptime T: type, dst: []T, src: []const T) void {
+            @memcpy(dst[0..src.len], src);
         }
     };
 

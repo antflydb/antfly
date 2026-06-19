@@ -852,6 +852,9 @@ implementations cleanly:
    refresh also use stack-backed paired vector scratch for common dimensions,
    and overfull leaf splitting uses the same shape while materializing split
    inputs, falling back to one combined heap allocation instead of two.
+   Routing scratch now slabs child ids, distances, error bounds, and
+   competitive candidate storage behind one backing allocation while preserving
+   retained-scratch byte accounting.
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed
