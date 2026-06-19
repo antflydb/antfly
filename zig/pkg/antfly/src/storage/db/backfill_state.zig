@@ -39,6 +39,7 @@ pub const RebuildState = struct {
         defer io_impl.deinit();
         return std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
             error.FileNotFound => null,
+            error.NotDir => null,
             else => return err,
         };
     }
@@ -59,27 +60,50 @@ pub const RebuildState = struct {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        try ensureParentDir(io, path);
-        try ensureParentDir(io, tmp_path);
+        ensureParentDir(io, path) catch |err| switch (err) {
+            error.NotDir => return,
+            else => return err,
+        };
+        ensureParentDir(io, tmp_path) catch |err| switch (err) {
+            error.NotDir => return,
+            else => return err,
+        };
 
-        try writeStateFile(io, tmp_path, key);
+        writeStateFile(io, tmp_path, key) catch |err| switch (err) {
+            error.NotDir => return,
+            else => return err,
+        };
 
         if (std.fs.path.isAbsolute(path)) {
             renameAbsolutePortable(tmp_path, path) catch |err| switch (err) {
                 error.FileNotFound => {
-                    try ensureParentDir(io, path);
-                    try writeStateFile(io, path, key);
+                    ensureParentDir(io, path) catch |parent_err| switch (parent_err) {
+                        error.NotDir => return,
+                        else => return parent_err,
+                    };
+                    writeStateFile(io, path, key) catch |write_err| switch (write_err) {
+                        error.NotDir => return,
+                        else => return write_err,
+                    };
                     std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
                 },
+                error.NotDir => return,
                 else => return err,
             };
         } else {
             std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| switch (err) {
                 error.FileNotFound => {
-                    try ensureParentDir(io, path);
-                    try writeStateFile(io, path, key);
+                    ensureParentDir(io, path) catch |parent_err| switch (parent_err) {
+                        error.NotDir => return,
+                        else => return parent_err,
+                    };
+                    writeStateFile(io, path, key) catch |write_err| switch (write_err) {
+                        error.NotDir => return,
+                        else => return write_err,
+                    };
                     std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
                 },
+                error.NotDir => return,
                 else => return err,
             };
         }
@@ -97,11 +121,13 @@ pub const RebuildState = struct {
         if (std.fs.path.isAbsolute(path)) {
             std.Io.Dir.deleteFileAbsolute(io_impl.io(), path) catch |err| switch (err) {
                 error.FileNotFound => {},
+                error.NotDir => {},
                 else => return err,
             };
         } else {
             std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch |err| switch (err) {
                 error.FileNotFound => {},
+                error.NotDir => {},
                 else => return err,
             };
         }

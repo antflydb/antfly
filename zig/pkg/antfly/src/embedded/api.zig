@@ -186,10 +186,45 @@ pub const Api = struct {
         return try std.json.Stringify.valueAlloc(alloc, configs, .{});
     }
 
+    pub fn addIndexJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(embedded_db.types.IndexConfig, alloc, body, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        try self.db.addIndex(parsed.value);
+        return try namedMutationJson(alloc, "created", parsed.value.name);
+    }
+
+    pub fn dropIndexJson(self: *Api, alloc: Allocator, name: []const u8) ![]u8 {
+        const removed = try self.db.deleteIndex(name);
+        return try namedBoolMutationJson(alloc, "removed", name, removed);
+    }
+
     pub fn listEnrichmentsJson(self: *Api, alloc: Allocator) ![]u8 {
         const configs = try self.db.listEnrichments(alloc);
         defer embedded_db.types.freeEnrichmentConfigs(alloc, configs);
         return try std.json.Stringify.valueAlloc(alloc, configs, .{});
+    }
+
+    pub fn addEnrichmentJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(embedded_db.types.EnrichmentConfig, alloc, body, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        try self.db.addEnrichment(parsed.value);
+        return try namedMutationJson(alloc, "created", parsed.value.name);
+    }
+
+    pub fn dropEnrichmentJson(
+        self: *Api,
+        alloc: Allocator,
+        kind: embedded_db.types.EnrichmentKind,
+        name: []const u8,
+    ) ![]u8 {
+        const removed = try self.db.deleteEnrichment(kind, name);
+        return try namedBoolMutationJson(alloc, "removed", name, removed);
     }
 };
 
@@ -317,6 +352,24 @@ fn appendJsonString(
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
+}
+
+fn namedMutationJson(alloc: Allocator, field_name: []const u8, name: []const u8) ![]u8 {
+    return try namedBoolMutationJson(alloc, field_name, name, true);
+}
+
+fn namedBoolMutationJson(alloc: Allocator, field_name: []const u8, name: []const u8, value: bool) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, &out, field_name);
+    try out.append(alloc, ':');
+    try out.appendSlice(alloc, if (value) "true" else "false");
+    try out.appendSlice(alloc, ",\"name\":");
+    try appendJsonString(alloc, &out, name);
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 test "embedded api round-trips batch lookup scan and search over memory-backed durable lsm" {
@@ -575,5 +628,65 @@ test "embedded api openLite round-trips batch lookup over aflite file" {
         defer alloc.free(lookup_json);
         try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"found\":true") != null);
         try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"alpha lite api\"") != null);
+    }
+}
+
+test "embedded api openLite manages index and enrichment definitions over aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-management.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var api = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer api.close();
+
+        const created_index = try api.addIndexJson(
+            alloc,
+            "{\"name\":\"full_text_index_v0\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+        );
+        defer alloc.free(created_index);
+        try std.testing.expect(std.mem.indexOf(u8, created_index, "\"created\":true") != null);
+
+        const created_enrichment = try api.addEnrichmentJson(
+            alloc,
+            "{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":8,\"chunk_overlap\":2}",
+        );
+        defer alloc.free(created_enrichment);
+        try std.testing.expect(std.mem.indexOf(u8, created_enrichment, "\"created\":true") != null);
+    }
+
+    {
+        var reopened = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer reopened.close();
+
+        const indexes = try reopened.listIndexesJson(alloc);
+        defer alloc.free(indexes);
+        try std.testing.expect(std.mem.indexOf(u8, indexes, "\"full_text_index_v0\"") != null);
+
+        const enrichments = try reopened.listEnrichmentsJson(alloc);
+        defer alloc.free(enrichments);
+        try std.testing.expect(std.mem.indexOf(u8, enrichments, "\"body_chunks_v1\"") != null);
+
+        const removed_index = try reopened.dropIndexJson(alloc, "full_text_index_v0");
+        defer alloc.free(removed_index);
+        try std.testing.expect(std.mem.indexOf(u8, removed_index, "\"removed\":true") != null);
+
+        const removed_enrichment = try reopened.dropEnrichmentJson(alloc, .chunk, "body_chunks_v1");
+        defer alloc.free(removed_enrichment);
+        try std.testing.expect(std.mem.indexOf(u8, removed_enrichment, "\"removed\":true") != null);
     }
 }

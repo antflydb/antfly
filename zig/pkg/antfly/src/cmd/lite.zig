@@ -40,6 +40,7 @@ const LiteDb = struct {
 
         var opts = db_mod.OpenOptions{
             .open_mode = open_mode,
+            .external_derived_checkpoints = false,
         };
         pinLiteStorage(&opts, storage.storage());
 
@@ -119,6 +120,8 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "lookup")) return try lookup(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "scan")) return try scan(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "query")) return try query(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "index")) return try indexCommand(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "enrichment")) return try enrichmentCommand(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "run-until-idle")) return try runUntilIdle(init.gpa, init.io, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
@@ -229,6 +232,138 @@ fn query(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     defer lite.close();
 
     const json = try searchJson(allocator, &lite.db, body);
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn indexCommand(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const action = args.next() orelse cli.fatal("index subcommand is required", .{});
+    if (std.mem.eql(u8, action, "list")) return try indexList(allocator, io, args);
+    if (std.mem.eql(u8, action, "create")) return try indexCreate(allocator, io, args);
+    if (std.mem.eql(u8, action, "drop")) return try indexDrop(allocator, io, args);
+    cli.fatal("unknown index subcommand: {s}", .{action});
+}
+
+fn indexList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    requireNoMoreArgs(args);
+
+    var lite = try LiteDb.open(allocator, path, .status_only);
+    defer lite.close();
+
+    const configs = try lite.db.listIndexes(allocator);
+    defer db_types.freeIndexConfigs(allocator, configs);
+    const json = try std.json.Stringify.valueAlloc(allocator, configs, .{});
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn indexCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    const file_path = parseFileFlag(args);
+
+    const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
+    defer allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(db_types.IndexConfig, allocator, body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    try lite.db.addIndex(parsed.value);
+    const json = try mutationJson(allocator, "created", parsed.value.name, true);
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn indexDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    const name = parseNameFlag(args, "--index");
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    const removed = try lite.db.deleteIndex(name);
+    const json = try mutationJson(allocator, "removed", name, removed);
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn enrichmentCommand(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const action = args.next() orelse cli.fatal("enrichment subcommand is required", .{});
+    if (std.mem.eql(u8, action, "list")) return try enrichmentList(allocator, io, args);
+    if (std.mem.eql(u8, action, "create")) return try enrichmentCreate(allocator, io, args);
+    if (std.mem.eql(u8, action, "drop")) return try enrichmentDrop(allocator, io, args);
+    cli.fatal("unknown enrichment subcommand: {s}", .{action});
+}
+
+fn enrichmentList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    requireNoMoreArgs(args);
+
+    var lite = try LiteDb.open(allocator, path, .status_only);
+    defer lite.close();
+
+    const configs = try lite.db.listEnrichments(allocator);
+    defer db_types.freeEnrichmentConfigs(allocator, configs);
+    const json = try std.json.Stringify.valueAlloc(allocator, configs, .{});
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn enrichmentCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    const file_path = parseFileFlag(args);
+
+    const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
+    defer allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(db_types.EnrichmentConfig, allocator, body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    try lite.db.addEnrichment(parsed.value);
+    const json = try mutationJson(allocator, "created", parsed.value.name, true);
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn enrichmentDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+
+    var kind: ?db_types.EnrichmentKind = null;
+    var name: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--kind")) {
+            kind = parseEnrichmentKind(args.next() orelse cli.fatal("--kind requires a value", .{}));
+        } else if (std.mem.eql(u8, arg, "--name")) {
+            name = args.next();
+        } else {
+            cli.fatal("unknown enrichment drop argument: {s}", .{arg});
+        }
+    }
+
+    const resolved_kind = kind orelse cli.fatal("--kind is required", .{});
+    const resolved_name = name orelse cli.fatal("--name is required", .{});
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    const removed = try lite.db.deleteEnrichment(resolved_kind, resolved_name);
+    const json = try mutationJson(allocator, "removed", resolved_name, removed);
     defer allocator.free(json);
     writeJsonLine(io, json);
 }
@@ -441,6 +576,29 @@ fn parseFileFlag(args: *std.process.Args.Iterator) []const u8 {
     return file_path orelse cli.fatal("--file is required", .{});
 }
 
+fn parseNameFlag(args: *std.process.Args.Iterator, flag_name: []const u8) []const u8 {
+    var name: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, flag_name) or std.mem.eql(u8, arg, "--name")) {
+            name = args.next();
+        } else {
+            cli.fatal("unknown argument: {s}", .{arg});
+        }
+    }
+    return name orelse cli.fatal("{s} is required", .{flag_name});
+}
+
+fn parseEnrichmentKind(value: []const u8) db_types.EnrichmentKind {
+    if (std.mem.eql(u8, value, "chunk")) return .chunk;
+    if (std.mem.eql(u8, value, "asset")) return .asset;
+    if (std.mem.eql(u8, value, "embedding")) return .embedding;
+    cli.fatal("unknown enrichment kind: {s}", .{value});
+}
+
+fn requireNoMoreArgs(args: *std.process.Args.Iterator) void {
+    if (args.next()) |arg| cli.fatal("unknown argument: {s}", .{arg});
+}
+
 fn requireAflitePath(path: []const u8) !void {
     if (!std.mem.endsWith(u8, path, ".aflite")) {
         std.debug.print("error: Antfly Lite database paths must end in .aflite: {s}\n", .{path});
@@ -459,6 +617,20 @@ fn writeJsonString(allocator: Allocator, io: std.Io, value: []const u8) !void {
     cli.writeStdout(io, json);
 }
 
+fn mutationJson(allocator: Allocator, field_name: []const u8, name: []const u8, value: bool) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+
+    try out.append(allocator, '{');
+    try appendJsonString(allocator, &out, field_name);
+    try out.append(allocator, ':');
+    try out.appendSlice(allocator, if (value) "true" else "false");
+    try out.appendSlice(allocator, ",\"name\":");
+    try appendJsonString(allocator, &out, name);
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
+}
+
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
         \\usage: {s} lite <subcommand> [options]
@@ -470,6 +642,12 @@ fn printUsage(argv0: []const u8) void {
         \\  lookup <db.aflite> --key <key> [--file request.json]
         \\  scan <db.aflite> --file request.json
         \\  query <db.aflite> --file request.json
+        \\  index list <db.aflite>
+        \\  index create <db.aflite> --file index.json
+        \\  index drop <db.aflite> --index <name>
+        \\  enrichment list <db.aflite>
+        \\  enrichment create <db.aflite> --file enrichment.json
+        \\  enrichment drop <db.aflite> --kind <chunk|asset|embedding> --name <name>
         \\  run-until-idle <db.aflite>
         \\
     , .{argv0});

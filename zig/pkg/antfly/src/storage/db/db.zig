@@ -247,6 +247,7 @@ pub const OpenOptions = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
     start_optional_runtimes: bool = true,
+    external_derived_checkpoints: bool = true,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
@@ -2649,6 +2650,7 @@ pub const DB = struct {
                 opts.identity_namespace,
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
+                opts.external_derived_checkpoints,
             );
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);

@@ -102,7 +102,10 @@ pub const DB = struct {
         var lite_opts = opts;
         pinLiteStorage(&lite_opts, lite_storage.storage());
 
-        const inner = db_mod.DB.open(alloc, path, toDbOpenOptions(lite_opts, profile)) catch |err| {
+        var db_opts = toDbOpenOptions(lite_opts, profile);
+        db_opts.external_derived_checkpoints = false;
+
+        const inner = db_mod.DB.open(alloc, path, db_opts) catch |err| {
             lite_storage.deinit();
             alloc.destroy(lite_storage);
             return err;
@@ -197,8 +200,16 @@ pub const DB = struct {
         try self.inner.addIndex(cfg);
     }
 
+    pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        return try self.inner.deleteIndex(name);
+    }
+
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         try self.inner.addEnrichment(cfg);
+    }
+
+    pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+        return try self.inner.deleteEnrichment(kind, name);
     }
 
     pub fn setSchema(self: *DB, table_schema: support.schema.TableSchema) !void {
