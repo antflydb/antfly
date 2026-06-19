@@ -845,7 +845,9 @@ implementations cleanly:
    are for distinct lifetime/shape classes such as vector batches, member ids,
    posting overlay summaries, and posting caches. Small transformed-vector
    matrix loads and small metadata batch lookups now use stack-backed scratch
-   before falling back to heap allocation. Centroid recompute and quantized
+   before falling back to heap allocation. Bulk-split external-vector matrix
+   cache misses also keep the common missing-id/matrix-position lists on stack
+   scratch before falling back to heap allocation. Centroid recompute and quantized
    refresh also use stack-backed paired vector scratch for common dimensions,
    and overfull leaf splitting uses the same shape while materializing split
    inputs, falling back to one combined heap allocation instead of two.

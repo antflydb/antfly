@@ -5803,10 +5803,20 @@ pub const HBCIndex = struct {
         if (vector_ids.len != matrix_positions.len) return error.InvalidArgument;
         if (vector_ids.len == 0) return true;
 
-        var missing_ids = try self.alloc.alloc(u64, vector_ids.len);
-        defer self.alloc.free(missing_ids);
-        var missing_positions = try self.alloc.alloc(usize, vector_ids.len);
-        defer self.alloc.free(missing_positions);
+        const missing_stack_capacity = 1024;
+        var missing_ids_stack: [missing_stack_capacity]u64 = undefined;
+        var missing_positions_stack: [missing_stack_capacity]usize = undefined;
+        const use_missing_stack = vector_ids.len <= missing_stack_capacity;
+        const missing_ids = if (use_missing_stack)
+            missing_ids_stack[0..vector_ids.len]
+        else
+            try self.alloc.alloc(u64, vector_ids.len);
+        defer if (!use_missing_stack) self.alloc.free(missing_ids);
+        const missing_positions = if (use_missing_stack)
+            missing_positions_stack[0..vector_ids.len]
+        else
+            try self.alloc.alloc(usize, vector_ids.len);
+        defer if (!use_missing_stack) self.alloc.free(missing_positions);
 
         var missing_count: usize = 0;
         for (vector_ids, matrix_positions) |vector_id, matrix_position| {
