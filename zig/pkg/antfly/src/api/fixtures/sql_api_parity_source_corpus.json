@@ -99,6 +99,13 @@
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE"
     },
     {
+      "name": "unsupported rich unique expression index",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=unique_expression_owner_ast",
+      "classification_reason": "unique_expression_owner_ast",
+      "sql": "CREATE UNIQUE INDEX usage_records_status_replace_key ON usage_records (replace(status, 'old', 'new'))"
+    },
+    {
       "name": "unsupported deferrable primary key",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=deferrable_primary_key",

@@ -457,6 +457,7 @@
     "unsupported_ddl_system_time_temporal_table",
     "unsupported_ddl_temporal_fk_update_action",
     "unsupported_ddl_transaction_scoped_search_path",
+    "unsupported_ddl_unique_expression_owner_ast",
     "unsupported_delete",
     "unsupported_delete_joined_multi_output_subquery_selector",
     "unsupported_delete_joined_source",
