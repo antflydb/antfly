@@ -1652,7 +1652,7 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
         for (file.row_groups) |row_group| {
             for (projected_columns) |column| {
                 const chunk = findColumnChunk(row_group, column) orelse return error.ParquetColumnNotFound;
-                try validatePlannedChunk(chunk, validation);
+                try validatePlannedChunk(inventory.format, chunk, validation);
             }
             if (!rowGroupMayMatchPredicate(row_group, predicate)) continue;
             total_row_groups += 1;
@@ -1759,7 +1759,8 @@ fn findPartitionValue(file: external_source.FileEntry, column_id: []const u8) ?e
     return null;
 }
 
-fn validatePlannedChunk(chunk: external_source.ColumnChunk, validation: RowGroupPlanValidation) !void {
+fn validatePlannedChunk(format: external_source.Format, chunk: external_source.ColumnChunk, validation: RowGroupPlanValidation) !void {
+    if (format == .iceberg and chunk.field_id == null) return error.UnsupportedIcebergSchemaEvolution;
     switch (validation) {
         .none => {},
         .supported_i64 => {
@@ -6739,6 +6740,7 @@ test "iceberg object range planner prunes files with partition equality metadata
                 .uncompressed_len = 16,
                 .encoding = try alloc.dupe(u8, "plain"),
                 .physical_type = try alloc.dupe(u8, "int64"),
+                .field_id = 1,
             }}),
         }}),
     };
@@ -6765,6 +6767,7 @@ test "iceberg object range planner prunes files with partition equality metadata
                     .uncompressed_len = 16,
                     .encoding = try alloc.dupe(u8, "plain"),
                     .physical_type = try alloc.dupe(u8, "int64"),
+                    .field_id = 1,
                 },
                 .{
                     .column_id = try alloc.dupe(u8, "region"),
@@ -6773,6 +6776,7 @@ test "iceberg object range planner prunes files with partition equality metadata
                     .uncompressed_len = 16,
                     .encoding = try alloc.dupe(u8, "plain"),
                     .physical_type = try alloc.dupe(u8, "byte_array"),
+                    .field_id = 2,
                 },
             }),
         }}),
@@ -6793,6 +6797,54 @@ test "iceberg object range planner prunes files with partition equality metadata
 
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
     try std.testing.expectEqualStrings("part-west.parquet", plan.row_groups[0].file_id);
+}
+
+test "iceberg object range planner requires projected field ids" {
+    const alloc = std.testing.allocator;
+
+    var chunks = [_]external_source.ColumnChunk{.{
+        .column_id = @constCast("amount"),
+        .file_offset = 100,
+        .compressed_len = 16,
+        .uncompressed_len = 16,
+        .encoding = @constCast("plain"),
+        .physical_type = @constCast("int64"),
+    }};
+    var row_groups = [_]external_source.RowGroup{.{
+        .ordinal = 0,
+        .row_count = 2,
+        .file_offset = 100,
+        .total_byte_len = 16,
+        .column_chunks = chunks[0..],
+    }};
+    var files = [_]external_source.FileEntry{.{
+        .file_id = @constCast("part-a.parquet"),
+        .object_uri = @constCast("s3://bucket/events/part-a.parquet"),
+        .version_id = @constCast("iceberg:v1:a"),
+        .byte_len = 1024,
+        .row_count = 2,
+        .row_groups = row_groups[0..],
+    }};
+    const inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = @constCast("events"),
+        .source_uri = @constCast("s3://bucket/events"),
+        .snapshot_id = @constCast("12"),
+        .schema_fingerprint = @constCast("iceberg-schema:7"),
+        .files = files[0..],
+    };
+    const projection = [_][]const u8{"amount"};
+
+    try std.testing.expectError(
+        error.UnsupportedIcebergSchemaEvolution,
+        planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &projection),
+    );
+
+    chunks[0].field_id = 1;
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &projection);
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
+    try std.testing.expectEqualStrings("part-a.parquet", plan.row_groups[0].file_id);
 }
 
 test "iceberg partition predicate pruning supports typed equality metadata" {
