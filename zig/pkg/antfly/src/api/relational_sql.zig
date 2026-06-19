@@ -64830,6 +64830,129 @@ test "postgres sql adapter typed write plans execute through relational storage"
     try std.testing.expectEqualStrings("{\"id\":\"u3_copy_cte_copy\",\"status\":\"QUEUED\"}", joined_rows.rows[9]);
 }
 
+test "postgres sql adapter insert source plan collects cross-schema CTE source rows" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_target = try schema_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target.deinit(alloc);
+    const target_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_target);
+    defer runtime_schema.freeSchema(alloc, target_schema);
+
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"archive_id":{"type":"keyword"},"archive_status":{"type":"keyword"},"archive_amount":{"type":"numeric"}},"required":["archive_id"],"additionalProperties":false}}},"primary_key":{"columns":["archive_id"]}}
+    ;
+    var parsed_source = try schema_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed_source.deinit(alloc);
+    const source_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source);
+    defer runtime_schema.freeSchema(alloc, source_schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-insert-source-cross-schema-cte-target", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-insert-source-cross-schema-cte-source", .{tmp.sub_path});
+    defer alloc.free(source_path);
+
+    var target_db = try db_mod.DB.open(alloc, target_path, .{});
+    defer target_db.close();
+    try target_db.applyTableSchemaJson(alloc, target_schema_json, .{});
+    var source_db = try db_mod.DB.open(alloc, source_path, .{});
+    defer source_db.close();
+    try source_db.applyTableSchemaJson(alloc, source_schema_json, .{});
+
+    const source_jsons = [_][]const u8{
+        "{\"archive_id\":\"a1\",\"archive_status\":\"READY\",\"archive_amount\":10}",
+        "{\"archive_id\":\"a2\",\"archive_status\":\"ready\",\"archive_amount\":30}",
+        "{\"archive_id\":\"a3\",\"archive_status\":\"ready\",\"archive_amount\":20}",
+        "{\"archive_id\":\"skip\",\"archive_status\":\"closed\",\"archive_amount\":99}",
+    };
+    var source_keys: [source_jsons.len][]u8 = undefined;
+    for (source_jsons, 0..) |row_json, i| source_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, source_schema, row_json);
+    defer {
+        for (source_keys) |key| alloc.free(key);
+    }
+
+    try source_db.batch(.{
+        .writes = &.{
+            .{ .key = source_keys[0], .value = source_jsons[0] },
+            .{ .key = source_keys[1], .value = source_jsons[1] },
+            .{ .key = source_keys[2], .value = source_jsons[2] },
+            .{ .key = source_keys[3], .value = source_jsons[3] },
+        },
+        .sync_level = .write,
+    });
+
+    var no_existing_primary = TestPrimaryResolver{ .row_json = "", .version = 0, .exists = false };
+    var catalog = AppParitySourceSchemaCatalog.init("archived_records", source_schema_json);
+    var write_plan = try lowerWritePlanWithCatalogAlloc(
+        alloc,
+        "WITH ready_archives AS (SELECT archive_id, lower(archive_status) AS status_key, archive_amount + 1 AS next_amount FROM archived_records WHERE lower(archive_status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT archive_id, status_key, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status, amount",
+        target_schema,
+        &.{},
+        .{ .unique_resolver = no_existing_primary.resolver() },
+        catalog.iface(),
+    );
+    defer write_plan.deinit(alloc);
+
+    const source_ranges = [_]db_mod.types.RelationalRowsDocKeyRange{.{
+        .start = source_keys[0],
+        .end = "",
+    }};
+
+    switch (write_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("archived_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.ctes[0].name);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(@as(?u32, 2), insert_source.insert_source.req.source.limit);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+
+            var batch = try relational_rows.buildRowsInsertSourcePlanBatchFromDbAlloc(
+                alloc,
+                &source_db,
+                insert_source.table_name,
+                target_schema,
+                source_schema,
+                .{
+                    .ctes = insert_source.ctes,
+                    .ranges = source_ranges[0..],
+                    .insert_source = insert_source.insert_source.req,
+                },
+                no_existing_primary.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 0), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"a2\",\"status\":\"ready\",\"amount\":31}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"a3\",\"status\":\"ready\",\"amount\":21}", batch.returning_rows[1]);
+            try target_db.batch(batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const select = [_][]const u8{ "id", "status", "amount" };
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var rows = try target_db.queryRelationalRows(alloc, target_schema, .{
+        .select = select[0..],
+        .order_by = order_by[0..],
+    });
+    defer rows.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), rows.total);
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a2\",\"status\":\"ready\",\"amount\":31}", rows.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a3\",\"status\":\"ready\",\"amount\":21}", rows.rows[1]);
+}
+
 test "postgres sql adapter merge mutation batch executes through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
