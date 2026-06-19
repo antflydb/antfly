@@ -301,9 +301,13 @@ Package entry:
 - `type`: `application/antfly-extension-package+json`
 - `url`: `/extensions/v1/packages/{name}/versions/{version}`
 - `metadata.digest`: package digest
-- `metadata.artifacts`: manifest/wasm/native artifact summary
+- `metadata.kind`: package kind
+- `metadata.trusted`: package trust flag
+- `metadata.artifactCount`: count of manifest/wasm/native artifacts
+- `metadata.capabilitiesRequestedCount`: count of requested extension capabilities
+- `trustManifest.provenance`: package digest and artifact lineage
 
-If strict `ai-catalog` schema validation rejects structured metadata values, Antfly should keep the package URL as the canonical artifact document and move rich digest/artifact lineage to either that package document or `trustManifest.provenance`. The catalog entry must still preserve ARD's exactly-one-of `url` or `data` rule.
+Antfly should keep the package URL as the canonical artifact document and put rich digest/artifact lineage in `trustManifest.provenance`. The catalog entry must preserve ARD's exactly-one-of `url` or `data` rule.
 
 Catalog `metadata` must remain schema-compatible scalar key/value data. Extension package artifact lists, artifact digests, and install lineage belong in `trustManifest.provenance`; the catalog may keep scalar hints such as package digest, package kind, trust boolean, artifact count, scope string, and capability counts in `metadata`.
 
@@ -311,9 +315,15 @@ Installed extension entry:
 
 - `type`: `application/antfly-installed-extension+json`
 - `url`: `/extensions/v1/installed/{name}`
-- `metadata.scope`: cluster/table/embedded_db
+- `metadata.digest`: installed package digest
+- `metadata.packageName`: package name
+- `metadata.packageVersion`: package version
+- `metadata.scope`: concrete scope string such as `cluster`, `embedded_db`, or `table:{name}`
+- `metadata.scopeKind`: cluster/table/embedded_db
+- `metadata.scopeTableName`: table name only for table-scoped installs
 - `metadata.status`: ready/disabled/etc.
-- `metadata.grantedCapabilities`: granted extension capabilities
+- `metadata.grantedCapabilitiesCount`: count of granted extension capabilities
+- `trustManifest.provenance`: installed extension lineage back to the package version and digest
 
 Extension MCP entries remain separate because they are directly invokable resources.
 
