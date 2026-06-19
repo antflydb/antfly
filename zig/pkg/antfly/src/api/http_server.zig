@@ -8626,7 +8626,7 @@ pub const ApiHttpServer = struct {
         var out = OwnedExternalLakeSidecarRequestContext{ .base = self.cfg.external_lake_sidecar_context };
         errdefer out.deinit(self.alloc);
         const artifacts = self.cfg.external_lake_artifact_store orelse return out;
-        if (out.base.sidecars.len == 0 or query.text_patterns.len == 0) return out;
+        if (out.base.sidecars.len == 0) return out;
 
         out.owned_candidates = try self.textSidecarCandidateSetsForRowsQueryAlloc(artifacts, out.base.sidecars, query);
         out.has_owned_candidates = true;
@@ -8684,6 +8684,16 @@ pub const ApiHttpServer = struct {
             try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(self.alloc, &sets, produced.sets);
         }
 
+        if (try self.textSidecarCandidateSetsForRowsAccessOrPredicatesAlloc(
+            artifacts,
+            sidecars,
+            query.access_or_predicates,
+        )) |produced_or_value| {
+            var produced_or = produced_or_value;
+            defer produced_or.deinit(self.alloc);
+            try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(self.alloc, &sets, produced_or.sets);
+        }
+
         return .{ .sets = try sets.toOwnedSlice(self.alloc) };
     }
 
@@ -8691,7 +8701,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         aggregate: db_mod.types.RelationalRowsAggregateRequest,
     ) !OwnedExternalLakeSidecarRequestContext {
-        if (aggregate.source.text_patterns.len == 0) {
+        if (aggregate.source.text_patterns.len == 0 and aggregate.source.access_or_predicates.len == 0) {
             return .{ .base = self.cfg.external_lake_sidecar_context };
         }
         return try self.externalLakeSidecarContextForRowsQueryAlloc(aggregate.source);
@@ -8734,6 +8744,85 @@ pub const ApiHttpServer = struct {
             if (try textSidecarCandidatePlanForRowsTextPatternAlloc(alloc, sidecars, predicate)) |plan| return plan;
         }
         return null;
+    }
+
+    fn textSidecarCandidateSetsForRowsAccessOrPredicatesAlloc(
+        self: *ApiHttpServer,
+        artifacts: *serverless_artifacts.ArtifactStore,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+        groups: []const db_mod.types.RelationalRowsAccessPredicateGroup,
+    ) !?serverless_query.LakeOwnedSidecarCandidateSets {
+        if (groups.len == 0) return null;
+
+        var union_sets = std.ArrayListUnmanaged(serverless_query.LakeOwnedSidecarCandidateSet).empty;
+        errdefer deinitOwnedCandidateSetList(self.alloc, &union_sets);
+
+        for (groups) |group| {
+            if (!accessPredicateGroupIsPureText(group)) {
+                deinitOwnedCandidateSetList(self.alloc, &union_sets);
+                return null;
+            }
+
+            var branch_sets = try self.textSidecarCandidateSetsForRowsAccessGroupAlloc(
+                artifacts,
+                sidecars,
+                group,
+            );
+            defer branch_sets.deinit(self.alloc);
+            if (branch_sets.sets.len != 1) {
+                deinitOwnedCandidateSetList(self.alloc, &union_sets);
+                return null;
+            }
+            if (union_sets.items.len != 0 and ownedCandidateSetIndexByName(union_sets.items, branch_sets.sets[0].sidecar_name) == null) {
+                deinitOwnedCandidateSetList(self.alloc, &union_sets);
+                return null;
+            }
+            try appendOwnedCandidateSetsUnioningDuplicatesAlloc(self.alloc, &union_sets, branch_sets.sets);
+        }
+
+        return .{ .sets = try union_sets.toOwnedSlice(self.alloc) };
+    }
+
+    fn textSidecarCandidateSetsForRowsAccessGroupAlloc(
+        self: *ApiHttpServer,
+        artifacts: *serverless_artifacts.ArtifactStore,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+        group: db_mod.types.RelationalRowsAccessPredicateGroup,
+    ) !serverless_query.LakeOwnedSidecarCandidateSets {
+        var sets = std.ArrayListUnmanaged(serverless_query.LakeOwnedSidecarCandidateSet).empty;
+        errdefer deinitOwnedCandidateSetList(self.alloc, &sets);
+
+        for (group.text_patterns) |predicate| {
+            const plan = (try textSidecarCandidatePlanForRowsTextPatternAlloc(
+                self.alloc,
+                sidecars,
+                predicate,
+            )) orelse continue;
+            defer if (plan.sidecar_names) |names| self.alloc.free(names);
+
+            var produced = try serverless_query.lakeTextSidecarCandidateSetsFromArtifactStoreAlloc(
+                self.alloc,
+                artifacts,
+                sidecars,
+                plan,
+            );
+            defer produced.deinit(self.alloc);
+            try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(self.alloc, &sets, produced.sets);
+        }
+
+        return .{ .sets = try sets.toOwnedSlice(self.alloc) };
+    }
+
+    fn accessPredicateGroupIsPureText(group: db_mod.types.RelationalRowsAccessPredicateGroup) bool {
+        return group.text_patterns.len != 0 and
+            group.predicates.len == 0 and
+            group.array_any.len == 0 and
+            group.array_contains.len == 0 and
+            group.array_eq.len == 0 and
+            group.in_predicates.len == 0 and
+            group.json_contains.len == 0 and
+            group.json_path_eq.len == 0 and
+            group.json_path_exists.len == 0;
     }
 
     fn textSidecarCandidatePlanForRowsTextPatternAlloc(
@@ -8866,6 +8955,37 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn appendOwnedCandidateSetsUnioningDuplicatesAlloc(
+        alloc: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(serverless_query.LakeOwnedSidecarCandidateSet),
+        incoming: []const serverless_query.LakeOwnedSidecarCandidateSet,
+    ) !void {
+        for (incoming) |candidate_set| {
+            if (ownedCandidateSetIndexByName(out.items, candidate_set.sidecar_name)) |existing_idx| {
+                const unioned = try unionOwnedRowRefsAlloc(
+                    alloc,
+                    out.items[existing_idx].row_refs,
+                    candidate_set.row_refs,
+                );
+                lake_source_binding_api.freeOwnedRowRefs(alloc, out.items[existing_idx].row_refs);
+                out.items[existing_idx].row_refs = unioned;
+                continue;
+            }
+            var cloned = try cloneOwnedCandidateSetAlloc(alloc, candidate_set);
+            errdefer cloned.deinit(alloc);
+            try out.append(alloc, cloned);
+        }
+    }
+
+    fn deinitOwnedCandidateSetList(
+        alloc: std.mem.Allocator,
+        list: *std.ArrayListUnmanaged(serverless_query.LakeOwnedSidecarCandidateSet),
+    ) void {
+        for (list.items) |*set| set.deinit(alloc);
+        list.deinit(alloc);
+        list.* = .empty;
+    }
+
     fn ownedCandidateSetIndexByName(
         values: []const serverless_query.LakeOwnedSidecarCandidateSet,
         name: []const u8,
@@ -8917,6 +9037,27 @@ pub const ApiHttpServer = struct {
         }
         for (lhs) |row_ref| {
             if (!rowRefSliceContains(rhs, row_ref)) continue;
+            if (rowRefSliceContains(out.items, row_ref)) continue;
+            try out.append(alloc, try cloneRowRefAlloc(alloc, row_ref));
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn unionOwnedRowRefsAlloc(
+        alloc: std.mem.Allocator,
+        lhs: []const rowsource_api.RowRef,
+        rhs: []const rowsource_api.RowRef,
+    ) ![]rowsource_api.RowRef {
+        var out = std.ArrayListUnmanaged(rowsource_api.RowRef).empty;
+        errdefer {
+            for (out.items) |row_ref| lake_source_binding_api.freeOwnedRowRef(alloc, row_ref);
+            out.deinit(alloc);
+        }
+        for (lhs) |row_ref| {
+            if (rowRefSliceContains(out.items, row_ref)) continue;
+            try out.append(alloc, try cloneRowRefAlloc(alloc, row_ref));
+        }
+        for (rhs) |row_ref| {
             if (rowRefSliceContains(out.items, row_ref)) continue;
             try out.append(alloc, try cloneRowRefAlloc(alloc, row_ref));
         }
@@ -20214,11 +20355,46 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 1), text_aggregate_candidates.get("intersected_ref_count").?.integer);
     try std.testing.expect(text_aggregate_candidates.get("hydration_possible").?.bool);
 
+    var or_text_sidecar_response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"any\":[{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"},{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"gamma\"}]}}}", null);
+    defer or_text_sidecar_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), or_text_sidecar_response.status);
+    try std.testing.expectEqual(@as(u32, 13), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_or_text_sidecar = try std.json.parseFromSlice(std.json.Value, alloc, or_text_sidecar_response.body, .{ .allocate = .alloc_always });
+    defer parsed_or_text_sidecar.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_or_text_sidecar.value.object.get("total").?.integer);
+    const or_text_sidecar_rows = parsed_or_text_sidecar.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), or_text_sidecar_rows.len);
+    try std.testing.expectEqual(@as(i64, 20), or_text_sidecar_rows[0].object.get("amount").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), or_text_sidecar_rows[1].object.get("amount").?.integer);
+
+    var or_text_query_explain_response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/events/rows/explain",
+        .body = "{\"query\":{\"select\":[\"amount\"],\"where\":{\"any\":[{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"},{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"gamma\"}]}}}",
+    });
+    defer or_text_query_explain_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), or_text_query_explain_response.status);
+    try std.testing.expectEqual(@as(u32, 14), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_or_text_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, or_text_query_explain_response.body, .{ .allocate = .alloc_always });
+    defer parsed_or_text_query_explain.deinit();
+    const or_text_query_explain_plan = parsed_or_text_query_explain.value.object.get("plan").?.object;
+    const or_text_query_candidates = or_text_query_explain_plan.get("sidecar_candidates").?.object;
+    try std.testing.expectEqual(@as(i64, 1), or_text_query_candidates.get("supplied_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), or_text_query_candidates.get("supplied_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), or_text_query_candidates.get("usable_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), or_text_query_candidates.get("usable_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), or_text_query_candidates.get("intersected_ref_count").?.integer);
+    try std.testing.expect(or_text_query_candidates.get("hydration_possible").?.bool);
+
     var gcs_response = try server.handlePublicTableRowsQuery("events_gcs", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":7}}}", null);
     defer gcs_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), gcs_response.status);
-    try std.testing.expectEqual(@as(u32, 13), resolver.open_count);
-    try std.testing.expectEqual(@as(u32, 12), resolver.s3_open_count);
+    try std.testing.expectEqual(@as(u32, 15), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 14), resolver.s3_open_count);
     try std.testing.expectEqual(@as(u32, 1), resolver.gcs_open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
