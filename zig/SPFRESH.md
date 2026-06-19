@@ -253,7 +253,12 @@ Current status:
   the existing atomic segment+manifest commit path, including coalescing
   individual and multi-record posting delta appends into one encoded delta-tail
   value per posting, which gives the future runtime backend an explicit
-  micro-batch append primitive. The runtime batcher also coalesces pending
+  micro-batch append primitive. Segment files keep their index sorted by
+  logical key while laying out values by record kind: posting bases first,
+  centroid-directory values next, and delta tails last. That preserves
+  binary-search lookup and makes base-batch prefetch plus centroid-directory
+  scans more sequential for file/serverless reads. The runtime batcher also
+  coalesces pending
   posting-base and centroid-directory point records so a publish window keeps
   only the latest point value while the immutable segment writer continues to
   reject duplicate exact keys; identical pending point replacements now keep the

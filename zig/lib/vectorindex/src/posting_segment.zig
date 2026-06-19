@@ -2894,17 +2894,19 @@ pub const Writer = struct {
         sortPendingEntriesIfNeeded(self.entries.items);
         try rejectDuplicateEntries(self.entries.items);
 
+        const value_offsets = try self.alloc.alloc(usize, self.entries.items.len);
+        defer self.alloc.free(value_offsets);
+
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(self.alloc);
         try out.ensureTotalCapacity(self.alloc, try encodedSegmentSizeForPendingEntries(self.entries.items));
 
-        for (self.entries.items) |entry| {
-            try out.appendSlice(self.alloc, entry.value);
-        }
+        try appendPendingEntryValuesForKind(self.alloc, &out, self.entries.items, value_offsets, .base);
+        try appendPendingEntryValuesForKind(self.alloc, &out, self.entries.items, value_offsets, .centroid_directory);
+        try appendPendingEntryValuesForKind(self.alloc, &out, self.entries.items, value_offsets, .delta);
 
         const index_offset = out.items.len;
-        var value_offset: usize = 0;
-        for (self.entries.items) |entry| {
+        for (self.entries.items, value_offsets) |entry, value_offset| {
             try appendIndexEntry(self.alloc, &out, .{
                 .posting_id = entry.posting_id,
                 .kind = entry.kind,
@@ -2913,7 +2915,6 @@ pub const Writer = struct {
                 .len = entry.value.len,
                 .value_checksum = valueChecksum(entry.value),
             });
-            value_offset += entry.value.len;
         }
         const index_end = out.items.len;
         const stored_index_checksum = indexChecksum(out.items[index_offset..index_end]);
@@ -2937,6 +2938,20 @@ pub const Writer = struct {
         };
     }
 };
+
+fn appendPendingEntryValuesForKind(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    entries: []const PendingEntry,
+    value_offsets: []usize,
+    kind: EntryKind,
+) !void {
+    for (entries, 0..) |entry, index| {
+        if (entry.kind != kind) continue;
+        value_offsets[index] = out.items.len;
+        try out.appendSlice(alloc, entry.value);
+    }
+}
 
 fn encodedSegmentSizeForPendingEntries(entries: []const PendingEntry) !usize {
     const index_bytes = std.math.mul(usize, entries.len, index_entry_size) catch return error.PostingSegmentTooLarge;
@@ -4952,10 +4967,14 @@ pub fn testReaderReportsPointValueLocations() !void {
     const reader = try Reader.init(bytes);
     const base_location = (try reader.getBaseLocation(7)).?;
     const centroid_location = (try reader.getCentroidDirectoryLocation(7)).?;
+    const other_base_location = (try reader.getBaseLocation(9)).?;
     try std.testing.expect(base_location.offset < reader.index_offset);
     try std.testing.expect(centroid_location.offset < reader.index_offset);
+    try std.testing.expectEqual(base_location.offset + base_location.len, other_base_location.offset);
+    try std.testing.expectEqual(other_base_location.offset + other_base_location.len, centroid_location.offset);
     try std.testing.expectEqualSlices(u8, "base-value", try base_location.value(bytes));
     try std.testing.expectEqualSlices(u8, "centroid-value", try centroid_location.value(bytes));
+    try std.testing.expectEqualSlices(u8, "other-base", try other_base_location.value(bytes));
     try base_location.verifyValue("base-value");
     try std.testing.expectError(error.BadPostingSegmentChecksum, base_location.verifyValue("base-VALUE"));
     try std.testing.expectError(error.CorruptedPostingSegment, base_location.verifyValue("base"));
