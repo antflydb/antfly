@@ -2465,21 +2465,17 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
         while (try iter.next()) |entry| {
             if (entry.kind != .delta) continue;
             const base_generation = base_generations.get(entry.posting_id);
-            var delta_iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
-            stats.input_delta_records += delta_iterator.recordCount();
-            while (try delta_iterator.next()) |record| {
-                if (base_generation) |generation| {
-                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) {
-                        stats.dropped_stale_delta_records += 1;
-                        continue;
-                    }
-                }
-                try deltas.append(alloc, .{
-                    .posting_id = entry.posting_id,
-                    .segment_id = segment.meta.segment_id,
-                    .record = record,
-                });
-            }
+            const appended = try appendCompactionDeltaCandidatesAlloc(
+                alloc,
+                &deltas,
+                entry.posting_id,
+                segment.meta.segment_id,
+                entry.sequence,
+                entry.value,
+                base_generation,
+            );
+            stats.input_delta_records += appended.input_records;
+            stats.dropped_stale_delta_records += appended.dropped_stale_records;
         }
     }
     sortDeltaCandidatesIfNeeded(deltas.items);
@@ -2755,6 +2751,11 @@ const DeltaCandidate = struct {
     posting_id: PostingId,
     segment_id: u64,
     record: posting.PostingDeltaRecord,
+};
+
+const CompactionDeltaAppendSummary = struct {
+    input_records: usize = 0,
+    dropped_stale_records: usize = 0,
 };
 
 const BatchPointValueRead = struct {
@@ -4981,6 +4982,73 @@ fn sortDeltaCandidatesIfNeeded(candidates: []DeltaCandidate) void {
     }
 }
 
+fn appendCompactionDeltaCandidatesAlloc(
+    alloc: Allocator,
+    candidates: *std.ArrayListUnmanaged(DeltaCandidate),
+    posting_id: PostingId,
+    segment_id: u64,
+    value_sequence: u64,
+    value: []const u8,
+    base_generation: ?u64,
+) !CompactionDeltaAppendSummary {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    const record_count = iterator.recordCount();
+    var summary = CompactionDeltaAppendSummary{ .input_records = record_count };
+
+    if (base_generation == null or posting.PostingFormat.deltaSequenceGeneration(value_sequence) > base_generation.?) {
+        try candidates.ensureUnusedCapacity(alloc, record_count);
+        while (try iterator.next()) |record| {
+            candidates.appendAssumeCapacity(.{
+                .posting_id = posting_id,
+                .segment_id = segment_id,
+                .record = record,
+            });
+        }
+        return summary;
+    }
+
+    const generation = base_generation.?;
+    if (record_count >= delta_value_live_precount_min_records) {
+        const live = try deltaValueLiveSummaryAfterGeneration(value, generation);
+        try candidates.ensureUnusedCapacity(alloc, live.records_after_generation);
+        summary.dropped_stale_records = record_count - live.records_after_generation;
+        try appendCompactionDeltaCandidatesAfterGenerationAssumeCapacity(candidates, posting_id, segment_id, value, generation);
+        return summary;
+    }
+
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) {
+            summary.dropped_stale_records += 1;
+            continue;
+        }
+        try candidates.ensureUnusedCapacity(alloc, 1);
+        candidates.appendAssumeCapacity(.{
+            .posting_id = posting_id,
+            .segment_id = segment_id,
+            .record = record,
+        });
+    }
+    return summary;
+}
+
+fn appendCompactionDeltaCandidatesAfterGenerationAssumeCapacity(
+    candidates: *std.ArrayListUnmanaged(DeltaCandidate),
+    posting_id: PostingId,
+    segment_id: u64,
+    value: []const u8,
+    generation: u64,
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+        candidates.appendAssumeCapacity(.{
+            .posting_id = posting_id,
+            .segment_id = segment_id,
+            .record = record,
+        });
+    }
+}
+
 fn retainedDeltaCandidateCount(candidates: []const DeltaCandidate) usize {
     if (candidates.len == 0) return 0;
     var count: usize = 1;
@@ -5356,6 +5424,53 @@ pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
     };
     try std.testing.expectEqual(@as(usize, 0), retainedDeltaCandidateCount(&.{}));
     try std.testing.expectEqual(@as(usize, 3), retainedDeltaCandidateCount(&candidates));
+}
+
+pub fn testCompactionDeltaCandidateAppendPrecountsLargeMixedValues() !void {
+    const alloc = std.testing.allocator;
+    const stale_count: usize = 5;
+    const live_count: usize = delta_value_live_precount_min_records;
+    const record_count = stale_count + live_count;
+    const records = try alloc.alloc(posting.PostingDeltaRecord, record_count);
+    defer alloc.free(records);
+
+    for (records[0..stale_count], 0..) |*record, i| {
+        record.* = .{
+            .sequence = (@as(u64, 2) << 32) | @as(u64, @intCast(i + 1)),
+            .op = .insert,
+            .vector_id = @intCast(1000 + i),
+        };
+    }
+    for (records[stale_count..], 0..) |*record, i| {
+        record.* = .{
+            .sequence = (@as(u64, 4) << 32) | @as(u64, @intCast(i + 1)),
+            .op = if (i == 0) .tombstone else .insert,
+            .vector_id = @intCast(2000 + i),
+        };
+    }
+
+    const encoded = try posting.PostingFormat.encodeDeltaTail(alloc, records);
+    defer alloc.free(encoded);
+    var candidates = std.ArrayListUnmanaged(DeltaCandidate).empty;
+    defer candidates.deinit(alloc);
+
+    const summary = try appendCompactionDeltaCandidatesAlloc(
+        alloc,
+        &candidates,
+        7,
+        11,
+        records[0].sequence,
+        encoded,
+        3,
+    );
+
+    try std.testing.expectEqual(record_count, summary.input_records);
+    try std.testing.expectEqual(stale_count, summary.dropped_stale_records);
+    try std.testing.expectEqual(live_count, candidates.items.len);
+    try std.testing.expectEqual(@as(PostingId, 7), candidates.items[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 11), candidates.items[0].segment_id);
+    try std.testing.expectEqual(records[stale_count], candidates.items[0].record);
+    try std.testing.expectEqual(records[record_count - 1], candidates.items[candidates.items.len - 1].record);
 }
 
 pub fn testBaseGenerationsFromCandidatesDecodesHeadersOnce() !void {
@@ -8059,6 +8174,10 @@ test "posting segment skips sorting ordered batch point reads" {
 
 test "posting segment retained delta candidate count deduplicates sequences" {
     try testRetainedDeltaCandidateCountDeduplicatesSequences();
+}
+
+test "posting segment compaction candidate append pre-counts large mixed values" {
+    try testCompactionDeltaCandidateAppendPrecountsLargeMixedValues();
 }
 
 test "posting segment base generation cache decodes headers once" {
