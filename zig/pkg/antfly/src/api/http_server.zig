@@ -97,9 +97,18 @@ const root_openapi_yaml =
     \\  /.well-known/ai-catalog.json:
     \\    get:
     \\      summary: Fetch the ARD ai-catalog manifest
+    \\  /ard/v1:
+    \\    get:
+    \\      summary: Fetch the Antfly ARD registry root
     \\  /ard/v1/catalog:
     \\    get:
     \\      summary: Fetch the authenticated tenant ARD catalog
+    \\  /ard/v1/openapi.yaml:
+    \\    get:
+    \\      summary: Fetch the ARD discovery OpenAPI document
+    \\  /ard/v1/openapi/{spec}.yaml:
+    \\    get:
+    \\      summary: Fetch an Antfly API OpenAPI document advertised by ARD
     \\  /ard/v1/search:
     \\    post:
     \\      summary: Search the authenticated tenant ARD catalog
@@ -112,9 +121,18 @@ const root_openapi_yaml =
     \\  /ard/v1/skills/{skill}:
     \\    get:
     \\      summary: Fetch a tenant-scoped Antfly skill artifact
-    \\  /ard/v1/resources/mcp/{name}:
+    \\  /ard/v1/skills/extensions/{extension}/{skill}:
     \\    get:
-    \\      summary: Fetch an MCP resource descriptor
+    \\      summary: Fetch an extension-owned skill artifact
+    \\  /ard/v1/resources/mcp/default:
+    \\    get:
+    \\      summary: Fetch the aggregate MCP resource descriptor
+    \\  /ard/v1/resources/mcp/extensions/{extension}:
+    \\    get:
+    \\      summary: Fetch an extension MCP resource descriptor
+    \\  /ard/v1/resources/mcp/profiles/{profile}:
+    \\    get:
+    \\      summary: Fetch a profile-scoped MCP resource descriptor
     \\
 ;
 
@@ -10562,6 +10580,12 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), openapi.status);
     try std.testing.expectEqualStrings("application/yaml", openapi.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "openapi:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/openapi/{spec}.yaml:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/skills/extensions/{extension}/{skill}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/default:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/extensions/{extension}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/profiles/{profile}:") != null);
 
     var openapi_wrong_method = try server.handle(.{
         .method = .POST,
