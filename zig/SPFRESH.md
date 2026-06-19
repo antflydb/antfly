@@ -122,7 +122,10 @@ Current status:
   values, avoiding repeated `DeltaValue` array growth when a posting has many
   sealed delta values. Eager catalog replay now reuses that same range lookup
   for iterator start and count, avoiding a second delta index search in segment
-  collection paths. Segment compaction also pre-counts each sorted posting
+  collection paths. Allocation-returning segment delta reads also exact-size
+  their owned record slice when metadata proves the whole segment range is
+  newer than the base generation, avoiding `ArrayList` growth on all-live
+  replay. Segment compaction also pre-counts each sorted posting
   group's retained unique delta sequences before building the replacement delta
   tail, so duplicate-heavy compactions do not grow retained-record scratch one
   winner at a time. The same compaction pass now decodes retained base headers

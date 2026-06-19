@@ -2351,12 +2351,16 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, io, dir, entry, index_data.data, posting_id, &stack_values)) orelse return try records.toOwnedSlice(alloc);
     defer range.deinit(alloc);
 
+    if (all_records_after_generation) {
+        return try readDeltaValueRangeAllRecordsOwnedAlloc(alloc, index_data.data, range);
+    }
+
     var index = range.first_index;
     while (index < range.past_index) : (index += 1) {
         const found = try deltaIndexEntryFromRange(index_data.data, range, index);
         const value = try deltaValueFromEntryRange(range, found);
         if (min_generation) |generation| {
-            if (all_records_after_generation or posting.PostingFormat.deltaSequenceGeneration(found.sequence) > generation) {
+            if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > generation) {
                 try appendDeltaValueAllRecordsAlloc(alloc, value, &records);
                 continue;
             }
@@ -4601,6 +4605,37 @@ fn appendDeltaValueAllRecordsAlloc(
     var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
     try records.ensureUnusedCapacity(alloc, iterator.recordCount());
     while (try iterator.next()) |record| records.appendAssumeCapacity(record);
+}
+
+fn readDeltaValueRangeAllRecordsOwnedAlloc(
+    alloc: Allocator,
+    index_data: []const u8,
+    range: DeltaValueRange,
+) ![]posting.PostingDeltaRecord {
+    var record_count: usize = 0;
+    var index = range.first_index;
+    while (index < range.past_index) : (index += 1) {
+        const found = try deltaIndexEntryFromRange(index_data, range, index);
+        const value = try deltaValueFromEntryRange(range, found);
+        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+        record_count = try std.math.add(usize, record_count, iterator.recordCount());
+    }
+
+    const records = try alloc.alloc(posting.PostingDeltaRecord, record_count);
+    errdefer alloc.free(records);
+    var out_index: usize = 0;
+    index = range.first_index;
+    while (index < range.past_index) : (index += 1) {
+        const found = try deltaIndexEntryFromRange(index_data, range, index);
+        const value = try deltaValueFromEntryRange(range, found);
+        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+        while (try iterator.next()) |record| {
+            records[out_index] = record;
+            out_index += 1;
+        }
+    }
+    std.debug.assert(out_index == records.len);
+    return records;
 }
 
 fn appendDeltaValueAfterGenerationAlloc(
