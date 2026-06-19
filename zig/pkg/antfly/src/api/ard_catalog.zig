@@ -2096,7 +2096,6 @@ fn catalogOptionsAllowMedia(options: CatalogOptions, media_type: []const u8, tag
     }
     if (options.profile) |profile| {
         if (!std.mem.eql(u8, profile, "copilot")) return false;
-        if (std.mem.eql(u8, media_type, "application/mcp-server+json")) return true;
         return jsonStringSliceContains(tags, profile);
     }
     return true;
@@ -2734,6 +2733,7 @@ test "ARD profile filter keeps only profile-compatible skills" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "Antfly Copilot MCP Profile") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Antfly MCP Server") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Antfly Query Builder") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Antfly Retrieval") == null);
 

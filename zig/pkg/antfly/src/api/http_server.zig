@@ -11283,6 +11283,8 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), ard_filtered_catalog_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "Antfly Copilot MCP Profile") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/profiles/copilot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/default\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") == null);
 
     var copilot_profile_resource = try server.handle(.{
@@ -11305,6 +11307,22 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer skill_filtered_profile_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), skill_filtered_profile_resource.status);
+
+    var profile_filtered_default_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default?profile=copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer profile_filtered_default_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), profile_filtered_default_resource.status);
+
+    var profile_filtered_extension_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/docsaf?profile=copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer profile_filtered_extension_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), profile_filtered_extension_resource.status);
 
     const no_permission_payload = try std.fmt.allocPrint(
         std.testing.allocator,
