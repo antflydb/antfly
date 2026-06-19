@@ -81,6 +81,7 @@ pub const ObjectStorageRangeReader = struct {
         });
         defer result.deinit(alloc);
         if (result.body.len != len) return error.InvalidLakeRangeRead;
+        try validatePlannedObjectMetadata(read, result.metadata);
         return try alloc.dupe(u8, result.body);
     }
 
@@ -104,6 +105,17 @@ pub const ObjectStorageRangeReader = struct {
         }
     }
 };
+
+fn validatePlannedObjectMetadata(read: lake_range_io.RangeRead, metadata: object_storage.ObjectMetadata) !void {
+    if (read.object.version.etag.len != 0) {
+        const returned_etag = metadata.etag orelse return error.PreconditionFailed;
+        if (!std.mem.eql(u8, returned_etag, read.object.version.etag)) return error.PreconditionFailed;
+    }
+    if (read.object.version.version_id.len != 0) {
+        const returned_version = metadata.version_id orelse return error.PreconditionFailed;
+        if (!std.mem.eql(u8, returned_version, read.object.version.version_id)) return error.PreconditionFailed;
+    }
+}
 
 fn isRetryableObjectReadError(err: anyerror) bool {
     return switch (err) {
@@ -170,6 +182,103 @@ test "object storage range reader enforces planned object etag" {
     var overwritten = try client.putObject("bucket", "events/part-a.parquet", "stale-object-body", .{});
     defer overwritten.deinit(alloc);
     try std.testing.expectError(error.PreconditionFailed, parquet_reader.readPlannedAlloc(alloc, read));
+}
+
+test "object storage range reader validates returned planned object metadata" {
+    const alloc = std.testing.allocator;
+    const MismatchedObjectStorage = struct {
+        etag: ?[]const u8 = null,
+        version_id: ?[]const u8 = null,
+
+        fn client(self: *@This()) object_storage.ObjectStorage {
+            return .{
+                .allocator = alloc,
+                .ptr = self,
+                .vtable = &.{
+                    .deinit = deinit,
+                    .bucket_exists = bucketExists,
+                    .make_bucket = makeBucket,
+                    .put_object = putObject,
+                    .get_object = getObject,
+                    .get_object_attributes = getObjectAttributes,
+                    .stat_object = statObject,
+                    .delete_object = deleteObject,
+                    .list_objects = listObjects,
+                },
+            };
+        }
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
+            return error.UnsupportedOperation;
+        }
+        fn getObject(ptr: *anyopaque, a: Allocator, bucket: []const u8, key: []const u8, opts: object_storage.GetOptions) !object_storage.GetResult {
+            _ = opts;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .body = try a.dupe(u8, "456789"),
+                .metadata = .{
+                    .bucket = try a.dupe(u8, bucket),
+                    .key = try a.dupe(u8, key),
+                    .etag = if (self.etag) |value| try a.dupe(u8, value) else null,
+                    .version_id = if (self.version_id) |value| try a.dupe(u8, value) else null,
+                    .content_length = 6,
+                },
+            };
+        }
+        fn getObjectAttributes(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectAttributes {
+            return error.UnsupportedOperation;
+        }
+        fn statObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectMetadata {
+            return error.UnsupportedOperation;
+        }
+        fn deleteObject(_: *anyopaque, _: []const u8, _: []const u8, _: object_storage.DeleteOptions) !void {
+            return error.UnsupportedOperation;
+        }
+        fn listObjects(_: *anyopaque, a: Allocator, _: []const u8, _: object_storage.ListOptions) !object_storage.ListResult {
+            return .{
+                .entries = try a.alloc(object_storage.ListEntry, 0),
+                .common_prefixes = try a.alloc([]u8, 0),
+            };
+        }
+    };
+
+    const read = lake_range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "events/part-a.parquet",
+            .byte_len = 16,
+            .version = .{ .etag = "etag-a", .version_id = "v1" },
+        },
+        .range = .{ .offset = 4, .len = 6 },
+        .purpose = .parquet_footer,
+    };
+
+    var missing_etag = MismatchedObjectStorage{ .version_id = "v1" };
+    var missing_etag_reader = ObjectStorageRangeReader.init(missing_etag.client());
+    try std.testing.expectError(error.PreconditionFailed, missing_etag_reader.parquetReader().readPlannedAlloc(alloc, read));
+
+    var wrong_etag = MismatchedObjectStorage{ .etag = "etag-b", .version_id = "v1" };
+    var wrong_etag_reader = ObjectStorageRangeReader.init(wrong_etag.client());
+    try std.testing.expectError(error.PreconditionFailed, wrong_etag_reader.parquetReader().readPlannedAlloc(alloc, read));
+
+    var missing_version = MismatchedObjectStorage{ .etag = "etag-a" };
+    var missing_version_reader = ObjectStorageRangeReader.init(missing_version.client());
+    try std.testing.expectError(error.PreconditionFailed, missing_version_reader.parquetReader().readPlannedAlloc(alloc, read));
+
+    var wrong_version = MismatchedObjectStorage{ .etag = "etag-a", .version_id = "v2" };
+    var wrong_version_reader = ObjectStorageRangeReader.init(wrong_version.client());
+    try std.testing.expectError(error.PreconditionFailed, wrong_version_reader.parquetReader().readPlannedAlloc(alloc, read));
+
+    var matching = MismatchedObjectStorage{ .etag = "etag-a", .version_id = "v1" };
+    var matching_reader = ObjectStorageRangeReader.init(matching.client());
+    const bytes = try matching_reader.parquetReader().readPlannedAlloc(alloc, read);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("456789", bytes);
 }
 
 test "object storage range reader retries transient planned reads only" {
