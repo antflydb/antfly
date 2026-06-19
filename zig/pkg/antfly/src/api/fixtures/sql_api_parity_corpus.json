@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "e871d64126b0e712b636ea6bb4dd93f64e119a273f5ab6b1146195101af1f175",
-  "source_entry_count": 922,
-  "entry_count": 922,
+  "source_sha256": "00615243f00a3f6add6dbd95251f4c025b3e85317d2ca775698d8fb462fe7dd7",
+  "source_entry_count": 924,
+  "entry_count": 924,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -2942,6 +2942,17 @@
       "sql": "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id"
     },
     {
+      "name": "create sequence if not exists catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 6
+      },
+      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=true:options=6",
+      "sql": "CREATE SEQUENCE IF NOT EXISTS usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE"
+    },
+    {
       "name": "alter sequence catalog ddl",
       "family": "ddl",
       "summary": {
@@ -2972,6 +2983,16 @@
       },
       "plan": "ddl:drop_sequence:sequence=usage_records_id_seq:if_exists=false",
       "sql": "DROP SEQUENCE usage_records_id_seq"
+    },
+    {
+      "name": "drop sequence cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_sequence",
+        "table_name": "usage_records_id_seq"
+      },
+      "plan": "ddl:drop_sequence:sequence=usage_records_id_seq:if_exists=true:cascade=true",
+      "sql": "DROP SEQUENCE IF EXISTS usage_records_id_seq CASCADE"
     },
     {
       "name": "serial identity allocator catalog ddl",

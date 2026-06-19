@@ -3351,6 +3351,17 @@
       "sql": "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id"
     },
     {
+      "name": "create sequence if not exists catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 6
+      },
+      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=true:options=6",
+      "sql": "CREATE SEQUENCE IF NOT EXISTS usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE"
+    },
+    {
       "name": "alter sequence catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3381,6 +3392,16 @@
       },
       "plan": "ddl:drop_sequence:sequence=usage_records_id_seq:if_exists=false",
       "sql": "DROP SEQUENCE usage_records_id_seq"
+    },
+    {
+      "name": "drop sequence cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_sequence",
+        "table_name": "usage_records_id_seq"
+      },
+      "plan": "ddl:drop_sequence:sequence=usage_records_id_seq:if_exists=true:cascade=true",
+      "sql": "DROP SEQUENCE IF EXISTS usage_records_id_seq CASCADE"
     },
     {
       "name": "serial identity allocator catalog ddl",

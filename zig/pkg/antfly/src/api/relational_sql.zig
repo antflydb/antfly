@@ -44782,6 +44782,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:drop_sequence:sequence=users_id_seq:if_exists=true", drop_sequence_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, drop_sequence));
 
+    var drop_sequence_cascade = try lowerDdlPlanAlloc(alloc, "DROP SEQUENCE IF EXISTS users_id_seq CASCADE;");
+    defer drop_sequence_cascade.deinit(alloc);
+    const drop_sequence_cascade_fingerprint = try ddlFingerprintAlloc(alloc, drop_sequence_cascade);
+    defer alloc.free(drop_sequence_cascade_fingerprint);
+    try std.testing.expectEqualStrings("ddl:drop_sequence:sequence=users_id_seq:if_exists=true:cascade=true", drop_sequence_cascade_fingerprint);
+
     var serial_identity = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text);");
     defer serial_identity.deinit(alloc);
     const serial_identity_plan = switch (serial_identity) {

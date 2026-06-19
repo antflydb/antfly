@@ -3878,10 +3878,13 @@ pub const AppParityCorpusCoverage = struct {
     ddl_domain_alter: bool = false,
     ddl_domain_drop: bool = false,
     ddl_sequence_create: bool = false,
+    ddl_sequence_create_if_not_exists: bool = false,
     ddl_sequence_create_typed_owned: bool = false,
     ddl_sequence_alter: bool = false,
+    ddl_sequence_alter_if_exists: bool = false,
     ddl_sequence_alter_typed_owned: bool = false,
     ddl_sequence_drop: bool = false,
+    ddl_sequence_drop_cascade: bool = false,
     ddl_identity_allocator_serial: bool = false,
     ddl_identity_allocator_generated: bool = false,
     ddl_identity_allocator_generated_options: bool = false,
@@ -5395,17 +5398,22 @@ pub const AppParityCorpusCoverage = struct {
                 .drop_domain => self.ddl_domain_drop = true,
                 .create_sequence => {
                     self.ddl_sequence_create = true;
+                    self.ddl_sequence_create_if_not_exists = self.ddl_sequence_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
                     self.ddl_sequence_create_typed_owned = self.ddl_sequence_create_typed_owned or
                         (std.mem.indexOf(u8, entry.sql, " AS bigint ") != null and
                             std.mem.indexOf(u8, entry.sql, " OWNED BY ") != null);
                 },
                 .alter_sequence => {
                     self.ddl_sequence_alter = true;
+                    self.ddl_sequence_alter_if_exists = self.ddl_sequence_alter_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
                     self.ddl_sequence_alter_typed_owned = self.ddl_sequence_alter_typed_owned or
                         (std.mem.indexOf(u8, entry.sql, " AS integer ") != null and
                             std.mem.indexOf(u8, entry.sql, " OWNED BY NONE") != null);
                 },
-                .drop_sequence => self.ddl_sequence_drop = true,
+                .drop_sequence => {
+                    self.ddl_sequence_drop = true;
+                    self.ddl_sequence_drop_cascade = self.ddl_sequence_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
                 .identity_allocator => {
                     self.ddl_identity_allocator_serial = self.ddl_identity_allocator_serial or sql_adapter.planHasAnyExactStringToken(entry.plan, ":kind=", &.{ "serial", "bigserial" });
                     self.ddl_identity_allocator_generated = self.ddl_identity_allocator_generated or sql_adapter.planHasAnyExactStringToken(entry.plan, ":kind=", &.{ "generated_by_default", "generated_always" });
@@ -6200,10 +6208,13 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_domain_alter);
         try std.testing.expect(self.ddl_domain_drop);
         try std.testing.expect(self.ddl_sequence_create);
+        try std.testing.expect(self.ddl_sequence_create_if_not_exists);
         try std.testing.expect(self.ddl_sequence_create_typed_owned);
         try std.testing.expect(self.ddl_sequence_alter);
+        try std.testing.expect(self.ddl_sequence_alter_if_exists);
         try std.testing.expect(self.ddl_sequence_alter_typed_owned);
         try std.testing.expect(self.ddl_sequence_drop);
+        try std.testing.expect(self.ddl_sequence_drop_cascade);
         try std.testing.expect(self.ddl_schema_namespace_create);
         try std.testing.expect(self.ddl_schema_namespace_rename);
         try std.testing.expect(self.ddl_schema_namespace_drop);
