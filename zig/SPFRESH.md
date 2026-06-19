@@ -1250,6 +1250,9 @@ implementations cleanly:
     to buffered delta records rather than only already-encoded point values;
     once those bounds are checked, pending delta batch records append through
     assume-capacity paths after reserving the exact incoming record count.
+    Segment garbage collection likewise pre-reserves live manifest filenames
+    and inserts them through the assume-capacity hash path before scanning for
+    orphan segment files.
     The comparison summarizer now also carries segment-relevant physical
     IO columns, including manifest writes, renames, deletes, read-call
     breakdowns, and bytes-per-read/write-call ratios, so segment-vs-LSM

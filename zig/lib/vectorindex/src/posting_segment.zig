@@ -2122,7 +2122,7 @@ pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     try live_names.ensureTotalCapacity(alloc, live_path_capacity);
     for (manifest.segments) |entry| {
         const name = canonicalSegmentFileNameFromPath(entry.path) orelse continue;
-        try live_names.put(alloc, name, {});
+        live_names.putAssumeCapacity(name, {});
     }
 
     var stats = DirectoryGarbageCollectionStats{
