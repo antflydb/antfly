@@ -2100,7 +2100,7 @@ pub const ApiHttpServer = struct {
             const rest = uri_parts.path[routes.Routes.ard_v1_resources_prefix.len..];
             if (std.mem.startsWith(u8, rest, "mcp/")) {
                 const name = rest["mcp/".len..];
-                var snapshot_opt = if (std.mem.startsWith(u8, name, "extensions/")) try self.source.adminSnapshot() else null;
+                var snapshot_opt = if (std.mem.startsWith(u8, name, "extensions/") or std.mem.startsWith(u8, name, "profiles/")) try self.source.adminSnapshot() else null;
                 defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
@@ -10947,7 +10947,51 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer ard_filtered_catalog_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), ard_filtered_catalog_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "Antfly Copilot MCP Profile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/profiles/copilot\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") == null);
+
+    var copilot_profile_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/profiles/copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer copilot_profile_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), copilot_profile_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"endpoint\":\"/mcp/v1/extensions/profiles/copilot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"store_doc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_memories\"") == null);
+
+    const no_permission_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:eve","tenant":"tenant-1","tables":[],"operations":[],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(no_permission_payload);
+    const no_permission_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, no_permission_payload);
+    defer std.testing.allocator.free(no_permission_token);
+    const no_permission_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = no_permission_token },
+    };
+
+    var no_permission_profile_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
+        .headers = &no_permission_headers,
+    });
+    defer no_permission_profile_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), no_permission_profile_catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly Copilot MCP Profile") == null);
+
+    var no_permission_profile_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/profiles/copilot",
+        .headers = &no_permission_headers,
+    });
+    defer no_permission_profile_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), no_permission_profile_resource.status);
 
     var ard_search_resp = try server.handle(.{
         .method = .POST,
