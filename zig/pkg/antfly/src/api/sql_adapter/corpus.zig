@@ -3743,6 +3743,8 @@ pub const AppParityCorpusCoverage = struct {
     ddl_set_transaction_mode: bool = false,
     ddl_start_transaction_mode: bool = false,
     ddl_begin_transaction_mode: bool = false,
+    ddl_transaction_deferrable_true: bool = false,
+    ddl_transaction_deferrable_false: bool = false,
     ddl_advisory_lock: bool = false,
     ddl_advisory_unlock: bool = false,
     read: bool = false,
@@ -5101,6 +5103,8 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_set_transaction_mode = self.ddl_set_transaction_mode or sql_adapter.planHasExactStringToken(entry.plan, ":starter=", "set_transaction");
                     self.ddl_start_transaction_mode = self.ddl_start_transaction_mode or sql_adapter.planHasExactStringToken(entry.plan, ":starter=", "start_transaction");
                     self.ddl_begin_transaction_mode = self.ddl_begin_transaction_mode or sql_adapter.planHasExactStringToken(entry.plan, ":starter=", "begin");
+                    self.ddl_transaction_deferrable_true = self.ddl_transaction_deferrable_true or sql_adapter.planHasExactStringToken(entry.plan, ":deferrable=", "true");
+                    self.ddl_transaction_deferrable_false = self.ddl_transaction_deferrable_false or sql_adapter.planHasExactStringToken(entry.plan, ":deferrable=", "false");
                 },
                 .advisory_lock => {
                     self.ddl_advisory_lock = self.ddl_advisory_lock or sql_adapter.planHasExactStringToken(entry.plan, ":action=", "lock");
@@ -5860,6 +5864,8 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_set_transaction_mode);
         try std.testing.expect(self.ddl_start_transaction_mode);
         try std.testing.expect(self.ddl_begin_transaction_mode);
+        try std.testing.expect(self.ddl_transaction_deferrable_true);
+        try std.testing.expect(self.ddl_transaction_deferrable_false);
         try std.testing.expect(self.ddl_advisory_lock);
         try std.testing.expect(self.ddl_advisory_unlock);
         try std.testing.expect(self.unsupported_query_recursive_cte_stream_plan);

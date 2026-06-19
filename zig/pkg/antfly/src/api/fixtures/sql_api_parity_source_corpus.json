@@ -416,6 +416,26 @@
       "sql": "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE"
     },
     {
+      "name": "set transaction not deferrable mode control plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "transaction_mode",
+        "operations": 3
+      },
+      "plan": "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=repeatable_read:access=read_only:deferrable=false",
+      "sql": "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY, NOT DEFERRABLE"
+    },
+    {
+      "name": "begin transaction deferrable mode control plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "transaction_mode",
+        "operations": 2
+      },
+      "plan": "ddl:transaction_control:kind=transaction_mode:starter=begin:isolation=none:access=read_write:deferrable=true",
+      "sql": "BEGIN READ WRITE DEFERRABLE"
+    },
+    {
       "name": "advisory lock transaction control plan",
       "family": "ddl",
       "summary": {

@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 879,
-  "entry_count": 879,
+  "source_entry_count": 881,
+  "entry_count": 881,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -8430,6 +8430,26 @@
       },
       "plan": "ddl:transaction_control:kind=transaction_mode:starter=begin:isolation=serializable:access=read_write:deferrable=none",
       "sql": "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE"
+    },
+    {
+      "name": "set transaction not deferrable mode control plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "transaction_mode",
+        "operations": 3
+      },
+      "plan": "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=repeatable_read:access=read_only:deferrable=false",
+      "sql": "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY, NOT DEFERRABLE"
+    },
+    {
+      "name": "begin transaction deferrable mode control plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "transaction_mode",
+        "operations": 2
+      },
+      "plan": "ddl:transaction_control:kind=transaction_mode:starter=begin:isolation=none:access=read_write:deferrable=true",
+      "sql": "BEGIN READ WRITE DEFERRABLE"
     },
     {
       "name": "advisory lock transaction control plan",
