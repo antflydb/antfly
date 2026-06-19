@@ -64953,6 +64953,169 @@ test "postgres sql adapter insert source plan collects cross-schema CTE source r
     try std.testing.expectEqualStrings("{\"id\":\"a3\",\"status\":\"ready\",\"amount\":21}", rows.rows[1]);
 }
 
+test "postgres sql adapter joined mutation consumes cross-schema CTE source rows" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"source_pk":{"type":"keyword"},"source_status":{"type":"keyword"},"source_quantity":{"type":"numeric"}},"required":["source_pk"],"additionalProperties":false}}},"primary_key":{"columns":["source_pk"]}}
+    ;
+    var parsed_target = try schema_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target.deinit(alloc);
+    const target_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_target);
+    defer runtime_schema.freeSchema(alloc, target_schema);
+    var parsed_source = try schema_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed_source.deinit(alloc);
+    const source_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source);
+    defer runtime_schema.freeSchema(alloc, source_schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-joined-mutation-cross-schema-cte-target", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-joined-mutation-cross-schema-cte-source", .{tmp.sub_path});
+    defer alloc.free(source_path);
+
+    var target_db = try db_mod.DB.open(alloc, target_path, .{});
+    defer target_db.close();
+    try target_db.applyTableSchemaJson(alloc, target_schema_json, .{});
+    var source_db = try db_mod.DB.open(alloc, source_path, .{});
+    defer source_db.close();
+    try source_db.applyTableSchemaJson(alloc, source_schema_json, .{});
+
+    const target_jsons = [_][]const u8{
+        "{\"id\":\"t1\",\"source_id\":\"s1\",\"status\":\"open\",\"quantity\":1}",
+        "{\"id\":\"t2\",\"source_id\":\"s2\",\"status\":\"open\",\"quantity\":2}",
+    };
+    var target_keys: [target_jsons.len][]u8 = undefined;
+    for (target_jsons, 0..) |row_json, i| target_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, row_json);
+    defer {
+        for (target_keys) |key| alloc.free(key);
+    }
+    const source_jsons = [_][]const u8{
+        "{\"source_pk\":\"s1\",\"source_status\":\"synced\",\"source_quantity\":42}",
+        "{\"source_pk\":\"s2\",\"source_status\":\"stale\",\"source_quantity\":99}",
+    };
+    var source_keys: [source_jsons.len][]u8 = undefined;
+    for (source_jsons, 0..) |row_json, i| source_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, source_schema, row_json);
+    defer {
+        for (source_keys) |key| alloc.free(key);
+    }
+
+    try target_db.batch(.{
+        .writes = &.{
+            .{ .key = target_keys[0], .value = target_jsons[0] },
+            .{ .key = target_keys[1], .value = target_jsons[1] },
+        },
+        .sync_level = .write,
+    });
+    try source_db.batch(.{
+        .writes = &.{
+            .{ .key = source_keys[0], .value = source_jsons[0] },
+            .{ .key = source_keys[1], .value = source_jsons[1] },
+        },
+        .sync_level = .write,
+    });
+
+    const txn_id = try target_db.beginTransaction(31_000);
+    var committed = false;
+    defer if (!committed) target_db.abortTransaction(txn_id, 31_001) catch {};
+    const row_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-joined-cross-schema-cte",
+        .txn_id = txn_id,
+    };
+
+    var lowered = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "WITH ready_sources AS (SELECT source_pk, source_status, source_quantity FROM source_records WHERE source_status = 'synced') UPDATE usage_records SET status = source.source_status, quantity = source.source_quantity FROM ready_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, status, quantity",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.target_table_name);
+    try std.testing.expectEqualStrings("source_records", lowered.source_table_name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.ctes.len);
+    try std.testing.expectEqualStrings("ready_sources", lowered.mutation.req.ctes[0].name);
+    try std.testing.expectEqualStrings("ready_sources", lowered.mutation.req.join.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 2), lowered.mutation.req.source_assignments.len);
+
+    var target_candidates = try target_db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(
+        alloc,
+        target_schema,
+        lowered.mutation.req,
+        null,
+    );
+    errdefer {
+        for (target_candidates) |*candidate| candidate.deinit(alloc);
+        if (target_candidates.len > 0) alloc.free(target_candidates);
+    }
+    var source_rows = try source_db.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(
+        alloc,
+        source_schema,
+        lowered.mutation.req,
+        null,
+    );
+    defer source_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), source_rows.total);
+    try std.testing.expectEqual(@as(usize, 1), source_rows.rows.len);
+
+    var joined_candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(
+        alloc,
+        lowered.mutation.req,
+        &target_candidates,
+        source_rows.rows,
+    );
+    errdefer {
+        for (joined_candidates) |*candidate| candidate.deinit(alloc);
+        if (joined_candidates.len > 0) alloc.free(joined_candidates);
+    }
+    var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(
+        alloc,
+        lowered.mutation.req,
+        &joined_candidates,
+    );
+    defer plan.deinit(alloc);
+
+    var result = try target_db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(
+        alloc,
+        target_schema,
+        source_schema,
+        lowered.mutation.req,
+        plan.matched,
+        plan.candidates,
+    );
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"synced\",\"quantity\":42}", result.returning_rows[0]);
+
+    try target_db.commitTransaction(txn_id, 31_010);
+    committed = true;
+
+    const select = [_][]const u8{ "id", "status", "quantity" };
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var rows = try target_db.queryRelationalRows(alloc, target_schema, .{
+        .select = select[0..],
+        .order_by = order_by[0..],
+    });
+    defer rows.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), rows.total);
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"synced\",\"quantity\":42}", rows.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"t2\",\"status\":\"open\",\"quantity\":2}", rows.rows[1]);
+}
+
 test "postgres sql adapter merge mutation batch executes through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
