@@ -983,6 +983,7 @@ pub const BulkIoSyntax = struct {
     freeze: bool = false,
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
+    force_not_null_columns: []const []const u8 = &.{},
     delimiter: ?[]const u8 = null,
     quote: ?[]const u8 = null,
     escape: ?[]const u8 = null,
@@ -993,6 +994,7 @@ pub const BulkIoSyntax = struct {
         alloc.free(@constCast(self.table_name));
         freeStringSlice(alloc, self.columns);
         freeStringSlice(alloc, self.force_quote_columns);
+        freeStringSlice(alloc, self.force_not_null_columns);
         alloc.free(@constCast(self.endpoint));
         if (self.format) |format| alloc.free(@constCast(format));
         if (self.delimiter) |delimiter| alloc.free(@constCast(delimiter));
@@ -4878,6 +4880,7 @@ pub fn parseBulkIoTailAlloc(
     var freeze = false;
     var force_quote_all = false;
     var force_quote_columns: []const []const u8 = &.{};
+    var force_not_null_columns: []const []const u8 = &.{};
     var delimiter: ?[]const u8 = null;
     var quote: ?[]const u8 = null;
     var escape: ?[]const u8 = null;
@@ -4885,6 +4888,7 @@ pub fn parseBulkIoTailAlloc(
     var encoding: ?[]const u8 = null;
     var format_transferred = false;
     var force_quote_columns_transferred = false;
+    var force_not_null_columns_transferred = false;
     var delimiter_transferred = false;
     var quote_transferred = false;
     var escape_transferred = false;
@@ -4892,6 +4896,7 @@ pub fn parseBulkIoTailAlloc(
     var encoding_transferred = false;
     errdefer if (!format_transferred) if (format) |value| alloc.free(@constCast(value));
     errdefer if (!force_quote_columns_transferred) freeStringSlice(alloc, force_quote_columns);
+    errdefer if (!force_not_null_columns_transferred) freeStringSlice(alloc, force_not_null_columns);
     errdefer if (!delimiter_transferred) if (delimiter) |value| alloc.free(@constCast(value));
     errdefer if (!quote_transferred) if (quote) |value| alloc.free(@constCast(value));
     errdefer if (!escape_transferred) if (escape) |value| alloc.free(@constCast(value));
@@ -4925,6 +4930,11 @@ pub fn parseBulkIoTailAlloc(
                     force_quote_columns = try parseIdentifierListAlloc(alloc, tokens, pos);
                     try cursor.expectToken(.rparen);
                 } else return error.UnsupportedSqlShape;
+            } else if (cursor.matchKeyword("force_not_null")) {
+                if (force_not_null_columns.len != 0) return error.UnsupportedSqlShape;
+                try cursor.expectToken(.lparen);
+                force_not_null_columns = try parseIdentifierListAlloc(alloc, tokens, pos);
+                try cursor.expectToken(.rparen);
             } else if (cursor.matchKeyword("delimiter")) {
                 if (delimiter != null) return error.UnsupportedSqlShape;
                 const value = try parseSqlStringLiteralValueAlloc(alloc, cursor);
@@ -4968,12 +4978,14 @@ pub fn parseBulkIoTailAlloc(
     }
     if (freeze and direction != .from) return error.UnsupportedSqlShape;
     if ((force_quote_all or force_quote_columns.len != 0) and direction != .to) return error.UnsupportedSqlShape;
+    if (force_not_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
 
     try parseAdapterNoopStatementEnd(cursor);
     table_transferred = true;
     endpoint_transferred = true;
     format_transferred = true;
     force_quote_columns_transferred = true;
+    force_not_null_columns_transferred = true;
     delimiter_transferred = true;
     quote_transferred = true;
     escape_transferred = true;
@@ -4989,6 +5001,7 @@ pub fn parseBulkIoTailAlloc(
         .freeze = freeze,
         .force_quote_all = force_quote_all,
         .force_quote_columns = force_quote_columns,
+        .force_not_null_columns = force_not_null_columns,
         .delimiter = delimiter,
         .quote = quote,
         .escape = escape,
@@ -8666,7 +8679,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
     try std.testing.expect(!copy_from.header);
 
-    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FREEZE true, FORMAT csv, DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
+    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FREEZE true, FORMAT csv, FORCE_NOT_NULL (id, status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
     defer lexer.freeTokens(alloc, &copy_header_tokens);
     var copy_header_pos: usize = 0;
     var copy_header = try parseBulkIoTailAlloc(alloc, copy_header_tokens.items, &copy_header_pos);
@@ -8676,6 +8689,9 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_header.format.?);
     try std.testing.expect(copy_header.header);
     try std.testing.expect(copy_header.freeze);
+    try std.testing.expectEqual(@as(usize, 2), copy_header.force_not_null_columns.len);
+    try std.testing.expectEqualStrings("id", copy_header.force_not_null_columns[0]);
+    try std.testing.expectEqualStrings("status", copy_header.force_not_null_columns[1]);
     try std.testing.expectEqualStrings(",", copy_header.delimiter.?);
     try std.testing.expectEqualStrings("\"", copy_header.quote.?);
     try std.testing.expectEqualStrings("!", copy_header.escape.?);
@@ -8706,7 +8722,12 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("id", force_quote_columns.force_quote_columns[0]);
     try std.testing.expectEqualStrings("status", force_quote_columns.force_quote_columns[1]);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (FORCE_NOT_NULL *);");
+    var force_not_null_to_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDOUT WITH (FORCE_NOT_NULL (id));");
+    defer lexer.freeTokens(alloc, &force_not_null_to_tokens);
+    var force_not_null_to_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, force_not_null_to_tokens.items, &force_not_null_to_pos));
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (FORCE_NULL (id));");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

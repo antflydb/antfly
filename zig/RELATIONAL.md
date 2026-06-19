@@ -4979,9 +4979,10 @@ setting names, scoped/reset forms, and expression values under
 `COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
 to typed bulk import/export intent that captures table identity, selected
 columns, stream endpoint, direction, format, CSV header intent, import-freeze
-intent, export force-quote column policy, delimiter byte, quote byte, escape
-byte, and null-marker string, then fails closed when applied to table schema or
-runtime storage. Stream encoding names are captured as typed bulk-I/O metadata so
+intent, export force-quote column policy, import force-not-null column policy,
+delimiter byte, quote byte, escape byte, and null-marker string, then fails
+closed when applied to table schema or runtime storage. Stream encoding names
+are captured as typed bulk-I/O metadata so
 import/export validation can normalize or transcode before row decoding. The
 production shape should stream rows through typed schema validation, defaults,
 generated columns, checks, unique/FK participants, row-policy/authorization
@@ -4990,7 +4991,7 @@ for imports, and through typed snapshot/range-read plans for exports. PostgreSQL
 adapter frontend for those contracts, but it must not bypass
 row-batch, mutation-source, or routed read semantics. Until server-file,
 `PROGRAM`, alternate stream endpoints, and richer COPY options such as
-import force-null/not-null column policies have
+import force-null column policies have
 native bulk-I/O endpoint and validation contracts, the source parity corpus
 requires them to fail closed under `bulk_io_plan`.
 

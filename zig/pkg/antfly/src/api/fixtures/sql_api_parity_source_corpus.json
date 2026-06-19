@@ -4153,19 +4153,19 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:force_quote=none:force_quote_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:force_quote=none:force_quote_columns=0:force_not_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
     },
     {
-      "name": "copy from header freeze delimiter escape null encoding bulk import ddl",
+      "name": "copy from header freeze force not null delimiter escape null encoding bulk import ddl",
       "family": "ddl",
       "summary": {
         "ddl_tag": "copy_from",
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:force_quote=none:force_quote_columns=0:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:encoding_hex=55544638",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8')"
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:force_quote=none:force_quote_columns=0:force_not_null_columns=2:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:encoding_hex=55544638",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, FORCE_NOT_NULL (id, status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8')"
     },
     {
       "name": "copy to bulk export ddl",
@@ -4175,7 +4175,7 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:force_quote=all:force_quote_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:force_quote=all:force_quote_columns=0:force_not_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *)"
     },
     {
@@ -4200,11 +4200,11 @@
       "sql": "COPY usage_records (id, status) TO STDIN"
     },
     {
-      "name": "unsupported copy force not null option",
+      "name": "unsupported copy force null option",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=bulk_io_plan",
       "classification_reason": "bulk_io_plan",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORCE_NOT_NULL *)"
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORCE_NULL (id))"
     },
     {
       "name": "create function catalog ddl",
