@@ -766,7 +766,7 @@ fn appendFlatCentroidBlockFromEntries(
     }
     var quantized = try self.quantizer.quantize(zero, vectors.centroids, entries.len);
     errdefer quantized.deinit(self.alloc);
-    try blocks.append(self.alloc, .{
+    blocks.appendAssumeCapacity(.{
         .metadata_storage = metadata.storage,
         .posting_ids = metadata.posting_ids,
         .parents = metadata.parents,

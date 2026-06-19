@@ -948,8 +948,9 @@ implementations cleanly:
    changing eviction behavior.
    Flat/two-level centroid-directory blocks now slab posting metadata arrays
    and f32 centroid/radius/measure arrays into two backing allocations per
-   block, and directory construction fills those slabs directly from sorted
-   entries instead of first copying through block-sized scratch arrays. The
+   block. Directory construction pre-reserves the exact block count, appends
+   blocks through the assume-capacity path, and fills those slabs directly from
+   sorted entries instead of first copying through block-sized scratch arrays. The
    record-backed build path also pre-sizes entry and block lists from exact
    record/posting counts and appends owned centroid entries through the
    assume-capacity path, avoiding geometric growth churn and repeated capacity
