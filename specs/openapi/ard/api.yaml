@@ -477,4 +477,3 @@ components:
           type: string
         agents:
           type: string
-
