@@ -25,6 +25,8 @@ const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_query_probe_stack_capacity = 512;
 const flat_centroid_zero_stack_capacity = 4096;
 const leaf_bounds_radius_vector_scratch_stack_capacity = 4096;
+const boundary_reassignment_moves_stack_capacity = 128;
+const boundary_reassignment_parent_stack_capacity = 128;
 const boundary_reassignment_vector_scratch_stack_capacity = 8192;
 
 pub const FlatCentroidBlock = struct {
@@ -1952,13 +1954,30 @@ fn targetedBoundaryReassignParent(
     if (initialized < 2) return result;
 
     const moves_cap = @min(max_moves, @as(usize, @intCast(std.math.maxInt(u32))));
-    var moves = try self.alloc.alloc(BoundaryMove, moves_cap);
-    defer self.alloc.free(moves);
-    const planned_out = try self.alloc.alloc(usize, initialized);
-    defer self.alloc.free(planned_out);
+    var moves_stack: [boundary_reassignment_moves_stack_capacity]BoundaryMove = undefined;
+    const use_moves_stack = moves_cap <= moves_stack.len;
+    var moves = if (use_moves_stack)
+        moves_stack[0..moves_cap]
+    else
+        try self.alloc.alloc(BoundaryMove, moves_cap);
+    defer if (!use_moves_stack) self.alloc.free(moves);
+
+    var planned_out_stack: [boundary_reassignment_parent_stack_capacity]usize = undefined;
+    const use_planned_out_stack = initialized <= planned_out_stack.len;
+    const planned_out = if (use_planned_out_stack)
+        planned_out_stack[0..initialized]
+    else
+        try self.alloc.alloc(usize, initialized);
+    defer if (!use_planned_out_stack) self.alloc.free(planned_out);
     @memset(planned_out, 0);
-    const planned_in = try self.alloc.alloc(usize, initialized);
-    defer self.alloc.free(planned_in);
+
+    var planned_in_stack: [boundary_reassignment_parent_stack_capacity]usize = undefined;
+    const use_planned_in_stack = initialized <= planned_in_stack.len;
+    const planned_in = if (use_planned_in_stack)
+        planned_in_stack[0..initialized]
+    else
+        try self.alloc.alloc(usize, initialized);
+    defer if (!use_planned_in_stack) self.alloc.free(planned_in);
     @memset(planned_in, 0);
 
     const dims: usize = @intCast(self.config.dims);
@@ -2068,8 +2087,13 @@ fn targetedBoundaryReassignParent(
     }
     if (move_count == 0) return result;
 
-    const changed = try self.alloc.alloc(bool, initialized);
-    defer self.alloc.free(changed);
+    var changed_stack: [boundary_reassignment_parent_stack_capacity]bool = undefined;
+    const use_changed_stack = initialized <= changed_stack.len;
+    const changed = if (use_changed_stack)
+        changed_stack[0..initialized]
+    else
+        try self.alloc.alloc(bool, initialized);
+    defer if (!use_changed_stack) self.alloc.free(changed);
     @memset(changed, false);
 
     var applied: usize = 0;
