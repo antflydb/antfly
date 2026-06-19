@@ -489,7 +489,6 @@ const CentroidBlockProbeCollector = struct {
         if (self.count < self.probes.len) {
             self.probes[self.count] = candidate;
             self.count += 1;
-            if (self.count == self.probes.len) self.buildHeap();
             return;
         }
 
@@ -2540,6 +2539,23 @@ test "centroid block probe collector preserves distance tie ordering" {
     try std.testing.expectEqual(@as(usize, 2), items.len);
     try std.testing.expectEqual(@as(u64, 4), items[0].posting_id);
     try std.testing.expectEqual(@as(u64, 2), items[1].posting_id);
+}
+
+test "centroid block probe collector builds heap lazily on overflow" {
+    var storage: [2]FlatCentroidProbe = undefined;
+    var collector = CentroidBlockProbeCollector.init(&storage);
+
+    collector.insert(.{ .posting_id = 1, .distance = 3, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 2, .distance = 1, .error_bound = 0 });
+    try std.testing.expect(!collector.heap_ready);
+
+    collector.insert(.{ .posting_id = 3, .distance = 2, .error_bound = 0 });
+    try std.testing.expect(collector.heap_ready);
+
+    const items = collector.items();
+    std.mem.sort(FlatCentroidProbe, items, {}, centroidBlockProbeLess);
+    try std.testing.expectEqual(@as(u64, 2), items[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 3), items[1].posting_id);
 }
 
 test "adaptive flat centroid block probing stops at clear margin" {
