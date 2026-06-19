@@ -1090,8 +1090,11 @@ implementations cleanly:
     sequence space through latest-record helpers instead of loading full tails
     for the one-vector case. Segment latest-member scans also coalesce matching
     delta values into one contiguous range read per segment before checking the
-    target vector. That preserves the format's sequence contract across the
-    file/runtime boundary. Query scratch replay applies that combined stream
+    target vector. Segment batch base prefetch now coalesces adjacent posting
+    base point values from the same segment into bounded range reads, so
+    flat/two-level directory probes do not turn a selected posting batch into
+    one file read per base value. That preserves the format's sequence contract
+    across the file/runtime boundary. Query scratch replay applies that combined stream
     directly into retained member scratch, using sorted merge for canonical bases
     and avoiding a second owned materialized member buffer on pending-overlay
     reads while preserving canonical sorted output; segment materialization now

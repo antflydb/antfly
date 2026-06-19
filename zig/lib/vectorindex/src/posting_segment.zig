@@ -39,7 +39,10 @@ const compact_sorted_delta_max_records: usize = 64;
 const compact_sorted_delta_scratch_max_records: usize = 512;
 const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
 const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
+const base_data_batch_bulk_read_max_bytes: usize = 1024 * 1024;
+const base_data_batch_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const stack_index_max_bytes: usize = 64 * 1024;
+const stack_base_value_range_max_bytes: usize = 64 * 1024;
 const stack_delta_value_range_max_bytes: usize = 64 * 1024;
 const stack_centroid_value_range_max_bytes: usize = 64 * 1024;
 
@@ -877,6 +880,9 @@ pub const LazyDirectorySnapshot = struct {
         }
         defer if (!sorted_by_segment_id) alloc.free(best_segment_ids);
 
+        var point_reads = std.ArrayListUnmanaged(BatchPointValueRead).empty;
+        defer point_reads.deinit(alloc);
+
         var segment_index = self.manifest.segments.len;
         while (segment_index > 0) {
             segment_index -= 1;
@@ -898,17 +904,22 @@ pub const LazyDirectorySnapshot = struct {
             const index_data = try readSegmentIndexWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, &stack_index);
             defer index_data.deinit(alloc);
 
+            point_reads.clearRetainingCapacity();
+
             for (posting_ids, 0..) |posting_id, i| {
                 if (sorted_by_segment_id and out[i] != null) continue;
                 if (!sorted_by_segment_id and best_segment_ids[i] >= entry.meta.segment_id) continue;
                 if (!entry.meta.mayContainPosting(posting_id)) continue;
                 const found = (try pointIndexEntryFromIndexData(index_data.data, entry.meta.entry_count, posting_id, .base)) orelse continue;
-                const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
-                if (!sorted_by_segment_id) {
-                    if (out[i]) |previous| alloc.free(previous);
-                }
-                out[i] = value;
-                if (!sorted_by_segment_id) best_segment_ids[i] = entry.meta.segment_id;
+                try point_reads.append(alloc, .{
+                    .output_index = i,
+                    .found = found,
+                });
+            }
+
+            try readSegmentBatchPointValuesAlloc(alloc, self.io, self.dir, manifest_entry, point_reads.items, out);
+            if (!sorted_by_segment_id) {
+                for (point_reads.items) |read| best_segment_ids[read.output_index] = entry.meta.segment_id;
             }
         }
 
@@ -2621,6 +2632,11 @@ const DeltaCandidate = struct {
     record: posting.PostingDeltaRecord,
 };
 
+const BatchPointValueRead = struct {
+    output_index: usize,
+    found: IndexEntry,
+};
+
 const IndexEntry = struct {
     posting_id: PostingId,
     kind: EntryKind,
@@ -3780,6 +3796,72 @@ fn readSegmentEntryValuePrefixInto(io: std.Io, dir: std.Io.Dir, entry: ManifestE
     const prefix_end = std.math.add(usize, found.offset, out.len) catch return error.CorruptedPostingSegment;
     if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset or prefix_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
     try readFileRangeInto(io, dir, entry.path, @intCast(found.offset), out);
+}
+
+fn batchPointValueReadLess(_: void, lhs: BatchPointValueRead, rhs: BatchPointValueRead) bool {
+    if (lhs.found.offset == rhs.found.offset) return lhs.output_index < rhs.output_index;
+    return lhs.found.offset < rhs.found.offset;
+}
+
+fn readSegmentBatchPointValuesAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    reads: []BatchPointValueRead,
+    out: []?[]u8,
+) !void {
+    if (reads.len == 0) return;
+    std.mem.sort(BatchPointValueRead, reads, {}, batchPointValueReadLess);
+
+    const file = try dir.openFile(io, entry.path, .{});
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    var stack_values: [stack_base_value_range_max_bytes]u8 = undefined;
+    var heap_values = std.ArrayListUnmanaged(u8).empty;
+    defer heap_values.deinit(alloc);
+
+    var read_index: usize = 0;
+    while (read_index < reads.len) {
+        var range_offset = reads[read_index].found.offset;
+        var range_end = try checkedSegmentValueEnd(entry.meta, reads[read_index].found);
+        var past_index = read_index + 1;
+        while (past_index < reads.len) : (past_index += 1) {
+            const found = reads[past_index].found;
+            const value_end = try checkedSegmentValueEnd(entry.meta, found);
+            const candidate_offset = @min(range_offset, found.offset);
+            const candidate_end = @max(range_end, value_end);
+            const candidate_len = candidate_end - candidate_offset;
+            const gap = if (found.offset > range_end) found.offset - range_end else 0;
+            if (candidate_len > base_data_batch_bulk_read_max_bytes or gap > base_data_batch_bulk_read_max_gap_bytes) break;
+            range_offset = candidate_offset;
+            range_end = candidate_end;
+        }
+
+        const range_len = range_end - range_offset;
+        const bytes = if (range_len <= stack_values.len) blk: {
+            break :blk stack_values[0..range_len];
+        } else blk: {
+            try heap_values.resize(alloc, range_len);
+            break :blk heap_values.items;
+        };
+        try reader.seekTo(@intCast(range_offset));
+        reader.interface.readSliceAll(bytes) catch |err| switch (err) {
+            error.EndOfStream => return error.CorruptedPostingSegment,
+            else => return err,
+        };
+
+        for (reads[read_index..past_index]) |read| {
+            if (read.output_index >= out.len) return error.CorruptedPostingSegment;
+            const value = try valueFromBufferedRange(bytes, range_offset, read.found);
+            const owned = try alloc.dupe(u8, value);
+            if (out[read.output_index]) |previous| alloc.free(previous);
+            out[read.output_index] = owned;
+        }
+
+        read_index = past_index;
+    }
 }
 
 fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
@@ -6775,6 +6857,12 @@ pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
         .members = &.{ 20, 30 },
     });
     defer alloc.free(new_base);
+    const new_base_8 = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 8,
+        .generation = 1,
+        .members = &.{ 80, 81, 82 },
+    });
+    defer alloc.free(new_base_8);
     const new_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
         .posting_id = 7,
         .generation = 2,
@@ -6791,6 +6879,7 @@ pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
     var writer_2 = Writer.init(alloc);
     defer writer_2.deinit();
     try writer_2.appendBase(7, new_base);
+    try writer_2.appendBase(8, new_base_8);
     try writer_2.appendCentroidDirectory(7, new_centroid);
     var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
     defer committed_2.deinit(alloc);
@@ -6817,14 +6906,18 @@ pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
     try std.testing.expectEqual(@as(u64, 2), header.generation);
     try std.testing.expectEqual(@as(usize, 2), header.member_count);
 
-    const batch_ids = [_]PostingId{ 7, 8 };
+    const batch_ids = [_]PostingId{ 7, 8, 9 };
     const batch = try snapshot.loadBaseDataBatchAlloc(alloc, &batch_ids);
     defer deinitOptionalByteSlices(alloc, batch);
     const batch_base = batch[0] orelse return error.TestExpectedEqual;
     const batch_header = try posting.PostingFormat.decodeBaseHeader(batch_base);
     try std.testing.expectEqual(@as(u64, 2), batch_header.generation);
     try std.testing.expectEqual(@as(usize, 2), batch_header.member_count);
-    try std.testing.expect(batch[1] == null);
+    const batch_base_8 = batch[1] orelse return error.TestExpectedEqual;
+    const batch_header_8 = try posting.PostingFormat.decodeBaseHeader(batch_base_8);
+    try std.testing.expectEqual(@as(u64, 1), batch_header_8.generation);
+    try std.testing.expectEqual(@as(usize, 3), batch_header_8.member_count);
+    try std.testing.expect(batch[2] == null);
 
     var centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
     defer centroid.deinit(alloc);
