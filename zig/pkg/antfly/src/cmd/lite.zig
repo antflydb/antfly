@@ -15,6 +15,7 @@
 const std = @import("std");
 const antfly = @import("antfly-zig");
 const cli = @import("cli/mod.zig");
+const httpx = @import("httpx");
 const fs_paths = antfly.common.fs_paths;
 
 const Allocator = std.mem.Allocator;
@@ -24,7 +25,9 @@ const db_mod = antfly.db;
 const db_types = db_mod.types;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
+const backups_api = antfly.public_api.backups;
 const portable_backup = antfly.portable_backup;
+const group_ids = antfly.common.group_ids;
 
 const LiteDb = struct {
     backend: antfly.lite.backend.Handle,
@@ -123,6 +126,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "backup") or std.mem.eql(u8, subcommand, "export")) return try backup(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "restore")) return try restore(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "import")) return try importBackup(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "promote")) return try promote(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "check")) return try check(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "compact") or std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(init.gpa, init.io, args);
 
@@ -524,6 +528,192 @@ fn readPortableRestoreSourceAlloc(allocator: Allocator, io: std.Io, source_path:
     return error.InvalidArguments;
 }
 
+const PromoteOptions = struct {
+    target: []const u8,
+    table: []const u8,
+    backup_id: []const u8,
+    location: []const u8,
+};
+
+const StagedPromotion = struct {
+    backup_id: []const u8,
+    location: []const u8,
+    snapshot_path: []const u8,
+    table_name: []const u8,
+
+    fn deinit(self: *StagedPromotion, allocator: Allocator) void {
+        allocator.free(self.backup_id);
+        allocator.free(self.location);
+        allocator.free(self.snapshot_path);
+        allocator.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+
+    const opts = try parsePromoteOptions(allocator, path, args);
+    defer allocator.free(opts.backup_id);
+
+    var staged = try stagePromoteBackup(allocator, path, opts.table, opts.backup_id, opts.location);
+    defer staged.deinit(allocator);
+
+    const global_config = cli.parseGlobalFlags();
+    var http = httpx.Client.initWithConfig(allocator, io, .{});
+    defer http.deinit();
+    var client = try cli.initClient(allocator, &http, global_config);
+    defer client.deinit();
+    try client.setBaseUrl(opts.target);
+    try client.restoreTable(opts.table, .{
+        .backup_id = staged.backup_id,
+        .location = staged.location,
+        .format = "portable",
+    });
+
+    cli.writeStdout(io, "{\"promoted\":true,\"table\":");
+    try writeJsonString(allocator, io, opts.table);
+    cli.writeStdout(io, ",\"target\":");
+    try writeJsonString(allocator, io, opts.target);
+    cli.writeStdout(io, ",\"backup_id\":");
+    try writeJsonString(allocator, io, staged.backup_id);
+    cli.writeStdout(io, ",\"location\":");
+    try writeJsonString(allocator, io, staged.location);
+    cli.writeStdout(io, "}\n");
+}
+
+fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.process.Args.Iterator) !PromoteOptions {
+    var target: ?[]const u8 = null;
+    var table: ?[]const u8 = null;
+    var backup_id: ?[]const u8 = null;
+    var location: []const u8 = "file:///tmp/antfly_backups";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "--url")) {
+            target = args.next();
+        } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
+            table = args.next();
+        } else if (std.mem.eql(u8, arg, "--backup-id")) {
+            backup_id = args.next();
+        } else if (std.mem.eql(u8, arg, "--location")) {
+            location = args.next() orelse location;
+        } else {
+            cli.fatal("unknown promote argument: {s}", .{arg});
+        }
+    }
+    const resolved_target = target orelse cli.fatal("--target is required", .{});
+    const resolved_table = table orelse cli.fatal("--table is required", .{});
+    return .{
+        .target = resolved_target,
+        .table = resolved_table,
+        .backup_id = if (backup_id) |id| try allocator.dupe(u8, id) else try defaultPromoteBackupIdAlloc(allocator, path),
+        .location = location,
+    };
+}
+
+fn defaultPromoteBackupIdAlloc(allocator: Allocator, path: []const u8) ![]u8 {
+    const base = std.fs.path.basename(path);
+    const stem = if (std.mem.endsWith(u8, base, ".aflite")) base[0 .. base.len - ".aflite".len] else base;
+    var out = try std.ArrayListUnmanaged(u8).initCapacity(allocator, "lite-".len + stem.len);
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "lite-");
+    for (stem) |byte| {
+        try out.append(allocator, if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_') byte else '-');
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn stagePromoteBackup(
+    allocator: Allocator,
+    path: []const u8,
+    table_name: []const u8,
+    backup_id: []const u8,
+    location_uri: []const u8,
+) !StagedPromotion {
+    try requireAflitePath(path);
+    var location = try backups_api.openBackupLocation(allocator, location_uri);
+    defer location.deinit(allocator);
+
+    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    defer lite.close();
+
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(allocator);
+    try portable_backup.exportPortable(allocator, lite.db.core.store, &portable);
+
+    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
+    errdefer allocator.free(snapshot_path);
+    try backups_api.writeFileToLocation(allocator, &location, snapshot_path, portable.items, "application/vnd.antfly.backup");
+
+    const manifest = try promoteManifest(allocator, &lite.db, table_name, backup_id, snapshot_path);
+    defer freePromoteManifest(allocator, manifest);
+    try backups_api.writeManifestToLocation(allocator, &location, &manifest);
+
+    return .{
+        .backup_id = try allocator.dupe(u8, backup_id),
+        .location = try allocator.dupe(u8, location_uri),
+        .snapshot_path = snapshot_path,
+        .table_name = try allocator.dupe(u8, table_name),
+    };
+}
+
+fn promoteManifest(
+    allocator: Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    backup_id: []const u8,
+    snapshot_path: []const u8,
+) !backups_api.TableBackupManifest {
+    const schema_json = (try db.getSchemaJson(allocator)) orelse try allocator.dupe(u8, "{}");
+    errdefer allocator.free(schema_json);
+    const indexes_json = try indexesObjectJson(allocator, db);
+    errdefer allocator.free(indexes_json);
+    const shard = try allocator.alloc(backups_api.ShardSnapshot, 1);
+    errdefer allocator.free(shard);
+    shard[0] = .{
+        .group_id = group_ids.dataGroupIdFromHash(1),
+        .start_key = try allocator.dupe(u8, ""),
+        .end_key = null,
+        .snapshot_path = try allocator.dupe(u8, snapshot_path),
+    };
+    errdefer shard[0].deinit(allocator);
+
+    return .{
+        .backup_id = try allocator.dupe(u8, backup_id),
+        .table_name = try allocator.dupe(u8, table_name),
+        .description = try allocator.dupe(u8, "Promoted from Antfly Lite"),
+        .schema_json = schema_json,
+        .read_schema_json = try allocator.dupe(u8, ""),
+        .indexes_json = indexes_json,
+        .replication_sources_json = try allocator.dupe(u8, "[]"),
+        .shards = shard,
+    };
+}
+
+fn freePromoteManifest(allocator: Allocator, manifest: backups_api.TableBackupManifest) void {
+    var owned = manifest;
+    owned.deinit(allocator);
+}
+
+fn indexesObjectJson(allocator: Allocator, db: *db_mod.DB) ![]u8 {
+    const configs = try db.listIndexes(allocator);
+    defer db_types.freeIndexConfigs(allocator, configs);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, '{');
+    for (configs, 0..) |cfg, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try appendJsonString(allocator, &out, cfg.name);
+        try out.append(allocator, ':');
+        const encoded = try std.json.Stringify.valueAlloc(allocator, cfg, .{});
+        defer allocator.free(encoded);
+        try out.appendSlice(allocator, encoded);
+    }
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
+}
+
 fn check(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
@@ -889,6 +1079,7 @@ fn printUsage(argv0: []const u8) void {
         \\  export <db.aflite> --out backup.afb
         \\  restore <backup.afb|source.aflite> --out <db.aflite> [--replace]
         \\  import <db.aflite> --from <backup.afb|source.aflite> [--replace]
+        \\  promote <db.aflite> --target <url> --table <name> [--backup-id <id>] [--location <uri>]
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
@@ -973,4 +1164,51 @@ test "lite restore source can be an aflite database" {
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"from aflite source\"") != null);
     }
+}
+
+test "lite promote stages portable afb and table manifest" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/promote-src.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/promote-backups", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(backup_root);
+    const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
+    defer allocator.free(location);
+
+    {
+        var source = try LiteDb.open(allocator, src_path, .writer);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:promote\":{\"title\":\"portable promote\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+
+    var staged = try stagePromoteBackup(allocator, src_path, "docs", "lite-promote-test", location);
+    defer staged.deinit(allocator);
+    try std.testing.expectEqualStrings("lite-promote-test", staged.backup_id);
+    try std.testing.expectEqualStrings("lite-promote-test.afb", staged.snapshot_path);
+
+    var backup_location = try backups_api.openBackupLocation(allocator, location);
+    defer backup_location.deinit(allocator);
+    var manifest = try backups_api.readManifestFromLocation(allocator, &backup_location, "lite-promote-test");
+    defer manifest.deinit(allocator);
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
+    try std.testing.expectEqualStrings("lite-promote-test.afb", manifest.shards[0].snapshot_path);
+
+    const afb_path = try std.fmt.allocPrint(allocator, "{s}/lite-promote-test.afb", .{backup_root});
+    defer allocator.free(afb_path);
+    const portable = try std.Io.Dir.cwd().readFileAlloc(io, afb_path, allocator, .limited(max_afb_file_bytes));
+    defer allocator.free(portable);
+    try std.testing.expect(portable.len > 0);
 }

@@ -1212,6 +1212,23 @@ pub fn copyFileFromLocation(
     }
 }
 
+pub fn writeFileToLocation(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    body: []const u8,
+    content_type: []const u8,
+) !void {
+    switch (location.*) {
+        .file => |backup_root| {
+            const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
+            defer alloc.free(dest_path);
+            try writeFileAbsolute(dest_path, body);
+        },
+        .remote => |*store| try store.writeBytes(alloc, trimLeftSlash(snapshot_path), body, content_type),
+    }
+}
+
 fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManifest) !TableBackupManifest {
     const shards = try alloc.alloc(ShardSnapshot, manifest.shards.len);
     var initialized_shards: usize = 0;
