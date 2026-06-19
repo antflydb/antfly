@@ -27,6 +27,7 @@ const http_internal = @import("http_internal.zig");
 const primary_mod = @import("primary.zig");
 const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
+const validation = @import("validation.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -94,6 +95,7 @@ pub const Client = struct {
         slot_name: []const u8,
         initial_lsn: ?u64,
     ) !void {
+        try validateSlotName(slot_name);
         const body = try std.json.Stringify.valueAlloc(
             self.alloc,
             struct {
@@ -127,6 +129,7 @@ pub const Client = struct {
         initial_lsn: ?u64,
         standby: *const standby_mod.Standby,
     ) !void {
+        try validateSlotName(slot_name);
         try self.verifyCompatibleUpstream(base_uri, standby);
         try self.createReplicationSlot(base_uri, slot_name, initial_lsn);
     }
@@ -151,6 +154,7 @@ pub const Client = struct {
         apply_fn: standby_mod.ApplyFn,
         options: ReplicateOptions,
     ) !Result {
+        try validateSlotName(slot_name);
         if (options.verify_upstream) {
             try self.verifyCompatibleUpstream(base_uri, standby);
         }
@@ -207,6 +211,7 @@ pub const Client = struct {
         apply_fn: standby_mod.ApplyFn,
         options: ReplicateOptions,
     ) !LoopResult {
+        try validateSlotName(slot_name);
         var iterations: usize = 0;
         var received_count: usize = 0;
         var applied_count: usize = 0;
@@ -262,6 +267,7 @@ pub const Client = struct {
         from_lsn: u64,
         options: ReplicateOptions,
     ) !ParsedResponse(internal_api.HAStartReplicationResponse) {
+        try validateSlotName(slot_name);
         const body = try std.json.Stringify.valueAlloc(
             self.alloc,
             struct {
@@ -313,6 +319,7 @@ pub const Client = struct {
         slot_name: []const u8,
         standby: *const standby_mod.Standby,
     ) !void {
+        try validateSlotName(slot_name);
         const progress = standby.currentProgress();
         const body = try std.json.Stringify.valueAlloc(
             self.alloc,
@@ -569,7 +576,16 @@ fn positiveUint64FromJson(value: i64) !u64 {
     return @intCast(value);
 }
 
+fn validateSlotName(slot_name: []const u8) !void {
+    if (!validation.isIdentifier(slot_name)) return error.InvalidSlotName;
+}
+
+fn validateBaseURI(base_uri: []const u8) !void {
+    if (!validation.isHTTPURLWithHostNoHiddenWhitespace(base_uri)) return error.InvalidInternalReplicationURL;
+}
+
 fn join(alloc: Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
+    try validateBaseURI(base_uri);
     return try routes.Routes.join(alloc, base_uri, path);
 }
 
@@ -658,6 +674,24 @@ const ApplyCapture = struct {
         const owned = try self.alloc.dupe(u8, record.payload);
         errdefer self.alloc.free(owned);
         try self.payloads.append(self.alloc, owned);
+    }
+};
+
+const NoCallExecutor = struct {
+    fn executor(self: *NoCallExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        _ = ptr;
+        _ = alloc;
+        _ = req;
+        return error.TestExecutorShouldNotRun;
     }
 };
 
@@ -939,6 +973,72 @@ fn jsonTestResponse(alloc: Allocator, value: anytype) !http_common.HttpResponse 
         .content_type = try alloc.dupe(u8, "application/json"),
         .body = try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
+}
+
+test "storage.ha http replication client rejects invalid local inputs before execution" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-local-inputs");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var executor = NoCallExecutor{};
+    var client = Client.init(alloc, executor.executor());
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+
+    try std.testing.expectError(
+        error.InvalidInternalReplicationURL,
+        client.identifySystem(" http://primary.internal.test"),
+    );
+    try std.testing.expectError(
+        error.InvalidInternalReplicationURL,
+        client.createReplicationSlot("ftp://primary.internal.test", "standby-a", 0),
+    );
+    try std.testing.expectError(
+        error.InvalidInternalReplicationURL,
+        client.replicateUntilCaughtUp(
+            "http://primary internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{},
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidSlotName,
+        client.createReplicationSlot("http://primary.internal.test", " standby-a", 0),
+    );
+    try std.testing.expectError(
+        error.InvalidSlotName,
+        client.createReplicationSlotForStandby("http://primary.internal.test", "standby/a", 0, &standby),
+    );
+    try std.testing.expectError(
+        error.InvalidSlotName,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSlotName,
+        client.replicateUntilCaughtUp(
+            "http://primary.internal.test",
+            "standby-a\n",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
+        ),
+    );
 }
 
 test "storage.ha http replication client pulls applies and acknowledges standby progress" {
