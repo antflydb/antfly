@@ -26,6 +26,7 @@ const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
+const validation = @import("validation.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -156,7 +157,7 @@ pub fn createReplicationSlot(
     primary: *primary_mod.Primary,
     request: CreateReplicationSlotRequest,
 ) !CreateReplicationSlotResponse {
-    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    try validateSlotName(request.slot_name);
     const initial_lsn = request.initial_lsn orelse primary.lastLsn();
     if (initial_lsn > primary.lastLsn()) return error.InitialLsnAheadOfPrimary;
     try primary.createSlot(request.slot_name, initial_lsn);
@@ -179,7 +180,7 @@ pub fn pauseReplicationSlot(
     primary: *primary_mod.Primary,
     request: SlotLifecycleRequest,
 ) !SlotLifecycleResponse {
-    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    try validateSlotName(request.slot_name);
     try primary.pauseSlot(request.slot_name);
     return try lifecycleResponse(primary, request.slot_name, false);
 }
@@ -188,7 +189,7 @@ pub fn resumeReplicationSlot(
     primary: *primary_mod.Primary,
     request: SlotLifecycleRequest,
 ) !SlotLifecycleResponse {
-    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    try validateSlotName(request.slot_name);
     try primary.resumeSlot(request.slot_name);
     return try lifecycleResponse(primary, request.slot_name, false);
 }
@@ -197,7 +198,7 @@ pub fn dropReplicationSlot(
     primary: *primary_mod.Primary,
     request: SlotLifecycleRequest,
 ) !SlotLifecycleResponse {
-    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    try validateSlotName(request.slot_name);
     const slot = primary.slot(request.slot_name) orelse return error.SlotNotFound;
     const response = SlotLifecycleResponse{
         .slot_name = request.slot_name,
@@ -221,7 +222,7 @@ pub fn startReplication(
     primary: *primary_mod.Primary,
     request: StartReplicationRequest,
 ) !StartReplicationResponse {
-    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    try validateSlotName(request.slot_name);
     if (request.from_lsn == 0) return error.InvalidReplicationStartLsn;
     const slot = primary.slot(request.slot_name) orelse return error.SlotNotFound;
 
@@ -300,6 +301,7 @@ pub fn standbyStatusUpdate(
     primary: *primary_mod.Primary,
     request: StandbyStatusUpdateRequest,
 ) !StandbyStatusUpdateResponse {
+    try validateSlotName(request.slot_name);
     try primary.standbyStatusUpdateWithSafeRead(
         request.slot_name,
         request.timeline_id,
@@ -320,6 +322,10 @@ pub fn standbyStatusUpdate(
         .last_error = slot.last_error,
         .current_lsn = primary.lastLsn(),
     };
+}
+
+fn validateSlotName(slot_name: []const u8) !void {
+    if (!validation.isIdentifier(slot_name)) return error.InvalidSlotName;
 }
 
 const TestPaths = struct {
@@ -397,6 +403,37 @@ test "storage.ha replication api identifies primary and creates restartable slot
     try std.testing.expectError(error.InitialLsnAheadOfPrimary, createReplicationSlot(&primary, .{
         .slot_name = "bad",
         .initial_lsn = 99,
+    }));
+}
+
+test "storage.ha replication api rejects invalid slot identifiers" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-slot-identifiers");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try createReplicationSlot(&primary, .{
+        .slot_name = "standby-a",
+        .initial_lsn = 1,
+    });
+
+    try std.testing.expectError(error.InvalidSlotName, createReplicationSlot(&primary, .{ .slot_name = "" }));
+    try std.testing.expectError(error.InvalidSlotName, createReplicationSlot(&primary, .{ .slot_name = " standby-a" }));
+    try std.testing.expectError(error.InvalidSlotName, pauseReplicationSlot(&primary, .{ .slot_name = "standby a" }));
+    try std.testing.expectError(error.InvalidSlotName, resumeReplicationSlot(&primary, .{ .slot_name = "standby/a" }));
+    try std.testing.expectError(error.InvalidSlotName, dropReplicationSlot(&primary, .{ .slot_name = "standby-a\n" }));
+    try std.testing.expectError(error.InvalidSlotName, startReplication(alloc, &primary, .{
+        .slot_name = "standby/a",
+        .from_lsn = 1,
+    }));
+    try std.testing.expectError(error.InvalidSlotName, standbyStatusUpdate(&primary, .{
+        .slot_name = "standby a",
+        .timeline_id = identity.timeline_id,
+        .received_lsn = 1,
+        .applied_lsn = 1,
     }));
 }
 
