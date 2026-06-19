@@ -140,6 +140,7 @@ pub const LakeParquetObjectRangeRowGroupPlan = lake_parquet_rowgroup.ObjectRange
 pub const LakeParquetDiscoveredObjectRangeRowGroupPlan = lake_parquet_rowgroup.DiscoveredObjectRangeRowGroupPlan;
 pub const LakeParquetObjectRangeRowsQueryRequest = lake_parquet_rowgroup.ObjectRangeRowsQueryRequest;
 pub const LakeParquetTestPlainI64Column = lake_parquet_rowgroup.TestPlainI64Column;
+pub const LakeParquetTestPlainByteArrayColumn = lake_parquet_rowgroup.TestPlainByteArrayColumn;
 pub const LakeParquetOwnedBatch = lake_parquet_rowgroup.OwnedBatch;
 pub const LakeParquetPlainI64RowGroupSource = lake_parquet_rowgroup.RowGroupSource;
 pub const LakeParquetPlainI64ObjectRangeRowGroupSource = lake_parquet_rowgroup.ObjectRangeRowGroupSource;
@@ -192,6 +193,7 @@ pub const buildLakeParquetSupportedI64CachedCoalescedObjectRangeRowGroupBatchAll
 pub const initLakeParquetServingObjectRangeCache = lake_parquet_rowgroup.ObjectRangeCache.initWithLakeServingDefaults;
 pub const buildLakeParquetTestSingleColumnPlainI64ObjectAlloc = lake_parquet_rowgroup.buildTestSingleColumnPlainI64ParquetObjectAlloc;
 pub const buildLakeParquetTestPlainI64ObjectAlloc = lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc;
+pub const buildLakeParquetTestPlainI64AndByteArrayObjectAlloc = lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc;
 pub const planLakeParquetPlainI64ObjectRangeRowGroupsAlloc = lake_parquet_rowgroup.planRequiredPlainI64ObjectRangeRowGroupsAlloc;
 pub const planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc = lake_parquet_rowgroup.planSupportedI64ObjectRangeRowGroupsAlloc;
 pub const queryLakeParquetSupportedI64ObjectRangeRowsAlloc = lake_parquet_rowgroup.querySupportedI64ObjectRangeRowsAlloc;
@@ -344,6 +346,8 @@ test "serverless query module compiles" {
     _ = LakeParquetObjectRangeRowGroupPlan;
     _ = LakeParquetDiscoveredObjectRangeRowGroupPlan;
     _ = LakeParquetObjectRangeRowsQueryRequest;
+    _ = LakeParquetTestPlainI64Column;
+    _ = LakeParquetTestPlainByteArrayColumn;
     _ = LakeParquetOwnedBatch;
     _ = LakeParquetPlainI64RowGroupSource;
     _ = LakeParquetPlainI64ObjectRangeRowGroupSource;
@@ -396,6 +400,7 @@ test "serverless query module compiles" {
     _ = planLakeParquetPlainI64ObjectRangeRowGroupsAlloc;
     _ = planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc;
     _ = initLakeParquetServingObjectRangeCache;
+    _ = buildLakeParquetTestPlainI64AndByteArrayObjectAlloc;
     _ = queryLakeParquetSupportedI64ObjectRangeRowsAlloc;
     _ = discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc;
     _ = discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc;

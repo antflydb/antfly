@@ -2791,6 +2791,71 @@ pub fn buildTestPlainI64ParquetObjectAlloc(alloc: Allocator, columns: []const Te
     return try object.toOwnedSlice(alloc);
 }
 
+pub fn buildTestPlainI64AndByteArrayParquetObjectAlloc(
+    alloc: Allocator,
+    i64_columns: []const TestPlainI64Column,
+    byte_array_columns: []const TestPlainByteArrayColumn,
+) ![]u8 {
+    if (i64_columns.len == 0 and byte_array_columns.len == 0) return error.InvalidParquetRowGroupBatch;
+    const row_count = if (i64_columns.len != 0) i64_columns[0].values.len else byte_array_columns[0].values.len;
+    if (row_count == 0) return error.InvalidParquetRowGroupBatch;
+    for (i64_columns) |column| {
+        if (column.column_id.len == 0 or column.values.len != row_count) return error.InvalidParquetRowGroupBatch;
+    }
+    for (byte_array_columns) |column| {
+        if (column.column_id.len == 0 or column.values.len != row_count) return error.InvalidParquetRowGroupBatch;
+    }
+
+    const column_count = i64_columns.len + byte_array_columns.len;
+    const chunks = try alloc.alloc(std.ArrayListUnmanaged(u8), column_count);
+    defer alloc.free(chunks);
+    @memset(chunks, .empty);
+    var initialized_chunks: usize = 0;
+    defer {
+        for (chunks[0..initialized_chunks]) |*chunk| chunk.deinit(alloc);
+    }
+    for (i64_columns, 0..) |column, idx| {
+        try appendPlainI64DataPage(&chunks[idx], alloc, column.values);
+        initialized_chunks += 1;
+    }
+    for (byte_array_columns, 0..) |column, idx| {
+        try appendPlainByteArrayDataPage(&chunks[i64_columns.len + idx], alloc, column.values);
+        initialized_chunks += 1;
+    }
+
+    const footers = try alloc.alloc(TestColumnFooter, column_count);
+    defer alloc.free(footers);
+
+    var object = std.ArrayListUnmanaged(u8).empty;
+    errdefer object.deinit(alloc);
+    try object.appendNTimes(alloc, 0, 100);
+    for (i64_columns, chunks[0..i64_columns.len], 0..) |column, chunk, idx| {
+        footers[idx] = .{
+            .column_id = column.column_id,
+            .column_offset = object.items.len,
+            .compressed_len = chunk.items.len,
+            .uncompressed_len = chunk.items.len,
+            .physical_type = 2,
+        };
+        try object.appendSlice(alloc, chunk.items);
+    }
+    for (byte_array_columns, chunks[i64_columns.len..], 0..) |column, chunk, idx| {
+        footers[i64_columns.len + idx] = .{
+            .column_id = column.column_id,
+            .column_offset = object.items.len,
+            .compressed_len = chunk.items.len,
+            .uncompressed_len = chunk.items.len,
+            .physical_type = 6,
+        };
+        try object.appendSlice(alloc, chunk.items);
+    }
+    const metadata_start = object.items.len;
+    try appendPlainI64FooterMetadata(&object, alloc, row_count, footers);
+    const metadata_len = object.items.len - metadata_start;
+    try appendParquetTrailer(&object, alloc, metadata_len);
+    return try object.toOwnedSlice(alloc);
+}
+
 fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?i64) !void {
     var present_count: usize = 0;
     for (values) |maybe| {

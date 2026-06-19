@@ -49,6 +49,7 @@ const catalog_resources = @import("catalog_resources.zig");
 const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
+const serverless_artifacts = @import("../serverless/artifacts/mod.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
 const lake_base_source = @import("../serverless/manifest/base_source.zig");
 const lake_artifact_ref = @import("../serverless/manifest/artifact_ref.zig");
@@ -275,6 +276,9 @@ pub const ApiHttpServerConfig = struct {
     /// Operator/query layers can install this while concrete sidecar query
     /// operators are being wired into public requests.
     external_lake_sidecar_context: table_reads.PinnedExternalLakeSidecarContext = .{},
+    /// Optional artifact store used by public external-lake routes to produce
+    /// sidecar candidate row refs from declared sidecar artifacts.
+    external_lake_artifact_store: ?*serverless_artifacts.ArtifactStore = null,
 };
 
 const RowsUniqueSelectorResolverContext = struct {
@@ -1556,10 +1560,17 @@ pub const ApiHttpServer = struct {
     }
 
     fn externalLakeRowsSourceOptions(self: *const ApiHttpServer) table_reads.ExternalObjectStorageLakeRowsSourceOptions {
+        return self.externalLakeRowsSourceOptionsWithSidecarContext(self.cfg.external_lake_sidecar_context);
+    }
+
+    fn externalLakeRowsSourceOptionsWithSidecarContext(
+        self: *const ApiHttpServer,
+        sidecar_context: table_reads.PinnedExternalLakeSidecarContext,
+    ) table_reads.ExternalObjectStorageLakeRowsSourceOptions {
         return .{
             .serving_cache_max_bytes = self.cfg.external_lake_serving_cache_max_bytes orelse default_external_lake_serving_cache_max_bytes,
             .persistent_cache_root_dir = self.cfg.external_lake_persistent_cache_root_dir,
-            .sidecar_context = self.cfg.external_lake_sidecar_context,
+            .sidecar_context = sidecar_context,
         };
     }
 
@@ -8543,12 +8554,22 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         schema: runtime_schema_mod.TableSchema,
     ) !table_reads.OpenedExternalObjectStorageLakeRowsSource {
+        return try self.openPublicExternalLakeRowsSourceWithOptionsAlloc(
+            schema,
+            self.externalLakeRowsSourceOptions(),
+        );
+    }
+
+    fn openPublicExternalLakeRowsSourceWithOptionsAlloc(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        lake_options: table_reads.ExternalObjectStorageLakeRowsSourceOptions,
+    ) !table_reads.OpenedExternalObjectStorageLakeRowsSource {
         const external_base_source = schema.external_base_source orelse return error.InvalidRowsRequest;
         const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
         const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
         self.external_lake_configured_resolver.configure(self.cfg.node_config, self.cfg.secret_store);
         const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_configured_resolver.resolver();
-        const lake_options = self.externalLakeRowsSourceOptions();
         const opened_store = try resolver.openParquetPrefixAlloc(self.alloc, binding, lake_options);
         return try table_reads.OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
             self.alloc,
@@ -8556,6 +8577,196 @@ pub const ApiHttpServer = struct {
             opened_store,
             lake_options,
         );
+    }
+
+    const OwnedExternalLakeSidecarRequestContext = struct {
+        base: table_reads.PinnedExternalLakeSidecarContext,
+        owned_candidates: serverless_query.LakeOwnedSidecarCandidateSets = .{ .sets = &.{} },
+        has_owned_candidates: bool = false,
+        generated_candidate_sets: []serverless_query.LakeRowsSidecarCandidateSet = &.{},
+        combined_candidate_sets: []serverless_query.LakeRowsSidecarCandidateSet = &.{},
+        generated_desired_sidecars: []serverless_query.LakeSidecarDesired = &.{},
+        combined_desired_sidecars: []serverless_query.LakeSidecarDesired = &.{},
+
+        fn context(self: *const @This()) table_reads.PinnedExternalLakeSidecarContext {
+            return .{
+                .sidecars = self.base.sidecars,
+                .desired_sidecars = if (self.combined_desired_sidecars.len != 0)
+                    self.combined_desired_sidecars
+                else if (self.generated_desired_sidecars.len != 0)
+                    self.generated_desired_sidecars
+                else
+                    self.base.desired_sidecars,
+                .sidecar_policy = self.base.sidecar_policy,
+                .candidates = if (self.combined_candidate_sets.len != 0)
+                    self.combined_candidate_sets
+                else if (self.generated_candidate_sets.len != 0)
+                    self.generated_candidate_sets
+                else
+                    self.base.candidates,
+            };
+        }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.combined_desired_sidecars.len > 0) alloc.free(self.combined_desired_sidecars);
+            if (self.generated_desired_sidecars.len > 0) alloc.free(self.generated_desired_sidecars);
+            if (self.combined_candidate_sets.len > 0) alloc.free(self.combined_candidate_sets);
+            if (self.generated_candidate_sets.len > 0) alloc.free(self.generated_candidate_sets);
+            if (self.has_owned_candidates) self.owned_candidates.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    fn externalLakeSidecarContextForRowsQueryAlloc(
+        self: *ApiHttpServer,
+        query: db_mod.types.RelationalRowsQueryRequest,
+    ) !OwnedExternalLakeSidecarRequestContext {
+        var out = OwnedExternalLakeSidecarRequestContext{ .base = self.cfg.external_lake_sidecar_context };
+        errdefer out.deinit(self.alloc);
+        const artifacts = self.cfg.external_lake_artifact_store orelse return out;
+        if (out.base.sidecars.len == 0 or query.text_patterns.len == 0) return out;
+
+        const plan = (try textSidecarCandidatePlanForRowsQueryAlloc(
+            self.alloc,
+            out.base.sidecars,
+            query,
+        )) orelse return out;
+        defer if (plan.sidecar_names) |names| self.alloc.free(names);
+
+        out.owned_candidates = try serverless_query.lakeTextSidecarCandidateSetsFromArtifactStoreAlloc(
+            self.alloc,
+            artifacts,
+            out.base.sidecars,
+            plan,
+        );
+        out.has_owned_candidates = true;
+        if (out.owned_candidates.sets.len == 0) return out;
+
+        out.generated_candidate_sets = try out.owned_candidates.asLakeRowsCandidateSetsAlloc(self.alloc);
+        out.generated_desired_sidecars = try serverless_query.lakeRowsDesiredSidecarsFromCandidateSetsAlloc(
+            self.alloc,
+            out.generated_candidate_sets,
+        );
+        if (out.base.candidates.len != 0) {
+            out.combined_candidate_sets = try concatCandidateSetsAlloc(
+                self.alloc,
+                out.base.candidates,
+                out.generated_candidate_sets,
+            );
+        }
+        if (out.base.desired_sidecars.len != 0) {
+            out.combined_desired_sidecars = try concatDesiredSidecarsAlloc(
+                self.alloc,
+                out.base.desired_sidecars,
+                out.generated_desired_sidecars,
+            );
+        }
+        return out;
+    }
+
+    fn externalLakeSidecarContextForRowsExplainAlloc(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        table_name: []const u8,
+    ) !OwnedExternalLakeSidecarRequestContext {
+        if (std.mem.trim(u8, body, " \t\r\n").len == 0) {
+            return .{ .base = self.cfg.external_lake_sidecar_context };
+        }
+        const operation = relational_rows_api.detectRowsPlanOperationWithoutSchema(self.alloc, body) catch return error.InvalidRowsRequest;
+        return switch (operation) {
+            .query => blk: {
+                var plan = relational_rows_api.parseRowsQueryPlanRequest(self.alloc, body, schema) catch return error.InvalidRowsRequest;
+                defer plan.deinit(self.alloc);
+                try self.applyRowsQueryPlanRowFilter(table_name, authenticated_identity, schema, &plan);
+                break :blk try self.externalLakeSidecarContextForRowsQueryAlloc(plan.query);
+            },
+            .aggregate, .window, .join, .lateral => .{ .base = self.cfg.external_lake_sidecar_context },
+        };
+    }
+
+    fn textSidecarCandidatePlanForRowsQueryAlloc(
+        alloc: std.mem.Allocator,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+        query: db_mod.types.RelationalRowsQueryRequest,
+    ) !?serverless_query.LakeTextSidecarCandidatePlan {
+        for (query.text_patterns) |predicate| {
+            const term = textCandidateTermFromPattern(predicate) orelse continue;
+            const sidecar_names = try textSidecarNamesForFieldAlloc(alloc, sidecars, predicate.field);
+            if (sidecar_names.len == 0) {
+                alloc.free(sidecar_names);
+                continue;
+            }
+            return .{
+                .request = .{
+                    .text = term,
+                    .operator = .any_terms,
+                    .limit = std.math.maxInt(usize),
+                },
+                .sidecar_names = sidecar_names,
+            };
+        }
+        return null;
+    }
+
+    fn textCandidateTermFromPattern(predicate: db_mod.types.RelationalRowsTextPatternPredicate) ?[]const u8 {
+        if (predicate.negated or predicate.case_insensitive or predicate.pattern.len == 0) return null;
+        for (predicate.pattern) |ch| {
+            if (ch == '%' or ch == '_' or ch == '\\') return null;
+            if (!std.ascii.isAlphanumeric(ch)) return null;
+        }
+        return predicate.pattern;
+    }
+
+    fn textSidecarNamesForFieldAlloc(
+        alloc: std.mem.Allocator,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+        field: []const u8,
+    ) ![]const []const u8 {
+        var names = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer names.deinit(alloc);
+        for (sidecars) |sidecar| {
+            if (sidecar.binding.sidecar_kind != .text) continue;
+            if (!stringSliceContains(sidecar.binding.column_bindings, field)) continue;
+            if (stringSliceContains(names.items, sidecar.name)) continue;
+            try names.append(alloc, sidecar.name);
+        }
+        return try names.toOwnedSlice(alloc);
+    }
+
+    fn concatCandidateSetsAlloc(
+        alloc: std.mem.Allocator,
+        lhs: []const serverless_query.LakeRowsSidecarCandidateSet,
+        rhs: []const serverless_query.LakeRowsSidecarCandidateSet,
+    ) ![]serverless_query.LakeRowsSidecarCandidateSet {
+        const out = try alloc.alloc(serverless_query.LakeRowsSidecarCandidateSet, lhs.len + rhs.len);
+        @memcpy(out[0..lhs.len], lhs);
+        @memcpy(out[lhs.len..], rhs);
+        return out;
+    }
+
+    fn concatDesiredSidecarsAlloc(
+        alloc: std.mem.Allocator,
+        lhs: []const serverless_query.LakeSidecarDesired,
+        rhs: []const serverless_query.LakeSidecarDesired,
+    ) ![]serverless_query.LakeSidecarDesired {
+        var out = std.ArrayListUnmanaged(serverless_query.LakeSidecarDesired).empty;
+        errdefer out.deinit(alloc);
+        try out.ensureTotalCapacity(alloc, lhs.len + rhs.len);
+        for (lhs) |item| out.appendAssumeCapacity(item);
+        for (rhs) |item| {
+            if (desiredSidecarsContainName(out.items, item.name)) continue;
+            out.appendAssumeCapacity(item);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn desiredSidecarsContainName(values: []const serverless_query.LakeSidecarDesired, name: []const u8) bool {
+        for (values) |value| {
+            if (std.mem.eql(u8, value.name, name)) return true;
+        }
+        return false;
     }
 
     pub fn handlePublicTableRowsSource(
@@ -8619,7 +8830,16 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        var lake_source = self.openPublicExternalLakeRowsSourceAlloc(schema) catch |err| switch (err) {
+        var sidecar_request_context = self.externalLakeSidecarContextForRowsExplainAlloc(schema, body, authenticated_identity, table_name) catch |err| switch (err) {
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows explain request"),
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+        defer sidecar_request_context.deinit(self.alloc);
+        var lake_source = self.openPublicExternalLakeRowsSourceWithOptionsAlloc(
+            schema,
+            self.externalLakeRowsSourceOptionsWithSidecarContext(sidecar_request_context.context()),
+        ) catch |err| switch (err) {
             error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows explain unavailable"),
             error.ExternalLakeCredentialRefNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ExternalLakeCredentialScopeMismatch => return try textResponse(self.alloc, 403, "forbidden"),
@@ -8868,7 +9088,6 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
-        const source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
         const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
@@ -8885,11 +9104,34 @@ pub const ApiHttpServer = struct {
         const result_schema = relational_rows_api.rowsReadPlanOutputColumnsAlloc(self.alloc, schema, .{ .query = plan }) catch return try textResponse(self.alloc, 400, "invalid rows query request");
         defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
+        var sidecar_context = if (schema.external_base_source != null)
+            try self.externalLakeSidecarContextForRowsQueryAlloc(plan.query)
+        else
+            OwnedExternalLakeSidecarRequestContext{ .base = self.cfg.external_lake_sidecar_context };
+        defer sidecar_context.deinit(self.alloc);
+        var lake_source: ?table_reads.OpenedExternalObjectStorageLakeRowsSource = null;
+        defer if (lake_source) |*source| source.deinit();
+        const source = if (schema.external_base_source != null) blk: {
+            lake_source = self.openPublicExternalLakeRowsSourceWithOptionsAlloc(
+                schema,
+                self.externalLakeRowsSourceOptionsWithSidecarContext(sidecar_context.context()),
+            ) catch |err| switch (err) {
+                error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
+                error.ExternalLakeCredentialRefNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.ExternalLakeCredentialScopeMismatch => return try textResponse(self.alloc, 403, "forbidden"),
+                error.InvalidRowsRequest => return try textResponse(self.alloc, 404, "not found"),
+                error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
+                else => return err,
+            };
+            break :blk lake_source.?.source();
+        } else self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
+
         var result = (source.rowsQueryPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows query request"),
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
             else => {
                 std.log.err("public table rows query failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "rows query failed");
@@ -19102,11 +19344,15 @@ test "api http server routes public external lake row queries through configured
     const object_store_support = @import("../serverless/object_store_support.zig");
     const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
     const external_source_api = @import("../serverless/external_source/mod.zig");
+    const external_rowsource = @import("../storage/rowsource/external.zig");
+    const rowsource_api = @import("../storage/rowsource/types.zig");
+    const lake_source_binding = @import("../serverless/segment/source_binding.zig");
+    const lake_sidecar_text_build = @import("../serverless/build/lake_sidecar_text.zig");
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["amount","discount","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"},"description":{"type":"text"}},"required":["amount","discount","tenant","rank","description"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
     const gcs_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"gs://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["amount","discount","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"gs://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"},"description":{"type":"text"}},"required":["amount","discount","tenant","rank","description"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
 
     const FakeSource = struct {
@@ -19226,10 +19472,72 @@ test "api http server routes public external lake row queries through configured
         .{ .column_id = "tenant", .values = &[_]i64{ 7, 8, 8 } },
         .{ .column_id = "rank", .values = &[_]i64{ 1, 3, 2 } },
     };
-    const parquet_object = try serverless_query.buildLakeParquetTestPlainI64ObjectAlloc(alloc, &parquet_columns);
+    const parquet_text_columns = [_]serverless_query.LakeParquetTestPlainByteArrayColumn{
+        .{ .column_id = "description", .values = &[_][]const u8{ "alpha", "beta", "gamma" } },
+    };
+    const parquet_object = try serverless_query.buildLakeParquetTestPlainI64AndByteArrayObjectAlloc(alloc, &parquet_columns, &parquet_text_columns);
     defer alloc.free(parquet_object);
     var put = try client.putObject("bucket", "events/part-a.parquet", parquet_object, .{});
     defer put.deinit(alloc);
+
+    var inventory = try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
+        .client = client,
+        .bucket = "bucket",
+        .prefix = "events",
+        .source_id = "events",
+        .source_uri = "s3://bucket/events",
+        .schema_fingerprint = "schema-v1",
+    });
+    defer inventory.deinit(alloc);
+    const external_binding = external_rowsource.Binding{
+        .format = .parquet,
+        .source_id = "events",
+        .source_uri = "s3://bucket/events",
+        .snapshot_id = inventory.snapshot_id,
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource_api.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "part-a.parquet", 0, 0),
+        try external_rowsource.makeRowRef(external_binding, "part-a.parquet", 0, 1),
+        try external_rowsource.makeRowRef(external_binding, "part-a.parquet", 0, 2),
+    };
+    const descriptions = [_][]const u8{ "alpha", "beta", "gamma" };
+    const sidecar_columns = [_]rowsource_api.ColumnVector{
+        .{ .name = "description", .values = .{ .bytes = &descriptions } },
+    };
+    const sidecar_batches = [_]rowsource_api.ColumnBatch{.{
+        .snapshot = external_binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &sidecar_columns,
+    }};
+    var sidecar_source = try external_rowsource.BatchSource.init(external_binding, &sidecar_batches);
+    const text_binding = lake_source_binding.bindingFromSnapshot(
+        .text,
+        .external_parquet,
+        external_binding.snapshot(),
+        external_binding.schema_fingerprint,
+        &[_][]const u8{"description"},
+        "sha256:text-description",
+    );
+    var artifact_tmp = std.testing.tmpDir(.{});
+    defer artifact_tmp.cleanup();
+    const artifact_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/external-lake-artifacts", .{artifact_tmp.sub_path});
+    defer alloc.free(artifact_path);
+    var fs_artifacts = try serverless_artifacts.FsStore.init(alloc, artifact_path);
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var text_sidecar = try lake_sidecar_text_build.publishTextSidecarFromRowSourceAlloc(
+        alloc,
+        &artifact_store,
+        sidecar_source.rowSource(),
+        text_binding,
+        .{
+            .name = "events.description.text",
+            .text_column = "description",
+            .config_json = "{\"analyzer\":\"simple\"}",
+        },
+    );
+    defer text_sidecar.deinit(alloc);
 
     var source = FakeSource{ .tables = .{ .{
         .table_id = 1,
@@ -19243,27 +19551,7 @@ test "api http server routes public external lake row queries through configured
         .desired_replica_count = 1,
     } } };
     var base_reads = FakeBaseReads{};
-    const sidecars = [_]lake_sidecar_manifest.DeclaredArtifact{.{
-        .name = "events.amount.vector",
-        .binding = .{
-            .sidecar_kind = .vector,
-            .source_kind = .external_parquet,
-            .row_ref_kind = .external,
-            .source_id = "events",
-            .snapshot_id = "sha256:configured",
-            .schema_fingerprint = "schema-v1",
-            .column_bindings = &[_][]const u8{"amount"},
-            .index_config_hash = "sha256:vector",
-        },
-        .artifact = .{
-            .kind = lake_artifact_ref.ArtifactKind.vector_segment,
-            .name = "events.amount.vector",
-            .artifact_id = "artifact:vector:configured",
-            .byte_len = 1,
-            .checksum = "sha256:artifact",
-        },
-    }};
-    const desired_sidecars = [_]serverless_query.LakeSidecarDesired{.{ .name = "events.description.text" }};
+    const sidecars = [_]lake_sidecar_manifest.DeclaredArtifact{text_sidecar.declaration};
     var resolver = FakeLakeResolver{
         .memory = &memory,
         .expected_serving_cache_max_bytes = 4096,
@@ -19276,8 +19564,8 @@ test "api http server routes public external lake row queries through configured
             .external_lake_serving_cache_max_bytes = 4096,
             .external_lake_sidecar_context = .{
                 .sidecars = sidecars[0..],
-                .desired_sidecars = desired_sidecars[0..],
             },
+            .external_lake_artifact_store = &artifact_store,
         },
         source.iface(),
         base_reads.source(),
@@ -19314,10 +19602,24 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 20), ordered_rows[0].object.get("amount").?.integer);
     try std.testing.expect(ordered_rows[0].object.get("rank") == null);
 
+    var text_sidecar_response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"}}}", null);
+    defer text_sidecar_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), text_sidecar_response.status);
+    try std.testing.expectEqual(@as(u32, 3), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_text_sidecar = try std.json.parseFromSlice(std.json.Value, alloc, text_sidecar_response.body, .{ .allocate = .alloc_always });
+    defer parsed_text_sidecar.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_text_sidecar.value.object.get("total").?.integer);
+    const text_sidecar_rows = parsed_text_sidecar.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), text_sidecar_rows.len);
+    try std.testing.expectEqual(@as(i64, 20), text_sidecar_rows[0].object.get("amount").?.integer);
+    try std.testing.expect(text_sidecar_rows[0].object.get("description") == null);
+
     var aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"net_amount_sum\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]}},{\"name\":\"large_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter\":{\"field\":\"amount\",\"op\":\"gte\",\"value\":20}},{\"name\":\"rank_two_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter_in\":[{\"field\":\"rank\",\"op\":\"in\",\"value\":[2]}]}]}}", null);
     defer aggregate_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), aggregate_response.status);
-    try std.testing.expectEqual(@as(u32, 3), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 4), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, aggregate_response.body, .{ .allocate = .alloc_always });
@@ -19344,7 +19646,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer source_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), source_response.status);
-    try std.testing.expectEqual(@as(u32, 4), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 5), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_source = try std.json.parseFromSlice(std.json.Value, alloc, source_response.body, .{ .allocate = .alloc_always });
@@ -19366,7 +19668,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), explain_response.status);
-    try std.testing.expectEqual(@as(u32, 5), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 6), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_explain = try std.json.parseFromSlice(std.json.Value, alloc, explain_response.body, .{ .allocate = .alloc_always });
@@ -19394,8 +19696,11 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqualStrings("schema-v1", explain_plan.get("schema_fingerprint").?.string);
     const sidecar_selection = explain_plan.get("sidecar_selection").?.object;
     try std.testing.expectEqual(@as(i64, 1), sidecar_selection.get("declared_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 0), sidecar_selection.get("selected_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), sidecar_selection.get("not_requested_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), sidecar_selection.get("selected_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), sidecar_selection.get("not_requested_count").?.integer);
+    const sidecar_candidates = explain_plan.get("sidecar_candidates").?.object;
+    try std.testing.expectEqual(@as(i64, 0), sidecar_candidates.get("supplied_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), sidecar_candidates.get("selected_without_candidates_count").?.integer);
     const range_cache = explain_plan.get("range_cache_accounting").?.object;
     const total_range_cache = range_cache.get("total").?.object;
     try std.testing.expectEqual(@as(i64, 0), total_range_cache.get("stored_bytes").?.integer);
@@ -19407,7 +19712,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer query_explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), query_explain_response.status);
-    try std.testing.expectEqual(@as(u32, 6), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 7), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, query_explain_response.body, .{ .allocate = .alloc_always });
@@ -19426,11 +19731,32 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqualStrings("scan", query_explain_plan.get("operation").?.string);
     try std.testing.expectEqual(@as(i64, 1), query_explain_plan.get("projected_column_count").?.integer);
 
+    var text_query_explain_response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/events/rows/explain",
+        .body = "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"}}}",
+    });
+    defer text_query_explain_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), text_query_explain_response.status);
+    try std.testing.expectEqual(@as(u32, 8), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_text_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, text_query_explain_response.body, .{ .allocate = .alloc_always });
+    defer parsed_text_query_explain.deinit();
+    const text_query_explain_plan = parsed_text_query_explain.value.object.get("plan").?.object;
+    const text_query_candidates = text_query_explain_plan.get("sidecar_candidates").?.object;
+    try std.testing.expectEqual(@as(i64, 1), text_query_candidates.get("supplied_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_query_candidates.get("supplied_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_query_candidates.get("usable_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_query_candidates.get("usable_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_query_candidates.get("intersected_ref_count").?.integer);
+    try std.testing.expect(text_query_candidates.get("hydration_possible").?.bool);
+
     var gcs_response = try server.handlePublicTableRowsQuery("events_gcs", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":7}}}", null);
     defer gcs_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), gcs_response.status);
-    try std.testing.expectEqual(@as(u32, 7), resolver.open_count);
-    try std.testing.expectEqual(@as(u32, 6), resolver.s3_open_count);
+    try std.testing.expectEqual(@as(u32, 9), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 8), resolver.s3_open_count);
     try std.testing.expectEqual(@as(u32, 1), resolver.gcs_open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
