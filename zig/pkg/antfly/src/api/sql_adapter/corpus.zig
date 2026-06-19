@@ -3923,6 +3923,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_from: bool = false,
     ddl_copy_header: bool = false,
     ddl_copy_delimiter: bool = false,
+    ddl_copy_quote: bool = false,
     ddl_copy_to: bool = false,
     ddl_partition_create_parent: bool = false,
     ddl_partition_create_child: bool = false,
@@ -5343,7 +5344,7 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_copy_unsupported_options = self.unsupported_ddl_copy_unsupported_options or
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     std.mem.startsWith(u8, entry.sql, "COPY ") and
-                    std.mem.indexOf(u8, entry.sql, "QUOTE") != null);
+                    std.mem.indexOf(u8, entry.sql, "ESCAPE") != null);
             self.unsupported_ddl_covering_expression_index_plan = self.unsupported_ddl_covering_expression_index_plan or
                 (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
                     std.mem.indexOf(u8, entry.sql, "lower(") != null and
@@ -5590,6 +5591,7 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_from = true;
                     self.ddl_copy_header = self.ddl_copy_header or sql_adapter.planHasExactBoolToken(entry.plan, ":header=", true);
                     self.ddl_copy_delimiter = self.ddl_copy_delimiter or sql_adapter.planHasExactStringToken(entry.plan, ":delimiter_hex=", "2c");
+                    self.ddl_copy_quote = self.ddl_copy_quote or sql_adapter.planHasExactStringToken(entry.plan, ":quote_hex=", "22");
                 },
                 .copy_to => self.ddl_copy_to = true,
                 .create_partitioned_table => self.ddl_partition_create_parent = true,
@@ -6536,6 +6538,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_copy_from);
         try std.testing.expect(self.ddl_copy_header);
         try std.testing.expect(self.ddl_copy_delimiter);
+        try std.testing.expect(self.ddl_copy_quote);
         try std.testing.expect(self.ddl_copy_to);
         try std.testing.expect(self.ddl_partition_create_parent);
         try std.testing.expect(self.ddl_partition_create_child);

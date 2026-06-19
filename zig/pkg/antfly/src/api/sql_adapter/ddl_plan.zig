@@ -1666,6 +1666,7 @@ pub const BulkIoPlan = struct {
     format: ?[]const u8 = null,
     header: bool = false,
     delimiter: ?[]const u8 = null,
+    quote: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -1673,6 +1674,7 @@ pub const BulkIoPlan = struct {
         alloc.free(self.endpoint);
         if (self.format) |format| alloc.free(format);
         if (self.delimiter) |delimiter| alloc.free(delimiter);
+        if (self.quote) |quote| alloc.free(quote);
         self.* = undefined;
     }
 };
