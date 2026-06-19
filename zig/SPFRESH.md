@@ -130,7 +130,10 @@ Current status:
   writers now use assume-capacity value, index, and footer appends after the
   exact encoded size has been reserved, removing repeated allocator capacity
   checks from immutable segment construction. Manifest encoding now follows the
-  same exact-size/assume-capacity path for segment metadata entries.
+  same exact-size/assume-capacity path for segment metadata entries. Directory
+  compaction planning also pre-reserves its selected segment-id list from the
+  manifest length and configured segment cap, avoiding growth churn while
+  choosing bounded compaction inputs.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and

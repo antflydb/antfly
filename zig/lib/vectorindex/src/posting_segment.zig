@@ -1645,6 +1645,7 @@ pub fn planDirectoryCompactionAlloc(alloc: Allocator, manifest: Manifest, option
     };
     var selected_ids = std.ArrayListUnmanaged(u64).empty;
     errdefer selected_ids.deinit(alloc);
+    try selected_ids.ensureTotalCapacity(alloc, maxDirectoryCompactionSelectedSegments(manifest.segments.len, options.max_input_segments));
 
     var selected_bytes: usize = 0;
     var selected_entries: usize = 0;
@@ -1694,6 +1695,11 @@ pub fn planDirectoryCompactionFromDirectoryAlloc(
         .next_segment_id = manifest.next_segment_id,
         .segments = entries,
     }, plan_options);
+}
+
+fn maxDirectoryCompactionSelectedSegments(manifest_segments: usize, max_input_segments: usize) usize {
+    if (max_input_segments == 0) return manifest_segments;
+    return @min(manifest_segments, max_input_segments);
 }
 
 pub fn openStoreAlloc(alloc: Allocator, manifest_data: []const u8, context: anytype, comptime readSegmentAlloc: anytype) !OwnedSegmentStore {
@@ -6037,6 +6043,9 @@ pub fn testDirectoryCompactionPlannerSelectsWithinBudgets() !void {
         .next_segment_id = 4,
         .segments = entries[0..],
     };
+    try std.testing.expectEqual(@as(usize, 3), maxDirectoryCompactionSelectedSegments(manifest.segments.len, 0));
+    try std.testing.expectEqual(@as(usize, 2), maxDirectoryCompactionSelectedSegments(manifest.segments.len, 2));
+    try std.testing.expectEqual(@as(usize, 3), maxDirectoryCompactionSelectedSegments(manifest.segments.len, 5));
 
     var by_count = try planDirectoryCompactionAlloc(alloc, manifest, .{
         .max_input_segments = 2,
