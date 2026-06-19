@@ -59,6 +59,17 @@ pub const DocumentEntry = struct {
     is_delete: bool = false,
 };
 
+pub const DocumentMutation = struct {
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+};
+
+pub const OwnedDocument = struct {
+    key: []u8,
+    value: []u8,
+};
+
 pub const CheckpointSlot = struct {
     commit_sequence: u64 = 0,
     catalog_root_page: u64 = 0,
@@ -241,19 +252,42 @@ pub const NativeFile = struct {
     }
 
     pub fn putDocument(self: *NativeFile, key: []const u8, value: []const u8) !void {
-        try self.appendDocumentEntry(.{
-            .previous_page = self.activeCheckpoint().document_root_page,
-            .key = key,
-            .value = value,
-        });
+        try self.putDocumentBatch(&.{.{ .key = key, .value = value }});
     }
 
     pub fn deleteDocument(self: *NativeFile, key: []const u8) !void {
-        try self.appendDocumentEntry(.{
-            .previous_page = self.activeCheckpoint().document_root_page,
-            .key = key,
-            .is_delete = true,
-        });
+        try self.putDocumentBatch(&.{.{ .key = key, .is_delete = true }});
+    }
+
+    pub fn putDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (mutations.len == 0) return;
+
+        const previous = self.activeCheckpoint();
+        const first_page_id = previous.page_count;
+        var next_root_page = previous.document_root_page;
+
+        for (mutations, 0..) |mutation, index| {
+            const page_id = first_page_id + @as(u64, @intCast(index));
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeDocumentEntry(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = mutation.key,
+                .value = mutation.value,
+                .is_delete = mutation.is_delete,
+            });
+            try self.writePage(page_id, .document, payload.items);
+            next_root_page = page_id;
+        }
+
+        try self.file.sync(self.io_impl.io());
+
+        var next = previous;
+        next.commit_sequence += 1;
+        next.document_root_page = next_root_page;
+        next.page_count = first_page_id + @as(u64, @intCast(mutations.len));
+        try self.publishCheckpoint(next);
     }
 
     pub fn getDocumentAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
@@ -271,27 +305,70 @@ pub const NativeFile = struct {
         return null;
     }
 
-    pub fn maxPagePayloadBytes(self: *const NativeFile) usize {
-        return @as(usize, @intCast(self.header.page_size)) - page_header_size;
+    pub fn snapshotDocumentsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedDocument {
+        var map = std.StringHashMapUnmanaged(?[]u8).empty;
+        defer {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                if (entry.value_ptr.*) |value| allocator.free(value);
+            }
+            map.deinit(allocator);
+        }
+
+        var page_id = self.activeCheckpoint().document_root_page;
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
+            defer allocator.free(payload);
+            const entry = try decodeDocumentEntry(payload);
+
+            if (!map.contains(entry.key)) {
+                const owned_key = try allocator.dupe(u8, entry.key);
+                errdefer allocator.free(owned_key);
+                const owned_value = if (entry.is_delete) null else try allocator.dupe(u8, entry.value);
+                errdefer if (owned_value) |value| allocator.free(value);
+                try map.put(allocator, owned_key, owned_value);
+            }
+            page_id = entry.previous_page;
+        }
+
+        var docs = std.ArrayListUnmanaged(OwnedDocument).empty;
+        errdefer {
+            for (docs.items) |doc| {
+                allocator.free(doc.key);
+                allocator.free(doc.value);
+            }
+            docs.deinit(allocator);
+        }
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const value = entry.value_ptr.* orelse continue;
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            const value_copy = try allocator.dupe(u8, value);
+            errdefer allocator.free(value_copy);
+            try docs.append(allocator, .{ .key = key, .value = value_copy });
+        }
+
+        std.mem.sort(OwnedDocument, docs.items, {}, struct {
+            fn lessThan(_: void, lhs: OwnedDocument, rhs: OwnedDocument) bool {
+                return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            }
+        }.lessThan);
+
+        return try docs.toOwnedSlice(allocator);
     }
 
-    fn appendDocumentEntry(self: *NativeFile, entry: DocumentEntry) !void {
-        const previous = self.activeCheckpoint();
-        const page_id = previous.page_count;
-        var payload = std.ArrayListUnmanaged(u8).empty;
-        defer payload.deinit(self.allocator);
-        try encodeDocumentEntry(self.allocator, &payload, .{
-            .previous_page = previous.document_root_page,
-            .key = entry.key,
-            .value = entry.value,
-            .is_delete = entry.is_delete,
-        });
+    pub fn freeSnapshotDocuments(allocator: Allocator, docs: []OwnedDocument) void {
+        for (docs) |doc| {
+            allocator.free(doc.key);
+            allocator.free(doc.value);
+        }
+        allocator.free(docs);
+    }
 
-        var next = previous;
-        next.commit_sequence += 1;
-        next.document_root_page = page_id;
-        next.page_count = page_id + 1;
-        _ = try self.appendPage(.document, payload.items, next);
+    pub fn maxPagePayloadBytes(self: *const NativeFile) usize {
+        return @as(usize, @intCast(self.header.page_size)) - page_header_size;
     }
 
     fn readPagePayloadByKindAlloc(self: *NativeFile, allocator: Allocator, page_id: u64, kind: PageKind) ![]u8 {
@@ -319,11 +396,19 @@ pub const NativeFile = struct {
 
     fn appendPage(self: *NativeFile, kind: PageKind, contents: []const u8, checkpoint: CheckpointSlot) !u64 {
         if (self.read_only) return error.ReadOnly;
-        if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
 
         const previous = self.activeCheckpoint();
         const page_id = previous.page_count;
         if (checkpoint.page_count != page_id + 1) return error.InvalidNativeCheckpoint;
+
+        try self.writePage(page_id, kind, contents);
+        try self.file.sync(self.io_impl.io());
+        try self.publishCheckpoint(checkpoint);
+        return page_id;
+    }
+
+    fn writePage(self: *NativeFile, page_id: u64, kind: PageKind, contents: []const u8) !void {
+        if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
 
         const page_size: usize = @intCast(self.header.page_size);
         const page_offset = page_id * @as(u64, self.header.page_size);
@@ -334,10 +419,6 @@ pub const NativeFile = struct {
 
         try self.file.setLength(self.io_impl.io(), page_offset + self.header.page_size);
         try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
-        try self.file.sync(self.io_impl.io());
-
-        try self.publishCheckpoint(checkpoint);
-        return page_id;
     }
 
     fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
@@ -978,6 +1059,73 @@ test "lite native document store detects corrupted root page" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getDocumentAlloc(allocator, "doc:1"));
+}
+
+test "lite native document batch publishes one checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-batch.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocumentBatch(&.{
+            .{ .key = "doc:b", .value = "second" },
+            .{ .key = "doc:a", .value = "first" },
+            .{ .key = "doc:b", .value = "newer second" },
+            .{ .key = "doc:c", .value = "deleted" },
+            .{ .key = "doc:c", .is_delete = true },
+        });
+        try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(u64, 6), file.activeCheckpoint().page_count);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const doc_a = (try reopened.getDocumentAlloc(allocator, "doc:a")).?;
+    defer allocator.free(doc_a);
+    try std.testing.expectEqualStrings("first", doc_a);
+
+    const doc_b = (try reopened.getDocumentAlloc(allocator, "doc:b")).?;
+    defer allocator.free(doc_b);
+    try std.testing.expectEqualStrings("newer second", doc_b);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(allocator, "doc:c"));
+}
+
+test "lite native document snapshot returns sorted live records" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-snapshot.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocumentBatch(&.{
+        .{ .key = "doc:b", .value = "second" },
+        .{ .key = "doc:a", .value = "first" },
+        .{ .key = "doc:b", .value = "newer second" },
+        .{ .key = "doc:c", .value = "third" },
+        .{ .key = "doc:c", .is_delete = true },
+    });
+
+    const docs = try file.snapshotDocumentsAlloc(allocator);
+    defer NativeFile.freeSnapshotDocuments(allocator, docs);
+
+    try std.testing.expectEqual(@as(usize, 2), docs.len);
+    try std.testing.expectEqualStrings("doc:a", docs[0].key);
+    try std.testing.expectEqualStrings("first", docs[0].value);
+    try std.testing.expectEqualStrings("doc:b", docs[1].key);
+    try std.testing.expectEqualStrings("newer second", docs[1].value);
 }
 
 test "lite native check validates committed root chains" {

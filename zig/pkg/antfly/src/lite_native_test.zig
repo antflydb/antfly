@@ -12,12 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const backend = @import("backend.zig");
-pub const docstore = @import("docstore.zig");
-pub const native = @import("native.zig");
-
 test {
-    _ = backend;
-    _ = docstore;
-    _ = native;
+    _ = @import("storage/lite/docstore.zig");
+    _ = @import("storage/lite/native.zig");
 }

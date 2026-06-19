@@ -2642,6 +2642,23 @@ pub fn build(b: *std.Build) void {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const lite_native_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, lite_native_test_mod, true, true);
+    const lite_native_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lite_native_tests = b.addRunArtifact(lite_native_tests);
+    const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
+    lite_native_test_step.dependOn(&run_lite_native_tests.step);
+
     const lib_recall_default_filters = [_][]const u8{
         "HBC recall",
     };
