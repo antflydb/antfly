@@ -67,9 +67,11 @@ pub const AppliedRelationalSqlDdlRecord = struct {
     requires_rebuild: bool = false,
     validation_required: bool = false,
     rewrite_required: bool = false,
+    work_items: []const relational_sql.AppliedDdlWorkItem = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         metadata_table_manager.freeTable(alloc, self.table);
+        if (self.work_items.len > 0) alloc.free(self.work_items);
         self.* = undefined;
     }
 };
@@ -1317,11 +1319,14 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
     defer applied.deinit(alloc);
 
     const updated = try applyRelationalDdlSchemaRecordAlloc(alloc, table, applied.schema_json);
+    const work_items = applied.work_items;
+    applied.work_items = &.{};
     return .{
         .table = updated,
         .requires_rebuild = applied.requires_rebuild,
         .validation_required = applied.validation_required,
         .rewrite_required = applied.rewrite_required,
+        .work_items = work_items,
     };
 }
 
@@ -4925,6 +4930,8 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expect(altered.requires_rebuild);
     try std.testing.expect(!altered.validation_required);
     try std.testing.expect(!altered.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 1), altered.work_items.len);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, altered.work_items[0].action);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"status\":{\"type\":\"keyword\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.read_schema_json, "\"version\":0") != null);
@@ -4939,6 +4946,9 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expect(generated.requires_rebuild);
     try std.testing.expect(!generated.validation_required);
     try std.testing.expect(generated.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 2), generated.work_items.len);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, generated.work_items[0].action);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rewrite, generated.work_items[1].action);
 
     var indexed = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
@@ -4950,6 +4960,9 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expect(indexed.requires_rebuild);
     try std.testing.expect(indexed.validation_required);
     try std.testing.expect(!indexed.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 2), indexed.work_items.len);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, indexed.work_items[0].action);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.validate, indexed.work_items[1].action);
     try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"users_tenant_email_key\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"version\":2") != null);
 

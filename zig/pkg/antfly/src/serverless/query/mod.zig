@@ -70,6 +70,8 @@ pub const QueryExecutionMetrics = runtime.QueryExecutionMetrics;
 pub const NamespaceQueryExecutionMetrics = runtime.NamespaceQueryExecutionMetrics;
 pub const LakeRowsGroupByRequest = lake_rows.GroupByRequest;
 pub const LakeRowsGroupByResult = lake_rows.GroupByResult;
+pub const LakeRowsExpressionAggregateRequest = lake_rows.ExpressionAggregateRequest;
+pub const LakeRowsExpressionAggregateResult = lake_rows.ExpressionAggregateResult;
 pub const LakeRowsHydrateResult = lake_rows.HydrateResult;
 pub const LakeRowsPredicate = lake_rows.Predicate;
 pub const LakeRowsPredicateOp = lake_rows.PredicateOp;
@@ -219,6 +221,7 @@ pub const discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromCachedFootersAl
 pub const planProjectedLakeScanAlloc = lake_scan_plan.planProjectedScanAlloc;
 pub const validateLakeBindingInventory = lake_scan_plan.validateBindingInventory;
 pub const executeLakeRowsGroupByAlloc = lake_rows.executeGroupByAlloc;
+pub const executeLakeRowsExpressionAggregatesAlloc = lake_rows.executeExpressionAggregatesAlloc;
 pub const hydrateLakeRowsAlloc = lake_rows.hydrateRowsAlloc;
 pub const hydrateLakeRowsExcludingDeletedAlloc = lake_rows.hydrateRowsExcludingDeletedAlloc;
 pub const hydrateLakeRowsForBindingAlloc = lake_rows.hydrateRowsForBindingAlloc;
@@ -296,6 +299,8 @@ test "serverless query module compiles" {
     _ = NamespaceQueryExecutionMetrics;
     _ = LakeRowsGroupByRequest;
     _ = LakeRowsGroupByResult;
+    _ = LakeRowsExpressionAggregateRequest;
+    _ = LakeRowsExpressionAggregateResult;
     _ = LakeRowsHydrateResult;
     _ = LakeRowsPredicate;
     _ = LakeRowsPredicateOp;
@@ -445,6 +450,7 @@ test "serverless query module compiles" {
     _ = planProjectedLakeScanAlloc;
     _ = validateLakeBindingInventory;
     _ = executeLakeRowsGroupByAlloc;
+    _ = executeLakeRowsExpressionAggregatesAlloc;
     _ = hydrateLakeRowsAlloc;
     _ = hydrateLakeRowsExcludingDeletedAlloc;
     _ = hydrateLakeRowsForBindingAlloc;

@@ -34,6 +34,12 @@ pub const GroupByRequest = struct {
     deleted_row_refs: []const rowsource.RowRef = &.{},
 };
 
+pub const ExpressionAggregateRequest = struct {
+    expressions: []const algebraic_segment.ExpressionSpec,
+    materialized_source: ?MaterializedSourceRef = null,
+    deleted_row_refs: []const rowsource.RowRef = &.{},
+};
+
 pub const MaterializedSourceRef = struct {
     kind: rowsource.SourceKind,
     source_id: []const u8 = &.{},
@@ -75,6 +81,34 @@ pub const GroupByResult = struct {
     pub fn find(self: GroupByResult, key: []const u8) ?algebraic_segment.AggregateValue {
         for (self.groups) |group| {
             if (std.mem.eql(u8, group.key, key)) return group.value;
+        }
+        return null;
+    }
+};
+
+pub const ExpressionResult = struct {
+    name: []u8,
+    value: algebraic_segment.AggregateValue,
+
+    pub fn deinit(self: *ExpressionResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const ExpressionAggregateResult = struct {
+    expressions: []ExpressionResult,
+    source: enum { rowsource_scan, algebraic_expression },
+
+    pub fn deinit(self: *ExpressionAggregateResult, alloc: Allocator) void {
+        for (self.expressions) |*expression| expression.deinit(alloc);
+        alloc.free(self.expressions);
+        self.* = undefined;
+    }
+
+    pub fn find(self: ExpressionAggregateResult, name: []const u8) ?algebraic_segment.AggregateValue {
+        for (self.expressions) |expression| {
+            if (std.mem.eql(u8, expression.name, name)) return expression.value;
         }
         return null;
     }
@@ -212,6 +246,24 @@ pub fn executeGroupByAlloc(
         }
     }
     return try resultFromSourceAlloc(alloc, source, request);
+}
+
+pub fn executeExpressionAggregatesAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    request: ExpressionAggregateRequest,
+    materialized: ?*const algebraic_segment.ExpressionReader,
+) !ExpressionAggregateResult {
+    try validateExpressionAggregateRequest(request);
+    if (request.materialized_source) |required| {
+        if (required.kind != source.kind) return error.LakeRowsMaterializedSourceMismatch;
+    }
+    if (materialized) |reader| {
+        if (request.deleted_row_refs.len == 0 and materializedExpressionMatches(reader.*, request)) {
+            return try expressionResultFromAlgebraicAlloc(alloc, reader.*, request.expressions);
+        }
+    }
+    return try expressionResultFromSourceAlloc(alloc, source, request);
 }
 
 pub fn scanRowsAlloc(
@@ -455,6 +507,18 @@ fn validateRequest(request: GroupByRequest) !void {
     if (request.materialized_source) |required| try required.validate();
 }
 
+fn validateExpressionAggregateRequest(request: ExpressionAggregateRequest) !void {
+    if (request.expressions.len == 0) return error.InvalidLakeRowsQuery;
+    if (request.materialized_source) |required| try required.validate();
+    for (request.expressions, 0..) |expression, idx| {
+        if (expression.name.len == 0) return error.InvalidLakeRowsQuery;
+        if (expression.op != .count and expression.value_column.len == 0) return error.InvalidLakeRowsQuery;
+        for (request.expressions[0..idx]) |previous| {
+            if (std.mem.eql(u8, previous.name, expression.name)) return error.InvalidLakeRowsQuery;
+        }
+    }
+}
+
 fn validateScanRequest(request: ScanRequest) !void {
     if (request.projected_columns.len == 0) return error.InvalidLakeRowsQuery;
     for (request.projected_columns) |column| {
@@ -587,6 +651,28 @@ fn materializedMatches(reader: algebraic_segment.Reader, request: GroupByRequest
         reader.segment.aggregate.op == request.op;
 }
 
+fn materializedExpressionMatches(reader: algebraic_segment.ExpressionReader, request: ExpressionAggregateRequest) bool {
+    if (request.materialized_source) |required| {
+        if (!materializedSourceMatches(reader.materialization.source, required)) return false;
+    }
+    for (request.expressions) |spec| {
+        const expression = findMaterializedExpression(reader.materialization, spec.name) orelse return false;
+        if (expression.op != spec.op) return false;
+        if (!std.mem.eql(u8, expression.value_column, spec.value_column)) return false;
+    }
+    return true;
+}
+
+fn findMaterializedExpression(
+    materialization: algebraic_segment.ExpressionMaterialization,
+    name: []const u8,
+) ?algebraic_segment.ExpressionFold {
+    for (materialization.expressions) |expression| {
+        if (std.mem.eql(u8, expression.name, name)) return expression;
+    }
+    return null;
+}
+
 fn materializedSourceMatches(source: algebraic_segment.SourceRef, required: MaterializedSourceRef) bool {
     return source.kind == algebraicSourceKindForRowSourceKind(required.kind) and
         std.mem.eql(u8, source.source_id, required.source_id) and
@@ -625,6 +711,30 @@ fn resultFromAlgebraicAlloc(
     }
 
     return .{ .groups = groups, .source = .algebraic_segment };
+}
+
+fn expressionResultFromAlgebraicAlloc(
+    alloc: Allocator,
+    reader: algebraic_segment.ExpressionReader,
+    expressions: []const algebraic_segment.ExpressionSpec,
+) !ExpressionAggregateResult {
+    const out = try alloc.alloc(ExpressionResult, expressions.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*expression| expression.deinit(alloc);
+    }
+
+    for (expressions, out) |spec, *item| {
+        const expression = findMaterializedExpression(reader.materialization, spec.name) orelse return error.LakeRowsMaterializedExpressionMismatch;
+        item.* = .{
+            .name = try alloc.dupe(u8, expression.name),
+            .value = expression.value,
+        };
+        initialized += 1;
+    }
+
+    return .{ .expressions = out, .source = .algebraic_expression };
 }
 
 fn resultFromSourceAlloc(
@@ -683,6 +793,68 @@ fn resultFromSourceAlloc(
     }
     std.mem.sort(GroupResult, groups, {}, compareGroupResult);
     return .{ .groups = groups, .source = .rowsource_scan };
+}
+
+const ExpressionAccumulator = struct {
+    spec: algebraic_segment.ExpressionSpec,
+    value: algebraic_segment.AggregateValue = .{ .count = 0 },
+    initialized: bool = false,
+};
+
+fn expressionResultFromSourceAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    request: ExpressionAggregateRequest,
+) !ExpressionAggregateResult {
+    const accumulators = try alloc.alloc(ExpressionAccumulator, request.expressions.len);
+    defer alloc.free(accumulators);
+    for (request.expressions, accumulators) |spec, *accumulator| {
+        accumulator.* = .{ .spec = spec };
+    }
+
+    while (try source.next(alloc)) |batch| {
+        for (accumulators) |*accumulator| {
+            const value_column = if (accumulator.spec.op == .count) null else batch.findColumn(accumulator.spec.value_column) orelse return error.RowSourceColumnNotFound;
+            if (value_column) |column| {
+                if (column.kind() != .i64) return error.UnsupportedLakeRowsValueColumnKind;
+            }
+            for (0..batch.rowCount()) |row_idx| {
+                if (containsRowRef(request.deleted_row_refs, batch.row_refs[row_idx])) continue;
+                const next_value = rowAggregateValue(accumulator.spec.op, value_column, row_idx) orelse continue;
+                if (!accumulator.initialized) {
+                    accumulator.value = next_value;
+                    accumulator.initialized = true;
+                } else {
+                    accumulator.value = combine(accumulator.value, next_value);
+                }
+            }
+        }
+    }
+
+    const out = try alloc.alloc(ExpressionResult, accumulators.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*expression| expression.deinit(alloc);
+    }
+    for (accumulators, out) |accumulator, *item| {
+        const value = if (accumulator.initialized) accumulator.value else emptyExpressionAggregateValue(accumulator.spec.op) orelse return error.EmptyLakeRowsExpressionAggregate;
+        item.* = .{
+            .name = try alloc.dupe(u8, accumulator.spec.name),
+            .value = value,
+        };
+        initialized += 1;
+    }
+
+    return .{ .expressions = out, .source = .rowsource_scan };
+}
+
+fn emptyExpressionAggregateValue(op: algebraic_segment.AggregateOp) ?algebraic_segment.AggregateValue {
+    return switch (op) {
+        .count => .{ .count = 0 },
+        .sum_i64 => .{ .sum_i64 = 0 },
+        .min_i64, .max_i64, .avg_i64 => null,
+    };
 }
 
 fn rowAggregateValue(
@@ -986,6 +1158,124 @@ test "lake rows group-by rejects stale algebraic materialization source" {
 
     try std.testing.expectEqual(@as(usize, 1), result.groups.len);
     try std.testing.expectEqual(@as(i64, 10), result.find("t1").?.sum_i64);
+    try std.testing.expectEqual(.rowsource_scan, result.source);
+}
+
+test "lake rows expression aggregates can use algebraic materialization" {
+    const alloc = std.testing.allocator;
+    var materialization = algebraic_segment.ExpressionMaterialization{
+        .source = .{
+            .kind = .serverless_fragment,
+            .snapshot_id = try alloc.dupe(u8, "manifest-1"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "orders"),
+        },
+        .expressions = try alloc.alloc(algebraic_segment.ExpressionFold, 2),
+    };
+    defer materialization.deinit(alloc);
+    materialization.expressions[0] = .{
+        .name = try alloc.dupe(u8, "row_count"),
+        .op = .count,
+        .value = .{ .count = 3 },
+    };
+    materialization.expressions[1] = .{
+        .name = try alloc.dupe(u8, "amount_sum"),
+        .value_column = try alloc.dupe(u8, "amount"),
+        .op = .sum_i64,
+        .value = .{ .sum_i64 = 42 },
+    };
+
+    const encoded = try algebraic_segment.encodeExpressionAlloc(alloc, materialization);
+    defer alloc.free(encoded);
+    var reader = try algebraic_segment.ExpressionReader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+
+    const EmptySource = struct {
+        fn next(_: *anyopaque, _: Allocator) !?rowsource.ColumnBatch {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const source = rowsource.Source{
+        .kind = .serverless_fragment,
+        .ctx = &dummy,
+        .next_batch = EmptySource.next,
+    };
+    const specs = [_]algebraic_segment.ExpressionSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+    };
+
+    var result = try executeExpressionAggregatesAlloc(alloc, source, .{
+        .expressions = &specs,
+        .materialized_source = .{
+            .kind = .serverless_fragment,
+            .source_id = "orders",
+            .snapshot_id = "manifest-1",
+            .schema_fingerprint = "schema-v1",
+        },
+    }, &reader);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.expressions.len);
+    try std.testing.expectEqual(@as(u64, 3), result.find("row_count").?.count);
+    try std.testing.expectEqual(@as(i64, 42), result.find("amount_sum").?.sum_i64);
+    try std.testing.expectEqual(.algebraic_expression, result.source);
+}
+
+test "lake rows expression aggregates reject stale algebraic materialization source" {
+    const alloc = std.testing.allocator;
+    const local = @import("../../storage/rowsource/local.zig");
+
+    var materialization = algebraic_segment.ExpressionMaterialization{
+        .source = .{
+            .kind = .relational_store,
+            .snapshot_id = try alloc.dupe(u8, "manifest-1"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "orders"),
+        },
+        .expressions = try alloc.alloc(algebraic_segment.ExpressionFold, 1),
+    };
+    defer materialization.deinit(alloc);
+    materialization.expressions[0] = .{
+        .name = try alloc.dupe(u8, "amount_sum"),
+        .value_column = try alloc.dupe(u8, "amount"),
+        .op = .sum_i64,
+        .value = .{ .sum_i64 = 999 },
+    };
+
+    const encoded = try algebraic_segment.encodeExpressionAlloc(alloc, materialization);
+    defer alloc.free(encoded);
+    var reader = try algebraic_segment.ExpressionReader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .relational_key = "row:a" },
+        .{ .relational_key = "row:b" },
+    };
+    const amounts = [_]i64{ 10, 20 };
+    const columns = [_]rowsource.ColumnVector{.{ .name = "amount", .values = .{ .i64 = &amounts } }};
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "manifest-2" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try local.relationalStoreSource(&batches);
+    const specs = [_]algebraic_segment.ExpressionSpec{.{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 }};
+
+    var result = try executeExpressionAggregatesAlloc(alloc, batch_source.rowSource(), .{
+        .expressions = &specs,
+        .materialized_source = .{
+            .kind = .relational_store,
+            .source_id = "orders",
+            .snapshot_id = "manifest-2",
+            .schema_fingerprint = "schema-v1",
+        },
+    }, &reader);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.expressions.len);
+    try std.testing.expectEqual(@as(i64, 30), result.find("amount_sum").?.sum_i64);
     try std.testing.expectEqual(.rowsource_scan, result.source);
 }
 

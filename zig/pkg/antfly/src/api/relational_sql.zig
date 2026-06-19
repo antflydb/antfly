@@ -312,6 +312,10 @@ pub const CreateIndexPlan = sql_adapter.CreateIndexPlan;
 pub const DdlIndexMethod = sql_adapter.DdlIndexMethod;
 pub const DdlIndexOpClass = sql_adapter.DdlIndexOpClass;
 pub const AppliedDdlSchemaJson = sql_adapter.AppliedDdlSchemaJson;
+pub const AppliedDdlWorkAction = sql_adapter.AppliedDdlWorkAction;
+pub const AppliedDdlWorkSubject = sql_adapter.AppliedDdlWorkSubject;
+pub const AppliedDdlWorkReason = sql_adapter.AppliedDdlWorkReason;
+pub const AppliedDdlWorkItem = sql_adapter.AppliedDdlWorkItem;
 
 const InsertColumnSpec = union(enum) {
     column: []const u8,
@@ -2097,22 +2101,25 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
         .adapter_noop, .session_catalog => return .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
         .create_table => |create_table| {
             if (current_schema_json.len != 0) {
-                if (create_table.replace_existing) return .{
-                    .schema_json = try schemaJsonFromCreateTablePlanAlloc(alloc, create_table),
-                    .requires_rebuild = true,
-                    .validation_required = true,
-                    .rewrite_required = true,
-                };
+                if (create_table.replace_existing) return try appliedDdlSchemaJsonWithFlagsAlloc(
+                    alloc,
+                    try schemaJsonFromCreateTablePlanAlloc(alloc, create_table),
+                    true,
+                    true,
+                    true,
+                );
                 if (!create_table.if_not_exists) return error.InvalidSqlCatalog;
                 return .{ .schema_json = try alloc.dupe(u8, current_schema_json) };
             }
             return .{ .schema_json = try schemaJsonFromCreateTablePlanAlloc(alloc, create_table) };
         },
-        .table_clone => |table_clone| return .{
-            .schema_json = try schemaJsonFromTableClonePlanAlloc(alloc, current_schema_json, table_clone),
-            .requires_rebuild = table_clone.options.indexes,
-            .validation_required = table_clone.options.constraints or table_clone.options.checks,
-        },
+        .table_clone => |table_clone| return try appliedDdlSchemaJsonWithFlagsAlloc(
+            alloc,
+            try schemaJsonFromTableClonePlanAlloc(alloc, current_schema_json, table_clone),
+            table_clone.options.indexes,
+            table_clone.options.constraints or table_clone.options.checks,
+            false,
+        ),
         .drop_table => |drop_table| {
             if (current_schema_json.len == 0) {
                 if (drop_table.if_exists) return .{ .schema_json = try alloc.dupe(u8, "") };
@@ -2241,10 +2248,87 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
             try applyCreateUpdatePolicyPlanToSchemaJsonValue(arena, root, update_policy);
         },
     }
-    result.schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
-    errdefer alloc.free(result.schema_json);
+    const schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+    result = try appliedDdlSchemaJsonWithFlagsAlloc(
+        alloc,
+        schema_json,
+        result.requires_rebuild,
+        result.validation_required,
+        result.rewrite_required,
+    );
+    errdefer result.deinit(alloc);
     try validateDdlAppliedSchemaJsonAlloc(alloc, result.schema_json);
     return result;
+}
+
+fn appliedDdlWorkItemsForFlagsAlloc(
+    alloc: std.mem.Allocator,
+    requires_rebuild: bool,
+    validation_required: bool,
+    rewrite_required: bool,
+) ![]const AppliedDdlWorkItem {
+    const count: usize =
+        (if (requires_rebuild) @as(usize, 1) else 0) +
+        (if (validation_required) @as(usize, 1) else 0) +
+        (if (rewrite_required) @as(usize, 1) else 0);
+    if (count == 0) return &.{};
+    var items = try alloc.alloc(AppliedDdlWorkItem, count);
+    var i: usize = 0;
+    if (requires_rebuild) {
+        items[i] = .{
+            .action = .rebuild,
+            .subject = .table,
+            .reason = .derived_artifacts,
+        };
+        i += 1;
+    }
+    if (validation_required) {
+        items[i] = .{
+            .action = .validate,
+            .subject = .table,
+            .reason = .constraints,
+        };
+        i += 1;
+    }
+    if (rewrite_required) {
+        items[i] = .{
+            .action = .rewrite,
+            .subject = .table,
+            .reason = .row_images,
+        };
+    }
+    return items;
+}
+
+fn appliedDdlSchemaJsonWithFlagsAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []u8,
+    requires_rebuild: bool,
+    validation_required: bool,
+    rewrite_required: bool,
+) !AppliedDdlSchemaJson {
+    errdefer alloc.free(schema_json);
+    const work_items = try appliedDdlWorkItemsForFlagsAlloc(alloc, requires_rebuild, validation_required, rewrite_required);
+    return .{
+        .schema_json = schema_json,
+        .requires_rebuild = requires_rebuild,
+        .validation_required = validation_required,
+        .rewrite_required = rewrite_required,
+        .work_items = work_items,
+    };
+}
+
+fn expectAppliedDdlWorkActions(applied: AppliedDdlSchemaJson, expected: []const AppliedDdlWorkAction) !void {
+    try std.testing.expectEqual(expected.len, applied.work_items.len);
+    for (expected, 0..) |action, i| {
+        try std.testing.expectEqual(action, applied.work_items[i].action);
+        try std.testing.expectEqual(AppliedDdlWorkSubject.table, applied.work_items[i].subject);
+        switch (action) {
+            .rebuild => try std.testing.expectEqual(AppliedDdlWorkReason.derived_artifacts, applied.work_items[i].reason),
+            .validate => try std.testing.expectEqual(AppliedDdlWorkReason.constraints, applied.work_items[i].reason),
+            .rewrite => try std.testing.expectEqual(AppliedDdlWorkReason.row_images, applied.work_items[i].reason),
+        }
+    }
 }
 
 const DdlWorkFlags = struct {
@@ -45642,6 +45726,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(replaced.requires_rebuild);
     try std.testing.expect(replaced.validation_required);
     try std.testing.expect(replaced.rewrite_required);
+    try expectAppliedDdlWorkActions(replaced, &.{ .rebuild, .validate, .rewrite });
 
     var replaced_parsed = try schema_api.parseValidatedTableSchema(alloc, replaced.schema_json);
     defer replaced_parsed.deinit(alloc);
@@ -45665,6 +45750,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(replaced_if_not_exists.requires_rebuild);
     try std.testing.expect(replaced_if_not_exists.validation_required);
     try std.testing.expect(replaced_if_not_exists.rewrite_required);
+    try expectAppliedDdlWorkActions(replaced_if_not_exists, &.{ .rebuild, .validate, .rewrite });
     var replaced_if_not_exists_parsed = try schema_api.parseValidatedTableSchema(alloc, replaced_if_not_exists.schema_json);
     defer replaced_if_not_exists_parsed.deinit(alloc);
     const replaced_if_not_exists_runtime = try schema_api.deriveRuntimeTableSchema(alloc, replaced_if_not_exists_parsed);
@@ -45745,6 +45831,7 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     defer status_indexed.deinit(alloc);
     try std.testing.expect(status_indexed.requires_rebuild);
     try std.testing.expect(!status_indexed.validation_required);
+    try expectAppliedDdlWorkActions(status_indexed, &.{.rebuild});
 
     var status_index_if_not_exists = try lowerDdlPlanAlloc(
         alloc,
@@ -45828,6 +45915,7 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     defer indexed.deinit(alloc);
     try std.testing.expect(indexed.requires_rebuild);
     try std.testing.expect(indexed.validation_required);
+    try expectAppliedDdlWorkActions(indexed, &.{ .rebuild, .validate });
 
     var unique_covering_index = try lowerDdlPlanAlloc(
         alloc,
@@ -45915,6 +46003,7 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     defer md5_unique_expression_indexed.deinit(alloc);
     try std.testing.expect(md5_unique_expression_indexed.requires_rebuild);
     try std.testing.expect(md5_unique_expression_indexed.validation_required);
+    try expectAppliedDdlWorkActions(md5_unique_expression_indexed, &.{ .rebuild, .validate });
     var parsed_md5_unique_expression_indexed = try schema_api.parseValidatedTableSchema(alloc, md5_unique_expression_indexed.schema_json);
     defer parsed_md5_unique_expression_indexed.deinit(alloc);
     const md5_unique_expression_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_md5_unique_expression_indexed);
@@ -45996,6 +46085,7 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     try std.testing.expect(temporal.requires_rebuild);
     try std.testing.expect(temporal.validation_required);
     try std.testing.expect(temporal.rewrite_required);
+    try expectAppliedDdlWorkActions(temporal, &.{ .rebuild, .validate, .rewrite });
     var parsed_temporal = try schema_api.parseValidatedTableSchema(alloc, temporal.schema_json);
     defer parsed_temporal.deinit(alloc);
     const temporal_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_temporal);
@@ -56711,10 +56801,12 @@ fn expectAppliedDdlCorpusPlan(
     for (entry.apply_setup_sql) |setup_sql| {
         var setup_plan = try lowerDdlPlanAlloc(alloc, setup_sql);
         defer setup_plan.deinit(alloc);
-        const setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        defer setup_applied.deinit(alloc);
+        const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
-        owned_current_schema_json = setup_applied.schema_json;
-        current_schema_json = setup_applied.schema_json;
+        owned_current_schema_json = next_schema_json;
+        current_schema_json = next_schema_json;
     }
 
     var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, lowered);
@@ -56735,10 +56827,12 @@ fn schemaJsonFromSetupSqlAlloc(
     for (setup_sql) |sql| {
         var setup_plan = try lowerDdlPlanAlloc(alloc, sql);
         defer setup_plan.deinit(alloc);
-        const setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        defer setup_applied.deinit(alloc);
+        const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
-        owned_current_schema_json = setup_applied.schema_json;
-        current_schema_json = setup_applied.schema_json;
+        owned_current_schema_json = next_schema_json;
+        current_schema_json = next_schema_json;
     }
 
     return owned_current_schema_json orelse try alloc.dupe(u8, current_schema_json);
@@ -58773,10 +58867,12 @@ fn appParityAppliedDdlPlanAlloc(
     for (entry.apply_setup_sql) |setup_sql| {
         var setup_plan = try lowerDdlPlanAlloc(alloc, setup_sql);
         defer setup_plan.deinit(alloc);
-        const setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
+        defer setup_applied.deinit(alloc);
+        const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
-        owned_current_schema_json = setup_applied.schema_json;
-        current_schema_json = setup_applied.schema_json;
+        owned_current_schema_json = next_schema_json;
+        current_schema_json = next_schema_json;
     }
 
     var lowered = try lowerDdlPlanAlloc(alloc, entry.sql);

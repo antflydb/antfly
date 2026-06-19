@@ -538,14 +538,44 @@ pub const DdlIndexOpClass = enum {
     array_ops,
 };
 
+pub const AppliedDdlWorkAction = enum {
+    rebuild,
+    validate,
+    rewrite,
+};
+
+pub const AppliedDdlWorkSubject = enum {
+    table,
+};
+
+pub const AppliedDdlWorkReason = enum {
+    derived_artifacts,
+    constraints,
+    row_images,
+};
+
+pub const AppliedDdlWorkItem = struct {
+    action: AppliedDdlWorkAction,
+    subject: AppliedDdlWorkSubject,
+    reason: AppliedDdlWorkReason,
+};
+
 pub const AppliedDdlSchemaJson = struct {
     schema_json: []u8,
     requires_rebuild: bool = false,
     validation_required: bool = false,
     rewrite_required: bool = false,
+    work_items: []const AppliedDdlWorkItem = &.{},
+
+    pub fn takeSchemaJson(self: *@This()) []u8 {
+        const schema_json = self.schema_json;
+        self.schema_json = &.{};
+        return schema_json;
+    }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.schema_json);
+        if (self.schema_json.len > 0) alloc.free(self.schema_json);
+        if (self.work_items.len > 0) alloc.free(self.work_items);
         self.* = undefined;
     }
 };
