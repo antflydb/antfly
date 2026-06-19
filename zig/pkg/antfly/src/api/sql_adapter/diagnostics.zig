@@ -19,8 +19,6 @@ pub const SqlAdapterClassificationReason = enum {
     bulk_io_plan,
     covering_derived_index_plan,
     cte_mutation_source_plan,
-    deferrable_primary_key,
-    deferrable_unique_constraint,
     duplicate_conflict_update_target,
     duplicate_output_name,
     duplicate_row_batch_target,

@@ -1574,7 +1574,9 @@ fn primaryKeysEqual(a: ?runtime_schema_mod.PrimaryKey, b: ?runtime_schema_mod.Pr
     return optionalStringsEqual(a.?.name, b.?.name) and
         stringSlicesEqual(a.?.columns, b.?.columns) and
         stringSlicesEqual(a.?.include_columns, b.?.include_columns) and
-        optionalStringsEqual(a.?.without_overlaps_period, b.?.without_overlaps_period);
+        optionalStringsEqual(a.?.without_overlaps_period, b.?.without_overlaps_period) and
+        a.?.deferrable == b.?.deferrable and
+        a.?.timing == b.?.timing;
 }
 
 fn findUniqueConstraintByName(unique_constraints: []const runtime_schema_mod.UniqueConstraint, name: []const u8) ?runtime_schema_mod.UniqueConstraint {
@@ -1598,6 +1600,8 @@ fn uniqueConstraintsEqual(a: runtime_schema_mod.UniqueConstraint, b: runtime_sch
         stringSlicesEqual(a.include_columns, b.include_columns) and
         optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
         a.nulls_not_distinct == b.nulls_not_distinct and
+        a.deferrable == b.deferrable and
+        a.timing == b.timing and
         uniquePredicateSlicesEqual(a.where, b.where) and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }

@@ -4715,8 +4715,8 @@ const Parser = struct {
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
-            const primary_key = try self.makeDdlPrimaryKey(constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
+            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
+            const primary_key = try self.makeDdlPrimaryKey(constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
             try self.appendAlterTableOperation(operations, .{ .add_primary_key = primary_key });
             return;
         }
@@ -4726,8 +4726,8 @@ const Parser = struct {
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
-            var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct);
+            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
+            var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
             constraint.validation_state = .unvalidated;
             try self.appendAlterTableOperation(operations, .{ .add_unique_constraint = constraint });
             return;
@@ -4789,8 +4789,8 @@ const Parser = struct {
                 const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
                 const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                 defer freeStringSlice(self.alloc, include_columns);
-                try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
-                var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct);
+                const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
+                var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
                 var constraint_transferred = false;
                 errdefer if (!constraint_transferred) freeDdlUniqueConstraint(self.alloc, constraint);
                 constraint.validation_state = .unvalidated;
@@ -5215,14 +5215,14 @@ const Parser = struct {
                     column.nullable = false;
                     const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
-                    try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
-                    try self.installDdlPrimaryKey(primary_key, constraint_name, &.{column.name}, include_columns, null);
+                    const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
+                    try self.installDdlPrimaryKey(primary_key, constraint_name, &.{column.name}, include_columns, null, timing);
                 } else if (constraint_prefix.kind == .unique and self.matchKeyword("unique")) {
                     const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
                     const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
-                    try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
-                    try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct);
+                    const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
+                    try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
                 } else if (constraint_prefix.kind == .check and self.matchKeyword("check")) {
                     const check = try self.parseDdlCheckConstraint(constraint_name);
                     var check_transferred = false;
@@ -5408,16 +5408,16 @@ const Parser = struct {
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
-            try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
+            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
+            try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
         } else if (self.matchKeyword("unique")) {
             const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
-            try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct);
+            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
+            try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
         } else if (self.matchKeyword("foreign")) {
             const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
             var transferred = false;
@@ -6127,9 +6127,10 @@ const Parser = struct {
         columns: []const []const u8,
         include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
+        timing: sql_adapter.DdlConstraintTimingSyntax,
     ) !void {
         if (primary_key.* != null) return error.UnsupportedSqlShape;
-        primary_key.* = try self.makeDdlPrimaryKey(constraint_name, columns, include_columns, without_overlaps_period);
+        primary_key.* = try self.makeDdlPrimaryKey(constraint_name, columns, include_columns, without_overlaps_period, timing);
     }
 
     fn makeDdlPrimaryKey(
@@ -6138,6 +6139,7 @@ const Parser = struct {
         columns: []const []const u8,
         include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
+        timing: sql_adapter.DdlConstraintTimingSyntax,
     ) !runtime_schema.PrimaryKey {
         const name = if (constraint_name) |value| try self.alloc.dupe(u8, value) else null;
         errdefer if (name) |value| self.alloc.free(value);
@@ -6151,6 +6153,8 @@ const Parser = struct {
             .columns = cloned_columns,
             .include_columns = cloned_include_columns,
             .without_overlaps_period = period,
+            .deferrable = timing.deferrable,
+            .timing = timing.timing,
         };
     }
 
@@ -6162,8 +6166,9 @@ const Parser = struct {
         include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
         nulls_not_distinct: bool,
+        timing: sql_adapter.DdlConstraintTimingSyntax,
     ) !void {
-        const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns, include_columns, without_overlaps_period, nulls_not_distinct);
+        const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns, include_columns, without_overlaps_period, nulls_not_distinct, timing);
         var transferred = false;
         errdefer if (!transferred) freeDdlUniqueConstraint(self.alloc, constraint);
         try unique_constraints.append(self.alloc, constraint);
@@ -6177,6 +6182,7 @@ const Parser = struct {
         include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
         nulls_not_distinct: bool,
+        timing: sql_adapter.DdlConstraintTimingSyntax,
     ) !runtime_schema.UniqueConstraint {
         if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
         const owned_columns = try cloneStringSlice(self.alloc, columns);
@@ -6204,6 +6210,8 @@ const Parser = struct {
             .include_columns = owned_include_columns,
             .without_overlaps_period = owned_period,
             .nulls_not_distinct = nulls_not_distinct,
+            .deferrable = timing.deferrable,
+            .timing = timing.timing,
         };
     }
 
@@ -36236,6 +36244,8 @@ fn schemaJsonPrimaryKeyAlloc(alloc: std.mem.Allocator, primary_key: runtime_sche
     try object.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, primary_key.columns));
     if (primary_key.include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "include_columns"), try schemaJsonStringArrayAlloc(alloc, primary_key.include_columns));
     if (primary_key.without_overlaps_period) |period| try putJsonString(alloc, &object, "without_overlaps_period", period);
+    if (primary_key.deferrable) try object.put(alloc, try alloc.dupe(u8, "deferrable"), .{ .bool = true });
+    if (primary_key.timing == .deferred) try putJsonString(alloc, &object, "timing", "deferred");
     return .{ .object = object };
 }
 
@@ -36273,6 +36283,8 @@ fn schemaJsonUniqueConstraintAlloc(alloc: std.mem.Allocator, constraint: runtime
     if (constraint.where.len > 0) try object.put(alloc, try alloc.dupe(u8, "where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, constraint.where));
     if (constraint.where_expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "where_expressions"), try schemaJsonExpressionConditionsAlloc(alloc, constraint.where_expressions));
     if (constraint.validation_state != .enforced) try putJsonString(alloc, &object, "validation_state", uniqueConstraintValidationStateString(constraint.validation_state));
+    if (constraint.deferrable) try object.put(alloc, try alloc.dupe(u8, "deferrable"), .{ .bool = true });
+    if (constraint.timing == .deferred) try putJsonString(alloc, &object, "timing", "deferred");
     return .{ .object = object };
 }
 
@@ -36629,6 +36641,8 @@ fn cloneDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.Prim
         .columns = columns,
         .include_columns = include_columns,
         .without_overlaps_period = period,
+        .deferrable = primary_key.deferrable,
+        .timing = primary_key.timing,
     };
 }
 
@@ -36729,6 +36743,8 @@ fn cloneDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema
     out.include_columns = try cloneStringSlice(alloc, constraint.include_columns);
     out.without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
     out.nulls_not_distinct = constraint.nulls_not_distinct;
+    out.deferrable = constraint.deferrable;
+    out.timing = constraint.timing;
     out.where = try cloneDdlUniquePredicates(alloc, constraint.where);
     out.where_expressions = try cloneExpressionConditionsAlloc(alloc, constraint.where_expressions);
     out.validation_state = constraint.validation_state;
@@ -41010,18 +41026,38 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var deferrable_unique = try lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_deferred_unique (id uuid PRIMARY KEY, email text UNIQUE DEFERRABLE);",
-    ));
+    );
+    defer deferrable_unique.deinit(alloc);
+    switch (deferrable_unique) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_deferred_unique", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expect(plan.unique_constraints[0].deferrable);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.immediate, plan.unique_constraints[0].timing);
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_deferred_table_unique (id uuid PRIMARY KEY, email text, CONSTRAINT bad_deferred_table_unique_email_key UNIQUE (email) NOT DEFERRABLE INITIALLY DEFERRED);",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var deferrable_primary = try lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_deferred_primary (id uuid PRIMARY KEY DEFERRABLE);",
-    ));
+    );
+    defer deferrable_primary.deinit(alloc);
+    switch (deferrable_primary) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_deferred_primary", plan.table_name);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expect(plan.primary_key.?.deferrable);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.immediate, plan.primary_key.?.timing);
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_deferred_table_primary (tenant_id text NOT NULL, id uuid NOT NULL, CONSTRAINT bad_deferred_table_primary_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY DEFERRED);",
@@ -42805,10 +42841,28 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var deferrable_unique = try lowerDdlPlanAlloc(
         alloc,
-        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE;",
-    ));
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE INITIALLY DEFERRED;",
+    );
+    defer deferrable_unique.deinit(alloc);
+    switch (deferrable_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expect(constraint.deferrable);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, constraint.timing);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var explicit_covering_unique = try lowerDdlPlanAlloc(
         alloc,
@@ -42860,10 +42914,29 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var deferrable_primary_key = try lowerDdlPlanAlloc(
         alloc,
-        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE;",
-    ));
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE INITIALLY DEFERRED;",
+    );
+    defer deferrable_primary_key.deinit(alloc);
+    switch (deferrable_primary_key) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_stage", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_primary_key => |primary_key| {
+                    try std.testing.expectEqualStrings("usage_stage_pk", primary_key.name.?);
+                    try std.testing.expectEqual(@as(usize, 2), primary_key.columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", primary_key.columns[0]);
+                    try std.testing.expectEqualStrings("id", primary_key.columns[1]);
+                    try std.testing.expect(primary_key.deferrable);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, primary_key.timing);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var explicit_covering_primary_key = try lowerDdlPlanAlloc(
         alloc,
@@ -56065,6 +56138,43 @@ fn appendForeignKeyOptionFingerprintsAlloc(
     return try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_match_partial", counts.match_partial);
 }
 
+const ConstraintTimingFingerprintCounts = struct {
+    primary_key_deferrable: usize = 0,
+    primary_key_deferred: usize = 0,
+    unique_deferrable: usize = 0,
+    unique_deferred: usize = 0,
+};
+
+fn addPrimaryKeyTimingFingerprintCount(counts: *ConstraintTimingFingerprintCounts, primary_key: runtime_schema.PrimaryKey) void {
+    if (primary_key.deferrable) counts.primary_key_deferrable += 1;
+    if (primary_key.timing == .deferred) counts.primary_key_deferred += 1;
+}
+
+fn addUniqueTimingFingerprintCounts(counts: *ConstraintTimingFingerprintCounts, unique_constraints: []const runtime_schema.UniqueConstraint) void {
+    for (unique_constraints) |constraint| {
+        if (constraint.deferrable) counts.unique_deferrable += 1;
+        if (constraint.timing == .deferred) counts.unique_deferred += 1;
+    }
+}
+
+fn countCreateTableConstraintTimingFingerprints(plan: CreateTablePlan) ConstraintTimingFingerprintCounts {
+    var counts: ConstraintTimingFingerprintCounts = .{};
+    if (plan.primary_key) |primary_key| addPrimaryKeyTimingFingerprintCount(&counts, primary_key);
+    addUniqueTimingFingerprintCounts(&counts, plan.unique_constraints);
+    return counts;
+}
+
+fn appendConstraintTimingFingerprintsAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    counts: ConstraintTimingFingerprintCounts,
+) ![]u8 {
+    var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, "pk_deferrable", counts.primary_key_deferrable);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "pk_deferred", counts.primary_key_deferred);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "unique_deferrable", counts.unique_deferrable);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "unique_deferred", counts.unique_deferred);
+}
+
 const AlterTablePlanFingerprintCounts = struct {
     add_column: usize = 0,
     add_column_if_not_exists: usize = 0,
@@ -56093,6 +56203,7 @@ const AlterTablePlanFingerprintCounts = struct {
     add_foreign_key: usize = 0,
     add_check: usize = 0,
     validate_constraint: usize = 0,
+    constraint_timing: ConstraintTimingFingerprintCounts = .{},
     foreign_key_options: ForeignKeyOptionFingerprintCounts = .{},
 };
 
@@ -56108,10 +56219,14 @@ fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerpri
             counts.add_column_unique += add.unique_constraints.len;
             counts.add_column_fk += add.foreign_keys.len;
             counts.add_column_check += add.checks.len;
+            addUniqueTimingFingerprintCounts(&counts.constraint_timing, add.unique_constraints);
             addForeignKeyOptionFingerprintCounts(&counts.foreign_key_options, add.foreign_keys);
         },
         .add_period => counts.add_period += 1,
-        .add_primary_key => counts.add_primary_key += 1,
+        .add_primary_key => |primary_key| {
+            counts.add_primary_key += 1;
+            addPrimaryKeyTimingFingerprintCount(&counts.constraint_timing, primary_key);
+        },
         .rename_column => counts.rename_column += 1,
         .rename_constraint => counts.rename_constraint += 1,
         .drop_column => |drop| {
@@ -56141,7 +56256,10 @@ fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerpri
             }
         },
         .alter_column_type => counts.alter_type += 1,
-        .add_unique_constraint => counts.add_unique += 1,
+        .add_unique_constraint => |constraint| {
+            counts.add_unique += 1;
+            addUniqueTimingFingerprintCounts(&counts.constraint_timing, &.{constraint});
+        },
         .add_foreign_key => |foreign_key| {
             counts.add_foreign_key += 1;
             addForeignKeyOptionFingerprintCounts(&counts.foreign_key_options, &.{foreign_key});
@@ -56823,6 +56941,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "defaults", createTablePlanDefaultColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "generated", createTablePlanGeneratedColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_update", createTablePlanUpdatePolicyColumnCount(plan));
+            fingerprint = try appendConstraintTimingFingerprintsAlloc(alloc, fingerprint, countCreateTableConstraintTimingFingerprints(plan));
             fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, countForeignKeyOptionFingerprints(plan.foreign_keys));
             break :blk fingerprint;
         },
@@ -57585,6 +57704,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_fk", counts.add_foreign_key);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_check", counts.add_check);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "validate", counts.validate_constraint);
+            fingerprint = try appendConstraintTimingFingerprintsAlloc(alloc, fingerprint, counts.constraint_timing);
             fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, counts.foreign_key_options);
             break :blk fingerprint;
         },

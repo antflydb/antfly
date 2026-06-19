@@ -84,6 +84,8 @@ pub const PrimaryKey = struct {
     columns: [][]const u8 = &.{},
     include_columns: [][]const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
+    deferrable: bool = false,
+    timing: ForeignKeyTiming = .immediate,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.name) |name| alloc.free(name);
@@ -229,6 +231,36 @@ fn foreignKeyDeferrableFromString(text: []const u8) ?ForeignKeyDeferrability {
     return null;
 }
 
+const ConstraintTimingMetadata = struct {
+    timing: ForeignKeyTiming = .immediate,
+    deferrable: bool = false,
+};
+
+fn constraintTimingMetadataFromObject(object: std.json.ObjectMap) !ConstraintTimingMetadata {
+    const timing_clause = if (object.get("timing")) |timing_value|
+        foreignKeyTimingClauseFromString(timing_value.string).?
+    else
+        null;
+    const explicit_timing = if (timing_clause) |clause| clause.timing else null;
+    const deferrability = if (object.get("deferrable")) |deferrable_value|
+        foreignKeyDeferrabilityFromValue(deferrable_value).?
+    else
+        null;
+    const timing_from_deferrability = if (deferrability) |clause| clause.timing else null;
+    if (explicit_timing != null and timing_from_deferrability != null and explicit_timing.? != timing_from_deferrability.?) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    const explicit_deferrable = if (timing_clause) |clause| clause.deferrable else null;
+    const deferrable_from_deferrability = if (deferrability) |clause| clause.deferrable else null;
+    if (explicit_deferrable != null and deferrable_from_deferrability != null and explicit_deferrable.? != deferrable_from_deferrability.?) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    const timing = explicit_timing orelse timing_from_deferrability orelse ForeignKeyTiming.immediate;
+    const deferrable = explicit_deferrable orelse deferrable_from_deferrability orelse (timing == .deferred);
+    if (timing == .deferred and !deferrable) return error.InvalidSchemaUpdateRequest;
+    return .{ .timing = timing, .deferrable = deferrable };
+}
+
 fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
     var actual_index: usize = 0;
     var expected_index: usize = 0;
@@ -292,6 +324,8 @@ pub const UniqueConstraint = struct {
     include_columns: [][]const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
     nulls_not_distinct: bool = false,
+    deferrable: bool = false,
+    timing: ForeignKeyTiming = .immediate,
     where: []UniquePredicate = &.{},
     where_expressions: []storage_schema.RelationalRowsExpressionCondition = &.{},
     validation_state: UniqueConstraintValidationState = .enforced,
@@ -1140,7 +1174,9 @@ fn validatePrimaryKey(value: std.json.Value) !void {
         if (!std.mem.eql(u8, entry.key_ptr.*, "name") and
             !std.mem.eql(u8, entry.key_ptr.*, "columns") and
             !std.mem.eql(u8, entry.key_ptr.*, "include_columns") and
-            !std.mem.eql(u8, entry.key_ptr.*, "without_overlaps_period"))
+            !std.mem.eql(u8, entry.key_ptr.*, "without_overlaps_period") and
+            !std.mem.eql(u8, entry.key_ptr.*, "timing") and
+            !std.mem.eql(u8, entry.key_ptr.*, "deferrable"))
         {
             return error.InvalidSchemaUpdateRequest;
         }
@@ -1154,6 +1190,13 @@ fn validatePrimaryKey(value: std.json.Value) !void {
     if (object.get("without_overlaps_period")) |period| {
         if (period != .string or period.string.len == 0) return error.InvalidSchemaUpdateRequest;
     }
+    if (object.get("timing")) |timing| {
+        if (timing != .string or foreignKeyTimingClauseFromString(timing.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("deferrable")) |deferrable| {
+        if (foreignKeyDeferrabilityFromValue(deferrable) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    _ = try constraintTimingMetadataFromObject(object);
 }
 
 fn validateRelationalPeriodsValue(value: std.json.Value) !void {
@@ -1307,6 +1350,13 @@ fn validateUniqueConstraints(value: std.json.Value) !void {
         if (object.get("validation_state")) |validation_state| {
             if (validation_state != .string or UniqueConstraintValidationState.fromString(validation_state.string) == null) return error.InvalidSchemaUpdateRequest;
         }
+        if (object.get("timing")) |timing| {
+            if (timing != .string or foreignKeyTimingClauseFromString(timing.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("deferrable")) |deferrable| {
+            if (foreignKeyDeferrabilityFromValue(deferrable) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        _ = try constraintTimingMetadataFromObject(object);
     }
 }
 
@@ -1317,6 +1367,8 @@ fn isAllowedUniqueConstraintField(field: []const u8) bool {
         std.mem.eql(u8, field, "include_columns") or
         std.mem.eql(u8, field, "without_overlaps_period") or
         std.mem.eql(u8, field, "nulls_not_distinct") or
+        std.mem.eql(u8, field, "timing") or
+        std.mem.eql(u8, field, "deferrable") or
         std.mem.eql(u8, field, "where") or
         std.mem.eql(u8, field, "where_expressions") or
         std.mem.eql(u8, field, "validation_state");
@@ -2345,6 +2397,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
 
 fn validateRelationalPrimaryKey(schema: TableSchema) !void {
     const primary_key = schema.primary_key orelse return;
+    if (primary_key.timing == .deferred and !primary_key.deferrable) return error.InvalidSchemaUpdateRequest;
     if (primary_key.name) |name| {
         for (schema.unique_constraints) |constraint| {
             if (std.mem.eql(u8, constraint.name, name)) return error.InvalidSchemaUpdateRequest;
@@ -2515,6 +2568,7 @@ fn relationalConstraintColumnTypesCompatible(child: DocumentProperty, parent: Do
 
 fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
     for (schema.unique_constraints, 0..) |constraint, i| {
+        if (constraint.timing == .deferred and !constraint.deferrable) return error.InvalidSchemaUpdateRequest;
         if (constraint.columns.len + constraint.expressions.len == 0) return error.InvalidSchemaUpdateRequest;
         if (constraint.validation_state == .validating or constraint.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
         if (constraint.without_overlaps_period) |period| try validateRelationalPeriodReference(schema, period);
@@ -3129,6 +3183,8 @@ fn uniqueConstraintsEquivalent(a: UniqueConstraint, b: UniqueConstraint) bool {
     if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
     if (!stringSlicesEqual(a.include_columns, b.include_columns)) return false;
     if (a.nulls_not_distinct != b.nulls_not_distinct) return false;
+    if (a.deferrable != b.deferrable) return false;
+    if (a.timing != b.timing) return false;
     return uniquePredicateSlicesEqual(a.where, b.where) and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }
@@ -4442,11 +4498,14 @@ fn parsePrimaryKey(alloc: std.mem.Allocator, value: std.json.Value) !PrimaryKey 
         if (include_columns.len > 0) alloc.free(include_columns);
     }
     const without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null;
+    const timing = try constraintTimingMetadataFromObject(object);
     return .{
         .name = name,
         .columns = columns,
         .include_columns = include_columns,
         .without_overlaps_period = without_overlaps_period,
+        .deferrable = timing.deferrable,
+        .timing = timing.timing,
     };
 }
 
@@ -5155,6 +5214,7 @@ fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
 
     for (array.items) |item| {
         const object = item.object;
+        const timing = try constraintTimingMetadataFromObject(object);
         constraints[initialized] = .{
             .name = try alloc.dupe(u8, object.get("name").?.string),
             .columns = if (object.get("columns")) |columns| try parseStringArrayAlloc(alloc, columns) else &.{},
@@ -5162,6 +5222,8 @@ fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
             .include_columns = if (object.get("include_columns")) |include_columns| try parseStringArrayAlloc(alloc, include_columns) else &.{},
             .without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null,
             .nulls_not_distinct = if (object.get("nulls_not_distinct")) |flag| flag.bool else false,
+            .deferrable = timing.deferrable,
+            .timing = timing.timing,
             .where = if (object.get("where")) |where| try parseUniquePredicates(alloc, where) else &.{},
             .where_expressions = if (object.get("where_expressions")) |where_expressions| try parseRelationalRowsExpressionConditionsAlloc(alloc, where_expressions) else &.{},
             .validation_state = if (object.get("validation_state")) |validation_state|
@@ -6401,7 +6463,7 @@ test "relational schema parses primary-key foreign keys and unique constraints" 
 
 test "relational schema parses application-time temporal constraints" {
     var parsed = try parseSchema(std.testing.allocator,
-        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to","range_type":"daterange"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"unique_constraints":[{"name":"price_sku_time_key","columns":["sku"],"without_overlaps_period":"valid_time"}],"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"}}]}
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to","range_type":"daterange"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time","deferrable":true,"timing":"deferred"},"unique_constraints":[{"name":"price_sku_time_key","columns":["sku"],"without_overlaps_period":"valid_time","deferrable":"DEFERRABLE INITIALLY DEFERRED"}],"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"}}]}
     );
     defer parsed.deinit(std.testing.allocator);
 
@@ -6412,7 +6474,11 @@ test "relational schema parses application-time temporal constraints" {
     try std.testing.expectEqual(storage_schema.RelationalPeriodRangeType.daterange, parsed.periods[0].range_type.?);
     try std.testing.expect(parsed.primary_key != null);
     try std.testing.expectEqualStrings("valid_time", parsed.primary_key.?.without_overlaps_period.?);
+    try std.testing.expect(parsed.primary_key.?.deferrable);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed.primary_key.?.timing);
     try std.testing.expectEqualStrings("valid_time", parsed.unique_constraints[0].without_overlaps_period.?);
+    try std.testing.expect(parsed.unique_constraints[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed.unique_constraints[0].timing);
     try std.testing.expectEqualStrings("valid_time", parsed.foreign_keys[0].period.?);
     try std.testing.expectEqualStrings("valid_time", parsed.foreign_keys[0].references.period.?);
 

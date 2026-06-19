@@ -132,11 +132,19 @@
       "sql": "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
     },
     {
-      "name": "unsupported deferrable unique constraint",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=deferrable_unique_constraint",
-      "classification_reason": "deferrable_unique_constraint",
-      "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE"
+      "name": "schema add deferrable unique validation work",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_table",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1:unique_deferrable=1:unique_deferred=1",
+      "apply_setup_sql": [
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text);"
+      ],
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
+      "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE INITIALLY DEFERRED;"
     },
     {
       "name": "schema rich unique expression index",
@@ -151,11 +159,19 @@
       "sql": "CREATE UNIQUE INDEX usage_records_status_replace_key ON usage_records (replace(status, 'old', 'new'))"
     },
     {
-      "name": "unsupported deferrable primary key",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=deferrable_primary_key",
-      "classification_reason": "deferrable_primary_key",
-      "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE"
+      "name": "schema add deferrable primary key validation work",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_table",
+        "table_name": "usage_stage",
+        "operations": 1
+      },
+      "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:add_pk=1:pk_deferrable=1:pk_deferred=1",
+      "apply_setup_sql": [
+        "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);"
+      ],
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
+      "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE INITIALLY DEFERRED;"
     },
     {
       "name": "read classifier row query",

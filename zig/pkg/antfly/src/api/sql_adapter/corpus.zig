@@ -4145,8 +4145,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_covering_gin_index_plan: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
-    unsupported_ddl_deferrable_unique_constraint: bool = false,
-    unsupported_ddl_deferrable_primary_key: bool = false,
     unsupported_ddl_prepare_transaction_plan: bool = false,
     unsupported_ddl_commit_prepared_transaction_plan: bool = false,
     unsupported_ddl_rollback_prepared_transaction_plan: bool = false,
@@ -4471,6 +4469,8 @@ pub const AppParityCorpusCoverage = struct {
     ddl_add_unvalidated_unique: bool = false,
     ddl_add_unvalidated_fk: bool = false,
     ddl_add_unvalidated_check: bool = false,
+    ddl_add_deferrable_primary_key: bool = false,
+    ddl_add_deferrable_unique_constraint: bool = false,
     ddl_validate_constraint: bool = false,
     ddl_drop_constraint: bool = false,
     ddl_drop_column: bool = false,
@@ -5388,14 +5388,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
                     std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                     std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null);
-            self.unsupported_ddl_deferrable_unique_constraint = self.unsupported_ddl_deferrable_unique_constraint or
-                (std.mem.eql(u8, entry.classification_reason, "deferrable_unique_constraint") and
-                    std.mem.indexOf(u8, entry.sql, " UNIQUE ") != null and
-                    std.mem.indexOf(u8, entry.sql, " DEFERRABLE") != null);
-            self.unsupported_ddl_deferrable_primary_key = self.unsupported_ddl_deferrable_primary_key or
-                (std.mem.eql(u8, entry.classification_reason, "deferrable_primary_key") and
-                    std.mem.indexOf(u8, entry.sql, " PRIMARY KEY ") != null and
-                    std.mem.indexOf(u8, entry.sql, " DEFERRABLE") != null);
             self.unsupported_ddl_prepare_transaction_plan = self.unsupported_ddl_prepare_transaction_plan or
                 (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
                     std.mem.startsWith(u8, entry.sql, "PREPARE TRANSACTION "));
@@ -5873,6 +5865,12 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_add_unvalidated_unique = self.ddl_add_unvalidated_unique or sql_adapter.appliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_unique=", 1);
                     self.ddl_add_unvalidated_fk = self.ddl_add_unvalidated_fk or sql_adapter.appliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_fk=", 1);
                     self.ddl_add_unvalidated_check = self.ddl_add_unvalidated_check or sql_adapter.appliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_check=", 1);
+                    self.ddl_add_deferrable_primary_key = self.ddl_add_deferrable_primary_key or
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":pk_deferrable=") and
+                            sql_adapter.planHasNonZeroToken(entry.plan, ":pk_deferred=");
+                    self.ddl_add_deferrable_unique_constraint = self.ddl_add_deferrable_unique_constraint or
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":unique_deferrable=") and
+                            sql_adapter.planHasNonZeroToken(entry.plan, ":unique_deferred=");
                     self.ddl_validate_constraint = self.ddl_validate_constraint or std.mem.indexOf(u8, entry.sql, "VALIDATE CONSTRAINT") != null;
                     self.ddl_drop_constraint = self.ddl_drop_constraint or std.mem.indexOf(u8, entry.sql, "DROP CONSTRAINT") != null;
                     self.ddl_drop_column = self.ddl_drop_column or std.mem.indexOf(u8, entry.sql, "DROP COLUMN") != null;
@@ -6768,8 +6766,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_write_recursive_cte_update);
         try std.testing.expect(self.unsupported_write_recursive_cte_delete);
         try std.testing.expect(self.unsupported_write_recursive_cte_merge);
-        try std.testing.expect(self.unsupported_ddl_deferrable_unique_constraint);
-        try std.testing.expect(self.unsupported_ddl_deferrable_primary_key);
         try std.testing.expect(self.unsupported_ddl_prepare_transaction_plan);
         try std.testing.expect(self.unsupported_ddl_commit_prepared_transaction_plan);
         try std.testing.expect(self.unsupported_ddl_rollback_prepared_transaction_plan);
@@ -6997,6 +6993,8 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_add_unvalidated_unique);
         try std.testing.expect(self.ddl_add_unvalidated_fk);
         try std.testing.expect(self.ddl_add_unvalidated_check);
+        try std.testing.expect(self.ddl_add_deferrable_primary_key);
+        try std.testing.expect(self.ddl_add_deferrable_unique_constraint);
         try std.testing.expect(self.ddl_validate_constraint);
         try std.testing.expect(self.ddl_drop_constraint);
         try std.testing.expect(self.ddl_drop_column);

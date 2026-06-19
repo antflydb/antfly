@@ -442,6 +442,11 @@ fn deriveRuntimePrimaryKey(alloc: std.mem.Allocator, schema: ParsedTableSchema) 
         .columns = columns,
         .include_columns = include_columns,
         .without_overlaps_period = without_overlaps_period,
+        .deferrable = primary_key.deferrable,
+        .timing = switch (primary_key.timing) {
+            .immediate => .immediate,
+            .deferred => .deferred,
+        },
     };
 }
 
@@ -573,6 +578,11 @@ fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableS
             .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
             .without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null,
             .nulls_not_distinct = constraint.nulls_not_distinct,
+            .deferrable = constraint.deferrable,
+            .timing = switch (constraint.timing) {
+                .immediate => .immediate,
+                .deferred => .deferred,
+            },
             .where = try cloneUniquePredicates(alloc, constraint.where),
             .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, constraint.where_expressions),
             .validation_state = switch (constraint.validation_state) {

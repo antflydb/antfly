@@ -3549,6 +3549,45 @@ pub fn consumeOptionalDdlImmediateConstraintTiming(tokens: []const Token, pos: *
     }
 }
 
+pub const DdlConstraintTimingSyntax = struct {
+    deferrable: bool = false,
+    timing: runtime_schema.ForeignKeyTiming = .immediate,
+};
+
+pub fn parseOptionalDdlConstraintTiming(tokens: []const Token, pos: *usize) !DdlConstraintTimingSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var timing: DdlConstraintTimingSyntax = .{};
+    var saw_deferrability = false;
+    var saw_initially = false;
+    while (true) {
+        if (cursor.matchKeyword("deferrable")) {
+            if (saw_deferrability) return error.UnsupportedSqlShape;
+            saw_deferrability = true;
+            timing.deferrable = true;
+        } else if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("deferrable");
+            if (saw_deferrability) return error.UnsupportedSqlShape;
+            if (timing.timing == .deferred) return error.UnsupportedSqlShape;
+            saw_deferrability = true;
+            timing.deferrable = false;
+        } else if (cursor.matchKeyword("initially")) {
+            if (saw_initially) return error.UnsupportedSqlShape;
+            saw_initially = true;
+            if (cursor.matchKeyword("deferred")) {
+                if (saw_deferrability and !timing.deferrable) return error.UnsupportedSqlShape;
+                timing.deferrable = true;
+                timing.timing = .deferred;
+            } else {
+                try cursor.expectKeyword("immediate");
+                timing.timing = .immediate;
+            }
+        } else {
+            break;
+        }
+    }
+    return timing;
+}
+
 pub fn peekDdlNotValid(tokens: []const Token, pos: usize) bool {
     if (pos + 1 >= tokens.len) return false;
     const not_token = tokens[pos];
@@ -7731,6 +7770,32 @@ test "sql adapter grammar parses ddl constraint suffixes" {
     defer lexer.freeTokens(alloc, &deferrable_tokens);
     var deferrable_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, consumeOptionalDdlImmediateConstraintTiming(deferrable_tokens.items, &deferrable_pos));
+
+    var flexible_timing_tokens = try lexer.tokenizeAlloc(alloc, "DEFERRABLE INITIALLY DEFERRED,");
+    defer lexer.freeTokens(alloc, &flexible_timing_tokens);
+    var flexible_timing_pos: usize = 0;
+    const flexible_timing = try parseOptionalDdlConstraintTiming(flexible_timing_tokens.items, &flexible_timing_pos);
+    try std.testing.expect(flexible_timing.deferrable);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, flexible_timing.timing);
+    try std.testing.expect(flexible_timing_tokens.items[flexible_timing_pos].kind == .comma);
+
+    var flexible_not_deferrable_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY IMMEDIATE,");
+    defer lexer.freeTokens(alloc, &flexible_not_deferrable_tokens);
+    var flexible_not_deferrable_pos: usize = 0;
+    const flexible_not_deferrable = try parseOptionalDdlConstraintTiming(flexible_not_deferrable_tokens.items, &flexible_not_deferrable_pos);
+    try std.testing.expect(!flexible_not_deferrable.deferrable);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.immediate, flexible_not_deferrable.timing);
+    try std.testing.expect(flexible_not_deferrable_tokens.items[flexible_not_deferrable_pos].kind == .comma);
+
+    var contradictory_timing_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY DEFERRED,");
+    defer lexer.freeTokens(alloc, &contradictory_timing_tokens);
+    var contradictory_timing_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintTiming(contradictory_timing_tokens.items, &contradictory_timing_pos));
+
+    var duplicate_timing_tokens = try lexer.tokenizeAlloc(alloc, "DEFERRABLE NOT DEFERRABLE,");
+    defer lexer.freeTokens(alloc, &duplicate_timing_tokens);
+    var duplicate_timing_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintTiming(duplicate_timing_tokens.items, &duplicate_timing_pos));
 }
 
 test "sql adapter grammar parses ddl constraint column lists" {

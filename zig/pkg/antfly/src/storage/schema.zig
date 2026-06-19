@@ -435,6 +435,8 @@ pub const UniqueConstraint = struct {
     include_columns: []const []const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
     nulls_not_distinct: bool = false,
+    deferrable: bool = false,
+    timing: ForeignKeyTiming = .immediate,
     where: []const UniquePredicate = &.{},
     where_expressions: []const RelationalRowsExpressionCondition = &.{},
     validation_state: UniqueConstraintValidationState = .enforced,
@@ -492,6 +494,8 @@ pub const PrimaryKey = struct {
     columns: []const []const u8 = &.{},
     include_columns: []const []const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
+    deferrable: bool = false,
+    timing: ForeignKeyTiming = .immediate,
 };
 
 pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []const RelationalColumn) bool {
@@ -623,7 +627,9 @@ pub fn primaryKeyCatalogsEqual(current: ?PrimaryKey, next: ?PrimaryKey) bool {
     return optionalStringsEqual(current.?.name, next.?.name) and
         stringSlicesEqual(current.?.columns, next.?.columns) and
         stringSlicesEqual(current.?.include_columns, next.?.include_columns) and
-        optionalStringsEqual(current.?.without_overlaps_period, next.?.without_overlaps_period);
+        optionalStringsEqual(current.?.without_overlaps_period, next.?.without_overlaps_period) and
+        current.?.deferrable == next.?.deferrable and
+        current.?.timing == next.?.timing;
 }
 
 pub fn relationalPeriodCatalogsEqual(current: []const RelationalPeriod, next: []const RelationalPeriod) bool {
@@ -665,6 +671,8 @@ pub fn uniqueConstraintCatalogsEqual(current: []const UniqueConstraint, next: []
         if (!stringSlicesEqual(a.include_columns, b.include_columns)) return false;
         if (!optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period)) return false;
         if (a.nulls_not_distinct != b.nulls_not_distinct) return false;
+        if (a.deferrable != b.deferrable) return false;
+        if (a.timing != b.timing) return false;
         if (!uniquePredicateSlicesEqual(a.where, b.where)) return false;
         if (!relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions)) return false;
         if (a.validation_state != b.validation_state) return false;
@@ -744,7 +752,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 41); // format version
+    try appendU32(&buf, alloc, 42); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -902,6 +910,8 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         }
         try appendRelationalRowsExpressionConditionSlice(&buf, alloc, constraint.where_expressions);
         try buf.append(alloc, @intFromEnum(constraint.validation_state));
+        try buf.append(alloc, if (constraint.deferrable) 1 else 0);
+        try buf.append(alloc, @intFromEnum(constraint.timing));
     }
 
     // Primary-key catalog (format version 17+).
@@ -912,6 +922,8 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendOptStr(&buf, alloc, primary_key.without_overlaps_period);
         try appendOptStr(&buf, alloc, primary_key.name);
         try appendStringSlice(&buf, alloc, primary_key.include_columns);
+        try buf.append(alloc, if (primary_key.deferrable) 1 else 0);
+        try buf.append(alloc, @intFromEnum(primary_key.timing));
     } else {
         try buf.append(alloc, 0);
     }
@@ -989,7 +1001,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 41) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 42) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1453,6 +1465,16 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 pos += 1;
                 break :state_blk value;
             } else .enforced;
+            const deferrable = if (fmt_version >= 42) deferrable_blk: {
+                const value = data[pos] == 1;
+                pos += 1;
+                break :deferrable_blk value;
+            } else false;
+            const timing: ForeignKeyTiming = if (fmt_version >= 42) timing_blk: {
+                const value: ForeignKeyTiming = @enumFromInt(data[pos]);
+                pos += 1;
+                break :timing_blk value;
+            } else .immediate;
             constraint.* = .{
                 .name = name,
                 .columns = columns,
@@ -1460,6 +1482,8 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .include_columns = include_columns,
                 .without_overlaps_period = without_overlaps_period,
                 .nulls_not_distinct = nulls_not_distinct,
+                .deferrable = deferrable,
+                .timing = timing,
                 .where = where,
                 .where_expressions = where_expressions,
                 .validation_state = validation_state,
@@ -1480,7 +1504,24 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         errdefer if (name) |value| alloc.free(value);
         const include_columns = if (fmt_version >= 37) try readStringSliceAlloc(alloc, data, &pos) else &.{};
         errdefer freeStringSlice(alloc, include_columns);
-        break :key_blk .{ .name = name, .columns = columns, .include_columns = include_columns, .without_overlaps_period = without_overlaps_period };
+        const deferrable = if (fmt_version >= 42) deferrable_blk: {
+            const value = data[pos] == 1;
+            pos += 1;
+            break :deferrable_blk value;
+        } else false;
+        const timing: ForeignKeyTiming = if (fmt_version >= 42) timing_blk: {
+            const value: ForeignKeyTiming = @enumFromInt(data[pos]);
+            pos += 1;
+            break :timing_blk value;
+        } else .immediate;
+        break :key_blk .{
+            .name = name,
+            .columns = columns,
+            .include_columns = include_columns,
+            .without_overlaps_period = without_overlaps_period,
+            .deferrable = deferrable,
+            .timing = timing,
+        };
     } else key_blk: {
         if (fmt_version >= 17) pos += 1;
         break :key_blk null;
@@ -2763,7 +2804,14 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{ .name = "tenant_key", .path = "tenant_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .lower, .field = "tenant_id" } },
             .{ .name = "tenant_upper_key", .path = "tenant_upper_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .upper, .field = "tenant_id" } },
         },
-        .primary_key = .{ .name = "orders_pkey", .columns = &.{ "tenant_id", "id" }, .include_columns = &.{ "created_at", "request_id" }, .without_overlaps_period = "valid_time" },
+        .primary_key = .{
+            .name = "orders_pkey",
+            .columns = &.{ "tenant_id", "id" },
+            .include_columns = &.{ "created_at", "request_id" },
+            .without_overlaps_period = "valid_time",
+            .deferrable = true,
+            .timing = .deferred,
+        },
         .periods = &.{.{ .name = "valid_time", .start_column = "created_at", .end_column = "created_day", .range_type = .daterange }},
         .foreign_keys = &.{
             .{
@@ -2800,6 +2848,8 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .columns = &.{ "tenant_id", "email" },
                 .include_columns = &.{ "created_at", "request_id" },
                 .nulls_not_distinct = true,
+                .deferrable = true,
+                .timing = .deferred,
                 .where = &.{
                     .{ .field = "email", .op = .is_not_null },
                 },
@@ -2883,6 +2933,8 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqualStrings("created_at", loaded.primary_key.?.include_columns[0]);
     try std.testing.expectEqualStrings("request_id", loaded.primary_key.?.include_columns[1]);
     try std.testing.expectEqualStrings("valid_time", loaded.primary_key.?.without_overlaps_period.?);
+    try std.testing.expect(loaded.primary_key.?.deferrable);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, loaded.primary_key.?.timing);
     try std.testing.expectEqual(@as(usize, 1), loaded.periods.len);
     try std.testing.expectEqualStrings("valid_time", loaded.periods[0].name);
     try std.testing.expectEqualStrings("created_at", loaded.periods[0].start_column);
@@ -2951,6 +3003,8 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqualStrings("created_at", loaded.unique_constraints[0].include_columns[0]);
     try std.testing.expectEqualStrings("request_id", loaded.unique_constraints[0].include_columns[1]);
     try std.testing.expect(loaded.unique_constraints[0].nulls_not_distinct);
+    try std.testing.expect(loaded.unique_constraints[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, loaded.unique_constraints[0].timing);
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.unique_constraints[0].where[0].op);
