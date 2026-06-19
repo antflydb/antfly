@@ -7679,7 +7679,8 @@ const Parser = struct {
         var left = try self.parseSelectWithSetBoundary(true);
         errdefer left.deinit(self.alloc);
         const left_columns = try self.setOperationOutputColumnsAlloc(left);
-        defer freeDdlRelationalColumns(self.alloc, left_columns);
+        var left_columns_transferred = false;
+        errdefer if (!left_columns_transferred) freeDdlRelationalColumns(self.alloc, left_columns);
         if (self.atEnd()) return error.UnsupportedSqlShape;
 
         const op = try self.parseSelectSetOperation();
@@ -7691,8 +7692,12 @@ const Parser = struct {
         const right_columns = try self.setOperationOutputColumnsAlloc(right);
         defer freeDdlRelationalColumns(self.alloc, right_columns);
 
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        const tail = try self.parseSetOperationResultTail(left);
+        var tail_transferred = false;
+        errdefer if (!tail_transferred) {
+            freeOrderBy(self.alloc, tail.order_by);
+            if (tail.order_by.len > 0) self.alloc.free(tail.order_by);
+        };
         if (!std.mem.eql(u8, left.table_name, right.table_name) and self.joined_source_schema == null) return error.UnsupportedSqlShape;
         if (!setOperationColumnsCompatible(left_columns, right_columns)) return error.UnsupportedSqlShape;
 
@@ -7717,10 +7722,72 @@ const Parser = struct {
         right.query = .{};
         errdefer right_plan.deinit(self.alloc);
 
+        left_columns_transferred = true;
+        tail_transferred = true;
         return .{
             .operation = op,
             .left = left_plan,
             .right = right_plan,
+            .output_columns = left_columns,
+            .order_by = tail.order_by,
+            .limit = tail.limit,
+            .offset = tail.offset,
+        };
+    }
+
+    const SetOperationResultTail = struct {
+        order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
+        limit: ?u32 = null,
+        offset: u32 = 0,
+    };
+
+    fn parseSetOperationResultTail(self: *@This(), lowered: LoweredSelect) !SetOperationResultTail {
+        var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
+        errdefer {
+            freeOrderBy(self.alloc, order_by.items);
+            order_by.deinit(self.alloc);
+        }
+        const select = SelectList{
+            .fields = lowered.query.select,
+            .json_extract = lowered.query.json_extract,
+            .array_length = lowered.query.array_length,
+            .coalesce = lowered.query.coalesce,
+            .field_aliases = lowered.query.field_aliases,
+            .expressions = lowered.query.expressions,
+            .outputs = lowered.select_outputs,
+            .select_all = lowered.query.select_all,
+        };
+        var limit: ?u32 = null;
+        var offset: u32 = 0;
+
+        while (!self.atEnd()) {
+            if (self.matchKeyword("order")) {
+                if (order_by.items.len > 0) return error.UnsupportedSqlShape;
+                try self.expectKeyword("by");
+                try self.parseSelectOutputOrderBy(&order_by, select);
+                for (order_by.items) |order| {
+                    if (order.expression != null) return error.UnsupportedSqlShape;
+                }
+            } else if (self.matchKeyword("limit")) {
+                if (limit != null) return error.UnsupportedSqlShape;
+                limit = try self.parseLimitValue();
+            } else if (self.matchKeyword("offset")) {
+                if (offset != 0) return error.UnsupportedSqlShape;
+                offset = try self.parseOffsetValue();
+            } else if (self.matchKeyword("fetch")) {
+                if (limit != null) return error.UnsupportedSqlShape;
+                limit = try self.parseFetchLimitValue();
+            } else if (self.match(.semicolon) != null) {
+                if (!self.atEnd()) return error.UnsupportedSqlShape;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        }
+
+        return .{
+            .order_by = try order_by.toOwnedSlice(self.alloc),
+            .limit = limit,
+            .offset = offset,
         };
     }
 
@@ -61675,11 +61742,16 @@ fn setOperationFingerprintAlloc(alloc: std.mem.Allocator, set_operation: Lowered
     defer alloc.free(left);
     const right = try queryFingerprintAlloc(alloc, "right", set_operation.right.table_name, set_operation.right.plan.query, set_operation.right.plan.ctes.len);
     defer alloc.free(right);
-    return try std.fmt.allocPrint(
+    var fingerprint = try std.fmt.allocPrint(
         alloc,
         "set_operation:op={s}:left={s}:right={s}",
         .{ @tagName(set_operation.operation), left, right },
     );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "result_output", set_operation.output_columns.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "result_order", set_operation.order_by.len);
+    if (set_operation.limit) |limit| fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "result_limit", limit);
+    fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "result_offset", set_operation.offset);
+    return fingerprint;
 }
 
 fn explainPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredExplainPlan) ![]u8 {
@@ -61864,9 +61936,9 @@ fn expectAppParityReadSummary(summary: AppParityPlanSummary, lowered: LoweredRea
             try expectOptionalTableName(summary.table_name, set_operation.left.table_name);
             try expectOptionalUsize(summary.ctes, set_operation.left.plan.ctes.len + set_operation.right.plan.ctes.len);
             try expectOptionalUsize(summary.select, set_operation.left.plan.query.select.len);
-            try expectOptionalUsize(summary.order_by, set_operation.left.plan.query.order_by.len + set_operation.right.plan.query.order_by.len);
-            try expectOptionalU32(summary.limit, set_operation.left.plan.query.limit);
-            if (summary.offset) |expected| try std.testing.expectEqual(expected, set_operation.left.plan.query.offset);
+            try expectOptionalUsize(summary.order_by, set_operation.left.plan.query.order_by.len + set_operation.right.plan.query.order_by.len + set_operation.order_by.len);
+            try expectOptionalU32(summary.limit, set_operation.limit orelse set_operation.left.plan.query.limit);
+            if (summary.offset) |expected| try std.testing.expectEqual(expected, if (set_operation.offset != 0) set_operation.offset else set_operation.left.plan.query.offset);
             if (summary.right_offset) |expected| try std.testing.expectEqual(expected, set_operation.right.plan.query.offset);
         },
         .aggregate => |aggregate| {

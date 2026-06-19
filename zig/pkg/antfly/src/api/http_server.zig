@@ -19158,19 +19158,29 @@ test "api http server applies SQL routine catalog plans through native runtime" 
     defer alloc.free(added);
     try std.testing.expectEqualStrings("5.5", added);
 
+    var created_concat = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';",
+        &session,
+    );
+    defer created_concat.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), server.sql_routine_runtime.routineCountForTest());
+    const label = try server.sql_routine_runtime.executeExpressionRoutineArgsAlloc(alloc, "status_label", &.{ "\"tenant\"", "\"active\"" });
+    defer alloc.free(label);
+    try std.testing.expectEqualStrings("\"tenant active\"", label);
+
     var created_strict = try server.applyRelationalSqlDdlWithSession(
         "CREATE FUNCTION strict_normalize_status(text) RETURNS text LANGUAGE sql STRICT AS 'SELECT lower($1)';",
         &session,
     );
     defer created_strict.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), server.sql_routine_runtime.routineCountForTest());
+    try std.testing.expectEqual(@as(usize, 4), server.sql_routine_runtime.routineCountForTest());
     const strict_null = try server.sql_routine_runtime.executeExpressionRoutineAlloc(alloc, "strict_normalize_status", "null");
     defer alloc.free(strict_null);
     try std.testing.expectEqualStrings("null", strict_null);
 
     var dropped = try server.applyRelationalSqlDdlWithSession("DROP FUNCTION normalize_status(text);", &session);
     defer dropped.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), server.sql_routine_runtime.routineCountForTest());
+    try std.testing.expectEqual(@as(usize, 3), server.sql_routine_runtime.routineCountForTest());
 }
 
 test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {

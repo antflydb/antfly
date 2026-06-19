@@ -4755,10 +4755,29 @@ fn executeLoweredSqlSetOperationPlanAlloc(
 
     const total = std.math.cast(u32, rows.items.len) orelse return error.InvalidRowsRequest;
     const owned_rows = try rows.toOwnedSlice(alloc);
-    return .{
+    if (lowered.order_by.len == 0 and lowered.limit == null and lowered.offset == 0) {
+        return .{
+            .rows = owned_rows,
+            .total = total,
+        };
+    }
+
+    var combined: db_mod.types.RelationalRowsQueryResult = .{
         .rows = owned_rows,
         .total = total,
     };
+    defer combined.deinit(alloc);
+    const output_schema: storage_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = lowered.output_columns,
+    };
+    const tail_query: relational_rows_api.OwnedRowsQueryRequest = .{
+        .select_all = true,
+        .order_by = lowered.order_by,
+        .limit = lowered.limit,
+        .offset = lowered.offset,
+    };
+    return try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, output_schema, tail_query, combined.rows);
 }
 
 fn appendSetOperationRowsAlloc(
@@ -19728,6 +19747,111 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
             try std.testing.expectEqualStrings("{\"id\":\"u2\"}", query_result.rows[1]);
             try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[2]);
             try std.testing.expectEqualStrings("{\"id\":\"u3\"}", query_result.rows[3]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_distinct = try relational_sql_api.lowerReadPlanAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer lowered_distinct.deinit(alloc);
+    switch (lowered_distinct) {
+        .set_operation => |set_operation| try std.testing.expectEqualStrings("union_distinct", @tagName(set_operation.operation)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var fake_distinct = FakeSource{};
+    var distinct_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake_distinct.source(),
+        catalog.iface(),
+        "usage_records",
+        schema,
+        lowered_distinct,
+        .read_index,
+    )).?;
+    defer distinct_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake_distinct.scan_calls);
+    switch (distinct_result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 3), query_result.total);
+            try std.testing.expectEqual(@as(usize, 3), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\"}", query_result.rows[1]);
+            try std.testing.expectEqualStrings("{\"id\":\"u3\"}", query_result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_intersect = try relational_sql_api.lowerReadPlanAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer lowered_intersect.deinit(alloc);
+    switch (lowered_intersect) {
+        .set_operation => |set_operation| try std.testing.expectEqualStrings("intersect", @tagName(set_operation.operation)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var fake_intersect = FakeSource{};
+    var intersect_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake_intersect.source(),
+        catalog.iface(),
+        "usage_records",
+        schema,
+        lowered_intersect,
+        .read_index,
+    )).?;
+    defer intersect_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake_intersect.scan_calls);
+    switch (intersect_result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 1), query_result.total);
+            try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_tail = try relational_sql_api.lowerReadPlanAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE ORDER BY id DESC LIMIT 2 OFFSET 1",
+        schema,
+        &.{},
+    );
+    defer lowered_tail.deinit(alloc);
+    switch (lowered_tail) {
+        .set_operation => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var fake_tail = FakeSource{};
+    var tail_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake_tail.source(),
+        catalog.iface(),
+        "usage_records",
+        schema,
+        lowered_tail,
+        .read_index,
+    )).?;
+    defer tail_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake_tail.scan_calls);
+    switch (tail_result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 4), query_result.total);
+            try std.testing.expectEqual(@as(usize, 2), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\"}", query_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[1]);
         },
         else => return error.TestUnexpectedResult,
     }

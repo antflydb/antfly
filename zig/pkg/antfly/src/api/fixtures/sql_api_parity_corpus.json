@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "f2cf2020ea7da541b19a30858774f7fa7de3eb4be9e0bcb13ce745b9572f7d67",
-  "source_entry_count": 990,
-  "entry_count": 990,
+  "source_sha256": "b4badbdcace2eb542a447155848a269533e76c04e31f24332a8bf59e3d467f8a",
+  "source_entry_count": 992,
+  "entry_count": 992,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4094,6 +4094,17 @@
       "sql": "CREATE FUNCTION second_status(text, text) RETURNS text LANGUAGE sql AS $$SELECT upper($2)$$"
     },
     {
+      "name": "create sql expression function concat body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "status_label",
+        "operations": 2
+      },
+      "plan": "ddl:create_function:name=status_label:args=2:replace=false:returns=text:language=sql:body=sql_expression:hook=expression:expr=concat_ws[value[222022]+field[source:arg1]+field[source:arg2]]",
+      "sql": "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS $$SELECT concat_ws(' ', $1, $2)$$"
+    },
+    {
       "name": "create sql expression function multi argument add body catalog ddl",
       "family": "ddl",
       "summary": {
@@ -4379,7 +4390,7 @@
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
@@ -4998,7 +5009,7 @@
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
@@ -5477,7 +5488,7 @@
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "read:set_operation:set_operation:op=intersect:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:set_operation:set_operation:op=intersect:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
       "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT upper(status) AS status_key FROM usage_records WHERE enabled IS TRUE"
     },
     {
@@ -5486,7 +5497,7 @@
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE"
     },
@@ -5496,9 +5507,21 @@
       "summary": {
         "table_name": "usage_records"
       },
-      "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
+    },
+    {
+      "name": "read set operation final order limit offset",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "order_by": 1,
+        "limit": 5,
+        "offset": 1
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1:result_order=1:result_limit=5:result_offset=1",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE ORDER BY id DESC LIMIT 5 OFFSET 1"
     },
     {
       "name": "read except mixed scalar expression predicate set operation",

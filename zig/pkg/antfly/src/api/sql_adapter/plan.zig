@@ -64,13 +64,28 @@ pub const LoweredSetOperationPlan = struct {
     operation: SelectSetOperation,
     left: LoweredQueryPlan,
     right: LoweredQueryPlan,
+    output_columns: []const runtime_schema.RelationalColumn = &.{},
+    order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.left.deinit(alloc);
         self.right.deinit(alloc);
+        freeSetOperationOutputColumns(alloc, self.output_columns);
+        var order_query: db_mod.types.RelationalRowsQueryRequest = .{ .order_by = self.order_by };
+        order_query.deinit(alloc);
         self.* = undefined;
     }
 };
+
+fn freeSetOperationOutputColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
+    for (columns) |column| {
+        if (column.name.len > 0) alloc.free(column.name);
+        if (column.path.len > 0) alloc.free(column.path);
+    }
+    if (columns.len > 0) alloc.free(columns);
+}
 
 pub const LoweredWindowPlan = struct {
     table_name: []const u8,

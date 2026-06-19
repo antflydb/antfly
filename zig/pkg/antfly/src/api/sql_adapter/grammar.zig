@@ -2839,32 +2839,12 @@ fn parseSqlRoutineBodyPlanAlloc(
             };
         }
     }
-    inline for (.{ "lower", "upper", "md5" }) |fn_name| {
-        if (expression_tokens.items.len == 4 and
-            expression_tokens.items[0].kind == .identifier and
-            std.ascii.eqlIgnoreCase(expression_tokens.items[0].text, fn_name) and
-            expression_tokens.items[1].kind == .lparen and
-            expression_tokens.items[3].kind == .rparen)
-        {
-            const argument_index = routineArgumentIndex(expression_tokens.items[2].text) orelse return error.UnsupportedSqlShape;
-            const kind: runtime_schema.RelationalRowsExpressionKind = if (std.ascii.eqlIgnoreCase(fn_name, "lower"))
-                .lower
-            else if (std.ascii.eqlIgnoreCase(fn_name, "upper"))
-                .upper
-            else
-                .md5;
-            const operand = try routineArgumentExpressionAlloc(alloc, argument_index);
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
-            const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
-            operands[0] = operand;
-            operand_transferred = true;
-            return .{
-                .kind = .sql_expression,
-                .hook = .expression,
-                .expression = try ddlGeneratedOperationExpressionAlloc(alloc, kind, operands),
-            };
-        }
+    if (try routineFunctionExpressionAlloc(alloc, expression_tokens.items)) |function_expression| {
+        return .{
+            .kind = .sql_expression,
+            .hook = .expression,
+            .expression = function_expression,
+        };
     }
     if (expression_tokens.items.len == 3 and expression_tokens.items[1].kind == .plus) {
         const lhs = try routineAddOperandExpressionAlloc(alloc, expression_tokens.items[0]);
@@ -2885,6 +2865,55 @@ fn parseSqlRoutineBodyPlanAlloc(
         };
     }
     return error.UnsupportedSqlShape;
+}
+
+fn routineFunctionExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !?runtime_schema.RelationalRowsExpression {
+    if (tokens.len < 4 or tokens[0].kind != .identifier or tokens[1].kind != .lparen or tokens[tokens.len - 1].kind != .rparen) return null;
+    const kind = routineFunctionExpressionKind(tokens[0].text) orelse return null;
+    var operands_list = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands_list.items) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        operands_list.deinit(alloc);
+    }
+    var i: usize = 2;
+    while (i < tokens.len - 1) {
+        const operand = try routineExpressionOperandAlloc(alloc, tokens[i]);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        try operands_list.append(alloc, operand);
+        operand_transferred = true;
+        i += 1;
+        if (i == tokens.len - 1) break;
+        if (tokens[i].kind != .comma) return error.UnsupportedSqlShape;
+        i += 1;
+        if (i >= tokens.len - 1) return error.UnsupportedSqlShape;
+    }
+
+    switch (kind) {
+        .lower, .upper, .md5 => if (operands_list.items.len != 1) return error.UnsupportedSqlShape,
+        .concat => if (operands_list.items.len < 1) return error.UnsupportedSqlShape,
+        .concat_ws, .coalesce => if (operands_list.items.len < 2) return error.UnsupportedSqlShape,
+        .nullif => if (operands_list.items.len != 2) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
+
+    const operands = try operands_list.toOwnedSlice(alloc);
+    operands_list = .empty;
+    return try ddlGeneratedOperationExpressionAlloc(alloc, kind, operands);
+}
+
+fn routineFunctionExpressionKind(name: []const u8) ?runtime_schema.RelationalRowsExpressionKind {
+    if (std.ascii.eqlIgnoreCase(name, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(name, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
+    if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
+    if (std.ascii.eqlIgnoreCase(name, "coalesce")) return .coalesce;
+    if (std.ascii.eqlIgnoreCase(name, "nullif")) return .nullif;
+    return null;
 }
 
 fn routineArgumentIndex(text: []const u8) ?usize {
@@ -2915,9 +2944,28 @@ fn routineAddOperandExpressionAlloc(
     }
     if (token.kind != .number) return error.UnsupportedSqlShape;
     _ = std.fmt.parseFloat(f64, token.text) catch return error.UnsupportedSqlShape;
-    const value_json = try alloc.dupe(u8, token.text);
+    return try routineValueExpressionAlloc(alloc, try alloc.dupe(u8, token.text));
+}
+
+fn routineExpressionOperandAlloc(
+    alloc: std.mem.Allocator,
+    token: Token,
+) !runtime_schema.RelationalRowsExpression {
+    if (token.kind == .string) return try routineValueExpressionAlloc(alloc, try std.json.Stringify.valueAlloc(alloc, token.text, .{}));
+    if (token.kind == .identifier) {
+        if (std.ascii.eqlIgnoreCase(token.text, "true")) return try routineValueExpressionAlloc(alloc, try alloc.dupe(u8, "true"));
+        if (std.ascii.eqlIgnoreCase(token.text, "false")) return try routineValueExpressionAlloc(alloc, try alloc.dupe(u8, "false"));
+        if (std.ascii.eqlIgnoreCase(token.text, "null")) return try routineValueExpressionAlloc(alloc, try alloc.dupe(u8, "null"));
+    }
+    return try routineAddOperandExpressionAlloc(alloc, token);
+}
+
+fn routineValueExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+) !runtime_schema.RelationalRowsExpression {
     var value_transferred = false;
-    errdefer if (!value_transferred) alloc.free(value_json);
+    errdefer if (!value_transferred) alloc.free(@constCast(value_json));
     const value = try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
     value_transferred = true;
     return value;
@@ -7706,6 +7754,27 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, literal_add_body.body.?.expression.kind);
     try std.testing.expectEqualStrings("1", literal_add_body.body.?.expression.operands[0].value_json);
     try std.testing.expectEqualStrings("arg1", literal_add_body.body.?.expression.operands[1].field);
+
+    var concat_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';");
+    defer lexer.freeTokens(alloc, &concat_body_tokens);
+    var concat_body_pos: usize = 0;
+    var concat_body = try parseCreateRoutineCatalogTailAlloc(alloc, concat_body_tokens.items, &concat_body_pos);
+    defer concat_body.deinit(alloc);
+    try std.testing.expectEqual(concat_body_tokens.items.len, concat_body_pos);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, concat_body.body.?.expression.kind);
+    try std.testing.expectEqualStrings("\" \"", concat_body.body.?.expression.operands[0].value_json);
+    try std.testing.expectEqualStrings("arg1", concat_body.body.?.expression.operands[1].field);
+    try std.testing.expectEqualStrings("arg2", concat_body.body.?.expression.operands[2].field);
+
+    var coalesce_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION status_or_fallback(text) RETURNS text LANGUAGE sql AS 'SELECT coalesce($1, ''missing'')';");
+    defer lexer.freeTokens(alloc, &coalesce_body_tokens);
+    var coalesce_body_pos: usize = 0;
+    var coalesce_body = try parseCreateRoutineCatalogTailAlloc(alloc, coalesce_body_tokens.items, &coalesce_body_pos);
+    defer coalesce_body.deinit(alloc);
+    try std.testing.expectEqual(coalesce_body_tokens.items.len, coalesce_body_pos);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.coalesce, coalesce_body.body.?.expression.kind);
+    try std.testing.expectEqualStrings("arg1", coalesce_body.body.?.expression.operands[0].field);
+    try std.testing.expectEqualStrings("\"missing\"", coalesce_body.body.?.expression.operands[1].value_json);
 
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);

@@ -2215,12 +2215,14 @@ pub fn corpusFixtureAllowsPredicateSummary(entry: AppParityCorpusEntry) bool {
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusReadPlanHasPrefix(entry, "read:lateral:") or
-            corpusReadPlanHasPrefix(entry, "read:window:"),
+            corpusReadPlanHasPrefix(entry, "read:window:") or
+            corpusReadPlanHasPrefix(entry, "read:set_operation:"),
         .explain => corpusReadPlanHasPrefix(entry, "read:query:") or
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusReadPlanHasPrefix(entry, "read:lateral:") or
             corpusReadPlanHasPrefix(entry, "read:window:") or
+            corpusReadPlanHasPrefix(entry, "read:set_operation:") or
             corpusExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
             corpusExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
             corpusExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
@@ -2287,7 +2289,8 @@ pub fn corpusFixtureAllowsAccessSummary(entry: AppParityCorpusEntry) bool {
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusReadPlanHasPrefix(entry, "read:lateral:") or
-            corpusReadPlanHasPrefix(entry, "read:window:"),
+            corpusReadPlanHasPrefix(entry, "read:window:") or
+            corpusReadPlanHasPrefix(entry, "read:set_operation:"),
         .explain => corpusReadPlanHasPrefix(entry, "read:query:") or
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
@@ -2548,7 +2551,8 @@ pub fn corpusFixtureAllowsPaginationSummary(entry: AppParityCorpusEntry) bool {
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusReadPlanHasPrefix(entry, "read:lateral:") or
-            corpusReadPlanHasPrefix(entry, "read:window:"),
+            corpusReadPlanHasPrefix(entry, "read:window:") or
+            corpusReadPlanHasPrefix(entry, "read:set_operation:"),
         .explain => corpusReadPlanHasPrefix(entry, "read:query:") or
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
@@ -2581,19 +2585,24 @@ fn corpusFixtureUsesSourcePagination(entry: AppParityCorpusEntry) bool {
 
 pub fn corpusFixturePaginationSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
     const source_pagination = corpusFixtureUsesSourcePagination(entry);
+    const result_pagination = corpusFixtureUsesSetOperationResultPagination(entry);
     if (entry.summary.order_by) |order_by| {
-        const token_text = if (source_pagination) ":source_order=" else ":order=";
+        const token_text = if (source_pagination) ":source_order=" else if (result_pagination) ":result_order=" else ":order=";
         if (!planHasExactUsizeToken(entry.plan, token_text, order_by)) return false;
     }
     if (entry.summary.limit) |limit| {
-        const token_text = if (source_pagination) ":source_limit=" else ":limit=";
+        const token_text = if (source_pagination) ":source_limit=" else if (result_pagination) ":result_limit=" else ":limit=";
         if (!planHasExactUsizeToken(entry.plan, token_text, limit)) return false;
     }
     if (entry.summary.offset) |offset| {
-        const token_text = if (source_pagination) ":source_offset=" else ":offset=";
+        const token_text = if (source_pagination) ":source_offset=" else if (result_pagination) ":result_offset=" else ":offset=";
         if (!planHasExactUsizeToken(entry.plan, token_text, offset)) return false;
     }
     return true;
+}
+
+fn corpusFixtureUsesSetOperationResultPagination(entry: AppParityCorpusEntry) bool {
+    return corpusReadPlanHasPrefix(entry, "read:set_operation:");
 }
 
 pub fn corpusFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
@@ -4063,6 +4072,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_support: bool = false,
     ddl_function_transform: bool = false,
     ddl_function_setting: bool = false,
+    ddl_function_sql_expression_concat_body: bool = false,
     ddl_function_sql_expression_body: bool = false,
     ddl_function_sql_expression_multi_arg_body: bool = false,
     ddl_function_drop: bool = false,
@@ -4907,16 +4917,18 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
             sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "5"));
         self.read_set_operation_order_limit = self.read_set_operation_order_limit or (entry.family == .read and
-            std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null and
+            (std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null or
+                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null) and
             std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
-            sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") and
-            sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
-            sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "5"));
+            (sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") or std.mem.startsWith(u8, entry.plan, "read:set_operation:")) and
+            sql_adapter.planHasNonZeroToken(entry.plan, ":result_order=") and
+            sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "5"));
         self.set_operation_fetch_tail = self.set_operation_fetch_tail or
             ((entry.family == .query or entry.family == .read) and
                 std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
                 std.mem.indexOf(u8, entry.sql, " FETCH FIRST ROW ONLY") != null and
-                sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "1"));
+                (sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "1") or
+                    sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "1")));
         self.set_operation_null_pagination_tail = self.set_operation_null_pagination_tail or
             ((entry.family == .query or entry.family == .read) and
                 std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
@@ -5747,6 +5759,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_setting = self.ddl_function_setting or std.mem.indexOf(u8, entry.plan, ":settings=") != null;
                     self.ddl_function_sql_expression_body = self.ddl_function_sql_expression_body or
                         std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null;
+                    self.ddl_function_sql_expression_concat_body = self.ddl_function_sql_expression_concat_body or
+                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                            std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null);
                     self.ddl_function_sql_expression_multi_arg_body = self.ddl_function_sql_expression_multi_arg_body or
                         (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
                             std.mem.indexOf(u8, entry.plan, "arg2") != null);

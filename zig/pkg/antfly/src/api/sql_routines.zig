@@ -327,6 +327,19 @@ test "sql routine runtime executes bounded multi argument expression bodies" {
     const out = try runtime.executeExpressionRoutineArgsAlloc(alloc, "add_amounts", &.{ "2", "3.5" });
     defer alloc.free(out);
     try std.testing.expectEqualStrings("5.5", out);
+
+    var concat_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';",
+    );
+    defer concat_plan.deinit(alloc);
+    try runtime.apply(switch (concat_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    const label = try runtime.executeExpressionRoutineArgsAlloc(alloc, "status_label", &.{ "\"tenant\"", "\"active\"" });
+    defer alloc.free(label);
+    try std.testing.expectEqualStrings("\"tenant active\"", label);
 }
 
 test "sql routine runtime applies returns-null null-input policy before execution" {
