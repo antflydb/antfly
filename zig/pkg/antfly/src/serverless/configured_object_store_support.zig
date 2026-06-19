@@ -317,6 +317,123 @@ test "credentialed binding object store opens scoped gcs source with bearer toke
     }));
 }
 
+test "credentialed binding object store opens scoped s3 source with configured credentials" {
+    const alloc = std.testing.allocator;
+    const cfg_json =
+        \\{
+        \\  "connections": {
+        \\    "prod-s3-lake-read": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_read"],
+        \\      "external_io": {
+        \\        "protocol": "s3",
+        \\        "endpoint": "http://127.0.0.1:9000",
+        \\        "use_ssl": true,
+        \\        "buckets": ["lake-bucket"],
+        \\        "prefix": "events",
+        \\        "access_key_id": "test-key",
+        \\        "secret_access_key": "test-secret",
+        \\        "session_token": "test-session"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try common_config.Config.parseFromSlice(alloc, cfg_json);
+    defer cfg.deinit();
+
+    var opened = try openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "s3://lake-bucket/events/2026",
+        .credential_ref = .{ .ref_id = "prod-s3-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+    });
+    defer opened.deinit();
+
+    try std.testing.expectEqualStrings("lake-bucket", opened.bucket);
+    try std.testing.expectEqualStrings("events/2026", opened.prefix);
+    const s3_client = opened.s3_client orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("127.0.0.1:9000", s3_client.cfg.credentials.endpoint);
+    try std.testing.expect(!s3_client.cfg.credentials.use_ssl);
+    try std.testing.expectEqualStrings("test-key", s3_client.cfg.credentials.access_key_id);
+    try std.testing.expectEqualStrings("test-secret", s3_client.cfg.credentials.secret_access_key);
+    try std.testing.expectEqualStrings("test-session", s3_client.cfg.credentials.session_token.?);
+
+    try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "s3://lake-bucket/other",
+        .credential_ref = .{ .ref_id = "prod-s3-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+    }));
+}
+
+test "credentialed binding object store resolves s3 credential secrets" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const secret_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/s3-secrets.json", .{tmp.sub_path});
+    defer alloc.free(secret_path);
+    var secret_store = try common_secrets.FileStore.init(alloc, secret_path);
+    defer secret_store.deinit();
+    var stored_endpoint = try secret_store.put(alloc, "s3.lake.endpoint", "http://127.0.0.1:9000");
+    defer stored_endpoint.deinit(alloc);
+    var stored_key = try secret_store.put(alloc, "s3.lake.access_key_id", "secret-key");
+    defer stored_key.deinit(alloc);
+    var stored_secret = try secret_store.put(alloc, "s3.lake.secret_access_key", "secret-secret");
+    defer stored_secret.deinit(alloc);
+    var stored_session = try secret_store.put(alloc, "s3.lake.session_token", "secret-session");
+    defer stored_session.deinit(alloc);
+
+    const cfg_json =
+        \\{
+        \\  "connections": {
+        \\    "prod-s3-lake-read": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_read"],
+        \\      "external_io": {
+        \\        "protocol": "s3",
+        \\        "endpoint": "${secret:s3.lake.endpoint}",
+        \\        "buckets": ["lake-bucket"],
+        \\        "access_key_id": "${secret:s3.lake.access_key_id}",
+        \\        "secret_access_key": "${secret:s3.lake.secret_access_key}",
+        \\        "session_token": "${secret:s3.lake.session_token}"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try common_config.Config.parseFromSliceWithSecrets(alloc, cfg_json, &secret_store);
+    defer cfg.deinit();
+
+    var opened = try openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "s3://lake-bucket/events",
+        .credential_ref = .{ .ref_id = "prod-s3-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+        .secret_store = &secret_store,
+    });
+    defer opened.deinit();
+
+    const s3_client = opened.s3_client orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("127.0.0.1:9000", s3_client.cfg.credentials.endpoint);
+    try std.testing.expect(!s3_client.cfg.credentials.use_ssl);
+    try std.testing.expectEqualStrings("secret-key", s3_client.cfg.credentials.access_key_id);
+    try std.testing.expectEqualStrings("secret-secret", s3_client.cfg.credentials.secret_access_key);
+    try std.testing.expectEqualStrings("secret-session", s3_client.cfg.credentials.session_token.?);
+}
+
 test "credentialed binding object store resolves gcs authorization secret" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
