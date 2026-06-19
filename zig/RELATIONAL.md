@@ -1393,6 +1393,9 @@ and semijoin selectors such as `WHERE id IN (SELECT id FROM source_cte)`.
 Non-recursive `WITH ... MERGE` now lowers into the same typed MERGE plan with
 owned source CTE metadata and a source-side CTE reference, so the source stream
 remains an Antfly row-plan input rather than SQL text attached to execution.
+Local execution materializes that source CTE through the ordinary row-plan
+reader, including catalog-resolved cross-schema source tables, before feeding
+the resulting typed source rows into the deterministic MERGE batch builder.
 Recursive CTE-backed writes still fail closed under `recursive_cte_stream_plan`
 until recursive stream planning has a bounded native execution model.
 The catalog-backed write-plan entrypoint also resolves direct joined

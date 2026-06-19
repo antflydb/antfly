@@ -65421,6 +65421,143 @@ test "postgres sql adapter merge mutation batch collects cross-schema local prei
     try std.testing.expectEqualStrings("{\"id\":\"t_skip\",\"status\":\"closed\",\"organization_id\":\"org:1\",\"amount\":2,\"kind\":\"target\"}", rows.rows[2]);
 }
 
+test "postgres sql adapter merge mutation batch collects cross-schema CTE source preimages" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"amount":{"type":"numeric"},"kind":{"type":"keyword"}},"required":["id","kind"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_target = try schema_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target.deinit(alloc);
+    const target_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_target);
+    defer runtime_schema.freeSchema(alloc, target_schema);
+
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"source_pk":{"type":"keyword"},"archive_id":{"type":"keyword"},"archive_status":{"type":"keyword"},"archive_amount":{"type":"numeric"},"archive_org":{"type":"keyword"},"archive_kind":{"type":"keyword"}},"required":["source_pk","archive_id","archive_kind"],"additionalProperties":false}}},"primary_key":{"columns":["source_pk"]}}
+    ;
+    var parsed_source = try schema_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed_source.deinit(alloc);
+    const source_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source);
+    defer runtime_schema.freeSchema(alloc, source_schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-merge-cross-schema-cte-target-preimages", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-merge-cross-schema-cte-source-preimages", .{tmp.sub_path});
+    defer alloc.free(source_path);
+
+    var db = try db_mod.DB.open(alloc, target_path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, target_schema_json, .{});
+    var source_db = try db_mod.DB.open(alloc, source_path, .{});
+    defer source_db.close();
+    try source_db.applyTableSchemaJson(alloc, source_schema_json, .{});
+
+    const target_jsons = [_][]const u8{
+        "{\"id\":\"t1\",\"kind\":\"target\",\"status\":\"open\",\"organization_id\":\"org:1\",\"amount\":1}",
+        "{\"id\":\"t_skip\",\"kind\":\"target\",\"status\":\"closed\",\"organization_id\":\"org:1\",\"amount\":2}",
+    };
+    var target_keys: [target_jsons.len][]u8 = undefined;
+    for (target_jsons, 0..) |row_json, i| target_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, row_json);
+    defer {
+        for (target_keys) |key| alloc.free(key);
+    }
+
+    const source_jsons = [_][]const u8{
+        "{\"source_pk\":\"s1\",\"archive_id\":\"t1\",\"archive_kind\":\"source\",\"archive_status\":\"UPDATED\",\"archive_amount\":11,\"archive_org\":\"org:1\"}",
+        "{\"source_pk\":\"s2\",\"archive_id\":\"new1\",\"archive_kind\":\"source\",\"archive_status\":\"inserted\",\"archive_amount\":22,\"archive_org\":\"org:2\"}",
+        "{\"source_pk\":\"s3\",\"archive_id\":\"t_skip\",\"archive_kind\":\"skip\",\"archive_status\":\"ignored\",\"archive_amount\":33,\"archive_org\":\"org:1\"}",
+    };
+    var source_keys: [source_jsons.len][]u8 = undefined;
+    for (source_jsons, 0..) |row_json, i| source_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, source_schema, row_json);
+    defer {
+        for (source_keys) |key| alloc.free(key);
+    }
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = target_keys[0], .value = target_jsons[0] },
+            .{ .key = target_keys[1], .value = target_jsons[1] },
+        },
+        .sync_level = .write,
+    });
+    try source_db.batch(.{
+        .writes = &.{
+            .{ .key = source_keys[0], .value = source_jsons[0] },
+            .{ .key = source_keys[1], .value = source_jsons[1] },
+            .{ .key = source_keys[2], .value = source_jsons[2] },
+        },
+        .sync_level = .write,
+    });
+
+    var catalog = AppParitySourceSchemaCatalog.init("archived_records", source_schema_json);
+    var write_plan = try lowerWritePlanWithCatalogAlloc(
+        alloc,
+        "WITH ready_archives AS (SELECT archive_id, archive_status, archive_amount, archive_org FROM archived_records WHERE archive_kind = 'source') MERGE INTO usage_records AS target USING ready_archives AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = lower(source.archive_status), amount = source.archive_amount WHEN NOT MATCHED THEN INSERT (id, status, organization_id, amount, kind) VALUES (source.archive_id, upper(source.archive_status), source.archive_org, source.archive_amount, 'target') RETURNING target.id, target.status, target.amount",
+        target_schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer write_plan.deinit(alloc);
+
+    const target_predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "kind",
+        .op = .eq,
+        .value_json = "\"target\"",
+    }};
+    const target_order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    const target_query: db_mod.types.RelationalRowsQueryRequest = .{
+        .predicates = target_predicates[0..],
+        .order_by = target_order_by[0..],
+    };
+    const target_ranges = [_]db_mod.types.RelationalRowsDocKeyRange{.{
+        .start = target_keys[0],
+        .end = "",
+    }};
+    const source_ranges = [_]db_mod.types.RelationalRowsDocKeyRange{.{
+        .start = source_keys[0],
+        .end = "",
+    }};
+
+    switch (write_plan) {
+        .merge_mutation => |merge| {
+            try std.testing.expectEqual(@as(usize, 1), merge.ctes.len);
+            try std.testing.expectEqualStrings("ready_archives", merge.source.source_cte);
+            try std.testing.expectEqualStrings("archived_records", merge.source_table_name);
+            var batch = try buildMergeMutationBatchFromDbsAcrossRangesAlloc(alloc, &db, &source_db, target_schema, source_schema, merge, target_query, target_ranges[0..], .{}, source_ranges[0..]);
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 0), batch.deleted);
+            try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"updated\",\"amount\":11}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"new1\",\"status\":\"INSERTED\",\"amount\":22}", batch.returning_rows[1]);
+            try db.batch(batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const select = [_][]const u8{ "id", "status", "organization_id", "amount", "kind" };
+    var rows = try db.queryRelationalRows(alloc, target_schema, .{
+        .select = select[0..],
+        .predicates = target_predicates[0..],
+        .order_by = target_order_by[0..],
+    });
+    defer rows.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), rows.total);
+    try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"new1\",\"status\":\"INSERTED\",\"organization_id\":\"org:2\",\"amount\":22,\"kind\":\"target\"}", rows.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"updated\",\"organization_id\":\"org:1\",\"amount\":11,\"kind\":\"target\"}", rows.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"t_skip\",\"status\":\"closed\",\"organization_id\":\"org:1\",\"amount\":2,\"kind\":\"target\"}", rows.rows[2]);
+}
+
 test "postgres sql adapter mutation source jsonb_set executes through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
