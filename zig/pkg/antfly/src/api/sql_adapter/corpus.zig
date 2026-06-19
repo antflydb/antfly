@@ -4012,14 +4012,25 @@ pub const AppParityCorpusCoverage = struct {
     ddl_comment_index: bool = false,
     ddl_comment_constraint: bool = false,
     ddl_table_lock: bool = false,
+    ddl_table_lock_access_exclusive: bool = false,
+    ddl_table_lock_multi_table: bool = false,
+    ddl_table_lock_share_row_exclusive: bool = false,
     ddl_constraint_mode: bool = false,
+    ddl_constraint_mode_all: bool = false,
+    ddl_constraint_mode_named: bool = false,
+    ddl_constraint_mode_deferred: bool = false,
+    ddl_constraint_mode_immediate: bool = false,
     ddl_set_transaction_mode: bool = false,
     ddl_start_transaction_mode: bool = false,
     ddl_begin_transaction_mode: bool = false,
+    ddl_transaction_isolation: bool = false,
+    ddl_transaction_read_only: bool = false,
+    ddl_transaction_read_write: bool = false,
     ddl_transaction_deferrable_true: bool = false,
     ddl_transaction_deferrable_false: bool = false,
     ddl_advisory_lock: bool = false,
     ddl_advisory_unlock: bool = false,
+    ddl_advisory_lock_two_keys: bool = false,
     read: bool = false,
     read_query: bool = false,
     read_aggregate: bool = false,
@@ -5692,18 +5703,33 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_comment_index = self.ddl_comment_index or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "index");
                     self.ddl_comment_constraint = self.ddl_comment_constraint or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "constraint");
                 },
-                .table_lock => self.ddl_table_lock = true,
-                .constraint_mode => self.ddl_constraint_mode = true,
+                .table_lock => {
+                    self.ddl_table_lock = true;
+                    self.ddl_table_lock_access_exclusive = self.ddl_table_lock_access_exclusive or sql_adapter.planHasExactStringToken(entry.plan, ":mode=", "access_exclusive");
+                    self.ddl_table_lock_multi_table = self.ddl_table_lock_multi_table or sql_adapter.planHasExactUsizeToken(entry.plan, ":tables=", 2);
+                    self.ddl_table_lock_share_row_exclusive = self.ddl_table_lock_share_row_exclusive or sql_adapter.planHasExactStringToken(entry.plan, ":mode=", "share_row_exclusive");
+                },
+                .constraint_mode => {
+                    self.ddl_constraint_mode = true;
+                    self.ddl_constraint_mode_all = self.ddl_constraint_mode_all or sql_adapter.planHasExactBoolToken(entry.plan, ":all=", true);
+                    self.ddl_constraint_mode_named = self.ddl_constraint_mode_named or sql_adapter.planHasNonZeroToken(entry.plan, ":constraints=");
+                    self.ddl_constraint_mode_deferred = self.ddl_constraint_mode_deferred or sql_adapter.planHasExactStringToken(entry.plan, ":mode=", "deferred");
+                    self.ddl_constraint_mode_immediate = self.ddl_constraint_mode_immediate or sql_adapter.planHasExactStringToken(entry.plan, ":mode=", "immediate");
+                },
                 .transaction_mode => {
                     self.ddl_set_transaction_mode = self.ddl_set_transaction_mode or sql_adapter.planHasExactStringToken(entry.plan, ":starter=", "set_transaction");
                     self.ddl_start_transaction_mode = self.ddl_start_transaction_mode or sql_adapter.planHasExactStringToken(entry.plan, ":starter=", "start_transaction");
                     self.ddl_begin_transaction_mode = self.ddl_begin_transaction_mode or sql_adapter.planHasExactStringToken(entry.plan, ":starter=", "begin");
+                    self.ddl_transaction_isolation = self.ddl_transaction_isolation or !sql_adapter.planHasExactStringToken(entry.plan, ":isolation=", "none");
+                    self.ddl_transaction_read_only = self.ddl_transaction_read_only or sql_adapter.planHasExactStringToken(entry.plan, ":access=", "read_only");
+                    self.ddl_transaction_read_write = self.ddl_transaction_read_write or sql_adapter.planHasExactStringToken(entry.plan, ":access=", "read_write");
                     self.ddl_transaction_deferrable_true = self.ddl_transaction_deferrable_true or sql_adapter.planHasExactStringToken(entry.plan, ":deferrable=", "true");
                     self.ddl_transaction_deferrable_false = self.ddl_transaction_deferrable_false or sql_adapter.planHasExactStringToken(entry.plan, ":deferrable=", "false");
                 },
                 .advisory_lock => {
                     self.ddl_advisory_lock = self.ddl_advisory_lock or sql_adapter.planHasExactStringToken(entry.plan, ":action=", "lock");
                     self.ddl_advisory_unlock = self.ddl_advisory_unlock or sql_adapter.planHasExactStringToken(entry.plan, ":action=", "unlock");
+                    self.ddl_advisory_lock_two_keys = self.ddl_advisory_lock_two_keys or sql_adapter.planHasExactUsizeToken(entry.plan, ":keys=", 2);
                 },
                 .set_search_path => self.session_set_search_path = true,
                 .reset_search_path => self.session_reset_search_path = true,
@@ -6527,14 +6553,25 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_identity_allocator_generated);
         try std.testing.expect(self.ddl_identity_allocator_generated_options);
         try std.testing.expect(self.ddl_table_lock);
+        try std.testing.expect(self.ddl_table_lock_access_exclusive);
+        try std.testing.expect(self.ddl_table_lock_multi_table);
+        try std.testing.expect(self.ddl_table_lock_share_row_exclusive);
         try std.testing.expect(self.ddl_constraint_mode);
+        try std.testing.expect(self.ddl_constraint_mode_all);
+        try std.testing.expect(self.ddl_constraint_mode_named);
+        try std.testing.expect(self.ddl_constraint_mode_deferred);
+        try std.testing.expect(self.ddl_constraint_mode_immediate);
         try std.testing.expect(self.ddl_set_transaction_mode);
         try std.testing.expect(self.ddl_start_transaction_mode);
         try std.testing.expect(self.ddl_begin_transaction_mode);
+        try std.testing.expect(self.ddl_transaction_isolation);
+        try std.testing.expect(self.ddl_transaction_read_only);
+        try std.testing.expect(self.ddl_transaction_read_write);
         try std.testing.expect(self.ddl_transaction_deferrable_true);
         try std.testing.expect(self.ddl_transaction_deferrable_false);
         try std.testing.expect(self.ddl_advisory_lock);
         try std.testing.expect(self.ddl_advisory_unlock);
+        try std.testing.expect(self.ddl_advisory_lock_two_keys);
         try std.testing.expect(self.unsupported_query_recursive_cte_stream_plan);
         try std.testing.expect(self.unsupported_query_set_operation_plan);
         try std.testing.expect(self.query_calendar_interval_expression);

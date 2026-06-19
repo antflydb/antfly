@@ -1191,7 +1191,9 @@ row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
 direction/count and `CLOSE ALL` tails, transaction-control grammar for `LOCK TABLE`,
 `SET CONSTRAINTS`, `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN`
-mode clauses plus advisory-lock function-call tails, maintenance-job grammar for
+mode clauses plus advisory-lock function-call tails, including multi-table lock
+modes, named/all constraint modes, isolation/access/deferrable transaction
+metadata, and one- or two-key advisory locks, maintenance-job grammar for
 `VACUUM`, `ANALYZE`, `REINDEX`, and
 `CLUSTER`, including vacuum options, analyze columns, reindex concurrency, and
 cluster index/verbose metadata, notification-channel grammar for `LISTEN`, `NOTIFY`, and

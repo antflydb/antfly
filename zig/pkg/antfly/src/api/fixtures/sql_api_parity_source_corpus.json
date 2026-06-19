@@ -481,6 +481,17 @@
       "sql": "LOCK TABLE usage_records IN ACCESS EXCLUSIVE MODE"
     },
     {
+      "name": "multi table share row exclusive lock transaction control plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "table_lock",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:transaction_control:kind=table_lock:tables=2:mode=share_row_exclusive",
+      "sql": "LOCK TABLE usage_records, archived_records IN SHARE ROW EXCLUSIVE MODE"
+    },
+    {
       "name": "deferred constraint mode transaction control plan",
       "family": "ddl",
       "summary": {
@@ -489,6 +500,16 @@
       },
       "plan": "ddl:transaction_control:kind=constraint_mode:all=true:constraints=0:mode=deferred",
       "sql": "SET CONSTRAINTS ALL DEFERRED"
+    },
+    {
+      "name": "named immediate constraint mode transaction control plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "constraint_mode",
+        "operations": 2
+      },
+      "plan": "ddl:transaction_control:kind=constraint_mode:all=false:constraints=2:mode=immediate",
+      "sql": "SET CONSTRAINTS usage_fk, usage_check IMMEDIATE"
     },
     {
       "name": "set transaction mode control plan",
@@ -549,6 +570,16 @@
       },
       "plan": "ddl:transaction_control:kind=advisory_lock:action=lock:keys=1",
       "sql": "SELECT pg_advisory_lock(42);"
+    },
+    {
+      "name": "two-key advisory lock transaction control plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "advisory_lock",
+        "operations": 2
+      },
+      "plan": "ddl:transaction_control:kind=advisory_lock:action=lock:keys=2",
+      "sql": "SELECT pg_advisory_lock(-42, 7);"
     },
     {
       "name": "advisory unlock transaction control plan",
