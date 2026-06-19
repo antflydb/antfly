@@ -3855,11 +3855,20 @@ pub const AppParityCorpusCoverage = struct {
     ddl: bool = false,
     ddl_table_clone: bool = false,
     ddl_view_create: bool = false,
+    ddl_view_create_replace: bool = false,
+    ddl_view_create_if_not_exists: bool = false,
     ddl_view_rename: bool = false,
     ddl_view_drop: bool = false,
+    ddl_view_drop_cascade: bool = false,
     ddl_materialized_view_create: bool = false,
+    ddl_materialized_view_create_replace: bool = false,
+    ddl_materialized_view_create_if_not_exists: bool = false,
+    ddl_materialized_view_create_no_data: bool = false,
     ddl_materialized_view_refresh: bool = false,
+    ddl_materialized_view_refresh_concurrently: bool = false,
+    ddl_materialized_view_refresh_no_data: bool = false,
     ddl_materialized_view_drop: bool = false,
+    ddl_materialized_view_drop_cascade: bool = false,
     ddl_relation_lifetime_temporary: bool = false,
     ddl_relation_lifetime_unlogged: bool = false,
     ddl_enum_type_create: bool = false,
@@ -5349,12 +5358,31 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_replace_table = self.ddl_replace_table or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
                 },
                 .table_clone => self.ddl_table_clone = true,
-                .create_view => self.ddl_view_create = true,
+                .create_view => {
+                    self.ddl_view_create = true;
+                    self.ddl_view_create_replace = self.ddl_view_create_replace or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
+                    self.ddl_view_create_if_not_exists = self.ddl_view_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
+                },
                 .rename_view => self.ddl_view_rename = true,
-                .drop_view => self.ddl_view_drop = true,
-                .create_materialized_view => self.ddl_materialized_view_create = true,
-                .refresh_materialized_view => self.ddl_materialized_view_refresh = true,
-                .drop_materialized_view => self.ddl_materialized_view_drop = true,
+                .drop_view => {
+                    self.ddl_view_drop = true;
+                    self.ddl_view_drop_cascade = self.ddl_view_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
+                .create_materialized_view => {
+                    self.ddl_materialized_view_create = true;
+                    self.ddl_materialized_view_create_replace = self.ddl_materialized_view_create_replace or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
+                    self.ddl_materialized_view_create_if_not_exists = self.ddl_materialized_view_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
+                    self.ddl_materialized_view_create_no_data = self.ddl_materialized_view_create_no_data or sql_adapter.planHasExactBoolToken(entry.plan, ":populate=", false);
+                },
+                .refresh_materialized_view => {
+                    self.ddl_materialized_view_refresh = true;
+                    self.ddl_materialized_view_refresh_concurrently = self.ddl_materialized_view_refresh_concurrently or sql_adapter.planHasExactBoolToken(entry.plan, ":concurrently=", true);
+                    self.ddl_materialized_view_refresh_no_data = self.ddl_materialized_view_refresh_no_data or sql_adapter.planHasExactBoolToken(entry.plan, ":populate=", false);
+                },
+                .drop_materialized_view => {
+                    self.ddl_materialized_view_drop = true;
+                    self.ddl_materialized_view_drop_cascade = self.ddl_materialized_view_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
                 .relation_lifetime => {
                     self.ddl_relation_lifetime_temporary = self.ddl_relation_lifetime_temporary or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "temporary");
                     self.ddl_relation_lifetime_unlogged = self.ddl_relation_lifetime_unlogged or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "unlogged");
@@ -6149,11 +6177,20 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_delete_joined_source);
         try std.testing.expect(self.unsupported_merge_mutation);
         try std.testing.expect(self.ddl_view_create);
+        try std.testing.expect(self.ddl_view_create_replace);
+        try std.testing.expect(self.ddl_view_create_if_not_exists);
         try std.testing.expect(self.ddl_view_rename);
         try std.testing.expect(self.ddl_view_drop);
+        try std.testing.expect(self.ddl_view_drop_cascade);
         try std.testing.expect(self.ddl_materialized_view_create);
+        try std.testing.expect(self.ddl_materialized_view_create_replace);
+        try std.testing.expect(self.ddl_materialized_view_create_if_not_exists);
+        try std.testing.expect(self.ddl_materialized_view_create_no_data);
         try std.testing.expect(self.ddl_materialized_view_refresh);
+        try std.testing.expect(self.ddl_materialized_view_refresh_concurrently);
+        try std.testing.expect(self.ddl_materialized_view_refresh_no_data);
         try std.testing.expect(self.ddl_materialized_view_drop);
+        try std.testing.expect(self.ddl_materialized_view_drop_cascade);
         try std.testing.expect(self.ddl_relation_lifetime_temporary);
         try std.testing.expect(self.ddl_relation_lifetime_unlogged);
         try std.testing.expect(self.ddl_enum_type_create);

@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "eeac4ee0ebaf2422ca8b2070f8e8a56b46bad9ae4e53d84994206946e9251cca",
-  "source_entry_count": 919,
-  "entry_count": 919,
+  "source_sha256": "e871d64126b0e712b636ea6bb4dd93f64e119a273f5ab6b1146195101af1f175",
+  "source_entry_count": 922,
+  "entry_count": 922,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3243,6 +3243,16 @@
       "sql": "REFRESH MATERIALIZED VIEW usage_records_mv"
     },
     {
+      "name": "refresh materialized view concurrently no data catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "refresh_materialized_view",
+        "table_name": "usage_records_mv"
+      },
+      "plan": "ddl:refresh_materialized_view:view=usage_records_mv:concurrently=true:populate=false",
+      "sql": "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_records_mv WITH NO DATA"
+    },
+    {
       "name": "drop materialized view catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3251,6 +3261,16 @@
       },
       "plan": "ddl:drop_materialized_view:view=usage_records_mv:if_exists=false",
       "sql": "DROP MATERIALIZED VIEW usage_records_mv"
+    },
+    {
+      "name": "drop materialized view cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_materialized_view",
+        "table_name": "usage_records_mv"
+      },
+      "plan": "ddl:drop_materialized_view:view=usage_records_mv:if_exists=true:cascade=true",
+      "sql": "DROP MATERIALIZED VIEW IF EXISTS usage_records_mv CASCADE"
     },
     {
       "name": "temporary table lifetime ddl",
@@ -3599,6 +3619,16 @@
       },
       "plan": "ddl:drop_view:view=usage_records_v:if_exists=false",
       "sql": "DROP VIEW usage_records_v"
+    },
+    {
+      "name": "drop view cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_view",
+        "table_name": "usage_records_v"
+      },
+      "plan": "ddl:drop_view:view=usage_records_v:if_exists=true:cascade=true",
+      "sql": "DROP VIEW IF EXISTS usage_records_v CASCADE"
     },
     {
       "name": "no key update row lock query",

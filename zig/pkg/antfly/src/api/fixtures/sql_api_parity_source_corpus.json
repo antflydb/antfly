@@ -3652,6 +3652,16 @@
       "sql": "REFRESH MATERIALIZED VIEW usage_records_mv"
     },
     {
+      "name": "refresh materialized view concurrently no data catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "refresh_materialized_view",
+        "table_name": "usage_records_mv"
+      },
+      "plan": "ddl:refresh_materialized_view:view=usage_records_mv:concurrently=true:populate=false",
+      "sql": "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_records_mv WITH NO DATA"
+    },
+    {
       "name": "drop materialized view catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3660,6 +3670,16 @@
       },
       "plan": "ddl:drop_materialized_view:view=usage_records_mv:if_exists=false",
       "sql": "DROP MATERIALIZED VIEW usage_records_mv"
+    },
+    {
+      "name": "drop materialized view cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_materialized_view",
+        "table_name": "usage_records_mv"
+      },
+      "plan": "ddl:drop_materialized_view:view=usage_records_mv:if_exists=true:cascade=true",
+      "sql": "DROP MATERIALIZED VIEW IF EXISTS usage_records_mv CASCADE"
     },
     {
       "name": "temporary table lifetime ddl",
@@ -4007,6 +4027,16 @@
       },
       "plan": "ddl:drop_view:view=usage_records_v:if_exists=false",
       "sql": "DROP VIEW usage_records_v"
+    },
+    {
+      "name": "drop view cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_view",
+        "table_name": "usage_records_v"
+      },
+      "plan": "ddl:drop_view:view=usage_records_v:if_exists=true:cascade=true",
+      "sql": "DROP VIEW IF EXISTS usage_records_v CASCADE"
     },
     {
       "name": "no key update row lock query",

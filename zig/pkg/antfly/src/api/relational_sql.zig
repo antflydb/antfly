@@ -44421,6 +44421,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:drop_view:view=active_users_v:if_exists=true:cascade=true", drop_view_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, drop_view));
 
+    var drop_view_restrict = try lowerDdlPlanAlloc(alloc, "DROP VIEW users_v RESTRICT;");
+    defer drop_view_restrict.deinit(alloc);
+    const drop_view_restrict_fingerprint = try ddlFingerprintAlloc(alloc, drop_view_restrict);
+    defer alloc.free(drop_view_restrict_fingerprint);
+    try std.testing.expectEqualStrings("ddl:drop_view:view=users_v:if_exists=false", drop_view_restrict_fingerprint);
+
     var create_materialized_view = try lowerDdlPlanAlloc(alloc, "CREATE MATERIALIZED VIEW IF NOT EXISTS users_mv AS SELECT id, email FROM users WITH NO DATA;");
     defer create_materialized_view.deinit(alloc);
     const create_materialized_view_plan = switch (create_materialized_view) {
@@ -44527,12 +44533,24 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:refresh_materialized_view:view=users_mv:concurrently=true:populate=true", refresh_materialized_view_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, refresh_materialized_view));
 
+    var refresh_materialized_view_no_data = try lowerDdlPlanAlloc(alloc, "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;");
+    defer refresh_materialized_view_no_data.deinit(alloc);
+    const refresh_materialized_view_no_data_fingerprint = try ddlFingerprintAlloc(alloc, refresh_materialized_view_no_data);
+    defer alloc.free(refresh_materialized_view_no_data_fingerprint);
+    try std.testing.expectEqualStrings("ddl:refresh_materialized_view:view=users_mv:concurrently=true:populate=false", refresh_materialized_view_no_data_fingerprint);
+
     var drop_materialized_view = try lowerDdlPlanAlloc(alloc, "DROP MATERIALIZED VIEW IF EXISTS users_mv RESTRICT;");
     defer drop_materialized_view.deinit(alloc);
     const drop_materialized_view_fingerprint = try ddlFingerprintAlloc(alloc, drop_materialized_view);
     defer alloc.free(drop_materialized_view_fingerprint);
     try std.testing.expectEqualStrings("ddl:drop_materialized_view:view=users_mv:if_exists=true", drop_materialized_view_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, drop_materialized_view));
+
+    var drop_materialized_view_cascade = try lowerDdlPlanAlloc(alloc, "DROP MATERIALIZED VIEW IF EXISTS users_mv CASCADE;");
+    defer drop_materialized_view_cascade.deinit(alloc);
+    const drop_materialized_view_cascade_fingerprint = try ddlFingerprintAlloc(alloc, drop_materialized_view_cascade);
+    defer alloc.free(drop_materialized_view_cascade_fingerprint);
+    try std.testing.expectEqualStrings("ddl:drop_materialized_view:view=users_mv:if_exists=true:cascade=true", drop_materialized_view_cascade_fingerprint);
 
     var temporary_table = try lowerDdlPlanAlloc(alloc, "CREATE TEMPORARY TABLE users_session (id uuid PRIMARY KEY, status text);");
     defer temporary_table.deinit(alloc);

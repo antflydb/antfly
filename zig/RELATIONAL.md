@@ -1239,7 +1239,9 @@ identity-allocator table header grammar for
 `serial`, `bigserial`, and `GENERATED ALWAYS/BY DEFAULT AS IDENTITY (...)`
 allocator specs,
 view catalog grammar for `CREATE VIEW`, `CREATE MATERIALIZED VIEW`,
-`ALTER VIEW ... RENAME TO`, `REFRESH MATERIALIZED VIEW`, and table-clone
+`ALTER VIEW ... RENAME TO`, `DROP VIEW`, `REFRESH MATERIALIZED VIEW`, and
+`DROP MATERIALIZED VIEW`, including replace/idempotent/create-populate,
+refresh-concurrency/populate, and drop dependency metadata, and table-clone
 grammar for `CREATE TABLE ... (LIKE source INCLUDING ...)`,
 create-table header grammar for `CREATE TABLE [IF NOT EXISTS] name (...)`,
 create-table element prefix grammar for column entries and
