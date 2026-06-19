@@ -262,6 +262,41 @@ const FlatCentroidEntrySortContext = struct {
     dim: usize,
 };
 
+const SelectedFlatCentroidBlocks = struct {
+    all_blocks: bool = false,
+    block_count: usize = 0,
+    indices: []const usize = &.{},
+    lower_bounds: []const f32 = &.{},
+
+    fn all(count: usize) SelectedFlatCentroidBlocks {
+        return .{
+            .all_blocks = true,
+            .block_count = count,
+        };
+    }
+
+    fn subset(indices: []const usize, lower_bounds: []const f32) SelectedFlatCentroidBlocks {
+        std.debug.assert(lower_bounds.len == 0 or lower_bounds.len == indices.len);
+        return .{
+            .indices = indices,
+            .lower_bounds = lower_bounds,
+        };
+    }
+
+    fn len(self: SelectedFlatCentroidBlocks) usize {
+        return if (self.all_blocks) self.block_count else self.indices.len;
+    }
+
+    fn blockIndex(self: SelectedFlatCentroidBlocks, selected_index: usize) usize {
+        return if (self.all_blocks) selected_index else self.indices[selected_index];
+    }
+
+    fn lowerBound(self: SelectedFlatCentroidBlocks, selected_index: usize) ?f32 {
+        if (self.lower_bounds.len == 0) return null;
+        return self.lower_bounds[selected_index];
+    }
+};
+
 fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
@@ -1196,19 +1231,22 @@ pub fn selectFlatRabitqPostings(
         )
     else
         directory.blocks.len;
-    const selected_block_capacity = if (use_two_level_blocks and block_probe_limit < directory.blocks.len)
+    const select_block_subset = use_two_level_blocks and block_probe_limit < directory.blocks.len;
+    const selected_block_capacity = if (select_block_subset)
         flatCentroidBlockProbeCandidateCount(fixed_block_probe_count, directory.blocks.len, block_probe_limit)
     else
-        directory.blocks.len;
+        0;
     var selected_block_stack: [flat_centroid_query_probe_stack_capacity]usize = undefined;
     const use_selected_block_stack = selected_block_capacity <= selected_block_stack.len;
-    var selected_block_storage = if (use_selected_block_stack)
+    var selected_block_storage: []usize = if (!select_block_subset)
+        &.{}
+    else if (use_selected_block_stack)
         selected_block_stack[0..selected_block_capacity]
     else
         try self.alloc.alloc(usize, selected_block_capacity);
-    defer if (!use_selected_block_stack) self.alloc.free(selected_block_storage);
-    var selected_blocks: []usize = selected_block_storage[0..0];
-    const track_selected_block_lower_bounds = use_two_level_blocks and block_probe_limit < directory.blocks.len;
+    defer if (select_block_subset and !use_selected_block_stack) self.alloc.free(selected_block_storage);
+    var selected_blocks = SelectedFlatCentroidBlocks.all(0);
+    const track_selected_block_lower_bounds = select_block_subset;
     var selected_block_lower_bounds_stack: [flat_centroid_query_probe_stack_capacity]f32 = undefined;
     const use_selected_block_lower_bounds_stack = selected_block_capacity <= selected_block_lower_bounds_stack.len;
     var selected_block_lower_bounds_storage: []f32 = if (!track_selected_block_lower_bounds)
@@ -1218,11 +1256,9 @@ pub fn selectFlatRabitqPostings(
     else
         try self.alloc.alloc(f32, selected_block_capacity);
     defer if (track_selected_block_lower_bounds and !use_selected_block_lower_bounds_stack) self.alloc.free(selected_block_lower_bounds_storage);
-    var selected_block_lower_bounds: []f32 = selected_block_lower_bounds_storage[0..0];
     if (use_two_level_blocks) {
-        if (block_probe_limit >= directory.blocks.len) {
-            for (directory.blocks, 0..) |_, block_index| selected_block_storage[block_index] = block_index;
-            selected_blocks = selected_block_storage[0..directory.blocks.len];
+        if (!select_block_subset) {
+            selected_blocks = SelectedFlatCentroidBlocks.all(directory.blocks.len);
         } else {
             const distances = scratch.distances[0..directory.blocks.len];
             const error_bounds = scratch.error_bounds[0..directory.blocks.len];
@@ -1266,23 +1302,24 @@ pub fn selectFlatRabitqPostings(
                 selected_block_storage[i] = @intCast(block_probe.posting_id);
                 selected_block_lower_bounds_storage[i] = flatProbeLowerBound(block_probe);
             }
-            selected_blocks = selected_block_storage[0..selected_block_count];
-            selected_block_lower_bounds = selected_block_lower_bounds_storage[0..selected_block_count];
+            selected_blocks = SelectedFlatCentroidBlocks.subset(
+                selected_block_storage[0..selected_block_count],
+                selected_block_lower_bounds_storage[0..selected_block_count],
+            );
         }
         profile.approx_nodes_expanded += @intCast(directory.blocks.len);
         profile.centroid_directory_blocks_scanned += @intCast(directory.blocks.len);
-        profile.centroid_directory_blocks_selected += @intCast(selected_blocks.len);
+        profile.centroid_directory_blocks_selected += @intCast(selected_blocks.len());
         profile.centroid_directory_block_probe_limit += @intCast(block_probe_limit);
-        profile.centroid_directory_block_probe_count += @intCast(selected_blocks.len);
+        profile.centroid_directory_block_probe_count += @intCast(selected_blocks.len());
     } else {
-        for (directory.blocks, 0..) |_, block_index| selected_block_storage[block_index] = block_index;
-        selected_blocks = selected_block_storage[0..directory.blocks.len];
+        selected_blocks = SelectedFlatCentroidBlocks.all(directory.blocks.len);
         profile.centroid_directory_blocks_scanned += @intCast(directory.blocks.len);
-        profile.centroid_directory_blocks_selected += @intCast(selected_blocks.len);
+        profile.centroid_directory_blocks_selected += @intCast(selected_blocks.len());
     }
 
     const global_posting_quantized = global: {
-        if (selected_blocks.len != directory.blocks.len or
+        if (selected_blocks.len() != directory.blocks.len or
             !shouldBuildGlobalPostingQuantized(self, directory.blocks.len, directory.posting_count))
         {
             break :global null;
@@ -1293,15 +1330,15 @@ pub fn selectFlatRabitqPostings(
     if (global_posting_quantized != null) {
         try scratch.ensureDistanceOnlyCapacity(self.alloc, @max(base_distance_capacity, directory.posting_count));
     }
-    const quantized_posting_candidate_limit = if (self.config.use_quantization and selected_blocks.len != 0)
+    const quantized_posting_candidate_limit = if (self.config.use_quantization and selected_blocks.len() != 0)
         @min(
             if (global_posting_quantized != null) directory.posting_count else max_block_postings,
             if (global_posting_quantized != null)
-                @max(@as(usize, 1), @max(probe_limit *| 2, selected_blocks.len))
+                @max(@as(usize, 1), @max(probe_limit *| 2, selected_blocks.len()))
             else
                 @max(
                     @as(usize, 1),
-                    (std.math.divCeil(usize, probe_limit, selected_blocks.len) catch unreachable) * 2,
+                    (std.math.divCeil(usize, probe_limit, selected_blocks.len()) catch unreachable) * 2,
                 ),
         )
     else
@@ -1323,7 +1360,8 @@ pub fn selectFlatRabitqPostings(
         profile.centroid_directory_posting_centroid_estimates += @intCast(directory.posting_count);
 
         var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
-        for (selected_blocks) |block_index| {
+        for (0..selected_blocks.len()) |selected_block_index| {
+            const block_index = selected_blocks.blockIndex(selected_block_index);
             const block = &directory.blocks[block_index];
             const distances = scratch.distances[block.posting_offset..][0..block.posting_ids.len];
             const error_bounds = scratch.error_bounds[block.posting_offset..][0..block.posting_ids.len];
@@ -1372,14 +1410,17 @@ pub fn selectFlatRabitqPostings(
         }
         profile.centroid_directory_posting_centroids_scored += @intCast(scored_candidates);
     } else {
-        for (selected_blocks, 0..) |block_index, selected_block_index| {
-            if (selected_block_lower_bounds.len != 0 and shouldStopFlatSelectedBlockByEffort(
-                self.config.metric,
-                selected_block_lower_bounds[selected_block_index],
-                best_exact_probe_distance,
-                epsilon,
-                &probe_collector,
-            )) break;
+        for (0..selected_blocks.len()) |selected_block_index| {
+            const block_index = selected_blocks.blockIndex(selected_block_index);
+            if (selected_blocks.lowerBound(selected_block_index)) |lower_bound| {
+                if (shouldStopFlatSelectedBlockByEffort(
+                    self.config.metric,
+                    lower_bound,
+                    best_exact_probe_distance,
+                    epsilon,
+                    &probe_collector,
+                )) break;
+            }
             const block = &directory.blocks[block_index];
             const count = block.posting_ids.len;
             if (self.config.use_quantization) {
@@ -1467,7 +1508,7 @@ pub fn selectFlatRabitqPostings(
 
     const selected_probes = probe_collector.items();
     std.mem.sort(FlatCentroidProbe, selected_probes, {}, flatProbeLess);
-    profile.approx_nodes_expanded += @intCast(selected_blocks.len);
+    profile.approx_nodes_expanded += @intCast(selected_blocks.len());
     return selected_probes.len;
 }
 
@@ -2450,6 +2491,23 @@ test "adaptive flat centroid block probing expands ambiguous boundary" {
     };
 
     try std.testing.expectEqual(@as(usize, 3), adaptiveFlatCentroidBlockProbeCount(&probes, 2));
+}
+
+test "selected flat centroid blocks represent full scans without storage" {
+    const all = SelectedFlatCentroidBlocks.all(4);
+    try std.testing.expectEqual(@as(usize, 4), all.len());
+    try std.testing.expectEqual(@as(usize, 0), all.blockIndex(0));
+    try std.testing.expectEqual(@as(usize, 3), all.blockIndex(3));
+    try std.testing.expect(all.lowerBound(0) == null);
+
+    const indices = [_]usize{ 4, 7 };
+    const lower_bounds = [_]f32{ 0.5, 0.75 };
+    const subset = SelectedFlatCentroidBlocks.subset(&indices, &lower_bounds);
+    try std.testing.expectEqual(@as(usize, 2), subset.len());
+    try std.testing.expectEqual(@as(usize, 4), subset.blockIndex(0));
+    try std.testing.expectEqual(@as(usize, 7), subset.blockIndex(1));
+    try std.testing.expectEqual(@as(f32, 0.5), subset.lowerBound(0).?);
+    try std.testing.expectEqual(@as(f32, 0.75), subset.lowerBound(1).?);
 }
 
 test "flat probe collector keeps bounded lowest lower bounds" {

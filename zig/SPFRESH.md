@@ -427,10 +427,11 @@ Current status:
   file-format substrate for the segment-backed base/delta mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
-  is stored as a backward-compatible node side record. Record-backed flat and
-  two-level centroid directories read freshness from that small posting-state
-  record when available, so payload-only maintenance can skip rewriting the full
-  centroid-directory point value.
+  is stored as a backward-compatible node side record and mirrored into strict
+  centroid-directory records. Record-backed flat and two-level centroid
+  directories read freshness from the centroid-directory record directly, so
+  directory rebuild does not scan or probe the separate posting-state key
+  family.
 - A bounded posting maintenance pass now exists. It scans leaf postings,
   repairs dirty centroids/payloads, persists clean posting state, refreshes HBC
   ancestor centroids when needed, and reports repair counters.
@@ -981,7 +982,9 @@ implementations cleanly:
    quantized payload path unless the configured block probing is a deterministic
    full-directory scan, so adaptive/full-small-directory boundaries do not grow
    distance scratch to every posting centroid or estimate centroids outside the
-   selected block work.
+   selected block work. Full-directory flat/two-level scans now also represent
+   selected blocks as an implicit all-block view instead of allocating and
+   filling a per-query block-id list.
    Directory block construction also reuses one zero-centroid quantization
    vector across all blocks in a rebuild instead of allocating/clearing it per
    block.
@@ -2723,8 +2726,9 @@ selection, so scoring block centroids does not grow vector-fetch buffers by the
 number of centroid blocks or inflate the query-result slab. Selected block IDs
 live in a stack/usize scratch buffer instead of `SearchScratch.positions`, and
 adaptive two-level probes size that buffer to the bounded selected-block
-candidate window instead of the full directory block count. `SearchScratch`
-exposes distance-only growth for coarse block scoring. Directory blocks also
+candidate window instead of the full directory block count; full scans use an
+implicit all-block view and do not allocate/fill a selected-block list at all.
+`SearchScratch` exposes distance-only growth for coarse block scoring. Directory blocks also
 retain the coarse centroid's metric measure, so non-quantized block scoring can
 use the same precomputed candidate-measure path as posting-centroid scoring
 instead of recomputing block centroid norms/measures on every query. Adaptive
