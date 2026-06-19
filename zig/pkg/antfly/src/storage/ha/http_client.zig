@@ -273,6 +273,7 @@ pub const Client = struct {
         slot_name: []const u8,
         initial_lsn: ?u64,
     ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
+        try validateClientSlotName(slot_name);
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(
@@ -325,6 +326,7 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.BaseBackupStartRequest,
     ) !ParsedOutput(admin_api.HABaseBackupBeginResponse) {
+        try validateClientSlotName(request.slot_name);
         var result = try self.postJson(
             admin_api.HABaseBackupBeginResponse,
             base_uri,
@@ -500,6 +502,7 @@ pub const Client = struct {
         slot_name: []const u8,
         action: enum { pause, @"resume", drop },
     ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
+        try validateClientSlotName(slot_name);
         const path = switch (action) {
             .pause => try admin_api.routes.replicationSlotPausePathAlloc(self.alloc, slot_name),
             .@"resume" => try admin_api.routes.replicationSlotResumePathAlloc(self.alloc, slot_name),
@@ -617,7 +620,12 @@ pub const Client = struct {
 };
 
 fn join(alloc: Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
+    if (!validation.isHTTPURLWithHostNoHiddenWhitespace(base_uri)) return error.InvalidHAAdminURL;
     return try routes.Routes.join(alloc, base_uri, path);
+}
+
+fn validateClientSlotName(slot_name: []const u8) !void {
+    if (!validation.isIdentifier(slot_name)) return error.InvalidSlotName;
 }
 
 fn appendQueryU64(alloc: Allocator, old_uri: []u8, key: []const u8, value: u64) ![]u8 {
@@ -2056,6 +2064,22 @@ test "storage.ha http client accepts already applied idempotent admin receipts" 
             .receipt = testFenceReceipt(),
         }));
     }
+}
+
+test "storage.ha http client rejects invalid local admin inputs" {
+    const alloc = std.testing.allocator;
+    var executor = StaticJsonExecutor{ .body = "{}" };
+    var client = Client.init(alloc, executor.executor());
+
+    try std.testing.expectError(error.InvalidHAAdminURL, client.listReplicationSlots(" http://ha-admin.test"));
+    try std.testing.expectError(error.InvalidHAAdminURL, client.listReplicationSlots("ftp://ha-admin.test"));
+    try std.testing.expectError(error.InvalidHAAdminURL, client.listReplicationSlots("http://ha admin.test"));
+    try std.testing.expectError(error.InvalidSlotName, client.createReplicationSlot("http://ha-admin.test", "standby a", 0));
+    try std.testing.expectError(error.InvalidSlotName, client.pauseReplicationSlot("http://ha-admin.test", " standby-a"));
+    try std.testing.expectError(error.InvalidSlotName, client.beginBaseBackup("http://ha-admin.test", .{
+        .slot_name = "standby/a",
+        .manifest_id = "base-a",
+    }));
 }
 
 test "storage.ha http client rejects invalid typed admin responses" {
