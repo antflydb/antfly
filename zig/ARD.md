@@ -337,6 +337,7 @@ Package visibility must be derived from a visible installed extension, not from 
 
 Package entry:
 
+- `identifier`: `urn:ai:<publisher-domain>:antfly:extension:package:{name}:{version}`
 - `type`: `application/antfly-extension-package+json`
 - `url`: `/extensions/v1/packages/{name}/versions/{version}`
 - `metadata.digest`: package digest

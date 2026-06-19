@@ -1502,7 +1502,7 @@ fn writeSearchExtensionSkillEntries(
 
 fn writeExtensionPackageFields(writer: *std.Io.Writer, options: CatalogOptions, package: extension_domain.PackageManifest) !void {
     try writer.writeAll("\"identifier\":");
-    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension-package:{s}:{s}", .{ options.publisher_domain, package.name, package.version });
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:package:{s}:{s}", .{ options.publisher_domain, package.name, package.version });
     try writer.writeAll(",\"displayName\":");
     try writeStringFmt(writer, "Antfly Extension Package {s} {s}", .{ package.name, package.version });
     try writer.writeAll(",\"type\":\"application/antfly-extension-package+json\",\"description\":");
@@ -2796,7 +2796,7 @@ test "ARD catalog entries contain required value or reference fields" {
     try std.testing.expect(root.get("host").?.object.get("trustManifest") != null);
     const entries = root.get("entries").?.array.items;
     try std.testing.expect(entries.len >= 13);
-    _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension-package:docsaf:1.0.0");
+    _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:package:docsaf:1.0.0");
     _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:installed");
     _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:mcp");
     _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:skill:docs");
@@ -2994,7 +2994,7 @@ test "ARD extension package entries use trust provenance for artifact digests" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
 
-    const package_entry = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension-package:docsaf:1.0.0");
+    const package_entry = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:package:docsaf:1.0.0");
     const package_metadata = package_entry.object.get("metadata").?;
     try expectMetadataValuesAreScalars(package_metadata);
     try std.testing.expect(package_metadata.object.get("artifacts") == null);
@@ -3074,7 +3074,7 @@ test "ARD search supports extension metadata filters" {
     defer package_parsed.deinit();
     const package_results = package_parsed.value.object.get("results").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), package_results.len);
-    try std.testing.expect(std.mem.indexOf(u8, package_results[0].object.get("identifier").?.string, ":extension-package:docsaf:1.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, package_results[0].object.get("identifier").?.string, ":extension:package:docsaf:1.0.0") != null);
 
     const installed_body = try searchJsonWithExtensionsAlloc(
         std.testing.allocator,
@@ -3142,7 +3142,7 @@ test "ARD search supports extension metadata filters" {
     defer package_trust_parsed.deinit();
     const package_trust_results = package_trust_parsed.value.object.get("results").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), package_trust_results.len);
-    try std.testing.expect(std.mem.indexOf(u8, package_trust_results[0].object.get("identifier").?.string, ":extension-package:docsaf:1.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, package_trust_results[0].object.get("identifier").?.string, ":extension:package:docsaf:1.0.0") != null);
 
     const installed_trust_body = try searchJsonWithExtensionsAlloc(
         std.testing.allocator,
