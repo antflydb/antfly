@@ -2013,7 +2013,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchArdRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_openapi)) {
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_openapi)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             return try self.bodyResponse(200, "application/yaml", root_openapi_yaml, false);
         }
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_openapi_prefix)) {
@@ -2026,7 +2027,8 @@ pub const ApiHttpServer = struct {
             }
             return try self.bodyResponse(200, "application/yaml", spec.body, false);
         }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
             var snapshot_opt: ?metadata_api.AdminSnapshot = null;
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
@@ -2041,7 +2043,8 @@ pub const ApiHttpServer = struct {
             );
             return try self.ardCatalogResponse(200, body, true);
         }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
@@ -10478,6 +10481,27 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), openapi.status);
     try std.testing.expectEqualStrings("application/yaml", openapi.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "openapi:") != null);
+
+    var openapi_wrong_method = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_openapi,
+    });
+    defer openapi_wrong_method.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), openapi_wrong_method.status);
+
+    var catalog_wrong_method = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer catalog_wrong_method.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), catalog_wrong_method.status);
+
+    var well_known_wrong_method = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer well_known_wrong_method.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), well_known_wrong_method.status);
 
     var antfly_openapi = try server.handle(.{
         .method = .GET,
