@@ -93,12 +93,15 @@ pub fn readSnapshotInventoryAlloc(
                 };
                 initialized += 1;
             },
-            .deletes => try readUnsupportedDeleteManifestAlloc(
-                alloc,
-                &client,
-                request.cache,
-                manifest_entry,
-            ),
+            .deletes => {
+                const active_deletes = try readDeleteManifestHasActiveDeletesAlloc(
+                    alloc,
+                    &client,
+                    request.cache,
+                    manifest_entry,
+                );
+                if (active_deletes) return error.UnsupportedIcebergDeletes;
+            },
         }
     }
 
@@ -110,12 +113,12 @@ pub fn readSnapshotInventoryAlloc(
     });
 }
 
-fn readUnsupportedDeleteManifestAlloc(
+fn readDeleteManifestHasActiveDeletesAlloc(
     alloc: Allocator,
     client: *object_storage.ObjectStorage,
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache,
     manifest_entry: iceberg_avro.ManifestListEntry,
-) !void {
+) !bool {
     const manifest_bytes = try readFullObjectAlloc(
         alloc,
         client,
@@ -128,14 +131,13 @@ fn readUnsupportedDeleteManifestAlloc(
 
     var delete_manifest = try iceberg_avro.parseDataManifestAlloc(alloc, manifest_bytes);
     defer delete_manifest.deinit(alloc);
-    try validateUnsupportedDeleteManifest(manifest_entry, delete_manifest);
-    return error.UnsupportedIcebergDeletes;
+    return try validateDeleteManifestAndHasActiveDeletes(manifest_entry, delete_manifest);
 }
 
-fn validateUnsupportedDeleteManifest(
+fn validateDeleteManifestAndHasActiveDeletes(
     manifest_entry: iceberg_avro.ManifestListEntry,
     manifest: iceberg_avro.DataManifest,
-) !void {
+) !bool {
     var added_files: u32 = 0;
     var existing_files: u32 = 0;
     var deleted_files: u32 = 0;
@@ -162,13 +164,15 @@ fn validateUnsupportedDeleteManifest(
             },
         }
     }
-    if (!hasManifestSummary(manifest_entry)) return;
+    const has_active_deletes = added_files != 0 or existing_files != 0 or added_rows != 0 or existing_rows != 0;
+    if (!hasManifestSummary(manifest_entry)) return has_active_deletes;
     if (added_files != manifest_entry.added_files_count) return error.IcebergManifestSummaryMismatch;
     if (existing_files != manifest_entry.existing_files_count) return error.IcebergManifestSummaryMismatch;
     if (deleted_files != manifest_entry.deleted_files_count) return error.IcebergManifestSummaryMismatch;
     if (added_rows != manifest_entry.added_rows_count) return error.IcebergManifestSummaryMismatch;
     if (existing_rows != manifest_entry.existing_rows_count) return error.IcebergManifestSummaryMismatch;
     if (deleted_rows != manifest_entry.deleted_rows_count) return error.IcebergManifestSummaryMismatch;
+    return has_active_deletes;
 }
 
 fn hasManifestSummary(manifest_entry: iceberg_avro.ManifestListEntry) bool {
@@ -484,6 +488,51 @@ test "iceberg snapshot reader reads delete manifest metadata before failing clos
     try std.testing.expect(stats.stored_bytes >= testMetadataJson().len + manifest_list.items.len + delete_manifest.items.len);
 }
 
+test "iceberg snapshot reader ignores inactive delete manifests" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var data_manifest = try buildDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var delete_manifest = try buildInactiveDeleteManifestFixture(alloc);
+    defer delete_manifest.deinit(alloc);
+    var manifest_list = try buildDataAndInactiveDeleteManifestListFixture(
+        alloc,
+        data_manifest.items.len,
+        delete_manifest.items.len,
+    );
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "t/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "t/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+    var delete_manifest_put = try client.putObject("bucket", "t/metadata/d-a.avro", delete_manifest.items, .{});
+    defer delete_manifest_put.deinit(alloc);
+
+    var cache = lake_parquet_rowgroup.ObjectRangeCache{};
+    defer cache.deinit(alloc);
+
+    var inventory = try readSnapshotInventoryAlloc(alloc, .{
+        .client = client,
+        .source_id = "events",
+        .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json",
+        .requested_snapshot_id = "12",
+        .cache = &cache,
+    });
+    defer inventory.deinit(alloc);
+
+    try std.testing.expectEqual(external_source.Format.iceberg, inventory.format);
+    try std.testing.expectEqual(@as(usize, 2), inventory.files.len);
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 4), stats.misses);
+    try std.testing.expectEqual(@as(usize, 4), stats.lane(.metadata).misses);
+}
+
 test "iceberg snapshot reader rejects requested snapshot mismatch" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -543,6 +592,38 @@ fn buildDeleteManifestListFixture(alloc: Allocator, manifest_length: usize) !std
     });
 }
 
+fn buildDataAndInactiveDeleteManifestListFixture(
+    alloc: Allocator,
+    data_manifest_length: usize,
+    delete_manifest_length: usize,
+) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendAvroHeader(alloc, &out, manifestListSchema(), "0123456789abcdef");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendManifestListRecord(alloc, &block, "s3://bucket/t/metadata/m-a.avro", .data, data_manifest_length, .{
+        .added_files = 0,
+        .existing_files = 0,
+        .deleted_files = 0,
+        .added_rows = 0,
+        .existing_rows = 0,
+        .deleted_rows = 0,
+    });
+    try appendManifestListRecord(alloc, &block, "s3://bucket/t/metadata/d-a.avro", .deletes, delete_manifest_length, .{
+        .added_files = 0,
+        .existing_files = 0,
+        .deleted_files = 1,
+        .added_rows = 0,
+        .existing_rows = 0,
+        .deleted_rows = 1,
+    });
+
+    try appendAvroBlock(alloc, &out, block.items, 2, "0123456789abcdef");
+    return out;
+}
+
 const ManifestSummaryFixture = struct {
     added_files: i64,
     existing_files: i64,
@@ -565,20 +646,31 @@ fn buildOneManifestListFixture(
 
     var block = std.ArrayListUnmanaged(u8).empty;
     defer block.deinit(alloc);
-    try appendString(alloc, &block, manifest_path);
-    try appendLong(alloc, &block, @intCast(manifest_length));
-    try appendLong(alloc, &block, 0);
-    try appendLong(alloc, &block, @intFromEnum(content));
-    try appendLong(alloc, &block, 42);
-    try appendLong(alloc, &block, summary.added_files);
-    try appendLong(alloc, &block, summary.existing_files);
-    try appendLong(alloc, &block, summary.deleted_files);
-    try appendLong(alloc, &block, summary.added_rows);
-    try appendLong(alloc, &block, summary.existing_rows);
-    try appendLong(alloc, &block, summary.deleted_rows);
+    try appendManifestListRecord(alloc, &block, manifest_path, content, manifest_length, summary);
 
     try appendAvroBlock(alloc, &out, block.items, 1, "0123456789abcdef");
     return out;
+}
+
+fn appendManifestListRecord(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    manifest_path: []const u8,
+    content: iceberg_avro.ManifestContent,
+    manifest_length: usize,
+    summary: ManifestSummaryFixture,
+) !void {
+    try appendString(alloc, out, manifest_path);
+    try appendLong(alloc, out, @intCast(manifest_length));
+    try appendLong(alloc, out, 0);
+    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, 42);
+    try appendLong(alloc, out, summary.added_files);
+    try appendLong(alloc, out, summary.existing_files);
+    try appendLong(alloc, out, summary.deleted_files);
+    try appendLong(alloc, out, summary.added_rows);
+    try appendLong(alloc, out, summary.existing_rows);
+    try appendLong(alloc, out, summary.deleted_rows);
 }
 
 fn buildDataManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
@@ -603,6 +695,19 @@ fn buildDeleteManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
     var block = std.ArrayListUnmanaged(u8).empty;
     defer block.deinit(alloc);
     try appendDataManifestRecord(alloc, &block, .added, .position_deletes, "s3://bucket/t/deletes/pos-a.parquet", 1, 1024);
+
+    try appendAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
+    return out;
+}
+
+fn buildInactiveDeleteManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendAvroHeader(alloc, &out, dataManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendDataManifestRecord(alloc, &block, .deleted, .position_deletes, "s3://bucket/t/deletes/pos-a.parquet", 1, 1024);
 
     try appendAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
     return out;

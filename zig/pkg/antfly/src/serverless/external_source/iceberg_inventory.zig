@@ -160,7 +160,10 @@ pub fn planInventoryFromSnapshotManifestsAlloc(
 
     var total_entries: usize = 0;
     for (request.manifest_list.entries) |manifest_entry| {
-        if (manifest_entry.content != .data) return error.UnsupportedIcebergDeletes;
+        if (manifest_entry.content != .data) {
+            if (manifest_entry.content == .deletes and deleteManifestEntryHasNoActiveDeletes(manifest_entry)) continue;
+            return error.UnsupportedIcebergDeletes;
+        }
         const decoded = try decodedManifestForPath(request.data_manifests, manifest_entry.manifest_path);
         try validateManifestSummary(manifest_entry, decoded.manifest);
         total_entries += decoded.manifest.entries.len;
@@ -171,6 +174,7 @@ pub fn planInventoryFromSnapshotManifestsAlloc(
     defer alloc.free(data_files);
     var next_file: usize = 0;
     for (request.manifest_list.entries) |manifest_entry| {
+        if (manifest_entry.content != .data) continue;
         const decoded = try decodedManifestForPath(request.data_manifests, manifest_entry.manifest_path);
         for (decoded.manifest.entries) |entry| {
             data_files[next_file] = entry;
@@ -266,6 +270,13 @@ fn hasManifestSummary(manifest_entry: iceberg_avro.ManifestListEntry) bool {
         manifest_entry.added_rows_count != 0 or
         manifest_entry.existing_rows_count != 0 or
         manifest_entry.deleted_rows_count != 0;
+}
+
+fn deleteManifestEntryHasNoActiveDeletes(manifest_entry: iceberg_avro.ManifestListEntry) bool {
+    return manifest_entry.added_files_count == 0 and
+        manifest_entry.existing_files_count == 0 and
+        manifest_entry.added_rows_count == 0 and
+        manifest_entry.existing_rows_count == 0;
 }
 
 fn syntheticVersionIdAlloc(
@@ -427,6 +438,40 @@ test "iceberg inventory planner rejects delete manifests before delete applicati
         .manifest_list = manifest_list,
         .data_manifests = &.{},
     }));
+}
+
+test "iceberg inventory planner ignores inactive delete manifests" {
+    const alloc = std.testing.allocator;
+    var plan = try testMetadataPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+    var manifest_list = try testManifestListAlloc(alloc);
+    defer manifest_list.deinit(alloc);
+    manifest_list.entries[1].content = .deletes;
+    manifest_list.entries[1].existing_files_count = 0;
+    manifest_list.entries[1].existing_rows_count = 0;
+    manifest_list.entries[1].deleted_files_count = 1;
+    manifest_list.entries[1].deleted_rows_count = 1;
+
+    var manifest_a = try testDataManifestAlloc(alloc, &[_]TestDataFileSpec{
+        .{ .status = .added, .path = "s3://bucket/t/data/a.parquet", .rows = 3, .bytes = 4096 },
+        .{ .status = .deleted, .path = "s3://bucket/t/data/old.parquet", .rows = 1, .bytes = 1024 },
+    });
+    defer manifest_a.deinit(alloc);
+    const decoded = [_]DecodedManifest{.{
+        .manifest_path = manifest_list.entries[0].manifest_path,
+        .manifest = manifest_a,
+    }};
+
+    var inventory = try planInventoryFromSnapshotManifestsAlloc(alloc, .{
+        .source_id = "events",
+        .metadata_plan = plan,
+        .manifest_list = manifest_list,
+        .data_manifests = &decoded,
+    });
+    defer inventory.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), inventory.files.len);
+    try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", inventory.files[0].file_id);
 }
 
 test "iceberg inventory planner validates manifest-list summaries when present" {
