@@ -5103,36 +5103,24 @@ than PR unit coverage:
   per-family active-worker page progress. Promotion tooling can therefore
   reject a run where one family silently serialized all page ownership through a
   single worker while another family supplied the maximum worker-step evidence.
-  The
-  focused local target is
+  The focused local target is the single parameterized harness,
   `zig build graph-metric-release-qualification -- <args>`; the Make wrappers are
   `make -C zig graph-metric-release-qualification` and
-  `make zig-graph-metric-release-qualification`. Named profile targets are
-  also available: `zig build graph-metric-release-qualification-smoke` and
-  `make zig-graph-metric-release-qualification-smoke` run the small all-family
-  resume/fan-in profile used in PR validation. `zig build
-  graph-metric-release-qualification-smoke-budgeted` and
-  `make zig-graph-metric-release-qualification-smoke-budgeted` run the same
-  smoke workload with loose local/planned/cleanup latency runaway guards plus
-  conservative public-read, fan-in, retained-storage, page-claim, cleanup-tick,
-  executed-round, failed-retry, worker-step, coordinator-step, attempt-record,
-  and four-family summary budgets, giving PR validation a fast pass/fail
-  exercise of every release-budget category without claiming production latency
-  baselines. The smoke and build-only targets use the build's selected
-  optimization mode, so local correctness validation can run in Debug or
-  ReleaseSafe without paying the optimized promotion compile cost; use
-  `zig build graph-metric-release-qualification-releasefast-build` when only
-  the optimized harness artifact is needed. `zig build
-  graph-metric-release-qualification-promotion` and
-  `make zig-graph-metric-release-qualification-promotion` run the larger
-  release-profile floor through the ReleaseFast harness. `zig build
-  graph-metric-release-qualification-promotion-budgeted` and
-  `make zig-graph-metric-release-qualification-promotion-budgeted` run that
-  same ReleaseFast promotion floor with conservative pass/fail budgets for
-  published-read latency, fresh-failure latency, fan-in latency, retained
-  storage records, page claims, cleanup ticks, executed rounds, failed rebuild
-  retries, worker steps, coordinator steps, and minimum split worker identity
-  progress, plus a four-family summary floor. Retained storage budgets now
+  `make zig-graph-metric-release-qualification`. Release recipes pass
+  `--profile smoke` or `--profile promotion` plus the selected latency,
+  retained-storage, scheduler, worker-identity, and family-floor budgets as
+  arguments instead of adding one public build or Make target per profile.
+  The budgeted smoke recipe uses loose local/planned/cleanup latency runaway
+  guards plus conservative public-read, fan-in, retained-storage, page-claim,
+  cleanup-tick, executed-round, failed-retry, worker-step, coordinator-step,
+  attempt-record, and four-family summary budgets, giving PR validation a fast
+  pass/fail exercise of every release-budget category without claiming
+  production latency baselines. The promotion recipe runs the larger
+  release-profile floor with conservative pass/fail budgets for published-read
+  latency, fresh-failure latency, fan-in latency, retained storage records,
+  page claims, cleanup ticks, executed rounds, failed rebuild retries, worker
+  steps, coordinator steps, and minimum split worker identity progress, plus a
+  four-family summary floor. Retained storage budgets now
   include explicit attempt-record ceilings in addition to score, metric,
   control, failure, and event records, while the cleanup invariant still
   requires zero retained attempt records after fresh and failed cleanup. That
@@ -5187,14 +5175,9 @@ than PR unit coverage:
   rows are the local composed promotion evidence that rollout tooling should
   require before looking at hosted deployment-scale artifacts. The process-owner target compiles the `antfly` child binary before
   compiling the process harness, and the composed target runs that process
-  harness before starting the release smoke, keeping the three large Zig
-  executables out of the same parallel compile window for CI memory stability.
-  Compile-only jobs that only need to validate the distributed gate artifacts
-  can use `zig build graph-metric-distributed-release-gate-build`, or the Make
-  wrappers `make -C zig graph-metric-distributed-release-gate-build` and
-  `make zig-graph-metric-distributed-release-gate-build`, to build the child
-  `antfly` binary, process harness, and release-qualification harness without
-  running the five-minute spawned-process qualification.
+  harness before starting the release smoke, keeping the large spawned-process
+  and release-qualification work explicit instead of hiding it behind
+  compile-only wrapper targets.
   It is intentionally
   smaller than the promotion-budgeted target and does not replace
   deployment-scale hosted owner, fan-in, cleanup, or latency evidence. Release

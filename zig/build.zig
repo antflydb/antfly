@@ -6555,10 +6555,6 @@ pub fn build(b: *std.Build) void {
     }
     const graph_metric_release_qualification_step = b.step("graph-metric-release-qualification", "Run graph metric release qualification JSONL harness");
     graph_metric_release_qualification_step.dependOn(&run_graph_metric_release_qualification.step);
-    const run_graph_metric_release_qualification_smoke = b.addRunArtifact(graph_metric_release_qualification);
-    run_graph_metric_release_qualification_smoke.addArgs(&.{ "--profile", "smoke" });
-    const graph_metric_release_qualification_smoke_step = b.step("graph-metric-release-qualification-smoke", "Run smoke graph metric release qualification profile");
-    graph_metric_release_qualification_smoke_step.dependOn(&run_graph_metric_release_qualification_smoke.step);
     const graph_metric_release_qualification_smoke_budgeted_args = &.{
         "--profile",
         "smoke",
@@ -6601,14 +6597,6 @@ pub fn build(b: *std.Build) void {
         "--min-families-run",
         "4",
     };
-    const run_graph_metric_release_qualification_smoke_budgeted = b.addRunArtifact(graph_metric_release_qualification);
-    run_graph_metric_release_qualification_smoke_budgeted.addArgs(graph_metric_release_qualification_smoke_budgeted_args);
-    const graph_metric_release_qualification_smoke_budgeted_step = b.step("graph-metric-release-qualification-smoke-budgeted", "Run smoke graph metric release qualification profile with storage and scheduler budgets");
-    graph_metric_release_qualification_smoke_budgeted_step.dependOn(&run_graph_metric_release_qualification_smoke_budgeted.step);
-    const run_graph_metric_release_qualification_promotion = b.addRunArtifact(graph_metric_release_qualification_releasefast);
-    run_graph_metric_release_qualification_promotion.addArgs(&.{ "--profile", "promotion" });
-    const graph_metric_release_qualification_promotion_step = b.step("graph-metric-release-qualification-promotion", "Run promotion graph metric release qualification profile");
-    graph_metric_release_qualification_promotion_step.dependOn(&run_graph_metric_release_qualification_promotion.step);
     const graph_metric_release_qualification_promotion_budgeted_args = &.{
         "--profile",
         "promotion",
@@ -6652,14 +6640,6 @@ pub fn build(b: *std.Build) void {
         "4",
         "--require-deployment-shaped-release-gate",
     };
-    const run_graph_metric_release_qualification_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification_releasefast);
-    run_graph_metric_release_qualification_promotion_budgeted.addArgs(graph_metric_release_qualification_promotion_budgeted_args);
-    const graph_metric_release_qualification_promotion_budgeted_step = b.step("graph-metric-release-qualification-promotion-budgeted", "Run promotion graph metric release qualification profile with storage and scheduler budgets");
-    graph_metric_release_qualification_promotion_budgeted_step.dependOn(&run_graph_metric_release_qualification_promotion_budgeted.step);
-    const build_graph_metric_release_qualification_step = b.step("graph-metric-release-qualification-build", "Build graph metric release qualification harness without running it");
-    build_graph_metric_release_qualification_step.dependOn(&graph_metric_release_qualification.step);
-    const build_graph_metric_release_qualification_releasefast_step = b.step("graph-metric-release-qualification-releasefast-build", "Build optimized graph metric release qualification harness without running it");
-    build_graph_metric_release_qualification_releasefast_step.dependOn(&graph_metric_release_qualification_releasefast.step);
 
     const algebraic_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/algebraic_bench.zig"),
@@ -7284,9 +7264,6 @@ pub fn build(b: *std.Build) void {
         run_graph_metric_release_qualification_distributed_promotion_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
         const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run spawned-process graph metric maintenance smoke test");
         graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
-        const graph_metric_distributed_release_gate_build_step = b.step("graph-metric-distributed-release-gate-build", "Build local distributed graph metric process and release qualification harnesses without running them");
-        graph_metric_distributed_release_gate_build_step.dependOn(&graph_metric_process_harness.step);
-        graph_metric_distributed_release_gate_build_step.dependOn(&graph_metric_release_qualification.step);
         const graph_metric_distributed_release_gate_step = b.step("graph-metric-distributed-release-gate", "Run local distributed graph metric process and release qualification gates");
         graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_process_harness.step);
         graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_release_qualification_distributed_smoke_budgeted.step);
