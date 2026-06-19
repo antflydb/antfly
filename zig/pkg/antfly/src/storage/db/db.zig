@@ -3735,6 +3735,12 @@ pub const DB = struct {
         return try self.core.index_manager.runLsmMaintenanceStep();
     }
 
+    pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.primary_store_owner.runLsmMaintenanceStep();
+    }
+
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (!self.core.tryLockApplyExclusive()) return false;
         defer self.core.unlockApply();
@@ -3760,6 +3766,12 @@ pub const DB = struct {
             steps += 1;
         }
         return steps;
+    }
+
+    pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.retryFailedIndexLoads(self.core.store, monotonicTimeNs(), force);
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
@@ -5529,6 +5541,68 @@ pub const DB = struct {
             .id = try alloc.dupe(u8, artifact_id),
             .value = value,
             .artifact_ref = artifact_ref,
+        };
+    }
+
+    pub fn getDocumentArtifactManifest(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?types.DocumentArtifactManifest {
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+        defer alloc.free(manifest_key);
+        const manifest_json = try self.core.getStoreValue(alloc, manifest_key) orelse return null;
+        errdefer alloc.free(manifest_json);
+
+        const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
+        defer alloc.free(state_key);
+        const state_json = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        errdefer if (state_json) |value| alloc.free(value);
+
+        return try documentArtifactManifestFromValueAlloc(alloc, doc_key, artifact_name, manifest_key, manifest_json, state_json);
+    }
+
+    pub fn listDocumentArtifactManifests(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+    ) !types.DocumentArtifactManifestList {
+        var list = std.ArrayListUnmanaged(types.DocumentArtifactManifest).empty;
+        errdefer {
+            for (list.items) |*manifest| manifest.deinit(alloc);
+            list.deinit(alloc);
+        }
+
+        const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "asset");
+        defer alloc.free(prefix);
+        const artifacts = try self.core.scanStorePrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+        for (artifacts) |entry| {
+            var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+            defer artifact_ref.deinit(alloc);
+            if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
+
+            const manifest_json = try alloc.dupe(u8, entry.value);
+            errdefer alloc.free(manifest_json);
+            const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_ref.name);
+            defer alloc.free(state_key);
+            const state_json = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            errdefer if (state_json) |value| alloc.free(value);
+
+            try list.append(alloc, try documentArtifactManifestFromValueAlloc(alloc, doc_key, artifact_ref.name, entry.key, manifest_json, state_json));
+        }
+
+        return .{
+            .document_id = try alloc.dupe(u8, doc_key),
+            .artifacts = try list.toOwnedSlice(alloc),
         };
     }
 
@@ -10859,7 +10933,7 @@ pub const DB = struct {
             .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
             .planned => try self.runGraphMetricPlannedMaintenanceForIdleLocked(),
             .auto => if (try self.core.index_manager.shouldRunGraphMetricPlannedAutoIdle(self.graph_metric_idle_auto_options))
-                try self.runGraphMetricPlannedMaintenanceForIdleLocked()
+                try self.runGraphMetricPlannedAutoMaintenanceForIdleLocked()
             else
                 try self.core.index_manager.runGraphMetricMaintenance(),
             .degree_canary => try self.runGraphMetricDegreeCanaryMaintenanceForIdleLocked(),
@@ -10870,6 +10944,20 @@ pub const DB = struct {
         const result = try self.core.index_manager.runGraphMetricPlannedMaintenance(self.graph_metric_idle_planned_options);
         if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
         return result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+    }
+
+    fn runGraphMetricPlannedAutoMaintenanceForIdleLocked(self: *DB) !usize {
+        const result = try self.core.index_manager.runGraphMetricPlannedAutoMaintenance(
+            self.graph_metric_idle_planned_options,
+            self.graph_metric_idle_auto_options,
+        );
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        const progressed = result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+        const after_decision = try self.core.index_manager.graphMetricPlannedAutoIdleDecision(self.graph_metric_idle_auto_options);
+        if (!after_decision.shouldRunPlanned() and after_decision.ineligible_queued != 0) {
+            return progressed + try self.core.index_manager.runGraphMetricMaintenance();
+        }
+        return progressed;
     }
 
     fn runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self: *DB) !usize {
@@ -33664,6 +33752,124 @@ fn jsonObjectOptionalBool(object: std.json.ObjectMap, field_name: []const u8) !?
     return value.bool;
 }
 
+fn jsonObjectStringDupOrEmpty(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
+    return try jsonObjectOptionalStringDup(alloc, object, field_name) orelse "";
+}
+
+fn jsonObjectOptionalU64OrZero(object: std.json.ObjectMap, field_name: []const u8) !u64 {
+    return try jsonObjectOptionalU64(object, field_name) orelse 0;
+}
+
+fn jsonObjectOptionalUsizeOrZero(object: std.json.ObjectMap, field_name: []const u8) !usize {
+    return try jsonObjectOptionalUsize(object, field_name) orelse 0;
+}
+
+fn documentArtifactManifestFromValueAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    manifest_key: []const u8,
+    manifest_json: []u8,
+    state_json: ?[]u8,
+) !types.DocumentArtifactManifest {
+    var manifest_json_owned = true;
+    errdefer if (manifest_json_owned) alloc.free(manifest_json);
+    var state_json_owned = true;
+    errdefer if (state_json_owned) {
+        if (state_json) |value| alloc.free(value);
+    };
+
+    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, manifest_key)) orelse return error.InvalidDocumentExtractionManifest;
+    defer artifact_ref.deinit(alloc);
+    const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
+    errdefer alloc.free(artifact_id);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const object = parsed.value.object;
+
+    var child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(alloc, manifest_json);
+    errdefer freeDocumentArtifactChildRanges(alloc, child_ranges);
+
+    var merge_status: []u8 = "";
+    errdefer if (merge_status.len > 0) alloc.free(merge_status);
+    var merge_from_generation: u64 = 0;
+    var merge_to_generation: u64 = 0;
+    var merge_operation_granularity: []u8 = "";
+    errdefer if (merge_operation_granularity.len > 0) alloc.free(merge_operation_granularity);
+    var merge_operation_count: usize = 0;
+    if (object.get("merge_plan")) |merge_value| {
+        if (merge_value != .object) return error.InvalidDocumentExtractionManifest;
+        merge_status = try jsonObjectStringDupOrEmpty(alloc, merge_value.object, "status");
+        merge_from_generation = try jsonObjectOptionalU64OrZero(merge_value.object, "from_generation");
+        merge_to_generation = try jsonObjectOptionalU64OrZero(merge_value.object, "to_generation");
+        merge_operation_granularity = try jsonObjectStringDupOrEmpty(alloc, merge_value.object, "operation_granularity");
+        if (merge_value.object.get("operations")) |operations| {
+            if (operations != .array) return error.InvalidDocumentExtractionManifest;
+            merge_operation_count = operations.array.items.len;
+        }
+    }
+
+    var last_error_code: ?[]u8 = null;
+    errdefer if (last_error_code) |value| alloc.free(value);
+    var last_error_message: ?[]u8 = null;
+    errdefer if (last_error_message) |value| alloc.free(value);
+    if (object.get("last_error")) |last_error| {
+        if (last_error != .object) return error.InvalidDocumentExtractionManifest;
+        last_error_code = try jsonObjectOptionalStringDup(alloc, last_error.object, "code");
+        last_error_message = try jsonObjectOptionalStringDup(alloc, last_error.object, "message");
+    }
+
+    const source_url = try jsonObjectStringDupOrEmpty(alloc, object, "source_url");
+    errdefer if (source_url.len > 0) alloc.free(source_url);
+    const source_fingerprint = try jsonObjectStringDupOrEmpty(alloc, object, "source_fingerprint");
+    errdefer if (source_fingerprint.len > 0) alloc.free(source_fingerprint);
+    const content_type = try jsonObjectStringDupOrEmpty(alloc, object, "content_type");
+    errdefer if (content_type.len > 0) alloc.free(content_type);
+    const route_type = try jsonObjectStringDupOrEmpty(alloc, object, "route_type");
+    errdefer if (route_type.len > 0) alloc.free(route_type);
+    const unsupported_reason = try jsonObjectOptionalStringDup(alloc, object, "unsupported_reason");
+    errdefer if (unsupported_reason) |value| alloc.free(value);
+
+    const document_id = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(document_id);
+    const artifact_name_owned = try alloc.dupe(u8, artifact_name);
+    errdefer alloc.free(artifact_name_owned);
+    const manifest_version = try jsonObjectOptionalU64OrZero(object, "manifest_version");
+    const generation = try jsonObjectOptionalU64OrZero(object, "generation");
+    const unit_count = try jsonObjectOptionalUsizeOrZero(object, "unit_count");
+    const chunk_count = try jsonObjectOptionalUsizeOrZero(object, "chunk_count");
+
+    manifest_json_owned = false;
+    state_json_owned = false;
+    return .{
+        .document_id = document_id,
+        .artifact_name = artifact_name_owned,
+        .artifact_id = artifact_id,
+        .manifest_json = manifest_json,
+        .state_json = state_json,
+        .manifest_version = manifest_version,
+        .generation = generation,
+        .source_url = source_url,
+        .source_fingerprint = source_fingerprint,
+        .content_type = content_type,
+        .route_type = route_type,
+        .unsupported_reason = unsupported_reason,
+        .unit_count = unit_count,
+        .chunk_count = chunk_count,
+        .child_ranges = child_ranges,
+        .child_range_count = child_ranges.len,
+        .merge_status = merge_status,
+        .merge_from_generation = merge_from_generation,
+        .merge_to_generation = merge_to_generation,
+        .merge_operation_granularity = merge_operation_granularity,
+        .merge_operation_count = merge_operation_count,
+        .last_error_code = last_error_code,
+        .last_error_message = last_error_message,
+    };
+}
+
 fn documentArtifactChildRangesFromManifestJsonAlloc(alloc: Allocator, manifest_json: []const u8) ![]types.DocumentArtifactChildRange {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
     defer parsed.deinit();
@@ -49334,6 +49540,8 @@ const TestAssetProducer = struct {
     reader_calls: usize = 0,
     transcriber_calls: usize = 0,
     extractor_calls: usize = 0,
+    reader_output: ?[]const u8 = null,
+    transcriber_output: ?[]const u8 = null,
     extractor_output: ?[]const u8 = null,
 
     fn producer(self: *@This()) asset_producer_mod.Producer {
@@ -49357,6 +49565,12 @@ const TestAssetProducer = struct {
         if (request.producer_type == .extractor) {
             if (self.extractor_output) |output| return try alloc.dupe(u8, output);
             return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
+        }
+        if (request.producer_type == .reader) {
+            if (self.reader_output) |output| return try alloc.dupe(u8, output);
+        }
+        if (request.producer_type == .transcriber) {
+            if (self.transcriber_output) |output| return try alloc.dupe(u8, output);
         }
         return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
     }
@@ -53265,10 +53479,29 @@ fn expectGraphMetricPlannedAutoDecision(
     eligible_queued: usize,
     ineligible_queued: usize,
 ) !void {
+    try expectGraphMetricPlannedAutoDecisionDetailed(
+        db,
+        should_run_planned,
+        active_builds,
+        eligible_queued,
+        0,
+        ineligible_queued,
+    );
+}
+
+fn expectGraphMetricPlannedAutoDecisionDetailed(
+    db: *DB,
+    should_run_planned: bool,
+    active_builds: usize,
+    eligible_queued: usize,
+    deferred_queued: usize,
+    ineligible_queued: usize,
+) !void {
     const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
     try std.testing.expectEqual(should_run_planned, decision.shouldRunPlanned());
     try std.testing.expectEqual(active_builds, decision.active_builds);
     try std.testing.expectEqual(eligible_queued, decision.eligible_queued);
+    try std.testing.expectEqual(deferred_queued, decision.deferred_queued);
     try std.testing.expectEqual(ineligible_queued, decision.ineligible_queued);
 }
 
@@ -53998,7 +54231,7 @@ test "db runUntilIdle default graph metric maintenance auto chooses planned for 
     try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
 }
 
-test "db runUntilIdle default graph metric maintenance auto falls back for larger pagerank" {
+test "db runUntilIdle default graph metric maintenance auto can cap larger pagerank" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -54037,14 +54270,17 @@ test "db runUntilIdle default graph metric maintenance auto falls back for large
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
-        try std.testing.expect(!decision.shouldRunPlanned());
-        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
-        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
-        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
+    db.graph_metric_idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -54155,7 +54391,7 @@ test "db runUntilIdle default graph metric maintenance auto can widen pagerank p
     try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
 }
 
-test "db runUntilIdle default graph metric maintenance auto falls back for multi metric indexes" {
+test "db runUntilIdle default graph metric maintenance auto chooses bounded planned for multi metric indexes" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -54191,14 +54427,17 @@ test "db runUntilIdle default graph metric maintenance auto falls back for multi
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 2, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
-        try std.testing.expect(!decision.shouldRunPlanned());
-        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
-        try std.testing.expectEqual(@as(usize, 2), decision.eligible_queued);
-        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 2), pending.active_builds);
     }
 
+    db.graph_metric_idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -54312,7 +54551,7 @@ test "db runUntilIdle default graph metric maintenance auto chooses planned for 
     try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
 }
 
-test "db runUntilIdle default graph metric maintenance auto falls back for queued hits by default" {
+test "db runUntilIdle default graph metric maintenance auto chooses planned for compatible hits by default" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -54347,14 +54586,17 @@ test "db runUntilIdle default graph metric maintenance auto falls back for queue
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
-        try std.testing.expect(!decision.shouldRunPlanned());
-        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
-        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
-        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
+    db.graph_metric_idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -54680,7 +54922,7 @@ test "db runUntilIdle auto graph metric maintenance chooses planned for one smal
     try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
 }
 
-test "db runUntilIdle auto graph metric maintenance falls back for multi metric indexes" {
+test "db runUntilIdle auto graph metric maintenance chooses bounded planned for multi metric indexes" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -54717,8 +54959,17 @@ test "db runUntilIdle auto graph metric maintenance falls back for multi metric 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 2, 0);
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 2, 0);
 
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 2), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     var metric_result = try db.search(alloc, .{
@@ -54751,7 +55002,80 @@ test "db runUntilIdle auto graph metric maintenance falls back for multi metric 
     try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[1].scores[0].node);
 }
 
-test "db runUntilIdle auto graph metric maintenance falls back for larger pagerank" {
+test "db runUntilIdle auto graph metric maintenance defers queued work at per-index cap" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-bounded-fair-cap",
+            .max_rounds = 200,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_active_builds_per_index = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecisionDetailed(&db, true, 0, 1, 1, 0);
+
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+}
+
+test "db runUntilIdle auto graph metric maintenance can cap larger pagerank" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -54791,14 +55115,17 @@ test "db runUntilIdle auto graph metric maintenance falls back for larger pagera
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
-        try std.testing.expect(!decision.shouldRunPlanned());
-        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
-        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
-        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
+    db.graph_metric_idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -54826,7 +55153,7 @@ test "db runUntilIdle auto graph metric maintenance falls back for larger pagera
     try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
 }
 
-test "db runUntilIdle auto graph metric maintenance falls back for larger eigenvector" {
+test "db runUntilIdle auto graph metric maintenance can cap larger eigenvector" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -54979,7 +55306,7 @@ test "db runUntilIdle auto graph metric maintenance can widen eigenvector planne
     try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
 }
 
-test "db runUntilIdle auto graph metric maintenance falls back for queued hits by default" {
+test "db runUntilIdle auto graph metric maintenance chooses planned for compatible hits by default" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -55015,14 +55342,17 @@ test "db runUntilIdle auto graph metric maintenance falls back for queued hits b
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
-        try std.testing.expect(!decision.shouldRunPlanned());
-        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
-        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
-        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
+    db.graph_metric_idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -55062,7 +55392,7 @@ test "db runUntilIdle auto graph metric maintenance falls back for queued hits b
     try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
 }
 
-test "db runUntilIdle auto graph metric maintenance falls back for incompatible opt-in hits pair" {
+test "db runUntilIdle auto graph metric maintenance falls back for incompatible hits pair" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -55141,7 +55471,7 @@ test "db runUntilIdle auto graph metric maintenance falls back for incompatible 
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
 }
 
-test "db runUntilIdle auto graph metric maintenance chooses planned for one opt-in small hits pair" {
+test "db runUntilIdle auto graph metric maintenance chooses planned for one compatible small hits pair" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;

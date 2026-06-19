@@ -2332,7 +2332,7 @@ pub const AntflyApiHandler = struct {
         };
         defer result.deinit(alloc);
 
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, table_name);
+        const row_filter_json = try self.api_server.resolveEffectiveRowFilterJsonForDatabase(alloc, authenticated_identity, tables_api.default_database_name, table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
             const filtered = try self.api_server.filterScanResultByRowFilter(source, table_name, result.ndjson, value);
@@ -2368,7 +2368,7 @@ pub const AntflyApiHandler = struct {
         };
         defer result.deinit(alloc);
 
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, table_name);
+        const row_filter_json = try self.api_server.resolveEffectiveRowFilterJsonForDatabase(alloc, authenticated_identity, tables_api.default_database_name, table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
             if (!(try self.api_server.docJsonMatchesRowFilter(decoded_key, result.json, value))) {

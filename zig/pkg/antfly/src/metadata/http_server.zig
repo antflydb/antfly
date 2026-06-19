@@ -2090,6 +2090,15 @@ fn applyRelationalSqlDdlOnMetadataService(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
+    return try applyRelationalSqlDdlOnMetadataServiceWithSession(service_impl, alloc, sql, catalog_resources.SqlCatalogSession.default());
+}
+
+fn applyRelationalSqlDdlOnMetadataServiceWithSession(
+    service_impl: anytype,
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
     if (try extension_domain.sql_adapter.executeRelationalSqlDdlOnService(service_impl, alloc, sql)) |applied| {
         return applied;
     }
@@ -2097,18 +2106,18 @@ fn applyRelationalSqlDdlOnMetadataService(
     var snapshot = try service_impl.adminSnapshot();
     defer service_impl.freeAdminSnapshot(&snapshot);
 
-    if (try tables_api.applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, service_impl, &snapshot, sql, .{})) |applied| {
+    if (try tables_api.applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, service_impl, &snapshot, sql, session)) |applied| {
         return applied;
     }
 
-    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
+    var target = try tables_api.relationalSqlDdlTargetWithSessionAlloc(alloc, sql, session);
     defer target.deinit(alloc);
 
     if (target.createsTable()) {
         try tables_api.validateRelationalSqlDdlNamespace(&snapshot, target);
         if (tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
         const base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
-        var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &base_table, sql);
+        var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, &base_table, sql, session);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
         try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
@@ -2147,7 +2156,7 @@ fn applyRelationalSqlDdlOnMetadataService(
         };
     }
 
-    var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
+    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, table, sql, session);
     errdefer applied.deinit(alloc);
     try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
     try service_impl.upsertTable(applied.table);

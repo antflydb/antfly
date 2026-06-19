@@ -87,10 +87,21 @@ fn executeAlterRole(
     defer alloc.free(subject);
     switch (plan.setting_kind) {
         .app => switch (plan.operation) {
-            .set => try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape),
-            .reset => manager.removeRoleSetting(subject, plan.setting_name) catch |err| switch (err) {
-                error.RoleSettingNotFound => {},
-                else => return err,
+            .set => if (plan.database_name) |database_name| {
+                try manager.setRoleDatabaseSetting(subject, database_name, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape);
+            } else {
+                try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape);
+            },
+            .reset => if (plan.database_name) |database_name| {
+                manager.removeRoleDatabaseSetting(subject, database_name, plan.setting_name) catch |err| switch (err) {
+                    error.RoleSettingNotFound => {},
+                    else => return err,
+                };
+            } else {
+                manager.removeRoleSetting(subject, plan.setting_name) catch |err| switch (err) {
+                    error.RoleSettingNotFound => {},
+                    else => return err,
+                };
             },
         },
         .runtime => switch (plan.operation) {
@@ -187,7 +198,9 @@ fn executeCreateRowSecurityPolicy(
     defer alloc.free(table_resource);
     const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
     defer alloc.free(filter_json);
-    try manager.createSqlRowSecurityPolicy(plan.policy_name, table_resource, filter_json);
+    const role_targets = try rowSecurityPolicyTargetSubjectsAlloc(manager, alloc, plan.role_targets);
+    defer freeStringSlice(alloc, role_targets);
+    try manager.createSqlRowSecurityPolicyWithTargets(plan.policy_name, table_resource, filter_json, role_targets);
     return try changedRecordAlloc(alloc);
 }
 
@@ -201,7 +214,9 @@ fn executeAlterRowSecurityPolicy(
     defer alloc.free(table_resource);
     const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
     defer alloc.free(filter_json);
-    try manager.replaceSqlRowSecurityPolicy(plan.policy_name, table_resource, filter_json);
+    const role_targets = try rowSecurityPolicyTargetSubjectsAlloc(manager, alloc, plan.role_targets);
+    defer freeStringSlice(alloc, role_targets);
+    try manager.replaceSqlRowSecurityPolicyWithTargets(plan.policy_name, table_resource, filter_json, role_targets);
     return try changedRecordAlloc(alloc);
 }
 
@@ -472,11 +487,37 @@ fn principalSubjectAlloc(
     return role_subject;
 }
 
+fn rowSecurityPolicyTargetSubjectsAlloc(
+    manager: *const usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    role_targets: []const []const u8,
+) ![]const []const u8 {
+    for (role_targets) |target| {
+        if (std.ascii.eqlIgnoreCase(target, "public")) return try alloc.alloc([]const u8, 0);
+    }
+    const out = try alloc.alloc([]const u8, role_targets.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |subject| alloc.free(@constCast(subject));
+        alloc.free(out);
+    }
+    for (role_targets, 0..) |target, i| {
+        out[i] = try principalSubjectAlloc(manager, alloc, target);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn sqlRoleSubjectAlloc(alloc: std.mem.Allocator, role_name: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, role_name, "role:") or std.mem.startsWith(u8, role_name, "group:")) {
         return try alloc.dupe(u8, role_name);
     }
     return try std.fmt.allocPrint(alloc, "role:{s}", .{role_name});
+}
+
+fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(values);
 }
 
 fn changedRecordAlloc(alloc: std.mem.Allocator) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -671,6 +712,11 @@ test "sql auth adapter creates roles and applies table grants through user manag
     const tenant_setting = try manager.getRoleSetting("role:app_writer", "app.tenant_id");
     defer alloc.free(tenant_setting);
     try std.testing.expectEqualStrings("acme", tenant_setting);
+    var scoped_app_altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'scoped-acme';")).?;
+    defer scoped_app_altered.deinit(alloc);
+    const scoped_tenant_setting = try manager.getRoleDatabaseSetting("role:app_writer", "appdb", "app.tenant_id");
+    defer alloc.free(scoped_tenant_setting);
+    try std.testing.expectEqualStrings("scoped-acme", scoped_tenant_setting);
     try manager.addRoleToUser("alice", "role:app_writer");
     const effective_settings = try manager.getEffectiveRoleSettings("alice");
     defer {
@@ -680,6 +726,17 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expectEqual(@as(usize, 1), effective_settings.len);
     try std.testing.expectEqualStrings("app.tenant_id", effective_settings[0].name);
     try std.testing.expectEqualStrings("acme", effective_settings[0].value);
+    const scoped_effective_settings = try manager.getEffectiveRoleSettingsForDatabase("alice", "appdb");
+    defer {
+        for (scoped_effective_settings) |*setting| setting.deinit(alloc);
+        alloc.free(scoped_effective_settings);
+    }
+    try std.testing.expectEqual(@as(usize, 1), scoped_effective_settings.len);
+    try std.testing.expectEqualStrings("app.tenant_id", scoped_effective_settings[0].name);
+    try std.testing.expectEqualStrings("scoped-acme", scoped_effective_settings[0].value);
+    var scoped_reset = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer IN DATABASE appdb RESET app.tenant_id;")).?;
+    defer scoped_reset.deinit(alloc);
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleDatabaseSetting("role:app_writer", "appdb", "app.tenant_id"));
     var reset = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET app.tenant_id;")).?;
     defer reset.deinit(alloc);
     try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "app.tenant_id"));
@@ -901,6 +958,97 @@ test "sql auth adapter applies row security policies through user manager" {
     var missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY IF EXISTS usage_records_tenant_policy ON usage_records;")).?;
     defer missing.deinit(alloc);
     try std.testing.expect(missing.noop);
+}
+
+test "sql auth adapter maps row security policy targets to Antfly role subjects" {
+    const alloc = std.testing.allocator;
+
+    var store = usermgr.MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try usermgr.UserManager.init(
+        alloc,
+        store.iface(),
+        try usermgr.initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var alice = try manager.createUser("alice", "secret", &.{});
+    defer alice.deinit(alloc);
+    var bob = try manager.createUser("bob", "secret", &.{});
+    defer bob.deinit(alloc);
+
+    var reader = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_reader;")).?;
+    defer reader.deinit(alloc);
+    var writer = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_writer;")).?;
+    defer writer.deinit(alloc);
+    try manager.addRoleToUser("alice", "role:app_reader");
+
+    var enabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;")).?;
+    defer enabled.deinit(alloc);
+    try std.testing.expectError(
+        error.RoleNotFound,
+        executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY unknown_target ON docs TO missing_role USING (tenant_id = 'missing');"),
+    );
+
+    var targeted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY docs_reader_policy ON docs TO app_reader USING (tenant_id = 'reader');")).?;
+    defer targeted.deinit(alloc);
+
+    const alice_reader_filters = try manager.getRowFilters("alice");
+    defer {
+        for (alice_reader_filters) |*entry| entry.deinit(alloc);
+        alloc.free(alice_reader_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alice_reader_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_reader_filters[0].filter, "\"tenant_id\":\"reader\"") != null);
+
+    const bob_reader_filters = try manager.getRowFilters("bob");
+    defer {
+        for (bob_reader_filters) |*entry| entry.deinit(alloc);
+        alloc.free(bob_reader_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bob_reader_filters.len);
+
+    var public_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY docs_public_policy ON docs TO PUBLIC USING (visibility = 'public');")).?;
+    defer public_policy.deinit(alloc);
+    const bob_public_filters = try manager.getRowFilters("bob");
+    defer {
+        for (bob_public_filters) |*entry| entry.deinit(alloc);
+        alloc.free(bob_public_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bob_public_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, bob_public_filters[0].filter, "\"visibility\":\"public\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob_public_filters[0].filter, "\"tenant_id\":\"reader\"") == null);
+
+    try manager.addRoleToUser("bob", "role:app_writer");
+    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY docs_reader_policy ON docs TO app_writer USING (tenant_id = 'writer');")).?;
+    defer altered.deinit(alloc);
+
+    const alice_writer_filters = try manager.getRowFilters("alice");
+    defer {
+        for (alice_writer_filters) |*entry| entry.deinit(alloc);
+        alloc.free(alice_writer_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alice_writer_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_writer_filters[0].filter, "\"tenant_id\":\"writer\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_writer_filters[0].filter, "\"visibility\":\"public\"") != null);
+
+    const bob_writer_filters = try manager.getRowFilters("bob");
+    defer {
+        for (bob_writer_filters) |*entry| entry.deinit(alloc);
+        alloc.free(bob_writer_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bob_writer_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, bob_writer_filters[0].filter, "\"tenant_id\":\"writer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob_writer_filters[0].filter, "\"visibility\":\"public\"") != null);
+
+    try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
+    var dropped_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY docs_reader_policy ON docs;")).?;
+    defer dropped_policy.deinit(alloc);
+    try manager.removeRoleFromUser("bob", "role:app_writer");
+    var dropped_writer = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
+    defer dropped_writer.deinit(alloc);
 }
 
 test "sql auth adapter row security uses qualified catalog table resources" {

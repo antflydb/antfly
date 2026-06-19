@@ -1127,7 +1127,7 @@ fn applyRelationalSqlDdlOnServiceWithSession(
         return applied;
     }
 
-    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
+    var target = try tables_api.relationalSqlDdlTargetWithSessionAlloc(alloc, sql, session);
     defer target.deinit(alloc);
 
     if (target.createsTable()) {
@@ -1140,7 +1140,7 @@ fn applyRelationalSqlDdlOnServiceWithSession(
             policy_table = try tables_api.applyTablespacePlacementPolicyAlloc(alloc, base_table, tablespace);
             break :blk policy_table.?;
         } else base_table;
-        var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &resolved_table, sql);
+        var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, &resolved_table, sql, session);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
 
@@ -1176,7 +1176,7 @@ fn applyRelationalSqlDdlOnServiceWithSession(
         try svc.runRound();
         return dropped;
     }
-    var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
+    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, table, sql, session);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
     try svc.runRound();
@@ -3812,7 +3812,7 @@ pub const ApiHttpServer = struct {
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 try runner.ensureTableReadable(table_name);
-                const row_filter_json = try resolveEffectiveRowFilterJson(inner_alloc, runner.authenticated_identity, table_name);
+                const row_filter_json = try runner.server.resolveEffectiveRowFilterJsonForDatabase(inner_alloc, runner.authenticated_identity, tables_api.default_database_name, table_name);
                 defer if (row_filter_json) |value| inner_alloc.free(value);
                 var semantic_resolver = SemanticStatusResolver{
                     .source = runner.server.source,
@@ -4885,7 +4885,7 @@ pub const ApiHttpServer = struct {
             return try textResponse(self.alloc, 404, "not found");
         };
         defer result.deinit(self.alloc);
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         if (row_filter_json) |value| {
             if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
@@ -4919,7 +4919,7 @@ pub const ApiHttpServer = struct {
         defer result.deinit(self.alloc);
         const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
         defer self.alloc.free(resource_name);
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, resource_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, target.database_name, resource_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         if (row_filter_json) |value| {
             if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
@@ -5413,7 +5413,7 @@ pub const ApiHttpServer = struct {
                     .read_index,
                 )) orelse return try textResponse(self.alloc, 404, "not found");
                 defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, scan.table_name);
+                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, scan.table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
                     const filtered = try self.filterScanResultByRowFilter(source, scan.table_name, result.ndjson, value);
@@ -5770,7 +5770,7 @@ pub const ApiHttpServer = struct {
         key: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !bool {
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         if (row_filter_json == null) return true;
         const source = self.table_reads orelse return false;
@@ -7036,7 +7036,7 @@ pub const ApiHttpServer = struct {
             var parsed_join = owned_join;
             defer parsed_join.deinit(alloc);
             if (authenticated_identity) |identity| {
-                try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
+                try self.applyAuthenticatedIdentityToJoinRequestForDatabase(alloc, identity, tables_api.default_database_name, &parsed_join.join);
             }
             return distributed_join.executeSupportedJoinedPublicTableQueryRequest(self.joinContext(), &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources);
         }
@@ -7114,7 +7114,7 @@ pub const ApiHttpServer = struct {
             var parsed_join = owned_join;
             defer parsed_join.deinit(alloc);
             if (authenticated_identity) |identity| {
-                try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
+                try self.applyAuthenticatedIdentityToJoinRequestForDatabase(alloc, identity, target.database_name, &parsed_join.join);
             }
             const catalog_table_name = try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
             defer alloc.free(catalog_table_name);
@@ -7201,6 +7201,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
+            tables_api.default_database_name,
             request,
             foreign_source,
         );
@@ -7238,6 +7239,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
+            target.database_name,
             request,
             foreign_source,
         );
@@ -7251,6 +7253,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        database_name: []const u8,
         request: anytype,
         foreign_source: foreign_mod.PostgresConfig,
     ) anyerror![]u8 {
@@ -7260,7 +7263,7 @@ pub const ApiHttpServer = struct {
             var parsed_join = (try distributed_join.parseSupportedJoinRequestWithSecrets(alloc, body, self.cfg.secret_store)) orelse return error.InvalidQueryRequest;
             defer parsed_join.deinit(alloc);
             if (authenticated_identity) |identity| {
-                try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
+                try self.applyAuthenticatedIdentityToJoinRequestForDatabase(alloc, identity, database_name, &parsed_join.join);
             }
             return try self.executeSupportedJoinedForeignPublicTableQueryRequest(
                 alloc,
@@ -8556,7 +8559,7 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         for (rows_req.keys, 0..) |maybe_key, i| {
@@ -10032,7 +10035,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         schema: runtime_schema_mod.TableSchema,
     ) !?RowsAuthFilterPlan {
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const json = row_filter_json orelse return null;
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, json, .{
@@ -10787,7 +10790,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
@@ -10818,7 +10821,7 @@ pub const ApiHttpServer = struct {
     pub fn handlePublicCatalogTableQuery(self: *ApiHttpServer, target: catalog_resources.TableTarget, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
         defer self.alloc.free(resource_name);
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, resource_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, target.database_name, resource_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
@@ -11580,6 +11583,60 @@ pub const ApiHttpServer = struct {
             },
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
+    }
+
+    fn effectiveRoleSettingsForIdentityDatabaseAlloc(
+        self: *ApiHttpServer,
+        identity: anytype,
+        database_name: []const u8,
+    ) !?[]usermgr.RoleSetting {
+        const manager = self.cfg.user_manager orelse return null;
+        if (!manager.hasUser(identity.username)) return null;
+        return manager.getEffectiveRoleSettingsForDatabase(identity.username, database_name) catch |err| switch (err) {
+            error.RoleSettingConflict => return error.InvalidQueryRequest,
+            else => return err,
+        };
+    }
+
+    pub fn resolveEffectiveRowFilterJsonForDatabase(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        identity: anytype,
+        database_name: []const u8,
+        table_name: []const u8,
+    ) !?[]u8 {
+        const raw = effectiveRowFilterJson(identity, table_name) orelse return null;
+        const active_identity = identity orelse return try alloc.dupe(u8, raw);
+        const scoped_role_settings = try self.effectiveRoleSettingsForIdentityDatabaseAlloc(active_identity, database_name);
+        defer if (scoped_role_settings) |settings| {
+            for (settings) |*setting| setting.deinit(alloc);
+            if (settings.len > 0) alloc.free(settings);
+        };
+        var scoped_identity = active_identity;
+        if (scoped_role_settings) |settings| {
+            scoped_identity.role_settings = settings;
+        }
+        return try resolveAuthRowFilterJson(alloc, scoped_identity, raw);
+    }
+
+    fn applyAuthenticatedIdentityToJoinRequestForDatabase(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        identity: AuthenticatedIdentity,
+        database_name: []const u8,
+        join: *distributed_join.SupportedJoinRequest,
+    ) !void {
+        if (!permissionsAllow(identity.permissions, .table, join.right_table, .read)) return error.InvalidQueryRequest;
+
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(alloc, @as(?AuthenticatedIdentity, identity), database_name, join.right_table);
+        defer if (row_filter_json) |value| alloc.free(value);
+        if (row_filter_json) |value| {
+            try distributed_join.applyRightTableRowFilterJson(alloc, join, value);
+        }
+
+        if (join.nested_join) |nested| {
+            try self.applyAuthenticatedIdentityToJoinRequestForDatabase(alloc, identity, database_name, nested);
+        }
     }
 };
 
@@ -15591,6 +15648,71 @@ test "api http server hydrates trusted principal role settings from antfly user 
     const resolved = try resolveEffectiveRowFilterJson(std.testing.allocator, @as(?AuthenticatedIdentity, identity), "docs");
     defer std.testing.allocator.free(resolved.?);
     try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"acme\"}}", resolved.?);
+}
+
+test "api http server resolves row filter role settings for target database" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var user = try auth.manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+    try auth.manager.createRoleSubject("role:app_writer");
+    try auth.manager.setRoleSetting("role:app_writer", "app.tenant_id", "global-acme");
+    try auth.manager.setRoleDatabaseSetting("role:app_writer", "tenant_ops", "app.tenant_id", "tenant-scoped-acme");
+    try auth.manager.addRoleToUser("alice", "role:app_writer");
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .user_manager = &auth.manager },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    const role_settings = try auth.manager.getEffectiveRoleSettings("alice");
+    const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "tenant_ops.public.docs", "{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.tenant_id\"}}}");
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .row_filter = row_filters,
+        .role_settings = role_settings,
+    };
+    defer identity.deinit(alloc);
+
+    const scoped = (try server.resolveEffectiveRowFilterJsonForDatabase(alloc, @as(?AuthenticatedIdentity, identity), "tenant_ops", "tenant_ops.public.docs")) orelse return error.TestExpectedEqual;
+    defer alloc.free(scoped);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"tenant-scoped-acme\"}}", scoped);
+
+    const global = (try server.resolveEffectiveRowFilterJsonForDatabase(alloc, @as(?AuthenticatedIdentity, identity), tables_api.default_database_name, "tenant_ops.public.docs")) orelse return error.TestExpectedEqual;
+    defer alloc.free(global);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"global-acme\"}}", global);
+
+    try auth.manager.createRoleSubject("role:app_reader");
+    try auth.manager.setRoleDatabaseSetting("role:app_reader", "tenant_ops", "app.tenant_id", "conflicting-acme");
+    try auth.manager.addRoleToUser("alice", "role:app_reader");
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        server.resolveEffectiveRowFilterJsonForDatabase(alloc, @as(?AuthenticatedIdentity, identity), "tenant_ops", "tenant_ops.public.docs"),
+    );
 }
 
 test "api http server treats only exact extension prefixes as admin routes" {

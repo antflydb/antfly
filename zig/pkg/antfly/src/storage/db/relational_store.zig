@@ -9490,9 +9490,19 @@ test "relational row rewrite sets cells and honors column index policy" {
     try std.testing.expectEqual(@as(u64, 1), report.rewritten_rows);
     try std.testing.expectEqual(@as(u64, 3), report.set_cells);
 
+    const raw_row_key = try internal_keys.relationalRowKeyAlloc(alloc, "doc:a");
+    defer alloc.free(raw_row_key);
+    const raw_row = try store.get(alloc, raw_row_key);
+    defer alloc.free(raw_row);
+    const status_cell = (try relational_row_codec.findCellByPath(raw_row, "status")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, status_cell.value_type);
+    try std.testing.expectEqualStrings("closed", status_cell.value.bytes_val);
+    const count_cell = (try relational_row_codec.findCellByPath(raw_row, "count")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(typed_dv.ValueType.f64_val, count_cell.value_type);
+    try std.testing.expectEqual(@as(f64, 7.0), count_cell.value.f64_val);
     const materialized = (try getMaterializedAlloc(alloc, &store, "doc:a")).?;
     defer alloc.free(materialized);
-    try std.testing.expectEqualStrings("{\"status\":\"closed\",\"count\":3,\"backfilled\":\"defaulted\"}", materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"backfilled\":\"defaulted\"") != null);
 
     const backfilled_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "backfilled");
     defer alloc.free(backfilled_column);

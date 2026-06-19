@@ -15719,7 +15719,8 @@ fn generatedColumnValueJsonAlloc(
     return switch (generated.op) {
         .lower, .upper, .md5 => blk: {
             const field = generated.field orelse return error.InvalidRowsRequest;
-            const source = try plannedStringFieldValueAlloc(alloc, schema, row_value, resolved_defaults, field);
+            const source = try plannedStringFieldValueOrNullAlloc(alloc, schema, row_value, resolved_defaults, field) orelse
+                break :blk try alloc.dupe(u8, "null");
             defer alloc.free(source);
             const folded = switch (generated.op) {
                 .lower => try std.ascii.allocLowerString(alloc, source),

@@ -2847,6 +2847,7 @@ pub const IndexManager = struct {
         max_metrics: usize = 64,
         start_background_builds: bool = true,
         now_ms: ?u64 = null,
+        auto_idle_options: ?GraphMetricPlannedAutoIdleOptions = null,
     };
 
     pub const GraphMetricPlannedWorkerSweepOptions = struct {
@@ -2932,21 +2933,21 @@ pub const IndexManager = struct {
     };
 
     pub const GraphMetricPlannedAutoIdleOptions = struct {
-        max_pagerank_iterations: u32 = 3,
-        max_eigenvector_iterations: u32 = 1,
-        max_hits_iterations: u32 = 0,
+        max_pagerank_iterations: u32 = std.math.maxInt(u32),
+        max_eigenvector_iterations: u32 = std.math.maxInt(u32),
+        max_hits_iterations: u32 = std.math.maxInt(u32),
+        max_active_builds: usize = 4,
+        max_active_builds_per_index: usize = 2,
     };
 
     pub const GraphMetricPlannedAutoIdleDecision = struct {
         active_builds: usize = 0,
         eligible_queued: usize = 0,
+        deferred_queued: usize = 0,
         ineligible_queued: usize = 0,
 
         pub fn shouldRunPlanned(self: @This()) bool {
-            if (self.ineligible_queued != 0) return false;
-            if (self.active_builds == 1 and self.eligible_queued == 0) return true;
-            if (self.active_builds == 0 and self.eligible_queued == 1) return true;
-            return false;
+            return self.active_builds != 0 or self.eligible_queued != 0;
         }
     };
 
@@ -3006,6 +3007,7 @@ pub const IndexManager = struct {
                     }
                 }
                 if (status.state == .building or status.phase == .cleanup_old_generations) {
+                    if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
                     stats.active_builds += 1;
                     continue;
                 }
@@ -3084,13 +3086,15 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedAutoIdleDecision {
         var decision = GraphMetricPlannedAutoIdleDecision{};
         for (self.graph_indexes.items) |*entry| {
+            const index_active_builds = try graphMetricIndexActiveBuilds(entry);
+            var index_scheduled_builds: usize = 0;
+            decision.active_builds += index_active_builds;
             for (entry.metric_configs) |cfg| {
                 var status = try entry.index.graphMetricStatus(cfg.name);
                 defer status.deinit(entry.index.alloc);
                 if (status.maintenance_paused) continue;
 
                 if (status.state == .building or status.phase == .cleanup_old_generations) {
-                    decision.active_builds += 1;
                     continue;
                 }
 
@@ -3098,10 +3102,19 @@ pub const IndexManager = struct {
                 if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
                 switch (status.state) {
                     .not_ready, .stale => {
-                        if (graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, options)) {
-                            decision.eligible_queued += 1;
-                        } else {
+                        if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, options)) {
                             decision.ineligible_queued += 1;
+                        } else if (graphMetricPlannedAutoCanStart(
+                            options,
+                            decision.active_builds,
+                            decision.eligible_queued,
+                            index_active_builds,
+                            index_scheduled_builds,
+                        )) {
+                            decision.eligible_queued += 1;
+                            index_scheduled_builds += 1;
+                        } else {
+                            decision.deferred_queued += 1;
                         }
                     },
                     .disabled, .fresh, .building, .failed => {},
@@ -3110,6 +3123,33 @@ pub const IndexManager = struct {
         }
 
         return decision;
+    }
+
+    fn graphMetricIndexActiveBuilds(entry: *GraphIndex) !usize {
+        var active_builds: usize = 0;
+        for (entry.metric_configs) |cfg| {
+            var status = try entry.index.graphMetricStatus(cfg.name);
+            defer status.deinit(entry.index.alloc);
+            if (status.maintenance_paused) continue;
+            if (status.state == .building or status.phase == .cleanup_old_generations) {
+                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                active_builds += 1;
+            }
+        }
+        return active_builds;
+    }
+
+    fn graphMetricPlannedAutoCanStart(
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        eligible_queued: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (options.max_active_builds == 0 or options.max_active_builds_per_index == 0) return false;
+        if (active_builds + eligible_queued >= options.max_active_builds) return false;
+        if (index_active_builds + index_scheduled_builds >= options.max_active_builds_per_index) return false;
+        return true;
     }
 
     fn graphMetricQueuedPlannedAutoEligible(
@@ -3155,6 +3195,26 @@ pub const IndexManager = struct {
             graphMetricEdgeFiltersEqual(candidate.edge_filter, cfg.edge_filter);
     }
 
+    fn graphMetricShouldAutoStartQueuedBuild(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        scheduled_builds: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (!graphMetricBackgroundStartCanonical(configs, cfg)) return false;
+        if (!graphMetricQueuedPlannedAutoEligible(configs, cfg, options)) return false;
+        return graphMetricPlannedAutoCanStart(
+            options,
+            active_builds,
+            scheduled_builds,
+            index_active_builds,
+            index_scheduled_builds,
+        );
+    }
+
     fn graphMetricEdgeFiltersEqual(
         a: graph_mod.GraphMetricEdgeFilter,
         b: graph_mod.GraphMetricEdgeFilter,
@@ -3172,8 +3232,18 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedSchedulerSweepResult {
         var result = GraphMetricPlannedSchedulerSweepResult{};
         if (options.max_metrics == 0) return result;
+        const active_builds_before_start: usize = if (options.auto_idle_options != null)
+            try self.graphMetricActiveBuildCount()
+        else
+            0;
+        var scheduled_builds: usize = 0;
 
         for (self.graph_indexes.items) |*entry| {
+            const index_active_builds = if (options.auto_idle_options != null)
+                try graphMetricIndexActiveBuilds(entry)
+            else
+                0;
+            var index_scheduled_builds: usize = 0;
             for (entry.metric_configs) |cfg| {
                 if (result.metrics_scanned >= options.max_metrics) {
                     result.budget_exhausted = true;
@@ -3189,10 +3259,22 @@ pub const IndexManager = struct {
                 if (!active and options.start_background_builds and cfg.refresh == .background) {
                     switch (status.state) {
                         .not_ready, .stale => {
-                            if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                            if (options.auto_idle_options) |auto_options| {
+                                if (!graphMetricShouldAutoStartQueuedBuild(
+                                    entry.metric_configs,
+                                    cfg,
+                                    auto_options,
+                                    active_builds_before_start,
+                                    scheduled_builds,
+                                    index_active_builds,
+                                    index_scheduled_builds,
+                                )) continue;
+                            } else if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
                             var started = try entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation);
                             defer started.deinit(entry.index.alloc);
                             result.builds_started += 1;
+                            scheduled_builds += 1;
+                            index_scheduled_builds += 1;
                             active = true;
                         },
                         .disabled, .fresh, .building, .failed => {},
@@ -3217,6 +3299,14 @@ pub const IndexManager = struct {
             }
         }
         return result;
+    }
+
+    fn graphMetricActiveBuildCount(self: *IndexManager) !usize {
+        var active_builds: usize = 0;
+        for (self.graph_indexes.items) |*entry| {
+            active_builds += try graphMetricIndexActiveBuilds(entry);
+        }
+        return active_builds;
     }
 
     pub fn runGraphMetricPlannedWorkerSweep(
@@ -3270,6 +3360,22 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricPlannedMaintenanceOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, null);
+    }
+
+    pub fn runGraphMetricPlannedAutoMaintenance(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, auto_options);
+    }
+
+    fn runGraphMetricPlannedMaintenanceWithAuto(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: ?GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
         try validateGraphMetricPlannedMaintenanceWorkers(options);
         var total = GraphMetricPlannedSchedulerSweepResult{};
         if (options.max_rounds == 0) {
@@ -3284,6 +3390,7 @@ pub const IndexManager = struct {
                 .max_metrics = options.max_metrics_per_round,
                 .start_background_builds = true,
                 .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
             });
             round.add(coordinator_before);
 
@@ -3317,6 +3424,7 @@ pub const IndexManager = struct {
                 .max_metrics = options.max_metrics_per_round,
                 .start_background_builds = true,
                 .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
             });
             round.add(coordinator_after);
 

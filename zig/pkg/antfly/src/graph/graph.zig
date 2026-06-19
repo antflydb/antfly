@@ -2389,7 +2389,6 @@ pub const GraphIndex = struct {
         page.state = .failed;
         page.worker_id = worker_id;
         page.lease_expires_at_ms = 0;
-        page.cursor = "";
         page.last_error = last_error;
         try self.putGraphMetricBuildPageInBatch(&batch, metric_name, page);
         try batch.commit();
@@ -10905,10 +10904,10 @@ test "graph metric build pagerank manifest partitions iterative phase pages" {
     var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
-    for (0..3) |i| {
-        var source_buf: [64]u8 = undefined;
-        const source = try std.fmt.bufPrint(&source_buf, "doc-{d:0>3}", .{i});
-        try graph.addEdge(source, "hub", "cites", 1.0, 0, 0, "");
+    for (0..graph_metric_build_target_scan_page_units + 1) |i| {
+        var target_buf: [64]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buf, "doc-{d:0>3}", .{i});
+        try graph.addEdge("hub", target, "cites", 1.0, 0, 0, "");
     }
     try graph.acquireGraphMetricBuildLease("pagerank", graph.edge_generation);
     defer graph.releaseGraphMetricBuildLease("pagerank") catch {};
@@ -14510,7 +14509,7 @@ test "graph metric build page progress cursor survives renew and reopen" {
     try std.testing.expectEqual(@as(u64, 1), failed_status.build_pages[0].attempt);
     try std.testing.expectEqualStrings("edge-page:0001", failed_status.build_pages[0].cursor);
     try std.testing.expectEqual(@as(u64, 1), failed_status.build_pages[0].completed_units);
-    try std.testing.expectEqual(@as(u64, 10), failed_status.build_pages[0].total_units);
+    try std.testing.expectEqual(claim.total_units, failed_status.build_pages[0].total_units);
     try std.testing.expectEqualStrings("simulated page failure", failed_status.build_pages[0].last_error);
 }
 
@@ -15206,9 +15205,11 @@ test "graph degree planned worker and coordinator steps survive reopened handles
         var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
-        try graph.addEdge("doc-a", "hub", "cites", 1.0, 0, 0, "");
-        try graph.addEdge("doc-b", "hub", "cites", 1.0, 0, 0, "");
-        try graph.addEdge("doc-c", "hub", "cites", 1.0, 0, 0, "");
+        for (0..graph_metric_build_target_scan_page_units + 1) |i| {
+            var target_buf: [64]u8 = undefined;
+            const target = try std.fmt.bufPrint(&target_buf, "doc-{d:0>3}", .{i});
+            try graph.addEdge("hub", target, "cites", 1.0, 0, 0, "");
+        }
         try graph.acquireGraphMetricBuildLease("degree", graph.edge_generation);
     }
 

@@ -1296,10 +1296,19 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
     table: *const metadata_table_manager.TableRecord,
     sql: []const u8,
 ) !AppliedRelationalSqlDdlRecord {
+    return try applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, table, sql, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn applyRelationalSqlDdlToTableRecordWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !AppliedRelationalSqlDdlRecord {
     var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
-    if (try relationalSqlDdlPlanTableRefAlloc(alloc, plan)) |table_ref_value| {
+    if (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) |table_ref_value| {
         var table_ref = table_ref_value;
         defer table_ref.deinit(alloc);
         if (!tableCatalogIdentityMatches(table.*, table_ref.database_name, table_ref.namespace_name, table_ref.table_name)) return error.InvalidSchemaUpdateRequest;
@@ -1334,10 +1343,18 @@ pub fn relationalSqlDdlTargetAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !RelationalSqlDdlTarget {
+    return try relationalSqlDdlTargetWithSessionAlloc(alloc, sql, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn relationalSqlDdlTargetWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlDdlTarget {
     var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
-    var table_ref = (try relationalSqlDdlPlanTableRefAlloc(alloc, plan)) orelse return error.UnsupportedSqlShape;
+    var table_ref = (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) orelse return error.UnsupportedSqlShape;
     errdefer table_ref.deinit(alloc);
     return .{
         .database_name = table_ref.database_name,
@@ -1364,8 +1381,16 @@ fn relationalSqlDdlPlanTableRefAlloc(
     alloc: std.mem.Allocator,
     plan: relational_sql.LoweredDdlPlan,
 ) !?RelationalSqlDdlTableRef {
+    return try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, catalog_resources.SqlCatalogSession.default());
+}
+
+fn relationalSqlDdlPlanTableRefWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    plan: relational_sql.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !?RelationalSqlDdlTableRef {
     const table_name = relationalSqlDdlPlanTableName(plan) orelse return null;
-    return try parseRelationalSqlDdlTableRefAlloc(alloc, table_name);
+    return try parseRelationalSqlDdlTableRefWithSessionAlloc(alloc, table_name, session);
 }
 
 fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) ?[]const u8 {
@@ -1384,29 +1409,20 @@ fn parseRelationalSqlDdlTableRefAlloc(
     alloc: std.mem.Allocator,
     raw_table_name: []const u8,
 ) !RelationalSqlDdlTableRef {
-    if (std.mem.indexOfScalar(u8, raw_table_name, '.')) |dot| {
-        if (dot == 0) return error.UnsupportedSqlShape;
-        const namespace_name = raw_table_name[0..dot];
-        const table_name = raw_table_name[dot + 1 ..];
-        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '.') != null) return error.UnsupportedSqlShape;
-        const owned_database_name = try alloc.dupe(u8, default_database_name);
-        errdefer alloc.free(owned_database_name);
-        const owned_namespace_name = try alloc.dupe(u8, namespace_name);
-        errdefer alloc.free(owned_namespace_name);
-        const owned_table_name = try alloc.dupe(u8, table_name);
-        errdefer alloc.free(owned_table_name);
-        return .{
-            .database_name = owned_database_name,
-            .namespace_name = owned_namespace_name,
-            .table_name = owned_table_name,
-        };
-    }
-    if (raw_table_name.len == 0) return error.UnsupportedSqlShape;
-    const owned_database_name = try alloc.dupe(u8, default_database_name);
+    return try parseRelationalSqlDdlTableRefWithSessionAlloc(alloc, raw_table_name, catalog_resources.SqlCatalogSession.default());
+}
+
+fn parseRelationalSqlDdlTableRefWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    raw_table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlDdlTableRef {
+    const target = try session.tableTargetFromObjectName(raw_table_name);
+    const owned_database_name = try alloc.dupe(u8, target.database_name);
     errdefer alloc.free(owned_database_name);
-    const owned_namespace_name = try alloc.dupe(u8, default_namespace_name);
+    const owned_namespace_name = try alloc.dupe(u8, target.namespace_name);
     errdefer alloc.free(owned_namespace_name);
-    const owned_table_name = try alloc.dupe(u8, raw_table_name);
+    const owned_table_name = try alloc.dupe(u8, target.table_name);
     errdefer alloc.free(owned_table_name);
     return .{
         .database_name = owned_database_name,
