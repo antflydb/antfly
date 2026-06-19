@@ -138,6 +138,7 @@
     "ddl_copy_freeze",
     "ddl_copy_from",
     "ddl_copy_header",
+    "ddl_copy_log_verbosity",
     "ddl_copy_null_marker",
     "ddl_copy_on_error_ignore",
     "ddl_copy_quote",

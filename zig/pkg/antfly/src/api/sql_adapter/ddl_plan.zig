@@ -1668,6 +1668,7 @@ pub const BulkIoPlan = struct {
     freeze: bool = false,
     on_error: BulkIoOnErrorPolicy = .stop,
     reject_limit: ?usize = null,
+    log_verbosity: BulkIoLogVerbosity = .default,
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
     force_not_null_columns: []const []const u8 = &.{},
@@ -1703,6 +1704,12 @@ pub const BulkIoDirection = enum {
 pub const BulkIoOnErrorPolicy = enum {
     stop,
     ignore,
+};
+
+pub const BulkIoLogVerbosity = enum {
+    default,
+    verbose,
+    terse,
 };
 
 pub const MaterializedViewCatalogPlan = union(enum) {

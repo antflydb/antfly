@@ -983,6 +983,7 @@ pub const BulkIoSyntax = struct {
     freeze: bool = false,
     on_error: ddl_plan.BulkIoOnErrorPolicy = .stop,
     reject_limit: ?usize = null,
+    log_verbosity: ddl_plan.BulkIoLogVerbosity = .default,
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
     force_not_null_columns: []const []const u8 = &.{},
@@ -4884,6 +4885,7 @@ pub fn parseBulkIoTailAlloc(
     var freeze = false;
     var on_error: ddl_plan.BulkIoOnErrorPolicy = .stop;
     var reject_limit: ?usize = null;
+    var log_verbosity: ddl_plan.BulkIoLogVerbosity = .default;
     var force_quote_all = false;
     var force_quote_columns: []const []const u8 = &.{};
     var force_not_null_columns: []const []const u8 = &.{};
@@ -4941,6 +4943,15 @@ pub fn parseBulkIoTailAlloc(
             } else if (cursor.matchKeyword("reject_limit")) {
                 if (reject_limit != null) return error.UnsupportedSqlShape;
                 reject_limit = try parseBulkIoRejectLimit(cursor);
+            } else if (cursor.matchKeyword("log_verbosity")) {
+                const value = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+                if (std.ascii.eqlIgnoreCase(value.text, "default")) {
+                    log_verbosity = .default;
+                } else if (std.ascii.eqlIgnoreCase(value.text, "verbose")) {
+                    log_verbosity = .verbose;
+                } else if (std.ascii.eqlIgnoreCase(value.text, "terse")) {
+                    log_verbosity = .terse;
+                } else return error.UnsupportedSqlShape;
             } else if (cursor.matchKeyword("force_quote")) {
                 if (force_quote_all or force_quote_columns.len != 0) return error.UnsupportedSqlShape;
                 if (cursor.matchToken(.star) != null) {
@@ -5004,6 +5015,8 @@ pub fn parseBulkIoTailAlloc(
     if (on_error != .stop and direction != .from) return error.UnsupportedSqlShape;
     if (reject_limit != null and direction != .from) return error.UnsupportedSqlShape;
     if (reject_limit != null and on_error != .ignore) return error.UnsupportedSqlShape;
+    if (log_verbosity != .default and direction != .from) return error.UnsupportedSqlShape;
+    if (log_verbosity != .default and on_error != .ignore) return error.UnsupportedSqlShape;
     if ((force_quote_all or force_quote_columns.len != 0) and direction != .to) return error.UnsupportedSqlShape;
     if (force_not_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
     if (force_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
@@ -5030,6 +5043,7 @@ pub fn parseBulkIoTailAlloc(
         .freeze = freeze,
         .on_error = on_error,
         .reject_limit = reject_limit,
+        .log_verbosity = log_verbosity,
         .force_quote_all = force_quote_all,
         .force_quote_columns = force_quote_columns,
         .force_not_null_columns = force_not_null_columns,
@@ -8719,7 +8733,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
     try std.testing.expect(!copy_from.header);
 
-    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, FORMAT csv, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
+    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORMAT csv, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
     defer lexer.freeTokens(alloc, &copy_header_tokens);
     var copy_header_pos: usize = 0;
     var copy_header = try parseBulkIoTailAlloc(alloc, copy_header_tokens.items, &copy_header_pos);
@@ -8731,6 +8745,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expect(copy_header.freeze);
     try std.testing.expectEqual(ddl_plan.BulkIoOnErrorPolicy.ignore, copy_header.on_error);
     try std.testing.expectEqual(@as(?usize, 10), copy_header.reject_limit);
+    try std.testing.expectEqual(ddl_plan.BulkIoLogVerbosity.verbose, copy_header.log_verbosity);
     try std.testing.expectEqual(@as(usize, 2), copy_header.force_not_null_columns.len);
     try std.testing.expectEqualStrings("id", copy_header.force_not_null_columns[0]);
     try std.testing.expectEqualStrings("status", copy_header.force_not_null_columns[1]);
@@ -8791,7 +8806,17 @@ test "sql adapter grammar parses bulk io tails" {
     var reject_limit_to_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, reject_limit_to_tokens.items, &reject_limit_to_pos));
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (LOG_VERBOSITY verbose);");
+    var log_verbosity_stop_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (LOG_VERBOSITY verbose);");
+    defer lexer.freeTokens(alloc, &log_verbosity_stop_tokens);
+    var log_verbosity_stop_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, log_verbosity_stop_tokens.items, &log_verbosity_stop_pos));
+
+    var log_verbosity_to_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDOUT WITH (ON_ERROR ignore, LOG_VERBOSITY verbose);");
+    defer lexer.freeTokens(alloc, &log_verbosity_to_tokens);
+    var log_verbosity_to_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, log_verbosity_to_tokens.items, &log_verbosity_to_pos));
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (DEFAULT 'n/a');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
