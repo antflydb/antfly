@@ -4000,8 +4000,15 @@ pub const AppParityCorpusCoverage = struct {
     ddl_declare_cursor_binary_hold_scroll: bool = false,
     ddl_declare_cursor_read_subject: bool = false,
     ddl_fetch_cursor: bool = false,
+    ddl_fetch_cursor_absolute: bool = false,
+    ddl_fetch_cursor_all: bool = false,
+    ddl_fetch_cursor_backward: bool = false,
     ddl_fetch_cursor_count: bool = false,
+    ddl_fetch_cursor_first: bool = false,
     ddl_fetch_cursor_forward: bool = false,
+    ddl_fetch_cursor_last: bool = false,
+    ddl_fetch_cursor_prior: bool = false,
+    ddl_fetch_cursor_relative: bool = false,
     ddl_close_cursor: bool = false,
     ddl_close_cursor_all: bool = false,
     ddl_savepoint_transaction: bool = false,
@@ -5697,8 +5704,15 @@ pub const AppParityCorpusCoverage = struct {
                 },
                 .fetch_cursor => {
                     self.ddl_fetch_cursor = true;
+                    self.ddl_fetch_cursor_absolute = self.ddl_fetch_cursor_absolute or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "absolute");
+                    self.ddl_fetch_cursor_all = self.ddl_fetch_cursor_all or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "all");
+                    self.ddl_fetch_cursor_backward = self.ddl_fetch_cursor_backward or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "backward");
                     self.ddl_fetch_cursor_count = self.ddl_fetch_cursor_count or sql_adapter.planHasNonZeroToken(entry.plan, ":count=");
+                    self.ddl_fetch_cursor_first = self.ddl_fetch_cursor_first or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "first");
                     self.ddl_fetch_cursor_forward = self.ddl_fetch_cursor_forward or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "forward");
+                    self.ddl_fetch_cursor_last = self.ddl_fetch_cursor_last or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "last");
+                    self.ddl_fetch_cursor_prior = self.ddl_fetch_cursor_prior or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "prior");
+                    self.ddl_fetch_cursor_relative = self.ddl_fetch_cursor_relative or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "relative");
                 },
                 .close_cursor => {
                     self.ddl_close_cursor = true;
@@ -6557,8 +6571,15 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_declare_cursor_binary_hold_scroll);
         try std.testing.expect(self.ddl_declare_cursor_read_subject);
         try std.testing.expect(self.ddl_fetch_cursor);
+        try std.testing.expect(self.ddl_fetch_cursor_absolute);
+        try std.testing.expect(self.ddl_fetch_cursor_all);
+        try std.testing.expect(self.ddl_fetch_cursor_backward);
         try std.testing.expect(self.ddl_fetch_cursor_count);
+        try std.testing.expect(self.ddl_fetch_cursor_first);
         try std.testing.expect(self.ddl_fetch_cursor_forward);
+        try std.testing.expect(self.ddl_fetch_cursor_last);
+        try std.testing.expect(self.ddl_fetch_cursor_prior);
+        try std.testing.expect(self.ddl_fetch_cursor_relative);
         try std.testing.expect(self.ddl_close_cursor);
         try std.testing.expect(self.ddl_close_cursor_all);
         try std.testing.expect(self.ddl_savepoint_transaction);

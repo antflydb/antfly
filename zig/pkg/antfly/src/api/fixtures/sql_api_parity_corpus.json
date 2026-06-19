@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "bd5f19c74d066f9ea0e7795f4ceacddccd01d1aca5880bf0b1ebfdde3d5bf995",
-  "source_entry_count": 947,
-  "entry_count": 947,
+  "source_sha256": "de09f067f8fc0de51a86e059f834e4f1c31b3d6f383801715325614e57b0fc65",
+  "source_entry_count": 954,
+  "entry_count": 954,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -302,6 +302,79 @@
       },
       "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=forward",
       "sql": "FETCH FORWARD usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal backward counted protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor",
+        "operations": 5
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=backward:count=5",
+      "sql": "FETCH BACKWARD 5 FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal prior protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=prior",
+      "sql": "FETCH PRIOR FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal first protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=first",
+      "sql": "FETCH FIRST FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal last protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=last",
+      "sql": "FETCH LAST FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal absolute protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor",
+        "operations": 3
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=absolute:count=3",
+      "sql": "FETCH ABSOLUTE 3 FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal relative protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor",
+        "operations": 2
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=relative:count=2",
+      "sql": "FETCH RELATIVE 2 FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal all protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=all",
+      "sql": "FETCH ALL FROM usage_cursor"
     },
     {
       "name": "close cursor portal protocol plan",

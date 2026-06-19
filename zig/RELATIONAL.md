@@ -4568,7 +4568,9 @@ epochs, authorization context, and invalidation rules. `DECLARE ... [BINARY]
 [NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH [direction] [FROM|IN]
 cursor`, shorthand `FETCH cursor`, bare-count `FETCH n cursor`, and `CLOSE
 cursor|ALL` lower to typed cursor-portal intents that capture portal name,
-scroll/hold/binary metadata, fetch direction/count, and close scope. The
+scroll/hold/binary metadata, fetch direction/count, and close scope. Fetch
+directions are explicit metadata for `NEXT`, `PRIOR`, `FIRST`, `LAST`,
+`ABSOLUTE n`, `RELATIVE n`, `FORWARD [n|ALL]`, `BACKWARD [n]`, and `ALL`. The
 `CLOSE` cleanup tail also lives in `api/sql_adapter/grammar.zig`, so protocol
 cleanup syntax stays adapter-owned while the lowerer allocates the typed plan.
 They still fail closed when applied to storage until there is a typed portal

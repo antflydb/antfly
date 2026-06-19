@@ -298,6 +298,79 @@
       "sql": "FETCH FORWARD usage_cursor"
     },
     {
+      "name": "fetch cursor portal backward counted protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor",
+        "operations": 5
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=backward:count=5",
+      "sql": "FETCH BACKWARD 5 FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal prior protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=prior",
+      "sql": "FETCH PRIOR FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal first protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=first",
+      "sql": "FETCH FIRST FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal last protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=last",
+      "sql": "FETCH LAST FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal absolute protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor",
+        "operations": 3
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=absolute:count=3",
+      "sql": "FETCH ABSOLUTE 3 FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal relative protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor",
+        "operations": 2
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=relative:count=2",
+      "sql": "FETCH RELATIVE 2 FROM usage_cursor"
+    },
+    {
+      "name": "fetch cursor portal all protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor"
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=all",
+      "sql": "FETCH ALL FROM usage_cursor"
+    },
+    {
       "name": "close cursor portal protocol plan",
       "family": "ddl",
       "summary": {
