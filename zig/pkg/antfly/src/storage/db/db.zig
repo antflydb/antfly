@@ -35097,6 +35097,7 @@ test "db leased enrichment worker persists chunk storage when full text consumes
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
+        .start_index_workers = false,
     });
     defer db.close();
 
@@ -35119,7 +35120,6 @@ test "db leased enrichment worker persists chunk storage when full text consumes
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -35147,6 +35147,7 @@ test "db leased enrichment worker persists chunk storage when chunker enables fu
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
+        .start_index_workers = false,
     });
     defer db.close();
 
@@ -35164,7 +35165,6 @@ test "db leased enrichment worker persists chunk storage when chunker enables fu
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -35192,6 +35192,7 @@ test "db default full text index searches template chunk text when chunker full 
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
+        .start_index_workers = false,
     });
     defer db.close();
 
@@ -35210,11 +35211,8 @@ test "db default full text index searches template chunk text when chunker full 
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"Alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
         },
-        .sync_level = .write,
+        .sync_level = .full_text,
     });
-
-    try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
 
     var result = try waitForSearchResult(alloc, &db, .{
         .index_name = "full_text_index_v0",
