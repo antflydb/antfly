@@ -2061,7 +2061,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, "", authenticated_identity),
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
                 req.body,
                 false,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2077,7 +2077,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, "", authenticated_identity),
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
                 req.body,
                 true,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -10584,6 +10584,15 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/mcp-server+json\"") == null);
 
+    var profile_search = try server.handle(.{
+        .method = .POST,
+        .uri = "/ard/v1/search?profile=copilot",
+        .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
+    });
+    defer profile_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_search.body, "\"results\":[]") != null);
+
     var federated_search = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
@@ -10613,6 +10622,15 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"facets\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"buckets\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"value\":\"retrieval\"") != null);
+
+    var profile_explore = try server.handle(.{
+        .method = .POST,
+        .uri = "/ard/v1/explore?profile=copilot",
+        .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
+    });
+    defer profile_explore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_explore.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_explore.body, "\"value\":\"application/ai-skill+md\"") == null);
 
     var agents = try server.handle(.{
         .method = .GET,
