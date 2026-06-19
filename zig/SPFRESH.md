@@ -1377,6 +1377,11 @@ Current slice:
   centroid-directory probe now carries posting parent, level, and persisted
   posting state, so query materialization goes straight through the posting
   store and does not read packed leaf nodes as a metadata fallback.
+- Flat/two-level centroid-directory selection now consumes the resolved search
+  epsilon when scoring quantized posting-centroid candidates. Sorted lower
+  bounds stop exact centroid scoring once the best exact posting centroid is
+  outside the effort window, while inner-product search remains unpruned to
+  match the HBC dynamic-pruning guard.
 - delta sequence high bits are treated as the posting mutation generation; query
   overlay and maintenance fold ignore records at or below the base generation so
   full base snapshots are authoritative over older shadow deltas.

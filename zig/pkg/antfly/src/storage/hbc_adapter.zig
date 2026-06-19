@@ -8174,21 +8174,39 @@ test "two-level rabitq default block probes cover requested posting probes" {
     };
     try idx.bulkBuildWithMetadata(&items);
 
-    var profiled = try idx.searchProfiledRequest(.{
+    var full_profiled = try idx.searchProfiledRequest(.{
         .query = &[_]f32{ 30.0, 30.0 },
         .k = 1,
         .search_width = 8,
+        .epsilon = 10_000.0,
         .load_metadata = false,
     });
-    defer profiled.results.deinit();
+    defer full_profiled.results.deinit();
 
-    const hits = profiled.results.getHits();
+    const full_hits = full_profiled.results.getHits();
+    try std.testing.expectEqual(@as(usize, 1), full_hits.len);
+    try std.testing.expectEqual(@as(u64, 7), full_hits[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 4), full_profiled.profile.centroid_directory_blocks_scanned);
+    try std.testing.expectEqual(@as(u64, 4), full_profiled.profile.centroid_directory_blocks_selected);
+    try std.testing.expectEqual(@as(u64, 4), full_profiled.profile.centroid_directory_posting_centroids_scored);
+    try std.testing.expectEqual(@as(u64, 4), full_profiled.profile.centroid_directory_posting_centroid_estimates);
+
+    var pruned_profiled = try idx.searchProfiledRequest(.{
+        .query = &[_]f32{ 30.0, 30.0 },
+        .k = 1,
+        .search_width = 8,
+        .epsilon = 0.0,
+        .load_metadata = false,
+    });
+    defer pruned_profiled.results.deinit();
+
+    const hits = pruned_profiled.results.getHits();
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(@as(u64, 7), hits[0].vector_id);
-    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_blocks_scanned);
-    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_blocks_selected);
-    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_posting_centroids_scored);
-    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_posting_centroid_estimates);
+    try std.testing.expectEqual(@as(u64, 4), pruned_profiled.profile.centroid_directory_blocks_scanned);
+    try std.testing.expectEqual(@as(u64, 4), pruned_profiled.profile.centroid_directory_blocks_selected);
+    try std.testing.expectEqual(@as(u64, 1), pruned_profiled.profile.centroid_directory_posting_centroids_scored);
+    try std.testing.expectEqual(@as(u64, 4), pruned_profiled.profile.centroid_directory_posting_centroid_estimates);
 }
 
 test "searchProfiled records phase timings and counters" {

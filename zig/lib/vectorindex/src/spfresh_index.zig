@@ -332,6 +332,13 @@ fn flatProbeUpperBound(probe: FlatCentroidProbe) f32 {
     return probe.distance + probe.error_bound;
 }
 
+fn shouldPruneFlatProbeByEpsilon(metric: vec.DistanceMetric, lower_bound: f32, best_distance: f32, epsilon: f32) bool {
+    if (metric == .inner_product) return false;
+    if (best_distance >= std.math.inf(f32)) return false;
+    const threshold = @max(@abs(best_distance * (epsilon + 1.0)), epsilon);
+    return @abs(lower_bound) > threshold;
+}
+
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
     return flatProbeLowerBound(lhs) < flatProbeLowerBound(rhs);
 }
@@ -1068,6 +1075,7 @@ pub fn selectFlatRabitqPostings(
     txn: anytype,
     query: []const f32,
     limit: usize,
+    epsilon: f32,
     probes: []FlatCentroidProbe,
     scratch: anytype,
     profile: *search_types.SearchProfile,
@@ -1198,6 +1206,7 @@ pub fn selectFlatRabitqPostings(
     }
     defer if (quantized_posting_candidate_limit != 0 and !use_quantized_posting_candidates_stack) self.alloc.free(quantized_posting_candidates);
 
+    var best_exact_probe_distance: f32 = std.math.inf(f32);
     if (global_posting_quantized) |posting_q| {
         try self.quantizer.estimateDistancesWithScratch(posting_q, query, scratch.distances[0..directory.posting_count], scratch.error_bounds[0..directory.posting_count], &scratch.estimate);
         profile.centroid_directory_posting_centroid_estimates += @intCast(directory.posting_count);
@@ -1225,7 +1234,9 @@ pub fn selectFlatRabitqPostings(
         std.mem.sort(FlatCentroidProbe, candidates, {}, flatProbeLess);
         var scored_candidates: usize = 0;
         for (candidates) |candidate| {
-            if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) break;
+            const lower_bound = flatProbeLowerBound(candidate);
+            if (shouldPruneFlatProbeByEpsilon(self.config.metric, lower_bound, best_exact_probe_distance, epsilon)) break;
+            if (probe_collector.wouldRejectLowerBound(lower_bound)) break;
             const block = &directory.blocks[candidate.block_index];
             const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
             const distance = vec.distanceToQueryWithCandidateMeasure(
@@ -1236,6 +1247,7 @@ pub fn selectFlatRabitqPostings(
                 self.config.metric,
             );
             scored_candidates += 1;
+            best_exact_probe_distance = @min(best_exact_probe_distance, distance);
             probe_collector.insert(.{
                 .posting_id = candidate.posting_id,
                 .parent = candidate.parent,
@@ -1276,7 +1288,9 @@ pub fn selectFlatRabitqPostings(
                 std.mem.sort(FlatCentroidProbe, candidates, {}, flatProbeLess);
                 var scored_candidates: usize = 0;
                 for (candidates) |candidate| {
-                    if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) break;
+                    const lower_bound = flatProbeLowerBound(candidate);
+                    if (shouldPruneFlatProbeByEpsilon(self.config.metric, lower_bound, best_exact_probe_distance, epsilon)) break;
+                    if (probe_collector.wouldRejectLowerBound(lower_bound)) break;
                     const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
                     const distance = vec.distanceToQueryWithCandidateMeasure(
                         query,
@@ -1286,6 +1300,7 @@ pub fn selectFlatRabitqPostings(
                         self.config.metric,
                     );
                     scored_candidates += 1;
+                    best_exact_probe_distance = @min(best_exact_probe_distance, distance);
                     probe_collector.insert(.{
                         .posting_id = candidate.posting_id,
                         .parent = candidate.parent,
@@ -2323,6 +2338,15 @@ test "flat probe collector candidates sort by lower bound before exact scoring" 
     try std.testing.expectEqual(@as(u64, 4), items[0].posting_id);
     try std.testing.expectEqual(@as(u64, 2), items[1].posting_id);
     try std.testing.expectEqual(@as(u64, 3), items[2].posting_id);
+}
+
+test "flat probe dynamic pruning follows effort epsilon" {
+    try std.testing.expect(shouldPruneFlatProbeByEpsilon(.l2_squared, 2.1, 1.0, 1.0));
+    try std.testing.expect(!shouldPruneFlatProbeByEpsilon(.l2_squared, 2.1, 1.0, 1.2));
+    try std.testing.expect(shouldPruneFlatProbeByEpsilon(.l2_squared, 2.1, 0.0, 1.0));
+    try std.testing.expect(!shouldPruneFlatProbeByEpsilon(.l2_squared, 2.1, 0.0, 3.0));
+    try std.testing.expect(!shouldPruneFlatProbeByEpsilon(.inner_product, 100.0, 1.0, 0.1));
+    try std.testing.expect(!shouldPruneFlatProbeByEpsilon(.cosine, 2.1, std.math.inf(f32), 1.0));
 }
 
 test "flat probe collector rejection is monotonic for sorted lower bounds" {

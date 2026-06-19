@@ -2678,6 +2678,7 @@ pub fn searchProfiledRequest(
             &txn,
             transformed_query,
             probe_limit,
+            epsilon,
             probes,
             scratch,
             &profile,
