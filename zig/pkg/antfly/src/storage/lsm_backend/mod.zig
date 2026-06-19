@@ -21,6 +21,7 @@ pub const compaction = @import("compaction.zig");
 pub const compaction_scheduler = @import("compaction_scheduler.zig");
 pub const recovery = @import("recovery.zig");
 pub const storage_io = @import("storage_io.zig");
+pub const aflite_container = @import("aflite_container.zig");
 pub const background = @import("background.zig");
 pub const cache = @import("cache.zig");
 pub const wal = @import("wal.zig");
@@ -32,6 +33,7 @@ pub const IoRuntime = impl.IoRuntime;
 pub const Storage = impl.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const MemoryStorage = storage_io.MemoryStorage;
+pub const AfliteContainerStorage = aflite_container.ContainerStorage;
 pub const NativeStorageStats = impl.NativeStorageStats;
 pub const Cache = impl.Cache;
 pub const DefaultCacheSizeBytes = impl.DefaultCacheSizeBytes;
@@ -46,6 +48,7 @@ test {
     _ = impl;
     _ = cache;
     _ = wal;
+    _ = aflite_container;
     _ = background;
     _ = compaction_scheduler;
 }
