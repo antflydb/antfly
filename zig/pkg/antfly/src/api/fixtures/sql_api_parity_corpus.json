@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "1c8b96eb0127e983b29faeee4d0a1f6c12d9d4b6cccc1e81c4d060b9d0f9e60f",
-  "source_entry_count": 929,
-  "entry_count": 929,
+  "source_sha256": "cdd5c92676c8da08c1aaf68d0075b2f9999f9eef21fc6bfdd53a5840f0a906b8",
+  "source_entry_count": 931,
+  "entry_count": 931,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -621,6 +621,16 @@
       "sql": "CREATE SCHEMA tenant_ops"
     },
     {
+      "name": "create schema namespace idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_schema_namespace",
+        "table_name": "tenant_ops"
+      },
+      "plan": "ddl:create_schema_namespace:schema=tenant_ops:if_not_exists=true",
+      "sql": "CREATE SCHEMA IF NOT EXISTS tenant_ops"
+    },
+    {
       "name": "rename schema namespace catalog ddl",
       "family": "ddl",
       "summary": {
@@ -639,6 +649,16 @@
       },
       "plan": "ddl:drop_schema_namespace:schema=tenant_ops:if_exists=false",
       "sql": "DROP SCHEMA tenant_ops"
+    },
+    {
+      "name": "drop schema namespace cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_schema_namespace",
+        "table_name": "tenant_ops"
+      },
+      "plan": "ddl:drop_schema_namespace:schema=tenant_ops:if_exists=true:cascade=true",
+      "sql": "DROP SCHEMA IF EXISTS tenant_ops CASCADE"
     },
     {
       "name": "create database catalog ddl",

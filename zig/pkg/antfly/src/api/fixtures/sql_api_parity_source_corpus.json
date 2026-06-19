@@ -615,6 +615,16 @@
       "sql": "CREATE SCHEMA tenant_ops"
     },
     {
+      "name": "create schema namespace idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_schema_namespace",
+        "table_name": "tenant_ops"
+      },
+      "plan": "ddl:create_schema_namespace:schema=tenant_ops:if_not_exists=true",
+      "sql": "CREATE SCHEMA IF NOT EXISTS tenant_ops"
+    },
+    {
       "name": "rename schema namespace catalog ddl",
       "family": "ddl",
       "summary": {
@@ -633,6 +643,16 @@
       },
       "plan": "ddl:drop_schema_namespace:schema=tenant_ops:if_exists=false",
       "sql": "DROP SCHEMA tenant_ops"
+    },
+    {
+      "name": "drop schema namespace cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_schema_namespace",
+        "table_name": "tenant_ops"
+      },
+      "plan": "ddl:drop_schema_namespace:schema=tenant_ops:if_exists=true:cascade=true",
+      "sql": "DROP SCHEMA IF EXISTS tenant_ops CASCADE"
     },
     {
       "name": "create database catalog ddl",

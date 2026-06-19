@@ -1198,7 +1198,8 @@ mode clauses plus advisory-lock function-call tails, maintenance-job grammar for
 DATABASE ... SET`, `DROP DATABASE`, `CREATE TABLESPACE`, `ALTER TABLESPACE ...
 RENAME TO`, and `DROP TABLESPACE`, bulk I/O grammar for `COPY ... FROM` and
 `COPY ... TO`, schema-namespace catalog grammar for `CREATE SCHEMA`, `ALTER
-SCHEMA ... RENAME TO`, and `DROP SCHEMA`, extension catalog grammar for
+SCHEMA ... RENAME TO`, and `DROP SCHEMA`, including idempotent create and drop
+dependency metadata, extension catalog grammar for
 `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`,
 including idempotent/versioned create, targeted/latest update, and drop
 dependency metadata,
