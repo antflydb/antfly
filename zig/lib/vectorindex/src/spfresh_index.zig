@@ -1036,6 +1036,8 @@ fn buildFlatCentroidDirectoryFromNodes(self: anytype, txn: anytype, root_node: u
     defer deinitFlatCentroidEntries(self.alloc, &entries);
     var pending = std.ArrayListUnmanaged(u64).empty;
     defer pending.deinit(self.alloc);
+    const pending_capacity: usize = @intCast(@min(node_count, @as(u64, std.math.maxInt(usize))));
+    try pending.ensureTotalCapacity(self.alloc, pending_capacity);
     try pending.append(self.alloc, root_node);
 
     var cursor: usize = 0;
