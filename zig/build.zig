@@ -4192,6 +4192,7 @@ pub fn build(b: *std.Build) void {
             "configured external lake resolver opens credentialed filesystem connection",
             "lowered sql cross-table read plans execute through routed scans",
             "lowered sql set operation plans preserve overlapping union all rows",
+            "lowered sql set operation materialization admission fails closed on caps and spill",
             "lowered sql insert source plans build batches from routed scans",
             "lowered sql merge mutation plans build batches from routed scans",
             "lowered relation population plans execute routed typed read sources",

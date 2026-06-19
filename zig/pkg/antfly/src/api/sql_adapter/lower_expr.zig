@@ -14,10 +14,30 @@
 
 const std = @import("std");
 
+const ddl_plan = @import("ddl_plan.zig");
 const parser = @import("parser.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
+
+pub const ExtensionFunctionBinding = struct {
+    sql_name: []const u8,
+    native_expression_kind: runtime_schema.RelationalRowsExpressionKind,
+    arity: u16,
+};
+
+pub const RoutineExpressionBinding = struct {
+    sql_name: []const u8,
+    arity: u16,
+    expression: runtime_schema.RelationalRowsExpression,
+    null_input: ?ddl_plan.RoutineNullInput = null,
+};
+
+pub const SqlFunctionBindings = struct {
+    extension_functions: []const ExtensionFunctionBinding = &.{},
+    routine_expressions: []const RoutineExpressionBinding = &.{},
+};
 
 pub fn sqlKeywordIsAnyOrSome(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "any") or std.ascii.eqlIgnoreCase(text, "some");
@@ -33,6 +53,203 @@ pub fn sqlKeywordStartsScalarPredicate(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "notnull") or
         sqlKeywordIsAnyOrSome(text) or
         std.ascii.eqlIgnoreCase(text, "all");
+}
+
+pub fn peekExtensionFunctionCall(tokens: []const Token, pos: usize, bindings: []const ExtensionFunctionBinding) bool {
+    if (bindings.len == 0) return false;
+    if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier or tokens[pos + 1].kind != .lparen) return false;
+    for (bindings) |binding| {
+        if (std.ascii.eqlIgnoreCase(binding.sql_name, tokens[pos].text)) return true;
+    }
+    return false;
+}
+
+pub fn extensionFunctionBinding(bindings: []const ExtensionFunctionBinding, name: []const u8) !?ExtensionFunctionBinding {
+    var found: ?ExtensionFunctionBinding = null;
+    for (bindings) |binding| {
+        if (!std.ascii.eqlIgnoreCase(binding.sql_name, name)) continue;
+        if (found != null) return error.UnsupportedSqlShape;
+        found = binding;
+    }
+    return found;
+}
+
+pub fn peekRoutineExpressionCall(tokens: []const Token, pos: usize, bindings: []const RoutineExpressionBinding) bool {
+    if (bindings.len == 0) return false;
+    if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier or tokens[pos + 1].kind != .lparen) return false;
+    for (bindings) |binding| {
+        if (std.ascii.eqlIgnoreCase(binding.sql_name, tokens[pos].text)) return true;
+    }
+    return false;
+}
+
+pub fn routineExpressionBinding(
+    bindings: []const RoutineExpressionBinding,
+    name: []const u8,
+    arity: usize,
+) !?RoutineExpressionBinding {
+    var found: ?RoutineExpressionBinding = null;
+    for (bindings) |binding| {
+        if (!std.ascii.eqlIgnoreCase(binding.sql_name, name)) continue;
+        if (@as(usize, binding.arity) != arity) continue;
+        if (found != null) return error.UnsupportedSqlShape;
+        found = binding;
+    }
+    return found;
+}
+
+pub fn routineArgumentExpressionIsNullLiteral(value: runtime_schema.RelationalRowsExpression) bool {
+    return value.kind == .value and std.mem.eql(u8, value.value_json, "null");
+}
+
+fn routineArgIndex(field: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, field, "arg") or field.len <= 3) return null;
+    var index: usize = 0;
+    for (field[3..]) |ch| {
+        if (ch < '0' or ch > '9') return null;
+        index = index * 10 + @as(usize, ch - '0');
+    }
+    if (index == 0) return null;
+    return index - 1;
+}
+
+pub fn cloneExpressionSubstitutingRoutineArgsAlloc(
+    alloc: std.mem.Allocator,
+    value: runtime_schema.RelationalRowsExpression,
+    args: []const runtime_schema.RelationalRowsExpression,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    if (value.kind == .field and value.field_source == .row) {
+        if (routineArgIndex(value.field)) |index| {
+            if (index >= args.len) return error.UnsupportedSqlShape;
+            return try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, args[index]);
+        }
+    }
+
+    var cloned: runtime_schema.RelationalRowsExpression = .{
+        .kind = value.kind,
+        .field_source = value.field_source,
+        .cast_type = value.cast_type,
+        .json_as_text = value.json_as_text,
+    };
+    errdefer runtime_schema.freeRelationalRowsExpression(alloc, cloned);
+
+    if (value.field.len > 0) cloned.field = try alloc.dupe(u8, value.field);
+    if (value.value_json.len > 0) cloned.value_json = try alloc.dupe(u8, value.value_json);
+    if (value.json_path.len > 0) cloned.json_path = try alloc.dupe(u8, value.json_path);
+
+    if (value.operands.len > 0) {
+        const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, value.operands.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (operands[0..initialized]) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+            alloc.free(operands);
+        }
+        for (value.operands, 0..) |operand, i| {
+            operands[i] = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, operand, args);
+            initialized += 1;
+        }
+        cloned.operands = operands;
+    }
+
+    if (value.case_branches.len > 0) {
+        const branches = try alloc.alloc(runtime_schema.RelationalRowsExpressionCaseBranch, value.case_branches.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (branches[0..initialized]) |branch| freeRoutineExpressionCaseBranch(alloc, branch);
+            alloc.free(branches);
+        }
+        for (value.case_branches, 0..) |branch, i| {
+            branches[i] = try cloneExpressionCaseBranchSubstitutingRoutineArgsAlloc(alloc, branch, args);
+            initialized += 1;
+        }
+        cloned.case_branches = branches;
+    }
+
+    if (value.case_else.len > 0) {
+        const fallback = try alloc.alloc(runtime_schema.RelationalRowsExpression, value.case_else.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (fallback[0..initialized]) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
+            alloc.free(fallback);
+        }
+        for (value.case_else, 0..) |expression, i| {
+            fallback[i] = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, expression, args);
+            initialized += 1;
+        }
+        cloned.case_else = fallback;
+    }
+
+    return cloned;
+}
+
+fn cloneExpressionCaseBranchSubstitutingRoutineArgsAlloc(
+    alloc: std.mem.Allocator,
+    value: runtime_schema.RelationalRowsExpressionCaseBranch,
+    args: []const runtime_schema.RelationalRowsExpression,
+) anyerror!runtime_schema.RelationalRowsExpressionCaseBranch {
+    const when = try cloneExpressionConditionSubstitutingRoutineArgsAlloc(alloc, value.when, args);
+    var when_transferred = false;
+    errdefer if (!when_transferred) runtime_schema.freeRelationalRowsExpressionCondition(alloc, when);
+    const then_expression = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, value.then, args);
+    when_transferred = true;
+    return .{
+        .when = when,
+        .then = then_expression,
+    };
+}
+
+fn cloneExpressionConditionSubstitutingRoutineArgsAlloc(
+    alloc: std.mem.Allocator,
+    value: runtime_schema.RelationalRowsExpressionCondition,
+    args: []const runtime_schema.RelationalRowsExpression,
+) anyerror!runtime_schema.RelationalRowsExpressionCondition {
+    const lhs = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, value.lhs, args);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+
+    const rhs = if (value.rhs.len > 0) blk: {
+        const out = try alloc.alloc(runtime_schema.RelationalRowsExpression, value.rhs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
+            alloc.free(out);
+        }
+        for (value.rhs, 0..) |expression, i| {
+            out[i] = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, expression, args);
+            initialized += 1;
+        }
+        break :blk out;
+    } else &.{};
+
+    lhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = value.op,
+        .rhs = rhs,
+    };
+}
+
+fn freeRoutineExpressionCaseBranch(
+    alloc: std.mem.Allocator,
+    value: runtime_schema.RelationalRowsExpressionCaseBranch,
+) void {
+    runtime_schema.freeRelationalRowsExpressionCondition(alloc, value.when);
+    runtime_schema.freeRelationalRowsExpression(alloc, value.then);
+}
+
+pub fn validateExtensionFunctionArity(
+    kind: runtime_schema.RelationalRowsExpressionKind,
+    declared_arity: u16,
+    operand_count: usize,
+) !void {
+    if (operand_count != @as(usize, declared_arity)) return error.UnsupportedSqlShape;
+    switch (kind) {
+        .uuid_v4 => if (operand_count != 0) return error.UnsupportedSqlShape,
+        .lower, .upper, .md5 => if (operand_count != 1) return error.UnsupportedSqlShape,
+        .concat => if (operand_count == 0) return error.UnsupportedSqlShape,
+        .concat_ws => if (operand_count < 2) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 pub fn sqlJoinedSourceAliasTerminator(text: []const u8) bool {

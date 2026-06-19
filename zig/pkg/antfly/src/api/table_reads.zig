@@ -4753,6 +4753,7 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         },
     }
 
+    try enforceSetOperationMaterializationAdmission(rows.items, .{ .name = "__sql_set_operation_result" });
     const total = std.math.cast(u32, rows.items.len) orelse return error.InvalidRowsRequest;
     const owned_rows = try rows.toOwnedSlice(alloc);
     if (lowered.order_by.len == 0 and lowered.limit == null and lowered.offset == 0) {
@@ -4778,6 +4779,17 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         .offset = lowered.offset,
     };
     return try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, output_schema, tail_query, combined.rows);
+}
+
+fn enforceSetOperationMaterializationAdmission(
+    rows: []const []const u8,
+    cte_admission: db_mod.types.RelationalRowsCte,
+) !void {
+    const observed_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(rows) orelse return error.UnsupportedRowsQuery;
+    switch (db_mod.types.relationalRowsCteMaterializationDecision(cte_admission, rows.len, observed_bytes)) {
+        .memory => {},
+        .spill, .reject => return error.UnsupportedRowsQuery,
+    }
 }
 
 fn appendSetOperationRowsAlloc(
@@ -4827,6 +4839,39 @@ fn freeSetOperationSeenKeys(
     var keys = seen.keyIterator();
     while (keys.next()) |key| alloc.free(@constCast(key.*));
     seen.deinit(alloc);
+}
+
+test "lowered sql set operation materialization admission fails closed on caps and spill" {
+    const rows = [_][]const u8{
+        "{\"id\":\"a\"}",
+        "{\"id\":\"b\"}",
+    };
+    const observed_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(&rows) orelse return error.TestUnexpectedResult;
+
+    try enforceSetOperationMaterializationAdmission(&rows, .{
+        .name = "set_result",
+        .max_rows = 2,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes,
+    });
+    try std.testing.expectError(error.UnsupportedRowsQuery, enforceSetOperationMaterializationAdmission(&rows, .{
+        .name = "set_result",
+        .max_rows = 1,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes,
+    }));
+    try std.testing.expectError(error.UnsupportedRowsQuery, enforceSetOperationMaterializationAdmission(&rows, .{
+        .name = "set_result",
+        .max_rows = 2,
+        .max_bytes = observed_bytes - 1,
+        .spill_after_bytes = observed_bytes - 1,
+    }));
+    try std.testing.expectError(error.UnsupportedRowsQuery, enforceSetOperationMaterializationAdmission(&rows, .{
+        .name = "set_result",
+        .max_rows = 2,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes - 1,
+    }));
 }
 
 fn catalogRuntimeSchemaUnlessDefaultAlloc(
