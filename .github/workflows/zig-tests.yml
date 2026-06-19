@@ -369,9 +369,6 @@ jobs:
       - name: Run public API graph metric e2e gate
         run: make zig-public-api-graph-metric-e2e-test
 
-      - name: Run graph metric process test
-        run: make zig-graph-metric-process-test
-
       - name: Run full Zig unit tests
         run: taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test
 

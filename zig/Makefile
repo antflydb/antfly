@@ -25,7 +25,7 @@ ONNXRUNTIME_VERSION ?= 1.24.3
 GENAI_VERSION ?= 0.12.1
 ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
 
-.PHONY: build test unit-test sql-api-parity-test db-temporal-test graph-metric-lifecycle-test graph-metric-cleanup-test graph-metric-degree-canary-test graph-metric-default-gate-test graph-metric-fan-in-test graph-metric-operations-test public-api-graph-metric-e2e-test graph-metric-process-test download-onnx force-download-onnx clean-onnx
+.PHONY: build test unit-test sql-api-parity-test db-temporal-test graph-metric-lifecycle-test graph-metric-cleanup-test graph-metric-degree-canary-test graph-metric-default-gate-test graph-metric-fan-in-test graph-metric-operations-test public-api-graph-metric-e2e-test download-onnx force-download-onnx clean-onnx
 
 $(ONNXRUNTIME_STAMP): $(INFERENCE_DIR)/scripts/download-onnxruntime.sh
 	@test -d $(INFERENCE_DIR) || (echo "ERROR: inference package not found at $(INFERENCE_DIR)" && exit 1)
@@ -74,9 +74,6 @@ graph-metric-operations-test: ## Run focused graph metric operations and status 
 
 public-api-graph-metric-e2e-test: ## Run focused public API graph metric e2e tests.
 	$(ZIG) build public-api-graph-metric-e2e-test
-
-graph-metric-process-test: ## Run spawned-process graph metric maintenance tests.
-	$(ZIG) build graph-metric-process-test
 
 clean-onnx: ## Remove downloaded ONNX Runtime files.
 	rm -rf $(ONNXRUNTIME_ROOT)

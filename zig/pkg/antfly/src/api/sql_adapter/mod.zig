@@ -281,7 +281,6 @@ pub const RenameViewSyntax = grammar.RenameViewSyntax;
 pub const RoutineBodyKind = ddl_plan.RoutineBodyKind;
 pub const RoutineBodyPlan = ddl_plan.RoutineBodyPlan;
 pub const RoutineExecutionHook = ddl_plan.RoutineExecutionHook;
-pub const RoutineExpressionOperation = ddl_plan.RoutineExpressionOperation;
 pub const RoutineKind = ddl_plan.RoutineKind;
 pub const RoutineKindSyntax = grammar.RoutineKindSyntax;
 pub const RoutineNullInput = ddl_plan.RoutineNullInput;

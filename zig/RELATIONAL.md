@@ -4542,10 +4542,17 @@ rollback/release semantics exist. Prepared transaction commands are not boundary
 no-ops: `PREPARE TRANSACTION`, `COMMIT PREPARED`, and `ROLLBACK PREPARED` lower
 to typed prepared-transaction DDL plans and a generated-corpus `execution_plan`
 fingerprint for the coordinator-owned recovery action
-(`register_prepared`, `resolve_commit`, or `resolve_rollback`). Applying those
-plans to schema JSON or runtime table storage still fails closed until the
-coordinator recovery log is durable, but the adapter boundary no longer treats
-the syntax as an opaque unsupported string.
+(`register_prepared`, `resolve_commit`, or `resolve_rollback`).
+`relational_sql.executePreparedTransactionRecoveryPlan` is the explicit
+execution boundary for those intents: it maps the SQL GID to a domain-separated
+deterministic Antfly transaction id, registers prepared transactions in the
+transaction coordinator store, resolves `COMMIT PREPARED` / `ROLLBACK PREPARED`
+through the same durable intent-resolution path used by native transactions,
+and fails closed for duplicate prepared GIDs, missing GIDs, and conflicting
+terminal decisions. Applying those plans to schema JSON or runtime table storage
+still fails closed because prepared transactions are coordinator actions rather
+than schema mutations, but the adapter boundary no longer treats the syntax as
+an opaque unsupported string.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
@@ -4638,9 +4645,10 @@ constraint state and request-level isolation/access/retry options. Plain
 TRANSACTION`, `ROLLBACK`, and `ROLLBACK WORK` lower to typed adapter no-op
 records with the stable `transaction_control` reason. Mode-bearing transaction
 starts remain typed transaction-control plans. Prepared transaction
-prepare/commit/rollback lower to typed recovery intents and are rejected only at
-schema/storage application until the coordinator recovery log can register,
-resolve, replay, and audit them durably.
+prepare/commit/rollback lower to typed recovery intents and execute through the
+coordinator recovery service when called with a transaction store. Schema and
+table-storage application still reject them because the authoritative side
+effect is coordinator recovery state, not table schema.
 
 Notification-channel SQL is also adapter grammar over typed native intent, not
 backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in
@@ -5060,12 +5068,14 @@ become native metadata before they can execute. The known updated-at helper
 definition uses that same typed routine-catalog boundary; the native behavior
 still lives in table-owned update-policy metadata created by `CREATE TRIGGER`.
 Safe `LANGUAGE sql AS $$SELECT ...$$` expression bodies lower only when they map
-to a typed routine body hook over a declared argument, currently identity,
-`lower`, `upper`, `md5`, and literal addition. Routine bodies and routine
-options that do not yet have typed metadata remain unsupported and are pinned in
-the source parity corpus under `routine_body_plan` and `routine_option_plan`
-until there is a native mutation-hook/catalog contract: deterministic hook
-identity, declared row inputs and outputs, allowed side effects, dependency
+to a typed routine body hook carrying the same row-expression AST used by
+generated columns, row rewrites, checks, expression indexes, predicates, update
+transforms, and `RETURNING`; routine argument references normalize to
+`field[source:arg1]` inside that AST. Routine bodies and routine options that do
+not yet have typed metadata remain unsupported and are pinned in the source
+parity corpus under `routine_body_plan` and `routine_option_plan` until there
+is a native mutation-hook/catalog contract: deterministic hook identity,
+declared row inputs and outputs, allowed side effects, dependency
 tracking, schema promotion, authorization hooks, replay behavior, and
 repair/rebuild semantics. Storage should never execute or persist opaque
 PL/pgSQL bodies as part of the relational model.

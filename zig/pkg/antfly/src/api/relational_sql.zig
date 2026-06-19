@@ -20,6 +20,7 @@ const json_helpers = @import("json_helpers.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
+const mem_backend = @import("../storage/mem_backend.zig");
 const platform_time = @import("../platform/time.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const relational_rows = @import("relational_rows.zig");
@@ -27,6 +28,7 @@ const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("sql_adapter/mod.zig");
 const table_catalog = @import("table_catalog.zig");
+const transactions_mod = @import("../storage/transactions.zig");
 const usermgr = @import("../usermgr/mod.zig");
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
@@ -206,6 +208,14 @@ pub const PreparedTransactionRecoveryIntent = struct {
     gid: []const u8,
     requires_coordinator_recovery: bool = true,
     audit_action: PreparedTransactionAction,
+};
+pub const PreparedTransactionCoordinatorResult = struct {
+    operation: PreparedTransactionRecoveryOperation,
+    gid: []const u8,
+    txn_id: transactions_mod.TxnId,
+    status: transactions_mod.TxnStatus,
+    audit_action: PreparedTransactionAction,
+    coordinator_recovery_log: bool = true,
 };
 pub const CursorPortalPlan = sql_adapter.CursorPortalPlan;
 pub const DeclareCursorPortalPlan = sql_adapter.DeclareCursorPortalPlan;
@@ -2053,6 +2063,81 @@ pub fn preparedTransactionRecoveryFingerprintAlloc(alloc: std.mem.Allocator, int
         "prepared_txn_recovery:op={s}:gid={s}:audit={s}:requires_coordinator={}",
         .{ @tagName(intent.operation), intent.gid, @tagName(intent.audit_action), intent.requires_coordinator_recovery },
     );
+}
+
+pub fn preparedTransactionTxnIdFromGid(gid: []const u8) transactions_mod.TxnId {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var hasher = Sha256.init(.{});
+    hasher.update("antfly.sql.prepared_transaction.gid.v1\x00");
+    hasher.update(gid);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    var txn_id: transactions_mod.TxnId = undefined;
+    @memcpy(&txn_id, digest[0..txn_id.len]);
+    return txn_id;
+}
+
+pub fn executePreparedTransactionRecoveryPlan(
+    alloc: std.mem.Allocator,
+    store: anytype,
+    plan: PreparedTransactionPlan,
+    timestamp: u64,
+) !PreparedTransactionCoordinatorResult {
+    return try executePreparedTransactionRecoveryIntent(
+        alloc,
+        store,
+        preparedTransactionRecoveryIntentFromPlan(plan),
+        timestamp,
+    );
+}
+
+pub fn executePreparedTransactionRecoveryIntent(
+    alloc: std.mem.Allocator,
+    store: anytype,
+    intent: PreparedTransactionRecoveryIntent,
+    timestamp: u64,
+) !PreparedTransactionCoordinatorResult {
+    const txn_id = preparedTransactionTxnIdFromGid(intent.gid);
+    var manager = try transactions_mod.TxnManager.init(alloc, store);
+    defer manager.deinit();
+
+    switch (intent.operation) {
+        .register_prepared => {
+            if (manager.getTransactionStatus(txn_id)) |_| {
+                return error.PreparedTransactionAlreadyExists;
+            } else |err| switch (err) {
+                error.TxnNotFound => {},
+                else => return err,
+            }
+            try manager.initTransaction(txn_id, timestamp);
+            return .{
+                .operation = intent.operation,
+                .gid = intent.gid,
+                .txn_id = txn_id,
+                .status = .pending,
+                .audit_action = intent.audit_action,
+            };
+        },
+        .resolve_commit, .resolve_rollback => {
+            const status: transactions_mod.TxnStatus = switch (intent.operation) {
+                .resolve_commit => .committed,
+                .resolve_rollback => .aborted,
+                .register_prepared => unreachable,
+            };
+            manager.resolveIntents(txn_id, status, timestamp) catch |err| switch (err) {
+                error.TxnNotFound => return error.PreparedTransactionNotFound,
+                error.DecisionConflict => return error.PreparedTransactionDecisionConflict,
+                else => return err,
+            };
+            return .{
+                .operation = intent.operation,
+                .gid = intent.gid,
+                .txn_id = txn_id,
+                .status = status,
+                .audit_action = intent.audit_action,
+            };
+        },
+    }
 }
 
 pub const OwnedSqlCatalogSession = struct {
@@ -47182,6 +47267,79 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(@as(usize, 1), runtime.checks.len);
 }
 
+test "postgres sql adapter executes prepared transaction recovery intents" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "sql-prepared-txn" });
+    defer runtime_store.deinit();
+
+    var prepare = try lowerDdlPlanAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
+    defer prepare.deinit(alloc);
+    const prepare_plan = switch (prepare) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const expected_txn_id = preparedTransactionTxnIdFromGid("usage_batch");
+    const prepared = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, prepare_plan, 1_000);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.register_prepared, prepared.operation);
+    try std.testing.expectEqualStrings("usage_batch", prepared.gid);
+    try std.testing.expectEqualSlices(u8, &expected_txn_id, &prepared.txn_id);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, prepared.status);
+    try std.testing.expect(prepared.coordinator_recovery_log);
+
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(expected_txn_id));
+    try std.testing.expectError(error.PreparedTransactionAlreadyExists, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, prepare_plan, 1_001));
+
+    var commit = try lowerDdlPlanAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    defer commit.deinit(alloc);
+    const commit_plan = switch (commit) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const committed = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, commit_plan, 2_000);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_commit, committed.operation);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, committed.status);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(expected_txn_id));
+
+    var rollback_committed = try lowerDdlPlanAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
+    defer rollback_committed.deinit(alloc);
+    const rollback_committed_plan = switch (rollback_committed) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectError(error.PreparedTransactionDecisionConflict, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_committed_plan, 3_000));
+
+    var rollback = try lowerDdlPlanAlloc(alloc, "PREPARE TRANSACTION 'usage_abort';");
+    defer rollback.deinit(alloc);
+    const rollback_prepare_plan = switch (rollback) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepare_plan, 4_000);
+
+    var rollback_prepared = try lowerDdlPlanAlloc(alloc, "ROLLBACK PREPARED 'usage_abort';");
+    defer rollback_prepared.deinit(alloc);
+    const rollback_prepared_plan = switch (rollback_prepared) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const aborted = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepared_plan, 5_000);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_rollback, aborted.operation);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, aborted.status);
+
+    var missing_commit = try lowerDdlPlanAlloc(alloc, "COMMIT PREPARED 'missing_gid';");
+    defer missing_commit.deinit(alloc);
+    const missing_commit_plan = switch (missing_commit) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectError(error.PreparedTransactionNotFound, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, missing_commit_plan, 6_000));
+}
+
 test "postgres sql adapter applies incremental ddl plans to public schema json" {
     const alloc = std.testing.allocator;
     var create = try lowerDdlPlanAlloc(
@@ -48030,10 +48188,17 @@ test "postgres sql adapter rejects unsupported ddl shapes explicitly" {
         alloc,
         "CREATE TABLE audit_log (id uuid PRIMARY KEY, amount numeric COLLATE \"C\")",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var alter_type_rewrite = try lowerDdlPlanAlloc(
         alloc,
         "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1",
-    ));
+    );
+    defer alter_type_rewrite.deinit(alloc);
+    const alter_type_rewrite_fingerprint = try ddlFingerprintAlloc(alloc, alter_type_rewrite);
+    defer alloc.free(alter_type_rewrite_fingerprint);
+    try std.testing.expectEqualStrings(
+        "ddl:alter_table:table=audit_log:ops=1:if_exists=false:alter_type=1:alter_type_rewrite_expr=1",
+        alter_type_rewrite_fingerprint,
+    );
     var nulls_not_distinct_unique_index = try lowerDdlPlanAlloc(
         alloc,
         "CREATE UNIQUE INDEX audit_log_external_id_key ON audit_log (external_id) NULLS NOT DISTINCT",
@@ -58422,16 +58587,6 @@ fn routineExecutionHookName(hook: RoutineExecutionHook) []const u8 {
     };
 }
 
-fn routineExpressionOperationName(operation: sql_adapter.RoutineExpressionOperation) []const u8 {
-    return switch (operation) {
-        .identity => "identity",
-        .lower => "lower",
-        .upper => "upper",
-        .md5 => "md5",
-        .add_literal => "add_literal",
-    };
-}
-
 fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutinePlan) ![]u8 {
     var base = if (create.language) |language|
         try std.fmt.allocPrint(
@@ -58589,31 +58744,18 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
         base = next;
     }
     if (create.body) |body| {
-        const next = if (body.literal_json) |literal|
-            try std.fmt.allocPrint(
-                alloc,
-                "{s}:body={s}:hook={s}:op={s}:arg={d}:literal={s}",
-                .{
-                    base,
-                    routineBodyKindName(body.kind),
-                    routineExecutionHookName(body.hook),
-                    routineExpressionOperationName(body.expression_op),
-                    body.source_argument_index,
-                    literal,
-                },
-            )
-        else
-            try std.fmt.allocPrint(
-                alloc,
-                "{s}:body={s}:hook={s}:op={s}:arg={d}",
-                .{
-                    base,
-                    routineBodyKindName(body.kind),
-                    routineExecutionHookName(body.hook),
-                    routineExpressionOperationName(body.expression_op),
-                    body.source_argument_index,
-                },
-            );
+        const expression = try rowRewriteExpressionFingerprintAlloc(alloc, body.expression);
+        defer alloc.free(expression);
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:body={s}:hook={s}:expr={s}",
+            .{
+                base,
+                routineBodyKindName(body.kind),
+                routineExecutionHookName(body.hook),
+                expression,
+            },
+        );
         alloc.free(base);
         base = next;
     }

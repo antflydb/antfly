@@ -7139,8 +7139,7 @@ pub fn build(b: *std.Build) void {
         const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
         run_graph_metric_process_harness.addArtifactArg(antfly_main);
         run_graph_metric_process_harness.has_side_effects = true;
-        const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run spawned-process graph metric maintenance smoke test");
-        graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
+        integration_test_step.dependOn(&run_graph_metric_process_harness.step);
     }
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });

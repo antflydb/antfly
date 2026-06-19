@@ -769,23 +769,13 @@ pub const RoutineExecutionHook = enum {
     expression,
 };
 
-pub const RoutineExpressionOperation = enum {
-    identity,
-    lower,
-    upper,
-    md5,
-    add_literal,
-};
-
 pub const RoutineBodyPlan = struct {
     kind: RoutineBodyKind,
     hook: RoutineExecutionHook,
-    expression_op: RoutineExpressionOperation,
-    source_argument_index: usize = 0,
-    literal_json: ?[]const u8 = null,
+    expression: db_mod.types.RelationalRowsExpression,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.literal_json) |literal| alloc.free(literal);
+        runtime_schema.freeRelationalRowsExpression(alloc, self.expression);
         self.* = undefined;
     }
 };

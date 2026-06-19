@@ -2796,34 +2796,77 @@ fn parseSqlRoutineBodyPlanAlloc(
         expression = std.mem.trim(u8, expression[0 .. expression.len - 1], " \t\r\n");
     }
     if (std.ascii.eqlIgnoreCase(expression, "$1") or std.ascii.eqlIgnoreCase(expression, "arg1")) {
-        return .{ .kind = .sql_expression, .hook = .expression, .expression_op = .identity };
+        return .{
+            .kind = .sql_expression,
+            .hook = .expression,
+            .expression = try routineArgumentExpressionAlloc(alloc),
+        };
     }
     inline for (.{ "lower", "upper", "md5" }) |fn_name| {
         const prefix = fn_name ++ "(";
         if (std.ascii.startsWithIgnoreCase(expression, prefix) and std.mem.endsWith(u8, expression, ")")) {
             const inner = std.mem.trim(u8, expression[prefix.len .. expression.len - 1], " \t\r\n");
             if (!std.ascii.eqlIgnoreCase(inner, "$1") and !std.ascii.eqlIgnoreCase(inner, "arg1")) return error.UnsupportedSqlShape;
-            const op: ddl_plan.RoutineExpressionOperation = if (std.ascii.eqlIgnoreCase(fn_name, "lower"))
+            const kind: runtime_schema.RelationalRowsExpressionKind = if (std.ascii.eqlIgnoreCase(fn_name, "lower"))
                 .lower
             else if (std.ascii.eqlIgnoreCase(fn_name, "upper"))
                 .upper
             else
                 .md5;
-            return .{ .kind = .sql_expression, .hook = .expression, .expression_op = op };
+            const operand = try routineArgumentExpressionAlloc(alloc);
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
+            const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
+            operands[0] = operand;
+            operand_transferred = true;
+            return .{
+                .kind = .sql_expression,
+                .hook = .expression,
+                .expression = try ddlGeneratedOperationExpressionAlloc(alloc, kind, operands),
+            };
         }
     }
     if (std.mem.startsWith(u8, expression, "$1 + ") or std.ascii.startsWithIgnoreCase(expression, "arg1 + ")) {
         const literal_start: usize = if (std.mem.startsWith(u8, expression, "$1 + ")) "$1 + ".len else "arg1 + ".len;
         const literal = std.mem.trim(u8, expression[literal_start..], " \t\r\n");
         _ = std.fmt.parseFloat(f64, literal) catch return error.UnsupportedSqlShape;
+        const operand = try routineArgumentExpressionAlloc(alloc);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        const value_json = try alloc.dupe(u8, literal);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        const value = try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
+        value_transferred = true;
+        var value_expression_transferred = false;
+        errdefer if (!value_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, value);
+        const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 2);
+        operands[0] = operand;
+        operands[1] = value;
+        operand_transferred = true;
+        value_expression_transferred = true;
         return .{
             .kind = .sql_expression,
             .hook = .expression,
-            .expression_op = .add_literal,
-            .literal_json = try alloc.dupe(u8, literal),
+            .expression = try ddlGeneratedOperationExpressionAlloc(alloc, .add, operands),
         };
     }
     return error.UnsupportedSqlShape;
+}
+
+fn routineArgumentExpressionAlloc(alloc: std.mem.Allocator) !runtime_schema.RelationalRowsExpression {
+    const field = try alloc.dupe(u8, "arg1");
+    errdefer alloc.free(field);
+    const value_json = try alloc.dupe(u8, "");
+    errdefer alloc.free(value_json);
+    const json_path = try alloc.dupe(u8, "");
+    return .{
+        .kind = .field,
+        .field = field,
+        .field_source = .source,
+        .value_json = value_json,
+        .json_path = json_path,
+    };
 }
 
 fn parseRoutineSettingAlloc(

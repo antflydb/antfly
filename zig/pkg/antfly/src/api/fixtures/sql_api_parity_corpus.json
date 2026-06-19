@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "9c32188a1e308006df9bf7df4c3ec9b83b70675a2b499b1e7df0dc3812bef573",
+  "source_sha256": "c6a9f18228a7f996560f45a1937247a52b0490f41f2ad9d31eba12a273dce865",
   "source_entry_count": 981,
   "entry_count": 981,
   "skipped_entries": [
@@ -4036,7 +4036,7 @@
         "table_name": "normalize_status",
         "operations": 1
       },
-      "plan": "ddl:create_function:name=normalize_status:args=1:replace=false:returns=text:language=sql:volatility=immutable:body=sql_expression:hook=expression:op=lower:arg=0",
+      "plan": "ddl:create_function:name=normalize_status:args=1:replace=false:returns=text:language=sql:volatility=immutable:body=sql_expression:hook=expression:expr=lower[field[source:arg1]]",
       "sql": "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT lower($1)$$"
     },
     {

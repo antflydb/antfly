@@ -4448,7 +4448,7 @@
         "table_name": "normalize_status",
         "operations": 1
       },
-      "plan": "ddl:create_function:name=normalize_status:args=1:replace=false:returns=text:language=sql:volatility=immutable:body=sql_expression:hook=expression:op=lower:arg=0",
+      "plan": "ddl:create_function:name=normalize_status:args=1:replace=false:returns=text:language=sql:volatility=immutable:body=sql_expression:hook=expression:expr=lower[field[source:arg1]]",
       "sql": "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT lower($1)$$"
     },
     {

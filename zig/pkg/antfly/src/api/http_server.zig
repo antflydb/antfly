@@ -16610,7 +16610,7 @@ test "api http server applies authorization SQL DDL through user manager" {
     try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read));
     try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.docs", .read));
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "future_table", .read)));
-    const stored_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records");
+    const stored_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "default.public.usage_records");
     defer alloc.free(stored_policy);
     try std.testing.expect(std.mem.indexOf(u8, stored_policy, "\"$auth\":\"settings.app.tenant_id\"") != null);
 
