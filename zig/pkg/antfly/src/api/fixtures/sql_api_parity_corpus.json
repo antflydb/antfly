@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "bdf95a44b2fb2490f9b6a2ea00c41c4f9d678a37def9313dd0a5d2a165bcfc54",
-  "source_entry_count": 897,
-  "entry_count": 897,
+  "source_sha256": "16f601784184b57af7a76d3b57dc6b4f4fe946e337adfb0b0e65135a5ad9589c",
+  "source_entry_count": 898,
+  "entry_count": 898,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -6873,6 +6873,13 @@
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records ALTER COLUMN updated_at_ns TYPE timestamptz USING updated_at_ns::timestamptz;"
+    },
+    {
+      "name": "unsupported schema alter column computed rewrite expression",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_rewrite_expression_plan",
+      "classification_reason": "row_rewrite_expression_plan",
+      "sql": "ALTER TABLE usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;"
     },
     {
       "name": "schema updated-at policy",

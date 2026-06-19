@@ -7377,6 +7377,13 @@
       "sql": "ALTER TABLE usage_records ALTER COLUMN updated_at_ns TYPE timestamptz USING updated_at_ns::timestamptz;"
     },
     {
+      "name": "unsupported schema alter column computed rewrite expression",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_rewrite_expression_plan",
+      "classification_reason": "row_rewrite_expression_plan",
+      "sql": "ALTER TABLE usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;"
+    },
+    {
       "name": "schema updated-at policy",
       "family": "ddl",
       "summary": {
