@@ -1131,7 +1131,9 @@ implementations cleanly:
     and avoiding a second owned materialized member buffer on pending-overlay
     reads while preserving canonical sorted output; segment materialization now
     also reuses no-resort sorted replay helpers after its own delta ordering
-    pass instead of sorting the same record buffer twice. When a sorted
+    pass instead of sorting the same record buffer twice, and lazy segment
+    materialization streams sorted delta records directly against the encoded
+    base instead of first copying them into compact id/op scratch. When a sorted
     committed manifest has a newer base segment, lazy replay also starts delta
     scanning at that base segment instead of visiting older manifest entries
     only to skip them. Fold replay for committed

@@ -792,6 +792,66 @@ pub const PostingFormat = struct {
         return out_count;
     }
 
+    pub fn materializeSortedBaseWithDeltaRecordsIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_data: []const u8,
+        records: []PostingDeltaRecord,
+    ) !usize {
+        if (records.len == 0) {
+            const header = try decodeBaseHeader(base_data);
+            return try materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, base_data, header);
+        }
+        sortDeltaRecordsBySequenceIfNeeded(records);
+        stableSortDeltaRecordsByVector(records);
+        return try materializeSortedBaseWithDeltaRecordsIntoScratchAssumeSorted(alloc, scratch, base_data, records);
+    }
+
+    pub fn materializeSortedBaseWithDeltaRecordsIntoScratchAssumeSorted(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_data: []const u8,
+        records: []const PostingDeltaRecord,
+    ) !usize {
+        var base_iter = try BaseMemberIterator.init(base_data);
+        try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + dedupedLiveSortedDeltaRecordCount(records));
+        const out = scratch.member_ids;
+        var out_count: usize = 0;
+        var maybe_base = try base_iter.next();
+        var record_index: usize = 0;
+
+        while (maybe_base != null or record_index < records.len) {
+            if (record_index >= records.len) {
+                out[out_count] = maybe_base.?;
+                out_count += 1;
+                maybe_base = try base_iter.next();
+                continue;
+            }
+
+            const vector_id = records[record_index].vector_id;
+            var last_op = records[record_index].op;
+            record_index += 1;
+            while (record_index < records.len and records[record_index].vector_id == vector_id) : (record_index += 1) {
+                last_op = records[record_index].op;
+            }
+
+            while (maybe_base) |base_member| {
+                if (base_member >= vector_id) break;
+                out[out_count] = base_member;
+                out_count += 1;
+                maybe_base = try base_iter.next();
+            }
+            const present_in_base = if (maybe_base) |base_member| base_member == vector_id else false;
+            if (last_op != .tombstone) {
+                out[out_count] = vector_id;
+                out_count += 1;
+            }
+            if (present_in_base) maybe_base = try base_iter.next();
+        }
+        try base_iter.finish();
+        return out_count;
+    }
+
     pub fn stableSortCompactDeltaRecordsByVector(scratch: anytype) void {
         var i: usize = 1;
         while (i < scratch.compact_delta_count) : (i += 1) {
@@ -1280,6 +1340,20 @@ pub const PostingFormat = struct {
                 records[j] = records[j - 1];
             }
             records[j] = record;
+        }
+    }
+
+    fn sortDeltaRecordsBySequenceIfNeeded(records: []PostingDeltaRecord) void {
+        var i: usize = 1;
+        while (i < records.len) : (i += 1) {
+            if (records[i].sequence < records[i - 1].sequence) {
+                std.mem.sort(PostingDeltaRecord, records, {}, struct {
+                    fn lessThan(_: void, lhs: PostingDeltaRecord, rhs: PostingDeltaRecord) bool {
+                        return lhs.sequence < rhs.sequence;
+                    }
+                }.lessThan);
+                return;
+            }
         }
     }
 
@@ -7840,6 +7914,33 @@ test "posting sorted compact op replay skips empty tails without touching scratc
     try std.testing.expectEqual(@as(usize, base_members.len), scratch.member_ids.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_ids.len);
     try std.testing.expectEqualSlices(VectorId, base_members[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting materializes sorted base with delta records without compact copy" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_data = try PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(base_data);
+
+    var records = [_]PostingDeltaRecord{
+        .{ .sequence = 4, .op = .insert, .vector_id = 40 },
+        .{ .sequence = 1, .op = .insert, .vector_id = 15 },
+        .{ .sequence = 3, .op = .insert, .vector_id = 20 },
+        .{ .sequence = 2, .op = .tombstone, .vector_id = 20 },
+    };
+
+    const out_count = try PostingFormat.materializeSortedBaseWithDeltaRecordsIntoScratch(alloc, &scratch, base_data, records[0..]);
+
+    const expected = [_]VectorId{ 10, 15, 20, 30, 40 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+    try std.testing.expectEqual(@as(usize, 0), scratch.compactDeltaRecordCount());
 }
 
 test "posting sorted compact op replay sizes output scratch by deduped live ops" {
