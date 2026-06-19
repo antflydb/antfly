@@ -718,6 +718,7 @@ const DesiredArtifactInput = struct {
     sidecar_kind: source_binding.SidecarKind,
     artifact_kind: manifest_artifact.ArtifactKind,
     column_bindings: []const []const u8,
+    column_kinds: []const rowsource.ColumnKind = &.{},
     index_config_hash: []const u8,
     build_spec: BuildSpec,
 };
@@ -752,7 +753,14 @@ fn appendDesiredArtifactAlloc(
     if (input.name.len == 0) return error.InvalidLakeRebuildDesiredArtifacts;
     const name = try alloc.dupe(u8, input.name);
     errdefer alloc.free(name);
-    const binding = try bindingForDesiredArtifactAlloc(alloc, source, input.sidecar_kind, input.column_bindings, input.index_config_hash);
+    const binding = try bindingForDesiredArtifactAlloc(
+        alloc,
+        source,
+        input.sidecar_kind,
+        input.column_bindings,
+        input.column_kinds,
+        input.index_config_hash,
+    );
     errdefer freeOwnedBinding(alloc, binding);
     var build_spec = try cloneBuildSpecAlloc(alloc, input.build_spec);
     errdefer freeOwnedBuildSpec(alloc, &build_spec);
@@ -772,8 +780,10 @@ fn bindingForDesiredArtifactAlloc(
     source: LakeSourceSnapshot,
     sidecar_kind: source_binding.SidecarKind,
     column_bindings: []const []const u8,
+    column_kinds: []const rowsource.ColumnKind,
     index_config_hash: []const u8,
 ) !source_binding.Binding {
+    if (column_kinds.len != 0 and column_kinds.len != column_bindings.len) return error.InvalidLakeRebuildDesiredArtifacts;
     const owned_columns = try alloc.alloc([]const u8, column_bindings.len);
     errdefer alloc.free(owned_columns);
     var initialized: usize = 0;
@@ -785,6 +795,8 @@ fn bindingForDesiredArtifactAlloc(
         owned_columns[idx] = try alloc.dupe(u8, column);
         initialized += 1;
     }
+    const owned_column_kinds = try alloc.dupe(rowsource.ColumnKind, column_kinds);
+    errdefer alloc.free(owned_column_kinds);
 
     const source_id = try alloc.dupe(u8, source.source_id);
     errdefer alloc.free(source_id);
@@ -803,6 +815,7 @@ fn bindingForDesiredArtifactAlloc(
         .snapshot_id = snapshot_id,
         .schema_fingerprint = schema_fingerprint,
         .column_bindings = owned_columns,
+        .column_kinds = owned_column_kinds,
         .index_config_hash = owned_index_config_hash,
     };
     errdefer freeOwnedBinding(alloc, binding);
@@ -1030,6 +1043,7 @@ fn appendAlgebraicMaterializationDesiredArtifactAlloc(
             column_count = 2;
         }
         const columns = columns_buf[0..column_count];
+        const column_kinds = algebraicGroupByColumnKinds(op);
         const index_hash = try indexConfigHashAlloc(alloc, "algebraic", artifact_name, config_json, columns);
         defer alloc.free(index_hash);
         try appendDesiredArtifactAlloc(alloc, artifacts, source, .{
@@ -1037,6 +1051,7 @@ fn appendAlgebraicMaterializationDesiredArtifactAlloc(
             .sidecar_kind = .algebraic,
             .artifact_kind = .algebraic_segment,
             .column_bindings = columns,
+            .column_kinds = column_kinds,
             .index_config_hash = index_hash,
             .build_spec = .{ .algebraic_group_by = .{
                 .group_column = group_by[0],
@@ -1054,6 +1069,7 @@ fn appendAlgebraicMaterializationDesiredArtifactAlloc(
     };
     const index_hash = try indexConfigHashAlloc(alloc, "algebraic", artifact_name, config_json, columns);
     defer alloc.free(index_hash);
+    const column_kinds = algebraicExpressionColumnKinds(op);
     const expressions = [_]algebraic_segment.ExpressionSpec{.{
         .name = materialization_name,
         .value_column = if (op == .count) &.{} else value_column.?,
@@ -1064,9 +1080,24 @@ fn appendAlgebraicMaterializationDesiredArtifactAlloc(
         .sidecar_kind = .algebraic,
         .artifact_kind = .algebraic_segment,
         .column_bindings = columns,
+        .column_kinds = column_kinds,
         .index_config_hash = index_hash,
         .build_spec = .{ .algebraic_expression = .{ .expressions = &expressions } },
     });
+}
+
+fn algebraicGroupByColumnKinds(op: algebraic_segment.AggregateOp) []const rowsource.ColumnKind {
+    return switch (op) {
+        .count => &[_]rowsource.ColumnKind{.bytes},
+        .sum_i64, .min_i64, .max_i64, .avg_i64 => &[_]rowsource.ColumnKind{ .bytes, .i64 },
+    };
+}
+
+fn algebraicExpressionColumnKinds(op: algebraic_segment.AggregateOp) []const rowsource.ColumnKind {
+    return switch (op) {
+        .count => &[_]rowsource.ColumnKind{},
+        .sum_i64, .min_i64, .max_i64, .avg_i64 => &[_]rowsource.ColumnKind{.i64},
+    };
 }
 
 fn isTypedIndexConfig(value: std.json.Value, expected_type: []const u8) bool {
@@ -1698,6 +1729,41 @@ test "lake rebuild planner reuses matching source bindings" {
     try std.testing.expectEqualStrings("vec-1", plan.find("orders.embedding").?.artifact_id);
 }
 
+test "lake rebuild planner rebuilds algebraic sidecars when typed bindings change" {
+    const alloc = std.testing.allocator;
+    const desired_binding = source_binding.Binding{
+        .sidecar_kind = .algebraic,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-10",
+        .schema_fingerprint = "schema-v2",
+        .column_bindings = &[_][]const u8{ "tenant", "amount" },
+        .column_kinds = &[_]rowsource.ColumnKind{ .bytes, .i64 },
+        .index_config_hash = "sha256:group",
+    };
+    var published_binding = desired_binding;
+    published_binding.column_kinds = &.{};
+
+    const desired = [_]DesiredArtifact{.{
+        .name = "events.amount_by_tenant",
+        .binding = desired_binding,
+        .kind = .algebraic_segment,
+    }};
+    const published = [_]PublishedArtifact{.{
+        .name = "events.amount_by_tenant",
+        .binding = published_binding,
+        .artifact = .{ .kind = .algebraic_segment, .artifact_id = "fold-1", .byte_len = 64, .checksum = "len:64" },
+    }};
+
+    var plan = try planAlloc(alloc, &desired, &published);
+    defer plan.deinit(alloc);
+
+    try std.testing.expect(plan.anyRebuild());
+    try std.testing.expectEqual(Action.rebuild, plan.find("events.amount_by_tenant").?.action);
+    try std.testing.expectEqualStrings("column kind bindings changed", plan.find("events.amount_by_tenant").?.reason);
+}
+
 test "lake rebuild desired artifacts derive from table index metadata" {
     const alloc = std.testing.allocator;
     var desired = try desiredArtifactsFromTableDefinitionAlloc(alloc, .{
@@ -1858,11 +1924,15 @@ test "lake rebuild desired artifacts derive supported algebraic materializations
 
     const grouped = desired.find("alg.count_by_tenant").?;
     try std.testing.expectEqual(source_binding.SidecarKind.algebraic, grouped.binding.sidecar_kind);
+    try std.testing.expectEqual(@as(usize, 1), grouped.binding.column_kinds.len);
+    try std.testing.expectEqual(rowsource.ColumnKind.bytes, grouped.binding.column_kinds[0]);
     try std.testing.expectEqual(BuilderKind.algebraic_group_by, std.meta.activeTag(grouped.build_spec.?));
     try std.testing.expectEqualStrings("tenant", grouped.build_spec.?.algebraic_group_by.group_column);
     try std.testing.expectEqual(algebraic_segment.AggregateOp.count, grouped.build_spec.?.algebraic_group_by.op);
 
     const expression = desired.find("alg.sum_amount").?;
+    try std.testing.expectEqual(@as(usize, 1), expression.binding.column_kinds.len);
+    try std.testing.expectEqual(rowsource.ColumnKind.i64, expression.binding.column_kinds[0]);
     try std.testing.expectEqual(BuilderKind.algebraic_expression, std.meta.activeTag(expression.build_spec.?));
     try std.testing.expectEqual(@as(usize, 1), expression.build_spec.?.algebraic_expression.expressions.len);
     try std.testing.expectEqualStrings("sum_amount", expression.build_spec.?.algebraic_expression.expressions[0].name);
@@ -1870,6 +1940,9 @@ test "lake rebuild desired artifacts derive supported algebraic materializations
     try std.testing.expectEqual(algebraic_segment.AggregateOp.sum_i64, expression.build_spec.?.algebraic_expression.expressions[0].op);
 
     const avg_grouped = desired.find("alg.avg_by_tenant").?;
+    try std.testing.expectEqual(@as(usize, 2), avg_grouped.binding.column_kinds.len);
+    try std.testing.expectEqual(rowsource.ColumnKind.bytes, avg_grouped.binding.column_kinds[0]);
+    try std.testing.expectEqual(rowsource.ColumnKind.i64, avg_grouped.binding.column_kinds[1]);
     try std.testing.expectEqual(BuilderKind.algebraic_group_by, std.meta.activeTag(avg_grouped.build_spec.?));
     try std.testing.expectEqualStrings("tenant", avg_grouped.build_spec.?.algebraic_group_by.group_column);
     try std.testing.expectEqualStrings("amount", avg_grouped.build_spec.?.algebraic_group_by.value_column);
