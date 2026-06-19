@@ -382,7 +382,6 @@ const FlatProbeCollector = struct {
         if (self.count < self.probes.len) {
             self.probes[self.count] = candidate;
             self.count += 1;
-            if (self.count == self.probes.len) self.buildHeap();
             return;
         }
 
@@ -2450,6 +2449,23 @@ test "flat probe collector keeps bounded lowest lower bounds" {
     try std.testing.expectEqual(@as(u64, 6), items[0].posting_id);
     try std.testing.expectEqual(@as(u64, 4), items[1].posting_id);
     try std.testing.expectEqual(@as(u64, 2), items[2].posting_id);
+}
+
+test "flat probe collector builds heap lazily on overflow" {
+    var storage: [2]FlatCentroidProbe = undefined;
+    var collector = FlatProbeCollector.init(&storage);
+
+    collector.insert(.{ .posting_id = 1, .distance = 2, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 2, .distance = 1, .error_bound = 0 });
+    try std.testing.expect(!collector.heap_ready);
+
+    collector.insert(.{ .posting_id = 3, .distance = 3, .error_bound = 0 });
+    try std.testing.expect(collector.heap_ready);
+
+    const items = collector.items();
+    std.mem.sort(FlatCentroidProbe, items, {}, flatProbeLess);
+    try std.testing.expectEqual(@as(u64, 2), items[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 1), items[1].posting_id);
 }
 
 test "flat probe collector candidates sort by lower bound before exact scoring" {

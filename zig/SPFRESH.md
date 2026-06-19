@@ -2513,7 +2513,10 @@ blocks cannot contribute, the query stops before per-block posting estimates
 and exact centroid scoring. Per-block quantized posting candidate collection
 also checks the current final posting heap bound before inserting into the
 temporary candidate heap, so clearly rejected candidates no longer participate
-in candidate sorting. Adaptive two-level queries also delay the
+in candidate sorting. Bounded flat probe collectors also build their internal
+heap lazily only when an overflow insert or rejection check requires it, so
+exactly-filled candidate buffers can go straight to the final sort. Adaptive
+two-level queries also delay the
 posting-count-sized
 distance/error-bound scratch reservation until the selected block set is known
 to full-scan the directory and use the global posting quantized payload; pruned
