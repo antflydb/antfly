@@ -4890,67 +4890,6 @@
       "sql": "SELECT id FROM usage_records WHERE name ILIKE $1"
     },
     {
-      "name": "unsupported recursive cte query",
-      "family": "unsupported",
-      "plan": "unsupported:query:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
-      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
-    },
-    {
-      "name": "single table json expression order key query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "sql": "SELECT id FROM usage_records ORDER BY to_jsonb(status) ASC LIMIT 5"
-    },
-    {
-      "name": "unsupported recursive cte read classifier",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
-      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
-    },
-    {
-      "name": "read json expression order key",
-      "family": "read",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "sql": "SELECT id, jsonb_build_object('status', status) AS status_doc FROM usage_records ORDER BY jsonb_build_object('status', status) ASC LIMIT 5"
-    },
-    {
-      "name": "unsupported read duplicate output name",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=duplicate_output_name",
-      "classification_reason": "duplicate_output_name",
-      "sql": "SELECT id, row_number() OVER (ORDER BY amount DESC) AS id FROM usage_records"
-    },
-    {
-      "name": "unsupported aggregate duplicate output name",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=aggregate_duplicate_output_name",
-      "classification_reason": "aggregate_duplicate_output_name",
-      "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
-    },
-    {
-      "name": "select into relation population plan",
-      "family": "relation_population",
-      "summary": {
-        "table_name": "usage_archive"
-      },
-      "plan": "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
-      "sql": "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'"
-    },
-    {
       "name": "point update joined source routes to claimed joined mutation source",
       "family": "update_joined_source",
       "summary": {
@@ -10781,6 +10720,67 @@
       "plan": "unsupported:read:requires=set_operation_plan",
       "classification_reason": "set_operation_plan",
       "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
+    },
+    {
+      "name": "unsupported recursive cte query",
+      "family": "unsupported",
+      "plan": "unsupported:query:requires=recursive_cte_stream_plan",
+      "classification_reason": "recursive_cte_stream_plan",
+      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
+    },
+    {
+      "name": "single table json expression order key query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records ORDER BY to_jsonb(status) ASC LIMIT 5"
+    },
+    {
+      "name": "unsupported recursive cte read classifier",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=recursive_cte_stream_plan",
+      "classification_reason": "recursive_cte_stream_plan",
+      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
+    },
+    {
+      "name": "read json expression order key",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "sql": "SELECT id, jsonb_build_object('status', status) AS status_doc FROM usage_records ORDER BY jsonb_build_object('status', status) ASC LIMIT 5"
+    },
+    {
+      "name": "unsupported read duplicate output name",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=duplicate_output_name",
+      "classification_reason": "duplicate_output_name",
+      "sql": "SELECT id, row_number() OVER (ORDER BY amount DESC) AS id FROM usage_records"
+    },
+    {
+      "name": "unsupported aggregate duplicate output name",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=aggregate_duplicate_output_name",
+      "classification_reason": "aggregate_duplicate_output_name",
+      "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
+    },
+    {
+      "name": "select into relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_archive"
+      },
+      "plan": "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'"
     }
   ]
 }
