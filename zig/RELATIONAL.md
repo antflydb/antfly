@@ -4533,19 +4533,19 @@ Adapter-only transaction-control coverage includes `BEGIN`, `BEGIN WORK`, bare
 WORK` as explicit no-op classifications, so migration wrappers and client
 protocol boundary statements stay out of storage while still remaining visible in
 the golden corpus. The boundary tail matcher lives in
-`api/sql_adapter/grammar.zig`, including statement-end validation, `WORK` and
-`TRANSACTION` aliases, and fail-closed handling for prepared transactions or
-extra statements. `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO
+`api/sql_adapter/grammar.zig`, including statement-end validation plus `WORK`
+and `TRANSACTION` aliases. `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO
 [SAVEPOINT]` syntax is also parsed in `api/sql_adapter/grammar.zig` and lowers
 to typed savepoint transaction-control intents that capture the savepoint name
 and fail closed at schema/storage application until native nested transaction
 rollback/release semantics exist. Prepared transaction commands are not boundary
-no-ops; the source parity corpus requires `PREPARE TRANSACTION`,
-`COMMIT PREPARED`, and `ROLLBACK PREPARED` to fail closed with the stable
-`prepared_transaction_plan` reason until Antfly owns a durable
-prepared-transaction model. This keeps savepoint and prepared-transaction
-syntax out of storage while preserving a stable typed boundary for the future
-subtransaction model.
+no-ops: `PREPARE TRANSACTION`, `COMMIT PREPARED`, and `ROLLBACK PREPARED` lower
+to typed prepared-transaction DDL plans and a generated-corpus `execution_plan`
+fingerprint for the coordinator-owned recovery action
+(`register_prepared`, `resolve_commit`, or `resolve_rollback`). Applying those
+plans to schema JSON or runtime table storage still fails closed until the
+coordinator recovery log is durable, but the adapter boundary no longer treats
+the syntax as an opaque unsupported string.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
@@ -4637,10 +4637,10 @@ constraint state and request-level isolation/access/retry options. Plain
 `BEGIN`, `BEGIN WORK`, bare `START TRANSACTION`, `COMMIT`, `COMMIT
 TRANSACTION`, `ROLLBACK`, and `ROLLBACK WORK` lower to typed adapter no-op
 records with the stable `transaction_control` reason. Mode-bearing transaction
-starts remain typed transaction-control plans, and non-boundary operations such
-as prepared transaction prepare/commit/rollback must fail closed with
-`prepared_transaction_plan` until Antfly owns a durable prepared-transaction
-model.
+starts remain typed transaction-control plans. Prepared transaction
+prepare/commit/rollback lower to typed recovery intents and are rejected only at
+schema/storage application until the coordinator recovery log can register,
+resolve, replay, and audit them durably.
 
 Notification-channel SQL is also adapter grammar over typed native intent, not
 backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in

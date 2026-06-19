@@ -191,6 +191,19 @@ pub const PreparedStatementSubjectKind = sql_adapter.PreparedStatementSubjectKin
 pub const PreparedStatementStatementKind = sql_adapter.PreparedStatementStatementKind;
 pub const ExecutePreparedStatementPlan = sql_adapter.ExecutePreparedStatementPlan;
 pub const DeallocatePreparedStatementPlan = sql_adapter.DeallocatePreparedStatementPlan;
+pub const PreparedTransactionPlan = sql_adapter.PreparedTransactionPlan;
+pub const PreparedTransactionAction = sql_adapter.PreparedTransactionAction;
+pub const PreparedTransactionRecoveryOperation = enum {
+    register_prepared,
+    resolve_commit,
+    resolve_rollback,
+};
+pub const PreparedTransactionRecoveryIntent = struct {
+    operation: PreparedTransactionRecoveryOperation,
+    gid: []const u8,
+    requires_coordinator_recovery: bool = true,
+    audit_action: PreparedTransactionAction,
+};
 pub const CursorPortalPlan = sql_adapter.CursorPortalPlan;
 pub const DeclareCursorPortalPlan = sql_adapter.DeclareCursorPortalPlan;
 pub const CursorScrollMode = sql_adapter.CursorScrollMode;
@@ -2017,6 +2030,26 @@ pub fn bulkSqlIoExecutionFingerprintAlloc(alloc: std.mem.Allocator, plan: BulkSq
     );
 }
 
+pub fn preparedTransactionRecoveryIntentFromPlan(plan: PreparedTransactionPlan) PreparedTransactionRecoveryIntent {
+    return .{
+        .operation = switch (plan.action) {
+            .prepare => .register_prepared,
+            .commit => .resolve_commit,
+            .rollback => .resolve_rollback,
+        },
+        .gid = plan.gid,
+        .audit_action = plan.action,
+    };
+}
+
+pub fn preparedTransactionRecoveryFingerprintAlloc(alloc: std.mem.Allocator, intent: PreparedTransactionRecoveryIntent) ![]const u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "prepared_txn_recovery:op={s}:gid={s}:audit={s}:requires_coordinator={}",
+        .{ @tagName(intent.operation), intent.gid, @tagName(intent.audit_action), intent.requires_coordinator_recovery },
+    );
+}
+
 pub const OwnedSqlCatalogSession = struct {
     current_database_name: []u8,
     search_path: []const []const u8,
@@ -2170,6 +2203,7 @@ pub fn applyDdlPlanToRuntimeSchemaAlloc(
         .type_system_catalog => error.UnsupportedSqlShape,
         .maintenance_job => error.UnsupportedSqlShape,
         .prepared_statement => error.UnsupportedSqlShape,
+        .prepared_transaction => error.UnsupportedSqlShape,
         .cursor_portal => error.UnsupportedSqlShape,
         .savepoint_transaction => error.UnsupportedSqlShape,
         .comment_metadata => |comment| applyCommentMetadataPlanAlloc(alloc, current, comment),
@@ -2353,6 +2387,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
         .type_system_catalog => return error.UnsupportedSqlShape,
         .maintenance_job => return error.UnsupportedSqlShape,
         .prepared_statement => return error.UnsupportedSqlShape,
+        .prepared_transaction => return error.UnsupportedSqlShape,
         .cursor_portal => return error.UnsupportedSqlShape,
         .savepoint_transaction => return error.UnsupportedSqlShape,
         .transaction_control => return error.UnsupportedSqlShape,
@@ -2387,6 +2422,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
             .type_system_catalog => unreachable,
             .maintenance_job => unreachable,
             .prepared_statement => unreachable,
+            .prepared_transaction => unreachable,
             .cursor_portal => unreachable,
             .savepoint_transaction => unreachable,
             .comment_metadata => error.InvalidSqlCatalog,
@@ -2430,6 +2466,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
         .type_system_catalog => unreachable,
         .maintenance_job => unreachable,
         .prepared_statement => unreachable,
+        .prepared_transaction => unreachable,
         .cursor_portal => unreachable,
         .savepoint_transaction => unreachable,
         .comment_metadata => |comment| try applyCommentMetadataPlanToSchemaJsonValue(arena, root, comment),
@@ -3363,6 +3400,9 @@ const Parser = struct {
             return .{ .bulk_io = try self.parseBulkIoDdl() };
         }
         if (self.matchKeyword("prepare")) {
+            if (self.peekKeyword("transaction")) {
+                return .{ .prepared_transaction = try self.parsePreparedTransactionDdl(.prepare) };
+            }
             return .{ .prepared_statement = .{ .prepare = try self.parsePrepareStatementDdl() } };
         }
         if (self.matchKeyword("execute")) {
@@ -3387,6 +3427,9 @@ const Parser = struct {
             return .{ .savepoint_transaction = .{ .release = try self.parseReleaseSavepointDdl() } };
         }
         if (self.matchKeyword("rollback")) {
+            if (self.peekKeyword("prepared")) {
+                return .{ .prepared_transaction = try self.parsePreparedTransactionDdl(.rollback) };
+            }
             if (!self.peekKeyword("to") and !self.peekKeyword("savepoint")) {
                 if (!try self.matchAdapterNoopTransactionBoundaryTail(.{ .work = true, .transaction = true })) return error.UnsupportedSqlShape;
                 return .{ .adapter_noop = .{ .reason = .transaction_control } };
@@ -3394,6 +3437,9 @@ const Parser = struct {
             return .{ .savepoint_transaction = .{ .rollback_to = try self.parseRollbackToSavepointDdl() } };
         }
         if (self.matchKeyword("commit")) {
+            if (self.peekKeyword("prepared")) {
+                return .{ .prepared_transaction = try self.parsePreparedTransactionDdl(.commit) };
+            }
             if (!try self.matchAdapterNoopTransactionBoundaryTail(.{ .work = true, .transaction = true })) return error.UnsupportedSqlShape;
             return .{ .adapter_noop = .{ .reason = .transaction_control } };
         }
@@ -4099,6 +4145,21 @@ const Parser = struct {
     fn parseDeallocatePreparedStatementDdl(self: *@This()) !DeallocatePreparedStatementPlan {
         const syntax = try sql_adapter.parseDeallocatePreparedStatementTail(self.tokens, &self.pos);
         return try self.deallocatePreparedStatementPlanFromSyntax(syntax);
+    }
+
+    fn parsePreparedTransactionDdl(self: *@This(), action: PreparedTransactionAction) !PreparedTransactionPlan {
+        switch (action) {
+            .prepare => try self.expectKeyword("transaction"),
+            .commit, .rollback => try self.expectKeyword("prepared"),
+        }
+        const gid_token = self.match(.string) orelse return error.UnsupportedSqlShape;
+        if (gid_token.text.len == 0) return error.UnsupportedSqlShape;
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        return .{
+            .action = action,
+            .gid = try self.alloc.dupe(u8, gid_token.text),
+        };
     }
 
     fn parseDeclareCursorPortalDdl(self: *@This()) !DeclareCursorPortalPlan {
@@ -46631,7 +46692,49 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(rollback_work_protocol_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=transaction_control", rollback_work_protocol_fingerprint);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "COMMIT PREPARED 'x';"));
+    var prepare_transaction = try lowerDdlPlanAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
+    defer prepare_transaction.deinit(alloc);
+    const prepare_transaction_plan = switch (prepare_transaction) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(PreparedTransactionAction.prepare, prepare_transaction_plan.action);
+    try std.testing.expectEqualStrings("usage_batch", prepare_transaction_plan.gid);
+    const prepare_transaction_fingerprint = try ddlFingerprintAlloc(alloc, prepare_transaction);
+    defer alloc.free(prepare_transaction_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepared_transaction:action=prepare:gid=usage_batch", prepare_transaction_fingerprint);
+    const prepare_recovery = preparedTransactionRecoveryIntentFromPlan(prepare_transaction_plan);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.register_prepared, prepare_recovery.operation);
+    const prepare_recovery_fingerprint = try preparedTransactionRecoveryFingerprintAlloc(alloc, prepare_recovery);
+    defer alloc.free(prepare_recovery_fingerprint);
+    try std.testing.expectEqualStrings("prepared_txn_recovery:op=register_prepared:gid=usage_batch:audit=prepare:requires_coordinator=true", prepare_recovery_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_transaction));
+
+    var commit_prepared = try lowerDdlPlanAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    defer commit_prepared.deinit(alloc);
+    const commit_prepared_plan = switch (commit_prepared) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(PreparedTransactionAction.commit, commit_prepared_plan.action);
+    const commit_prepared_fingerprint = try ddlFingerprintAlloc(alloc, commit_prepared);
+    defer alloc.free(commit_prepared_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepared_transaction:action=commit:gid=usage_batch", commit_prepared_fingerprint);
+    const commit_recovery = preparedTransactionRecoveryIntentFromPlan(commit_prepared_plan);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_commit, commit_recovery.operation);
+
+    var rollback_prepared = try lowerDdlPlanAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
+    defer rollback_prepared.deinit(alloc);
+    const rollback_prepared_plan = switch (rollback_prepared) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(PreparedTransactionAction.rollback, rollback_prepared_plan.action);
+    const rollback_prepared_fingerprint = try ddlFingerprintAlloc(alloc, rollback_prepared);
+    defer alloc.free(rollback_prepared_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepared_transaction:action=rollback:gid=usage_batch", rollback_prepared_fingerprint);
+    const rollback_recovery = preparedTransactionRecoveryIntentFromPlan(rollback_prepared_plan);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_rollback, rollback_recovery.operation);
 
     var set_local_session = try lowerDdlPlanAlloc(alloc, "SET LOCAL client_min_messages = warning;");
     defer set_local_session.deinit(alloc);
@@ -57765,6 +57868,11 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     .{deallocate.statement_name orelse return error.TestUnexpectedResult},
                 ),
         },
+        .prepared_transaction => |plan| try std.fmt.allocPrint(
+            alloc,
+            "ddl:prepared_transaction:action={s}:gid={s}",
+            .{ @tagName(plan.action), plan.gid },
+        ),
         .cursor_portal => |plan| switch (plan) {
             .declare => |declare| try std.fmt.allocPrint(
                 alloc,
@@ -58472,6 +58580,27 @@ fn expectAppliedDdlCorpusPlan(
     try expectAppParityPlan(entry.applied_plan, fingerprint);
 }
 
+fn expectDdlExecutionCorpusPlan(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    lowered: LoweredDdlPlan,
+) !void {
+    if (entry.execution_plan.len == 0) return;
+    const fingerprint = switch (lowered) {
+        .bulk_io => |plan| blk: {
+            const execution_plan = try bulkSqlIoExecutionPlanFromDdlPlan(plan);
+            break :blk try bulkSqlIoExecutionFingerprintAlloc(alloc, execution_plan);
+        },
+        .prepared_transaction => |plan| blk: {
+            const intent = preparedTransactionRecoveryIntentFromPlan(plan);
+            break :blk try preparedTransactionRecoveryFingerprintAlloc(alloc, intent);
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(fingerprint);
+    try expectAppParityPlan(entry.execution_plan, fingerprint);
+}
+
 fn schemaJsonFromSetupSqlAlloc(
     alloc: std.mem.Allocator,
     setup_sql: []const []const u8,
@@ -58971,6 +59100,14 @@ fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !voi
                     try expectOptionalTableName(summary.table_name, name);
                 }
             },
+        },
+        .prepared_transaction => |plan| {
+            try std.testing.expectEqual(switch (plan.action) {
+                .prepare => AppParityDdlTag.prepare_transaction,
+                .commit => AppParityDdlTag.commit_prepared,
+                .rollback => AppParityDdlTag.rollback_prepared,
+            }, expected);
+            try expectOptionalTableName(summary.table_name, plan.gid);
         },
         .cursor_portal => |plan| switch (plan) {
             .declare => |declare| {
@@ -60450,6 +60587,7 @@ fn expectAppParityCorpusEntry(
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
             try expectAppliedDdlCorpusPlan(alloc, base_schema_json, entry, lowered);
+            try expectDdlExecutionCorpusPlan(alloc, entry, lowered);
         },
         .read => {
             var lowered = try lowerAppParityReadPlanAlloc(alloc, effective_schema, entry);

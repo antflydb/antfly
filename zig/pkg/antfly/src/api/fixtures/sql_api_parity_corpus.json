@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "b5328a4bc6b47e7a9cccd297c5c2c66ee724b488838f893734c526f2a655f4b1",
+  "source_sha256": "addee3d656138667919b0175cec288402e184148473d1434432d5baac8b5246a",
   "source_entry_count": 978,
   "entry_count": 978,
   "skipped_entries": [
@@ -3807,6 +3807,7 @@
         "operations": 2
       },
       "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
     },
     {
@@ -3818,6 +3819,7 @@
         "operations": 2
       },
       "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:on_error=ignore:reject_limit=10:log_verbosity=verbose:force_quote=none:force_quote_columns=0:force_not_null_columns=2:force_null_columns=1:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:default_marker_hex=6e2f61:encoding_hex=55544638:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8')"
     },
     {
@@ -3829,6 +3831,7 @@
         "operations": 2
       },
       "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=csv:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *)"
     },
     {
@@ -3861,6 +3864,7 @@
         "operations": 2
       },
       "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=1",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=1:requires_stream=true",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active'"
     },
     {
@@ -7841,24 +7845,36 @@
       "sql": "ROLLBACK WORK;"
     },
     {
-      "name": "unsupported prepare transaction durable state",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=prepared_transaction_plan",
-      "classification_reason": "prepared_transaction_plan",
+      "name": "prepare transaction durable recovery intent",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_transaction",
+        "table_name": "usage_batch"
+      },
+      "plan": "ddl:prepared_transaction:action=prepare:gid=usage_batch",
+      "execution_plan": "prepared_txn_recovery:op=register_prepared:gid=usage_batch:audit=prepare:requires_coordinator=true",
       "sql": "PREPARE TRANSACTION 'usage_batch';"
     },
     {
-      "name": "unsupported commit prepared transaction durable state",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=prepared_transaction_plan",
-      "classification_reason": "prepared_transaction_plan",
+      "name": "commit prepared transaction durable recovery intent",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "commit_prepared",
+        "table_name": "usage_batch"
+      },
+      "plan": "ddl:prepared_transaction:action=commit:gid=usage_batch",
+      "execution_plan": "prepared_txn_recovery:op=resolve_commit:gid=usage_batch:audit=commit:requires_coordinator=true",
       "sql": "COMMIT PREPARED 'usage_batch';"
     },
     {
-      "name": "unsupported rollback prepared transaction durable state",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=prepared_transaction_plan",
-      "classification_reason": "prepared_transaction_plan",
+      "name": "rollback prepared transaction durable recovery intent",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "rollback_prepared",
+        "table_name": "usage_batch"
+      },
+      "plan": "ddl:prepared_transaction:action=rollback:gid=usage_batch",
+      "execution_plan": "prepared_txn_recovery:op=resolve_rollback:gid=usage_batch:audit=rollback:requires_coordinator=true",
       "sql": "ROLLBACK PREPARED 'usage_batch';"
     },
     {

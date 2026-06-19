@@ -145,6 +145,9 @@ pub const AppParityDdlTag = enum {
     prepare_statement,
     execute_statement,
     deallocate_statement,
+    prepare_transaction,
+    commit_prepared,
+    rollback_prepared,
     declare_cursor,
     fetch_cursor,
     close_cursor,
@@ -300,6 +303,7 @@ pub const AppParityCorpusEntry = struct {
     apply_setup_sql: []const []const u8 = &.{},
     returning_rows: []const []const u8 = &.{},
     applied_plan: []const u8 = "",
+    execution_plan: []const u8 = "",
     resolver_row_json: []const u8 = "",
     resolver_version: u64 = 0,
     resolver_exists: ?bool = null,
@@ -666,6 +670,7 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         "apply_setup_sql",
         "returning_rows",
         "applied_plan",
+        "execution_plan",
         "resolver_row_json",
         "resolver_version",
         "resolver_exists",
@@ -690,6 +695,7 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         .apply_setup_sql = try parseFixtureStringListAlloc(alloc, object, "apply_setup_sql"),
         .returning_rows = try parseFixtureStringListAlloc(alloc, object, "returning_rows"),
         .applied_plan = try fixtureJsonOptionalString(object, "applied_plan", ""),
+        .execution_plan = try fixtureJsonOptionalString(object, "execution_plan", ""),
         .resolver_row_json = try fixtureJsonOptionalString(object, "resolver_row_json", ""),
         .resolver_version = try fixtureJsonOptionalU64(object, "resolver_version", 0),
         .resolver_exists = try fixtureJsonOptionalBool(object, "resolver_exists"),
@@ -1119,6 +1125,7 @@ pub fn fixtureJsonAlloc(
         try fixtureWriteStringListField(entries_writer, &first, "      ", "apply_setup_sql", entry.apply_setup_sql);
         try fixtureWriteStringListField(entries_writer, &first, "      ", "returning_rows", entry.returning_rows);
         if (encoded.applied_plan.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "applied_plan", encoded.applied_plan);
+        if (entry.execution_plan.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "execution_plan", entry.execution_plan);
         if (entry.resolver_row_json.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "resolver_row_json", entry.resolver_row_json);
         if (entry.resolver_version != 0) try fixtureWriteU64Field(entries_writer, &first, "      ", "resolver_version", entry.resolver_version);
         if (entry.resolver_exists) |exists| try fixtureWriteBoolField(entries_writer, &first, "      ", "resolver_exists", exists);
@@ -1504,6 +1511,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .create_function, .drop_function, .create_procedure, .drop_procedure => false,
         .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege => false,
         .copy_from, .copy_to => false,
+        .prepare_transaction, .commit_prepared, .rollback_prepared => false,
         .create_partitioned_table, .create_table_partition, .attach_table_partition, .detach_table_partition => false,
         .enable_row_security, .disable_row_security, .create_row_policy, .alter_row_policy, .drop_row_policy => false,
         .create_database, .alter_database, .drop_database => false,
@@ -1539,6 +1547,26 @@ pub fn corpusDdlFixtureAppliesFromEmptyCatalog(entry: AppParityCorpusEntry) !boo
             !planHasExactBoolToken(entry.plan, ":replace=", true),
         else => false,
     };
+}
+
+pub fn corpusFixtureAllowsExecutionPlan(entry: AppParityCorpusEntry) bool {
+    if (entry.family != .ddl) return false;
+    return switch (entry.summary.ddl_tag orelse return false) {
+        .copy_from, .copy_to => true,
+        .prepare_transaction, .commit_prepared, .rollback_prepared => true,
+        else => false,
+    };
+}
+
+pub fn corpusFixtureRequiresExecutionPlan(entry: AppParityCorpusEntry) bool {
+    return corpusFixtureAllowsExecutionPlan(entry);
+}
+
+pub fn corpusFixtureExecutionPlanIsStructured(entry: AppParityCorpusEntry) bool {
+    if (entry.execution_plan.len == 0) return true;
+    if (!corpusFixtureAllowsExecutionPlan(entry)) return false;
+    return std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=") or
+        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=");
 }
 
 const AppParityCorpusMetadataMode = enum {
@@ -1713,6 +1741,7 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
     }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) return error.TestUnexpectedResult;
     if (entry.applied_plan.len > 0 and !appliedPlanIsStructured(entry.applied_plan)) return error.TestUnexpectedResult;
+    if (!corpusFixtureExecutionPlanIsStructured(entry)) return error.TestUnexpectedResult;
     if (entry.apply_setup_sql.len > 0 and !corpusFixtureFamilyAllowsSetupSql(entry.family)) {
         return error.TestUnexpectedResult;
     }
@@ -1757,6 +1786,9 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
     if (entry.resolver_exists == true and entry.resolver_row_json.len == 0) return error.TestUnexpectedResult;
     if (mode == .generated_fixture and try corpusDdlFixtureRequiresAppliedPlan(entry)) {
         if (entry.applied_plan.len == 0) return error.TestUnexpectedResult;
+    }
+    if (mode == .generated_fixture and corpusFixtureRequiresExecutionPlan(entry)) {
+        if (entry.execution_plan.len == 0) return error.TestUnexpectedResult;
     }
 }
 
@@ -1866,6 +1898,7 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .reindex_maintenance => (planBoolTokenUsize(entry.plan, ":concurrently=") orelse return false) == expected,
         .cluster_maintenance => (planNonNoneStringTokenUsize(entry.plan, ":index=") orelse return false) == expected,
         .prepare_statement => planHasExactUsizeToken(entry.plan, ":params=", expected),
+        .prepare_transaction, .commit_prepared, .rollback_prepared => expected == 1,
         .execute_statement => planHasExactUsizeToken(entry.plan, ":args=", expected),
         .comment_metadata => (planBoolTokenUsize(entry.plan, ":comment=") orelse return false) == expected,
         .table_lock => planHasExactUsizeToken(entry.plan, ":tables=", expected),
@@ -3937,6 +3970,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_privilege_grant: bool = false,
     ddl_privilege_revoke: bool = false,
     ddl_copy_from: bool = false,
+    ddl_copy_from_execution_contract: bool = false,
     ddl_copy_default_marker: bool = false,
     ddl_copy_header: bool = false,
     ddl_copy_delimiter: bool = false,
@@ -3952,6 +3986,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_reject_limit: bool = false,
     ddl_copy_quote: bool = false,
     ddl_copy_to: bool = false,
+    ddl_copy_to_execution_contract: bool = false,
     ddl_copy_where_expression: bool = false,
     ddl_partition_create_parent: bool = false,
     ddl_partition_create_child: bool = false,
@@ -4035,6 +4070,10 @@ pub const AppParityCorpusCoverage = struct {
     ddl_prepare_statement_delete_family: bool = false,
     ddl_prepare_statement_merge_family: bool = false,
     ddl_prepare_cte_write_statement: bool = false,
+    ddl_prepared_transaction_commit: bool = false,
+    ddl_prepared_transaction_prepare: bool = false,
+    ddl_prepared_transaction_recovery_contract: bool = false,
+    ddl_prepared_transaction_rollback: bool = false,
     ddl_execute_statement: bool = false,
     ddl_execute_statement_args: bool = false,
     ddl_deallocate_statement: bool = false,
@@ -4144,9 +4183,6 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
-    unsupported_ddl_prepare_transaction_plan: bool = false,
-    unsupported_ddl_commit_prepared_transaction_plan: bool = false,
-    unsupported_ddl_rollback_prepared_transaction_plan: bool = false,
     unsupported_ddl_role_setting_name: bool = false,
     unsupported_ddl_role_setting_reset: bool = false,
     unsupported_ddl_role_setting_expression: bool = false,
@@ -5379,15 +5415,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
                     std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                     std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null);
-            self.unsupported_ddl_prepare_transaction_plan = self.unsupported_ddl_prepare_transaction_plan or
-                (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
-                    std.mem.startsWith(u8, entry.sql, "PREPARE TRANSACTION "));
-            self.unsupported_ddl_commit_prepared_transaction_plan = self.unsupported_ddl_commit_prepared_transaction_plan or
-                (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
-                    std.mem.startsWith(u8, entry.sql, "COMMIT PREPARED "));
-            self.unsupported_ddl_rollback_prepared_transaction_plan = self.unsupported_ddl_rollback_prepared_transaction_plan or
-                (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
-                    std.mem.startsWith(u8, entry.sql, "ROLLBACK PREPARED "));
             self.unsupported_ddl_role_setting_name = self.unsupported_ddl_role_setting_name or
                 (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
                     std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
@@ -5599,6 +5626,8 @@ pub const AppParityCorpusCoverage = struct {
                 .revoke_privilege => self.ddl_privilege_revoke = true,
                 .copy_from => {
                     self.ddl_copy_from = true;
+                    self.ddl_copy_from_execution_contract = self.ddl_copy_from_execution_contract or
+                        std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:");
                     self.ddl_copy_default_marker = self.ddl_copy_default_marker or sql_adapter.planHasExactStringToken(entry.plan, ":default_marker_hex=", "6e2f61");
                     self.ddl_copy_header = self.ddl_copy_header or sql_adapter.planHasExactBoolToken(entry.plan, ":header=", true);
                     self.ddl_copy_delimiter = self.ddl_copy_delimiter or sql_adapter.planHasExactStringToken(entry.plan, ":delimiter_hex=", "2c");
@@ -5616,6 +5645,8 @@ pub const AppParityCorpusCoverage = struct {
                 },
                 .copy_to => {
                     self.ddl_copy_to = true;
+                    self.ddl_copy_to_execution_contract = self.ddl_copy_to_execution_contract or
+                        std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:");
                     self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");
                 },
                 .create_partitioned_table => self.ddl_partition_create_parent = true,
@@ -5752,6 +5783,21 @@ pub const AppParityCorpusCoverage = struct {
                         std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                             std.mem.indexOf(u8, entry.sql, " AS WITH ") != null and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
+                },
+                .prepare_transaction => {
+                    self.ddl_prepared_transaction_prepare = true;
+                    self.ddl_prepared_transaction_recovery_contract = self.ddl_prepared_transaction_recovery_contract or
+                        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=register_prepared:");
+                },
+                .commit_prepared => {
+                    self.ddl_prepared_transaction_commit = true;
+                    self.ddl_prepared_transaction_recovery_contract = self.ddl_prepared_transaction_recovery_contract or
+                        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=resolve_commit:");
+                },
+                .rollback_prepared => {
+                    self.ddl_prepared_transaction_rollback = true;
+                    self.ddl_prepared_transaction_recovery_contract = self.ddl_prepared_transaction_recovery_contract or
+                        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=resolve_rollback:");
                 },
                 .execute_statement => {
                     self.ddl_execute_statement = true;

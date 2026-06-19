@@ -241,6 +241,7 @@ pub const LoweredDdlPlan = union(enum) {
     type_system_catalog: TypeSystemCatalogPlan,
     maintenance_job: MaintenanceJobPlan,
     prepared_statement: PreparedStatementPlan,
+    prepared_transaction: PreparedTransactionPlan,
     cursor_portal: CursorPortalPlan,
     savepoint_transaction: SavepointTransactionPlan,
     comment_metadata: CommentMetadataPlan,
@@ -278,6 +279,7 @@ pub const LoweredDdlPlan = union(enum) {
             .type_system_catalog => |*plan| plan.deinit(alloc),
             .maintenance_job => |*plan| plan.deinit(alloc),
             .prepared_statement => |*plan| plan.deinit(alloc),
+            .prepared_transaction => |*plan| plan.deinit(alloc),
             .cursor_portal => |*plan| plan.deinit(alloc),
             .savepoint_transaction => |*plan| plan.deinit(alloc),
             .comment_metadata => |*plan| plan.deinit(alloc),
@@ -864,6 +866,22 @@ pub const PreparedStatementPlan = union(enum) {
         }
         self.* = undefined;
     }
+};
+
+pub const PreparedTransactionPlan = struct {
+    action: PreparedTransactionAction,
+    gid: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.gid);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedTransactionAction = enum {
+    prepare,
+    commit,
+    rollback,
 };
 
 pub const PrepareStatementPlan = struct {
