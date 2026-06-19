@@ -1080,8 +1080,12 @@ wrapped read classifier plans, live in checked-in fixture JSON under
 `api/fixtures/` and are interpreted by a generic `corpus.zig` runner with named
 expected coverage buckets. Expectation names resolve directly against boolean
 fields in the coverage accumulator, so adding a reviewable regression case does
-not require extending a second Zig-side name map. That keeps regression
-examples data-driven without hand-editing the generated parity corpus. SQL/API
+not require extending a second Zig-side name map. Summary-shape regressions
+that need named predicate checks live in
+`api/fixtures/sql_api_summary_regressions.json`; `corpus.zig` owns the small
+assertion-name map and parser, while the entry data and positive/negative
+expectations stay reviewable as JSON. That keeps regression examples
+data-driven without hand-editing the generated parity corpus. SQL/API
 parity entries that are pure workload examples move into
 `api/fixtures/sql_api_parity_source_corpus.json`, a hand-maintained source
 fixture with the same entry schema as the generated golden fixture. Corpus-wide

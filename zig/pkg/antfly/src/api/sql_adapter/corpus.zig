@@ -307,6 +307,7 @@ pub const AppParityCorpusEntry = struct {
 
 pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;
+pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
 
 pub const AppParityFixtureRoot = struct {
@@ -873,6 +874,83 @@ fn checkCoverageRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) 
     for (expect_false) |name| {
         try std.testing.expect(!try appParityCoverageFlag(coverage, name));
     }
+}
+
+fn checkSummaryRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) !void {
+    const object = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(object, &.{ "name", "entry", "expect_true", "expect_false" });
+
+    const entry_value = object.get("entry") orelse return error.TestUnexpectedResult;
+    const entry = try parseFixtureEntryAlloc(alloc, entry_value);
+    defer freeFixtureEntry(alloc, entry);
+
+    const expect_true = try parseFixtureStringListAlloc(alloc, object, "expect_true");
+    defer {
+        if (expect_true.len > 0) alloc.free(expect_true);
+    }
+    const expect_false = try parseFixtureStringListAlloc(alloc, object, "expect_false");
+    defer {
+        if (expect_false.len > 0) alloc.free(expect_false);
+    }
+    if (expect_true.len == 0 and expect_false.len == 0) return error.TestUnexpectedResult;
+
+    for (expect_true) |name| {
+        try std.testing.expect(try appParitySummaryRegressionAssertion(entry, name));
+    }
+    for (expect_false) |name| {
+        try std.testing.expect(!try appParitySummaryRegressionAssertion(entry, name));
+    }
+}
+
+fn appParitySummaryRegressionAssertion(entry: AppParityCorpusEntry, name: []const u8) !bool {
+    if (std.mem.eql(u8, name, "explain_plan_has_write_kind")) return explainPlanHasKind(entry.plan, "write");
+    if (std.mem.eql(u8, name, "explain_plan_has_read_kind")) return explainPlanHasKind(entry.plan, "read");
+    if (std.mem.eql(u8, name, "explain_write_inner_insert")) return corpusExplainWriteInnerHasPrefix(entry, ":inner=insert:");
+    if (std.mem.eql(u8, name, "read_plan_has_query_prefix")) return corpusReadPlanHasPrefix(entry, "read:query:");
+    if (std.mem.eql(u8, name, "plan_analyze_true_token")) return planHasExactBoolToken(entry.plan, ":analyze=", true);
+    if (std.mem.eql(u8, name, "plan_format_present")) return planHasStringToken(entry.plan, ":format=");
+    if (std.mem.eql(u8, name, "plan_verbose_present")) return planUsizeTokenValue(entry.plan, ":verbose=") != null;
+    if (std.mem.eql(u8, name, "plan_costs_present")) return planUsizeTokenValue(entry.plan, ":costs=") != null;
+
+    if (std.mem.eql(u8, name, "operations_matches_3")) return corpusFixtureOperationsSummaryMatchesPlan(entry, 3);
+    if (std.mem.eql(u8, name, "operations_matches_2")) return corpusFixtureOperationsSummaryMatchesPlan(entry, 2);
+    if (std.mem.eql(u8, name, "allows_returning")) return corpusFixtureAllowsReturningSummary(entry);
+    if (std.mem.eql(u8, name, "returning_matches_1")) return corpusFixtureReturningSummaryMatchesPlan(entry, 1);
+    if (std.mem.eql(u8, name, "returning_all_matches_true")) return corpusFixtureReturningAllSummaryMatchesPlan(entry, true);
+    if (std.mem.eql(u8, name, "allows_conflict_where")) return corpusFixtureAllowsConflictWhereSummary(entry);
+    if (std.mem.eql(u8, name, "conflict_where_matches_false")) return corpusFixtureConflictWhereSummaryMatchesPlan(entry, false);
+    if (std.mem.eql(u8, name, "allows_mutation_transform")) return corpusFixtureAllowsMutationTransformSummary(entry);
+    if (std.mem.eql(u8, name, "transform_matches_plan")) return corpusFixtureTransformSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_source_assignments")) return corpusFixtureAllowsSourceAssignmentsSummary(entry);
+    if (std.mem.eql(u8, name, "source_assignments_match_2")) return corpusFixtureSourceAssignmentsSummaryMatchesPlan(entry, 2);
+    if (std.mem.eql(u8, name, "allows_merge_arm")) return corpusFixtureAllowsMergeArmSummary(entry);
+    if (std.mem.eql(u8, name, "merge_arm_matches_plan")) return corpusFixtureMergeArmSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_aggregate")) return corpusFixtureAllowsAggregateSummary(entry);
+    if (std.mem.eql(u8, name, "aggregate_matches_plan")) return corpusFixtureAggregateSummaryMatchesPlan(entry);
+
+    if (std.mem.eql(u8, name, "ddl_select_matches")) return corpusFixtureDdlSelectSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "ddl_predicate_matches")) return corpusFixtureDdlPredicateSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_predicate")) return corpusFixtureAllowsPredicateSummary(entry);
+    if (std.mem.eql(u8, name, "predicate_matches")) return corpusFixturePredicateSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_access")) return corpusFixtureAllowsAccessSummary(entry);
+    if (std.mem.eql(u8, name, "access_matches")) return corpusFixtureAccessSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "select_matches")) return corpusFixtureSelectSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_full_query_output")) return corpusFixtureAllowsFullQueryOutputSummary(entry);
+    if (std.mem.eql(u8, name, "full_query_output_matches")) return corpusFixtureFullQueryOutputSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_pagination")) return corpusFixtureAllowsPaginationSummary(entry);
+    if (std.mem.eql(u8, name, "pagination_matches")) return corpusFixturePaginationSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_row_claim")) return corpusFixtureAllowsRowClaimSummary(entry);
+    if (std.mem.eql(u8, name, "row_claim_matches")) return corpusFixtureRowClaimSummaryMatchesPlan(entry);
+    if (std.mem.eql(u8, name, "allows_join_select")) return corpusFixtureAllowsJoinSelectSummary(entry);
+    if (std.mem.eql(u8, name, "join_select_matches_1")) return corpusFixtureJoinSelectSummaryMatchesPlan(entry, 1);
+    if (std.mem.eql(u8, name, "allows_join_on")) return corpusFixtureAllowsJoinOnSummary(entry);
+    if (std.mem.eql(u8, name, "join_on_matches_1")) return corpusFixtureJoinOnSummaryMatchesPlan(entry, 1);
+    if (std.mem.eql(u8, name, "allows_window")) return corpusFixtureAllowsWindowSummary(entry);
+    if (std.mem.eql(u8, name, "window_matches_1")) return corpusFixtureWindowSummaryMatchesPlan(entry, 1);
+    if (std.mem.eql(u8, name, "allows_lateral")) return corpusFixtureAllowsLateralSummary(entry);
+    if (std.mem.eql(u8, name, "lateral_matches")) return corpusFixtureLateralSummaryMatchesPlan(entry);
+
+    return error.TestUnexpectedResult;
 }
 
 fn fixtureWriteObjectComma(writer: anytype, first: *bool) !void {
@@ -3670,41 +3748,24 @@ test "sql adapter corpus exact-token helpers reject ddl submode suffixes" {
     try std.testing.expect(planHasExactStringToken(population, "relation_population:mode=", "create_table_as_extra"));
 }
 
-test "sql adapter corpus explain wrapper predicates are exact" {
-    const write_suffix = AppParityCorpusEntry{
-        .family = .explain,
-        .summary = .{ .returning = 1 },
-        .plan = "explain:kind=write_extra:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
-    };
-    try std.testing.expect(!explainPlanHasKind(write_suffix.plan, "write"));
-    try std.testing.expect(!corpusFixtureAllowsReturningSummary(write_suffix));
-    try std.testing.expect(!corpusExplainWriteInnerHasPrefix(write_suffix, ":inner=insert:"));
+test "sql adapter corpus data-driven summary regressions" {
+    const alloc = std.testing.allocator;
+    const fixture_json = @embedFile("../fixtures/sql_api_summary_regressions.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
+    defer parsed.deinit();
 
-    const duplicate_inner = AppParityCorpusEntry{
-        .family = .explain,
-        .summary = .{ .returning = 1 },
-        .plan = "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:inner=update_source:table=usage_records",
+    const root = try fixtureJsonObject(parsed.value);
+    try fixtureRequireOnlyKeys(root, &.{ "summary_format", "cases" });
+    const summary_format = try fixtureJsonOptionalU64(root, "summary_format", 0);
+    if (summary_format != app_parity_summary_regression_fixture_format) return error.TestUnexpectedResult;
+    const cases = switch (root.get("cases") orelse return error.TestUnexpectedResult) {
+        .array => |array| array.items,
+        else => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(!corpusExplainWriteInnerHasPrefix(duplicate_inner, ":inner=insert:"));
-
-    const read_suffix = AppParityCorpusEntry{
-        .family = .explain,
-        .plan = "explain:kind=read_extra:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=0:select=1:order=0:limit=none:claim=none",
-    };
-    try std.testing.expect(!corpusReadPlanHasPrefix(read_suffix, "read:query:"));
-
-    const read_stray_prefix = AppParityCorpusEntry{
-        .family = .explain,
-        .plan = "explain:kind=read:analyze=false:detail=read:query:inner=read:join:join:type=inner:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=none",
-    };
-    try std.testing.expect(!corpusReadPlanHasPrefix(read_stray_prefix, "read:query:"));
-
-    const options = "explain:kind=read:analyze=true_extra:inner=read:query:query:table=usage_records:format=:verbose=1:costs=0";
-    try std.testing.expect(explainPlanHasKind(options, "read"));
-    try std.testing.expect(!planHasExactBoolToken(options, ":analyze=", true));
-    try std.testing.expect(!planHasStringToken(options, ":format="));
-    try std.testing.expect(planUsizeTokenValue(options, ":verbose=") != null);
-    try std.testing.expect(planUsizeTokenValue(options, ":costs=") != null);
+    if (cases.len == 0) return error.TestUnexpectedResult;
+    for (cases) |regression_case| {
+        try checkSummaryRegressionCase(alloc, regression_case);
+    }
 }
 
 test "sql adapter corpus data-driven coverage regressions" {
@@ -3776,217 +3837,6 @@ test "sql adapter corpus parses data-driven coverage requirements" {
     var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
     defer parsed_incomplete.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRequirementsRootAlloc(alloc, parsed_incomplete.value));
-}
-
-test "sql adapter corpus validates fixture mutation and aggregate summaries" {
-    const ddl_entry = AppParityCorpusEntry{
-        .name = "create table",
-        .sql = "CREATE TABLE usage_records (id text PRIMARY KEY)",
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table, .operations = 3 },
-        .plan = "ddl:create_table:table=usage_records:columns=2:unique=1:fk=1:checks=1:if_not_exists=false:pk=1",
-    };
-    try std.testing.expect(corpusFixtureOperationsSummaryMatchesPlan(ddl_entry, 3));
-    try std.testing.expect(!corpusFixtureOperationsSummaryMatchesPlan(ddl_entry, 2));
-
-    const insert_entry = AppParityCorpusEntry{
-        .name = "insert returning",
-        .sql = "INSERT INTO usage_records (id) VALUES ('u1') RETURNING *",
-        .family = .insert,
-        .summary = .{ .returning = 1, .returning_all = true, .conflict_where = false },
-        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:returning_all=1",
-    };
-    try std.testing.expect(corpusFixtureAllowsReturningSummary(insert_entry));
-    try std.testing.expect(corpusFixtureReturningSummaryMatchesPlan(insert_entry, 1));
-    try std.testing.expect(corpusFixtureReturningAllSummaryMatchesPlan(insert_entry, true));
-    try std.testing.expect(corpusFixtureAllowsConflictWhereSummary(insert_entry));
-    try std.testing.expect(corpusFixtureConflictWhereSummaryMatchesPlan(insert_entry, false));
-
-    const insert_source_entry = AppParityCorpusEntry{
-        .name = "insert source conflict transform",
-        .sql = "INSERT INTO usage_records SELECT * FROM staged_records ON CONFLICT DO UPDATE SET count = count + 1",
-        .family = .insert_source,
-        .summary = .{ .patch_expressions = 1, .increment_expressions = 1, .json_set_expressions = 1 },
-        .plan = "insert_source:table=usage_records:source_table=staged_records:assignments=2:conflict=1:returning=0:returning_expr=0:returning_all=0:conflict_patch_expr=1:conflict_increment_expr=1:conflict_json_set_expr=1",
-    };
-    try std.testing.expect(corpusFixtureAllowsMutationTransformSummary(insert_source_entry));
-    try std.testing.expect(corpusFixtureTransformSummaryMatchesPlan(insert_source_entry));
-
-    const joined_update_entry = AppParityCorpusEntry{
-        .name = "joined update source assignments",
-        .sql = "UPDATE usage_records SET status = staged.status FROM staged_records staged WHERE usage_records.id = staged.id",
-        .family = .update_joined_source,
-        .summary = .{ .source_assignments = 2 },
-        .plan = "update_joined_source:target=usage_records:source=staged_records:left_pred=0:right_pred=0:on=1:ops=1:source_assignments=2:returning=0:returning_expr=0",
-    };
-    try std.testing.expect(corpusFixtureAllowsSourceAssignmentsSummary(joined_update_entry));
-    try std.testing.expect(corpusFixtureSourceAssignmentsSummaryMatchesPlan(joined_update_entry, 2));
-
-    const merge_entry = AppParityCorpusEntry{
-        .name = "merge arms",
-        .sql = "MERGE INTO usage_records USING staged_records ON usage_records.id = staged_records.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN DO NOTHING",
-        .family = .merge_mutation,
-        .summary = .{ .matched_predicates = 1, .matched_delete = true, .matched_do_nothing = false, .not_matched_predicates = 0, .not_matched_do_nothing = true },
-        .plan = "merge_mutation:target=usage_records:source=staged_records:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0",
-    };
-    try std.testing.expect(corpusFixtureAllowsMergeArmSummary(merge_entry));
-    try std.testing.expect(corpusFixtureMergeArmSummaryMatchesPlan(merge_entry));
-
-    const aggregate_entry = AppParityCorpusEntry{
-        .name = "aggregate",
-        .sql = "SELECT tenant_id, count(*) FROM usage_records GROUP BY tenant_id",
-        .family = .aggregate,
-        .summary = .{ .group_by = 1, .group_expressions = 0, .aggregations = 1, .filter_groups = 0, .having = 0, .having_expressions = 0, .having_any = 0, .having_not = 0 },
-        .plan = "aggregate:table=usage_records:group=1:group_expr=0:aggs=1:having=0",
-    };
-    try std.testing.expect(corpusFixtureAllowsAggregateSummary(aggregate_entry));
-    try std.testing.expect(corpusFixtureAggregateSummaryMatchesPlan(aggregate_entry));
-}
-
-test "sql adapter corpus validates ddl select and predicate summaries" {
-    const create_index_entry = AppParityCorpusEntry{
-        .name = "create index expression",
-        .sql = "CREATE INDEX usage_records_expr_idx ON usage_records (status, lower(id)) WHERE status = 'active'",
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_index, .select = 2, .predicates = 1 },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=1:unique=false:if_not_exists=false",
-    };
-    try std.testing.expect(corpusFixtureDdlSelectSummaryMatchesPlan(create_index_entry));
-    try std.testing.expect(corpusFixtureDdlPredicateSummaryMatchesPlan(create_index_entry));
-
-    const stale_select_entry = AppParityCorpusEntry{
-        .name = "stale index expression",
-        .sql = create_index_entry.sql,
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_index, .select = 2, .predicates = 1 },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false",
-    };
-    try std.testing.expect(!corpusFixtureDdlSelectSummaryMatchesPlan(stale_select_entry));
-    try std.testing.expect(corpusFixtureDdlPredicateSummaryMatchesPlan(stale_select_entry));
-
-    const stale_predicate_entry = AppParityCorpusEntry{
-        .name = "stale index predicate",
-        .sql = create_index_entry.sql,
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_index, .select = 2, .predicates = 1 },
-        .plan = "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=false:if_not_exists=false",
-    };
-    try std.testing.expect(corpusFixtureDdlSelectSummaryMatchesPlan(stale_predicate_entry));
-    try std.testing.expect(!corpusFixtureDdlPredicateSummaryMatchesPlan(stale_predicate_entry));
-
-    const session_entry = AppParityCorpusEntry{
-        .name = "session ddl without select",
-        .sql = "DISCARD ALL",
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .discard_all },
-        .plan = "ddl:session:discard_all",
-    };
-    try std.testing.expect(corpusFixtureDdlSelectSummaryMatchesPlan(session_entry));
-    try std.testing.expect(corpusFixtureDdlPredicateSummaryMatchesPlan(session_entry));
-}
-
-test "sql adapter corpus validates read shape fixture summaries" {
-    const query_entry = AppParityCorpusEntry{
-        .name = "query summaries",
-        .sql = "SELECT DISTINCT ON (tenant_id) id, status FROM usage_records WHERE attrs @> '{}' ORDER BY tenant_id LIMIT 10 OFFSET 2 FOR UPDATE SKIP LOCKED",
-        .family = .query,
-        .summary = .{
-            .predicates = 1,
-            .json_contains = 1,
-            .select = 2,
-            .select_all = true,
-            .distinct_on = 1,
-            .order_by = 1,
-            .limit = 10,
-            .offset = 2,
-            .row_claim_skip_locked = true,
-        },
-        .plan = "query:table=usage_records:pred=1:json_contains=1:select=2:select_all=1:distinct_on=1:order=1:limit=10:offset=2:claim=skip_locked",
-    };
-    try std.testing.expect(corpusFixtureAllowsPredicateSummary(query_entry));
-    try std.testing.expect(corpusFixturePredicateSummaryMatchesPlan(query_entry));
-    try std.testing.expect(corpusFixtureAllowsAccessSummary(query_entry));
-    try std.testing.expect(corpusFixtureAccessSummaryMatchesPlan(query_entry));
-    try std.testing.expect(corpusFixtureSelectSummaryMatchesPlan(query_entry));
-    try std.testing.expect(corpusFixtureAllowsFullQueryOutputSummary(query_entry));
-    try std.testing.expect(corpusFixtureFullQueryOutputSummaryMatchesPlan(query_entry));
-    try std.testing.expect(corpusFixtureAllowsPaginationSummary(query_entry));
-    try std.testing.expect(corpusFixturePaginationSummaryMatchesPlan(query_entry));
-    try std.testing.expect(corpusFixtureAllowsRowClaimSummary(query_entry));
-    try std.testing.expect(corpusFixtureRowClaimSummaryMatchesPlan(query_entry));
-
-    const join_entry = AppParityCorpusEntry{
-        .name = "join summaries",
-        .sql = "SELECT usage_records.id FROM usage_records JOIN users ON usage_records.user_id = users.id",
-        .family = .join,
-        .summary = .{
-            .predicates = 2,
-            .text_patterns = 3,
-            .join_select = 1,
-            .join_on = 1,
-            .row_claim_skip_locked = false,
-        },
-        .plan = "join:left=usage_records:right=users:left_pred=1:right_pred=1:left_text=1:right_text=2:select=1:on=1:claim=nowait",
-    };
-    try std.testing.expect(corpusFixtureAllowsPredicateSummary(join_entry));
-    try std.testing.expect(corpusFixturePredicateSummaryMatchesPlan(join_entry));
-    try std.testing.expect(corpusFixtureAllowsAccessSummary(join_entry));
-    try std.testing.expect(corpusFixtureAccessSummaryMatchesPlan(join_entry));
-    try std.testing.expect(corpusFixtureAllowsJoinSelectSummary(join_entry));
-    try std.testing.expect(corpusFixtureJoinSelectSummaryMatchesPlan(join_entry, 1));
-    try std.testing.expect(corpusFixtureAllowsJoinOnSummary(join_entry));
-    try std.testing.expect(corpusFixtureJoinOnSummaryMatchesPlan(join_entry, 1));
-    try std.testing.expect(corpusFixtureAllowsRowClaimSummary(join_entry));
-    try std.testing.expect(corpusFixtureRowClaimSummaryMatchesPlan(join_entry));
-
-    const read_window_entry = AppParityCorpusEntry{
-        .name = "wrapped window summaries",
-        .sql = "SELECT id, row_number() OVER (PARTITION BY tenant_id) FROM usage_records",
-        .family = .read,
-        .summary = .{
-            .predicates = 1,
-            .json_path_eq = 1,
-            .select = 2,
-            .windows = 1,
-        },
-        .plan = "read:window:table=usage_records:source_pred=1:source_json_eq=1:select=2:windows=1",
-    };
-    try std.testing.expect(corpusFixtureAllowsPredicateSummary(read_window_entry));
-    try std.testing.expect(corpusFixturePredicateSummaryMatchesPlan(read_window_entry));
-    try std.testing.expect(corpusFixtureAllowsAccessSummary(read_window_entry));
-    try std.testing.expect(corpusFixtureAccessSummaryMatchesPlan(read_window_entry));
-    try std.testing.expect(corpusFixtureSelectSummaryMatchesPlan(read_window_entry));
-    try std.testing.expect(corpusFixtureAllowsWindowSummary(read_window_entry));
-    try std.testing.expect(corpusFixtureWindowSummaryMatchesPlan(read_window_entry, 1));
-
-    const lateral_entry = AppParityCorpusEntry{
-        .name = "lateral summaries",
-        .sql = "SELECT usage_records.id FROM usage_records JOIN LATERAL (...) l ON true",
-        .family = .lateral,
-        .summary = .{
-            .expression_array_contains = 2,
-            .join_select = 1,
-            .lateral_correlations = 1,
-            .right_offset = 4,
-        },
-        .plan = "lateral:left=usage_records:right=usage_events:left_expr_array=1:right_expr_array=1:select=1:corr=1:right_offset=4",
-    };
-    try std.testing.expect(corpusFixtureAllowsAccessSummary(lateral_entry));
-    try std.testing.expect(corpusFixtureAccessSummaryMatchesPlan(lateral_entry));
-    try std.testing.expect(corpusFixtureAllowsJoinSelectSummary(lateral_entry));
-    try std.testing.expect(corpusFixtureJoinSelectSummaryMatchesPlan(lateral_entry, 1));
-    try std.testing.expect(corpusFixtureAllowsLateralSummary(lateral_entry));
-    try std.testing.expect(corpusFixtureLateralSummaryMatchesPlan(lateral_entry));
-
-    const bad_pagination_entry = AppParityCorpusEntry{
-        .name = "stale pagination",
-        .sql = query_entry.sql,
-        .family = .query,
-        .summary = .{ .limit = 5 },
-        .plan = "query:table=usage_records:limit=10",
-    };
-    try std.testing.expect(corpusFixtureAllowsPaginationSummary(bad_pagination_entry));
-    try std.testing.expect(!corpusFixturePaginationSummaryMatchesPlan(bad_pagination_entry));
 }
 
 fn appParitySqlHasComputedPattern(sql: []const u8) bool {
