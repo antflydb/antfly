@@ -11879,6 +11879,30 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"hello\"") != null);
 
+    var sample_documents_zero_limit_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"limit\":0}}}",
+    });
+    defer sample_documents_zero_limit_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), sample_documents_zero_limit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "limit must be greater than 0") != null);
+
+    var sample_documents_large_limit_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"limit\":101}}}",
+    });
+    defer sample_documents_large_limit_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), sample_documents_large_limit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "limit exceeds maximum sample size") != null);
+
     var describe_capabilities_resp = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,

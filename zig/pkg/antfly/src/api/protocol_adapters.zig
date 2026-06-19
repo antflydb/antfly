@@ -22,6 +22,7 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 
 const trusted_principal_header = "X-Antfly-Trusted-Principal";
+const max_mcp_sample_documents_limit: i64 = 100;
 
 const McpToolKind = enum {
     create_table,
@@ -383,8 +384,11 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const limit = jsonIntArg(args, "limit") orelse 5;
+            if (limit <= 0) return mcpError(alloc, "limit must be greater than 0");
+            if (limit > max_mcp_sample_documents_limit) return mcpError(alloc, "limit exceeds maximum sample size");
             var body = std.json.ObjectMap.empty;
-            try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 5 });
+            try body.put(alloc, "limit", .{ .integer = limit });
             if (jsonStringArg(args, "from")) |from| if (from.len != 0) try body.put(alloc, "from", .{ .string = from });
             if (jsonStringArg(args, "to")) |to| if (to.len != 0) try body.put(alloc, "to", .{ .string = to });
             if (jsonBoolArg(args, "inclusiveFrom")) |inclusive| try body.put(alloc, "inclusive_from", .{ .bool = inclusive });
