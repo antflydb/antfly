@@ -1274,10 +1274,11 @@ implementations cleanly:
     sequence to select all-record stats/replay/latest-op paths when the whole
     value is newer than the base generation, and committed segment readers also
     use segment-level min-delta metadata to take that path for every matching
-    value in an all-live segment. Delta-tail readers skip base-only and
-    centroid-only segment files from manifest metadata before opening or reading
-    their indexes. Allocation-returning delta loads,
-    stats reads, and scratch replay now all skip segment bytes entirely when
+    value in an all-live segment. Delta-tail readers and lower-level segment
+    delta helper functions skip base-only and centroid-only segment files from
+    manifest metadata before opening or reading their indexes.
+    Allocation-returning delta loads, stats reads, and scratch replay now all
+    skip segment bytes entirely when
     manifest max-sequence metadata proves the requested base generation already
     covers every delta in that segment. This removes the duplicate
     stats-then-replay scans, delta-location lists, and owned delta slices that
