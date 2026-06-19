@@ -3320,6 +3320,7 @@ pub fn build(b: *std.Build) void {
             "ARD search filters scoped catalog entries",
             "ARD search supports publisher and metadata filters",
             "ARD explore returns requested facet buckets over scoped entries",
+            "ARD extension package entries use trust provenance for artifact digests",
             "auth row filter resolver expands username references",
             "auth row filter resolver expands metadata references",
             "auth row filter validator accepts username references",

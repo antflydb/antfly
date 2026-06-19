@@ -46,6 +46,7 @@ const Entry = struct {
     url: ?[]const u8 = null,
     data: ?[]const u8 = null,
     metadata: ?[]const u8 = null,
+    trust_manifest: ?[]const u8 = null,
     tags: []const []const u8 = &.{},
     capabilities: []const []const u8 = &.{},
     representative_queries: []const []const u8 = &.{},
@@ -98,6 +99,10 @@ const Entry = struct {
         if (self.metadata) |metadata| {
             try writer.writeAll(",\"metadata\":");
             try writer.writeAll(metadata);
+        }
+        if (self.trust_manifest) |trust_manifest| {
+            try writer.writeAll(",\"trustManifest\":");
+            try writer.writeAll(trust_manifest);
         }
     }
 };
@@ -265,7 +270,7 @@ const tenant_entries = [_]Entry{
         .media_type = "application/openapi+yaml",
         .description = "Machine-readable OpenAPI specification for Antfly ARD discovery APIs.",
         .url = "/ard/v1/openapi.yaml",
-        .metadata = "{\"sourceSpec\":\"ard:v1\",\"requiredPermissions\":[\"tenant-api\"]}",
+        .metadata = "{\"sourceSpec\":\"ard:v1\",\"requiredPermissions\":\"tenant-api\"}",
         .tags = &.{ "openapi", "api", "public" },
         .capabilities = &.{ "table-management", "query", "retrieval", "extensions" },
         .representative_queries = &.{ "call the Antfly table query API", "manage Antfly extensions through HTTP", "inspect table schemas through OpenAPI" },
@@ -276,7 +281,7 @@ const tenant_entries = [_]Entry{
         .media_type = "application/openapi+yaml",
         .description = "Joined public OpenAPI specification for Antfly server APIs.",
         .url = "/ard/v1/openapi/antfly.yaml",
-        .metadata = "{\"sourceSpec\":\"openapi.yaml\",\"requiredPermissions\":[\"tenant-api\"]}",
+        .metadata = "{\"sourceSpec\":\"openapi.yaml\",\"requiredPermissions\":\"tenant-api\"}",
         .tags = &.{ "openapi", "api", "public" },
         .capabilities = &.{ "table-management", "query", "retrieval", "transactions", "extensions", "auth" },
         .representative_queries = &.{ "call Antfly APIs from an OpenAPI client", "generate an Antfly SDK", "inspect Antfly API request schemas" },
@@ -287,7 +292,7 @@ const tenant_entries = [_]Entry{
         .media_type = "application/openapi+yaml",
         .description = "OpenAPI specification for Antfly table, transaction, retrieval, and admin metadata APIs.",
         .url = "/ard/v1/openapi/metadata.yaml",
-        .metadata = "{\"sourceSpec\":\"specs/openapi/antfly/metadata.yaml\",\"requiredPermissions\":[\"tenant-api\"]}",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/antfly/metadata.yaml\",\"requiredPermissions\":\"tenant-api\"}",
         .tags = &.{ "openapi", "api", "metadata" },
         .capabilities = &.{ "table-management", "query", "retrieval", "transactions", "cluster-status" },
         .representative_queries = &.{ "inspect Antfly table APIs", "call the retrieval agent API", "manage Antfly transactions" },
@@ -298,7 +303,7 @@ const tenant_entries = [_]Entry{
         .media_type = "application/openapi+yaml",
         .description = "OpenAPI specification for extension package and lifecycle management.",
         .url = "/ard/v1/openapi/extensions.yaml",
-        .metadata = "{\"sourceSpec\":\"specs/openapi/extensions/api.yaml\",\"requiredPermissions\":[\"admin\"]}",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/extensions/api.yaml\",\"requiredPermissions\":\"admin\"}",
         .tags = &.{ "openapi", "api", "extensions", "admin" },
         .capabilities = &.{ "extension-install", "extension-config", "extension-lifecycle", "package-catalog" },
         .representative_queries = &.{ "install an Antfly extension through OpenAPI", "inspect installed extension config", "list extension packages" },
@@ -310,7 +315,7 @@ const tenant_entries = [_]Entry{
         .media_type = "application/openapi+yaml",
         .description = "OpenAPI specification for user, API key, permission, role, and row-filter management.",
         .url = "/ard/v1/openapi/auth.yaml",
-        .metadata = "{\"sourceSpec\":\"specs/openapi/auth/api.yaml\",\"requiredPermissions\":[\"admin\"]}",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/auth/api.yaml\",\"requiredPermissions\":\"admin\"}",
         .tags = &.{ "openapi", "api", "auth", "admin" },
         .capabilities = &.{ "user-management", "api-key-management", "permissions", "row-filters", "roles" },
         .representative_queries = &.{ "create an Antfly API key", "assign table permissions to a user", "configure row filters" },
@@ -322,7 +327,7 @@ const tenant_entries = [_]Entry{
         .media_type = "application/openapi+yaml",
         .description = "OpenAPI specification for Antfly inference and model-serving APIs.",
         .url = "/ard/v1/openapi/inference-config.yaml",
-        .metadata = "{\"sourceSpec\":\"specs/openapi/inference/config.yaml\",\"requiredPermissions\":[\"inference-api\"]}",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/inference/config.yaml\",\"requiredPermissions\":\"inference-api\"}",
         .tags = &.{ "openapi", "api", "inference" },
         .capabilities = &.{ "embedding", "chunking", "reranking", "generation", "extraction", "transcription" },
         .representative_queries = &.{ "embed text through Antfly inference", "rerank search results", "list local inference models" },
@@ -567,6 +572,9 @@ fn writeCatalogPrefix(writer: *std.Io.Writer, options: CatalogOptions) !void {
     try std.json.Stringify.value(options.display_name, .{}, writer);
     try writer.writeAll(",\"identifier\":");
     try writeStringFmt(writer, "did:web:{s}", .{options.publisher_domain});
+    try writer.writeAll(",\"trustManifest\":");
+    try writeTrustManifestPrefix(writer, options.publisher_domain);
+    try writer.writeByte('}');
     try writer.writeAll("},\"entries\":[");
 }
 
@@ -938,9 +946,33 @@ fn writeExtensionPackageFields(writer: *std.Io.Writer, publisher_domain: []const
     try std.json.Stringify.value(@tagName(package.kind), .{}, writer);
     try writer.writeAll(",\"trusted\":");
     try std.json.Stringify.value(package.trusted, .{}, writer);
-    try writer.writeAll(",\"artifacts\":");
-    try writePackageArtifacts(writer, package.artifacts);
+    try writer.writeAll(",\"artifactCount\":");
+    try writer.print("{d}", .{package.artifacts.len});
+    try writer.writeAll(",\"capabilitiesRequestedCount\":");
+    try writer.print("{d}", .{package.capabilities_requested.len});
+    try writer.writeAll("},\"trustManifest\":");
+    try writePackageTrustManifest(writer, publisher_domain, package);
+}
+
+fn writePackageTrustManifest(writer: *std.Io.Writer, publisher_domain: []const u8, package: extension_domain.PackageManifest) !void {
+    try writeTrustManifestPrefix(writer, publisher_domain);
+    try writer.writeAll(",\"provenance\":[");
+    try writer.writeAll("{\"relation\":\"publishedFrom\",\"sourceId\":");
+    try writeStringFmt(writer, "/extensions/v1/packages/{s}/versions/{s}", .{ package.name, package.version });
+    try writer.writeAll(",\"sourceDigest\":");
+    try std.json.Stringify.value(package.digest, .{}, writer);
     try writer.writeByte('}');
+    for (package.artifacts) |artifact| {
+        try writer.writeByte(',');
+        try writer.writeAll("{\"relation\":\"derivedFrom\",\"sourceId\":");
+        try std.json.Stringify.value(artifact.path, .{}, writer);
+        if (artifact.digest.len > 0) {
+            try writer.writeAll(",\"sourceDigest\":");
+            try std.json.Stringify.value(artifact.digest, .{}, writer);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
 }
 
 fn writeInstalledExtensionFields(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
@@ -965,25 +997,28 @@ fn writeInstalledExtensionFields(writer: *std.Io.Writer, publisher_domain: []con
     try writer.writeAll(",\"status\":");
     try std.json.Stringify.value(@tagName(installed.status), .{}, writer);
     try writer.writeAll(",\"scope\":");
-    try writeExtensionScope(writer, installed.scope);
-    try writer.writeAll(",\"grantedCapabilities\":");
-    try writeCapabilitiesFromGrants(writer, installed.granted_capabilities);
-    try writer.writeByte('}');
+    try writeExtensionScopeString(writer, installed.scope);
+    try writer.writeAll(",\"scopeKind\":");
+    try std.json.Stringify.value(@tagName(installed.scope.kind), .{}, writer);
+    if (installed.scope.kind == .table) {
+        try writer.writeAll(",\"scopeTableName\":");
+        try std.json.Stringify.value(installed.scope.table_name, .{}, writer);
+    }
+    try writer.writeAll(",\"grantedCapabilitiesCount\":");
+    try writer.print("{d}", .{installed.granted_capabilities.len});
+    try writer.writeAll("},\"trustManifest\":");
+    try writeInstalledExtensionTrustManifest(writer, publisher_domain, installed);
 }
 
-fn writePackageArtifacts(writer: *std.Io.Writer, artifacts: []const extension_domain.PackageArtifact) !void {
-    try writer.writeByte('[');
-    for (artifacts, 0..) |artifact, index| {
-        if (index > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"kind\":");
-        try std.json.Stringify.value(@tagName(artifact.kind), .{}, writer);
-        try writer.writeAll(",\"path\":");
-        try std.json.Stringify.value(artifact.path, .{}, writer);
-        try writer.writeAll(",\"digest\":");
-        try std.json.Stringify.value(artifact.digest, .{}, writer);
-        try writer.writeByte('}');
+fn writeInstalledExtensionTrustManifest(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
+    try writeTrustManifestPrefix(writer, publisher_domain);
+    try writer.writeAll(",\"provenance\":[{\"relation\":\"derivedFrom\",\"sourceId\":");
+    try writeStringFmt(writer, "/extensions/v1/packages/{s}/versions/{s}", .{ installed.package_name, installed.package_version });
+    if (installed.package_digest.len > 0) {
+        try writer.writeAll(",\"sourceDigest\":");
+        try std.json.Stringify.value(installed.package_digest, .{}, writer);
     }
-    try writer.writeByte(']');
+    try writer.writeAll("}]}");
 }
 
 fn writeExtensionMcpFields(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
@@ -1006,14 +1041,12 @@ fn writeExtensionMcpFields(writer: *std.Io.Writer, publisher_domain: []const u8,
     try writer.writeByte('}');
 }
 
-fn writeExtensionScope(writer: *std.Io.Writer, scope: extension_domain.ExtensionScope) !void {
-    try writer.writeAll("{\"kind\":");
-    try std.json.Stringify.value(@tagName(scope.kind), .{}, writer);
+fn writeExtensionScopeString(writer: *std.Io.Writer, scope: extension_domain.ExtensionScope) !void {
     if (scope.kind == .table) {
-        try writer.writeAll(",\"tableName\":");
-        try std.json.Stringify.value(scope.table_name, .{}, writer);
+        try writeStringFmt(writer, "table:{s}", .{scope.table_name});
+    } else {
+        try std.json.Stringify.value(@tagName(scope.kind), .{}, writer);
     }
-    try writer.writeByte('}');
 }
 
 fn writeCapabilitiesFromGrants(writer: *std.Io.Writer, capabilities: []const extension_domain.Capability) !void {
@@ -1023,6 +1056,12 @@ fn writeCapabilitiesFromGrants(writer: *std.Io.Writer, capabilities: []const ext
         try std.json.Stringify.value(capability.name, .{}, writer);
     }
     try writer.writeByte(']');
+}
+
+fn writeTrustManifestPrefix(writer: *std.Io.Writer, publisher_domain: []const u8) !void {
+    try writer.writeAll("{\"identity\":");
+    try writeStringFmt(writer, "did:web:{s}", .{publisher_domain});
+    try writer.writeAll(",\"identityType\":\"did\",\"trustSchema\":{\"identifier\":\"urn:antfly:ard:trust-schema:v1\",\"version\":\"1\",\"verificationMethods\":[\"did\",\"dns-01\"]}");
 }
 
 fn capabilityNamesAlloc(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) ![][]const u8 {
@@ -1439,6 +1478,7 @@ test "ARD catalog entries contain required value or reference fields" {
 
     const root = parsed.value.object;
     try std.testing.expect(root.get("specVersion") != null);
+    try std.testing.expect(root.get("host").?.object.get("trustManifest") != null);
     const entries = root.get("entries").?.array.items;
     try std.testing.expect(entries.len >= 9);
     for (entries) |entry| {
@@ -1449,7 +1489,59 @@ test "ARD catalog entries contain required value or reference fields" {
         const has_url = object.get("url") != null;
         const has_data = object.get("data") != null;
         try std.testing.expect(has_url != has_data);
+        if (object.get("metadata")) |metadata| try expectMetadataValuesAreScalars(metadata);
     }
+}
+
+test "ARD extension package entries use trust provenance for artifact digests" {
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "docsaf",
+        .version = "1.0.0",
+        .digest = "sha256:docs",
+        .trusted = true,
+        .capabilities_requested = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .artifacts = &.{
+            .{ .kind = .manifest, .path = "extension.json", .digest = "sha256:docs-manifest" },
+            .{ .kind = .wasm, .path = "docsaf.wasm", .digest = "sha256:docs-wasm" },
+        },
+        .install = .{ .scopes_supported = &.{.table} },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "docsaf",
+        .package_name = "docsaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:docs",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .granted_capabilities = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .status = .ready,
+    }};
+    const ctx: ExtensionCatalogContext = .{
+        .extension_packages = &packages,
+        .installed_extensions = &installed,
+    };
+
+    const body = try catalogJsonWithExtensionsAlloc(std.testing.allocator, .{ .mode = .tenant }, ctx);
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const package_entry = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension-package:docsaf:1.0.0");
+    const package_metadata = package_entry.object.get("metadata").?;
+    try expectMetadataValuesAreScalars(package_metadata);
+    try std.testing.expect(package_metadata.object.get("artifacts") == null);
+    try std.testing.expectEqual(@as(i64, 2), package_metadata.object.get("artifactCount").?.integer);
+
+    const trust_manifest = package_entry.object.get("trustManifest").?;
+    try std.testing.expectEqualStrings("did:web:antfly.local", trust_manifest.object.get("identity").?.string);
+    const provenance = trust_manifest.object.get("provenance").?.array.items;
+    try std.testing.expect(provenance.len >= 3);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"sourceDigest\":\"sha256:docs-wasm\"") != null);
+
+    const installed_entry = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:installed");
+    try expectMetadataValuesAreScalars(installed_entry.object.get("metadata").?);
+    try std.testing.expectEqualStrings("table:docs", installed_entry.object.get("metadata").?.object.get("scope").?.string);
+    try std.testing.expect(installed_entry.object.get("trustManifest") != null);
 }
 
 test "ARD search filters scoped catalog entries" {
@@ -1498,4 +1590,23 @@ fn expectFacetBucket(facet: std.json.Value, expected: []const u8) !void {
         if (std.mem.eql(u8, bucket.object.get("value").?.string, expected)) return;
     }
     return error.MissingFacetBucket;
+}
+
+fn expectMetadataValuesAreScalars(metadata: std.json.Value) !void {
+    if (metadata != .object) return error.MetadataMustBeObject;
+    var iterator = metadata.object.iterator();
+    while (iterator.next()) |kv| {
+        switch (kv.value_ptr.*) {
+            .string, .integer, .float, .bool, .null => {},
+            else => return error.NonScalarMetadataValue,
+        }
+    }
+}
+
+fn findCatalogEntryByIdentifierSuffix(root: std.json.Value, suffix: []const u8) !std.json.Value {
+    for (root.object.get("entries").?.array.items) |entry| {
+        const identifier = entry.object.get("identifier").?.string;
+        if (std.mem.endsWith(u8, identifier, suffix)) return entry;
+    }
+    return error.CatalogEntryNotFound;
 }

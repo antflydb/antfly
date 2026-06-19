@@ -10811,7 +10811,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"type\":\"application/antfly-installed-extension+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension-package:docsaf:1.0.0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"digest\":\"sha256:docs-wasm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"sourceDigest\":\"sha256:docs-wasm\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension-package:memoryaf:1.0.0") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);

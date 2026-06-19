@@ -305,6 +305,8 @@ Package entry:
 
 If strict `ai-catalog` schema validation rejects structured metadata values, Antfly should keep the package URL as the canonical artifact document and move rich digest/artifact lineage to either that package document or `trustManifest.provenance`. The catalog entry must still preserve ARD's exactly-one-of `url` or `data` rule.
 
+Catalog `metadata` must remain schema-compatible scalar key/value data. Extension package artifact lists, artifact digests, and install lineage belong in `trustManifest.provenance`; the catalog may keep scalar hints such as package digest, package kind, trust boolean, artifact count, scope string, and capability counts in `metadata`.
+
 Installed extension entry:
 
 - `type`: `application/antfly-installed-extension+json`
@@ -356,6 +358,13 @@ Initial trust metadata:
 - package digest for extension packages
 - artifact digests from extension manifests
 - source OpenAPI spec path or generation metadata
+
+Initial implementation should emit:
+
+- host `trustManifest.identity` matching the catalog `did:web` host identifier
+- extension package `trustManifest.provenance` entries for package digest and artifact digests
+- installed extension `trustManifest.provenance` pointing back to the package version and digest
+- scalar-only `metadata` values so catalogs remain compatible with the ARD `ai-catalog` schema
 
 Later:
 
