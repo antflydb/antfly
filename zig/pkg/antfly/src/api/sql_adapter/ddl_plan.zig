@@ -1667,6 +1667,7 @@ pub const BulkIoPlan = struct {
     header: bool = false,
     freeze: bool = false,
     on_error: BulkIoOnErrorPolicy = .stop,
+    reject_limit: ?usize = null,
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
     force_not_null_columns: []const []const u8 = &.{},

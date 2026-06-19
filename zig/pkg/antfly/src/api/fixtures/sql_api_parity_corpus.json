@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "9ff9f41cb8f6819f1c7de74fd18374d51be1c3d291b713ac88adb353b519b77a",
+  "source_sha256": "03e02bc6a1d733d4d3c158ee58448075aa562306bff2275824b758430e73bf20",
   "source_entry_count": 962,
   "entry_count": 962,
   "skipped_entries": [
@@ -3745,19 +3745,19 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
     },
     {
-      "name": "copy from header freeze on error force null delimiter escape null encoding bulk import ddl",
+      "name": "copy from header freeze on error reject limit force null delimiter escape null encoding bulk import ddl",
       "family": "ddl",
       "summary": {
         "ddl_tag": "copy_from",
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:on_error=ignore:force_quote=none:force_quote_columns=0:force_not_null_columns=2:force_null_columns=1:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:encoding_hex=55544638",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8')"
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:on_error=ignore:reject_limit=10:force_quote=none:force_quote_columns=0:force_not_null_columns=2:force_null_columns=1:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:encoding_hex=55544638",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8')"
     },
     {
       "name": "copy to bulk export ddl",
@@ -3767,7 +3767,7 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *)"
     },
     {
@@ -3792,11 +3792,11 @@
       "sql": "COPY usage_records (id, status) TO STDIN"
     },
     {
-      "name": "unsupported copy reject limit option",
+      "name": "unsupported copy log verbosity option",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=bulk_io_plan",
       "classification_reason": "bulk_io_plan",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (REJECT_LIMIT 10)"
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (LOG_VERBOSITY verbose)"
     },
     {
       "name": "create function catalog ddl",

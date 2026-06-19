@@ -141,6 +141,7 @@
     "ddl_copy_null_marker",
     "ddl_copy_on_error_ignore",
     "ddl_copy_quote",
+    "ddl_copy_reject_limit",
     "ddl_copy_to",
     "ddl_create_covering_index",
     "ddl_create_index",
