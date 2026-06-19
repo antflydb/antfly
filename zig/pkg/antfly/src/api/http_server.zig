@@ -262,6 +262,11 @@ pub const ApiHttpServerConfig = struct {
     /// When set, opened external lake sources own an object-range cache with the
     /// named lake-serving policy.
     external_lake_serving_cache_max_bytes: ?usize = null,
+    /// Optional durable range-cache directory for external lake row reads.
+    /// Requires `external_lake_serving_cache_max_bytes` so the in-memory cache
+    /// retains the serving admission policy while using this directory as a
+    /// validated backing store.
+    external_lake_persistent_cache_root_dir: ?[]const u8 = null,
     /// Optional sidecar declarations/candidates for external lake routing.
     /// Operator/query layers can install this while concrete sidecar query
     /// operators are being wired into public requests.
@@ -1549,6 +1554,7 @@ pub const ApiHttpServer = struct {
     fn externalLakeRowsSourceOptions(self: *const ApiHttpServer) table_reads.ExternalObjectStorageLakeRowsSourceOptions {
         return .{
             .serving_cache_max_bytes = self.cfg.external_lake_serving_cache_max_bytes,
+            .persistent_cache_root_dir = self.cfg.external_lake_persistent_cache_root_dir,
             .sidecar_context = self.cfg.external_lake_sidecar_context,
         };
     }

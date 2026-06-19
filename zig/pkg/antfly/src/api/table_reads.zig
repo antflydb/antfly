@@ -5039,6 +5039,7 @@ pub const PinnedExternalObjectStorageLakeRowsSource = struct {
 pub const ExternalObjectStorageLakeRowsSourceOptions = struct {
     cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
     serving_cache_max_bytes: ?usize = null,
+    persistent_cache_root_dir: ?[]const u8 = null,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
     sidecar_context: PinnedExternalLakeSidecarContext = .{},
     file_bucket: []const u8 = "external-lake",
@@ -5091,6 +5092,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     inventory: external_source_api.Inventory,
     pinned_source: PinnedExternalObjectStorageLakeRowsSource,
     owned_cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
+    owned_persistent_cache: ?*serverless_query.LakeParquetPersistentObjectRangeCache = null,
 
     pub fn initExternalLakeAlloc(
         alloc: std.mem.Allocator,
@@ -5109,6 +5111,11 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
             cache.deinit(alloc);
             alloc.destroy(cache);
         };
+        const owned_persistent_cache = try initOwnedPersistentRangeCacheAlloc(alloc, source_options);
+        errdefer if (owned_persistent_cache) |persistent_cache| alloc.destroy(persistent_cache);
+        if (owned_cache) |cache| {
+            if (owned_persistent_cache) |persistent_cache| cache.persistent = persistent_cache;
+        }
         if (source_options.cache == null) source_options.cache = owned_cache;
 
         var inventory = switch (binding.format) {
@@ -5146,6 +5153,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
             .inventory = inventory,
             .pinned_source = pinned_source,
             .owned_cache = owned_cache,
+            .owned_persistent_cache = owned_persistent_cache,
         };
     }
 
@@ -5256,6 +5264,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
             cache.deinit(self.alloc);
             self.alloc.destroy(cache);
         }
+        if (self.owned_persistent_cache) |persistent_cache| self.alloc.destroy(persistent_cache);
         self.inventory.deinit(self.alloc);
         self.* = undefined;
     }
@@ -5265,10 +5274,23 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         options: ExternalObjectStorageLakeRowsSourceOptions,
     ) !?*serverless_query.LakeParquetObjectRangeCache {
         if (options.cache != null and options.serving_cache_max_bytes != null) return error.InvalidRowsRequest;
+        if (options.cache != null and options.persistent_cache_root_dir != null) return error.InvalidRowsRequest;
         const max_bytes = options.serving_cache_max_bytes orelse return null;
         if (max_bytes == 0) return error.InvalidRowsRequest;
         const cache = try alloc.create(serverless_query.LakeParquetObjectRangeCache);
         cache.* = serverless_query.initLakeParquetServingObjectRangeCache(max_bytes);
+        return cache;
+    }
+
+    fn initOwnedPersistentRangeCacheAlloc(
+        alloc: std.mem.Allocator,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !?*serverless_query.LakeParquetPersistentObjectRangeCache {
+        const root_dir = options.persistent_cache_root_dir orelse return null;
+        if (root_dir.len == 0) return error.InvalidRowsRequest;
+        if (options.cache != null or options.serving_cache_max_bytes == null) return error.InvalidRowsRequest;
+        const cache = try alloc.create(serverless_query.LakeParquetPersistentObjectRangeCache);
+        cache.* = serverless_query.LakeParquetPersistentObjectRangeCache.init(root_dir);
         return cache;
     }
 
@@ -18160,6 +18182,11 @@ test "opened object storage lake source owns store and pins parquet prefix inven
 
 test "opened object storage lake source can own serving object range cache" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const persistent_cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lake-range-cache", .{tmp.sub_path});
+    defer alloc.free(persistent_cache_root);
+
     var columns = [_]storage_schema.RelationalColumn{
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
     };
@@ -18215,6 +18242,7 @@ test "opened object storage lake source can own serving object range cache" {
         opened_store,
         .{
             .serving_cache_max_bytes = 1024,
+            .persistent_cache_root_dir = persistent_cache_root,
             .sidecar_context = .{
                 .sidecars = sidecars[0..],
                 .desired_sidecars = desired[0..],
@@ -18224,7 +18252,10 @@ test "opened object storage lake source can own serving object range cache" {
     defer opened_source.deinit();
 
     const owned_cache = opened_source.owned_source.owned_cache orelse return error.TestExpectedEqual;
+    const owned_persistent_cache = opened_source.owned_source.owned_persistent_cache orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(owned_cache, opened_source.owned_source.pinned_source.scanner.cache.?);
+    try std.testing.expectEqual(owned_persistent_cache, owned_cache.persistent.?);
+    try std.testing.expectEqualStrings(persistent_cache_root, owned_persistent_cache.root_dir);
     try std.testing.expectEqual(@as(?usize, 1024), owned_cache.policy.max_total_bytes);
     try std.testing.expect(owned_cache.policy.isProtected(.metadata));
     try std.testing.expect(owned_cache.policy.isProtected(.serving_sidecar));
@@ -18251,6 +18282,24 @@ test "opened object storage lake source can own serving object range cache" {
             .{
                 .cache = &external_cache,
                 .serving_cache_max_bytes = 1024,
+            },
+        ),
+    );
+    const invalid_persistent_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+            alloc,
+            schema,
+            invalid_persistent_store,
+            .{
+                .cache = &external_cache,
+                .persistent_cache_root_dir = persistent_cache_root,
             },
         ),
     );

@@ -28,6 +28,7 @@ const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
 const range_io = @import("lake_range_io.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const fs_paths = @import("../../common/fs_paths.zig");
 const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
@@ -171,10 +172,50 @@ pub const ObjectRangeCacheEntry = struct {
     checksum: ObjectRangeCacheDigest,
 };
 
+pub const PersistentObjectRangeCache = struct {
+    root_dir: []const u8,
+
+    pub fn init(root_dir: []const u8) PersistentObjectRangeCache {
+        return .{ .root_dir = root_dir };
+    }
+
+    pub fn readAlloc(
+        self: PersistentObjectRangeCache,
+        alloc: Allocator,
+        cache_key: []const u8,
+        expected_len: usize,
+    ) !?[]u8 {
+        const path = try self.cachePathAlloc(alloc, cache_key);
+        defer alloc.free(path);
+        const contents = persistentObjectRangeReadFileAlloc(alloc, path) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return null,
+        };
+        defer alloc.free(contents);
+        return try persistentObjectRangeDecodeAlloc(alloc, contents, expected_len);
+    }
+
+    pub fn write(self: PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8, bytes: []const u8) !void {
+        const path = try self.cachePathAlloc(alloc, cache_key);
+        defer alloc.free(path);
+        const encoded = try persistentObjectRangeEncodeAlloc(alloc, bytes);
+        defer alloc.free(encoded);
+        try persistentObjectRangeEnsureParentDir(path);
+        try persistentObjectRangeWriteFileAtomically(path, encoded);
+    }
+
+    fn cachePathAlloc(self: PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8) ![]u8 {
+        const filename = try objectRangeCacheKeyDigestHexAlloc(alloc, cache_key);
+        defer alloc.free(filename);
+        return try std.fs.path.join(alloc, &.{ self.root_dir, filename });
+    }
+};
+
 pub const ObjectRangeCache = struct {
     entries: std.StringHashMapUnmanaged(ObjectRangeCacheEntry) = .empty,
     stats: ObjectRangeCacheStats = .{},
     policy: ObjectRangeCachePolicy = .{},
+    persistent: ?*PersistentObjectRangeCache = null,
 
     pub fn initWithLakeServingDefaults(max_total_bytes: usize) ObjectRangeCache {
         return .{ .policy = ObjectRangeCachePolicy.lakeServingDefaults(max_total_bytes) };
@@ -291,11 +332,11 @@ pub const ObjectRangeCache = struct {
     ) ![]u8 {
         const cache_lane = read.cacheLane();
         const cache_key = try read.cacheKeyAlloc(alloc);
+        const read_len: usize = std.math.cast(usize, read.range.len) orelse {
+            alloc.free(cache_key);
+            return error.InvalidLakeRangeRead;
+        };
         if (self.entries.get(cache_key)) |cached| {
-            const read_len: usize = std.math.cast(usize, read.range.len) orelse {
-                alloc.free(cache_key);
-                return error.InvalidLakeRangeRead;
-            };
             if (cached.bytes.len != read_len) {
                 alloc.free(cache_key);
                 return error.InvalidLakeRangeRead;
@@ -311,17 +352,39 @@ pub const ObjectRangeCache = struct {
             return try alloc.dupe(u8, cached.bytes);
         }
 
+        if (self.persistent) |persistent| {
+            if (try persistent.readAlloc(alloc, cache_key, read_len)) |bytes| {
+                errdefer alloc.free(bytes);
+                self.stats.hits += 1;
+                self.stats.lanes[@intFromEnum(cache_lane)].hits += 1;
+                try self.storeFetchedBytes(alloc, cache_key, cache_lane, bytes);
+                alloc.free(cache_key);
+                return bytes;
+            }
+        }
+
         self.stats.misses += 1;
         self.stats.lanes[@intFromEnum(cache_lane)].misses += 1;
         const bytes = try readObjectRangeAlloc(alloc, reader, read);
         errdefer alloc.free(bytes);
+        try self.storeFetchedBytes(alloc, cache_key, cache_lane, bytes);
+        alloc.free(cache_key);
+        return bytes;
+    }
+
+    fn storeFetchedBytes(
+        self: *ObjectRangeCache,
+        alloc: Allocator,
+        cache_key: []const u8,
+        cache_lane: range_io.CacheLane,
+        bytes: []const u8,
+    ) !void {
         self.ensureLaneCapacity(alloc, cache_lane, bytes.len);
         self.ensureTotalCapacity(alloc, cache_lane, bytes.len);
         if (!self.admitsLaneBytes(cache_lane, bytes.len) or !self.admitsTotalBytes(bytes.len)) {
             self.stats.rejected_bytes += bytes.len;
             self.stats.lanes[@intFromEnum(cache_lane)].rejected_bytes += bytes.len;
-            alloc.free(cache_key);
-            return bytes;
+            return;
         }
         const stored = try alloc.dupe(u8, bytes);
         errdefer alloc.free(stored);
@@ -329,20 +392,98 @@ pub const ObjectRangeCache = struct {
             .bytes = stored,
             .checksum = objectRangeCacheDigest(stored),
         };
-        self.entries.put(alloc, cache_key, entry) catch |err| {
-            alloc.free(cache_key);
-            return err;
-        };
+        const owned_key = try alloc.dupe(u8, cache_key);
+        errdefer alloc.free(owned_key);
+        try self.entries.put(alloc, owned_key, entry);
         self.stats.stored_bytes += stored.len;
         self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes += stored.len;
-        return bytes;
+        if (self.persistent) |persistent| persistent.write(alloc, cache_key, bytes) catch {};
     }
 };
+
+const persistent_object_range_cache_magic = "AFORC01\n";
+var persistent_object_range_cache_nonce: std.atomic.Value(u64) = .init(0);
 
 fn objectRangeCacheDigest(bytes: []const u8) ObjectRangeCacheDigest {
     var digest: ObjectRangeCacheDigest = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     return digest;
+}
+
+fn objectRangeCacheKeyDigestHexAlloc(alloc: Allocator, cache_key: []const u8) ![]u8 {
+    const digest = objectRangeCacheDigest(cache_key);
+    const out = try alloc.alloc(u8, std.crypto.hash.sha2.Sha256.digest_length * 2);
+    for (digest, 0..) |byte, idx| {
+        out[idx * 2] = hexNibble(byte >> 4);
+        out[idx * 2 + 1] = hexNibble(byte & 0x0f);
+    }
+    return out;
+}
+
+fn persistentObjectRangeEncodeAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const digest = objectRangeCacheDigest(bytes);
+    const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+    const encoded = try alloc.alloc(u8, persistent_object_range_cache_magic.len + digest_len + bytes.len);
+    @memcpy(encoded[0..persistent_object_range_cache_magic.len], persistent_object_range_cache_magic);
+    @memcpy(encoded[persistent_object_range_cache_magic.len..][0..digest_len], &digest);
+    @memcpy(encoded[persistent_object_range_cache_magic.len + digest_len ..], bytes);
+    return encoded;
+}
+
+fn persistentObjectRangeDecodeAlloc(alloc: Allocator, contents: []const u8, expected_len: usize) !?[]u8 {
+    const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+    const header_len = persistent_object_range_cache_magic.len + digest_len;
+    if (contents.len < header_len) return null;
+    if (!std.mem.eql(u8, contents[0..persistent_object_range_cache_magic.len], persistent_object_range_cache_magic)) return null;
+    const payload = contents[header_len..];
+    if (payload.len != expected_len) return null;
+    const expected_checksum = contents[persistent_object_range_cache_magic.len..header_len];
+    const actual_checksum = objectRangeCacheDigest(payload);
+    if (!std.mem.eql(u8, expected_checksum, &actual_checksum)) return null;
+    return try alloc.dupe(u8, payload);
+}
+
+fn persistentObjectRangeReadFileAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+    var io_impl = persistentObjectRangeThreadedIo();
+    defer io_impl.deinit();
+    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(std.math.maxInt(usize)));
+}
+
+fn persistentObjectRangeEnsureParentDir(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    var io_impl = persistentObjectRangeThreadedIo();
+    defer io_impl.deinit();
+    try fs_paths.createDirPathPortable(io_impl.io(), parent);
+}
+
+fn persistentObjectRangeWriteFileAtomically(path: []const u8, contents: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{d}", .{ path, persistent_object_range_cache_nonce.fetchAdd(1, .monotonic) });
+    defer std.heap.page_allocator.free(tmp_path);
+
+    var io_impl = persistentObjectRangeThreadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    {
+        var file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [4096]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try writer.interface.writeAll(contents);
+        try writer.end();
+    }
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    }
+}
+
+fn persistentObjectRangeThreadedIo() std.Io.Threaded {
+    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+}
+
+fn hexNibble(value: u8) u8 {
+    return if (value < 10) '0' + value else 'a' + (value - 10);
 }
 
 fn decrementSaturating(value: *usize, amount: usize) void {
@@ -4850,6 +4991,141 @@ test "parquet object range cache reuses coalesced projected chunks" {
     try std.testing.expectEqual(@as(usize, 1), stats.hits);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20 }, second.batch.columns[0].values.i64);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8 }, second.batch.columns[1].values.i64);
+}
+
+test "parquet object range cache reuses persistent validated ranges" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
+    defer alloc.free(cache_root);
+    var persistent = PersistentObjectRangeCache.init(cache_root);
+
+    const CountingRangeReader = struct {
+        body: []const u8,
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{ .ctx = self, .read_range_alloc = readRangeAlloc };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            self.read_count += 1;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var reader = CountingRangeReader{ .body = "0123456789" };
+    const read = range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "events/part-a.parquet",
+            .byte_len = 10,
+            .version = .{ .etag = "etag-a" },
+        },
+        .range = .{ .offset = 2, .len = 4 },
+        .purpose = .parquet_footer,
+    };
+
+    {
+        var cache = ObjectRangeCache{ .persistent = &persistent };
+        defer cache.deinit(alloc);
+        const bytes = try cache.readAlloc(alloc, reader.reader(), read);
+        defer alloc.free(bytes);
+        try std.testing.expectEqualStrings("2345", bytes);
+        try std.testing.expectEqual(@as(usize, 1), reader.read_count);
+        const stats = cache.statsSnapshot();
+        try std.testing.expectEqual(@as(usize, 1), stats.misses);
+        try std.testing.expectEqual(@as(usize, 0), stats.hits);
+    }
+
+    {
+        var cache = ObjectRangeCache{ .persistent = &persistent };
+        defer cache.deinit(alloc);
+        const bytes = try cache.readAlloc(alloc, reader.reader(), read);
+        defer alloc.free(bytes);
+        try std.testing.expectEqualStrings("2345", bytes);
+        try std.testing.expectEqual(@as(usize, 1), reader.read_count);
+        const stats = cache.statsSnapshot();
+        try std.testing.expectEqual(@as(usize, 0), stats.misses);
+        try std.testing.expectEqual(@as(usize, 1), stats.hits);
+        try std.testing.expectEqual(@as(usize, 4), stats.stored_bytes);
+    }
+}
+
+test "parquet object range cache ignores corrupted persistent ranges" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
+    defer alloc.free(cache_root);
+    var persistent = PersistentObjectRangeCache.init(cache_root);
+
+    const CountingRangeReader = struct {
+        body: []const u8,
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{ .ctx = self, .read_range_alloc = readRangeAlloc };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            self.read_count += 1;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var reader = CountingRangeReader{ .body = "0123456789" };
+    const read = range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "events/part-a.parquet",
+            .byte_len = 10,
+            .version = .{ .etag = "etag-a" },
+        },
+        .range = .{ .offset = 2, .len = 4 },
+        .purpose = .parquet_footer,
+    };
+    const cache_key = try read.cacheKeyAlloc(alloc);
+    defer alloc.free(cache_key);
+    const corrupted_path = try persistent.cachePathAlloc(alloc, cache_key);
+    defer alloc.free(corrupted_path);
+    try persistentObjectRangeEnsureParentDir(corrupted_path);
+    try persistentObjectRangeWriteFileAtomically(corrupted_path, "not-a-valid-cache-entry");
+
+    var cache = ObjectRangeCache{ .persistent = &persistent };
+    defer cache.deinit(alloc);
+    const bytes = try cache.readAlloc(alloc, reader.reader(), read);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("2345", bytes);
+    try std.testing.expectEqual(@as(usize, 1), reader.read_count);
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), stats.misses);
+    try std.testing.expectEqual(@as(usize, 0), stats.hits);
 }
 
 test "parquet object range reader rejects malformed range lengths" {

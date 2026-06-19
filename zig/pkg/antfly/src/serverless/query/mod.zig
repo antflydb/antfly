@@ -134,6 +134,7 @@ pub const LakeObjectStorageRangeReader = lake_object_reader.ObjectStorageRangeRe
 pub const LakeParquetObjectRangeCache = lake_parquet_rowgroup.ObjectRangeCache;
 pub const LakeParquetObjectRangeCachePolicy = lake_parquet_rowgroup.ObjectRangeCachePolicy;
 pub const LakeParquetObjectRangeCacheStats = lake_parquet_rowgroup.ObjectRangeCacheStats;
+pub const LakeParquetPersistentObjectRangeCache = lake_parquet_rowgroup.PersistentObjectRangeCache;
 pub const LakeParquetObjectRangeRowGroupInput = lake_parquet_rowgroup.ObjectRangeRowGroupInput;
 pub const LakeParquetObjectRangeRowGroupPlan = lake_parquet_rowgroup.ObjectRangeRowGroupPlan;
 pub const LakeParquetDiscoveredObjectRangeRowGroupPlan = lake_parquet_rowgroup.DiscoveredObjectRangeRowGroupPlan;
@@ -338,6 +339,7 @@ test "serverless query module compiles" {
     _ = LakeParquetObjectRangeCache;
     _ = LakeParquetObjectRangeCachePolicy;
     _ = LakeParquetObjectRangeCacheStats;
+    _ = LakeParquetPersistentObjectRangeCache;
     _ = LakeParquetObjectRangeRowGroupInput;
     _ = LakeParquetObjectRangeRowGroupPlan;
     _ = LakeParquetDiscoveredObjectRangeRowGroupPlan;
