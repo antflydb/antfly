@@ -27,6 +27,7 @@ pub const default_rbac_model_text =
     \\p2 = sub, obj, filter
     \\p3 = sub, setting, value
     \\p4 = table
+    \\p5 = sub, database, setting, value
     \\[role_definition]
     \\g = _, _
     \\[matchers]
@@ -35,6 +36,7 @@ pub const default_rbac_model_text =
 
 const sql_role_catalog_subject = "__antfly_sql_role_catalog__";
 const sql_row_security_policy_subject_prefix = "__antfly_sql_rls_policy__:";
+const global_runtime_role_setting_database = "*";
 
 pub const ResourceType = enum {
     database,
@@ -175,6 +177,27 @@ pub const RoleSetting = struct {
     }
 };
 
+pub const RuntimeRoleSetting = struct {
+    database_name: ?[]u8 = null,
+    name: []u8,
+    value: []u8,
+
+    pub fn initOwned(alloc: Allocator, database_name: ?[]const u8, name: []const u8, value: []const u8) !RuntimeRoleSetting {
+        return .{
+            .database_name = if (database_name) |db| try alloc.dupe(u8, db) else null,
+            .name = try alloc.dupe(u8, name),
+            .value = try alloc.dupe(u8, value),
+        };
+    }
+
+    pub fn deinit(self: *RuntimeRoleSetting, alloc: Allocator) void {
+        if (self.database_name) |database_name| alloc.free(database_name);
+        alloc.free(self.name);
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
 pub fn validateRoleSettingName(name: []const u8) !void {
     if (!std.mem.startsWith(u8, name, "app.") or name.len == "app.".len) return error.UnsupportedRoleSetting;
     var segments = std.mem.splitScalar(u8, name, '.');
@@ -186,6 +209,17 @@ pub fn validateRoleSettingName(name: []const u8) !void {
 }
 
 pub fn validateRoleSettingValue(value: []const u8) !void {
+    if (value.len == 0) return error.InvalidRoleSetting;
+}
+
+pub fn validateRuntimeRoleSettingName(name: []const u8) !void {
+    if (std.mem.eql(u8, name, "statement_timeout")) return;
+    if (std.mem.eql(u8, name, "timezone")) return;
+    if (std.mem.eql(u8, name, "search_path")) return;
+    return error.UnsupportedRoleSetting;
+}
+
+pub fn validateRuntimeRoleSettingValue(value: []const u8) !void {
     if (value.len == 0) return error.InvalidRoleSetting;
 }
 
@@ -688,6 +722,7 @@ pub const UserManager = struct {
         _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{username});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{username});
         _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{username});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{username});
     }
 
     pub fn listUsers(self: *const UserManager) ![][]u8 {
@@ -842,6 +877,7 @@ pub const UserManager = struct {
         if (try self.roleSubjectHasDependencies(role_subject)) return error.RoleInUse;
         _ = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{ sql_role_catalog_subject, role_subject });
         _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{role_subject});
     }
 
     pub fn dropRoleSubjectCascade(self: *UserManager, role_subject: []const u8) !void {
@@ -851,6 +887,7 @@ pub const UserManager = struct {
         _ = try self.enforcer.removeFilteredNamedPolicy("g", 1, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{role_subject});
     }
 
     pub fn roleSubjectHasDependencies(self: *const UserManager, role_subject: []const u8) !bool {
@@ -876,6 +913,7 @@ pub const UserManager = struct {
         if (self.users.contains(role_subject)) return true;
         if (try self.hasFilteredPolicy("p", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("p2", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p5", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("g", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("g", 1, role_subject)) return true;
         return false;
@@ -948,6 +986,74 @@ pub const UserManager = struct {
         if (!removed) return error.RoleSettingNotFound;
     }
 
+    pub fn setRoleRuntimeSetting(
+        self: *UserManager,
+        role_subject: []const u8,
+        database_name: ?[]const u8,
+        setting_name: []const u8,
+        setting_value: []const u8,
+    ) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        if (database_name) |db| if (db.len == 0 or std.mem.eql(u8, db, global_runtime_role_setting_database)) return error.InvalidRoleSetting;
+        try validateRuntimeRoleSettingName(setting_name);
+        try validateRuntimeRoleSettingValue(setting_value);
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+
+        const existing_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p5", 0, &.{ role_subject, database_key, setting_name });
+        defer {
+            for (existing_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(existing_rules);
+        }
+
+        var setting_present = false;
+        for (existing_rules) |rule| {
+            if (rule.fields.len >= 4 and std.mem.eql(u8, rule.fields[3], setting_value)) {
+                setting_present = true;
+                break;
+            }
+        }
+        const inserted_new = if (setting_present)
+            false
+        else
+            try self.enforcer.addNamedPolicy("p5", &.{ role_subject, database_key, setting_name, setting_value });
+        errdefer if (inserted_new) {
+            _ = self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{ role_subject, database_key, setting_name, setting_value }) catch {};
+        };
+
+        var removed_old_values = std.ArrayList([]const u8).empty;
+        defer removed_old_values.deinit(self.alloc);
+        try removed_old_values.ensureTotalCapacity(self.alloc, existing_rules.len);
+        errdefer {
+            for (removed_old_values.items) |old_value| {
+                _ = self.enforcer.addNamedPolicy("p5", &.{ role_subject, database_key, setting_name, old_value }) catch {};
+            }
+        }
+
+        for (existing_rules) |rule| {
+            if (rule.fields.len < 4 or std.mem.eql(u8, rule.fields[3], setting_value)) continue;
+            if (try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{ role_subject, database_key, setting_name, rule.fields[3] })) {
+                removed_old_values.appendAssumeCapacity(rule.fields[3]);
+            }
+        }
+    }
+
+    pub fn getRoleRuntimeSetting(self: *const UserManager, role_subject: []const u8, database_name: ?[]const u8, setting_name: []const u8) ![]u8 {
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p5", 0, &.{ role_subject, database_key, setting_name });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 4) return error.RoleSettingNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[3]);
+    }
+
+    pub fn removeRoleRuntimeSetting(self: *UserManager, role_subject: []const u8, database_name: ?[]const u8, setting_name: []const u8) !void {
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+        const removed = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{ role_subject, database_key, setting_name });
+        if (!removed) return error.RoleSettingNotFound;
+    }
+
     pub fn listRoleSettingsForSubject(self: *const UserManager, subject: []const u8) ![]RoleSetting {
         const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p3", 0, &.{subject});
         defer {
@@ -964,6 +1070,10 @@ pub const UserManager = struct {
             try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, rule.fields[1], rule.fields[2]));
         }
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn runtimeRoleSettingDatabaseKey(database_name: ?[]const u8) []const u8 {
+        return database_name orelse global_runtime_role_setting_database;
     }
 
     pub fn getEffectiveRoleSettings(self: *const UserManager, username: []const u8) ![]RoleSetting {
@@ -1903,6 +2013,44 @@ test "usermgr role settings are native app settings only and replace durably" {
     try std.testing.expectEqual(@as(usize, 1), settings.len);
     try std.testing.expectEqualStrings("app.tenant_id", settings[0].name);
     try std.testing.expectEqualStrings("other", settings[0].value);
+}
+
+test "usermgr runtime role settings are native role defaults with optional database scope" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    try manager.createRoleSubject("role:app_writer");
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "unknown_guc", "on"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", "", "statement_timeout", "5s"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", "*", "statement_timeout", "5s"));
+
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "5s");
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "10s");
+    const global_setting = try manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout");
+    defer alloc.free(global_setting);
+    try std.testing.expectEqualStrings("10s", global_setting);
+
+    try manager.setRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout", "1ms");
+    const scoped_setting = try manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
+    defer alloc.free(scoped_setting);
+    try std.testing.expectEqualStrings("1ms", scoped_setting);
+
+    try manager.removeRoleRuntimeSetting("role:app_writer", null, "statement_timeout");
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout"));
+    const scoped_after_global_reset = try manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
+    defer alloc.free(scoped_after_global_reset);
+    try std.testing.expectEqualStrings("1ms", scoped_after_global_reset);
 }
 
 test "usermgr permissions and row filters mirror go semantics" {

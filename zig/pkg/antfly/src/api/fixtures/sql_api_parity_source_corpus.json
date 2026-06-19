@@ -11456,16 +11456,16 @@
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u_multi_dup', 'ready'), ('u_multi_dup', 'duplicate') ON CONFLICT (id) DO NOTHING RETURNING id, status"
     },
     {
-      "name": "unsupported duplicate row batch target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=duplicate_row_batch_target",
+      "name": "invalid duplicate row batch target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=duplicate_row_batch_target",
       "classification_reason": "duplicate_row_batch_target",
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready'), ('u4', 'duplicate')"
     },
     {
-      "name": "unsupported duplicate conflict update target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=duplicate_conflict_update_target",
+      "name": "invalid duplicate conflict update target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=duplicate_conflict_update_target",
       "classification_reason": "duplicate_conflict_update_target",
       "resolver_row_json": "{\"id\":\"u4\",\"status\":\"existing\"}",
       "resolver_version": 19,

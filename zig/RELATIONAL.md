@@ -4999,10 +4999,11 @@ role-setting model because `app.*` settings are consumed by row-security
 PostgreSQL runtime defaults such as `ALTER ROLE app SET statement_timeout =
 '1ms'`, database-scoped runtime defaults, and `RESET statement_timeout` now
 lower to typed `alter_role` plans with `setting_kind=runtime` instead of being
-collapsed into native auth settings. The auth execution boundary still rejects
-those runtime plans until a separate runtime-settings catalog owns session
-default application, replay, and audit; this keeps PostgreSQL GUC-style defaults
-from contaminating the `app.*` row-security setting store. If inherited roles
+collapsed into native app row-security settings. The auth execution boundary
+persists supported runtime defaults (`statement_timeout`, `timezone`, and
+`search_path`) through a separate role runtime-setting policy namespace with
+optional database scope, so PostgreSQL GUC-style defaults do not contaminate the
+`app.*` row-security setting store. If inherited roles
 define the same native app setting with different values, effective-setting
 resolution fails closed; a direct user setting for the same key is an explicit
 override. Unsupported role-setting forms such as expression-valued defaults
@@ -6107,6 +6108,12 @@ Unsupported and adapter-noop classification reasons are exact fingerprint
 tokens. A fixture reason must match the full `requires` or `reason` token value,
 so prefix-only matches such as `session_setting_extra` cannot satisfy
 `session_setting`.
+
+Invalid typed mutations have their own golden-plan family instead of being
+reported as unsupported model gaps. For example, duplicate proposed row targets
+in multi-row inserts lower far enough to prove the statement is an invalid
+native insert (`invalid:insert:reason=...`) rather than claiming that
+`ON CONFLICT` or row-batch mutation support is missing.
 
 Point-write returning fixtures pin the same deterministic row count in both the
 public summary metadata and the typed-plan fingerprint before row JSON is

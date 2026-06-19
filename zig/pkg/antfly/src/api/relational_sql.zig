@@ -794,6 +794,27 @@ pub fn lowerInsertWithResolverAlloc(
     };
 }
 
+pub fn lowerInsertWithResolverStrictAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !LoweredInsert {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    var parser = Parser{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return try parser.parseInsert();
+}
+
 pub fn lowerInsertSourceWithResolverAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -18053,7 +18074,7 @@ const Parser = struct {
             var identity_transferred = false;
             errdefer if (!identity_transferred) self.alloc.free(identity);
             for (identities.items) |existing| {
-                if (std.mem.eql(u8, existing, identity)) return error.UnsupportedSqlShape;
+                if (std.mem.eql(u8, existing, identity)) return error.InvalidRowsRequest;
             }
             try identities.append(self.alloc, identity);
             identity_transferred = true;
@@ -61486,6 +61507,39 @@ fn expectAppParityUnsupportedPlanEntry(
     try expectAppParityPlan(entry.plan, fingerprint);
 }
 
+fn invalidInsertFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    reason: sql_adapter.SqlAdapterClassificationReason,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "invalid:insert:reason={s}", .{@tagName(reason)});
+}
+
+fn expectTypedInvalid(result: anytype) !void {
+    if (result) |_| {
+        return error.TestExpectedError;
+    } else |err| switch (err) {
+        error.InvalidRowsRequest, error.InvalidSqlCatalog, error.UnsupportedSqlShape => return,
+        else => return err,
+    }
+}
+
+fn expectAppParityInvalidPlanEntry(
+    alloc: std.mem.Allocator,
+    effective_schema: runtime_schema.TableSchema,
+    entry: AppParityCorpusEntry,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !void {
+    switch (entry.family) {
+        .invalid_insert => try expectTypedInvalid(lowerInsertWithResolverStrictAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const diagnostic_reason = sql_adapter.classificationReasonFromToken(entry.classification_reason) orelse return error.TestUnexpectedResult;
+    const fingerprint = try invalidInsertFingerprintAlloc(alloc, diagnostic_reason);
+    defer alloc.free(fingerprint);
+    try expectAppParityPlan(entry.plan, fingerprint);
+}
+
 fn expectAppParityCorpusEntry(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
@@ -61523,6 +61577,9 @@ fn expectAppParityCorpusEntry(
     }
     if (sql_adapter.corpusPlanFamilyIsUnsupported(entry.family)) {
         return try expectAppParityUnsupportedPlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
+    }
+    if (sql_adapter.corpusPlanFamilyIsInvalid(entry.family)) {
+        return try expectAppParityInvalidPlanEntry(alloc, effective_schema, entry, effective_unique_resolver);
     }
 
     switch (entry.family) {
@@ -61604,6 +61661,7 @@ fn expectAppParityCorpusEntry(
                 try expectAppParityPlan(entry.plan, fingerprint);
             }
         },
+        .invalid_insert => return error.TestUnexpectedResult,
         .unsupported,
         .unsupported_read,
         .unsupported_ddl,

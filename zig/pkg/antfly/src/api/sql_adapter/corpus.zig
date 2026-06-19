@@ -55,6 +55,7 @@ pub const AppParityCorpusPlanFamily = enum {
     delete_joined_source,
     merge_mutation,
     adapter_noop_ddl,
+    invalid_insert,
     unsupported,
     unsupported_read,
     unsupported_ddl,
@@ -1245,12 +1246,32 @@ pub fn corpusPlanFamilyIsUnsupported(family: AppParityCorpusPlanFamily) bool {
     return corpusUnsupportedPlanFamily(family) != null;
 }
 
+pub fn corpusPlanFamilyIsInvalid(family: AppParityCorpusPlanFamily) bool {
+    return family == .invalid_insert;
+}
+
 pub fn corpusFixtureFamilyNeedsReason(family: AppParityCorpusPlanFamily) bool {
-    return family == .adapter_noop_ddl or corpusPlanFamilyIsUnsupported(family);
+    return family == .adapter_noop_ddl or corpusPlanFamilyIsUnsupported(family) or corpusPlanFamilyIsInvalid(family);
 }
 
 pub fn corpusStableReasonToken(reason: []const u8) bool {
     return diagnostics.classificationReasonTokenIsKnown(reason);
+}
+
+const InvalidPlanFamily = enum {
+    insert,
+};
+
+fn invalidPlanMatchesReason(
+    plan: []const u8,
+    family: InvalidPlanFamily,
+    reason: diagnostics.SqlAdapterClassificationReason,
+) bool {
+    const prefix = switch (family) {
+        .insert => "invalid:insert:reason=",
+    };
+    return std.mem.startsWith(u8, plan, prefix) and
+        std.mem.eql(u8, plan[prefix.len..], @tagName(reason));
 }
 
 pub fn corpusPlanMatchesReason(
@@ -1261,6 +1282,7 @@ pub fn corpusPlanMatchesReason(
     const diagnostic_reason = diagnostics.classificationReasonFromToken(reason) orelse return false;
     switch (family) {
         .adapter_noop_ddl => return adapterNoopPlanMatchesReason(plan, "ddl", diagnostic_reason),
+        .invalid_insert => return invalidPlanMatchesReason(plan, .insert, diagnostic_reason),
         else => if (corpusUnsupportedPlanFamily(family)) |unsupported_family| {
             return unsupportedPlanMatchesReason(plan, unsupported_family, diagnostic_reason);
         } else return true,
@@ -1293,6 +1315,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         .delete_joined_source => "delete_joined_source:",
         .merge_mutation => "merge_mutation:",
         .adapter_noop_ddl => "adapter_noop:ddl:",
+        .invalid_insert => "invalid:insert:",
         .unsupported,
         .unsupported_read,
         .unsupported_ddl,
@@ -1397,6 +1420,7 @@ pub fn corpusFixtureFamilyAllowsResolverHint(family: AppParityCorpusPlanFamily) 
         .insert,
         .update,
         .delete,
+        .invalid_insert,
         .unsupported_insert,
         .unsupported_update,
         .unsupported_delete,
@@ -1772,7 +1796,7 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
         entry.resolver_exists != null;
     if (has_resolver_hint and !corpusFixtureFamilyAllowsResolverHint(entry.family)) return error.TestUnexpectedResult;
     if (has_resolver_hint and
-        (entry.family == .insert or entry.family == .unsupported_insert) and
+        (entry.family == .insert or entry.family == .invalid_insert or entry.family == .unsupported_insert) and
         std.mem.indexOf(u8, entry.sql, "ON CONFLICT") == null)
     {
         return error.TestUnexpectedResult;
@@ -4237,6 +4261,9 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_write_recursive_cte_update: bool = false,
     unsupported_write_recursive_cte_delete: bool = false,
     unsupported_write_recursive_cte_merge: bool = false,
+    invalid_insert: bool = false,
+    invalid_duplicate_row_batch_target: bool = false,
+    invalid_duplicate_conflict_update_target: bool = false,
     unsupported_insert: bool = false,
     unsupported_update: bool = false,
     unsupported_update_source: bool = false,
@@ -4468,8 +4495,6 @@ pub const AppParityCorpusCoverage = struct {
     migration_equivalent_schema_rewrite: bool = false,
     migration_equivalent_schema_validation: bool = false,
     unsupported_ddl_system_time_temporal_table: bool = false,
-    unsupported_duplicate_row_batch_target: bool = false,
-    unsupported_duplicate_conflict_update_target: bool = false,
     unsupported_invalid_expression_conflict_target: bool = false,
     unsupported_invalid_named_conflict_target: bool = false,
     unsupported_unvalidated_unique_conflict_target: bool = false,
@@ -5328,6 +5353,11 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
             },
             .adapter_noop_ddl => self.adapter_noop_ddl = true,
+            .invalid_insert => {
+                self.invalid_insert = true;
+                self.invalid_duplicate_row_batch_target = self.invalid_duplicate_row_batch_target or std.mem.eql(u8, entry.classification_reason, "duplicate_row_batch_target");
+                self.invalid_duplicate_conflict_update_target = self.invalid_duplicate_conflict_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_conflict_update_target");
+            },
             .unsupported => self.unsupported_query = true,
             .unsupported_read => self.unsupported_read = true,
             .unsupported_ddl => self.unsupported_ddl = true,
@@ -6461,8 +6491,6 @@ pub const AppParityCorpusCoverage = struct {
                 appParityAnyStringContains(entry.apply_setup_sql, "tenant_id, lower(") and
                 std.mem.indexOf(u8, entry.sql, "ON CONFLICT (tenant_id, lower(") != null);
         } else if (entry.family == .unsupported_insert) {
-            self.unsupported_duplicate_row_batch_target = self.unsupported_duplicate_row_batch_target or std.mem.eql(u8, entry.classification_reason, "duplicate_row_batch_target");
-            self.unsupported_duplicate_conflict_update_target = self.unsupported_duplicate_conflict_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_conflict_update_target");
             self.unsupported_invalid_expression_conflict_target = self.unsupported_invalid_expression_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_expression_conflict_target");
             self.unsupported_invalid_named_conflict_target = self.unsupported_invalid_named_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_named_conflict_target");
             self.unsupported_unvalidated_unique_conflict_target = self.unsupported_unvalidated_unique_conflict_target or std.mem.eql(u8, entry.classification_reason, "enforced_unique_conflict_target");

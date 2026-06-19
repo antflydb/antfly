@@ -83,14 +83,22 @@ fn executeAlterRole(
     alloc: std.mem.Allocator,
     plan: relational_sql.AlterRolePlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    if (plan.setting_kind != .app) return error.UnsupportedSqlShape;
     const subject = try principalSubjectAlloc(manager, alloc, plan.role_name);
     defer alloc.free(subject);
-    switch (plan.operation) {
-        .set => try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape),
-        .reset => manager.removeRoleSetting(subject, plan.setting_name) catch |err| switch (err) {
-            error.RoleSettingNotFound => {},
-            else => return err,
+    switch (plan.setting_kind) {
+        .app => switch (plan.operation) {
+            .set => try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape),
+            .reset => manager.removeRoleSetting(subject, plan.setting_name) catch |err| switch (err) {
+                error.RoleSettingNotFound => {},
+                else => return err,
+            },
+        },
+        .runtime => switch (plan.operation) {
+            .set => try manager.setRoleRuntimeSetting(subject, plan.database_name, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape),
+            .reset => manager.removeRoleRuntimeSetting(subject, plan.database_name, plan.setting_name) catch |err| switch (err) {
+                error.RoleSettingNotFound => {},
+                else => return err,
+            },
         },
     }
     return try changedRecordAlloc(alloc);
@@ -643,10 +651,21 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expect(missing.noop);
 
     try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';"));
+    try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
 
     var recreated = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_writer;")).?;
     defer recreated.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
+    var runtime_altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';")).?;
+    defer runtime_altered.deinit(alloc);
+    const runtime_setting = try manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout");
+    defer alloc.free(runtime_setting);
+    try std.testing.expectEqualStrings("5s", runtime_setting);
+    var runtime_database_altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer IN DATABASE appdb SET statement_timeout = '1ms';")).?;
+    defer runtime_database_altered.deinit(alloc);
+    const scoped_runtime_setting = try manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
+    defer alloc.free(scoped_runtime_setting);
+    try std.testing.expectEqualStrings("1ms", scoped_runtime_setting);
+
     var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';")).?;
     defer altered.deinit(alloc);
     const tenant_setting = try manager.getRoleSetting("role:app_writer", "app.tenant_id");
@@ -666,13 +685,23 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "app.tenant_id"));
     var reset_missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET app.tenant_id;")).?;
     defer reset_missing.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET statement_timeout;"));
+    var runtime_reset = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET statement_timeout;")).?;
+    defer runtime_reset.deinit(alloc);
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout"));
+    var runtime_reset_missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET statement_timeout;")).?;
+    defer runtime_reset_missing.deinit(alloc);
+    var runtime_database_reset = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer IN DATABASE appdb RESET statement_timeout;")).?;
+    defer runtime_database_reset.deinit(alloc);
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout"));
     var altered_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';")).?;
     defer altered_again.deinit(alloc);
+    var runtime_altered_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '10s';")).?;
+    defer runtime_altered_again.deinit(alloc);
     try manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped_with_setting = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
     defer dropped_with_setting.deinit(alloc);
     try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "app.tenant_id"));
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout"));
 }
 
 test "sql auth adapter resolves role setting conflicts deterministically" {

@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "f93906c55232f5e191e26add21c15059d1151959fbf7bb92fed1439c159f3a87",
+  "source_sha256": "6e1253d11c0ce5340a0d8efd8259de85021f8c65b95e74968449b81e812a7d27",
   "source_entry_count": 981,
   "entry_count": 981,
   "skipped_entries": [
@@ -10692,16 +10692,16 @@
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u_multi_dup', 'ready'), ('u_multi_dup', 'duplicate') ON CONFLICT (id) DO NOTHING RETURNING id, status"
     },
     {
-      "name": "unsupported duplicate row batch target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=duplicate_row_batch_target",
+      "name": "invalid duplicate row batch target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=duplicate_row_batch_target",
       "classification_reason": "duplicate_row_batch_target",
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready'), ('u4', 'duplicate')"
     },
     {
-      "name": "unsupported duplicate conflict update target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=duplicate_conflict_update_target",
+      "name": "invalid duplicate conflict update target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=duplicate_conflict_update_target",
       "classification_reason": "duplicate_conflict_update_target",
       "resolver_row_json": "{\"id\":\"u4\",\"status\":\"existing\"}",
       "resolver_version": 19,

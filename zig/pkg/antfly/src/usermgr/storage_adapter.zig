@@ -464,6 +464,7 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
                 \\p2 = sub, obj, filter
                 \\p3 = sub, setting, value
                 \\p4 = table
+                \\p5 = sub, database, setting, value
                 \\[role_definition]
                 \\g = _, _
                 \\[matchers]
@@ -484,6 +485,7 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
     try manager.setRowFilter("alice", "docs", "{\"term\":{\"team\":\"eng\"}}");
     try manager.createRoleSubject("role:app_writer");
     try manager.setRoleSetting("role:app_writer", "app.tenant_id", "acme");
+    try manager.setRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout", "1ms");
     try manager.enableSqlRowSecurity("docs");
     try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
 
@@ -502,6 +504,7 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
                 \\p2 = sub, obj, filter
                 \\p3 = sub, setting, value
                 \\p4 = table
+                \\p5 = sub, database, setting, value
                 \\[role_definition]
                 \\g = _, _
                 \\[matchers]
@@ -522,6 +525,9 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
     const role_setting = try reloaded.getRoleSetting("role:app_writer", "app.tenant_id");
     defer std.testing.allocator.free(role_setting);
     try std.testing.expectEqualStrings("acme", role_setting);
+    const runtime_role_setting = try reloaded.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
+    defer std.testing.allocator.free(runtime_role_setting);
+    try std.testing.expectEqualStrings("1ms", runtime_role_setting);
     try std.testing.expect(try reloaded.sqlRowSecurityEnabled("docs"));
 
     var api_row_filter = [_]user_manager.RowFilterEntry{
