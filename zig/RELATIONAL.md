@@ -1111,7 +1111,13 @@ metadata-only catalog updates, derived-artifact rebuild work, constraint
 validation work, and row-image rewrite/backfill work. Those buckets are derived
 from typed plan families and exact `applied_plan` lifecycle tokens, not fixture
 names or raw SQL substrings, so a stale corpus entry cannot accidentally satisfy
-the migration contract. SQL adapter
+the migration contract. Data-backfill buckets require typed fingerprint
+evidence for the native rewrite shape: insert-source plans must carry exact
+source-table and assignment tokens, update-source plans must carry mutation
+operation tokens, joined update/delete plans must carry exact source/join
+tokens, and delete-source plans must carry the lock/returning tokens that prove
+the statement reached the source-driven mutation lowerer. A fixture family label
+alone is not coverage. SQL adapter
 edge cases that are not golden typed-plan entries, such as comment preservation,
 malformed placeholder suffixes, statement-kind classification, and fail-closed
 point-lowerer boundaries, live in
@@ -4655,9 +4661,17 @@ backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in
 `api/sql_adapter/grammar.zig`; `NOTIFY` payload literals use the shared
 `api/sql_adapter/value.zig` untyped literal-to-JSON helper; and
 `relational_sql.zig` only maps the resulting channel name, optional payload JSON,
-or `UNLISTEN *` flag into typed notification-channel plans. Durable notification
-delivery, session subscriptions, fan-out, and wakeup ordering remain native
-runtime work rather than syntax state.
+or `UNLISTEN *` flag into typed notification-channel plans. `ApiHttpServer`
+executes those plans through `api/sql_notifications.zig`, an Antfly-owned
+notification runtime that assigns stable SQL notification session ids to owned
+catalog sessions, records idempotent `LISTEN` subscriptions, applies
+`UNLISTEN`/`UNLISTEN *`, and appends ordered `NOTIFY` delivery events with
+payload JSON and delivered session ids. Table-schema and table-storage
+application still reject notification-channel DDL because the authoritative
+side effect is event-channel runtime state, not schema JSON. Remaining
+production hardening is durable cross-node fan-out, transaction commit ordering,
+wakeup delivery APIs, backpressure, retry, and authorization policy around those
+native channel events.
 
 Schema namespace syntax is only adapter-only when it is proven boilerplate for
 the default `public` namespace, such as `CREATE SCHEMA IF NOT EXISTS public`.
@@ -4720,12 +4734,14 @@ the SQL lowerer maps owned syntax into typed logical-replication catalog plans,
 so future accepted options must become explicit native fields rather than raw
 SQL carried through storage.
 `LISTEN`, `NOTIFY`, and `UNLISTEN` lower to typed notification-channel intents
-that capture channel names and optional payloads, then fail closed when applied
-to table schema or runtime storage. Production execution still requires a native
-event-channel contract with transaction commit ordering, payload schema,
-subscriber lifetime, backpressure, retry, and authorization. PostgreSQL syntax
-can later lower into those native contracts, but it must not pretend that
-transient SQL sessions are a durable storage or routing primitive.
+that capture channel names and optional payloads. The HTTP SQL execution path
+now applies them through the native SQL notification runtime, while table schema
+and runtime storage still fail closed because notification state is not a table
+mutation. The remaining event-channel contract work is cross-node durability,
+transaction commit ordering, payload schema evolution, subscriber lifetime,
+backpressure, retry, and authorization. PostgreSQL syntax can lower into those
+native contracts, but it must not pretend that transient SQL sessions are a
+durable storage or routing primitive.
 
 Basic PostgreSQL custom type-system object syntax lowers to typed catalog
 intents and then fails closed when applied to table schema or runtime storage.

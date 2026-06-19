@@ -4690,6 +4690,31 @@ pub const AppParityCorpusCoverage = struct {
     parameterized_update_joined_source: bool = false,
     parameterized_delete_joined_source: bool = false,
 
+    fn observeMigrationEquivalentDataBackfill(self: *@This(), entry: AppParityCorpusEntry) void {
+        self.migration_equivalent_data_backfill_insert =
+            self.migration_equivalent_data_backfill_insert or
+            (corpusPlanMatchesFamily(.insert_source, entry.plan) and
+                planHasStringToken(entry.plan, ":source_table=") and
+                planUsizeTokenValue(entry.plan, ":assignments=") != null);
+        self.migration_equivalent_data_backfill_update =
+            self.migration_equivalent_data_backfill_update or
+            ((corpusPlanMatchesFamily(.update_source, entry.plan) and
+                planHasNonZeroToken(entry.plan, ":ops=")) or
+                (corpusPlanMatchesFamily(.update_joined_source, entry.plan) and
+                    planHasStringToken(entry.plan, ":source=") and
+                    planHasNonZeroToken(entry.plan, ":on=") and
+                    planHasNonZeroToken(entry.plan, ":ops=")));
+        self.migration_equivalent_data_backfill_delete =
+            self.migration_equivalent_data_backfill_delete or
+            ((corpusPlanMatchesFamily(.delete_source, entry.plan) and
+                planHasStringToken(entry.plan, ":claim=") and
+                planHasStringToken(entry.plan, ":returning=")) or
+                (corpusPlanMatchesFamily(.delete_joined_source, entry.plan) and
+                    planHasStringToken(entry.plan, ":source=") and
+                    planHasNonZeroToken(entry.plan, ":on=") and
+                    planHasStringToken(entry.plan, ":returning=")));
+    }
+
     pub fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
         const uses_cte_stream = sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") or sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
         const uses_returning_all = sql_adapter.planHasNonZeroToken(entry.plan, ":returning_all=");
@@ -5115,9 +5140,7 @@ pub const AppParityCorpusCoverage = struct {
         self.update_source_regexp_substr_expression = self.update_source_regexp_substr_expression or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.migration_equivalent_data_backfill_insert = self.migration_equivalent_data_backfill_insert or entry.family == .insert_source;
-        self.migration_equivalent_data_backfill_update = self.migration_equivalent_data_backfill_update or entry.family == .update_source or entry.family == .update_joined_source;
-        self.migration_equivalent_data_backfill_delete = self.migration_equivalent_data_backfill_delete or entry.family == .delete_source or entry.family == .delete_joined_source;
+        self.observeMigrationEquivalentDataBackfill(entry);
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
         if (entry.applied_plan.len > 0) {
             self.applied_catalog_plan = true;

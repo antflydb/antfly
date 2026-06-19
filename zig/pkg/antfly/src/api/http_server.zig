@@ -26,6 +26,8 @@ const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const relational_rows_api = @import("relational_rows.zig");
 const relational_sql = @import("relational_sql.zig");
+const sql_notifications = @import("sql_notifications.zig");
+const sql_routines = @import("sql_routines.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -1636,6 +1638,8 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    sql_notification_runtime: sql_notifications.Runtime = .{ .alloc = undefined },
+    sql_routine_runtime: sql_routines.Runtime = .{ .alloc = undefined },
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -1679,6 +1683,8 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .sql_notification_runtime = sql_notifications.Runtime.init(alloc),
+            .sql_routine_runtime = sql_routines.Runtime.init(alloc),
             .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
@@ -1795,6 +1801,8 @@ pub const ApiHttpServer = struct {
             self.alloc.destroy(opened);
         }
         self.artifact_reprocess_job_store.deinit();
+        self.sql_notification_runtime.deinit();
+        self.sql_routine_runtime.deinit();
         self.join_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
@@ -2383,13 +2391,22 @@ pub const ApiHttpServer = struct {
         return try self.applyRelationalSqlDdlWithSession(sql, &session);
     }
 
+    fn ensureSqlNotificationSessionId(self: *ApiHttpServer, session: *relational_sql.OwnedSqlCatalogSession) u64 {
+        if (session.notification_session_id == 0) {
+            session.notification_session_id = self.sql_notification_runtime.allocateSessionId();
+        }
+        return session.notification_session_id;
+    }
+
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *relational_sql.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
         var plan = try relational_sql.lowerDdlPlanAlloc(self.alloc, sql);
         defer plan.deinit(self.alloc);
         switch (plan) {
             .session_catalog => |session_plan| {
+                const notification_session_id = session.notification_session_id;
                 var updated = try relational_sql.applySessionCatalogPlanAlloc(self.alloc, session.session(), session_plan);
                 errdefer updated.deinit(self.alloc);
+                updated.notification_session_id = notification_session_id;
                 session.deinit(self.alloc);
                 session.* = updated;
                 var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
@@ -2398,6 +2415,11 @@ pub const ApiHttpServer = struct {
             },
             .prepared_transaction => |prepared_plan| {
                 _ = try self.source.applyPreparedTransactionPlan(self.alloc, prepared_plan, sqlDdlTimestampNs());
+                return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+            },
+            .notification_channel => |notification_plan| {
+                const session_id = self.ensureSqlNotificationSessionId(session);
+                _ = try self.sql_notification_runtime.apply(notification_plan, session_id, sqlDdlTimestampNs());
                 return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
             },
             else => {},
@@ -18861,6 +18883,86 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
     try std.testing.expectError(
         error.PreparedTransactionDecisionConflict,
         server.applyRelationalSqlDdlWithSession("ROLLBACK PREPARED 'usage_batch';", &session),
+    );
+}
+
+test "api http server executes SQL notification channel plans through native runtime" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl = applyRelationalSqlDdl,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdl(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var session_a = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session_a.deinit(alloc);
+    var session_b = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session_b.deinit(alloc);
+
+    var listen_a = try server.applyRelationalSqlDdlWithSession("LISTEN usage_events;", &session_a);
+    defer listen_a.deinit(alloc);
+    var listen_b = try server.applyRelationalSqlDdlWithSession("LISTEN usage_events;", &session_b);
+    defer listen_b.deinit(alloc);
+    var duplicate_listen_b = try server.applyRelationalSqlDdlWithSession("LISTEN usage_events;", &session_b);
+    defer duplicate_listen_b.deinit(alloc);
+    try std.testing.expect(session_a.notification_session_id != 0);
+    try std.testing.expect(session_b.notification_session_id != 0);
+    try std.testing.expect(session_a.notification_session_id != session_b.notification_session_id);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        server.sql_notification_runtime.subscriptionCountForTest(session_b.notification_session_id, "usage_events"),
+    );
+
+    var set_path = try server.applyRelationalSqlDdlWithSession("SET search_path TO public;", &session_b);
+    defer set_path.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        server.sql_notification_runtime.subscriptionCountForTest(session_b.notification_session_id, "usage_events"),
+    );
+
+    var notified = try server.applyRelationalSqlDdlWithSession("NOTIFY usage_events, 'updated';", &session_a);
+    defer notified.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_notification_runtime.eventCountForTest());
+    var event = (try server.sql_notification_runtime.cloneLastEventForTest(alloc)) orelse return error.TestUnexpectedResult;
+    defer event.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), event.sequence);
+    try std.testing.expectEqualStrings("usage_events", event.channel_name);
+    try std.testing.expectEqualStrings("\"updated\"", event.payload_json orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 2), event.delivered_session_ids.len);
+
+    var unlisten_b = try server.applyRelationalSqlDdlWithSession("UNLISTEN usage_events;", &session_b);
+    defer unlisten_b.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        server.sql_notification_runtime.subscriptionCountForTest(session_b.notification_session_id, "usage_events"),
+    );
+
+    var unlisten_a = try server.applyRelationalSqlDdlWithSession("UNLISTEN *;", &session_a);
+    defer unlisten_a.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        server.sql_notification_runtime.subscriptionCountForTest(session_a.notification_session_id, "usage_events"),
     );
 }
 

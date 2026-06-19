@@ -608,6 +608,86 @@
       ]
     },
     {
+      "name": "family-only migration backfill plans do not satisfy coverage",
+      "entries": [
+        {
+          "name": "insert source missing source table evidence",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "update source missing mutation evidence",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open'",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "delete source missing returning evidence",
+          "family": "delete_source",
+          "sql": "DELETE FROM usage_records WHERE status = 'archived'",
+          "plan": "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked"
+        },
+        {
+          "name": "joined update missing join evidence",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = source.status FROM archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:ops=1:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "joined delete missing join evidence",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records USING archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_false": [
+        "migration_equivalent_data_backfill_insert",
+        "migration_equivalent_data_backfill_update",
+        "migration_equivalent_data_backfill_delete"
+      ]
+    },
+    {
+      "name": "typed migration backfill plans satisfy coverage",
+      "entries": [
+        {
+          "name": "typed insert source backfill",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed update source backfill",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open'",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed delete source backfill",
+          "family": "delete_source",
+          "sql": "DELETE FROM usage_records WHERE status = 'archived'",
+          "plan": "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed joined update backfill",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = source.status FROM archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed joined delete backfill",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records USING archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_true": [
+        "migration_equivalent_data_backfill_insert",
+        "migration_equivalent_data_backfill_update",
+        "migration_equivalent_data_backfill_delete"
+      ]
+    },
+    {
       "name": "malformed temporal conflict transform count does not satisfy coverage",
       "entries": [
         {

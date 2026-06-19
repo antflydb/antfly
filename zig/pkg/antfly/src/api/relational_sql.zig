@@ -2659,6 +2659,7 @@ pub const OwnedSqlCatalogSession = struct {
     search_path: []const []const u8,
     settings: []const catalog_resources.SqlSessionSetting = &.{},
     transaction_local_search_path: bool = false,
+    notification_session_id: u64 = 0,
 
     pub fn fromSessionAlloc(alloc: std.mem.Allocator, source_session: catalog_resources.SqlCatalogSession) !OwnedSqlCatalogSession {
         const current_database_name = try alloc.dupe(u8, source_session.currentDatabase());
@@ -2696,6 +2697,7 @@ pub const OwnedSqlCatalogSession = struct {
             .search_path = search_path,
             .settings = settings,
             .transaction_local_search_path = false,
+            .notification_session_id = 0,
         };
     }
 
