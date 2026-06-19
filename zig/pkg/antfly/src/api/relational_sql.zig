@@ -2261,7 +2261,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
     return result;
 }
 
-fn appliedDdlWorkItemsForFlagsAlloc(
+pub fn appliedDdlTableWorkItemsForFlagsAlloc(
     alloc: std.mem.Allocator,
     requires_rebuild: bool,
     validation_required: bool,
@@ -2308,7 +2308,7 @@ fn appliedDdlSchemaJsonWithFlagsAlloc(
     rewrite_required: bool,
 ) !AppliedDdlSchemaJson {
     errdefer alloc.free(schema_json);
-    const work_items = try appliedDdlWorkItemsForFlagsAlloc(alloc, requires_rebuild, validation_required, rewrite_required);
+    const work_items = try appliedDdlTableWorkItemsForFlagsAlloc(alloc, requires_rebuild, validation_required, rewrite_required);
     return .{
         .schema_json = schema_json,
         .requires_rebuild = requires_rebuild,

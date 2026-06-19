@@ -6246,6 +6246,10 @@ applications must explicitly emit `work_items=0:work=none`. This keeps the
 SQL/API corpus tied to the Antfly-native work contract that production schema
 controllers will schedule durably, instead of letting tests infer work from
 legacy booleans alone.
+Service-level SQL table-drop records carry the same three typed table work
+items as applied drop-table fingerprints, so callers do not have to infer
+derived-artifact rebuild, constraint validation, and row-image rewrite work from
+`dropped_table` alone.
 
 | SQL family | Current Antfly baseline | Remaining long-term work | Completion signal |
 | --- | --- | --- | --- |

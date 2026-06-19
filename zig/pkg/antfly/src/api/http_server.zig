@@ -1168,22 +1168,68 @@ fn applyRelationalSqlDdlOnServiceWithSession(
         } else {
             try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
         }
-        const dropped = try metadata_table_manager.cloneTable(alloc, table.*);
-        errdefer metadata_table_manager.freeTable(alloc, dropped);
+        var dropped = try droppedRelationalSqlTableRecordAlloc(alloc, table.*);
+        errdefer dropped.deinit(alloc);
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         _ = try workflow.dropTable(svc, table.table_id);
         try svc.runRound();
-        return .{
-            .table = dropped,
-            .dropped_table = true,
-        };
+        return dropped;
     }
     var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
     try svc.runRound();
     return applied;
+}
+
+fn droppedRelationalSqlTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const dropped = try metadata_table_manager.cloneTable(alloc, table);
+    errdefer metadata_table_manager.freeTable(alloc, dropped);
+    const work_items = try relational_sql.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, true, true);
+    errdefer if (work_items.len > 0) alloc.free(work_items);
+    return .{
+        .table = dropped,
+        .dropped_table = true,
+        .requires_rebuild = true,
+        .validation_required = true,
+        .rewrite_required = true,
+        .work_items = work_items,
+    };
+}
+
+test "api http server sql ddl drop table record carries catalog work items" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 41,
+        .name = "events",
+        .schema_json =
+        \\{"schema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"primary_key":{"fields":["id"]},"relational":true}
+        ,
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    var dropped = try droppedRelationalSqlTableRecordAlloc(std.testing.allocator, table);
+    defer dropped.deinit(std.testing.allocator);
+
+    try std.testing.expect(dropped.dropped_table);
+    try std.testing.expect(dropped.requires_rebuild);
+    try std.testing.expect(dropped.validation_required);
+    try std.testing.expect(dropped.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 3), dropped.work_items.len);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, dropped.work_items[0].action);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkSubject.table, dropped.work_items[0].subject);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkReason.derived_artifacts, dropped.work_items[0].reason);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.validate, dropped.work_items[1].action);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkSubject.table, dropped.work_items[1].subject);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkReason.constraints, dropped.work_items[1].reason);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rewrite, dropped.work_items[2].action);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkSubject.table, dropped.work_items[2].subject);
+    try std.testing.expectEqual(relational_sql.AppliedDdlWorkReason.row_images, dropped.work_items[2].reason);
 }
 
 fn applyDatabaseCatalogPlanOnService(
