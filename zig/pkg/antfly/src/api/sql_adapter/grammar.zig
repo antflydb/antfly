@@ -969,6 +969,7 @@ pub const AlterRoleSyntax = struct {
     role_name: []const u8,
     database_name: ?[]const u8 = null,
     operation: ddl_plan.AlterRolePlan.Operation = .set,
+    setting_kind: ddl_plan.AlterRolePlan.SettingKind = .app,
     setting_name: []const u8,
     setting_value: ?[]const u8 = null,
 
@@ -5249,7 +5250,10 @@ pub fn parseAlterRoleCatalogTailAlloc(
     const setting_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var setting_transferred = false;
     errdefer if (!setting_transferred) alloc.free(setting_name);
-    if (!std.mem.startsWith(u8, setting_name, "app.")) return error.UnsupportedSqlShape;
+    const setting_kind: ddl_plan.AlterRolePlan.SettingKind = if (std.mem.startsWith(u8, setting_name, "app."))
+        .app
+    else
+        .runtime;
     var setting_value: ?[]const u8 = null;
     var value_transferred = true;
     if (operation == .set) {
@@ -5269,6 +5273,7 @@ pub fn parseAlterRoleCatalogTailAlloc(
         .role_name = role_name,
         .database_name = database_name,
         .operation = operation,
+        .setting_kind = setting_kind,
         .setting_name = setting_name,
         .setting_value = setting_value,
     };
@@ -9216,6 +9221,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(alter_role_tokens.items.len, alter_role_pos);
     try std.testing.expectEqualStrings("app_writer", alter_role.role_name);
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, alter_role.operation);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.app, alter_role.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", alter_role.setting_name);
     try std.testing.expectEqualStrings("acme", alter_role.setting_value orelse return error.TestUnexpectedResult);
 
@@ -9228,6 +9234,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqualStrings("app_writer", scoped_alter_role.role_name);
     try std.testing.expectEqualStrings("appdb", scoped_alter_role.database_name.?);
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, scoped_alter_role.operation);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.app, scoped_alter_role.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", scoped_alter_role.setting_name);
     try std.testing.expectEqualStrings("acme", scoped_alter_role.setting_value orelse return error.TestUnexpectedResult);
 
@@ -9239,6 +9246,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(reset_role_tokens.items.len, reset_role_pos);
     try std.testing.expectEqualStrings("app_writer", reset_role.role_name);
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, reset_role.operation);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.app, reset_role.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", reset_role.setting_name);
     try std.testing.expect(reset_role.setting_value == null);
 
@@ -9251,13 +9259,31 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqualStrings("app_writer", scoped_reset_role.role_name);
     try std.testing.expectEqualStrings("appdb", scoped_reset_role.database_name.?);
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, scoped_reset_role.operation);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.app, scoped_reset_role.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", scoped_reset_role.setting_name);
     try std.testing.expect(scoped_reset_role.setting_value == null);
 
-    var unsupported_role_setting_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET statement_timeout = '1ms';");
-    defer lexer.freeTokens(alloc, &unsupported_role_setting_tokens);
-    var unsupported_role_setting_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterRoleCatalogTailAlloc(alloc, unsupported_role_setting_tokens.items, &unsupported_role_setting_pos));
+    var runtime_role_setting_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET statement_timeout = '1ms';");
+    defer lexer.freeTokens(alloc, &runtime_role_setting_tokens);
+    var runtime_role_setting_pos: usize = 0;
+    var runtime_role_setting = try parseAlterRoleCatalogTailAlloc(alloc, runtime_role_setting_tokens.items, &runtime_role_setting_pos);
+    defer runtime_role_setting.deinit(alloc);
+    try std.testing.expectEqual(runtime_role_setting_tokens.items.len, runtime_role_setting_pos);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, runtime_role_setting.operation);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.runtime, runtime_role_setting.setting_kind);
+    try std.testing.expectEqualStrings("statement_timeout", runtime_role_setting.setting_name);
+    try std.testing.expectEqualStrings("1ms", runtime_role_setting.setting_value orelse return error.TestUnexpectedResult);
+
+    var runtime_reset_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer RESET statement_timeout;");
+    defer lexer.freeTokens(alloc, &runtime_reset_role_tokens);
+    var runtime_reset_role_pos: usize = 0;
+    var runtime_reset_role = try parseAlterRoleCatalogTailAlloc(alloc, runtime_reset_role_tokens.items, &runtime_reset_role_pos);
+    defer runtime_reset_role.deinit(alloc);
+    try std.testing.expectEqual(runtime_reset_role_tokens.items.len, runtime_reset_role_pos);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, runtime_reset_role.operation);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.runtime, runtime_reset_role.setting_kind);
+    try std.testing.expectEqualStrings("statement_timeout", runtime_reset_role.setting_name);
+    try std.testing.expect(runtime_reset_role.setting_value == null);
 
     var unsupported_role_value_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');");
     defer lexer.freeTokens(alloc, &unsupported_role_value_tokens);

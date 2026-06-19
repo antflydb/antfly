@@ -4008,6 +4008,8 @@ pub const AppParityCorpusCoverage = struct {
     ddl_role_alter: bool = false,
     ddl_role_alter_database_scope: bool = false,
     ddl_role_alter_reset: bool = false,
+    ddl_role_alter_runtime_setting: bool = false,
+    ddl_role_alter_runtime_reset: bool = false,
     ddl_role_drop: bool = false,
     ddl_privilege_grant: bool = false,
     ddl_privilege_revoke: bool = false,
@@ -4226,8 +4228,6 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
-    unsupported_ddl_role_setting_name: bool = false,
-    unsupported_ddl_role_setting_reset: bool = false,
     unsupported_ddl_role_setting_expression: bool = false,
     unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
@@ -5458,14 +5458,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
                     std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                     std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null);
-            self.unsupported_ddl_role_setting_name = self.unsupported_ddl_role_setting_name or
-                (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
-                    std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
-                    std.mem.indexOf(u8, entry.sql, " statement_timeout ") != null);
-            self.unsupported_ddl_role_setting_reset = self.unsupported_ddl_role_setting_reset or
-                (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
-                    std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
-                    std.mem.indexOf(u8, entry.sql, " RESET ") != null);
             self.unsupported_ddl_role_setting_expression = self.unsupported_ddl_role_setting_expression or
                 (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
                     std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
@@ -5662,6 +5654,12 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_role_alter = true;
                     self.ddl_role_alter_database_scope = self.ddl_role_alter_database_scope or std.mem.indexOf(u8, entry.plan, ":database=") != null;
                     self.ddl_role_alter_reset = self.ddl_role_alter_reset or std.mem.indexOf(u8, entry.plan, ":operation=reset:") != null;
+                    self.ddl_role_alter_runtime_setting = self.ddl_role_alter_runtime_setting or
+                        std.mem.indexOf(u8, entry.plan, ":setting_kind=runtime") != null and
+                            std.mem.indexOf(u8, entry.plan, ":operation=set:") != null;
+                    self.ddl_role_alter_runtime_reset = self.ddl_role_alter_runtime_reset or
+                        std.mem.indexOf(u8, entry.plan, ":setting_kind=runtime") != null and
+                            std.mem.indexOf(u8, entry.plan, ":operation=reset:") != null;
                 },
                 .drop_role => self.ddl_role_drop = true,
                 .grant_privilege => self.ddl_privilege_grant = true,

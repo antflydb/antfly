@@ -83,6 +83,7 @@ fn executeAlterRole(
     alloc: std.mem.Allocator,
     plan: relational_sql.AlterRolePlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
+    if (plan.setting_kind != .app) return error.UnsupportedSqlShape;
     const subject = try principalSubjectAlloc(manager, alloc, plan.role_name);
     defer alloc.free(subject);
     switch (plan.operation) {

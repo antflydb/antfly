@@ -327,6 +327,15 @@ pub const BulkSqlIoExecutionPlan = struct {
     on_error: BulkIoOnErrorPolicy = .stop,
     reject_limit: ?usize = null,
     log_verbosity: BulkIoLogVerbosity = .default,
+    header: bool = false,
+    delimiter: ?[]const u8 = null,
+    quote: ?[]const u8 = null,
+    escape: ?[]const u8 = null,
+    null_marker: ?[]const u8 = null,
+    default_marker: ?[]const u8 = null,
+    encoding: ?[]const u8 = null,
+    force_not_null_columns: []const []const u8 = &.{},
+    force_null_columns: []const []const u8 = &.{},
 };
 pub const MaterializedViewCatalogPlan = sql_adapter.MaterializedViewCatalogPlan;
 pub const CreateMaterializedViewPlan = sql_adapter.CreateMaterializedViewPlan;
@@ -1999,6 +2008,15 @@ pub fn bulkSqlIoExecutionPlanFromDdlPlan(plan: BulkIoPlan) !BulkSqlIoExecutionPl
                 .on_error = plan.on_error,
                 .reject_limit = plan.reject_limit,
                 .log_verbosity = plan.log_verbosity,
+                .header = plan.header,
+                .delimiter = plan.delimiter,
+                .quote = plan.quote,
+                .escape = plan.escape,
+                .null_marker = plan.null_marker,
+                .default_marker = plan.default_marker,
+                .encoding = plan.encoding,
+                .force_not_null_columns = plan.force_not_null_columns,
+                .force_null_columns = plan.force_null_columns,
             };
         },
         .to => {
@@ -2013,6 +2031,12 @@ pub fn bulkSqlIoExecutionPlanFromDdlPlan(plan: BulkIoPlan) !BulkSqlIoExecutionPl
                 .where_expressions = plan.where_expressions,
                 .required_permission = .read,
                 .audit_action = .copy_to,
+                .header = plan.header,
+                .delimiter = plan.delimiter,
+                .quote = plan.quote,
+                .escape = plan.escape,
+                .null_marker = plan.null_marker,
+                .encoding = plan.encoding,
             };
         },
     }
@@ -2043,6 +2067,296 @@ pub fn bulkSqlIoExecutionFingerprintAlloc(alloc: std.mem.Allocator, plan: BulkSq
             plan.requires_external_stream,
         },
     );
+}
+
+pub fn bulkSqlIoImportRowsBatchFromStdinAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    stdin_payload: []const u8,
+) !relational_rows.OwnedRowsBatchRequest {
+    if (plan.operation != .import_rows or plan.native_route != .rows_batch or plan.stream != .stdin) return error.UnsupportedSqlShape;
+    if (plan.codec != .csv) return error.UnsupportedSqlShape;
+    if (plan.columns.len == 0) return error.UnsupportedSqlShape;
+    if (plan.encoding) |encoding| {
+        if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, "{\"operations\":[");
+    var appended: usize = 0;
+    var skipped_header = false;
+    var line_start: usize = 0;
+    while (line_start <= stdin_payload.len) {
+        const newline_offset = std.mem.indexOfScalar(u8, stdin_payload[line_start..], '\n');
+        const line_end = if (newline_offset) |offset| line_start + offset else stdin_payload.len;
+        var line = stdin_payload[line_start..line_end];
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        line_start = line_end + 1;
+
+        if (line.len == 0 and line_end == stdin_payload.len) break;
+        if (std.mem.eql(u8, line, "\\.")) break;
+        if (line.len == 0) continue;
+        if (plan.header and !skipped_header) {
+            skipped_header = true;
+            continue;
+        }
+
+        const fields = try parseBulkSqlCsvRecordAlloc(alloc, line, plan);
+        defer freeStringSlice(alloc, fields);
+        if (fields.len != plan.columns.len) return error.InvalidRowsRequest;
+        const row_json = try bulkSqlIoRowJsonFromCsvFieldsAlloc(alloc, schema, plan, fields);
+        defer alloc.free(row_json);
+        if (!try bulkSqlIoRowMatchesWhereAlloc(alloc, row_json, plan.where_expressions)) continue;
+
+        if (appended != 0) try body.append(alloc, ',');
+        try body.appendSlice(alloc, "{\"op\":\"insert\",\"row\":");
+        try body.appendSlice(alloc, row_json);
+        try body.append(alloc, '}');
+        appended += 1;
+    }
+    try body.appendSlice(alloc, "]}");
+    return try relational_rows.parseRowsBatchRequest(alloc, body.items, schema);
+}
+
+fn parseBulkSqlCsvRecordAlloc(
+    alloc: std.mem.Allocator,
+    line: []const u8,
+    plan: BulkSqlIoExecutionPlan,
+) ![][]const u8 {
+    const delimiter = bulkSqlIoSingleByteOption(plan.delimiter, ',');
+    const quote = bulkSqlIoSingleByteOption(plan.quote, '"');
+    const escape = bulkSqlIoSingleByteOption(plan.escape, quote);
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |value| alloc.free(value);
+        fields.deinit(alloc);
+    }
+    var field = std.ArrayListUnmanaged(u8).empty;
+    errdefer field.deinit(alloc);
+    var in_quote = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (in_quote) {
+            if (c == escape and i + 1 < line.len) {
+                i += 1;
+                try field.append(alloc, line[i]);
+                continue;
+            }
+            if (c == quote) {
+                if (i + 1 < line.len and line[i + 1] == quote) {
+                    i += 1;
+                    try field.append(alloc, quote);
+                    continue;
+                }
+                in_quote = false;
+                continue;
+            }
+            try field.append(alloc, c);
+            continue;
+        }
+        if (c == quote and field.items.len == 0) {
+            in_quote = true;
+            continue;
+        }
+        if (c == delimiter) {
+            try fields.append(alloc, try field.toOwnedSlice(alloc));
+            field = .empty;
+            continue;
+        }
+        try field.append(alloc, c);
+    }
+    if (in_quote) return error.InvalidRowsRequest;
+    try fields.append(alloc, try field.toOwnedSlice(alloc));
+    return try fields.toOwnedSlice(alloc);
+}
+
+fn bulkSqlIoSingleByteOption(option: ?[]const u8, default: u8) u8 {
+    if (option) |value| {
+        if (value.len == 1) return value[0];
+    }
+    return default;
+}
+
+fn bulkSqlIoRowJsonFromCsvFieldsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    fields: []const []const u8,
+) ![]u8 {
+    var row = std.ArrayList(u8).empty;
+    errdefer row.deinit(alloc);
+    try row.append(alloc, '{');
+    var emitted: usize = 0;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for (plan.columns, fields) |column_name, raw_value| {
+        if (seen.contains(column_name)) return error.InvalidRowsRequest;
+        try seen.put(alloc, column_name, {});
+        const column = bulkSqlIoFindRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
+        if (column.generated != null) return error.InvalidRowsRequest;
+        const value_json = try bulkSqlIoCsvValueJsonAlloc(alloc, column, raw_value, plan);
+        if (value_json == null) continue;
+        defer alloc.free(value_json.?);
+        if (emitted != 0) try row.append(alloc, ',');
+        const key_json = try std.json.Stringify.valueAlloc(alloc, column_name, .{});
+        defer alloc.free(key_json);
+        try row.appendSlice(alloc, key_json);
+        try row.append(alloc, ':');
+        try row.appendSlice(alloc, value_json.?);
+        emitted += 1;
+    }
+    try row.append(alloc, '}');
+    return try row.toOwnedSlice(alloc);
+}
+
+fn bulkSqlIoFindRelationalColumn(schema: runtime_schema.TableSchema, column_name: []const u8) ?runtime_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, column_name)) return column;
+    }
+    return null;
+}
+
+fn bulkSqlIoCsvValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    raw_value: []const u8,
+    plan: BulkSqlIoExecutionPlan,
+) !?[]u8 {
+    if (plan.default_marker) |marker| {
+        if (std.mem.eql(u8, raw_value, marker)) return null;
+    }
+    const null_marker = plan.null_marker orelse "";
+    const forced_not_null = bulkSqlIoStringSliceContains(plan.force_not_null_columns, column.name);
+    const forced_null = bulkSqlIoStringSliceContains(plan.force_null_columns, column.name);
+    if ((forced_null or (!forced_not_null and std.mem.eql(u8, raw_value, null_marker)))) {
+        return try alloc.dupe(u8, "null");
+    }
+    return switch (column.field_type) {
+        .keyword, .text, .link, .blob, .html, .search_as_you_type, .datetime => try std.json.Stringify.valueAlloc(alloc, raw_value, .{}),
+        .numeric => try bulkSqlIoNumericJsonAlloc(alloc, raw_value),
+        .boolean => try bulkSqlIoBooleanJsonAlloc(alloc, raw_value),
+        .json => try bulkSqlIoParsedJsonValueAlloc(alloc, raw_value, false),
+        .array => try bulkSqlIoParsedJsonValueAlloc(alloc, raw_value, true),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn bulkSqlIoNumericJsonAlloc(alloc: std.mem.Allocator, raw_value: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw_value, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .integer, .float => return try alloc.dupe(u8, raw_value),
+        else => return error.InvalidRowsRequest,
+    }
+}
+
+fn bulkSqlIoBooleanJsonAlloc(alloc: std.mem.Allocator, raw_value: []const u8) ![]u8 {
+    if (std.ascii.eqlIgnoreCase(raw_value, "true") or std.mem.eql(u8, raw_value, "t") or std.mem.eql(u8, raw_value, "1")) {
+        return try alloc.dupe(u8, "true");
+    }
+    if (std.ascii.eqlIgnoreCase(raw_value, "false") or std.mem.eql(u8, raw_value, "f") or std.mem.eql(u8, raw_value, "0")) {
+        return try alloc.dupe(u8, "false");
+    }
+    return error.InvalidRowsRequest;
+}
+
+fn bulkSqlIoParsedJsonValueAlloc(alloc: std.mem.Allocator, raw_value: []const u8, require_array: bool) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw_value, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (require_array and parsed.value != .array) return error.InvalidRowsRequest;
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+fn bulkSqlIoStringSliceContains(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+fn bulkSqlIoRowMatchesWhereAlloc(
+    alloc: std.mem.Allocator,
+    row_json: []const u8,
+    conditions: []const db_mod.types.RelationalRowsExpressionCondition,
+) !bool {
+    if (conditions.len == 0) return true;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    for (conditions) |condition| {
+        if (!try bulkSqlIoExpressionConditionMatchesAlloc(alloc, parsed.value.object, condition)) return false;
+    }
+    return true;
+}
+
+fn bulkSqlIoExpressionConditionMatchesAlloc(
+    alloc: std.mem.Allocator,
+    row: std.json.ObjectMap,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) !bool {
+    if (condition.lhs.kind != .field or condition.lhs.field_source != .row) return error.UnsupportedSqlShape;
+    const lhs = row.get(condition.lhs.field) orelse std.json.Value.null;
+    switch (condition.op) {
+        .is_null => return lhs == .null,
+        .is_not_null => return lhs != .null,
+        else => {},
+    }
+    if (condition.rhs.len != 1 or condition.rhs[0].kind != .value) return error.UnsupportedSqlShape;
+    var parsed_rhs = std.json.parseFromSlice(std.json.Value, alloc, condition.rhs[0].value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed_rhs.deinit();
+    const cmp = try bulkSqlIoCompareJsonValues(alloc, lhs, parsed_rhs.value);
+    return switch (condition.op) {
+        .eq, .is_not_distinct => cmp == .eq,
+        .ne, .is_distinct => cmp != .eq,
+        .gt => cmp == .gt,
+        .gte => cmp == .gt or cmp == .eq,
+        .lt => cmp == .lt,
+        .lte => cmp == .lt or cmp == .eq,
+        .is_null, .is_not_null => unreachable,
+    };
+}
+
+const BulkSqlIoValueComparison = enum { lt, eq, gt };
+
+fn bulkSqlIoCompareJsonValues(alloc: std.mem.Allocator, lhs: std.json.Value, rhs: std.json.Value) !BulkSqlIoValueComparison {
+    if (bulkSqlIoJsonNumber(lhs)) |left_number| {
+        if (bulkSqlIoJsonNumber(rhs)) |right_number| {
+            if (left_number < right_number) return .lt;
+            if (left_number > right_number) return .gt;
+            return .eq;
+        }
+    }
+    if (lhs == .string and rhs == .string) {
+        const order = std.mem.order(u8, lhs.string, rhs.string);
+        return switch (order) {
+            .lt => .lt,
+            .eq => .eq,
+            .gt => .gt,
+        };
+    }
+    const lhs_json = try std.json.Stringify.valueAlloc(alloc, lhs, .{});
+    defer alloc.free(lhs_json);
+    const rhs_json = try std.json.Stringify.valueAlloc(alloc, rhs, .{});
+    defer alloc.free(rhs_json);
+    const order = std.mem.order(u8, lhs_json, rhs_json);
+    return switch (order) {
+        .lt => .lt,
+        .eq => .eq,
+        .gt => .gt,
+    };
+}
+
+fn bulkSqlIoJsonNumber(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        else => null,
+    };
 }
 
 pub fn preparedTransactionRecoveryIntentFromPlan(plan: PreparedTransactionPlan) PreparedTransactionRecoveryIntent {
@@ -3907,6 +4221,7 @@ const Parser = struct {
         const role_name = syntax.role_name;
         const database_name = syntax.database_name;
         const operation = syntax.operation;
+        const setting_kind = syntax.setting_kind;
         const setting_name = syntax.setting_name;
         const setting_value = syntax.setting_value;
         syntax.role_name = "";
@@ -3917,6 +4232,7 @@ const Parser = struct {
             .role_name = role_name,
             .database_name = database_name,
             .operation = operation,
+            .setting_kind = setting_kind,
             .setting_name = setting_name,
             .setting_value = setting_value,
         };
@@ -45978,6 +46294,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     };
     try std.testing.expectEqualStrings("app_writer", alter_role_plan.role_name);
     try std.testing.expectEqual(AlterRolePlan.Operation.set, alter_role_plan.operation);
+    try std.testing.expectEqual(AlterRolePlan.SettingKind.app, alter_role_plan.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", alter_role_plan.setting_name);
     try std.testing.expectEqualStrings("acme", alter_role_plan.setting_value orelse return error.TestUnexpectedResult);
     const alter_role_fingerprint = try ddlFingerprintAlloc(alloc, alter_role);
@@ -45997,6 +46314,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("app_writer", scoped_alter_role_plan.role_name);
     try std.testing.expectEqualStrings("appdb", scoped_alter_role_plan.database_name.?);
     try std.testing.expectEqual(AlterRolePlan.Operation.set, scoped_alter_role_plan.operation);
+    try std.testing.expectEqual(AlterRolePlan.SettingKind.app, scoped_alter_role_plan.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", scoped_alter_role_plan.setting_name);
     try std.testing.expectEqualStrings("acme", scoped_alter_role_plan.setting_value orelse return error.TestUnexpectedResult);
     const scoped_alter_role_fingerprint = try ddlFingerprintAlloc(alloc, scoped_alter_role);
@@ -46015,6 +46333,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     };
     try std.testing.expectEqualStrings("app_writer", reset_role_plan.role_name);
     try std.testing.expectEqual(AlterRolePlan.Operation.reset, reset_role_plan.operation);
+    try std.testing.expectEqual(AlterRolePlan.SettingKind.app, reset_role_plan.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", reset_role_plan.setting_name);
     try std.testing.expect(reset_role_plan.setting_value == null);
     const reset_role_fingerprint = try ddlFingerprintAlloc(alloc, reset_role);
@@ -46034,12 +46353,56 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("app_writer", scoped_reset_role_plan.role_name);
     try std.testing.expectEqualStrings("appdb", scoped_reset_role_plan.database_name.?);
     try std.testing.expectEqual(AlterRolePlan.Operation.reset, scoped_reset_role_plan.operation);
+    try std.testing.expectEqual(AlterRolePlan.SettingKind.app, scoped_reset_role_plan.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", scoped_reset_role_plan.setting_name);
     try std.testing.expect(scoped_reset_role_plan.setting_value == null);
     const scoped_reset_role_fingerprint = try ddlFingerprintAlloc(alloc, scoped_reset_role);
     defer alloc.free(scoped_reset_role_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:database=appdb:operation=reset:setting=app.tenant_id", scoped_reset_role_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, scoped_reset_role));
+
+    var runtime_alter_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer SET statement_timeout = '1ms';");
+    defer runtime_alter_role.deinit(alloc);
+    const runtime_alter_role_plan = switch (runtime_alter_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter_plan| alter_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("app_writer", runtime_alter_role_plan.role_name);
+    try std.testing.expectEqual(AlterRolePlan.Operation.set, runtime_alter_role_plan.operation);
+    try std.testing.expectEqual(AlterRolePlan.SettingKind.runtime, runtime_alter_role_plan.setting_kind);
+    try std.testing.expectEqualStrings("statement_timeout", runtime_alter_role_plan.setting_name);
+    try std.testing.expectEqualStrings("1ms", runtime_alter_role_plan.setting_value orelse return error.TestUnexpectedResult);
+    const runtime_alter_role_fingerprint = try ddlFingerprintAlloc(alloc, runtime_alter_role);
+    defer alloc.free(runtime_alter_role_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=set:setting=statement_timeout:setting_kind=runtime", runtime_alter_role_fingerprint);
+
+    var runtime_scoped_alter_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET statement_timeout = '1ms';");
+    defer runtime_scoped_alter_role.deinit(alloc);
+    const runtime_scoped_alter_role_fingerprint = try ddlFingerprintAlloc(alloc, runtime_scoped_alter_role);
+    defer alloc.free(runtime_scoped_alter_role_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=statement_timeout:setting_kind=runtime", runtime_scoped_alter_role_fingerprint);
+
+    var runtime_reset_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer RESET statement_timeout;");
+    defer runtime_reset_role.deinit(alloc);
+    const runtime_reset_role_plan = switch (runtime_reset_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |reset_plan| reset_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(AlterRolePlan.Operation.reset, runtime_reset_role_plan.operation);
+    try std.testing.expectEqual(AlterRolePlan.SettingKind.runtime, runtime_reset_role_plan.setting_kind);
+    try std.testing.expectEqualStrings("statement_timeout", runtime_reset_role_plan.setting_name);
+    try std.testing.expect(runtime_reset_role_plan.setting_value == null);
+    const runtime_reset_role_fingerprint = try ddlFingerprintAlloc(alloc, runtime_reset_role);
+    defer alloc.free(runtime_reset_role_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=reset:setting=statement_timeout:setting_kind=runtime", runtime_reset_role_fingerprint);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');"));
 
     var drop_role = try lowerDdlPlanAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
     defer drop_role.deinit(alloc);
@@ -57799,18 +58162,24 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 "ddl:create_role:role={s}",
                 .{create.role_name},
             ),
-            .alter_role => |alter| if (alter.database_name) |database_name|
-                try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:alter_role:role={s}:database={s}:operation={s}:setting={s}",
-                    .{ alter.role_name, database_name, @tagName(alter.operation), alter.setting_name },
-                )
-            else
-                try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:alter_role:role={s}:operation={s}:setting={s}",
-                    .{ alter.role_name, @tagName(alter.operation), alter.setting_name },
-                ),
+            .alter_role => |alter| blk: {
+                var fingerprint = if (alter.database_name) |database_name|
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_role:role={s}:database={s}:operation={s}:setting={s}",
+                        .{ alter.role_name, database_name, @tagName(alter.operation), alter.setting_name },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_role:role={s}:operation={s}:setting={s}",
+                        .{ alter.role_name, @tagName(alter.operation), alter.setting_name },
+                    );
+                if (alter.setting_kind != .app) {
+                    fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "setting_kind", @tagName(alter.setting_kind));
+                }
+                break :blk fingerprint;
+            },
             .drop_role => |drop| try std.fmt.allocPrint(
                 alloc,
                 "ddl:drop_role:role={s}:if_exists={}",

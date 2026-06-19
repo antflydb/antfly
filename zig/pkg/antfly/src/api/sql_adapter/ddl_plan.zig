@@ -864,10 +864,15 @@ pub const AlterRolePlan = struct {
         set,
         reset,
     };
+    pub const SettingKind = enum {
+        app,
+        runtime,
+    };
 
     role_name: []const u8,
     database_name: ?[]const u8 = null,
     operation: Operation = .set,
+    setting_kind: SettingKind = .app,
     setting_name: []const u8,
     setting_value: ?[]const u8 = null,
 

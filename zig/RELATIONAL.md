@@ -4996,16 +4996,18 @@ remaining owned settings. Authentication exposes merged effective role settings
 after role inheritance plus direct user settings. This is the first native SQL
 role-setting model because `app.*` settings are consumed by row-security
 `current_setting('app.*')` policies.
-Unsupported role setting names, including PostgreSQL runtime settings such as
-`statement_timeout`, fail closed until Antfly has a native runtime setting owner
-for them. Resetting those unsupported runtime settings also fails closed because
-it must not imply ownership by the native application-setting catalog. If
-inherited roles define the same setting with different values, effective-setting
+PostgreSQL runtime defaults such as `ALTER ROLE app SET statement_timeout =
+'1ms'`, database-scoped runtime defaults, and `RESET statement_timeout` now
+lower to typed `alter_role` plans with `setting_kind=runtime` instead of being
+collapsed into native auth settings. The auth execution boundary still rejects
+those runtime plans until a separate runtime-settings catalog owns session
+default application, replay, and audit; this keeps PostgreSQL GUC-style defaults
+from contaminating the `app.*` row-security setting store. If inherited roles
+define the same native app setting with different values, effective-setting
 resolution fails closed; a direct user setting for the same key is an explicit
-override. Unsupported role-setting forms such as non-`app.*` runtime settings
-and multi-token expressions still fail closed until they have explicit native
-semantics; the source parity corpus pins unsupported runtime setting names,
-runtime-setting reset, and expression values under `role_setting_plan`.
+override. Unsupported role-setting forms such as expression-valued defaults
+still fail closed until they have explicit native semantics; the source parity
+corpus pins that remaining expression case under `role_setting_plan`.
 
 `COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
 to typed bulk import/export intent that captures table identity, selected

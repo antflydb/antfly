@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "c6a9f18228a7f996560f45a1937247a52b0490f41f2ad9d31eba12a273dce865",
+  "source_sha256": "f93906c55232f5e191e26add21c15059d1151959fbf7bb92fed1439c159f3a87",
   "source_entry_count": 981,
   "entry_count": 981,
   "skipped_entries": [
@@ -3566,24 +3566,36 @@
       "sql": "ALTER ROLE app_writer RESET app.tenant_id"
     },
     {
-      "name": "unsupported role runtime setting",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=role_setting_plan",
-      "classification_reason": "role_setting_plan",
+      "name": "alter role runtime setting catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:operation=set:setting=statement_timeout:setting_kind=runtime",
       "sql": "ALTER ROLE app_writer SET statement_timeout = '1ms'"
     },
     {
-      "name": "unsupported role database scoped runtime setting",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=role_setting_plan",
-      "classification_reason": "role_setting_plan",
+      "name": "alter role database scoped runtime setting catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=statement_timeout:setting_kind=runtime",
       "sql": "ALTER ROLE app_writer IN DATABASE appdb SET statement_timeout = '1ms'"
     },
     {
-      "name": "unsupported role setting reset",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=role_setting_plan",
-      "classification_reason": "role_setting_plan",
+      "name": "alter role runtime setting reset catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:operation=reset:setting=statement_timeout:setting_kind=runtime",
       "sql": "ALTER ROLE app_writer RESET statement_timeout"
     },
     {
