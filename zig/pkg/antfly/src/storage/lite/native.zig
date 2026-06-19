@@ -42,6 +42,13 @@ const page_crc_offset: usize = 12;
 
 pub const PageKind = enum(u8) {
     data = 1,
+    catalog = 2,
+};
+
+pub const CatalogEntry = struct {
+    previous_page: u64,
+    key: []const u8,
+    value: []const u8,
 };
 
 pub const CheckpointSlot = struct {
@@ -125,27 +132,12 @@ pub const NativeFile = struct {
     }
 
     pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
-        if (self.read_only) return error.ReadOnly;
-        if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
-
         const previous = self.activeCheckpoint();
         const page_id = previous.page_count;
-        const page_size: usize = @intCast(self.header.page_size);
-        const page_offset = page_id * @as(u64, self.header.page_size);
-
-        const page = try self.allocator.alloc(u8, page_size);
-        defer self.allocator.free(page);
-        encodePage(page, .data, contents);
-
-        try self.file.setLength(self.io_impl.io(), page_offset + self.header.page_size);
-        try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
-        try self.file.sync(self.io_impl.io());
-
         var next = previous;
         next.commit_sequence += 1;
         next.page_count = page_id + 1;
-        try self.publishCheckpoint(next);
-        return page_id;
+        return try self.appendPage(.data, contents, next);
     }
 
     pub fn readPageAlloc(self: *NativeFile, allocator: Allocator, page_id: u64) ![]u8 {
@@ -166,8 +158,67 @@ pub const NativeFile = struct {
         return try decodePagePayloadAlloc(allocator, page, .data);
     }
 
+    pub fn putCatalogRecord(self: *NativeFile, key: []const u8, value: []const u8) !void {
+        const previous = self.activeCheckpoint();
+        const page_id = previous.page_count;
+        var payload = std.ArrayListUnmanaged(u8).empty;
+        defer payload.deinit(self.allocator);
+        try encodeCatalogEntry(self.allocator, &payload, .{
+            .previous_page = previous.catalog_root_page,
+            .key = key,
+            .value = value,
+        });
+
+        var next = previous;
+        next.commit_sequence += 1;
+        next.catalog_root_page = page_id;
+        next.page_count = page_id + 1;
+        _ = try self.appendPage(.catalog, payload.items, next);
+    }
+
+    pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
+        var page_id = self.activeCheckpoint().catalog_root_page;
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
+            defer allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+            if (std.mem.eql(u8, entry.key, key)) return try allocator.dupe(u8, entry.value);
+            page_id = entry.previous_page;
+        }
+        return null;
+    }
+
     pub fn maxPagePayloadBytes(self: *const NativeFile) usize {
         return @as(usize, @intCast(self.header.page_size)) - page_header_size;
+    }
+
+    fn readPagePayloadByKindAlloc(self: *NativeFile, allocator: Allocator, page_id: u64, kind: PageKind) ![]u8 {
+        const page = try self.readPageAlloc(allocator, page_id);
+        defer allocator.free(page);
+        return try decodePagePayloadAlloc(allocator, page, kind);
+    }
+
+    fn appendPage(self: *NativeFile, kind: PageKind, contents: []const u8, checkpoint: CheckpointSlot) !u64 {
+        if (self.read_only) return error.ReadOnly;
+        if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+
+        const previous = self.activeCheckpoint();
+        const page_id = previous.page_count;
+        if (checkpoint.page_count != page_id + 1) return error.InvalidNativeCheckpoint;
+
+        const page_size: usize = @intCast(self.header.page_size);
+        const page_offset = page_id * @as(u64, self.header.page_size);
+
+        const page = try self.allocator.alloc(u8, page_size);
+        defer self.allocator.free(page);
+        encodePage(page, kind, contents);
+
+        try self.file.setLength(self.io_impl.io(), page_offset + self.header.page_size);
+        try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
+        try self.file.sync(self.io_impl.io());
+
+        try self.publishCheckpoint(checkpoint);
+        return page_id;
     }
 
     fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
@@ -324,6 +375,7 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
     const kind_raw = raw[4];
     const kind: PageKind = switch (kind_raw) {
         @intFromEnum(PageKind.data) => .data,
+        @intFromEnum(PageKind.catalog) => .catalog,
         else => return error.InvalidNativePageKind,
     };
     if (kind != expected_kind) return error.UnexpectedNativePageKind;
@@ -338,6 +390,35 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
     if (crc.final() != expected_crc) return error.NativePageChecksumMismatch;
 
     return try allocator.dupe(u8, raw[page_header_size..][0..payload_len]);
+}
+
+fn encodeCatalogEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: CatalogEntry) !void {
+    if (entry.key.len > std.math.maxInt(u32) or entry.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    const start = out.items.len;
+    try out.resize(allocator, start + 16 + entry.key.len + entry.value.len);
+    const encoded = out.items[start..];
+    std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
+    std.mem.writeInt(u32, encoded[8..12], @intCast(entry.key.len), .little);
+    std.mem.writeInt(u32, encoded[12..16], @intCast(entry.value.len), .little);
+    @memcpy(encoded[16..][0..entry.key.len], entry.key);
+    @memcpy(encoded[16 + entry.key.len ..][0..entry.value.len], entry.value);
+}
+
+fn decodeCatalogEntry(raw: []const u8) !CatalogEntry {
+    if (raw.len < 16) return error.TruncatedNativeCatalogEntry;
+    const previous_page = std.mem.readInt(u64, raw[0..8], .little);
+    const key_len = std.mem.readInt(u32, raw[8..12], .little);
+    const value_len = std.mem.readInt(u32, raw[12..16], .little);
+    const payload_len = @as(u64, key_len) + @as(u64, value_len);
+    if (payload_len > raw.len - 16) return error.TruncatedNativeCatalogEntry;
+    const key_start: usize = 16;
+    const key_end = key_start + @as(usize, @intCast(key_len));
+    const value_end = key_end + @as(usize, @intCast(value_len));
+    return .{
+        .previous_page = previous_page,
+        .key = raw[key_start..key_end],
+        .value = raw[key_end..value_end],
+    };
 }
 
 fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
@@ -518,4 +599,63 @@ test "lite native file detects corrupted page payload" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectError(error.NativePageChecksumMismatch, reopened.readPagePayloadAlloc(allocator, 1));
+}
+
+test "lite native catalog stores and reopens records" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-catalog.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putCatalogRecord("schema", "{\"version\":1}");
+        try file.putCatalogRecord("index:text", "ready");
+        try file.putCatalogRecord("schema", "{\"version\":2}");
+        try std.testing.expectEqual(@as(u64, 3), file.activeCheckpoint().commit_sequence);
+        try std.testing.expect(file.activeCheckpoint().catalog_root_page != 0);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const schema = (try reopened.getCatalogRecordAlloc(allocator, "schema")).?;
+    defer allocator.free(schema);
+    try std.testing.expectEqualStrings("{\"version\":2}", schema);
+
+    const index = (try reopened.getCatalogRecordAlloc(allocator, "index:text")).?;
+    defer allocator.free(index);
+    try std.testing.expectEqualStrings("ready", index);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getCatalogRecordAlloc(allocator, "missing"));
+}
+
+test "lite native catalog detects corrupted root page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-catalog-corrupt.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putCatalogRecord("schema", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getCatalogRecordAlloc(allocator, "schema"));
 }
