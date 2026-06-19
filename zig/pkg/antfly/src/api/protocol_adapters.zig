@@ -22,16 +22,22 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 
 const trusted_principal_header = "X-Antfly-Trusted-Principal";
+const max_mcp_sample_documents_limit: i64 = 100;
 
 const McpToolKind = enum {
     create_table,
     drop_table,
     list_tables,
+    describe_table,
     create_index,
     drop_index,
     list_indexes,
+    describe_indexes,
     get_document,
+    sample_documents,
     query,
+    describe_query_request,
+    describe_mcp_capabilities,
     backup,
     restore,
     batch,
@@ -47,6 +53,7 @@ const McpToolSpec = struct {
 const McpToolFieldType = enum {
     string,
     integer,
+    boolean,
     array,
     object,
 };
@@ -58,7 +65,24 @@ const McpToolFieldSpec = struct {
     description: ?[]const u8 = null,
     default_json: ?[]const u8 = null,
     items_json: ?[]const u8 = null,
+    schema_json: ?[]const u8 = null,
 };
+
+const full_text_search_schema_json =
+    \\{"oneOf":[{"type":"string"},{"type":"object","additionalProperties":true}],"description":"Full-text query string shorthand, or the generic full_text_search query object accepted by the REST API"}
+;
+
+const query_request_schema_json =
+    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"},"offset":{"type":"integer"},"order_by":{"type":"array"},"search_after":{"type":"array","items":{"type":"string"}},"search_before":{"type":"array","items":{"type":"string"}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
+;
+
+const query_request_description_json =
+    \\{"openapi_schema":"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest","query_ast_schema":"specs/openapi/antfly/query.yaml#/components/schemas/Query","mcp_usage":{"tool":"query","path_table_argument":"tableName","raw_body_argument":"queryRequest","rules":["queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.","queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.","queryRequest.table is rejected because tableName selects the table-scoped route.","Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema."]},"top_level_fields":["query","full_text_search","semantic_search","embedding_template","indexes","filter_prefix","filter_query","exclusion_query","aggregations","embeddings","search_effort","fields","limit","offset","order_by","search_after","search_before","distance_under","distance_over","merge_config","count","profile","reranker","analyses","graph_searches","expand_strategy","document_renderer","pruner","join","foreign_sources"],"examples":{"fielded_full_text":{"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5},"hybrid":{"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},"filtered":{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10}}}
+;
+
+const mcp_capabilities_description_json =
+    \\{"protocol":"mcp","protocol_version":"2025-06-18","transport":"streamable_http","endpoint":"/mcp/v1","sessions":{"initialize_returns_session_id":true,"delete_closes_session":true,"last_event_id_cursor_supported":true,"historical_replay":false},"query_builder":"Use the A2A query-builder skill for agentic natural-language query planning. MCP stays focused on deterministic database tools and raw QueryRequest execution.","tools":{"deterministic":["list_tables","describe_table","list_indexes","describe_indexes","get_document","sample_documents","query","describe_query_request"],"write":["create_table","drop_table","create_index","drop_index","batch","backup","restore"],"schema_helpers":["describe_query_request","describe_mcp_capabilities"]},"query":{"raw_query_request":true,"raw_query_request_argument":"queryRequest","shorthand_arguments":["fullTextSearch","fullTextSearchField","semanticSearch","fields","limit","orderBy","indexes","filterPrefix"],"raw_mode_exclusive":true}}
+;
 
 const mcp_tool_specs = [_]McpToolSpec{
     .{
@@ -79,6 +103,12 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables" },
+    .{
+        .kind = .describe_table,
+        .name = "describe_table",
+        .description = "Describe an Antfly table, including schema, indexes, ranges, and storage status when available",
+        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+    },
     .{
         .kind = .create_index,
         .name = "create_index",
@@ -109,6 +139,12 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
+        .kind = .describe_indexes,
+        .name = "describe_indexes",
+        .description = "Describe indexes for an Antfly table",
+        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+    },
+    .{
         .kind = .get_document,
         .name = "get_document",
         .description = "Get an Antfly document by key",
@@ -119,12 +155,28 @@ const mcp_tool_specs = [_]McpToolSpec{
         },
     },
     .{
+        .kind = .sample_documents,
+        .name = "sample_documents",
+        .description = "Return a bounded NDJSON sample from a table using the table lookup/scan route",
+        .fields = &.{
+            .{ .name = "tableName", .schema_type = .string, .required = true },
+            .{ .name = "limit", .schema_type = .integer, .default_json = "5" },
+            .{ .name = "from", .schema_type = .string },
+            .{ .name = "to", .schema_type = .string },
+            .{ .name = "inclusiveFrom", .schema_type = .boolean, .description = "Set to true to include the from key." },
+            .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
+        },
+    },
+    .{
         .kind = .query,
         .name = "query",
         .description = "Run an Antfly table query",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "fullTextSearch", .schema_type = .string },
+            .{ .name = "queryRequest", .schema_type = .object, .schema_json = query_request_schema_json },
+            .{ .name = "fullTextSearch", .schema_type = .object, .schema_json = full_text_search_schema_json },
+            .{ .name = "full_text_search", .schema_type = .object, .description = "Generic REST-shaped full_text_search query object" },
+            .{ .name = "fullTextSearchField", .schema_type = .string, .description = "Field to search when fullTextSearch is a string shorthand, for example content" },
             .{ .name = "semanticSearch", .schema_type = .string },
             .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
             .{ .name = "limit", .schema_type = .integer, .default_json = "10" },
@@ -132,6 +184,16 @@ const mcp_tool_specs = [_]McpToolSpec{
             .{ .name = "indexes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
             .{ .name = "filterPrefix", .schema_type = .string },
         },
+    },
+    .{
+        .kind = .describe_query_request,
+        .name = "describe_query_request",
+        .description = "Return compact guidance for the raw Antfly QueryRequest accepted by query.queryRequest",
+    },
+    .{
+        .kind = .describe_mcp_capabilities,
+        .name = "describe_mcp_capabilities",
+        .description = "Describe Antfly MCP capabilities, deterministic tools, and A2A query-builder handoff guidance",
     },
     .{
         .kind = .backup,
@@ -234,11 +296,16 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
                 .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
+                .describe_table => try ctx.tableRoute(alloc, args, .GET, "tableName", null, ""),
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
                 .list_indexes => try ctx.listIndexes(alloc, args),
+                .describe_indexes => try ctx.listIndexes(alloc, args),
                 .get_document => try ctx.getDocument(alloc, args),
+                .sample_documents => try ctx.sampleDocuments(alloc, args),
                 .query => try ctx.query(alloc, args),
+                .describe_query_request => try ctx.describeQueryRequest(alloc),
+                .describe_mcp_capabilities => try ctx.describeMcpCapabilities(alloc),
                 .backup => try ctx.backupRestore(alloc, args, "backup"),
                 .restore => try ctx.backupRestore(alloc, args, "restore"),
                 .batch => try ctx.batch(alloc, args),
@@ -315,6 +382,21 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             return try ctx.simpleRoute(alloc, .GET, try uri.toOwnedSlice(alloc), "");
         }
 
+        fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const limit = jsonIntArg(args, "limit") orelse 5;
+            if (limit <= 0) return mcpError(alloc, "limit must be greater than 0");
+            if (limit > max_mcp_sample_documents_limit) return mcpError(alloc, "limit exceeds maximum sample size");
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "limit", .{ .integer = limit });
+            if (jsonStringArg(args, "from")) |from| if (from.len != 0) try body.put(alloc, "from", .{ .string = from });
+            if (jsonStringArg(args, "to")) |to| if (to.len != 0) try body.put(alloc, "to", .{ .string = to });
+            if (jsonBoolArg(args, "inclusiveFrom")) |inclusive| try body.put(alloc, "inclusive_from", .{ .bool = inclusive });
+            if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/lookup", .{ routes.Routes.tables, table_name });
+            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+        }
+
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
@@ -324,14 +406,17 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
-            var body = std.json.ObjectMap.empty;
-            if (jsonStringArg(args, "fullTextSearch")) |full_text| {
-                if (full_text.len != 0) {
-                    var full_text_obj = std.json.ObjectMap.empty;
-                    try full_text_obj.put(alloc, "query", .{ .string = full_text });
-                    try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
-                }
+            if (jsonValueArg(args, "queryRequest")) |query_request| {
+                if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
+                if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
+                if (query_request.object.get("table") != null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
+
+                const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
+                return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, query_request));
             }
+
+            var body = std.json.ObjectMap.empty;
+            putFullTextSearchArg(alloc, &body, args) catch return mcpError(alloc, "invalid fullTextSearch");
             if (jsonStringArg(args, "semanticSearch")) |semantic| if (semantic.len != 0) try body.put(alloc, "semantic_search", .{ .string = semantic });
             if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
             if (jsonValueArg(args, "orderBy")) |order_by| try body.put(alloc, "order_by", order_by);
@@ -340,6 +425,22 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 10 });
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+        }
+
+        fn describeQueryRequest(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
+            const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, query_request_description_json, .{});
+            return .{
+                .text = try alloc.dupe(u8, "Antfly QueryRequest schema summary for query.queryRequest"),
+                .structured = structured,
+            };
+        }
+
+        fn describeMcpCapabilities(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
+            const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, mcp_capabilities_description_json, .{});
+            return .{
+                .text = try alloc.dupe(u8, "Antfly MCP capabilities"),
+                .structured = structured,
+            };
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
@@ -512,8 +613,9 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
     return switch (kind) {
+        .describe_query_request, .describe_mcp_capabilities => true,
         .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
-        .query, .get_document, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
+        .query, .describe_table, .describe_indexes, .get_document, .sample_documents, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
         .batch => identityHasAnyPermission(identity.permissions, .table, .write),
         .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
     };
@@ -996,7 +1098,12 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     for (spec.fields, 0..) |field, i| {
         if (i != 0) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, field.name);
-        try out.appendSlice(alloc, ":{\"type\":");
+        try out.append(alloc, ':');
+        if (field.schema_json) |schema_json| {
+            try out.appendSlice(alloc, schema_json);
+            continue;
+        }
+        try out.appendSlice(alloc, "{\"type\":");
         try appendJsonString(alloc, &out, @tagName(field.schema_type));
         if (field.items_json) |items_json| {
             try out.appendSlice(alloc, ",\"items\":");
@@ -1319,9 +1426,67 @@ fn jsonIntObjectField(object: anytype, key: []const u8) ?i64 {
     };
 }
 
+fn jsonBoolArg(value: std.json.Value, key: []const u8) ?bool {
+    if (value != .object) return null;
+    const raw = value.object.get(key) orelse return null;
+    return switch (raw) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
 fn jsonValueArg(value: std.json.Value, key: []const u8) ?std.json.Value {
     if (value != .object) return null;
     return value.object.get(key);
+}
+
+fn hasNonRawQueryArg(args: std.json.Value) bool {
+    if (args != .object) return false;
+    var it = args.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "tableName") or std.mem.eql(u8, key, "queryRequest")) continue;
+        return true;
+    }
+    return false;
+}
+
+fn putFullTextSearch(
+    alloc: std.mem.Allocator,
+    body: *std.json.ObjectMap,
+    match: []const u8,
+    field: ?[]const u8,
+) !void {
+    var full_text_obj = std.json.ObjectMap.empty;
+    if (field) |field_name| {
+        if (field_name.len != 0) {
+            try full_text_obj.put(alloc, "match", .{ .string = match });
+            try full_text_obj.put(alloc, "field", .{ .string = field_name });
+            try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
+            return;
+        }
+    }
+    try full_text_obj.put(alloc, "query", .{ .string = match });
+    try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
+}
+
+fn putFullTextSearchArg(
+    alloc: std.mem.Allocator,
+    body: *std.json.ObjectMap,
+    args: std.json.Value,
+) !void {
+    if (jsonValueArg(args, "full_text_search")) |full_text| {
+        if (full_text != .null) try body.put(alloc, "full_text_search", full_text);
+        return;
+    }
+    if (jsonValueArg(args, "fullTextSearch")) |full_text| {
+        switch (full_text) {
+            .string => |text| if (text.len != 0) try putFullTextSearch(alloc, body, text, jsonStringArg(args, "fullTextSearchField")),
+            .object => try body.put(alloc, "full_text_search", full_text),
+            .null => {},
+            else => return error.InvalidParams,
+        }
+    }
 }
 
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {

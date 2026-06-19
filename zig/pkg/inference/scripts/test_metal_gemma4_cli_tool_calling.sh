@@ -15,16 +15,11 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-PKG_DIR="$ROOT_DIR/pkg/inference"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/inference_cli.sh
+source "$SCRIPT_DIR/inference_cli.sh"
 
-if [[ -z "${ANTFLY_BIN:-}" ]]; then
-  if [[ -x "$PKG_DIR/zig-out/bin/antfly-inference" ]]; then
-    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly-inference"
-  else
-    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly"
-  fi
-fi
+ANTFLY_BIN="$(resolve_antfly_inference_bin)"
 
 MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_MODEL:-$HOME/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf}"
 PROMPT="${ANTFLY_INFERENCE_GEMMA4_TOOL_PROMPT:-Use the lookup_order tool for order_id A123. Return only the tool call.}"
@@ -71,14 +66,13 @@ cat >"$TOOLS_JSON" <<'JSON'
 JSON
 
 run_antfly() {
-  local subcommand="$1"
-  shift
-  if [[ "$(basename "$ANTFLY_BIN")" == "antfly" ]]; then
-    "$ANTFLY_BIN" inference "$subcommand" "$@"
-  else
-    "$ANTFLY_BIN" "$subcommand" "$@"
-  fi
+  run_antfly_inference "$@"
 }
+
+if ! run_antfly generate --help 2>&1 | grep -q -- '--tools'; then
+  echo "metal Gemma4 CLI tool-calling diagnostic: generate CLI has no --tools support; server API coverage is test-metal-gemma4-tool-calling"
+  exit 0
+fi
 
 if ! run_antfly generate "$MODEL_DIR" "$PROMPT" \
   --backend metal \

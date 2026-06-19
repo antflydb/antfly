@@ -1484,13 +1484,12 @@ pub const AntflyApiHandler = struct {
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
         const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(table_name, &storage_status_buf);
-        var arena_impl = std.heap.ArenaAllocator.init(alloc);
-        defer arena_impl.deinit();
-        const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_name, storage_statuses)) orelse {
+        const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(alloc, &snapshot, table_name, storage_statuses)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
-        return ctx.json(response);
+        defer alloc.free(body);
+        return respondApiResponseBody(ctx, 200, body);
     }
 
     pub fn createTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -2129,6 +2128,29 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, table_name, index_name, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn putArtifactEnrichment(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        const body_data = (try ctx.body()) orelse "";
+        var resp = try public_table_http.handlePutArtifactEnrichment(alloc, table_name, decoded_artifact_name, body_data, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn deleteArtifactEnrichment(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        var resp = try public_table_http.handleDeleteArtifactEnrichment(alloc, table_name, decoded_artifact_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
 

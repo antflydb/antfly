@@ -41,6 +41,7 @@ pub const Routes = struct {
     pub const internal_table_restore_suffix = "/restore";
     pub const internal_table_schema_suffix = "/schema";
     pub const internal_table_indexes_infix = "/indexes/";
+    pub const internal_table_enrichments_infix = "/enrichments/";
     pub const internal_table_replication_sources_infix = "/replication-sources/";
     pub const internal_table_reseed_exact_cutover_suffix = "/reseed-exact-cutover";
     pub const internal_split_suffix = "/split";
@@ -53,6 +54,11 @@ pub const Routes = struct {
     pub const InternalTableIndexPath = struct {
         table_name: []const u8,
         index_name: []const u8,
+    };
+
+    pub const InternalTableEnrichmentPath = struct {
+        table_name: []const u8,
+        enrichment_name: []const u8,
     };
 
     pub const InternalTableReplicationSourcePath = struct {
@@ -145,6 +151,23 @@ pub const Routes = struct {
         return .{
             .table_name = table_name,
             .index_name = index_name,
+        };
+    }
+
+    pub fn matchInternalTableEnrichment(path: []const u8) ?InternalTableEnrichmentPath {
+        if (!std.mem.startsWith(u8, path, internal_tables_prefix)) return null;
+        const middle = path[internal_tables_prefix.len..];
+        const infix = internal_table_enrichments_infix;
+        const infix_index = std.mem.indexOf(u8, middle, infix) orelse return null;
+        const table_name = middle[0..infix_index];
+        const suffix = middle[infix_index..];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        if (!std.mem.startsWith(u8, suffix, infix)) return null;
+        const enrichment_name = suffix[infix.len..];
+        if (enrichment_name.len == 0 or std.mem.indexOfScalar(u8, enrichment_name, '/') != null) return null;
+        return .{
+            .table_name = table_name,
+            .enrichment_name = enrichment_name,
         };
     }
 

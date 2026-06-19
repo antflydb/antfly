@@ -1,0 +1,614 @@
+openapi: 3.1.0
+info:
+  title: Antfly ARD Discovery API
+  version: 1.0.0
+  description: Tenant-scoped Agentic Resource Discovery catalog and registry API.
+security:
+  - AntflyAuthorization: []
+  - TrustedPrincipal: []
+paths:
+  /.well-known/ai-catalog.json:
+    get:
+      summary: Fetch the ARD ai-catalog manifest
+      security:
+        - {}
+        - AntflyAuthorization: []
+        - TrustedPrincipal: []
+      parameters:
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          $ref: '#/components/responses/Catalog'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1:
+    get:
+      summary: Fetch the Antfly ARD registry root
+      responses:
+        '200':
+          description: Registry endpoint map.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryRoot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/catalog:
+    get:
+      summary: Fetch the authenticated tenant ARD catalog
+      parameters:
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          $ref: '#/components/responses/Catalog'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/openapi.yaml:
+    get:
+      summary: Fetch the ARD discovery OpenAPI document
+      responses:
+        '200':
+          description: This OpenAPI document.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/openapi/{spec}.yaml:
+    get:
+      summary: Fetch an Antfly API OpenAPI document advertised by ARD
+      parameters:
+        - name: spec
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [antfly, metadata, extensions, auth, inference-config]
+      responses:
+        '200':
+          description: OpenAPI YAML document.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/search:
+    post:
+      summary: Search the authenticated tenant ARD catalog
+      parameters:
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/SearchResults'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          description: Invalid ARD search request. Search requires non-empty query.text.
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/explore:
+    post:
+      summary: Explore the authenticated tenant ARD catalog
+      parameters:
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExploreRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/ExploreFacets'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          description: Invalid ARD explore request.
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/agents:
+    get:
+      summary: List visible agent-like ARD resources
+      parameters:
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+        - name: filter
+          in: query
+          description: Percent-encoded ARD filter object.
+          schema:
+            type: string
+        - name: orderBy
+          in: query
+          description: One of identifier, displayName, type, with optional asc/desc or leading -.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/pageToken'
+      responses:
+        '200':
+          $ref: '#/components/responses/Agents'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          description: Invalid ARD agents request.
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/skills/{skill}:
+    get:
+      summary: Fetch a tenant-scoped Antfly skill artifact
+      parameters:
+        - name: skill
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          description: Skill markdown.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/skills/extensions/{extension}/{skill}:
+    get:
+      summary: Fetch an extension-owned skill artifact
+      parameters:
+        - name: extension
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: skill
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          description: Skill markdown.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/resources/mcp/default:
+    get:
+      summary: Fetch the aggregate MCP resource descriptor
+      parameters:
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          $ref: '#/components/responses/McpDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/resources/mcp/extensions/{extension}:
+    get:
+      summary: Fetch an extension MCP resource descriptor
+      parameters:
+        - name: extension
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          $ref: '#/components/responses/McpDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/resources/mcp/profiles/{profile}:
+    get:
+      summary: Fetch a profile-scoped MCP resource descriptor
+      parameters:
+        - name: profile
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [copilot]
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          $ref: '#/components/responses/McpDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /ard/v1/resources/agents/extensions/{extension}/{agent}:
+    get:
+      summary: Fetch an extension agent resource descriptor
+      parameters:
+        - name: extension
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: agent
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/profile'
+        - $ref: '#/components/parameters/types'
+        - $ref: '#/components/parameters/include'
+      responses:
+        '200':
+          $ref: '#/components/responses/AgentDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /agents/v1/extensions/{extension}/{agent}/runs:
+    post:
+      summary: Start an extension agent run
+      parameters:
+        - $ref: '#/components/parameters/extension'
+        - $ref: '#/components/parameters/agent'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '501':
+          description: The extension agent runtime is not enabled yet.
+  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}:
+    get:
+      summary: Fetch extension agent run status
+      parameters:
+        - $ref: '#/components/parameters/extension'
+        - $ref: '#/components/parameters/agent'
+        - $ref: '#/components/parameters/run_id'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '501':
+          description: The extension agent runtime is not enabled yet.
+  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/events:
+    get:
+      summary: Stream extension agent run events
+      parameters:
+        - $ref: '#/components/parameters/extension'
+        - $ref: '#/components/parameters/agent'
+        - $ref: '#/components/parameters/run_id'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '501':
+          description: The extension agent runtime is not enabled yet.
+  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/cancel:
+    post:
+      summary: Cancel an extension agent run
+      parameters:
+        - $ref: '#/components/parameters/extension'
+        - $ref: '#/components/parameters/agent'
+        - $ref: '#/components/parameters/run_id'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '501':
+          description: The extension agent runtime is not enabled yet.
+components:
+  securitySchemes:
+    AntflyAuthorization:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Antfly HTTP authorization header, such as Basic credentials or an API key accepted by the deployment.
+    TrustedPrincipal:
+      type: apiKey
+      in: header
+      name: X-Antfly-Trusted-Principal
+      description: Signed trusted-principal token issued by an upstream identity layer.
+  parameters:
+    extension:
+      name: extension
+      in: path
+      required: true
+      schema:
+        type: string
+    agent:
+      name: agent
+      in: path
+      required: true
+      schema:
+        type: string
+    run_id:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+    profile:
+      name: profile
+      in: query
+      description: Restrict results to a configured profile such as copilot.
+      schema:
+        type: string
+    types:
+      name: types
+      in: query
+      description: Comma-separated ARD media types.
+      schema:
+        type: string
+    include:
+      name: include
+      in: query
+      description: Comma-separated resource classes such as mcp, agents, a2a, openapi, skills, extensions, registry, catalog.
+      schema:
+        type: string
+    pageSize:
+      name: pageSize
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+    pageToken:
+      name: pageToken
+      in: query
+      schema:
+        type: string
+  responses:
+    Catalog:
+      description: ARD ai-catalog document.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Catalog'
+    SearchResults:
+      description: ARD search results.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SearchResults'
+    ExploreFacets:
+      description: ARD facet exploration results.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ExploreFacets'
+    Agents:
+      description: Visible agent-like resources.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Agents'
+    McpDescriptor:
+      description: MCP server descriptor.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    AgentDescriptor:
+      description: Extension agent descriptor.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    Unauthorized:
+      description: Missing or invalid Antfly identity.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The authenticated identity cannot access this ARD resource.
+      content:
+        text/plain:
+          schema:
+            type: string
+    NotFound:
+      description: The resource is missing or not visible to this identity.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MethodNotAllowed:
+      description: Method not allowed for this ARD route.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+    Catalog:
+      type: object
+      required: [host, entries]
+      properties:
+        host:
+          type: object
+          additionalProperties: true
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogEntry'
+    CatalogEntry:
+      type: object
+      required: [identifier, displayName, type]
+      properties:
+        identifier:
+          type: string
+        displayName:
+          type: string
+        type:
+          type: string
+        url:
+          type: string
+        data:
+          description: Embedded ARD artifact. Exactly one of url or data is emitted.
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        representativeQueries:
+          type: array
+          items:
+            type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        trustManifest:
+          type: object
+          additionalProperties: true
+    ArdQuery:
+      type: object
+      properties:
+        text:
+          type: string
+        filter:
+          type: object
+          additionalProperties: true
+    SearchRequest:
+      type: object
+      properties:
+        query:
+          $ref: '#/components/schemas/ArdQuery'
+        federation:
+          type: string
+          enum: [none, referrals, auto]
+          default: auto
+        pageSize:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+        pageToken:
+          type: string
+        resultType:
+          type: object
+          additionalProperties: true
+    ExploreRequest:
+      allOf:
+        - $ref: '#/components/schemas/SearchRequest'
+      description: Explore accepts text, filter, both, or neither; Search requires query.text.
+    SearchResults:
+      type: object
+      required: [results, federation, count]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        federation:
+          type: string
+        referrals:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        count:
+          type: integer
+        pageToken:
+          type: string
+    ExploreFacets:
+      type: object
+      required: [resultType, facets, count]
+      properties:
+        resultType:
+          type: string
+          enum: [facets]
+        facets:
+          type: object
+          additionalProperties: true
+        count:
+          type: integer
+    Agents:
+      type: object
+      required: [agents, count]
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogEntry'
+        count:
+          type: integer
+        pageToken:
+          type: string
+    RegistryRoot:
+      type: object
+      required: [catalog, search, explore, agents]
+      properties:
+        catalog:
+          type: string
+        search:
+          type: string
+        explore:
+          type: string
+        agents:
+          type: string

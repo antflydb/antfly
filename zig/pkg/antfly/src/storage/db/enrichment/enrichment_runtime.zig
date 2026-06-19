@@ -635,6 +635,7 @@ fn shouldStoreChunkArtifacts(
     request: enrichment_types.GeneratedEnrichmentRequest,
     has_durable_text_consumer: bool,
 ) !bool {
+    if (request.full_text_index) return true;
     if (has_durable_text_consumer) return true;
     if (request.chunker_json.len == 0) return true;
     if (try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json)) return true;
@@ -2961,7 +2962,9 @@ fn appendRuntimeDocumentUnitChunkWrites(
         defer chunker_mod.freeChunks(runtime.alloc, chunks);
         if (chunks.len == 0) continue;
 
-        const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, entry.name, false);
+        const include_default_full_text = entry.full_text_index or
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(runtime.alloc, entry.chunker_json);
+        const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, entry.name, include_default_full_text);
         defer {
             for (text_indexes) |name| runtime.alloc.free(name);
             runtime.alloc.free(text_indexes);
@@ -4099,7 +4102,8 @@ fn processChunkText(
     if (chunks.len == 0) return;
 
     const artifact_name = requestArtifactName(request);
-    const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(runtime.alloc, request.chunker_json);
+    const include_default_full_text = request.full_text_index or
+        try chunking_types_mod.parseHasFullTextIndexFromSlice(runtime.alloc, request.chunker_json);
     const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, include_default_full_text);
     defer {
         for (text_indexes) |name| runtime.alloc.free(name);

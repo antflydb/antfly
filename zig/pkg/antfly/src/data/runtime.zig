@@ -63,6 +63,10 @@ const CliConfig = struct {
     raft_bind_host: ?[]const u8 = null,
     raft_bind_port: ?u16 = null,
     auth_enabled: ?bool = null,
+    ard_base_url: ?[]const u8 = null,
+    ard_publisher_domain: ?[]const u8 = null,
+    ard_display_name: ?[]const u8 = null,
+    ard_public_catalog_enabled: bool = false,
     metadata_apis: std.ArrayListUnmanaged([]const u8) = .empty,
     node_id: ?u64 = null,
     store_id: ?u64 = null,
@@ -6550,6 +6554,8 @@ const RemoteMetadataSource = struct {
                 .update_schema = remoteUpdateSchema,
                 .create_index = remoteCreateIndex,
                 .drop_index = remoteDropIndex,
+                .put_artifact_enrichment = remotePutArtifactEnrichment,
+                .delete_artifact_enrichment = remoteDeleteArtifactEnrichment,
                 .wait_table_lifecycle = remoteWaitTableLifecycle,
                 .wait_table_projection = remoteWaitTableProjection,
                 .install_extension = remoteInstallExtension,
@@ -6727,6 +6733,26 @@ const RemoteMetadataSource = struct {
                 try client.dropIndex(base_uri, ctx.table_name, ctx.index_name);
             }
         }.call, .{ .table_name = table_name, .index_name = index_name });
+        self.invalidateCache();
+    }
+
+    fn remotePutArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.putArtifactEnrichment(base_uri, ctx.table_name, ctx.artifact_name, ctx.enrichment_json);
+            }
+        }.call, .{ .table_name = table_name, .artifact_name = artifact_name, .enrichment_json = enrichment_json });
+        self.invalidateCache();
+    }
+
+    fn remoteDeleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.deleteArtifactEnrichment(base_uri, ctx.table_name, ctx.artifact_name);
+            }
+        }.call, .{ .table_name = table_name, .artifact_name = artifact_name });
         self.invalidateCache();
     }
 
@@ -8390,6 +8416,10 @@ pub fn runFromIterator(
             .auth_enabled = effective_auth_enabled,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .ard_base_url = cli.ard_base_url,
+            .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
+            .ard_display_name = cli.ard_display_name orelse "Antfly",
+            .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
@@ -8487,6 +8517,27 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.startsWith(u8, arg, "--auth=")) {
             cfg.auth_enabled = parseBoolFlag(arg["--auth=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-publisher-domain")) {
+            cfg.ard_publisher_domain = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-base-url")) {
+            cfg.ard_base_url = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-display-name")) {
+            cfg.ard_display_name = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-public-catalog")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.ard_public_catalog_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--ard-public-catalog=")) {
+            cfg.ard_public_catalog_enabled = parseBoolFlag(arg["--ard-public-catalog=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--metadata-api")) {
@@ -8794,6 +8845,10 @@ fn printUsage(argv0: []const u8) void {
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --auth <true|false>            Enable auth middleware and local user store
+        \\  --ard-base-url <url>           Absolute public base URL for ARD catalog artifact links
+        \\  --ard-publisher-domain <name>  ARD did:web publisher domain (default: antfly.local)
+        \\  --ard-display-name <name>      ARD catalog host display name (default: Antfly)
+        \\  --ard-public-catalog <bool>    Publish anonymous /.well-known ARD bootstrap when auth is enabled
         \\  --metadata-api <uri>           Metadata orchestration/API URL (repeat for multiple endpoints)
         \\  --node-id <id>                 Register this split data process as metadata node <id>
         \\  --store-id <id>                Register this split data process as metadata store <id>
@@ -8894,6 +8949,25 @@ test "data runtime cli accepts extension package store path" {
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "data runtime cli accepts ARD identity flags" {
+    const argv = [_][*:0]const u8{
+        "--ard-publisher-domain",
+        "tenant.example.com",
+        "--ard-base-url",
+        "https://tenant.example.com",
+        "--ard-display-name",
+        "Tenant Antfly",
+        "--ard-public-catalog=true",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
+    try std.testing.expectEqualStrings("tenant.example.com", cfg.ard_publisher_domain.?);
+    try std.testing.expectEqualStrings("Tenant Antfly", cfg.ard_display_name.?);
+    try std.testing.expect(cfg.ard_public_catalog_enabled);
 }
 
 test "data runtime resolves metadata api urls from common config" {

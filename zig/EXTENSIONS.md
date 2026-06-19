@@ -392,6 +392,9 @@ V1 should support manifest-only or mostly declarative objects:
   writes resolution artifacts. This lines up with the existing resolver catalog.
 - `mcp_tool`: an MCP tool exposed from an installed extension, with schema,
   handler mode, capabilities, and audit semantics.
+- `skill`: a first-class instruction and discovery artifact registered by an
+  extension. Skills are not executable, but they bind usage guidance to visible
+  agents, MCP tools, APIs, profiles, and capabilities.
 
 V2 should add safe runtime and integration objects:
 
@@ -401,9 +404,9 @@ V2 should add safe runtime and integration objects:
 - `api_endpoint`: an extension-owned HTTP/OpenAPI endpoint. This is useful, but
   should follow MCP tools because auth, routing, compatibility, and generated
   clients make it a wider public surface.
-- `a2a_agent`: an A2A-facing agent card, skill, task handler, or delegation
-  hook exposed by an installed extension. This should be gated by the same
-  schema, auth, audit, and runtime capability model as MCP tools.
+- `agent`: a callable multi-step or streaming agent exposed by an installed
+  extension. It may be surfaced through Antfly agents APIs, A2A, MCP wrapper
+  tools, ARD, and skills, but it remains one extension member object.
 - `auth_policy`: extension-owned roles, permission templates, capability
   policies, or auth integration hooks. This should be declarative first and
   tightly constrained, because auth objects affect every other extension
@@ -475,7 +478,202 @@ write replay, snapshots, shard split handoff, maintenance scheduling, and query
 visibility. A safer first public backend is a derived or enrichment-style
 runtime, where failures are isolated from primary document writes.
 
-### 7. Runtime Isolation
+### 7. Custom Agents, MCPs, and Skills
+
+Agents, MCP tools, and skills should be different views over the same
+extension-declared capability graph, not separate plugin systems.
+
+The core distinction is:
+
+```text
+mcp_tool = executable callable tool
+agent    = executable multi-step or streaming callable unit
+skill    = instruction and discovery artifact for visible capabilities
+```
+
+An extension can declare all three in one manifest:
+
+```json
+{
+  "objects": [
+    {
+      "kind": "agent",
+      "name": "research_agent",
+      "shape": "research_request",
+      "config_json": {
+        "displayName": "Research Agent",
+        "description": "Plans, searches, retrieves, and summarizes tenant-scoped knowledge.",
+        "protocols": ["agents-api", "a2a", "mcp-tool", "stream"],
+        "handler": "wasm:research_agent/run",
+        "stream_handler": "wasm:research_agent/stream",
+        "required_capabilities": [
+          { "name": "db:read", "scope": "docs" },
+          { "name": "mcp:call", "scope": "tenant" },
+          { "name": "agent:call", "scope": "tenant" }
+        ],
+        "allowed_tools": [
+          "mcp:antfly.search",
+          "mcp:memoryaf.search_memories"
+        ],
+        "allowed_agents": [
+          "agent:antfly.retrieval",
+          "agent:antfly.query-builder"
+        ]
+      }
+    },
+    {
+      "kind": "mcp_tool",
+      "name": "search_sources",
+      "shape": "search_sources_request",
+      "config_json": {
+        "description": "Search tenant-scoped sources for the research agent.",
+        "handler": "wasm:research_agent/search_sources"
+      }
+    },
+    {
+      "kind": "skill",
+      "name": "research",
+      "config_json": {
+        "displayName": "Research Skill",
+        "description": "Use the research agent with tenant-scoped search and citations.",
+        "profile": "copilot",
+        "capabilities": ["research", "retrieval", "citation"],
+        "agents": ["research_agent"],
+        "mcp_tools": ["search_sources"],
+        "body": "# Research\n\nUse this when an agent needs to plan, retrieve, cite, and summarize from visible Antfly resources.\n"
+      }
+    }
+  ]
+}
+```
+
+Skills should be registered extension objects. They should not be executable and
+they should not grant access by themselves. A skill is visible only when the
+caller can also see or run the executable capabilities it describes. For
+example, a MemoryAF skill should disappear if the caller cannot list the
+MemoryAF MCP tools or run the related MemoryAF agent.
+
+Extension agents should have a native Antfly run API:
+
+```text
+POST /agents/v1/extensions/{extension}/{agent}/runs
+GET  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}
+GET  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/events
+POST /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/cancel
+```
+
+The non-streaming run endpoint should be enough for simple agents. Streaming
+should use server-sent events first because it fits HTTP clients, A2A progress,
+and MCP wrapper tools without requiring a persistent bidirectional protocol.
+Typed events should be stable and append-only:
+
+```json
+{ "type": "run.started", "run_id": "run_123" }
+{ "type": "step.started", "name": "retrieve_context" }
+{ "type": "tool.call", "tool": "memoryaf.search_memories" }
+{ "type": "delta", "content": "partial answer text" }
+{ "type": "artifact", "kind": "citation", "ref": "doc:42" }
+{ "type": "run.completed" }
+```
+
+Extension agents can be surfaced through multiple protocols:
+
+- Antfly agents API: canonical run, status, streaming, and cancellation surface.
+- A2A: an agent card and task handler backed by the same extension agent member.
+- MCP: an optional generated MCP wrapper tool such as `run_research_agent`.
+- ARD: catalog entries for the agent descriptor, A2A card, MCP descriptor, and
+  related skill artifacts.
+- OpenAPI: `/agents/v1/extensions/{extension}/{agent}` operations.
+- Profiles: filtered views such as `copilot`, resolved through the same tenant
+  visibility and permission checks as MCP profiles.
+
+Agents should call other agents and MCP tools through brokered host APIs, not
+through direct internal access:
+
+```text
+host.call_mcp(tool_ref, input)
+host.call_agent(agent_ref, input)
+host.emit_event(event)
+host.read_secret(name)
+host.query_table(table, query)
+```
+
+Every host call must apply both the caller identity and the installed
+extension's granted capabilities. The effective permission is the intersection:
+a caller cannot use an extension agent to reach MCP tools, agents, rows, secrets,
+or providers that the same caller could not access through the native surface.
+
+Useful capability names for this layer:
+
+```text
+agent:run
+agent:call
+agent:stream
+mcp:tool
+mcp:call
+a2a:serve
+db:read
+db:write
+secret:read
+network:outbound
+```
+
+Dependencies on other agents and MCP tools should be declarative:
+
+```json
+{
+  "dependencies": {
+    "agents": [
+      {
+        "ref": "antfly:retrieval",
+        "required": true,
+        "capabilities": ["retrieval"]
+      }
+    ],
+    "mcp_tools": [
+      {
+        "ref": "memoryaf.search_memories",
+        "required": false
+      }
+    ]
+  }
+}
+```
+
+At install time Antfly should validate that required dependencies can be
+resolved in the package or tenant catalog. At runtime it should resolve
+dependencies against the authenticated caller's scoped catalog. Optional
+dependencies should degrade the agent capability set instead of failing install.
+
+Discovery should be generated from the same extension members:
+
+- A `skill` member is served under
+  `/ard/v1/skills/extensions/{extension}/{skill}` and appears as
+  `application/ai-skill+md`.
+- An `agent` member can appear as an Antfly agent descriptor, A2A agent card, or
+  MCP wrapper descriptor depending on the declared protocols.
+- An `mcp_tool` member appears in `/mcp/v1/extensions/{extension}`,
+  `/mcp/v1`, profile-scoped MCP endpoints, and ARD MCP descriptors only when
+  visible to the caller.
+
+Implementation phases:
+
+1. Add `skill` registration as a stable extension member object and keep ARD
+   skill visibility tied to the capabilities it describes.
+2. Add `agent` registration, manifest validation, and non-streaming
+   `/agents/v1/extensions/{extension}/{agent}/runs`.
+3. Add server-sent event streaming and cancellation for extension agent runs.
+4. Generate MCP wrapper tools for extension agents that opt into `mcp-tool`.
+5. Add A2A card/task routing for extension agents that opt into `a2a`.
+6. Add ARD catalog entries and skill references for extension agents.
+7. Add install-time and runtime validation for declared agent and MCP
+   dependencies.
+
+The design rule is that extensions register capabilities once. MCP, A2A, ARD,
+skills, streaming APIs, and future profiles expose scoped views over those
+registered members.
+
+### 8. Runtime Isolation
 
 Prefer a tiered model:
 
@@ -489,7 +687,7 @@ This is deliberately stricter than PostgreSQL. PostgreSQL assumes superuser
 trust for dangerous extensions; Antfly hosted clusters need tenant and operator
 isolation.
 
-### 8. Backup, Restore, and Export
+### 9. Backup, Restore, and Export
 
 Backups should record:
 
@@ -1127,10 +1325,14 @@ plugins.
   extension lifecycle. Version them together because package manifests,
   dependency resolution, trust policy, capability grants, and install/update/drop
   semantics evolve together.
-- In v1, MCP tools are extension-owned objects, not separate package installs.
-  A package such as `memoryaf` should include its data shape, relations,
-  artifacts, indexes, enrichments, query/API handlers, MCP tools, runtimes, and
-  capability grants in one extension package.
+- In v1, MCP tools and skills are extension-owned objects, not separate package
+  installs. A package such as `memoryaf` should include its data shape,
+  relations, artifacts, indexes, enrichments, query/API handlers, MCP tools,
+  skills, runtimes, and capability grants in one extension package.
+- Extension agents should use the same member, capability, dependency, and
+  visibility model as MCP tools. Antfly agents APIs, A2A, MCP wrapper tools,
+  ARD, skills, streaming APIs, and profiles should expose scoped views over the
+  same registered agent object.
 - Extension install/update/drop is transactional at metadata level and
   eventually convergent at shard level.
 - Start with `cluster`, `table`, and `embedded_db` extension scopes. Treat

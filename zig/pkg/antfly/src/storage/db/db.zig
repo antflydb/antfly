@@ -6960,6 +6960,12 @@ pub const DB = struct {
         try self.core.addEnrichment(cfg);
     }
 
+    pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.upsertEnrichment(cfg);
+    }
+
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         {
             lockApply(self);
@@ -13906,6 +13912,7 @@ fn getOrCreateChunks(
 }
 
 fn shouldStoreChunkArtifacts(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    if (request.full_text_index) return true;
     if (request.chunker_json.len == 0) return true;
     if (try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json)) return true;
     return try chunking_types_mod.parseStoreChunksFromSlice(alloc, request.chunker_json);
@@ -14017,7 +14024,8 @@ fn computeChunkRequestDerived(
         try appendChunkArtifactWrites(alloc, request.doc_key, request.source_field, artifact_name, chunks, artifact_writes, true);
     }
 
-    const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
+    const include_default_full_text = request.full_text_index or
+        try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
     const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, include_default_full_text);
     defer {
         for (text_indexes) |name| alloc.free(name);
@@ -14760,7 +14768,9 @@ fn appendDocumentUnitStoredChunkFullTextDocuments(
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
 
-        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        const include_default_full_text = entry.full_text_index or
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
+        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
         defer {
             for (chunk_text_indexes) |name| alloc.free(name);
             alloc.free(chunk_text_indexes);
@@ -14883,7 +14893,9 @@ fn appendDocumentUnitChunkWrites(
         defer chunker_mod.freeChunks(alloc, chunks);
         if (chunks.len == 0) continue;
 
-        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        const include_default_full_text = entry.full_text_index or
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
+        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
         defer {
             for (text_indexes) |name| alloc.free(name);
             alloc.free(text_indexes);
@@ -16194,7 +16206,8 @@ fn computeChunkRequest(
         try appendChunkArtifactWrites(alloc, request.doc_key, request.source_field, artifact_name, chunks, artifact_writes, true);
     }
 
-    const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
+    const include_default_full_text = request.full_text_index or
+        try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
     const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, include_default_full_text);
     defer {
         for (text_indexes) |name| alloc.free(name);
@@ -17557,7 +17570,8 @@ fn shouldPrecomputeGeneratedRequest(
         .all => true,
         .full_text_only => blk: {
             if (request.kind != .chunk_text) break :blk false;
-            const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(self.alloc, request.chunker_json);
+            const include_default_full_text = request.full_text_index or
+                try chunking_types_mod.parseHasFullTextIndexFromSlice(self.alloc, request.chunker_json);
             const text_indexes = try self.core.index_manager.textIndexesForChunk(self.alloc, request.artifact_name, include_default_full_text);
             defer {
                 for (text_indexes) |name| self.alloc.free(name);
@@ -36282,6 +36296,187 @@ test "db deleteEnrichment rejects referenced definitions" {
     });
 
     try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.chunk, "body_chunks_v1"));
+}
+
+test "db deleteEnrichment rejects asset referenced by chunk enrichment" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .source_artifact_name = "document_units_v1",
+        .field = "text",
+        .chunk_size = 512,
+    });
+
+    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "document_units_v1"));
+}
+
+test "db upsertEnrichment rejects replacing referenced asset with chunk" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .source_artifact_name = "document_units_v1",
+        .field = "text",
+        .chunk_size = 512,
+    });
+
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .chunk,
+        .source_artifact_name = "document_units_v1",
+        .field = "text",
+        .chunk_size = 512,
+    }));
+
+    var asset = (try db.getEnrichment(alloc, .asset, "document_units_v1")).?;
+    defer asset.deinit(alloc);
+    try std.testing.expectEqual(types.EnrichmentKind.asset, asset.kind);
+}
+
+test "db upsertEnrichment rejects replacing referenced chunk with asset" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 512,
+    });
+    try db.addEnrichment(.{
+        .name = "document_dense_v1",
+        .kind = .embedding,
+        .source_artifact_name = "document_chunks_v1",
+        .field = "text",
+        .expected_dims = 3,
+    });
+
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    }));
+
+    var chunk = (try db.getEnrichment(alloc, .chunk, "document_chunks_v1")).?;
+    defer chunk.deinit(alloc);
+    try std.testing.expectEqual(types.EnrichmentKind.chunk, chunk.kind);
+}
+
+test "db upsertEnrichment rejects replacing indexed chunk with asset" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 512,
+    });
+    try db.addIndex(.{
+        .name = "body_text",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    });
+
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    }));
+
+    var chunk = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")).?;
+    defer chunk.deinit(alloc);
+    try std.testing.expectEqual(types.EnrichmentKind.chunk, chunk.kind);
+}
+
+test "db addEnrichment rejects duplicate names across enrichment kinds" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_artifact_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    });
+    try std.testing.expectError(error.EnrichmentAlreadyExists, db.addEnrichment(.{
+        .name = "document_artifact_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 512,
+    }));
+}
+
+test "db addEnrichment allows unrelated definitions after field sparse index" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    });
 }
 
 test "db dense index can reference existing whole-doc embedding enrichment" {
