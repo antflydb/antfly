@@ -442,8 +442,8 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
 }
 
 fn restore(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
-    const backup_path = args.next() orelse cli.fatal("backup path is required", .{});
-    try requireAfbPath(backup_path);
+    const source_path = args.next() orelse cli.fatal("backup path is required", .{});
+    try requireRestoreSourcePath(source_path);
     var out_path: ?[]const u8 = null;
     var replace = false;
     while (args.next()) |arg| {
@@ -456,7 +456,7 @@ fn restore(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
         }
     }
     const resolved_out = out_path orelse cli.fatal("--out is required", .{});
-    try restoreFromBackupFile(allocator, io, backup_path, resolved_out, replace);
+    try restoreFromSourceFile(allocator, io, source_path, resolved_out, replace);
 }
 
 fn importBackup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -474,25 +474,29 @@ fn importBackup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
         }
     }
     const resolved_from = from_path orelse cli.fatal("--from is required", .{});
-    try restoreFromBackupFile(allocator, io, resolved_from, path, replace);
+    try restoreFromSourceFile(allocator, io, resolved_from, path, replace);
 }
 
-fn restoreFromBackupFile(
+fn restoreFromSourceFile(
     allocator: Allocator,
     io: std.Io,
-    backup_path: []const u8,
+    source_path: []const u8,
     out_path: []const u8,
     replace: bool,
 ) !void {
-    try requireAfbPath(backup_path);
+    try requireRestoreSourcePath(source_path);
     try requireAflitePath(out_path);
+    if (std.mem.eql(u8, source_path, out_path)) {
+        cli.fatal("source and output database paths must be different: {s}", .{source_path});
+    }
+
+    const body = try readPortableRestoreSourceAlloc(allocator, io, source_path);
+    defer allocator.free(body);
+
     if (pathExists(io, out_path)) {
         if (!replace) cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
         try deleteFilePath(io, out_path);
     }
-
-    const body = try cli.readFileAlloc(io, allocator, backup_path, max_afb_file_bytes);
-    defer allocator.free(body);
 
     var lite = try LiteDb.open(allocator, out_path, .writer);
     defer lite.close();
@@ -502,6 +506,22 @@ fn restoreFromBackupFile(
     cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
     try writeJsonString(allocator, io, out_path);
     cli.writeStdout(io, "}\n");
+}
+
+fn readPortableRestoreSourceAlloc(allocator: Allocator, io: std.Io, source_path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, source_path, ".afb")) {
+        return try cli.readFileAlloc(io, allocator, source_path, max_afb_file_bytes);
+    }
+    if (std.mem.endsWith(u8, source_path, ".aflite")) {
+        var source = try LiteDb.open(allocator, source_path, .query_readonly);
+        defer source.close();
+
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        try portable_backup.exportPortable(allocator, source.db.core.store, &out);
+        return try out.toOwnedSlice(allocator);
+    }
+    return error.InvalidArguments;
 }
 
 fn check(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -765,6 +785,12 @@ fn requireAfbPath(path: []const u8) !void {
     }
 }
 
+fn requireRestoreSourcePath(path: []const u8) !void {
+    if (std.mem.endsWith(u8, path, ".afb") or std.mem.endsWith(u8, path, ".aflite")) return;
+    std.debug.print("error: Antfly Lite restore sources must end in .afb or .aflite: {s}\n", .{path});
+    return error.InvalidArguments;
+}
+
 fn writeJsonLine(io: std.Io, json: []const u8) void {
     cli.writeStdout(io, json);
     cli.writeStdout(io, "\n");
@@ -861,8 +887,8 @@ fn printUsage(argv0: []const u8) void {
         \\  run-until-idle <db.aflite>
         \\  backup <db.aflite> --out backup.afb
         \\  export <db.aflite> --out backup.afb
-        \\  restore <backup.afb> --out <db.aflite> [--replace]
-        \\  import <db.aflite> --from <backup.afb> [--replace]
+        \\  restore <backup.afb|source.aflite> --out <db.aflite> [--replace]
+        \\  import <db.aflite> --from <backup.afb|source.aflite> [--replace]
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
@@ -878,6 +904,12 @@ test "lite path validation requires aflite extension" {
 test "lite backup path validation requires afb extension" {
     try requireAfbPath("app.afb");
     try std.testing.expectError(error.InvalidArguments, requireAfbPath("app.aflite"));
+}
+
+test "lite restore source validation accepts afb and aflite" {
+    try requireRestoreSourcePath("app.afb");
+    try requireRestoreSourcePath("app.aflite");
+    try std.testing.expectError(error.InvalidArguments, requireRestoreSourcePath("app.db"));
 }
 
 test "lite backup writer handles absolute output paths" {
@@ -897,11 +929,48 @@ test "lite backup writer handles absolute output paths" {
 
     try writeFileAtomically(allocator, io, path, "portable-backup");
 
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    var buf: [64]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    const body = try reader.interface.readAlloc(allocator, 64);
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64));
     defer allocator.free(body);
     try std.testing.expectEqualStrings("portable-backup", body);
+}
+
+test "lite restore source can be an aflite database" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-source.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-dst.aflite", .{tmp.sub_path});
+    defer allocator.free(dst_path);
+
+    {
+        var source = try LiteDb.open(allocator, src_path, .writer);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:lite-restore\":{\"title\":\"from aflite source\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+
+    const portable = try readPortableRestoreSourceAlloc(allocator, io, src_path);
+    defer allocator.free(portable);
+
+    {
+        var dest = try LiteDb.open(allocator, dst_path, .writer);
+        defer dest.close();
+        try portable_backup.importPortable(allocator, dest.db.core.store, portable);
+    }
+
+    {
+        var reopened = try LiteDb.open(allocator, dst_path, .query_readonly);
+        defer reopened.close();
+        const json = try lookupJson(allocator, &reopened.db, "doc:lite-restore", "");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"from aflite source\"") != null);
+    }
 }

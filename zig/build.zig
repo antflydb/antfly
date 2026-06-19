@@ -2659,6 +2659,32 @@ pub fn build(b: *std.Build) void {
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
 
+    const lite_cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_cli_test_mod.addImport("antfly-zig", lib_mod);
+    lite_cli_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    lite_cli_test_mod.addImport("httpx", httpx_mod);
+    lite_cli_test_mod.addImport("antfly_vellum", vellum_mod);
+    lite_cli_test_mod.addImport("raft_engine", raft_engine_mod);
+    lite_cli_test_mod.addImport("structlog", structlog_mod);
+    lite_cli_test_mod.addImport("antfly_platform", platform_mod);
+    lite_cli_test_mod.addImport("handlebars", handlebars_mod);
+    lite_cli_test_mod.addOptions("build_options", build_options);
+    const lite_cli_tests = b.addTest(.{
+        .root_module = lite_cli_test_mod,
+        .filters = &.{"cmd.lite"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lite_cli_tests = b.addRunArtifact(lite_cli_tests);
+    const lite_cli_test_step = b.step("lite-cli-test", "Run Antfly Lite CLI tests");
+    lite_cli_test_step.dependOn(&run_lite_cli_tests.step);
+
     const lib_recall_default_filters = [_][]const u8{
         "HBC recall",
     };
@@ -4066,6 +4092,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
+    unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
     unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
