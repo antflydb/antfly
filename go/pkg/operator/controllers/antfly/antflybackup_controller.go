@@ -165,7 +165,6 @@ func (r *AntflyBackupReconciler) buildCronJobSpec(backup *antflyv1.AntflyBackup,
 	// The $(date ...) suffix is intentionally unquoted so the shell expands it
 	// at runtime to produce a timestamped backup ID.
 	cmd := "/antfly backup" +
-		" --url " + shellQuote(clusterURL) +
 		" --backup-id " + shellQuote(backup.Name) + "-$(date +%Y%m%d%H%M%S)" +
 		" --location " + shellQuote(backup.Spec.Destination.Location)
 
@@ -246,6 +245,12 @@ func (r *AntflyBackupReconciler) buildCronJobSpec(backup *antflyv1.AntflyBackup,
 								Command: []string{"/bin/sh", "-c"},
 								Args:    []string{cmd},
 								EnvFrom: envFrom,
+								Env: []corev1.EnvVar{
+									{
+										Name:  "ANTFLY_URL",
+										Value: clusterURL,
+									},
+								},
 							},
 						},
 					},
