@@ -4155,7 +4155,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_deferrable_unique_constraint: bool = false,
     unsupported_ddl_deferrable_primary_key: bool = false,
     unsupported_ddl_transaction_scoped_search_path: bool = false,
-    unsupported_ddl_unique_expression_owner_ast: bool = false,
     unsupported_write: bool = false,
     unsupported_write_recursive_cte_insert: bool = false,
     unsupported_write_recursive_cte_update: bool = false,
@@ -5333,10 +5332,6 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_transaction_scoped_search_path = self.unsupported_ddl_transaction_scoped_search_path or
                 (std.mem.eql(u8, entry.classification_reason, "transaction_scoped_search_path") and
                     std.mem.indexOf(u8, entry.sql, "SET LOCAL search_path") != null);
-            self.unsupported_ddl_unique_expression_owner_ast = self.unsupported_ddl_unique_expression_owner_ast or
-                (std.mem.eql(u8, entry.classification_reason, "unique_expression_owner_ast") and
-                    std.mem.indexOf(u8, entry.sql, "CREATE UNIQUE INDEX ") != null and
-                    std.mem.indexOf(u8, entry.sql, "replace(") != null);
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
@@ -6294,7 +6289,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_deferrable_unique_constraint);
         try std.testing.expect(self.unsupported_ddl_deferrable_primary_key);
         try std.testing.expect(self.unsupported_ddl_transaction_scoped_search_path);
-        try std.testing.expect(self.unsupported_ddl_unique_expression_owner_ast);
         try std.testing.expect(self.read_row_lock_nowait);
         try std.testing.expect(self.read_row_lock_share);
         try std.testing.expect(self.read_row_lock_key_share);

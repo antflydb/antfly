@@ -592,7 +592,10 @@ fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage
         alloc.free(constraint.name);
         for (constraint.columns) |column| alloc.free(column);
         if (constraint.columns.len > 0) alloc.free(constraint.columns);
-        for (constraint.expressions) |expression| alloc.free(expression.field);
+        for (constraint.expressions) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
         if (constraint.expressions.len > 0) alloc.free(constraint.expressions);
         for (constraint.include_columns) |column| alloc.free(column);
         if (constraint.include_columns.len > 0) alloc.free(constraint.include_columns);
@@ -814,18 +817,29 @@ fn cloneUniqueExpressions(alloc: std.mem.Allocator, values: []const impl.UniqueE
     const out = try alloc.alloc(storage_schema.UniqueExpression, values.len);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        for (out[0..initialized]) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
         alloc.free(out);
     }
     for (values) |value| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const row_expression = if (value.expression) |expression| try cloneRelationalRowsExpressionAlloc(alloc, expression) else null;
+        errdefer if (row_expression) |expression| freeRelationalRowsExpression(alloc, expression);
         out[initialized] = .{
             .op = switch (value.op) {
                 .lower => .lower,
                 .upper => .upper,
                 .md5 => .md5,
+                .expression => .expression,
             },
-            .field = try alloc.dupe(u8, value.field),
+            .field = field,
+            .expression = row_expression,
         };
+        field_transferred = true;
         initialized += 1;
     }
     return out;

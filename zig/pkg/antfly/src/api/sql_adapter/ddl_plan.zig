@@ -2074,7 +2074,10 @@ fn freeDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runti
 }
 
 fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
-    for (expressions) |expression| alloc.free(expression.field);
+    for (expressions) |expression| {
+        if (expression.field.len > 0) alloc.free(expression.field);
+        if (expression.expression) |row_expression| runtime_schema.freeRelationalRowsExpression(alloc, row_expression);
+    }
     if (expressions.len > 0) alloc.free(expressions);
 }
 

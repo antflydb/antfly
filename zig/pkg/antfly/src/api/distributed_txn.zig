@@ -2953,8 +2953,12 @@ fn transformTouchesUniqueConstraint(
 fn constraintMetadataTouchesPath(constraint: storage_schema.UniqueConstraint, path: []const u8) bool {
     if (columnPathTouchesAny(path, constraint.columns)) return true;
     for (constraint.expressions) |expression| {
-        const dependency = uniqueExpressionDependency(expression);
-        if (columnPathTouches(path, dependency)) return true;
+        switch (expression.op) {
+            .lower, .upper, .md5 => if (columnPathTouches(path, expression.field)) return true,
+            .expression => if (expression.expression) |row_expression| {
+                if (rowExpressionTouchesPath(row_expression, path)) return true;
+            },
+        }
     }
     for (constraint.where) |predicate| {
         if (columnPathTouches(path, predicate.field)) return true;
@@ -2962,10 +2966,27 @@ fn constraintMetadataTouchesPath(constraint: storage_schema.UniqueConstraint, pa
     return false;
 }
 
-fn uniqueExpressionDependency(expression: storage_schema.UniqueExpression) []const u8 {
-    return switch (expression.op) {
-        .lower, .upper, .md5 => expression.field,
-    };
+fn rowExpressionTouchesPath(expression: storage_schema.RelationalRowsExpression, path: []const u8) bool {
+    if (expression.kind == .field and expression.field_source == .row and columnPathTouches(path, expression.field)) return true;
+    for (expression.operands) |operand| {
+        if (rowExpressionTouchesPath(operand, path)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (rowExpressionConditionTouchesPath(branch.when, path)) return true;
+        if (rowExpressionTouchesPath(branch.then, path)) return true;
+    }
+    for (expression.case_else) |fallback| {
+        if (rowExpressionTouchesPath(fallback, path)) return true;
+    }
+    return false;
+}
+
+fn rowExpressionConditionTouchesPath(condition: storage_schema.RelationalRowsExpressionCondition, path: []const u8) bool {
+    if (rowExpressionTouchesPath(condition.lhs, path)) return true;
+    for (condition.rhs) |rhs| {
+        if (rowExpressionTouchesPath(rhs, path)) return true;
+    }
+    return false;
 }
 
 fn keyHasRuntimeOwnerConstraintTransform(

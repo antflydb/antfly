@@ -13092,7 +13092,7 @@ fn writeCoalesceProjectionValue(
     try writer.writeAll("null");
 }
 
-fn expressionValueJsonAlloc(
+pub fn expressionValueJsonAlloc(
     alloc: std.mem.Allocator,
     row: std.json.Value,
     expression: db_mod.types.RelationalRowsExpression,

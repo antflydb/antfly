@@ -6858,6 +6858,9 @@ pub const DB = struct {
         for (a, b) |left, right| {
             if (left.op != right.op) return false;
             if (!std.mem.eql(u8, left.field, right.field)) return false;
+            if (left.expression == null or right.expression == null) {
+                if (left.expression != null or right.expression != null) return false;
+            } else if (!relationalRowsExpressionEqual(left.expression.?, right.expression.?)) return false;
         }
         return true;
     }
@@ -24554,7 +24557,10 @@ pub const DB = struct {
         var columns = std.ArrayListUnmanaged(schema_mod.RelationalColumn).empty;
         errdefer columns.deinit(alloc);
         for (constraint.columns) |field| try appendRelationalRowsUniqueConstraintColumn(alloc, runtime_schema, &columns, field);
-        for (constraint.expressions) |expression| try appendRelationalRowsUniqueConstraintColumn(alloc, runtime_schema, &columns, expression.field);
+        for (constraint.expressions) |expression| switch (expression.op) {
+            .lower, .upper, .md5 => try appendRelationalRowsUniqueConstraintColumn(alloc, runtime_schema, &columns, expression.field),
+            .expression => if (expression.expression) |row_expression| try appendRelationalRowsExpressionColumnsAlloc(alloc, runtime_schema, &columns, row_expression) else return error.InvalidQueryRequest,
+        };
         for (constraint.where) |predicate| try appendRelationalRowsUniqueConstraintColumn(alloc, runtime_schema, &columns, predicate.field);
         for (constraint.where_expressions) |condition| try appendRelationalRowsExpressionConditionColumnsAlloc(alloc, runtime_schema, &columns, condition);
         return try columns.toOwnedSlice(alloc);

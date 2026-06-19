@@ -1858,6 +1858,9 @@ fn uniqueExpressionSlicesEqual(a: []const runtime_schema_mod.UniqueExpression, b
     for (a, b) |left, right| {
         if (left.op != right.op) return false;
         if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (left.expression == null and right.expression == null) continue;
+        if (left.expression == null or right.expression == null) return false;
+        if (!relationalRowsExpressionsEqual(left.expression.?, right.expression.?)) return false;
     }
     return true;
 }

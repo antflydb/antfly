@@ -2421,6 +2421,7 @@ fn alterTablePlanWorkFlagsForSchemaJson(root: *std.json.ObjectMap, plan: AlterTa
 fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {
     return switch (op) {
         .lower, .upper, .md5 => true,
+        .expression => false,
     };
 }
 
@@ -2429,6 +2430,7 @@ fn relationalGeneratedOpForUniqueExpressionOp(op: runtime_schema.UniqueExpressio
         .lower => .lower,
         .upper => .upper,
         .md5 => .md5,
+        .expression => unreachable,
     };
 }
 
@@ -2437,6 +2439,7 @@ fn uniqueExpressionOpToken(op: runtime_schema.UniqueExpressionOp) []const u8 {
         .lower => "lower",
         .upper => "upper",
         .md5 => "md5",
+        .expression => "expression",
     };
 }
 
@@ -4610,7 +4613,7 @@ const Parser = struct {
         }
         var expressions = std.ArrayListUnmanaged(runtime_schema.UniqueExpression).empty;
         errdefer {
-            for (expressions.items) |expression| self.alloc.free(expression.field);
+            clearDdlUniqueExpressions(self.alloc, expressions.items);
             expressions.deinit(self.alloc);
         }
         var generated_expression: ?runtime_schema.RelationalGeneratedValue = null;
@@ -4622,10 +4625,9 @@ const Parser = struct {
             if (sql_adapter.peekDdlIndexElementExpression(self.tokens, self.pos, true)) {
                 const wrapper_count = sql_adapter.consumeDdlIndexExpressionWrappers(self.tokens, &self.pos);
                 if (unique) {
-                    if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) return error.UnsupportedSqlShape;
                     const expression = try sql_adapter.parseDdlUniqueExpressionAlloc(self.alloc, self.tokens, &self.pos);
                     var expression_transferred = false;
-                    errdefer if (!expression_transferred) self.alloc.free(expression.field);
+                    errdefer if (!expression_transferred) freeDdlUniqueExpression(self.alloc, expression);
                     try expressions.append(self.alloc, expression);
                     expression_transferred = true;
                 } else {
@@ -16273,7 +16275,12 @@ const Parser = struct {
     fn validateSqlUniqueExpressionListUnique(expressions: []const runtime_schema.UniqueExpression) !void {
         for (expressions, 0..) |lhs, i| {
             for (expressions[i + 1 ..]) |rhs| {
-                if (lhs.op == rhs.op and std.ascii.eqlIgnoreCase(lhs.field, rhs.field)) return error.UnsupportedSqlShape;
+                if (lhs.op != rhs.op) continue;
+                if (lhs.op == .expression) {
+                    if (lhs.expression != null and rhs.expression != null and expressionEqual(lhs.expression.?, rhs.expression.?)) return error.UnsupportedSqlShape;
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(lhs.field, rhs.field)) return error.UnsupportedSqlShape;
             }
         }
     }
@@ -16827,7 +16834,7 @@ const Parser = struct {
         }
         var expressions = std.ArrayListUnmanaged(runtime_schema.UniqueExpression).empty;
         errdefer {
-            for (expressions.items) |expression| self.alloc.free(expression.field);
+            clearDdlUniqueExpressions(self.alloc, expressions.items);
             expressions.deinit(self.alloc);
         }
         while (true) {
@@ -16835,7 +16842,7 @@ const Parser = struct {
                 const wrapper_count = sql_adapter.consumeDdlIndexExpressionWrappers(self.tokens, &self.pos);
                 const expression = try self.parseConflictTargetUniqueExpressionAlloc();
                 var expression_transferred = false;
-                errdefer if (!expression_transferred) self.alloc.free(expression.field);
+                errdefer if (!expression_transferred) freeDdlUniqueExpression(self.alloc, expression);
                 try expressions.append(self.alloc, expression);
                 expression_transferred = true;
                 try sql_adapter.closeDdlIndexExpressionWrappers(self.tokens, &self.pos, wrapper_count);
@@ -16896,7 +16903,7 @@ const Parser = struct {
         }
         for (columns.items) |column| self.alloc.free(column);
         columns.deinit(self.alloc);
-        for (expressions.items) |expression| self.alloc.free(expression.field);
+        clearDdlUniqueExpressions(self.alloc, expressions.items);
         expressions.deinit(self.alloc);
         if (where_json.len > 0) self.alloc.free(where_json);
         where_json = "";
@@ -16929,13 +16936,20 @@ const Parser = struct {
     }
 
     fn nextConflictTargetElementIsUniqueExpression(self: *@This()) bool {
-        return sql_adapter.peekDdlIndexElementExpression(self.tokens, self.pos, false);
+        return sql_adapter.peekDdlIndexElementExpression(self.tokens, self.pos, true);
     }
 
     fn parseConflictTargetUniqueExpressionAlloc(self: *@This()) !runtime_schema.UniqueExpression {
         const expression = try sql_adapter.parseDdlUniqueExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        errdefer self.alloc.free(expression.field);
-        if (relationalColumnForField(self.schema, expression.field, null) == null) return error.InvalidSqlCatalog;
+        errdefer freeDdlUniqueExpression(self.alloc, expression);
+        if (expression.op == .expression) {
+            const row_expression = expression.expression orelse return error.InvalidSqlCatalog;
+            try validateCheckExpressionForColumns(self.schema.relational_columns, row_expression);
+            if (!rowExpressionDeterministic(row_expression)) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeOrderable(try checkExpressionTypeForColumns(self.schema.relational_columns, row_expression))) return error.InvalidSqlCatalog;
+        } else if (relationalColumnForField(self.schema, expression.field, null) == null) {
+            return error.InvalidSqlCatalog;
+        }
         return expression;
     }
 
@@ -17072,11 +17086,9 @@ const Parser = struct {
             const value = try self.conflictExpressionValueAlloc(expression, insert_columns, row);
             defer self.alloc.free(value);
             if (wrote) try writer.writeByte(',');
-            try writer.print("{{\"expression\":{{\"op\":{f},\"field\":{f}}},\"value\":{f}}}", .{
-                std.json.fmt(uniqueExpressionOpToken(expression.op), .{}),
-                std.json.fmt(expression.field, .{}),
-                std.json.fmt(value, .{}),
-            });
+            try writer.writeAll("{\"expression\":");
+            try self.writeUniqueExpressionIdentityJson(writer, expression);
+            try writer.print(",\"value\":{f}}}", .{std.json.fmt(value, .{})});
             wrote = true;
         }
         try writer.writeByte(']');
@@ -17110,6 +17122,27 @@ const Parser = struct {
         insert_columns: []const []const u8,
         row: []const []const u8,
     ) ![]const u8 {
+        if (expression.op == .expression) {
+            const row_expression = expression.expression orelse return error.UnsupportedSqlShape;
+            var row_object: std.Io.Writer.Allocating = .init(self.alloc);
+            errdefer row_object.deinit();
+            const writer = &row_object.writer;
+            try writer.writeByte('{');
+            var wrote = false;
+            for (insert_columns, row) |column, value_json| {
+                if (column.len == 0) return error.UnsupportedSqlShape;
+                if (wrote) try writer.writeByte(',');
+                try writer.print("{f}:", .{std.json.fmt(column, .{})});
+                try writer.writeAll(value_json);
+                wrote = true;
+            }
+            try writer.writeByte('}');
+            const row_json = try row_object.toOwnedSlice();
+            defer self.alloc.free(row_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{}) catch return error.UnsupportedSqlShape;
+            defer parsed.deinit();
+            return try relational_rows.expressionValueJsonAlloc(self.alloc, parsed.value, row_expression);
+        }
         const value_json = conflictInsertedValueForColumn(insert_columns, row, expression.field) orelse return error.UnsupportedSqlShape;
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
         defer parsed.deinit();
@@ -17118,7 +17151,26 @@ const Parser = struct {
             .lower => try std.ascii.allocLowerString(self.alloc, parsed.value.string),
             .upper => try std.ascii.allocUpperString(self.alloc, parsed.value.string),
             .md5 => try md5HexTextAlloc(self.alloc, parsed.value.string),
+            .expression => unreachable,
         };
+    }
+
+    fn writeUniqueExpressionIdentityJson(
+        self: *@This(),
+        writer: *std.Io.Writer,
+        expression: runtime_schema.UniqueExpression,
+    ) !void {
+        _ = self;
+        try writer.writeAll("{\"op\":");
+        try writer.print("{f}", .{std.json.fmt(uniqueExpressionOpToken(expression.op), .{})});
+        switch (expression.op) {
+            .lower, .upper, .md5 => try writer.print(",\"field\":{f}", .{std.json.fmt(expression.field, .{})}),
+            .expression => {
+                try writer.writeAll(",\"expression\":");
+                try Parser.writeRowExpressionJson(writer, expression.expression orelse return error.UnsupportedSqlShape);
+            },
+        }
+        try writer.writeByte('}');
     }
 
     fn conflictExpressionIdentityAlloc(
@@ -17130,11 +17182,13 @@ const Parser = struct {
     ) ![]const u8 {
         const folded = try self.conflictExpressionValueAlloc(expression, insert_columns, row);
         defer self.alloc.free(folded);
-        return try std.fmt.allocPrint(self.alloc, "{f}:[{f}:{f}]", .{
-            std.json.fmt(label, .{}),
-            std.json.fmt(expression.field, .{}),
-            std.json.fmt(folded, .{}),
-        });
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.print("{f}:[{{\"expression\":", .{std.json.fmt(label, .{})});
+        try self.writeUniqueExpressionIdentityJson(writer, expression);
+        try writer.print(",\"value\":{f}}}]", .{std.json.fmt(folded, .{})});
+        return try out.toOwnedSlice();
     }
 
     fn parseJsonSetSqlValueAlloc(
@@ -34001,6 +34055,7 @@ fn uniqueExpressionsEqual(a: []const runtime_schema.UniqueExpression, b: []const
     for (a, b) |left, right| {
         if (left.op != right.op) return false;
         if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (!optionalExpressionEqual(left.expression, right.expression)) return false;
     }
     return true;
 }
@@ -34122,10 +34177,18 @@ fn uniqueConstraintReferencesAny(
 ) bool {
     if (stringSlicesIntersect(constraint.columns, fields)) return true;
     for (constraint.expressions) |expression| {
-        if (stringSlicesContains(fields, expression.field)) return true;
+        switch (expression.op) {
+            .lower, .upper, .md5 => if (stringSlicesContains(fields, expression.field)) return true,
+            .expression => if (expression.expression) |row_expression| {
+                if (expressionReferencesAny(row_expression, fields)) return true;
+            },
+        }
     }
     for (constraint.where) |predicate| {
         if (stringSlicesContains(fields, predicate.field)) return true;
+    }
+    for (constraint.where_expressions) |condition| {
+        if (expressionConditionReferencesAny(condition, fields)) return true;
     }
     return false;
 }
@@ -35363,6 +35426,7 @@ fn renameUniqueExpressionJsonFields(
     for (expressions.array.items) |*expression| {
         if (expression.* != .object) return error.InvalidSqlCatalog;
         try renameStringFieldInJsonObject(alloc, &expression.object, "field", old_name, new_name);
+        if (expression.object.getPtr("expression")) |row_expression| try renameExpressionJsonFields(alloc, row_expression, old_name, new_name);
     }
 }
 
@@ -35912,8 +35976,12 @@ fn schemaJsonUniqueExpressionsAlloc(alloc: std.mem.Allocator, expressions: []con
             .lower => "lower",
             .upper => "upper",
             .md5 => "md5",
+            .expression => "expression",
         });
-        try putJsonString(alloc, &object, "field", expression.field);
+        switch (expression.op) {
+            .lower, .upper, .md5 => try putJsonString(alloc, &object, "field", expression.field),
+            .expression => try object.put(alloc, try alloc.dupe(u8, "expression"), try schemaJsonExpressionAlloc(alloc, expression.expression orelse return error.UnsupportedSqlShape)),
+        }
         try array.append(.{ .object = object });
     }
     return .{ .array = array };
@@ -36272,9 +36340,16 @@ fn cloneDdlPeriods(alloc: std.mem.Allocator, periods: []const runtime_schema.Rel
 }
 
 fn cloneDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) !runtime_schema.UniqueExpression {
+    const field = try alloc.dupe(u8, expression.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const row_expression = if (expression.expression) |value| try cloneExpressionAlloc(alloc, value) else null;
+    errdefer if (row_expression) |value| freeExpression(alloc, value);
+    field_transferred = true;
     return .{
         .op = expression.op,
-        .field = try alloc.dupe(u8, expression.field),
+        .field = field,
+        .expression = row_expression,
     };
 }
 
@@ -36283,7 +36358,7 @@ fn cloneDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runt
     const out = try alloc.alloc(runtime_schema.UniqueExpression, expressions.len);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        for (out[0..initialized]) |expression| freeDdlUniqueExpression(alloc, expression);
         alloc.free(out);
     }
     for (expressions, 0..) |expression, i| {
@@ -36520,6 +36595,7 @@ fn renameRelationalColumnAlloc(
         try renameStringSliceValuesAlloc(alloc, constraint.columns, operation.old_name, operation.new_name);
         for (@constCast(constraint.expressions)) |*expression| {
             try replaceOwnedStringIfEqualAlloc(alloc, &expression.field, operation.old_name, operation.new_name);
+            if (expression.expression) |*row_expression| try renameRowExpressionFieldsAlloc(alloc, row_expression, operation.old_name, operation.new_name);
         }
         try renameStringSliceValuesAlloc(alloc, constraint.include_columns, operation.old_name, operation.new_name);
         try renameUniquePredicatesAlloc(alloc, constraint.where, operation.old_name, operation.new_name);
@@ -36542,6 +36618,7 @@ fn renameGeneratedValueFieldsAlloc(
 ) !void {
     if (generated.field) |*field| try replaceOwnedStringIfEqualAlloc(alloc, field, old_name, new_name);
     try renameStringSliceValuesAlloc(alloc, generated.fields, old_name, new_name);
+    if (generated.expression) |*expression| try renameRowExpressionFieldsAlloc(alloc, expression, old_name, new_name);
 }
 
 fn renameUniquePredicatesAlloc(
@@ -37248,6 +37325,12 @@ fn stableSecondaryIndexGeneration(plan: CreateIndexPlan) u64 {
     for (plan.expressions) |expression| {
         hashPlanU64(&hasher, @intFromEnum(expression.op));
         hashPlanField(&hasher, expression.field);
+        if (expression.expression) |row_expression| {
+            hasher.update(&.{1});
+            hashPlanExpression(&hasher, row_expression);
+        } else {
+            hasher.update(&.{0});
+        }
     }
     if (plan.generated_expression) |generated| {
         hasher.update(&.{1});
@@ -37473,6 +37556,12 @@ fn validateUniqueConstraintForColumns(columns: []const runtime_schema.Relational
             .lower, .upper, .md5 => {
                 const found = relationalColumnForDdl(columns, expression.field) orelse return error.InvalidSqlCatalog;
                 if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+            },
+            .expression => {
+                const row_expression = expression.expression orelse return error.InvalidSqlCatalog;
+                try validateCheckExpressionForColumns(columns, row_expression);
+                if (!rowExpressionDeterministic(row_expression)) return error.InvalidSqlCatalog;
+                if (!checkExpressionTypeOrderable(try checkExpressionTypeForColumns(columns, row_expression))) return error.InvalidSqlCatalog;
             },
         }
     }
@@ -38282,8 +38371,17 @@ fn clearDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runt
 }
 
 fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
-    for (expressions) |expression| alloc.free(expression.field);
+    clearDdlUniqueExpressions(alloc, expressions);
     if (expressions.len > 0) alloc.free(expressions);
+}
+
+fn clearDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
+    for (expressions) |expression| freeDdlUniqueExpression(alloc, expression);
+}
+
+fn freeDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) void {
+    if (expression.field.len > 0) alloc.free(expression.field);
+    if (expression.expression) |row_expression| freeExpression(alloc, row_expression);
 }
 
 fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) void {
@@ -43683,6 +43781,25 @@ test "postgres sql adapter applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.md5, md5_unique_schema.unique_constraints[2].expressions[0].op);
     try std.testing.expectEqualStrings("email", md5_unique_schema.unique_constraints[2].expressions[0].field);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, md5_unique_schema.unique_constraints[2].validation_state);
+
+    var rich_unique_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_status_replace_key ON users (replace(status, 'old', 'new'));",
+    );
+    defer rich_unique_index.deinit(alloc);
+    const rich_unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, md5_unique_schema, rich_unique_index);
+    defer runtime_schema.freeSchema(alloc, rich_unique_schema);
+    try std.testing.expectEqual(@as(usize, 4), rich_unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_status_replace_key", rich_unique_schema.unique_constraints[3].name);
+    try std.testing.expectEqual(@as(usize, 1), rich_unique_schema.unique_constraints[3].expressions.len);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.expression, rich_unique_schema.unique_constraints[3].expressions[0].op);
+    const rich_unique_expression = rich_unique_schema.unique_constraints[3].expressions[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, rich_unique_expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), rich_unique_expression.operands.len);
+    try std.testing.expectEqualStrings("status", rich_unique_expression.operands[0].field);
+    try std.testing.expectEqualStrings("\"old\"", rich_unique_expression.operands[1].value_json);
+    try std.testing.expectEqualStrings("\"new\"", rich_unique_expression.operands[2].value_json);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, rich_unique_schema.unique_constraints[3].validation_state);
 
     var temporal_create = try lowerDdlPlanAlloc(alloc,
         \\CREATE TABLE prices (

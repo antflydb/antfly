@@ -300,7 +300,10 @@ pub const UniqueConstraint = struct {
         alloc.free(self.name);
         for (self.columns) |column| alloc.free(column);
         if (self.columns.len > 0) alloc.free(self.columns);
-        for (self.expressions) |expression| alloc.free(expression.field);
+        for (self.expressions) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
         if (self.expressions.len > 0) alloc.free(self.expressions);
         for (self.include_columns) |column| alloc.free(column);
         if (self.include_columns.len > 0) alloc.free(self.include_columns);
@@ -320,11 +323,13 @@ pub const UniqueExpressionOp = enum {
     lower,
     upper,
     md5,
+    expression,
 };
 
 pub const UniqueExpression = struct {
     op: UniqueExpressionOp,
-    field: []const u8,
+    field: []const u8 = "",
+    expression: ?storage_schema.RelationalRowsExpression = null,
 };
 
 pub const UniquePredicateOp = enum {
@@ -1340,12 +1345,25 @@ fn validateUniqueExpressionArray(value: std.json.Value) !void {
         };
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (!std.mem.eql(u8, entry.key_ptr.*, "op") and !std.mem.eql(u8, entry.key_ptr.*, "field")) return error.InvalidSchemaUpdateRequest;
+            if (!std.mem.eql(u8, entry.key_ptr.*, "op") and
+                !std.mem.eql(u8, entry.key_ptr.*, "field") and
+                !std.mem.eql(u8, entry.key_ptr.*, "expression"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
         }
         const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
-        const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
-        if (op != .string or (!enumTokenEql(op.string, "lower") and !enumTokenEql(op.string, "upper") and !enumTokenEql(op.string, "md5"))) return error.InvalidSchemaUpdateRequest;
-        if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (op != .string) return error.InvalidSchemaUpdateRequest;
+        if (enumTokenEql(op.string, "expression")) {
+            if (object.get("field") != null) return error.InvalidSchemaUpdateRequest;
+            const expression = object.get("expression") orelse return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionJson(expression);
+        } else {
+            if (!enumTokenEql(op.string, "lower") and !enumTokenEql(op.string, "upper") and !enumTokenEql(op.string, "md5")) return error.InvalidSchemaUpdateRequest;
+            if (object.get("expression") != null) return error.InvalidSchemaUpdateRequest;
+            const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+            if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        }
     }
 }
 
@@ -2532,9 +2550,10 @@ fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
 }
 
 fn validateRelationalUniqueConstraintExpression(schema: TableSchema, expression: UniqueExpression) !void {
-    const property = findDocumentProperty(schema.document_schemas[0].properties, expression.field) orelse return error.InvalidSchemaUpdateRequest;
     switch (expression.op) {
         .lower, .upper, .md5 => {
+            if (expression.field.len == 0 or expression.expression != null) return error.InvalidSchemaUpdateRequest;
+            const property = findDocumentProperty(schema.document_schemas[0].properties, expression.field) orelse return error.InvalidSchemaUpdateRequest;
             const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
             if (!std.mem.eql(u8, field_type, "keyword") and
                 !std.mem.eql(u8, field_type, "link") and
@@ -2542,6 +2561,16 @@ fn validateRelationalUniqueConstraintExpression(schema: TableSchema, expression:
                 !std.mem.eql(u8, field_type, "text"))
             {
                 return error.InvalidSchemaUpdateRequest;
+            }
+        },
+        .expression => {
+            if (expression.field.len != 0) return error.InvalidSchemaUpdateRequest;
+            const row_expression = expression.expression orelse return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionDeterministic(row_expression)) return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionAgainstSchema(schema, row_expression);
+            switch (try relationalRowsExpressionType(schema, row_expression)) {
+                .text, .numeric, .boolean, .datetime => {},
+                .json, .array, .null => return error.InvalidSchemaUpdateRequest,
             }
         },
     }
@@ -3113,7 +3142,11 @@ fn uniqueExpressionSlicesEqual(a: []const UniqueExpression, b: []const UniqueExp
 }
 
 fn uniqueExpressionsEqual(a: UniqueExpression, b: UniqueExpression) bool {
-    return a.op == b.op and std.mem.eql(u8, a.field, b.field);
+    if (a.op != b.op) return false;
+    if (!std.mem.eql(u8, a.field, b.field)) return false;
+    if (a.expression == null and b.expression == null) return true;
+    if (a.expression == null or b.expression == null) return false;
+    return relationalRowsExpressionsEqual(a.expression.?, b.expression.?);
 }
 
 fn uniquePredicateSlicesEqual(a: []const UniquePredicate, b: []const UniquePredicate) bool {
@@ -5147,16 +5180,35 @@ fn parseUniqueExpressions(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
     const out = try alloc.alloc(UniqueExpression, array.items.len);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        for (out[0..initialized]) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
         alloc.free(out);
     }
     for (array.items) |item| {
         const object = item.object;
         const op = object.get("op").?.string;
-        out[initialized] = .{
-            .op = if (enumTokenEql(op, "lower")) .lower else if (enumTokenEql(op, "upper")) .upper else if (enumTokenEql(op, "md5")) .md5 else return error.InvalidSchemaUpdateRequest,
-            .field = try alloc.dupe(u8, object.get("field").?.string),
-        };
+        if (enumTokenEql(op, "expression")) {
+            const field = try alloc.dupe(u8, "");
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            const row_expression = try parseRelationalRowsExpressionAlloc(alloc, object.get("expression").?);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeRelationalRowsExpression(alloc, row_expression);
+            out[initialized] = .{
+                .op = .expression,
+                .field = field,
+                .expression = row_expression,
+            };
+            field_transferred = true;
+            expression_transferred = true;
+        } else {
+            out[initialized] = .{
+                .op = if (enumTokenEql(op, "lower")) .lower else if (enumTokenEql(op, "upper")) .upper else if (enumTokenEql(op, "md5")) .md5 else return error.InvalidSchemaUpdateRequest,
+                .field = try alloc.dupe(u8, object.get("field").?.string),
+            };
+        }
         initialized += 1;
     }
     return out;

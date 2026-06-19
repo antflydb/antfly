@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "4a81cbe9519a6cade9896dcc5f3a99044493a80c43a6fe6d4db07638cba960f9",
+  "source_sha256": "1346ffee5beb344d3bbff1fb32530b52ee6fb2737345da9f55f7ce963f76e471",
   "source_entry_count": 896,
   "entry_count": 896,
   "skipped_entries": [
@@ -105,10 +105,15 @@
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE"
     },
     {
-      "name": "unsupported rich unique expression index",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=unique_expression_owner_ast",
-      "classification_reason": "unique_expression_owner_ast",
+      "name": "schema rich unique expression index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=1:generated_expr=0:where=0:unique=true:if_not_exists=false",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE UNIQUE INDEX usage_records_status_replace_key ON usage_records (replace(status, 'old', 'new'))"
     },
     {

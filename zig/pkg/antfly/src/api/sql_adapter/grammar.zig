@@ -3430,21 +3430,39 @@ pub fn parseDdlUniqueExpressionAlloc(
     pos: *usize,
 ) !runtime_schema.UniqueExpression {
     const cursor = parser.Cursor.init(tokens, pos);
-    const op: runtime_schema.UniqueExpressionOp = if (cursor.matchKeyword("lower"))
+    const start = cursor.checkpoint();
+    const op: ?runtime_schema.UniqueExpressionOp = if (cursor.matchKeyword("lower"))
         .lower
     else if (cursor.matchKeyword("upper"))
         .upper
     else blk: {
-        if (cursor.matchIdentifierIf(sqlKeywordIsMd5Function) == null) return error.UnsupportedSqlShape;
+        if (cursor.matchIdentifierIf(sqlKeywordIsMd5Function) == null) break :blk null;
         break :blk .md5;
     };
-    try cursor.expectToken(.lparen);
-    const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
-    var field_transferred = false;
-    errdefer if (!field_transferred) alloc.free(field);
-    try cursor.expectToken(.rparen);
-    field_transferred = true;
-    return .{ .op = op, .field = field };
+    if (op) |simple_op| {
+        if (cursor.matchToken(.lparen) != null) {
+            const field = parseIdentifierOwnedAlloc(alloc, tokens, pos) catch |err| {
+                cursor.restore(start);
+                if (err == error.OutOfMemory) return err;
+                const expression = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+                errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
+                return .{ .op = .expression, .expression = expression };
+            };
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            if (cursor.matchToken(.rparen) != null) {
+                field_transferred = true;
+                return .{ .op = simple_op, .field = field };
+            }
+            alloc.free(field);
+            field_transferred = true;
+        }
+        cursor.restore(start);
+    }
+
+    const expression = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    return .{ .op = .expression, .expression = expression };
 }
 
 pub fn parseDdlGeneratedExpressionAlloc(
@@ -7291,7 +7309,12 @@ test "sql adapter grammar parses ddl unique expressions" {
     var concat_tokens = try lexer.tokenizeAlloc(alloc, "concat(tenant_id, ':', status)");
     defer lexer.freeTokens(alloc, &concat_tokens);
     var concat_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlUniqueExpressionAlloc(alloc, concat_tokens.items, &concat_pos));
+    const concat = try parseDdlUniqueExpressionAlloc(alloc, concat_tokens.items, &concat_pos);
+    defer runtime_schema.freeRelationalRowsExpression(alloc, concat.expression.?);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.expression, concat.op);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat, concat.expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 3), concat.expression.?.operands.len);
+    try std.testing.expectEqual(concat_tokens.items.len, concat_pos);
 }
 
 test "sql adapter grammar parses ddl index expression wrappers" {

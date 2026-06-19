@@ -4577,6 +4577,7 @@ fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8,
                             .lower => std.ascii.toLower(ch),
                             .upper => std.ascii.toUpper(ch),
                             .md5 => unreachable,
+                            .expression => unreachable,
                         };
                     }
                     break :blk folded;
@@ -4591,9 +4592,61 @@ fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8,
                     }
                     break :blk hashed;
                 },
+                .expression => unreachable,
             }
         },
+        .expression => blk: {
+            const row_expression = expression.expression orelse return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, row_expression);
+            defer alloc.free(value_json);
+            break :blk try uniqueConstraintJsonValueAlloc(alloc, value_json);
+        },
     };
+}
+
+fn uniqueConstraintJsonValueAlloc(alloc: Allocator, value_json: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+    defer parsed.deinit();
+    const cell: relational_row_codec.Cell = switch (parsed.value) {
+        .null => return null,
+        .string => |value| .{
+            .path = "",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = value },
+        },
+        .bool => |value| .{
+            .path = "",
+            .value_type = .bool_val,
+            .value = .{ .bool_val = value },
+        },
+        .integer => |value| .{
+            .path = "",
+            .value_type = .u64_val,
+            .value = .{ .u64_val = @bitCast(value) },
+        },
+        .float => |value| .{
+            .path = "",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = value },
+        },
+        .number_string => |value| blk: {
+            if (std.fmt.parseInt(i64, value, 10)) |integer| {
+                break :blk .{
+                    .path = "",
+                    .value_type = .u64_val,
+                    .value = .{ .u64_val = @bitCast(integer) },
+                };
+            } else |_| {
+                break :blk .{
+                    .path = "",
+                    .value_type = .f64_val,
+                    .value = .{ .f64_val = std.fmt.parseFloat(f64, value) catch return error.InvalidColumnValue },
+                };
+            }
+        },
+        else => return error.InvalidColumnValue,
+    };
+    return try uniqueConstraintCellValueAlloc(alloc, cell);
 }
 
 fn uniqueConstraintCellValueAlloc(alloc: Allocator, cell: relational_row_codec.Cell) ![]u8 {
@@ -7877,6 +7930,61 @@ test "relational unique constraints optionally treat null components as not dist
         error.UniqueConstraintViolation,
         strict_participant.prepareUpsert("events", "doc:d", row_b, null),
     );
+}
+
+test "relational unique constraints encode ast expression tuple components" {
+    const alloc = std.testing.allocator;
+
+    const row_old = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "status",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "very old" },
+        },
+    });
+    defer alloc.free(row_old);
+    const row_new = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "status",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "very new" },
+        },
+    });
+    defer alloc.free(row_new);
+    const row_other = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "status",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "very current" },
+        },
+    });
+    defer alloc.free(row_other);
+
+    const operands = [_]schema_mod.RelationalRowsExpression{
+        .{ .kind = .field, .field = "status" },
+        .{ .kind = .value, .value_json = "\"old\"" },
+        .{ .kind = .value, .value_json = "\"new\"" },
+    };
+    const constraint = schema_mod.UniqueConstraint{
+        .name = "events_status_replace_key",
+        .expressions = &.{.{
+            .op = .expression,
+            .expression = .{
+                .kind = .replace,
+                .operands = &operands,
+            },
+        }},
+    };
+
+    const old_tuple = (try uniqueConstraintTupleValueAlloc(alloc, row_old, constraint)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(old_tuple);
+    const new_tuple = (try uniqueConstraintTupleValueAlloc(alloc, row_new, constraint)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(new_tuple);
+    const other_tuple = (try uniqueConstraintTupleValueAlloc(alloc, row_other, constraint)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(other_tuple);
+
+    try std.testing.expectEqualSlices(u8, old_tuple, new_tuple);
+    try std.testing.expect(!std.mem.eql(u8, old_tuple, other_tuple));
 }
 
 test "relational foreign key reference extraction implements match simple for composite nullable components" {

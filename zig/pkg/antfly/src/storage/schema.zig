@@ -451,11 +451,13 @@ pub const UniqueExpressionOp = enum(u8) {
     lower = 0,
     upper = 1,
     md5 = 2,
+    expression = 3,
 };
 
 pub const UniqueExpression = struct {
     op: UniqueExpressionOp,
-    field: []const u8,
+    field: []const u8 = "",
+    expression: ?RelationalRowsExpression = null,
 };
 
 pub const UniquePredicateOp = enum(u8) {
@@ -675,6 +677,9 @@ fn uniqueExpressionSlicesEqual(a: []const UniqueExpression, b: []const UniqueExp
     for (a, b) |left, right| {
         if (left.op != right.op) return false;
         if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (left.expression == null and right.expression == null) continue;
+        if (left.expression == null or right.expression == null) return false;
+        if (!relationalRowsExpressionsEqual(left.expression.?, right.expression.?)) return false;
     }
     return true;
 }
@@ -739,7 +744,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 40); // format version
+    try appendU32(&buf, alloc, 41); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -879,6 +884,12 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         for (constraint.expressions) |expression| {
             try buf.append(alloc, @intFromEnum(expression.op));
             try appendStr(&buf, alloc, expression.field);
+            if (expression.expression) |row_expression| {
+                try buf.append(alloc, 1);
+                try appendRelationalRowsExpression(&buf, alloc, row_expression);
+            } else {
+                try buf.append(alloc, 0);
+            }
         }
         try appendStringSlice(&buf, alloc, constraint.include_columns);
         try appendOptStr(&buf, alloc, constraint.without_overlaps_period);
@@ -978,7 +989,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 40) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 41) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1422,7 +1433,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer alloc.free(name);
             const columns = try readStringSliceAlloc(alloc, data, &pos);
             errdefer freeStringSlice(alloc, columns);
-            const expressions = if (fmt_version >= 19) try readUniqueExpressionSliceAlloc(alloc, data, &pos) else &.{};
+            const expressions = if (fmt_version >= 19) try readUniqueExpressionSliceAlloc(alloc, data, &pos, fmt_version) else &.{};
             errdefer freeUniqueExpressionSlice(alloc, expressions);
             const include_columns = if (fmt_version >= 36) try readStringSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeStringSlice(alloc, include_columns);
@@ -1736,7 +1747,10 @@ fn freeUniqueConstraint(alloc: Allocator, constraint: UniqueConstraint) void {
 }
 
 fn freeUniqueExpressionSlice(alloc: Allocator, expressions: []const UniqueExpression) void {
-    for (expressions) |expression| alloc.free(expression.field);
+    for (expressions) |expression| {
+        alloc.free(expression.field);
+        if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+    }
     if (expressions.len > 0) alloc.free(expressions);
 }
 
@@ -2501,13 +2515,16 @@ fn readStringSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]cons
     return out;
 }
 
-fn readUniqueExpressionSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]const UniqueExpression {
+fn readUniqueExpressionSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize, fmt_version: u32) ![]const UniqueExpression {
     const count = readU32(data, pos);
     if (count == 0) return &.{};
     const out = try alloc.alloc(UniqueExpression, count);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        for (out[0..initialized]) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
         alloc.free(out);
     }
     for (out) |*expression| {
@@ -2515,12 +2532,24 @@ fn readUniqueExpressionSliceAlloc(alloc: Allocator, data: []const u8, pos: *usiz
             0 => .lower,
             1 => .upper,
             2 => .md5,
+            3 => .expression,
             else => return error.InvalidSchema,
         };
         pos.* += 1;
+        const field = try alloc.dupe(u8, readStr(data, pos));
+        errdefer alloc.free(field);
+        const row_expression: ?RelationalRowsExpression = if (fmt_version >= 41 and data[pos.*] == 1) expression_blk: {
+            pos.* += 1;
+            break :expression_blk try readRelationalRowsExpressionAlloc(alloc, data, pos);
+        } else expression_blk: {
+            if (fmt_version >= 41) pos.* += 1;
+            break :expression_blk null;
+        };
+        errdefer if (row_expression) |value| freeRelationalRowsExpression(alloc, value);
         expression.* = .{
             .op = op,
-            .field = try alloc.dupe(u8, readStr(data, pos)),
+            .field = field,
+            .expression = row_expression,
         };
         initialized += 1;
     }
