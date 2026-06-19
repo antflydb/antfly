@@ -151,7 +151,10 @@ Current status:
   empty and grow on first metadata/rerank/scoring use instead of being
   allocated for the initial candidate ceiling. The grouped query/distance slabs
   now grow geometrically instead of resizing exactly to each transient
-  candidate count. Small
+  candidate count. Rerank preparation grows query-result flags for the full
+  approximate window, but delays distance/error-bound and vector-batch growth
+  until the selected rerank count is known, so boundary rerank does not size
+  vector fetch scratch to candidates it will never exact-score. Small
   transformed-vector matrix loads now use stack-backed lookup, vector-view, and
   batch-vector scratch before falling back to heap allocation.
 - Delete-heavy posting mutations now switch `PostingStore.removeMembers` from
