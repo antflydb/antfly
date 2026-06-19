@@ -26,6 +26,7 @@ const flat_centroid_block_metadata_stack_capacity = 256;
 const flat_centroid_query_probe_stack_capacity = 512;
 const flat_centroid_zero_stack_capacity = 4096;
 const flat_centroid_coarse_scratch_stack_capacity = 8192;
+const boundary_reassignment_vector_scratch_stack_capacity = 8192;
 
 pub const FlatCentroidBlock = struct {
     posting_ids: []u64,
@@ -1730,14 +1731,18 @@ fn targetedBoundaryReassignParent(
     @memset(planned_in, 0);
 
     const dims: usize = @intCast(self.config.dims);
-    const raw_scratch = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(raw_scratch);
-    const transformed = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(transformed);
-    const swap_raw_scratch = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(swap_raw_scratch);
-    const swap_transformed = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(swap_transformed);
+    const vector_scratch_len = try std.math.mul(usize, dims, 4);
+    var vector_scratch_stack: [boundary_reassignment_vector_scratch_stack_capacity]f32 = undefined;
+    const use_vector_scratch_stack = vector_scratch_len <= vector_scratch_stack.len;
+    const vector_scratch = if (use_vector_scratch_stack)
+        vector_scratch_stack[0..vector_scratch_len]
+    else
+        try self.alloc.alloc(f32, vector_scratch_len);
+    defer if (!use_vector_scratch_stack) self.alloc.free(vector_scratch);
+    const raw_scratch = vector_scratch[0..dims];
+    const transformed = vector_scratch[dims..][0..dims];
+    const swap_raw_scratch = vector_scratch[dims * 2 ..][0..dims];
+    const swap_transformed = vector_scratch[dims * 3 ..][0..dims];
 
     var move_count: usize = 0;
     const min_source_members = self.minLeafOccupancy();
