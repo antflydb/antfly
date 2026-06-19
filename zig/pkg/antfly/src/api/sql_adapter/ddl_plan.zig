@@ -740,6 +740,7 @@ pub const CreateRoutinePlan = struct {
     null_input: ?RoutineNullInput = null,
     parallel_safety: ?RoutineParallelSafety = null,
     leakproof: bool = false,
+    window: bool = false,
     support_function: ?[]const u8 = null,
     transform_types: []const []const u8 = &.{},
     settings: []const RoutineSetting = &.{},

@@ -3529,6 +3529,7 @@ const Parser = struct {
         const null_input = syntax.null_input;
         const parallel_safety = syntax.parallel_safety;
         const leakproof = syntax.leakproof;
+        const window = syntax.window;
         const support_function = syntax.support_function;
         const transform_types = syntax.transform_types;
         const settings = syntax.settings;
@@ -3554,6 +3555,7 @@ const Parser = struct {
             .null_input = null_input,
             .parallel_safety = parallel_safety,
             .leakproof = leakproof,
+            .window = window,
             .support_function = support_function,
             .transform_types = transform_types,
             .settings = settings,
@@ -45304,6 +45306,21 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=leakproof_audit:args=0:replace=false:returns=trigger:language=plpgsql:leakproof=true", leakproof_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, leakproof_function));
 
+    var window_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION window_audit() RETURNS trigger LANGUAGE plpgsql WINDOW;");
+    defer window_function.deinit(alloc);
+    const window_function_plan = switch (window_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(window_function_plan.window);
+    const window_function_fingerprint = try ddlFingerprintAlloc(alloc, window_function);
+    defer alloc.free(window_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=window_audit:args=0:replace=false:returns=trigger:language=plpgsql:window=true", window_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, window_function));
+
     var support_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support;");
     defer support_function.deinit(alloc);
     const support_function_plan = switch (support_function) {
@@ -45356,7 +45373,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, setting_function));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql WINDOW;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql EXTERNAL SECURITY DEFINER;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -57821,6 +57838,11 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
     }
     if (create.leakproof) {
         const next = try std.fmt.allocPrint(alloc, "{s}:leakproof=true", .{base});
+        alloc.free(base);
+        base = next;
+    }
+    if (create.window) {
+        const next = try std.fmt.allocPrint(alloc, "{s}:window=true", .{base});
         alloc.free(base);
         base = next;
     }
