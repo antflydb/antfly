@@ -1945,8 +1945,22 @@ pub const AntflyApiHandler = struct {
 
         var lookup_opts = try http_route_helpers.parseLookupOptions(alloc, ctx.request.uri.query orelse "");
         defer lookup_opts.deinit(alloc);
+        const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid read consistency");
+        };
 
-        var result = (try source.lookup(alloc, table_name, decoded_key, lookup_opts.opts, .read_index)) orelse {
+        var result = (source.lookup(alloc, table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
+                _ = ctx.status(503);
+                return ctx.text("read requires primary");
+            },
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("standby read unavailable");
+            },
+            else => return err,
+        }) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };

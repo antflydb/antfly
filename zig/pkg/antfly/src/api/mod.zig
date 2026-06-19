@@ -64,6 +64,7 @@ pub const ProvisionedGroupStorage = provisioned_storage.ProvisionedGroupStorage;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;
+pub const HAReadGate = table_reads.HAReadGate;
 pub const backend_current_root_generation = table_reads.backend_current_root_generation;
 pub const HostedProvisionedTableReadSource = table_reads.HostedProvisionedTableReadSource;
 pub const DistributedCandidateSource = distributed_candidate_source.DistributedCandidateSource;

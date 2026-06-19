@@ -388,6 +388,7 @@ from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_users_response_200_item import ListUsersResponse200Item
+from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
 from .lsm_storage_status import LsmStorageStatus
 from .match_all_query import MatchAllQuery
@@ -968,6 +969,7 @@ __all__ = (
     "LinkupSearchConfigOutputType",
     "ListDocumentArtifactManifestsDetail",
     "ListUsersResponse200Item",
+    "LookupKeyConsistency",
     "LookupKeyResponse200",
     "LsmStorageStatus",
     "MatchAllQuery",

@@ -11990,6 +11990,12 @@ export interface operations {
                  * @example title,author,metadata.tags
                  */
                 fields?: string;
+                /**
+                 * @description Read consistency for the lookup. The default `read_index` routes to
+                 *     the primary for linearizable reads. `stale` allows a hot standby to
+                 *     serve the lookup at its safe-read LSN.
+                 */
+                consistency?: "read_index" | "leader_lease" | "stale";
             };
             header?: never;
             path: {

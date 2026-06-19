@@ -7989,6 +7989,20 @@ paths:
           schema:
             type: string
           example: "title,author,metadata.tags"
+        - name: consistency
+          in: query
+          required: false
+          description: |
+            Read consistency for the lookup. The default `read_index` routes to
+            the primary for linearizable reads. `stale` allows a hot standby to
+            serve the lookup at its safe-read LSN.
+          schema:
+            type: string
+            enum:
+              - read_index
+              - leader_lease
+              - stale
+            default: read_index
       responses:
         "200":
           description: Record found

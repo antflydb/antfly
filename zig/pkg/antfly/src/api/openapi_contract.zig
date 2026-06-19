@@ -21,6 +21,9 @@ pub const indexes_generated = @import("antfly_indexes_openapi");
 pub const generating_api_generated = @import("antfly_generating_api_openapi");
 pub const eval_generated = @import("antfly_eval_openapi");
 pub const query_generated = @import("antfly_query_openapi");
+pub const admin_generated = @import("antfly_admin_openapi");
+pub const admin_facade = @import("../admin/mod.zig");
+pub const internal_generated = @import("antfly_internal_openapi");
 pub const metadata_generated = @import("antfly_metadata_openapi");
 pub const usermgr_generated = @import("antfly_usermgr_openapi");
 pub const chunking_generated = @import("antfly_chunking_openapi");
@@ -45,6 +48,66 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "ClusterRestoreRequest"));
     try std.testing.expect(@hasDecl(generated, "ClusterRestoreResponse"));
     try std.testing.expect(@hasDecl(generated, "BackupListResponse"));
+}
+
+test "admin openapi contract module is generated and wired" {
+    try std.testing.expect(@hasDecl(admin_generated, "ReplicationSlotCreateRequest"));
+    try std.testing.expect(@hasField(admin_generated.ReplicationSlotCreateRequest, "slot_name"));
+    try std.testing.expect(@hasField(admin_generated.ReplicationSlotCreateRequest, "initial_lsn"));
+    try std.testing.expect(@hasDecl(admin_generated, "BaseBackupStartRequest"));
+    try std.testing.expect(@hasField(admin_generated.BaseBackupStartRequest, "manifest_id"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyBootstrapRequest"));
+    try std.testing.expect(@hasField(admin_generated.StandbyBootstrapRequest, "content_root"));
+    try std.testing.expect(@hasDecl(admin_generated, "FenceAcquireRequest"));
+    try std.testing.expect(@hasField(admin_generated.FenceAcquireRequest, "identity"));
+    try std.testing.expect(@hasField(admin_generated.FenceAcquireRequest, "old_primary_id"));
+    try std.testing.expect(@hasField(admin_generated.FenceAcquireRequest, "promoted_node_id"));
+    try std.testing.expect(@hasDecl(admin_generated, "PromotionAssessRequest"));
+    try std.testing.expect(@hasField(admin_generated.PromotionAssessRequest, "use_current_fence"));
+    try std.testing.expect(@hasDecl(admin_generated, "HAPromotionResult"));
+    try std.testing.expect(@hasField(admin_generated.HAPromotionResult, "node_id"));
+    try std.testing.expect(@hasDecl(admin_generated, "HAActionReceipt"));
+    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "action_id"));
+    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "action_kind"));
+    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "target"));
+    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "state"));
+    try std.testing.expect(@hasDecl(admin_generated, "HAPromotionResponse"));
+    try std.testing.expect(@hasField(admin_generated.HAPromotionResponse, "action"));
+    try std.testing.expect(@hasField(admin_generated.HAPromotionResponse, "promotion"));
+    try std.testing.expect(@hasDecl(admin_generated, "HAFenceReceipt"));
+    try std.testing.expect(@hasField(admin_generated.HAFenceReceipt, "parent_timeline_id"));
+    try std.testing.expect(@hasDecl(admin_generated, "RejoinAssessRequest"));
+    try std.testing.expect(@hasField(admin_generated.RejoinAssessRequest, "retained_from_lsn"));
+    try std.testing.expect(@hasField(admin_generated.RejoinAssessRequest, "receipt"));
+    try std.testing.expect(@hasDecl(admin_generated, "HARejoinAssessResponse"));
+    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "action"));
+    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "assessment"));
+    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "rewind"));
+    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "reseed"));
+    try std.testing.expect(@hasDecl(admin_generated, "HARejoinRewindResult"));
+    try std.testing.expect(@hasField(admin_generated.HARejoinRewindResult, "discarded_lsn_count"));
+    try std.testing.expect(@hasDecl(admin_generated, "HARejoinReseedResult"));
+    try std.testing.expect(@hasField(admin_generated.HARejoinReseedResult, "base_backup_required"));
+    try std.testing.expect(@hasDecl(admin_facade, "HAActionReceipt"));
+    try std.testing.expect(@hasDecl(admin_facade, "HARejoinRewindResult"));
+    try std.testing.expect(@hasDecl(admin_facade, "HARejoinReseedResult"));
+    try std.testing.expect(@hasDecl(admin_generated.server, "PauseHAReplicationSlotPathParams"));
+    try std.testing.expect(@hasField(admin_generated.server.PauseHAReplicationSlotPathParams, "slot_name"));
+}
+
+test "internal openapi contract module is generated and wired" {
+    try std.testing.expect(@hasDecl(internal_generated, "HAIdentifySystemResponse"));
+    try std.testing.expect(@hasField(internal_generated.HAIdentifySystemResponse, "identity"));
+    try std.testing.expect(@hasField(internal_generated.HAIdentifySystemResponse, "record_format_version"));
+    try std.testing.expect(@hasDecl(internal_generated, "HACreateReplicationSlotRequest"));
+    try std.testing.expect(@hasField(internal_generated.HACreateReplicationSlotRequest, "slot_name"));
+    try std.testing.expect(@hasDecl(internal_generated, "HAStartReplicationRequest"));
+    try std.testing.expect(@hasField(internal_generated.HAStartReplicationRequest, "from_lsn"));
+    try std.testing.expect(@hasDecl(internal_generated, "HAReplicationFrame"));
+    try std.testing.expect(@hasField(internal_generated.HAReplicationFrame, "encoded"));
+    try std.testing.expect(@hasDecl(internal_generated, "HAStandbyStatusUpdateRequest"));
+    try std.testing.expect(@hasField(internal_generated.HAStandbyStatusUpdateRequest, "safe_read_lsn"));
+    try std.testing.expect(@hasDecl(internal_generated.server, "ServerRouter"));
 }
 
 test "public table contract exposes migration metadata" {

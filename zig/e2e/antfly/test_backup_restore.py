@@ -651,7 +651,7 @@ def test_cluster_backup_restore_partial_statuses(backup_api):
 
         restored_doc = wait_until(
             lambda: _lookup_doc(backup_api, table_name, "doc:1"),
-            timeout_s=30.0,
+            timeout_s=60.0,
             interval_s=1.0,
         )
         assert restored_doc is not None

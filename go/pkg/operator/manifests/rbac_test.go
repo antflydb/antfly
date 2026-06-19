@@ -1,6 +1,14 @@
 package manifests
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/yaml"
+)
 
 func TestAllRBACResourcesAvoidsStorageAutoGrowRBAC(t *testing.T) {
 	for _, resource := range AllRBACResources() {
@@ -25,6 +33,76 @@ func TestClusterRoleAvoidsOptionalHighRiskPermissions(t *testing.T) {
 				t.Fatalf("ClusterRole should not grant nodes/proxy by default, got verbs %v", rule.Verbs)
 			}
 		}
+	}
+}
+
+func TestClusterRoleGrantsLeasePermissionsForHAFencing(t *testing.T) {
+	role := ClusterRole()
+	requiredVerbs := []string{"get", "list", "watch", "create", "update", "patch", "delete"}
+
+	for _, rule := range role.Rules {
+		if !containsString(rule.APIGroups, "coordination.k8s.io") || !containsString(rule.Resources, "leases") {
+			continue
+		}
+		for _, verb := range requiredVerbs {
+			if !containsString(rule.Verbs, verb) {
+				t.Fatalf("ClusterRole leases rule missing verb %q: %#v", verb, rule.Verbs)
+			}
+		}
+		return
+	}
+
+	t.Fatal("ClusterRole must grant coordination.k8s.io leases permissions for HA KubernetesLease fencing")
+}
+
+func TestHAAdminTokenSecretInjectionManifestsAreAligned(t *testing.T) {
+	rawDeployment, err := os.ReadFile("../config/manager/deployment.yaml")
+	if err != nil {
+		t.Fatalf("read deployment manifest: %v", err)
+	}
+	var deployment appsv1.Deployment
+	if err := yaml.Unmarshal(rawDeployment, &deployment); err != nil {
+		t.Fatalf("parse deployment manifest: %v", err)
+	}
+	if deployment.Namespace != OperatorNamespace {
+		t.Fatalf("deployment namespace = %q, want %q", deployment.Namespace, OperatorNamespace)
+	}
+
+	tokenEnv, ok := findContainerEnv(deployment.Spec.Template.Spec.Containers, "antfly-operator-manager", "ANTFLY_HA_ADMIN_TOKEN")
+	if !ok {
+		t.Fatal("deployment must inject ANTFLY_HA_ADMIN_TOKEN into antfly-operator-manager")
+	}
+	if tokenEnv.ValueFrom == nil || tokenEnv.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("ANTFLY_HA_ADMIN_TOKEN must come from a Secret key ref: %#v", tokenEnv)
+	}
+	secretRef := tokenEnv.ValueFrom.SecretKeyRef
+	if secretRef.Name != "antfly-ha-admin-token" {
+		t.Fatalf("ANTFLY_HA_ADMIN_TOKEN Secret name = %q, want antfly-ha-admin-token", secretRef.Name)
+	}
+	if secretRef.Key != "token" {
+		t.Fatalf("ANTFLY_HA_ADMIN_TOKEN Secret key = %q, want token", secretRef.Key)
+	}
+	if secretRef.Optional == nil || !*secretRef.Optional {
+		t.Fatal("ANTFLY_HA_ADMIN_TOKEN Secret key ref must be optional for deployments without HA admin automation")
+	}
+
+	rawExample, err := os.ReadFile("../examples/ha-hot-standby-swarm.yaml")
+	if err != nil {
+		t.Fatalf("read HA example manifest: %v", err)
+	}
+	firstDoc := strings.SplitN(string(rawExample), "\n---\n", 2)[0]
+	var secret corev1.Secret
+	if err := yaml.Unmarshal([]byte(firstDoc), &secret); err != nil {
+		t.Fatalf("parse HA example Secret: %v", err)
+	}
+	if secret.Name != secretRef.Name {
+		t.Fatalf("example Secret name = %q, want %q", secret.Name, secretRef.Name)
+	}
+	if secret.Namespace != deployment.Namespace {
+		t.Fatalf("example Secret namespace = %q, want deployment namespace %q", secret.Namespace, deployment.Namespace)
+	}
+	if _, ok := secret.StringData[secretRef.Key]; !ok {
+		t.Fatalf("example Secret stringData missing key %q", secretRef.Key)
 	}
 }
 
@@ -59,4 +137,27 @@ func TestStorageAutoGrowRBACGrantsNodeProxyOnly(t *testing.T) {
 	if subject.Kind != "ServiceAccount" || subject.Name != ServiceAccountName || subject.Namespace != OperatorNamespace {
 		t.Fatalf("StorageAutoGrowClusterRoleBinding subject = %#v", subject)
 	}
+}
+
+func findContainerEnv(containers []corev1.Container, containerName string, envName string) (corev1.EnvVar, bool) {
+	for _, container := range containers {
+		if container.Name != containerName {
+			continue
+		}
+		for _, env := range container.Env {
+			if env.Name == envName {
+				return env, true
+			}
+		}
+	}
+	return corev1.EnvVar{}, false
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
