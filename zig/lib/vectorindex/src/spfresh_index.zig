@@ -25,6 +25,7 @@ const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_query_probe_stack_capacity = 512;
 const flat_centroid_zero_stack_capacity = 4096;
 const leaf_bounds_radius_vector_scratch_stack_capacity = 4096;
+const boundary_reassignment_leaf_stack_capacity = 64;
 const boundary_reassignment_moves_stack_capacity = 128;
 const boundary_reassignment_parent_stack_capacity = 128;
 const boundary_reassignment_vector_scratch_stack_capacity = 8192;
@@ -1931,11 +1932,16 @@ fn targetedBoundaryReassignParent(
     defer parent.deinit(self.alloc);
     if (parent.is_leaf or parent.children.len < 2) return result;
 
-    var leaves = try self.alloc.alloc(types.Node, parent.children.len);
+    var leaves_stack: [boundary_reassignment_leaf_stack_capacity]types.Node = undefined;
+    const use_leaves_stack = parent.children.len <= leaves_stack.len;
+    const leaves = if (use_leaves_stack)
+        leaves_stack[0..parent.children.len]
+    else
+        try self.alloc.alloc(types.Node, parent.children.len);
     var initialized: usize = 0;
     defer {
         for (leaves[0..initialized]) |*leaf| leaf.deinit(self.alloc);
-        self.alloc.free(leaves);
+        if (!use_leaves_stack) self.alloc.free(leaves);
     }
 
     for (parent.children) |child_id| {
