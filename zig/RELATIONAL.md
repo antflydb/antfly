@@ -1088,7 +1088,14 @@ fixture with the same entry schema as the generated golden fixture. Corpus-wide
 coverage expectations live in
 `api/fixtures/sql_api_required_coverage.json`; those names resolve against the
 coverage accumulator by exact field name, so strengthening or relaxing a required
-coverage bucket is a fixture review instead of a Zig assertion edit. Prepared
+coverage bucket is a fixture review instead of a Zig assertion edit. SQL adapter
+edge cases that are not golden typed-plan entries, such as comment preservation,
+malformed placeholder suffixes, statement-kind classification, and fail-closed
+point-lowerer boundaries, live in
+`api/fixtures/sql_api_adapter_edge_cases.json` and are interpreted by one
+generic lowerer runner. Those cases should only move into the source corpus when
+they assert a durable typed plan, adapter no-op, or unsupported model-feature
+classification. Prepared
 statement, cursor portal, `EXPLAIN` wrapper, maintenance, transaction-control,
 catalog DDL, collation/operator/aggregate/cast catalog syntax, and adapter-only
 catalog no-op examples use this path because their expected behavior is fully
@@ -5255,7 +5262,9 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    computed membership predicates, scalar OR/membership predicates,
    parenthesized arithmetic projection/order examples,
    array/cardinality/position expressions, and computed-array predicates,
-   belong in the source fixture rather than embedded Zig case data.
+   belong in the source fixture rather than embedded Zig case data. Parser and
+   point-lowerer edge cases that are not golden plan assertions belong in
+   `sql_api_adapter_edge_cases.json` instead of inline tests.
 
 2. **DDL and migration compiler.**
    Compile native migration intent into Antfly schema mutations rather than replaying
@@ -6211,10 +6220,13 @@ queries, date/time expression queries, and JSON expression-projection queries,
 expression-membership/null-safe predicate queries, scalar OR/membership
 predicate queries, parenthesized arithmetic projection/order queries, and
 array/computed-array expression queries, and portable read-classifier
-query/aggregate examples. The embedded Zig case list is intentionally empty; if
-a future regression needs in-process fixture construction, the long-term shape is
-to add an explicit source-fixture field and parser/validator support so the case
-remains reviewable data.
+query/aggregate examples. The adapter edge-case fixture carries lowerer/parser
+examples that have no golden typed-plan fingerprint but still need reviewable
+SQL text and exact success/error expectations. The embedded Zig case list is
+intentionally empty; if a future regression needs in-process fixture
+construction, the long-term shape is to add an explicit source-fixture or
+edge-fixture field and parser/validator support so the case remains reviewable
+data.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 

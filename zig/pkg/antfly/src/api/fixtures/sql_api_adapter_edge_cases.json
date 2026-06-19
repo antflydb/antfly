@@ -1,0 +1,150 @@
+{
+  "edge_case_format": 1,
+  "cases": [
+    {
+      "name": "cte final join references missing cte output",
+      "action": "select",
+      "expected_error": "unsupported_sql_shape",
+      "sql": "WITH membership AS (SELECT id FROM users) SELECT id FROM membership JOIN organizations ON membership.organization_id = organizations.id"
+    },
+    {
+      "name": "window read without window-plan lowering",
+      "action": "select",
+      "expected_error": "invalid_sql_catalog",
+      "sql": "SELECT row_number() OVER (ORDER BY id) FROM users"
+    },
+    {
+      "name": "direct left join rejected by point select lowerer",
+      "action": "select",
+      "expected_error": "unsupported_sql_shape",
+      "sql": "SELECT id FROM users LEFT JOIN organizations ON users.organization_id = organizations.id"
+    },
+    {
+      "name": "malformed select placeholder suffix",
+      "action": "select",
+      "expected_error": "unsupported_sql_shape",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "SELECT id FROM users WHERE id = $1abc"
+    },
+    {
+      "name": "commented select still lowers to typed predicate",
+      "action": "select",
+      "expected_table": "users",
+      "expected_predicates": 1,
+      "expected_first_predicate_field": "id",
+      "expected_first_predicate_value_json": "\"u1\"",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "/* route: typed plan */ SELECT /* projection */ id FROM users -- source table\nWHERE id = $1"
+    },
+    {
+      "name": "non-unique update remains unsupported by point lowerer",
+      "action": "update",
+      "expected_error": "unsupported_sql_shape",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
+    },
+    {
+      "name": "malformed update placeholder suffix",
+      "action": "update",
+      "expected_error": "unsupported_sql_shape",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE id = $1abc"
+    },
+    {
+      "name": "commented update still lowers to typed mutation",
+      "action": "update",
+      "expected_table": "users",
+      "expected_transformed": 1,
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "UPDATE /* target */ users SET organization_id = 'o2' /* patch */ WHERE id = $1 -- identity\n"
+    },
+    {
+      "name": "cte update still classifies as update",
+      "action": "classify_write",
+      "expected_write_kind": "update",
+      "sql": "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "cte update has no supported write-plan selector",
+      "action": "write_plan",
+      "expected_error": "unsupported_rows_selector",
+      "sql": "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "non-unique delete remains unsupported by point lowerer",
+      "action": "delete",
+      "expected_error": "unsupported_sql_shape",
+      "sql": "DELETE FROM users WHERE organization_id = 'o1'"
+    },
+    {
+      "name": "cte delete still classifies as delete",
+      "action": "classify_write",
+      "expected_write_kind": "delete",
+      "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "cte delete has no supported write-plan selector",
+      "action": "write_plan",
+      "expected_error": "unsupported_rows_selector",
+      "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "malformed insert placeholder suffix",
+      "action": "insert",
+      "expected_error": "unsupported_sql_shape",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "INSERT INTO users (id, organization_id) VALUES ($1abc, 'o1')"
+    },
+    {
+      "name": "commented insert still lowers to typed batch",
+      "action": "insert",
+      "expected_table": "users",
+      "expected_inserted": 1,
+      "params": [
+        {
+          "string": "u2"
+        }
+      ],
+      "sql": "/* migration seed */ INSERT INTO users (id, organization_id) VALUES ($1, 'o1') -- final row"
+    },
+    {
+      "name": "expression conflict target rejected without catalog expression key",
+      "action": "insert",
+      "expected_error": "invalid_sql_catalog",
+      "sql": "INSERT INTO users (id, organization_id) VALUES ('u1', 'o1') ON CONFLICT (upper(organization_id)) DO NOTHING"
+    },
+    {
+      "name": "commented ddl still lowers create table",
+      "action": "ddl",
+      "expected_table": "users",
+      "expected_ddl_tag": "create_table",
+      "expected_if_not_exists": true,
+      "sql": "/* migration */ CREATE TABLE IF NOT EXISTS users (id text PRIMARY KEY) -- generated by adapter"
+    },
+    {
+      "name": "unterminated select comment is fail closed",
+      "action": "select",
+      "expected_error": "unsupported_sql_shape",
+      "sql": "SELECT id FROM users /* unterminated"
+    }
+  ]
+}
