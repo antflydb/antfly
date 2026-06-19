@@ -3833,6 +3833,57 @@
       },
       "plan": "ddl:drop_view:view=usage_records_v:if_exists=false",
       "sql": "DROP VIEW usage_records_v"
+    },
+    {
+      "name": "no key update row lock query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=no_key_update",
+      "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR NO KEY UPDATE"
+    },
+    {
+      "name": "read nowait row lock query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=nowait",
+      "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR UPDATE NOWAIT"
+    },
+    {
+      "name": "read share row lock query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=share",
+      "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR SHARE"
+    },
+    {
+      "name": "read key share row lock query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=key_share",
+      "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR KEY SHARE"
+    },
+    {
+      "name": "unsupported read non-target row lock",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=row_lock_mode_plan",
+      "classification_reason": "row_lock_mode_plan",
+      "sql": "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records"
     }
   ]
 }
