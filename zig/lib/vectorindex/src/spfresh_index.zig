@@ -24,7 +24,6 @@ const vec = @import("antfly_vector").vector;
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_query_probe_stack_capacity = 512;
 const flat_centroid_zero_stack_capacity = 4096;
-const flat_centroid_coarse_scratch_stack_capacity = 8192;
 const boundary_reassignment_vector_scratch_stack_capacity = 8192;
 
 pub const FlatCentroidBlock = struct {
@@ -217,6 +216,18 @@ const FlatCentroidBlocksVectorSource = struct {
             }
         }
         unreachable;
+    }
+};
+
+const FlatCentroidBlockCentroidSource = struct {
+    blocks: []const FlatCentroidBlock,
+
+    pub fn count(self: FlatCentroidBlockCentroidSource) usize {
+        return self.blocks.len;
+    }
+
+    pub fn vectorAt(self: FlatCentroidBlockCentroidSource, index: usize) []const f32 {
+        return self.blocks[index].centroid;
     }
 };
 
@@ -900,18 +911,9 @@ fn finalizeFlatCentroidDirectory(
         defer if (!use_zero_stack) self.alloc.free(zero);
         @memset(zero, 0);
 
-        const coarse_centroid_count = owned_blocks.len * dims;
-        var coarse_centroids_stack: [flat_centroid_coarse_scratch_stack_capacity]f32 = undefined;
-        const use_coarse_centroids_stack = coarse_centroid_count <= coarse_centroids_stack.len;
-        const coarse_centroids = if (use_coarse_centroids_stack)
-            coarse_centroids_stack[0..coarse_centroid_count]
-        else
-            try self.alloc.alloc(f32, coarse_centroid_count);
-        defer if (!use_coarse_centroids_stack) self.alloc.free(coarse_centroids);
-        for (owned_blocks, 0..) |*block, i| {
-            @memcpy(coarse_centroids[i * dims ..][0..dims], block.centroid);
-        }
-        coarse_quantized = try self.quantizer.quantize(zero, coarse_centroids, owned_blocks.len);
+        coarse_quantized = try self.quantizer.quantizeFromSource(zero, FlatCentroidBlockCentroidSource{
+            .blocks = owned_blocks,
+        });
         errdefer if (coarse_quantized) |*coarse| coarse.deinit(self.alloc);
 
         if (shouldBuildGlobalPostingQuantized(self, owned_blocks.len, posting_count)) {

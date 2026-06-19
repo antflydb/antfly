@@ -866,7 +866,9 @@ implementations cleanly:
    block, and directory construction fills those slabs directly from sorted
    entries instead of first copying through block-sized scratch arrays. The
    record-backed build path also pre-sizes entry and block lists from exact
-   record/posting counts, avoiding geometric growth churn on rebuild.
+   record/posting counts, avoiding geometric growth churn on rebuild. Coarse
+   block quantization now reads block centroids through a source view instead
+   of copying them into a temporary dense centroid array.
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed
