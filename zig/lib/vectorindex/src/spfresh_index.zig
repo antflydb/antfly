@@ -419,19 +419,9 @@ fn shouldBuildGlobalPostingQuantized(self: anytype, block_count: usize, posting_
     if (!self.config.use_quantization or posting_count == 0) return false;
     if (block_count <= 1) return true;
     if (self.config.centroid_directory_mode != .two_level_rabitq) return true;
+    if (block_count <= small_two_level_full_scan_blocks) return true;
 
-    const fixed_block_probe_count = self.config.flat_centroid_block_probe_count != 0;
-    const posting_probe_limit = if (self.config.flat_centroid_probe_count != 0)
-        self.config.flat_centroid_probe_count
-    else
-        self.config.search_width;
-    return effectiveFlatCentroidBlockProbeCount(
-        fixed_block_probe_count,
-        self.config.flat_centroid_block_probe_count,
-        block_count,
-        self.config.flat_centroid_block_size,
-        @max(posting_probe_limit, @as(usize, 1)),
-    ) >= block_count;
+    return self.config.flat_centroid_block_probe_count >= block_count;
 }
 
 fn adaptiveFlatCentroidBlockProbeCount(sorted_block_probes: []const FlatCentroidProbe, base_count: usize) usize {
@@ -2337,11 +2327,16 @@ test "global posting quantized payload is only built for deterministic full bloc
 
     var index = TestIndex{};
     try std.testing.expect(!shouldBuildGlobalPostingQuantized(&index, 47, 5953));
+    index.config.flat_centroid_probe_count = 5953;
+    try std.testing.expect(!shouldBuildGlobalPostingQuantized(&index, 47, 5953));
 
     index.config.flat_centroid_block_probe_count = 94;
     try std.testing.expect(shouldBuildGlobalPostingQuantized(&index, 47, 5953));
 
     index.config.flat_centroid_block_probe_count = 0;
+    index.config.flat_centroid_probe_count = 256;
+    try std.testing.expect(shouldBuildGlobalPostingQuantized(&index, small_two_level_full_scan_blocks, 1024));
+
     index.config.centroid_directory_mode = .flat_rabitq;
     try std.testing.expect(shouldBuildGlobalPostingQuantized(&index, 47, 5953));
 
