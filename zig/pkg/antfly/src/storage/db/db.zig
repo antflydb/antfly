@@ -90813,6 +90813,87 @@ test "relational rows aggregate groups filtered row-query streams" {
     try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"row_count\":1,\"open_count\":1,\"amount_sum\":7,\"open_amount_sum\":7,\"open_amount_avg\":7,\"open_amount_min\":7,\"open_amount_max\":7,\"first_status\":\"open\",\"last_status\":\"open\"}", result.rows[1]);
 }
 
+test "relational rows aggregate supports bounded percentile continuous metrics" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"bonus":{"type":"numeric"}},"required":["id","status","customer","amount","bonus"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:1", .value = "{\"id\":\"1\",\"status\":\"open\",\"customer\":\"alice\",\"amount\":10,\"bonus\":2}" },
+            .{ .key = "row:2", .value = "{\"id\":\"2\",\"status\":\"open\",\"customer\":\"alice\",\"amount\":20,\"bonus\":2}" },
+            .{ .key = "row:3", .value = "{\"id\":\"3\",\"status\":\"closed\",\"customer\":\"alice\",\"amount\":40,\"bonus\":4}" },
+            .{ .key = "row:4", .value = "{\"id\":\"4\",\"status\":\"open\",\"customer\":\"bob\",\"amount\":7,\"bonus\":1}" },
+            .{ .key = "row:5", .value = "{\"id\":\"5\",\"status\":\"open\",\"customer\":\"bob\",\"amount\":13,\"bonus\":3}" },
+        },
+        .sync_level = .write,
+    });
+
+    const amount_bonus_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount" },
+        .{ .kind = .field, .field = "bonus" },
+    };
+    const group_by = [_][]const u8{"customer"};
+    const aggregations = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "median_amount", .op = .percentile_cont, .field = "amount", .percentile = 0.5, .percentile_max_items = 8 },
+        .{ .name = "p25_amount", .op = .percentile_cont, .field = "amount", .percentile = 0.25, .percentile_max_items = 8 },
+        .{ .name = "median_total", .op = .percentile_cont, .expression = .{ .kind = .add, .operands = amount_bonus_operands[0..] }, .percentile = 0.5, .percentile_max_items = 8 },
+    };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "customer",
+        .direction = .asc,
+    }};
+    var result = try db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"median_amount\":20,\"p25_amount\":15,\"median_total\":22}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"median_amount\":10,\"p25_amount\":8.5,\"median_total\":12}", result.rows[1]);
+
+    const capped_aggregations = [_]types.RelationalRowsAggregateSpec{.{
+        .name = "median_amount",
+        .op = .percentile_cont,
+        .field = "amount",
+        .percentile = 0.5,
+        .percentile_max_items = 1,
+    }};
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = capped_aggregations[0..],
+    }));
+
+    const missing_percentile_aggregations = [_]types.RelationalRowsAggregateSpec{.{
+        .name = "median_amount",
+        .op = .percentile_cont,
+        .field = "amount",
+        .percentile_max_items = 8,
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = missing_percentile_aggregations[0..],
+    }));
+}
+
 test "relational rows aggregate supports global metrics and windowing" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");

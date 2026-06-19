@@ -22295,6 +22295,31 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, findRelationalColumn(scalar_extrema_output_columns, "last_status_key").?.field_type);
     try std.testing.expectEqual(runtime_schema.AntflyType.datetime, findRelationalColumn(scalar_extrema_output_columns, "latest_created_at").?.field_type);
 
+    var percentile_request = try parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"median_amount\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":0.5,\"percentile_max_items\":128},{\"name\":\"p90_net\",\"op\":\"percentile_cont\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]},\"percentile\":0.9}]}",
+        schema,
+    );
+    defer percentile_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), percentile_request.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, percentile_request.aggregations[0].op);
+    try std.testing.expectEqualStrings("amount", percentile_request.aggregations[0].field.?);
+    try std.testing.expectEqual(@as(f64, 0.5), percentile_request.aggregations[0].percentile.?);
+    try std.testing.expectEqual(@as(u32, 128), percentile_request.aggregations[0].percentile_max_items);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, percentile_request.aggregations[1].op);
+    try std.testing.expectEqual(@as(f64, 0.9), percentile_request.aggregations[1].percentile.?);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_percentile_max_items, percentile_request.aggregations[1].percentile_max_items);
+    const percentile_output_columns = try rowsAggregateOutputColumnsAlloc(
+        std.testing.allocator,
+        schema,
+        percentile_request.group_by,
+        percentile_request.group_expressions,
+        percentile_request.aggregations,
+    );
+    defer if (percentile_output_columns.len > 0) std.testing.allocator.free(percentile_output_columns);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, findRelationalColumn(percentile_output_columns, "median_amount").?.field_type);
+    try std.testing.expect(findRelationalColumn(percentile_output_columns, "median_amount").?.nullable);
+
     var group_expression_array_request = try parseRowsAggregateRequest(
         std.testing.allocator,
         "{\"group_expressions\":[{\"as\":\"scope_parts\",\"expr\":{\"op\":\"string_to_array\",\"args\":[{\"field\":\"scope\"},{\"value\":\" \"}]}}],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"}]}",
@@ -22352,6 +22377,31 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
         std.testing.allocator,
         "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"max\",\"field\":\"tags\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"amount\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":1.5}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"status\",\"percentile\":0.5}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":0.5,\"distinct\":true}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"sum\",\"field\":\"amount\",\"percentile\":0.5}]}",
         schema,
     ));
 

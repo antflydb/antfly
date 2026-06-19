@@ -50147,6 +50147,57 @@ test "postgres sql adapter lowers bounded array aggregate specs" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, string_lowered.aggregate.aggregations[0].array_order_by[0].direction);
 }
 
+test "postgres sql adapter lowers exact percentile continuous aggregates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateAlloc(
+        alloc,
+        "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount, percentile_cont(0.9) WITHIN GROUP (ORDER BY amount - discount) AS p90_net FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", lowered.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, lowered.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("median_amount", lowered.aggregate.aggregations[0].name);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(@as(f64, 0.5), lowered.aggregate.aggregations[0].percentile.?);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_percentile_max_items, lowered.aggregate.aggregations[0].percentile_max_items);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, lowered.aggregate.aggregations[1].op);
+    try std.testing.expectEqualStrings("p90_net", lowered.aggregate.aggregations[1].name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.aggregate.aggregations[1].expression.?.kind);
+    try std.testing.expectEqual(@as(f64, 0.9), lowered.aggregate.aggregations[1].percentile.?);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
+        alloc,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC) AS bad FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
+        alloc,
+        "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY amount) AS bad FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerAggregateAlloc(
+        alloc,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY status) AS bad FROM usage_records",
+        schema,
+        &.{},
+    ));
+}
+
 test "postgres sql adapter lowers global aggregate queries" {
     const alloc = std.testing.allocator;
     const schema_json =
