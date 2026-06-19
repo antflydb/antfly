@@ -23,6 +23,7 @@ const posting = @import("posting.zig");
 const posting_member_cache_miss_count_limit: usize = 256;
 const posting_member_cache_reuse_admit_count: u8 = 2;
 const posting_delta_tail_cache_slot_count: usize = 4;
+const posting_delta_tail_cache_max_records: usize = 512;
 const posting_delta_tail_prefetch_min: usize = 0;
 const posting_delta_tail_prefetch_default: usize = 3;
 const posting_delta_tail_prefetch_max: usize = 8;
@@ -457,10 +458,15 @@ pub const SearchScratch = struct {
     }
 
     pub fn appendPostingDeltaTailCacheRecord(self: *SearchScratch, alloc: Allocator, sequence: u64, vector_id: u64, op: u8) !void {
-        if (!self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].valid) return;
-        const old_bytes = self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].bytes();
-        try self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].append(alloc, sequence, vector_id, op);
-        const new_bytes = self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].bytes();
+        const active = &self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot];
+        if (!active.valid) return;
+        if (active.count >= posting_delta_tail_cache_max_records) {
+            active.deinit(alloc);
+            return;
+        }
+        const old_bytes = active.bytes();
+        try active.append(alloc, sequence, vector_id, op);
+        const new_bytes = active.bytes();
         if (new_bytes > old_bytes) self.noteScratchAllocation(new_bytes);
     }
 
@@ -1093,6 +1099,24 @@ test "SearchScratch posting delta tail cache grows geometrically" {
     try std.testing.expectEqual(@as(u64, 108), view.ids[8]);
     try std.testing.expectEqual(@as(u8, 0), view.ops[0]);
     try std.testing.expectEqual(@as(u8, 2), view.ops[8]);
+}
+
+test "SearchScratch posting delta tail cache discards oversized tails" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    scratch.beginPostingDeltaTailCache(10);
+    var i: usize = 0;
+    while (i < posting_delta_tail_cache_max_records) : (i += 1) {
+        try scratch.appendPostingDeltaTailCacheRecord(alloc, @intCast(i + 1), @intCast(100 + i), @intCast(i % 3));
+    }
+    const bounded = scratch.cachedPostingDeltaTail(10) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, posting_delta_tail_cache_max_records), bounded.sequences.len);
+
+    try scratch.appendPostingDeltaTailCacheRecord(alloc, @intCast(i + 1), @intCast(100 + i), @intCast(i % 3));
+    try std.testing.expect(scratch.cachedPostingDeltaTail(10) == null);
+    try std.testing.expectEqual(@as(usize, 0), scratch.posting_delta_tail_cache[scratch.posting_delta_tail_cache_active_slot].sequences.len);
 }
 
 test "SearchScratch grows posting overlay append buffers geometrically" {
