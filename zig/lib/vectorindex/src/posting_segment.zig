@@ -3379,7 +3379,8 @@ pub const DirectoryBatchWriter = struct {
         const previous_encoded_value_bytes = gop.value_ptr.encoded_value_bytes;
         const pending_value_bytes_without_batch = self.pending_value_bytes - previous_encoded_value_bytes;
         const next_pending_value_bytes = std.math.add(usize, pending_value_bytes_without_batch, next_encoded_value_bytes) catch return error.PostingSegmentTooLarge;
-        try gop.value_ptr.records.appendSlice(self.alloc, records);
+        try gop.value_ptr.records.ensureUnusedCapacity(self.alloc, records.len);
+        gop.value_ptr.records.appendSliceAssumeCapacity(records);
         gop.value_ptr.noteAppendedRecords(records, next_encoded_value_bytes);
         self.pending_value_bytes = next_pending_value_bytes;
         self.pending_delta_records += records.len;
@@ -3428,7 +3429,8 @@ pub const DirectoryBatchWriter = struct {
         const next_encoded_value_bytes = try pendingDeltaBatchEncodedSizeWithRecord(gop.value_ptr.*, record);
         const pending_value_bytes_without_batch = self.pending_value_bytes - previous_encoded_value_bytes;
         const next_pending_value_bytes = std.math.add(usize, pending_value_bytes_without_batch, next_encoded_value_bytes) catch return error.PostingSegmentTooLarge;
-        try gop.value_ptr.records.append(self.alloc, record);
+        try gop.value_ptr.records.ensureUnusedCapacity(self.alloc, 1);
+        gop.value_ptr.records.appendAssumeCapacity(record);
         gop.value_ptr.noteAppendedRecord(record, next_encoded_value_bytes);
         self.pending_value_bytes = next_pending_value_bytes;
         self.pending_delta_records += 1;

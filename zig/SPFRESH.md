@@ -1247,7 +1247,9 @@ implementations cleanly:
     base/delta read and write arms without changing the default optimized
     gate. The segment directory batch writer also accounts exact encoded bytes
     for pending delta micro-batches before flush, so value-byte bounds apply
-    to buffered delta records rather than only already-encoded point values.
+    to buffered delta records rather than only already-encoded point values;
+    once those bounds are checked, pending delta batch records append through
+    assume-capacity paths after reserving the exact incoming record count.
     The comparison summarizer now also carries segment-relevant physical
     IO columns, including manifest writes, renames, deletes, read-call
     breakdowns, and bytes-per-read/write-call ratios, so segment-vs-LSM
