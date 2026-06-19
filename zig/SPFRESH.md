@@ -125,7 +125,9 @@ Current status:
   collection paths. Allocation-returning segment delta reads also exact-size
   their owned record slice when metadata proves the whole segment range is
   newer than the base generation, avoiding `ArrayList` growth on all-live
-  replay. Segment compaction also pre-counts each sorted posting
+  replay. Segment stats and scratch delta readers use the same all-live range
+  pre-count to reserve once before appending and accumulating tail stats.
+  Segment compaction also pre-counts each sorted posting
   group's retained unique delta sequences before building the replacement delta
   tail, so duplicate-heavy compactions do not grow retained-record scratch one
   winner at a time. The same compaction pass now decodes retained base headers
