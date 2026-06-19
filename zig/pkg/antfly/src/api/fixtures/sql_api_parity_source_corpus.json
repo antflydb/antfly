@@ -4441,6 +4441,17 @@
       "sql": "CREATE FUNCTION setting_audit() RETURNS trigger LANGUAGE plpgsql SET search_path TO public"
     },
     {
+      "name": "create sql expression function body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "normalize_status",
+        "operations": 1
+      },
+      "plan": "ddl:create_function:name=normalize_status:args=1:replace=false:returns=text:language=sql:volatility=immutable:body=sql_expression:hook=expression:op=lower:arg=0",
+      "sql": "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT lower($1)$$"
+    },
+    {
       "name": "unsupported create function body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
@@ -8173,7 +8184,7 @@
       "apply_setup_sql": [
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);"
       ],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(expr=identity:target=updated_at_ns:source=updated_at_ns)",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(target=updated_at_ns:expr=field[row:updated_at_ns])",
       "sql": "ALTER TABLE usage_records ALTER COLUMN updated_at_ns TYPE timestamptz USING updated_at_ns::timestamptz;"
     },
     {
@@ -8188,8 +8199,23 @@
       "apply_setup_sql": [
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, amount bigint);"
       ],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(expr=add_literal:target=amount:source=amount:literal=1)",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(target=amount:expr=add[field[row:amount]+value[31]])",
       "sql": "ALTER TABLE usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;"
+    },
+    {
+      "name": "schema alter column function rewrite expression",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_table",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1:alter_type_rewrite_expr=1",
+      "apply_setup_sql": [
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"
+      ],
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(target=status:expr=lower[field[row:status]])",
+      "sql": "ALTER TABLE usage_records ALTER COLUMN status TYPE text USING lower(status);"
     },
     {
       "name": "schema updated-at policy",

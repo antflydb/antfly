@@ -499,22 +499,11 @@ pub const AlterColumnTypeOperation = struct {
     rewrite_expression: ?AlterColumnRewriteExpression = null,
 };
 
-pub const AlterColumnRewriteOperation = enum {
-    identity,
-    lower,
-    upper,
-    md5,
-    add_literal,
-};
-
 pub const AlterColumnRewriteExpression = struct {
-    operation: AlterColumnRewriteOperation,
-    source_column: []const u8,
-    literal_json: ?[]const u8 = null,
+    expression: db_mod.types.RelationalRowsExpression,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.source_column);
-        if (self.literal_json) |literal| alloc.free(literal);
+        runtime_schema.freeRelationalRowsExpression(alloc, self.expression);
         self.* = undefined;
     }
 };
@@ -578,15 +567,12 @@ pub const AppliedDdlWorkReason = enum {
 };
 
 pub const AppliedDdlRewriteExpression = struct {
-    operation: AlterColumnRewriteOperation,
     target_column: []const u8,
-    source_column: []const u8,
-    literal_json: ?[]const u8 = null,
+    expression: db_mod.types.RelationalRowsExpression,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.target_column);
-        alloc.free(self.source_column);
-        if (self.literal_json) |literal| alloc.free(literal);
+        runtime_schema.freeRelationalRowsExpression(alloc, self.expression);
         self.* = undefined;
     }
 };
@@ -775,6 +761,35 @@ pub const RoutineSetting = struct {
     }
 };
 
+pub const RoutineBodyKind = enum {
+    sql_expression,
+};
+
+pub const RoutineExecutionHook = enum {
+    expression,
+};
+
+pub const RoutineExpressionOperation = enum {
+    identity,
+    lower,
+    upper,
+    md5,
+    add_literal,
+};
+
+pub const RoutineBodyPlan = struct {
+    kind: RoutineBodyKind,
+    hook: RoutineExecutionHook,
+    expression_op: RoutineExpressionOperation,
+    source_argument_index: usize = 0,
+    literal_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.literal_json) |literal| alloc.free(literal);
+        self.* = undefined;
+    }
+};
+
 pub const CreateRoutinePlan = struct {
     kind: RoutineKind,
     routine_name: []const u8,
@@ -793,6 +808,7 @@ pub const CreateRoutinePlan = struct {
     settings: []const RoutineSetting = &.{},
     cost: ?[]const u8 = null,
     rows: ?[]const u8 = null,
+    body: ?RoutineBodyPlan = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.routine_name);
@@ -807,6 +823,7 @@ pub const CreateRoutinePlan = struct {
         if (self.settings.len > 0) alloc.free(@constCast(self.settings));
         if (self.cost) |cost| alloc.free(cost);
         if (self.rows) |rows| alloc.free(rows);
+        if (self.body) |*body| body.deinit(alloc);
         self.* = undefined;
     }
 };

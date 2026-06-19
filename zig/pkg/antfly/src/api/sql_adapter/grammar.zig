@@ -420,6 +420,7 @@ pub const CreateRoutineSyntax = struct {
     settings: []const ddl_plan.RoutineSetting = &.{},
     cost: ?[]const u8 = null,
     rows: ?[]const u8 = null,
+    body: ?ddl_plan.RoutineBodyPlan = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.routine_name));
@@ -430,6 +431,7 @@ pub const CreateRoutineSyntax = struct {
         freeRoutineSettingSlice(alloc, self.settings);
         if (self.cost) |cost| alloc.free(@constCast(cost));
         if (self.rows) |rows| alloc.free(@constCast(rows));
+        if (self.body) |*body| body.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2605,6 +2607,8 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     errdefer if (cost) |value| alloc.free(@constCast(value));
     var rows: ?[]const u8 = null;
     errdefer if (rows) |value| alloc.free(@constCast(value));
+    var body: ?ddl_plan.RoutineBodyPlan = null;
+    errdefer if (body) |*value| value.deinit(alloc);
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
         if (cursor.matchKeyword("returns")) {
             if (cursor.peekKeyword("null")) {
@@ -2736,6 +2740,12 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             setting_transferred = true;
             continue;
         }
+        if (cursor.matchKeyword("as")) {
+            if (body != null) return error.UnsupportedSqlShape;
+            const body_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+            body = try parseSqlRoutineBodyPlanAlloc(alloc, language, body_token.text);
+            continue;
+        }
         return error.UnsupportedSqlShape;
     }
     if (kind == .function and returns_type == null) return error.UnsupportedSqlShape;
@@ -2761,13 +2771,59 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .settings = owned_settings,
         .cost = cost,
         .rows = rows,
+        .body = body,
     };
     returns_type = null;
     language = null;
     support_function = null;
     cost = null;
     rows = null;
+    body = null;
     return out;
+}
+
+fn parseSqlRoutineBodyPlanAlloc(
+    alloc: std.mem.Allocator,
+    language: ?[]const u8,
+    body_text: []const u8,
+) !ddl_plan.RoutineBodyPlan {
+    const lang = language orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(lang, "sql")) return error.UnsupportedSqlShape;
+    const trimmed = std.mem.trim(u8, body_text, " \t\r\n");
+    if (!std.ascii.startsWithIgnoreCase(trimmed, "select ")) return error.UnsupportedSqlShape;
+    var expression = std.mem.trim(u8, trimmed["select ".len..], " \t\r\n");
+    if (std.mem.endsWith(u8, expression, ";")) {
+        expression = std.mem.trim(u8, expression[0 .. expression.len - 1], " \t\r\n");
+    }
+    if (std.ascii.eqlIgnoreCase(expression, "$1") or std.ascii.eqlIgnoreCase(expression, "arg1")) {
+        return .{ .kind = .sql_expression, .hook = .expression, .expression_op = .identity };
+    }
+    inline for (.{ "lower", "upper", "md5" }) |fn_name| {
+        const prefix = fn_name ++ "(";
+        if (std.ascii.startsWithIgnoreCase(expression, prefix) and std.mem.endsWith(u8, expression, ")")) {
+            const inner = std.mem.trim(u8, expression[prefix.len .. expression.len - 1], " \t\r\n");
+            if (!std.ascii.eqlIgnoreCase(inner, "$1") and !std.ascii.eqlIgnoreCase(inner, "arg1")) return error.UnsupportedSqlShape;
+            const op: ddl_plan.RoutineExpressionOperation = if (std.ascii.eqlIgnoreCase(fn_name, "lower"))
+                .lower
+            else if (std.ascii.eqlIgnoreCase(fn_name, "upper"))
+                .upper
+            else
+                .md5;
+            return .{ .kind = .sql_expression, .hook = .expression, .expression_op = op };
+        }
+    }
+    if (std.mem.startsWith(u8, expression, "$1 + ") or std.ascii.startsWithIgnoreCase(expression, "arg1 + ")) {
+        const literal_start: usize = if (std.mem.startsWith(u8, expression, "$1 + ")) "$1 + ".len else "arg1 + ".len;
+        const literal = std.mem.trim(u8, expression[literal_start..], " \t\r\n");
+        _ = std.fmt.parseFloat(f64, literal) catch return error.UnsupportedSqlShape;
+        return .{
+            .kind = .sql_expression,
+            .hook = .expression,
+            .expression_op = .add_literal,
+            .literal_json = try alloc.dupe(u8, literal),
+        };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn parseRoutineSettingAlloc(
@@ -3938,7 +3994,7 @@ fn parseDdlGeneratedRowExpressionGeneratedValueAlloc(
     };
 }
 
-fn parseDdlGeneratedRowExpressionAlloc(
+pub fn parseDdlGeneratedRowExpressionAlloc(
     alloc: std.mem.Allocator,
     cursor: parser.Cursor,
 ) anyerror!runtime_schema.RelationalRowsExpression {

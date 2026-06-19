@@ -3038,7 +3038,7 @@ fn consumeAppliedWorkItems(text: []const u8, index: *usize, expected_count: usiz
             consumeLiteral(text, index, "validate/table/constraints")))
         {
             if (!consumeLiteral(text, index, "rewrite/table/row_images")) return false;
-            if (consumeLiteral(text, index, "(expr=")) {
+            if (consumeLiteral(text, index, "(target=")) {
                 if (!consumeAppliedRewriteExpression(text, index)) return false;
             }
         }
@@ -3048,21 +3048,9 @@ fn consumeAppliedWorkItems(text: []const u8, index: *usize, expected_count: usiz
 }
 
 fn consumeAppliedRewriteExpression(text: []const u8, index: *usize) bool {
-    if (!(consumeLiteral(text, index, "identity") or
-        consumeLiteral(text, index, "lower") or
-        consumeLiteral(text, index, "upper") or
-        consumeLiteral(text, index, "md5") or
-        consumeLiteral(text, index, "add_literal")))
-    {
-        return false;
-    }
-    if (!consumeLiteral(text, index, ":target=")) return false;
     if (!consumeIdentifierValue(text, index)) return false;
-    if (!consumeLiteral(text, index, ":source=")) return false;
-    if (!consumeIdentifierValue(text, index)) return false;
-    if (consumeLiteral(text, index, ":literal=")) {
-        if (!consumeJsonNumberValue(text, index)) return false;
-    }
+    if (!consumeLiteral(text, index, ":expr=")) return false;
+    if (!consumeRowRewriteExpressionFingerprint(text, index)) return false;
     return consumeLiteral(text, index, ")");
 }
 
@@ -3072,17 +3060,29 @@ fn consumeIdentifierValue(text: []const u8, index: *usize) bool {
     return index.* > start;
 }
 
-fn consumeJsonNumberValue(text: []const u8, index: *usize) bool {
+fn consumeRowRewriteExpressionFingerprint(text: []const u8, index: *usize) bool {
     const start = index.*;
-    if (index.* < text.len and text[index.*] == '-') index.* += 1;
-    while (index.* < text.len and text[index.*] >= '0' and text[index.*] <= '9') : (index.* += 1) {}
-    if (index.* < text.len and text[index.*] == '.') {
-        index.* += 1;
-        const fraction_start = index.*;
-        while (index.* < text.len and text[index.*] >= '0' and text[index.*] <= '9') : (index.* += 1) {}
-        if (index.* == fraction_start) return false;
+    var depth: usize = 0;
+    while (index.* < text.len) : (index.* += 1) {
+        switch (text[index.*]) {
+            '[' => depth += 1,
+            ']' => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            ')' => if (depth == 0) break,
+            ',' => if (depth == 0) return false,
+            ':' => if (depth == 0) return false,
+            else => |ch| {
+                if (!(std.ascii.isAlphanumeric(ch) or
+                    ch == '_' or ch == '-' or ch == '+' or ch == '|' or ch == '[' or ch == ']' or ch == '=' or ch == '.'))
+                {
+                    return false;
+                }
+            },
+        }
     }
-    return index.* > start;
+    return index.* > start and depth == 0;
 }
 
 pub const SqlParameterScan = union(enum) {
@@ -3998,6 +3998,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_support: bool = false,
     ddl_function_transform: bool = false,
     ddl_function_setting: bool = false,
+    ddl_function_sql_expression_body: bool = false,
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
@@ -5644,6 +5645,8 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_support = self.ddl_function_support or std.mem.indexOf(u8, entry.plan, ":support=") != null;
                     self.ddl_function_transform = self.ddl_function_transform or std.mem.indexOf(u8, entry.plan, ":transforms=") != null;
                     self.ddl_function_setting = self.ddl_function_setting or std.mem.indexOf(u8, entry.plan, ":settings=") != null;
+                    self.ddl_function_sql_expression_body = self.ddl_function_sql_expression_body or
+                        std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null;
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;
@@ -5973,7 +5976,8 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_alter_column_type = self.ddl_alter_column_type or std.mem.indexOf(u8, entry.sql, " TYPE ") != null or std.mem.indexOf(u8, entry.sql, " SET DATA TYPE ") != null;
                     self.ddl_alter_column_rewrite_expression = self.ddl_alter_column_rewrite_expression or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":alter_type_rewrite_expr=") and
-                            std.mem.indexOf(u8, entry.applied_plan, "rewrite/table/row_images(expr=") != null;
+                            std.mem.indexOf(u8, entry.applied_plan, "rewrite/table/row_images(target=") != null and
+                            std.mem.indexOf(u8, entry.applied_plan, ":expr=") != null;
                     self.ddl_rename_column = self.ddl_rename_column or std.mem.indexOf(u8, entry.sql, "RENAME COLUMN") != null;
                     self.ddl_rename_constraint = self.ddl_rename_constraint or std.mem.indexOf(u8, entry.sql, "RENAME CONSTRAINT") != null;
                     self.ddl_drop_update_policy = self.ddl_drop_update_policy or std.mem.indexOf(u8, entry.sql, "DROP TRIGGER") != null;

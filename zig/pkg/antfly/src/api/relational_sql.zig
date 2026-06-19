@@ -174,6 +174,9 @@ pub const SequenceAlterOperation = sql_adapter.SequenceAlterOperation;
 pub const FunctionCatalogPlan = sql_adapter.FunctionCatalogPlan;
 pub const CreateRoutinePlan = sql_adapter.CreateRoutinePlan;
 pub const DropRoutinePlan = sql_adapter.DropRoutinePlan;
+pub const RoutineBodyKind = sql_adapter.RoutineBodyKind;
+pub const RoutineBodyPlan = sql_adapter.RoutineBodyPlan;
+pub const RoutineExecutionHook = sql_adapter.RoutineExecutionHook;
 pub const RoutineKind = sql_adapter.RoutineKind;
 pub const RoutineNullInput = sql_adapter.RoutineNullInput;
 pub const RoutineParallelSafety = sql_adapter.RoutineParallelSafety;
@@ -376,7 +379,6 @@ pub const AlterColumnDefaultOperation = sql_adapter.AlterColumnDefaultOperation;
 pub const AlterColumnNullabilityOperation = sql_adapter.AlterColumnNullabilityOperation;
 pub const AlterColumnTypeOperation = sql_adapter.AlterColumnTypeOperation;
 pub const AlterColumnRewriteExpression = sql_adapter.AlterColumnRewriteExpression;
-pub const AlterColumnRewriteOperation = sql_adapter.AlterColumnRewriteOperation;
 pub const CreateIndexPlan = sql_adapter.CreateIndexPlan;
 pub const DdlIndexMethod = sql_adapter.DdlIndexMethod;
 pub const DdlIndexOpClass = sql_adapter.DdlIndexOpClass;
@@ -2334,10 +2336,8 @@ fn schemaJsonFromTableClonePlanAlloc(
 }
 
 const AppliedDdlRewriteExpressionSource = struct {
-    operation: AlterColumnRewriteOperation,
     target_column: []const u8,
-    source_column: []const u8,
-    literal_json: ?[]const u8 = null,
+    expression: db_mod.types.RelationalRowsExpression,
 };
 
 fn alterTableRewriteExpressionSource(plan: AlterTablePlan) ?AppliedDdlRewriteExpressionSource {
@@ -2345,10 +2345,8 @@ fn alterTableRewriteExpressionSource(plan: AlterTablePlan) ?AppliedDdlRewriteExp
         .alter_column_type => |alter_type| {
             const rewrite = alter_type.rewrite_expression orelse continue;
             return .{
-                .operation = rewrite.operation,
                 .target_column = alter_type.column_name,
-                .source_column = rewrite.source_column,
-                .literal_json = rewrite.literal_json,
+                .expression = rewrite.expression,
             };
         },
         else => {},
@@ -2588,17 +2586,11 @@ fn appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(
         const owned_rewrite: ?AppliedDdlRewriteExpression = if (rewrite_expression) |rewrite| blk: {
             const target_column = try alloc.dupe(u8, rewrite.target_column);
             errdefer alloc.free(target_column);
-            const source_column = try alloc.dupe(u8, rewrite.source_column);
-            errdefer alloc.free(source_column);
-            const literal_json = if (rewrite.literal_json) |literal|
-                try alloc.dupe(u8, literal)
-            else
-                null;
+            const expression = try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, rewrite.expression);
+            errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
             break :blk .{
-                .operation = rewrite.operation,
                 .target_column = target_column,
-                .source_column = source_column,
-                .literal_json = literal_json,
+                .expression = expression,
             };
         } else null;
         items[i] = .{
@@ -3770,6 +3762,7 @@ const Parser = struct {
         const settings = syntax.settings;
         const cost = syntax.cost;
         const rows = syntax.rows;
+        const body = syntax.body;
         syntax.routine_name = "";
         syntax.returns_type = null;
         syntax.language = null;
@@ -3778,6 +3771,7 @@ const Parser = struct {
         syntax.settings = &.{};
         syntax.cost = null;
         syntax.rows = null;
+        syntax.body = null;
         return .{
             .kind = routineKindFromSyntax(syntax.kind),
             .routine_name = routine_name,
@@ -3796,6 +3790,7 @@ const Parser = struct {
             .settings = settings,
             .cost = cost,
             .rows = rows,
+            .body = body,
         };
     }
 
@@ -5004,46 +4999,15 @@ const Parser = struct {
     }
 
     fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(self: *@This(), column_name: []const u8) !?AlterColumnRewriteExpression {
+        _ = column_name;
         if (!self.matchKeyword("using")) return null;
-        const wrapped = self.match(.lparen) != null;
-        const first = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        const operation: AlterColumnRewriteOperation = blk: {
-            if (self.match(.lparen)) |_| {
-                const function_operation: AlterColumnRewriteOperation = if (std.ascii.eqlIgnoreCase(first.text, "lower"))
-                    .lower
-                else if (std.ascii.eqlIgnoreCase(first.text, "upper"))
-                    .upper
-                else if (std.ascii.eqlIgnoreCase(first.text, "md5"))
-                    .md5
-                else
-                    return error.UnsupportedSqlShape;
-                const source = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-                if (!std.mem.eql(u8, source.text, column_name)) return error.UnsupportedSqlShape;
-                try self.expect(.rparen);
-                if (wrapped) try self.expect(.rparen);
-                return .{
-                    .operation = function_operation,
-                    .source_column = try self.alloc.dupe(u8, source.text),
-                };
-            }
-            if (!std.mem.eql(u8, first.text, column_name)) return error.UnsupportedSqlShape;
-            if (self.match(.plus)) |_| {
-                const literal = self.match(.number) orelse return error.UnsupportedSqlShape;
-                if (wrapped) try self.expect(.rparen);
-                const source_column = try self.alloc.dupe(u8, first.text);
-                errdefer self.alloc.free(source_column);
-                return .{
-                    .operation = .add_literal,
-                    .source_column = source_column,
-                    .literal_json = try self.alloc.dupe(u8, literal.text),
-                };
-            }
-            if (wrapped) try self.expect(.rparen);
-            break :blk .identity;
-        };
+        const expression = try sql_adapter.parseDdlGeneratedRowExpressionAlloc(
+            self.alloc,
+            sql_adapter.Cursor.init(self.tokens, &self.pos),
+        );
+        errdefer runtime_schema.freeRelationalRowsExpression(self.alloc, expression);
         return .{
-            .operation = operation,
-            .source_column = try self.alloc.dupe(u8, first.text),
+            .expression = expression,
         };
     }
 
@@ -58254,16 +58218,6 @@ fn appliedDdlWorkReasonName(reason: AppliedDdlWorkReason) []const u8 {
     };
 }
 
-fn alterColumnRewriteOperationName(operation: AlterColumnRewriteOperation) []const u8 {
-    return switch (operation) {
-        .identity => "identity",
-        .lower => "lower",
-        .upper => "upper",
-        .md5 => "md5",
-        .add_literal => "add_literal",
-    };
-}
-
 fn appliedDdlWorkItemFingerprintAlloc(alloc: std.mem.Allocator, item: AppliedDdlWorkItem) ![]u8 {
     const base = try std.fmt.allocPrint(
         alloc,
@@ -58275,22 +58229,77 @@ fn appliedDdlWorkItemFingerprintAlloc(alloc: std.mem.Allocator, item: AppliedDdl
         },
     );
     if (item.rewrite_expression) |rewrite| {
-        const with_expression = if (rewrite.literal_json) |literal|
-            try std.fmt.allocPrint(
-                alloc,
-                "{s}(expr={s}:target={s}:source={s}:literal={s})",
-                .{ base, alterColumnRewriteOperationName(rewrite.operation), rewrite.target_column, rewrite.source_column, literal },
-            )
-        else
-            try std.fmt.allocPrint(
-                alloc,
-                "{s}(expr={s}:target={s}:source={s})",
-                .{ base, alterColumnRewriteOperationName(rewrite.operation), rewrite.target_column, rewrite.source_column },
-            );
+        const expression = try rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
+        defer alloc.free(expression);
+        const with_expression = try std.fmt.allocPrint(
+            alloc,
+            "{s}(target={s}:expr={s})",
+            .{ base, rewrite.target_column, expression },
+        );
         alloc.free(base);
         return with_expression;
     }
     return base;
+}
+
+fn rowRewriteExpressionFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    expression: db_mod.types.RelationalRowsExpression,
+) ![]u8 {
+    switch (expression.kind) {
+        .field => return try std.fmt.allocPrint(
+            alloc,
+            "field[{s}:{s}]",
+            .{ @tagName(expression.field_source), expression.field },
+        ),
+        .value => return try std.fmt.allocPrint(
+            alloc,
+            "value[{x}]",
+            .{expression.value_json},
+        ),
+        .cast => {
+            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
+            const operand = try rowRewriteExpressionFingerprintAlloc(alloc, expression.operands[0]);
+            defer alloc.free(operand);
+            return try std.fmt.allocPrint(
+                alloc,
+                "cast[{s}|{s}]",
+                .{ if (expression.cast_type) |cast_type| @tagName(cast_type) else "none", operand },
+            );
+        },
+        .json_extract => {
+            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
+            const operand = try rowRewriteExpressionFingerprintAlloc(alloc, expression.operands[0]);
+            defer alloc.free(operand);
+            return try std.fmt.allocPrint(
+                alloc,
+                "json_extract[{x}|text={}|{s}]",
+                .{ expression.json_path, expression.json_as_text, operand },
+            );
+        },
+        .case => {
+            if (expression.case_branches.len == 0) return error.UnsupportedSqlShape;
+            return try std.fmt.allocPrint(
+                alloc,
+                "case[branches={d}:else={d}]",
+                .{ expression.case_branches.len, expression.case_else.len },
+            );
+        },
+        else => {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            errdefer out.deinit();
+            const writer = &out.writer;
+            try writer.print("{s}[", .{@tagName(expression.kind)});
+            for (expression.operands, 0..) |operand, i| {
+                const operand_fingerprint = try rowRewriteExpressionFingerprintAlloc(alloc, operand);
+                defer alloc.free(operand_fingerprint);
+                if (i != 0) try writer.writeByte('+');
+                try writer.writeAll(operand_fingerprint);
+            }
+            try writer.writeByte(']');
+            return try out.toOwnedSlice();
+        },
+    }
 }
 
 fn appendAppliedDdlWorkItemsFingerprintAlloc(
@@ -58398,6 +58407,28 @@ fn routineParallelSafetyName(parallel_safety: RoutineParallelSafety) []const u8 
         .safe => "safe",
         .restricted => "restricted",
         .unsafe => "unsafe",
+    };
+}
+
+fn routineBodyKindName(kind: RoutineBodyKind) []const u8 {
+    return switch (kind) {
+        .sql_expression => "sql_expression",
+    };
+}
+
+fn routineExecutionHookName(hook: RoutineExecutionHook) []const u8 {
+    return switch (hook) {
+        .expression => "expression",
+    };
+}
+
+fn routineExpressionOperationName(operation: sql_adapter.RoutineExpressionOperation) []const u8 {
+    return switch (operation) {
+        .identity => "identity",
+        .lower => "lower",
+        .upper => "upper",
+        .md5 => "md5",
+        .add_literal => "add_literal",
     };
 }
 
@@ -58554,6 +58585,35 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             "{s}:rows={s}",
             .{ base, rows },
         );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.body) |body| {
+        const next = if (body.literal_json) |literal|
+            try std.fmt.allocPrint(
+                alloc,
+                "{s}:body={s}:hook={s}:op={s}:arg={d}:literal={s}",
+                .{
+                    base,
+                    routineBodyKindName(body.kind),
+                    routineExecutionHookName(body.hook),
+                    routineExpressionOperationName(body.expression_op),
+                    body.source_argument_index,
+                    literal,
+                },
+            )
+        else
+            try std.fmt.allocPrint(
+                alloc,
+                "{s}:body={s}:hook={s}:op={s}:arg={d}",
+                .{
+                    base,
+                    routineBodyKindName(body.kind),
+                    routineExecutionHookName(body.hook),
+                    routineExpressionOperationName(body.expression_op),
+                    body.source_argument_index,
+                },
+            );
         alloc.free(base);
         base = next;
     }
