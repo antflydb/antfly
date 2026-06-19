@@ -977,7 +977,9 @@ implementations cleanly:
    batch coalesced existing updates reuse one compare/transform scratch pair
    across posting groups. Fresh quantized leaf scoring now reserves only
    distance/error-bound scratch before exact fallback or payload rebuild needs
-   the fixed vector-fetch arrays. Posting-delta tail cache entries slab their
+   the fixed vector-fetch arrays, and exact fallback sizes those fixed fetch
+   arrays by vector-cache misses instead of total leaf members. Posting-delta
+   tail cache entries slab their
    sequence/id/op arrays and discard oversized opportunistic prefetch entries
    instead of retaining large decoded tails in query scratch; prefetch also
    checks value record counts before record decode so oversized tails are

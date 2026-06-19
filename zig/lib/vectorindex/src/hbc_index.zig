@@ -3200,7 +3200,7 @@ fn scoreLeafMemberIds(
         }
     }
 
-    try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
+    try scratch.ensureMemberIdCapacity(self.alloc, member_ids.len);
     const fetch_member_ids = scratch.member_ids[0..member_ids.len];
     var fetch_count: usize = 0;
     for (member_ids) |member_id| {
@@ -3221,6 +3221,7 @@ fn scoreLeafMemberIds(
 
     if (fetch_count == 0) return;
 
+    try scratch.ensureVectorFetchCapacity(self.alloc, fetch_count);
     const exact_distances = scratch.distances[0..fetch_count];
     var external_scored = false;
     const Index = comptime childType(@TypeOf(self));
