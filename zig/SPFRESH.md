@@ -938,7 +938,10 @@ implementations cleanly:
    opt-in `ENABLE_POSTING_BASE_BLOCK_SIZE_SWEEP=1` mode that adds HBC
    base/delta read/write arms for the configured
    `POSTING_BASE_MEMBER_BLOCK_SIZE_SWEEP` values without changing the default
-   optimized gate.
+   optimized gate. Canonical sorted fold auto-sizing now computes the 16/32/64
+   encoded-size candidates in one merged base/delta stream for overlay and
+   compact-delta paths instead of replaying the same folded posting three
+   times.
 
    Expected win: faster large-posting negative checks, partial decode, and
    sorted merge application.

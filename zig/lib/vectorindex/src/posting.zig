@@ -301,6 +301,11 @@ pub const PostingFormat = struct {
         encoded_len: usize = 0,
         member_count: usize,
     };
+    pub const BaseBlockSizeCandidates = struct {
+        size16: usize,
+        size32: usize,
+        size64: usize,
+    };
     pub const BaseMemberProbeStats = struct {
         found: bool = false,
         blocks_seen: usize = 0,
@@ -375,6 +380,34 @@ pub const PostingFormat = struct {
         }
     };
 
+    const BaseMemberBlockCandidateSizer = struct {
+        size16: BaseMemberBlockSizer,
+        size32: BaseMemberBlockSizer,
+        size64: BaseMemberBlockSizer,
+
+        fn init() BaseMemberBlockCandidateSizer {
+            return .{
+                .size16 = BaseMemberBlockSizer.init(16),
+                .size32 = BaseMemberBlockSizer.init(32),
+                .size64 = BaseMemberBlockSizer.init(64),
+            };
+        }
+
+        fn append(self: *BaseMemberBlockCandidateSizer, member_id: VectorId) !void {
+            try self.size16.append(member_id);
+            try self.size32.append(member_id);
+            try self.size64.append(member_id);
+        }
+
+        fn finish(self: *BaseMemberBlockCandidateSizer) !BaseBlockSizeCandidates {
+            return .{
+                .size16 = try self.size16.finish(),
+                .size32 = try self.size32.finish(),
+                .size64 = try self.size64.finish(),
+            };
+        }
+    };
+
     pub fn encodedBaseSizeWithOverlayPlan(scratch: anytype, base_data: []const u8) !EncodedBaseResult {
         return try encodedBaseSizeWithOverlayPlanWithBlockSize(scratch, base_data, base_member_default_block_size);
     }
@@ -413,31 +446,19 @@ pub const PostingFormat = struct {
     }
 
     pub fn encodedSortedBaseSizeWithPreparedAppended(base_data: []const u8, scratch: anytype, appended: []const VectorId, block_size: usize) !EncodedBaseResult {
-        const header = try decodeBaseHeader(base_data);
         var sizer = BaseMemberBlockSizer.init(block_size);
-        var reader = BaseMemberBlockReader.init(base_data, header.member_count);
-        var append_index: usize = 0;
-        var member_count: usize = 0;
-        while (try reader.next()) |member| {
-            if (overlayRemovedMembers(scratch).contains(member)) continue;
-            while (append_index < appended.len and appended[append_index] < member) : (append_index += 1) {
-                try sizer.append(appended[append_index]);
-                member_count += 1;
-            }
-            if (append_index < appended.len and appended[append_index] == member) append_index += 1;
-            try sizer.append(member);
-            member_count += 1;
-        }
-        try reader.finish();
-        while (append_index < appended.len) : (append_index += 1) {
-            try sizer.append(appended[append_index]);
-            member_count += 1;
-        }
+        const member_count = try streamSortedBaseWithPreparedAppended(&sizer, base_data, scratch, appended);
         return .{
             .encoded = &.{},
             .encoded_len = try sizer.finish(),
             .member_count = member_count,
         };
+    }
+
+    pub fn encodedSortedBaseSizeCandidatesWithPreparedAppended(base_data: []const u8, scratch: anytype, appended: []const VectorId) !BaseBlockSizeCandidates {
+        var sizer = BaseMemberBlockCandidateSizer.init();
+        _ = try streamSortedBaseWithPreparedAppended(&sizer, base_data, scratch, appended);
+        return try sizer.finish();
     }
 
     pub fn encodeBase(alloc: std.mem.Allocator, base: PostingBase) ![]u8 {
@@ -700,6 +721,12 @@ pub const PostingFormat = struct {
             .encoded_len = try sizer.finish(),
             .member_count = member_count,
         };
+    }
+
+    pub fn encodedSortedBaseSizeCandidatesWithCompactDeltaRecords(base_data: []const u8, scratch: anytype) !BaseBlockSizeCandidates {
+        var sizer = BaseMemberBlockCandidateSizer.init();
+        _ = try streamSortedBaseWithCompactDeltaRecords(&sizer, base_data, scratch);
+        return try sizer.finish();
     }
 
     pub fn encodeSortedBaseWithCompactDeltaRecords(
@@ -1273,6 +1300,29 @@ pub const PostingFormat = struct {
         return member_count;
     }
 
+    fn streamSortedBaseWithPreparedAppended(sink: anytype, base_data: []const u8, scratch: anytype, appended: []const VectorId) !usize {
+        const header = try decodeBaseHeader(base_data);
+        var reader = BaseMemberBlockReader.init(base_data, header.member_count);
+        var append_index: usize = 0;
+        var member_count: usize = 0;
+        while (try reader.next()) |member| {
+            if (overlayRemovedMembers(scratch).contains(member)) continue;
+            while (append_index < appended.len and appended[append_index] < member) : (append_index += 1) {
+                try sink.append(appended[append_index]);
+                member_count += 1;
+            }
+            if (append_index < appended.len and appended[append_index] == member) append_index += 1;
+            try sink.append(member);
+            member_count += 1;
+        }
+        try reader.finish();
+        while (append_index < appended.len) : (append_index += 1) {
+            try sink.append(appended[append_index]);
+            member_count += 1;
+        }
+        return member_count;
+    }
+
     pub fn encodeBaseWithOverlayPlan(
         scratch: anytype,
         base_data: []const u8,
@@ -1338,27 +1388,9 @@ pub const PostingFormat = struct {
         generation: u64,
         block_size: usize,
     ) !EncodedBaseResult {
-        const header = try decodeBaseHeader(base_data);
         encodeBaseHeader(scratch.encoded_base, posting_id, generation, 0);
         var writer = BaseMemberBlockWriter.init(scratch.encoded_base, block_size);
-        var reader = BaseMemberBlockReader.init(base_data, header.member_count);
-        var append_index: usize = 0;
-        var member_count: usize = 0;
-        while (try reader.next()) |member| {
-            if (overlayRemovedMembers(scratch).contains(member)) continue;
-            while (append_index < appended.len and appended[append_index] < member) : (append_index += 1) {
-                try writer.append(appended[append_index]);
-                member_count += 1;
-            }
-            if (append_index < appended.len and appended[append_index] == member) append_index += 1;
-            try writer.append(member);
-            member_count += 1;
-        }
-        try reader.finish();
-        while (append_index < appended.len) : (append_index += 1) {
-            try writer.append(appended[append_index]);
-            member_count += 1;
-        }
+        const member_count = try streamSortedBaseWithPreparedAppended(&writer, base_data, scratch, appended);
         const output_pos = try writer.finish();
 
         return .{
@@ -4899,11 +4931,7 @@ fn postingBaseMemberBlockSizeForSortedOverlay(index: anytype, base_data: []const
         const size = try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, scratch, sorted_appended, configured);
         return .{ .block_size = configured, .encoded_len = size.encoded_len };
     }
-    return selectAutoPostingBaseMemberBlockSize(.{
-        .size16 = (try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, scratch, sorted_appended, 16)).encoded_len,
-        .size32 = (try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, scratch, sorted_appended, 32)).encoded_len,
-        .size64 = (try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, scratch, sorted_appended, 64)).encoded_len,
-    });
+    return selectAutoPostingBaseMemberBlockSize(try PostingFormat.encodedSortedBaseSizeCandidatesWithPreparedAppended(base_data, scratch, sorted_appended));
 }
 
 fn postingBaseMemberBlockSizeForCompactDeltaRecords(index: anytype, base_data: []const u8, scratch: anytype) !PostingBaseBlockSizeChoice {
@@ -4912,11 +4940,7 @@ fn postingBaseMemberBlockSizeForCompactDeltaRecords(index: anytype, base_data: [
         const size = try PostingFormat.encodedSortedBaseSizeWithCompactDeltaRecords(base_data, scratch, configured);
         return .{ .block_size = configured, .encoded_len = size.encoded_len };
     }
-    return selectAutoPostingBaseMemberBlockSize(.{
-        .size16 = (try PostingFormat.encodedSortedBaseSizeWithCompactDeltaRecords(base_data, scratch, 16)).encoded_len,
-        .size32 = (try PostingFormat.encodedSortedBaseSizeWithCompactDeltaRecords(base_data, scratch, 32)).encoded_len,
-        .size64 = (try PostingFormat.encodedSortedBaseSizeWithCompactDeltaRecords(base_data, scratch, 64)).encoded_len,
-    });
+    return selectAutoPostingBaseMemberBlockSize(try PostingFormat.encodedSortedBaseSizeCandidatesWithCompactDeltaRecords(base_data, scratch));
 }
 
 fn autoPostingBaseMemberBlockSizeForMembers(members: []const VectorId) !PostingBaseBlockSizeChoice {
@@ -4927,13 +4951,7 @@ fn autoPostingBaseMemberBlockSizeForMembers(members: []const VectorId) !PostingB
     });
 }
 
-const PostingBaseBlockSizeCandidates = struct {
-    size16: usize,
-    size32: usize,
-    size64: usize,
-};
-
-fn selectAutoPostingBaseMemberBlockSize(candidates: PostingBaseBlockSizeCandidates) PostingBaseBlockSizeChoice {
+fn selectAutoPostingBaseMemberBlockSize(candidates: anytype) PostingBaseBlockSizeChoice {
     var best_size = candidates.size32;
     var best_block: usize = 32;
     if (candidates.size64 <= best_size) {
@@ -7799,6 +7817,54 @@ test "posting compact base materialization sizes output scratch by deduped live 
     try std.testing.expectEqual(@as(usize, expected.len), out_count);
     try std.testing.expect(scratch.member_ids.len >= base_members.len);
     try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting sorted overlay block-size candidates use one-pass sizing" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20, 30, 40 };
+    const encoded_len = try PostingFormat.encodedBaseSizeForMembers(base_members[0..]);
+    const base_data_buf = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(base_data_buf);
+    const base_data = try PostingFormat.encodeBaseMembersInto(base_data_buf, 9, 1, base_members[0..]);
+
+    try PostingFormat.applyPostingOverlayRecord(alloc, &scratch, .{ .sequence = 1, .op = .insert, .vector_id = 25 });
+    try PostingFormat.applyPostingOverlayRecord(alloc, &scratch, .{ .sequence = 2, .op = .tombstone, .vector_id = 20 });
+    try PostingFormat.applyPostingOverlayRecord(alloc, &scratch, .{ .sequence = 3, .op = .insert, .vector_id = 50 });
+    const appended = try PostingFormat.collectSortedLiveAppended(alloc, &scratch);
+
+    const candidates = try PostingFormat.encodedSortedBaseSizeCandidatesWithPreparedAppended(base_data, &scratch, appended);
+
+    try std.testing.expectEqual((try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, &scratch, appended, 16)).encoded_len, candidates.size16);
+    try std.testing.expectEqual((try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, &scratch, appended, 32)).encoded_len, candidates.size32);
+    try std.testing.expectEqual((try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, &scratch, appended, 64)).encoded_len, candidates.size64);
+}
+
+test "posting compact delta block-size candidates use one-pass sizing" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20, 30, 40 };
+    const encoded_len = try PostingFormat.encodedBaseSizeForMembers(base_members[0..]);
+    const base_data_buf = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(base_data_buf);
+    const base_data = try PostingFormat.encodeBaseMembersInto(base_data_buf, 9, 1, base_members[0..]);
+
+    try scratch.ensureCompactDeltaCapacity(alloc, 4);
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 1, .op = .insert, .vector_id = 25 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 2, .op = .tombstone, .vector_id = 20 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 3, .op = .insert, .vector_id = 50 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 4, .op = .tombstone, .vector_id = 999 });
+    PostingFormat.stableSortCompactDeltaRecordsByVector(&scratch);
+
+    const candidates = try PostingFormat.encodedSortedBaseSizeCandidatesWithCompactDeltaRecords(base_data, &scratch);
+
+    try std.testing.expectEqual((try PostingFormat.encodedSortedBaseSizeWithCompactDeltaRecords(base_data, &scratch, 16)).encoded_len, candidates.size16);
+    try std.testing.expectEqual((try PostingFormat.encodedSortedBaseSizeWithCompactDeltaRecords(base_data, &scratch, 32)).encoded_len, candidates.size32);
+    try std.testing.expectEqual((try PostingFormat.encodedSortedBaseSizeWithCompactDeltaRecords(base_data, &scratch, 64)).encoded_len, candidates.size64);
 }
 
 test "posting store cached sorted replay continues with overlay plan after compact threshold" {
