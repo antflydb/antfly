@@ -711,6 +711,11 @@ pub const RoutineParallelSafety = enum {
     unsafe,
 };
 
+pub const RoutineNullInput = enum {
+    called,
+    returns_null,
+};
+
 pub const RoutineSetting = struct {
     name: []const u8,
     values: []const []const u8 = &.{},
@@ -732,6 +737,7 @@ pub const CreateRoutinePlan = struct {
     language: ?[]const u8 = null,
     volatility: ?RoutineVolatility = null,
     security: ?RoutineSecurity = null,
+    null_input: ?RoutineNullInput = null,
     parallel_safety: ?RoutineParallelSafety = null,
     leakproof: bool = false,
     support_function: ?[]const u8 = null,

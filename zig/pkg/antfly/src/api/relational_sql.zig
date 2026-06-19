@@ -174,6 +174,7 @@ pub const FunctionCatalogPlan = sql_adapter.FunctionCatalogPlan;
 pub const CreateRoutinePlan = sql_adapter.CreateRoutinePlan;
 pub const DropRoutinePlan = sql_adapter.DropRoutinePlan;
 pub const RoutineKind = sql_adapter.RoutineKind;
+pub const RoutineNullInput = sql_adapter.RoutineNullInput;
 pub const RoutineParallelSafety = sql_adapter.RoutineParallelSafety;
 pub const RoutineSecurity = sql_adapter.RoutineSecurity;
 pub const RoutineSetting = sql_adapter.RoutineSetting;
@@ -3525,6 +3526,7 @@ const Parser = struct {
         const language = syntax.language;
         const volatility = syntax.volatility;
         const security = syntax.security;
+        const null_input = syntax.null_input;
         const parallel_safety = syntax.parallel_safety;
         const leakproof = syntax.leakproof;
         const support_function = syntax.support_function;
@@ -3549,6 +3551,7 @@ const Parser = struct {
             .language = language,
             .volatility = volatility,
             .security = security,
+            .null_input = null_input,
             .parallel_safety = parallel_safety,
             .leakproof = leakproof,
             .support_function = support_function,
@@ -45211,6 +45214,36 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=secure_audit:args=0:replace=false:returns=trigger:language=plpgsql:security=definer", security_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, security_function));
 
+    var called_null_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION called_null_audit() RETURNS trigger LANGUAGE plpgsql CALLED ON NULL INPUT;");
+    defer called_null_function.deinit(alloc);
+    const called_null_function_plan = switch (called_null_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineNullInput.called, called_null_function_plan.null_input.?);
+    const called_null_function_fingerprint = try ddlFingerprintAlloc(alloc, called_null_function);
+    defer alloc.free(called_null_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=called_null_audit:args=0:replace=false:returns=trigger:language=plpgsql:null_input=called", called_null_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, called_null_function));
+
+    var returns_null_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION returns_null_audit() RETURNS trigger LANGUAGE plpgsql RETURNS NULL ON NULL INPUT;");
+    defer returns_null_function.deinit(alloc);
+    const returns_null_function_plan = switch (returns_null_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineNullInput.returns_null, returns_null_function_plan.null_input.?);
+    const returns_null_function_fingerprint = try ddlFingerprintAlloc(alloc, returns_null_function);
+    defer alloc.free(returns_null_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=returns_null_audit:args=0:replace=false:returns=trigger:language=plpgsql:null_input=returns_null", returns_null_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, returns_null_function));
+
     var cost_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION costed_audit() RETURNS trigger LANGUAGE plpgsql COST 10;");
     defer cost_function.deinit(alloc);
     const cost_function_plan = switch (cost_function) {
@@ -45323,7 +45356,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, setting_function));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql CALLED ON NULL INPUT;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql WINDOW;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -57708,6 +57741,13 @@ fn routineSecurityName(security: RoutineSecurity) []const u8 {
     };
 }
 
+fn routineNullInputName(null_input: RoutineNullInput) []const u8 {
+    return switch (null_input) {
+        .called => "called",
+        .returns_null => "returns_null",
+    };
+}
+
 fn routineParallelSafetyName(parallel_safety: RoutineParallelSafety) []const u8 {
     return switch (parallel_safety) {
         .safe => "safe",
@@ -57757,6 +57797,15 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             alloc,
             "{s}:security={s}",
             .{ base, routineSecurityName(security) },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.null_input) |null_input| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:null_input={s}",
+            .{ base, routineNullInputName(null_input) },
         );
         alloc.free(base);
         base = next;

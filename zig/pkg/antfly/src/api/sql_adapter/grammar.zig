@@ -411,6 +411,7 @@ pub const CreateRoutineSyntax = struct {
     language: ?[]const u8 = null,
     volatility: ?ddl_plan.RoutineVolatility = null,
     security: ?ddl_plan.RoutineSecurity = null,
+    null_input: ?ddl_plan.RoutineNullInput = null,
     parallel_safety: ?ddl_plan.RoutineParallelSafety = null,
     leakproof: bool = false,
     support_function: ?[]const u8 = null,
@@ -2546,6 +2547,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     errdefer if (language) |value| alloc.free(@constCast(value));
     var volatility: ?ddl_plan.RoutineVolatility = null;
     var security: ?ddl_plan.RoutineSecurity = null;
+    var null_input: ?ddl_plan.RoutineNullInput = null;
     var parallel_safety: ?ddl_plan.RoutineParallelSafety = null;
     var leakproof = false;
     var support_function: ?[]const u8 = null;
@@ -2562,6 +2564,15 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     errdefer if (rows) |value| alloc.free(@constCast(value));
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
         if (cursor.matchKeyword("returns")) {
+            if (cursor.peekKeyword("null")) {
+                if (null_input != null) return error.UnsupportedSqlShape;
+                try cursor.expectKeyword("null");
+                try cursor.expectKeyword("on");
+                try cursor.expectKeyword("null");
+                try cursor.expectKeyword("input");
+                null_input = .returns_null;
+                continue;
+            }
             if (kind != .function or returns_type != null) return error.UnsupportedSqlShape;
             returns_type = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
             continue;
@@ -2595,6 +2606,19 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             } else {
                 return error.UnsupportedSqlShape;
             }
+            continue;
+        }
+        if (cursor.matchKeyword("called")) {
+            if (null_input != null) return error.UnsupportedSqlShape;
+            try cursor.expectKeyword("on");
+            try cursor.expectKeyword("null");
+            try cursor.expectKeyword("input");
+            null_input = .called;
+            continue;
+        }
+        if (cursor.matchKeyword("strict")) {
+            if (null_input != null) return error.UnsupportedSqlShape;
+            null_input = .returns_null;
             continue;
         }
         if (cursor.matchKeyword("parallel")) {
@@ -2668,6 +2692,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .language = language,
         .volatility = volatility,
         .security = security,
+        .null_input = null_input,
         .parallel_safety = parallel_safety,
         .leakproof = leakproof,
         .support_function = support_function,
@@ -7207,6 +7232,33 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(RoutineKindSyntax.function, rows_function.kind);
     try std.testing.expectEqualStrings("10", rows_function.rows.?);
 
+    var called_null_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql CALLED ON NULL INPUT;");
+    defer lexer.freeTokens(alloc, &called_null_function_tokens);
+    var called_null_function_pos: usize = 0;
+    var called_null_function = try parseCreateRoutineCatalogTailAlloc(alloc, called_null_function_tokens.items, &called_null_function_pos);
+    defer called_null_function.deinit(alloc);
+    try std.testing.expectEqual(called_null_function_tokens.items.len, called_null_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, called_null_function.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineNullInput.called, called_null_function.null_input.?);
+
+    var returns_null_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql RETURNS NULL ON NULL INPUT;");
+    defer lexer.freeTokens(alloc, &returns_null_function_tokens);
+    var returns_null_function_pos: usize = 0;
+    var returns_null_function = try parseCreateRoutineCatalogTailAlloc(alloc, returns_null_function_tokens.items, &returns_null_function_pos);
+    defer returns_null_function.deinit(alloc);
+    try std.testing.expectEqual(returns_null_function_tokens.items.len, returns_null_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, returns_null_function.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineNullInput.returns_null, returns_null_function.null_input.?);
+
+    var strict_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql STRICT;");
+    defer lexer.freeTokens(alloc, &strict_function_tokens);
+    var strict_function_pos: usize = 0;
+    var strict_function = try parseCreateRoutineCatalogTailAlloc(alloc, strict_function_tokens.items, &strict_function_pos);
+    defer strict_function.deinit(alloc);
+    try std.testing.expectEqual(strict_function_tokens.items.len, strict_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, strict_function.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineNullInput.returns_null, strict_function.null_input.?);
+
     var parallel_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql PARALLEL SAFE;");
     defer lexer.freeTokens(alloc, &parallel_function_tokens);
     var parallel_function_pos: usize = 0;
@@ -7322,7 +7374,7 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(security_tokens.items.len, security_pos);
     try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, security.security.?);
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql CALLED ON NULL INPUT;");
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql WINDOW;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));

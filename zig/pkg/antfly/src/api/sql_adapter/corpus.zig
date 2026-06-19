@@ -3914,6 +3914,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_replace: bool = false,
     ddl_function_volatility: bool = false,
     ddl_function_security: bool = false,
+    ddl_function_null_input: bool = false,
     ddl_function_cost: bool = false,
     ddl_function_rows: bool = false,
     ddl_function_parallel: bool = false,
@@ -5425,7 +5426,7 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_routine_option = self.unsupported_ddl_routine_option or
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
-                    std.mem.indexOf(u8, entry.sql, " NULL INPUT") != null);
+                    std.mem.indexOf(u8, entry.sql, " WINDOW") != null);
             self.unsupported_ddl_row_security_policy_expression = self.unsupported_ddl_row_security_policy_expression or
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
@@ -5588,6 +5589,7 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_replace = self.ddl_function_replace or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
                     self.ddl_function_volatility = self.ddl_function_volatility or std.mem.indexOf(u8, entry.plan, ":volatility=") != null;
                     self.ddl_function_security = self.ddl_function_security or std.mem.indexOf(u8, entry.plan, ":security=") != null;
+                    self.ddl_function_null_input = self.ddl_function_null_input or std.mem.indexOf(u8, entry.plan, ":null_input=") != null;
                     self.ddl_function_cost = self.ddl_function_cost or std.mem.indexOf(u8, entry.plan, ":cost=") != null;
                     self.ddl_function_rows = self.ddl_function_rows or std.mem.indexOf(u8, entry.plan, ":rows=") != null;
                     self.ddl_function_parallel = self.ddl_function_parallel or std.mem.indexOf(u8, entry.plan, ":parallel=") != null;
@@ -6573,6 +6575,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_function_replace);
         try std.testing.expect(self.ddl_function_volatility);
         try std.testing.expect(self.ddl_function_security);
+        try std.testing.expect(self.ddl_function_null_input);
         try std.testing.expect(self.ddl_function_cost);
         try std.testing.expect(self.ddl_function_rows);
         try std.testing.expect(self.ddl_function_parallel);

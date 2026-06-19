@@ -276,6 +276,7 @@ pub const RenameViewPlan = ddl_plan.RenameViewPlan;
 pub const RenameViewSyntax = grammar.RenameViewSyntax;
 pub const RoutineKind = ddl_plan.RoutineKind;
 pub const RoutineKindSyntax = grammar.RoutineKindSyntax;
+pub const RoutineNullInput = ddl_plan.RoutineNullInput;
 pub const RoutineParallelSafety = ddl_plan.RoutineParallelSafety;
 pub const RoutineSecurity = ddl_plan.RoutineSecurity;
 pub const RoutineVolatility = ddl_plan.RoutineVolatility;

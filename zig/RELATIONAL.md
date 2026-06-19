@@ -5017,10 +5017,12 @@ PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,
 language, optional volatility (`IMMUTABLE`, `STABLE`, or `VOLATILE`), optional
 security mode (`SECURITY INVOKER` or `SECURITY DEFINER`), optional planner
-`COST`, optional planner row-count metadata (`ROWS`), optional parallel-safety
-metadata (`PARALLEL SAFE`, `PARALLEL RESTRICTED`, or `PARALLEL UNSAFE`),
-optional `LEAKPROOF` metadata, optional planner support-function identity
-(`SUPPORT function_name`), optional transform type metadata (`TRANSFORM FOR TYPE
+`COST`, optional planner row-count metadata (`ROWS`), optional null-input
+behavior (`CALLED ON NULL INPUT`, `RETURNS NULL ON NULL INPUT`, or `STRICT`
+normalized to returns-null semantics), optional parallel-safety metadata
+(`PARALLEL SAFE`, `PARALLEL RESTRICTED`, or `PARALLEL UNSAFE`), optional
+`LEAKPROOF` metadata, optional planner support-function identity (`SUPPORT
+function_name`), optional transform type metadata (`TRANSFORM FOR TYPE
 type_name[, ...]`), optional routine-local setting metadata (`SET setting TO
 value[, ...]`, `SET setting = value[, ...]`, or `SET setting FROM CURRENT`) as
 ordered name/value or `FROM CURRENT` declarations, and drop dependency metadata

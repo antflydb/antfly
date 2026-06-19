@@ -207,6 +207,7 @@
     "ddl_function_drop",
     "ddl_function_drop_cascade",
     "ddl_function_leakproof",
+    "ddl_function_null_input",
     "ddl_function_parallel",
     "ddl_function_replace",
     "ddl_function_rows",

@@ -4292,6 +4292,17 @@
       "sql": "CREATE FUNCTION secure_audit() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER"
     },
     {
+      "name": "create called null input function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "called_null_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=called_null_audit:args=0:replace=false:returns=trigger:language=plpgsql:null_input=called",
+      "sql": "CREATE FUNCTION called_null_audit() RETURNS trigger LANGUAGE plpgsql CALLED ON NULL INPUT"
+    },
+    {
       "name": "create costed function catalog ddl",
       "family": "ddl",
       "summary": {
@@ -4380,7 +4391,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql CALLED ON NULL INPUT"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql WINDOW"
     },
     {
       "name": "drop function catalog ddl",
