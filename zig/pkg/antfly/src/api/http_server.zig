@@ -10635,6 +10635,22 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/mcp-server+json\"") == null);
 
+    var filter_only_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
+    });
+    defer filter_only_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), filter_only_search.status);
+
+    var blank_text_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"   \",\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
+    });
+    defer blank_text_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), blank_text_search.status);
+
     var profile_search = try server.handle(.{
         .method = .POST,
         .uri = "/ard/v1/search?profile=copilot",

@@ -3319,6 +3319,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves ARD OpenAPI, skill, resource, and registry endpoints",
             "api http server filters extension mcp tools by trusted principal table permissions",
             "ARD search filters scoped catalog entries",
+            "ARD search requires text while explore accepts filter-only requests",
             "ARD search supports publisher and metadata filters",
             "ARD search validates federation and returns referral envelope",
             "ARD explore returns requested facet buckets over scoped entries",

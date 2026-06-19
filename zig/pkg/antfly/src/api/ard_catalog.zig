@@ -2758,6 +2758,20 @@ test "ARD search filters scoped catalog entries" {
     }
 }
 
+test "ARD search requires text while explore accepts filter-only requests" {
+    try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}", false));
+    try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"   \",\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}", false));
+
+    const body = try searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}", true);
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("facets", parsed.value.object.get("resultType").?.string);
+    try expectFacetBucket(parsed.value.object.get("facets").?.object.get("type").?, "application/ai-skill+md");
+}
+
 test "ARD search supports publisher and metadata filters" {
     const body = try searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"OpenAPI\",\"filter\":{\"publisher\":[\"antfly.local\"],\"metadata.sourceSpec\":[\"openapi.yaml\"]}},\"federation\":\"none\"}", false);
     defer std.testing.allocator.free(body);
