@@ -1234,6 +1234,29 @@ func TestHAClientAcceptsAdminRootURL(t *testing.T) {
 	}
 }
 
+func TestHAClientRejectsInvalidBaseURLs(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{
+		"",
+		"  ",
+		" http://ha-admin.test ",
+		"http://ha admin.test",
+		"http://ha-admin.test/\tadmin",
+		"ha-admin.test",
+		"file:///tmp/ha-admin",
+	}
+
+	for _, baseURL := range tests {
+		t.Run(baseURL, func(t *testing.T) {
+			t.Parallel()
+			if _, err := NewHAClient(baseURL, nil); err == nil || !strings.Contains(err.Error(), "invalid HA admin base URL") {
+				t.Fatalf("NewHAClient(%q) error = %v, want invalid HA admin base URL", baseURL, err)
+			}
+		})
+	}
+}
+
 func TestHAClientCurrentFenceRejectsInvalidTypedResponse(t *testing.T) {
 	t.Parallel()
 

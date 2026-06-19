@@ -2088,7 +2088,11 @@ func NewHAClient(baseURL string, httpClient *http.Client) (*HAClient, error) {
 }
 
 func newHAClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*HAClient, error) {
-	client, err := oapi.NewClientWithResponses(normalizeAdminBaseURL(baseURL), opts...)
+	normalizedBaseURL, err := normalizeAdminBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	client, err := oapi.NewClientWithResponses(normalizedBaseURL, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2113,9 +2117,33 @@ func acceptJSONEditor(_ context.Context, req *http.Request) error {
 	return nil
 }
 
-func normalizeAdminBaseURL(baseURL string) string {
+func normalizeAdminBaseURL(baseURL string) (string, error) {
+	trimmedSpace := strings.TrimSpace(baseURL)
+	if trimmedSpace == "" {
+		return "", fmt.Errorf("invalid HA admin base URL %q", baseURL)
+	}
+	if baseURL != trimmedSpace || containsASCIIWhitespace(baseURL) {
+		return "", fmt.Errorf("invalid HA admin base URL %q", baseURL)
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid HA admin base URL %q", baseURL)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("invalid HA admin base URL %q", baseURL)
+	}
 	trimmed := strings.TrimRight(baseURL, "/")
-	return strings.TrimSuffix(trimmed, adminV1Path) + adminV1Path
+	return strings.TrimSuffix(trimmed, adminV1Path) + adminV1Path, nil
+}
+
+func containsASCIIWhitespace(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			return true
+		}
+	}
+	return false
 }
 
 func requireHAJSON200[T any](operation string, statusCode int, body []byte, value *T, err error) (*HAResponse[T], error) {
