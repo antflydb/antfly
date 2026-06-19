@@ -5244,6 +5244,13 @@
       "sql": "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR NO KEY UPDATE NOWAIT RETURNING id"
     },
     {
+      "name": "unsupported duplicate point update target",
+      "family": "unsupported_update",
+      "plan": "unsupported:update:requires=duplicate_update_target",
+      "classification_reason": "duplicate_update_target",
+      "sql": "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'"
+    },
+    {
       "name": "unsupported claimed update share row lock mode",
       "family": "unsupported_update_source",
       "plan": "unsupported:update_source:requires=row_lock_mode_plan",

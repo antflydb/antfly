@@ -22,6 +22,7 @@ pub const SqlAdapterClassificationReason = enum {
     duplicate_conflict_update_target,
     duplicate_output_name,
     duplicate_row_batch_target,
+    duplicate_update_target,
     enforced_unique_conflict_target,
     extension,
     invalid_expression_conflict_target,

@@ -479,6 +479,7 @@
     "unsupported_read_set_operation_intersect",
     "unsupported_read_set_operation_union",
     "unsupported_unvalidated_unique_conflict_target",
+    "unsupported_update",
     "unsupported_update_joined_multi_output_subquery_selector",
     "unsupported_update_joined_source",
     "unsupported_update_joined_source_row_lock_target",

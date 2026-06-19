@@ -1088,7 +1088,10 @@ fixture with the same entry schema as the generated golden fixture. Corpus-wide
 coverage expectations live in
 `api/fixtures/sql_api_required_coverage.json`; those names resolve against the
 coverage accumulator by exact field name, so strengthening or relaxing a required
-coverage bucket is a fixture review instead of a Zig assertion edit. SQL adapter
+coverage bucket is a fixture review instead of a Zig assertion edit. The parser
+requires that fixture to enumerate every boolean and counter accumulator field,
+which makes newly added coverage dimensions fail closed until they become
+explicit review policy. SQL adapter
 edge cases that are not golden typed-plan entries, such as comment preservation,
 malformed placeholder suffixes, statement-kind classification, and fail-closed
 point-lowerer boundaries, live in
@@ -6219,7 +6222,9 @@ the current contract. The source fixture carries `source_format` and an
 its `required` array lists exact coverage accumulator names, including nonzero
 counter requirements, that both the source and generated corpus gates must
 satisfy. Required coverage names must stay strictly sorted by coverage-field
-name so review diffs show only intentional additions/removals. Source fixture
+name and enumerate every boolean and counter accumulator field, so review diffs
+show only intentional additions/removals and a new accumulator cannot be added
+without explicit pass/fail policy. Source fixture
 entries should
 cover portable SQL/data examples directly, including scalar and text expression
 queries, date/time expression queries, and JSON expression-projection queries,

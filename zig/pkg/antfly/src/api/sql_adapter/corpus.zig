@@ -811,6 +811,11 @@ pub fn parseCoverageRequirementsRootAlloc(
         if (i > 0 and !std.mem.lessThan(u8, required[i - 1], name)) return error.TestUnexpectedResult;
         try seen.put(alloc, name, {});
     }
+    inline for (std.meta.fields(AppParityCorpusCoverage)) |field| {
+        if ((field.type == bool or field.type == usize) and !seen.contains(field.name)) {
+            return error.TestUnexpectedResult;
+        }
+    }
 
     return .{
         .coverage_format = coverage_format,
@@ -3761,6 +3766,16 @@ test "sql adapter corpus parses data-driven coverage requirements" {
     var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
     defer parsed_unsorted.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRequirementsRootAlloc(alloc, parsed_unsorted.value));
+
+    const incomplete_json =
+        \\{
+        \\  "coverage_format": 1,
+        \\  "required": ["aggregate"]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRequirementsRootAlloc(alloc, parsed_incomplete.value));
 }
 
 test "sql adapter corpus validates fixture mutation and aggregate summaries" {
@@ -6151,6 +6166,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl);
         try std.testing.expect(self.unsupported_write);
         try std.testing.expect(self.unsupported_insert);
+        try std.testing.expect(self.unsupported_update);
         try std.testing.expect(self.unsupported_update_source);
         try std.testing.expect(self.unsupported_delete);
         try std.testing.expect(self.unsupported_update_joined_source);
