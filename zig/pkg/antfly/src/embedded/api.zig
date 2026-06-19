@@ -782,6 +782,27 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         });
         defer api.close();
 
+        const schema_json =
+            \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+        ;
+        const schema_updated = try api.setSchemaJson(alloc, schema_json);
+        defer alloc.free(schema_updated);
+        try std.testing.expect(std.mem.indexOf(u8, schema_updated, "\"updated\":true") != null);
+
+        const enrichment_created = try api.addEnrichmentJson(
+            alloc,
+            "{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":128,\"chunk_overlap\":16}",
+        );
+        defer alloc.free(enrichment_created);
+        try std.testing.expect(std.mem.indexOf(u8, enrichment_created, "\"created\":true") != null);
+
+        const index_created = try api.addIndexJson(
+            alloc,
+            "{\"name\":\"ft_body\",\"kind\":\"full_text\",\"config_json\":\"{\\\"chunk_name\\\":\\\"body_chunks_v1\\\"}\"}",
+        );
+        defer alloc.free(index_created);
+        try std.testing.expect(std.mem.indexOf(u8, index_created, "\"created\":true") != null);
+
         const batch_a = try api.batchJson(
             alloc,
             "{\"inserts\":{\"doc:a\":{\"title\":\"first\"},\"doc:gone\":{\"title\":\"remove\"}}}",
@@ -820,6 +841,21 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         defer restored.close();
 
         try restored.importPortable(alloc, backup.items);
+
+        const schema_json = try restored.getSchemaJson(alloc);
+        defer alloc.free(schema_json);
+        try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"default_type\":\"doc\"") != null);
+
+        const indexes_json = try restored.listIndexesJson(alloc);
+        defer alloc.free(indexes_json);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"ft_body\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "body_chunks_v1") != null);
+
+        const enrichments_json = try restored.listEnrichmentsJson(alloc);
+        defer alloc.free(enrichments_json);
+        try std.testing.expect(std.mem.indexOf(u8, enrichments_json, "\"body_chunks_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, enrichments_json, "\"chunk_size\":128") != null);
+
         const lookup_json = try restored.lookupJson(
             alloc,
             "doc:a",
