@@ -4472,17 +4472,19 @@ preserving a stable typed boundary for the future subtransaction model.
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
 exact-value `SET [LOCAL|SESSION]` forms for inert client presentation settings,
-and `RESET` for the same inert setting allowlist. Catalog-affecting
+`SET LOCAL search_path TO public`, and `RESET` for the same inert setting
+allowlist. Catalog-affecting
 `SET search_path`, `RESET search_path`, `SHOW search_path`, and `DISCARD ALL`
 now lower to typed session catalog plans instead of adapter no-ops. Applying
 those plans mutates an explicit SQL catalog session used by table/schema
-resolution, while `SET LOCAL search_path` fails closed until Antfly has
-transaction-local session state. Role/session authorization changes, arbitrary
-settings, timeout settings, default storage settings, unsupported values for
-otherwise inert settings, `SHOW ALL`, and partial `DISCARD` variants still fail
-closed. The allowlist lives in `api/sql_adapter/grammar.zig` so new accepted
-session syntax must be explicit adapter grammar, not another raw token scan in
-the SQL lowerer. If Antfly later owns long-lived server-side prepared
+resolution, while `SET LOCAL search_path` with any non-public namespace fails
+closed until Antfly has transaction-local session state. Role/session
+authorization changes, arbitrary settings, timeout settings, default storage
+settings, unsupported values for otherwise inert settings, `SHOW ALL`, and
+partial `DISCARD` variants still fail closed. The allowlist lives in
+`api/sql_adapter/grammar.zig` so new accepted session syntax must be explicit
+adapter grammar, not another raw token scan in the SQL lowerer. If Antfly later
+owns long-lived server-side prepared
 statements, cursors, temporary objects, or session-local variables, `DISCARD`
 must expand from catalog-session reset into a typed cleanup request over those
 native objects.

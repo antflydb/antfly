@@ -4274,6 +4274,7 @@ pub const AppParityCorpusCoverage = struct {
     adapter_noop_transaction_rollback: bool = false,
     adapter_noop_session: bool = false,
     adapter_noop_session_probe: bool = false,
+    adapter_noop_local_public_search_path: bool = false,
     adapter_noop_schema_namespace: bool = false,
     adapter_noop_extension: bool = false,
     session_set_search_path: bool = false,
@@ -5353,6 +5354,9 @@ pub const AppParityCorpusCoverage = struct {
             self.adapter_noop_session_probe = self.adapter_noop_session_probe or
                 std.mem.eql(u8, entry.classification_reason, "session_setting") and
                     (std.ascii.startsWithIgnoreCase(entry.sql, "RESET") or std.ascii.startsWithIgnoreCase(entry.sql, "SHOW"));
+            self.adapter_noop_local_public_search_path = self.adapter_noop_local_public_search_path or
+                std.mem.eql(u8, entry.classification_reason, "session_setting") and
+                    std.mem.indexOf(u8, entry.sql, "SET LOCAL search_path TO public") != null;
             self.adapter_noop_schema_namespace = self.adapter_noop_schema_namespace or std.mem.eql(u8, entry.classification_reason, "schema_namespace");
             self.adapter_noop_extension = self.adapter_noop_extension or std.mem.eql(u8, entry.classification_reason, "extension");
             self.session_discard = self.session_discard or
@@ -6305,6 +6309,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.adapter_noop_transaction_rollback);
         try std.testing.expect(self.adapter_noop_session);
         try std.testing.expect(self.adapter_noop_session_probe);
+        try std.testing.expect(self.adapter_noop_local_public_search_path);
         try std.testing.expect(self.adapter_noop_schema_namespace);
         try std.testing.expect(self.adapter_noop_extension);
         try std.testing.expect(self.ddl_comment_table);

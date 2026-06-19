@@ -157,11 +157,18 @@
       "sql": "SET search_path TO public;"
     },
     {
-      "name": "unsupported local search path session catalog syntax",
+      "name": "adapter-only local public search path session syntax",
+      "family": "adapter_noop_ddl",
+      "plan": "adapter_noop:ddl:reason=session_setting",
+      "classification_reason": "session_setting",
+      "sql": "SET LOCAL search_path TO public;"
+    },
+    {
+      "name": "unsupported local non-public search path session catalog syntax",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=transaction_scoped_search_path",
       "classification_reason": "transaction_scoped_search_path",
-      "sql": "SET LOCAL search_path TO public;"
+      "sql": "SET LOCAL search_path TO tenant_schema, public;"
     },
     {
       "name": "reset search path session catalog syntax",

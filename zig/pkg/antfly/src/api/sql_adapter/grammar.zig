@@ -1578,7 +1578,6 @@ pub fn parseAdapterNoopSetStatementTail(tokens: []const Token, pos: *usize) !voi
 
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (std.ascii.eqlIgnoreCase(setting.text, "search_path")) {
-        if (local) return error.UnsupportedSqlShape;
         try parseAdapterNoopPublicSearchPathTail(cursor);
         return;
     }

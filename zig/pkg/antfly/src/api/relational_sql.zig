@@ -45281,7 +45281,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings(catalog_resources.default_database_name, tenant_session.session().currentDatabase());
     try std.testing.expectEqualStrings("tenant_schema", tenant_session.session().primarySearchPathNamespace());
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET LOCAL search_path TO public;"));
+    var set_local_public_search_path = try lowerDdlPlanAlloc(alloc, "SET LOCAL search_path TO public;");
+    defer set_local_public_search_path.deinit(alloc);
+    const set_local_public_search_path_fingerprint = try ddlFingerprintAlloc(alloc, set_local_public_search_path);
+    defer alloc.free(set_local_public_search_path_fingerprint);
+    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", set_local_public_search_path_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;"));
 
     var empty_path_session = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
         .current_database_name = "tenant_ops",
