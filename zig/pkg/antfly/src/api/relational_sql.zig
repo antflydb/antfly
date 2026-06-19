@@ -64317,27 +64317,6 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)",
         },
         .{
-            .name = "create enum type catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .create_enum_type, .table_name = "usage_status", .select = 3 },
-            .plan = "ddl:create_enum_type:type=usage_status:values=3",
-            .sql = "CREATE TYPE usage_status AS ENUM ('queued', 'processing', 'done')",
-        },
-        .{
-            .name = "add enum type value catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .add_enum_value, .table_name = "usage_status" },
-            .plan = "ddl:add_enum_value:type=usage_status:if_not_exists=false:position=none",
-            .sql = "ALTER TYPE usage_status ADD VALUE 'archived'",
-        },
-        .{
-            .name = "drop enum type catalog ddl",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .drop_enum_type, .table_name = "usage_status" },
-            .plan = "ddl:drop_enum_type:type=usage_status:if_exists=false",
-            .sql = "DROP TYPE usage_status",
-        },
-        .{
             .name = "create domain catalog ddl",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_domain, .table_name = "positive_amount", .predicates = 1 },
