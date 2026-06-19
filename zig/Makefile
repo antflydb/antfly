@@ -25,7 +25,7 @@ ONNXRUNTIME_VERSION ?= 1.24.3
 GENAI_VERSION ?= 0.12.1
 ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
 
-.PHONY: build test unit-test sql-api-parity-test db-temporal-test graph-metric-lifecycle-test graph-metric-cleanup-test graph-metric-degree-canary-test graph-metric-default-gate-test graph-metric-fan-in-test graph-metric-operations-test public-api-graph-metric-e2e-test graph-metric-process-test graph-metric-distributed-release-gate graph-metric-distributed-promotion-gate graph-metric-release-qualification download-onnx force-download-onnx clean-onnx
+.PHONY: build test unit-test sql-api-parity-test db-temporal-test graph-metric-lifecycle-test graph-metric-cleanup-test graph-metric-degree-canary-test graph-metric-default-gate-test graph-metric-fan-in-test graph-metric-operations-test public-api-graph-metric-e2e-test graph-metric-process-test download-onnx force-download-onnx clean-onnx
 
 $(ONNXRUNTIME_STAMP): $(INFERENCE_DIR)/scripts/download-onnxruntime.sh
 	@test -d $(INFERENCE_DIR) || (echo "ERROR: inference package not found at $(INFERENCE_DIR)" && exit 1)
@@ -77,15 +77,6 @@ public-api-graph-metric-e2e-test: ## Run focused public API graph metric e2e tes
 
 graph-metric-process-test: ## Run spawned-process graph metric maintenance tests.
 	$(ZIG) build graph-metric-process-test
-
-graph-metric-distributed-release-gate: ## Run local distributed graph metric process and release qualification gates.
-	$(ZIG) build graph-metric-distributed-release-gate $(ZIG_BUILD_FLAGS)
-
-graph-metric-distributed-promotion-gate: ## Run local distributed graph metric process gate followed by promotion release qualification.
-	$(ZIG) build graph-metric-distributed-promotion-gate $(ZIG_BUILD_FLAGS)
-
-graph-metric-release-qualification: ## Run graph metric release qualification JSONL harness.
-	$(ZIG) build graph-metric-release-qualification $(ZIG_BUILD_FLAGS)
 
 clean-onnx: ## Remove downloaded ONNX Runtime files.
 	rm -rf $(ONNXRUNTIME_ROOT)

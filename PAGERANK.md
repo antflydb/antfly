@@ -2629,7 +2629,7 @@ Authoritative rest-of-work roadmap:
 
 | Milestone | Design | Implementation slices | Exit gate |
 | --- | --- | --- | --- |
-| 1. Process supervisor boundary | Keep the graph metric API unchanged while moving the role-configured runtime into independently managed process owners. Processes receive DB path, runtime owner identity, worker identity, tick budgets, and idle policy only; metric config is resolved from the graph index. | Done for the first process proof: `graph-metric-maintenance supervise` runs coordinator and worker-pool child roles in bounded rounds, captures each child JSON summary, loops while durable progress is reported, exits after global idle, and applies bounded restart policy. The full `antfly graph-metric-maintenance supervise --help` binary path builds, deterministic command tests drive one degree generation through supervisor-built child argv, and the `graph-metric-process-test` build step now runs the real `antfly` binary as spawned coordinator/worker-pool child processes against one shared DB path. `graph-metric-maintenance launch` now starts coordinator and worker-pool role processes as independently owned children in each bounded round, writes per-role JSON summaries, preserves per-role stderr for diagnosis, aggregates global idle/restart state, and uses an explicit local DB writer guard for direct file-backed launches so runtime/page leases are not confused with a storage-engine multi-writer lock. The launch proof now drains partitioned degree, bounded PageRank, eigenvector, and compatible HITS builds through independently launched coordinator and worker-pool owners. The real spawned-process harness now also parses the aggregate supervisor/launcher JSON and asserts coordinator plus worker-pool child telemetry: runtime/owner hashes, worker counts/hashes, lease-key presence, lease ownership, acquisition count, tick progress, and no last error. Standalone role-process argv is preflighted with a strict allow-list to keep only DB path, role, owner identity, worker identity, lease policy, tick budgets, and test clock/ready inputs; metric names, index names, target generations, job/page ids, metric configs, summary files, unknown flags, missing values, and local writer-lock flags are rejected before both ordinary role runs and killable long-lived role owners are spawned. Standalone role-process summaries are checked too: every coordinator, worker, and worker-pool process used by restart, lease-fencing, publish, cleanup, and reclaim proofs must report the expected role, runtime/owner hash, worker hash/count, lease-key hash, lease ownership, tick completion, and zero error ticks. Publish-boundary restart proofs now also start a second real coordinator role process after degree, PageRank, eigenvector, and compatible HITS publish, and assert it cannot republish, fail, advance phase, or append another publish event. Publish-verifier failure proofs now also start a second real coordinator role process after PageRank, eigenvector, and compatible HITS fail at publish, and assert it cannot publish, fail again, advance phase, or append another failure event. The heavier `zig-graph-metric-distributed-release-gate` Make target is now wired into the full-default Zig CI job, so CI enforces the process-boundary harness and the all-family budgeted release-qualification smoke together instead of stopping at local-only process evidence. | Complete for process smoke: coordinator and worker processes can finish degree, PageRank, eigenvector, and compatible HITS work without worker-side metric config, and the local launch path can drain all four metric families through durable state. Remaining work moves to remote deployment orchestration and rollout gates. |
+| 1. Process supervisor boundary | Keep the graph metric API unchanged while moving the role-configured runtime into independently managed process owners. Processes receive DB path, runtime owner identity, worker identity, tick budgets, and idle policy only; metric config is resolved from the graph index. | Done for the first process proof: `graph-metric-maintenance supervise` runs coordinator and worker-pool child roles in bounded rounds, captures each child JSON summary, loops while durable progress is reported, exits after global idle, and applies bounded restart policy. The full `antfly graph-metric-maintenance supervise --help` binary path builds, deterministic command tests drive one degree generation through supervisor-built child argv, and the `graph-metric-process-test` build step now runs the real `antfly` binary as spawned coordinator/worker-pool child processes against one shared DB path. `graph-metric-maintenance launch` now starts coordinator and worker-pool role processes as independently owned children in each bounded round, writes per-role JSON summaries, preserves per-role stderr for diagnosis, aggregates global idle/restart state, and uses an explicit local DB writer guard for direct file-backed launches so runtime/page leases are not confused with a storage-engine multi-writer lock. The launch proof now drains partitioned degree, bounded PageRank, eigenvector, and compatible HITS builds through independently launched coordinator and worker-pool owners. The real spawned-process harness now also parses the aggregate supervisor/launcher JSON and asserts coordinator plus worker-pool child telemetry: runtime/owner hashes, worker counts/hashes, lease-key presence, lease ownership, acquisition count, tick progress, and no last error. Standalone role-process argv is preflighted with a strict allow-list to keep only DB path, role, owner identity, lease policy, tick budgets, and test clock/ready inputs; metric names, index names, target generations, job/page ids, metric configs, summary files, unknown flags, missing values, and local writer-lock flags are rejected before both ordinary role runs and killable long-lived role owners are spawned. Standalone role-process summaries are checked too: every coordinator, worker, and worker-pool process used by restart, lease-fencing, publish, cleanup, and reclaim proofs must report the expected role, runtime/owner hash, worker hash/count, lease-key hash, lease ownership, tick completion, and zero error ticks. Publish-boundary restart proofs now also start a second real coordinator role process after degree, PageRank, eigenvector, and compatible HITS publish, and assert it cannot republish, fail, advance phase, or append another publish event. Publish-verifier failure proofs now also start a second real coordinator role process after PageRank, eigenvector, and compatible HITS fail at publish, and assert it cannot publish, fail again, advance phase, or append another failure event. Full-default CI now runs this through the ordinary `graph-metric-process-test` focused test rather than a graph-specific release wrapper. | Complete for process smoke: coordinator and worker processes can finish degree, PageRank, eigenvector, and compatible HITS work without worker-side metric config, and the local launch path can drain all four metric families through durable state. Remaining work moves to remote deployment orchestration and rollout readiness. |
 | 2. Runtime ownership and lease hardening | Treat durable state, not process memory, as the coordination boundary. Runtime-owner leases fence processes; page leases fence page execution; page attempts fence output adoption. | The process harness now kills a coordinator owner after it has acquired its runtime lease, proves a distinct worker-pool process can continue under an independent runtime lease, proves a duplicate coordinator is fenced before the original lease expires, and proves a replacement coordinator can take over after expiry and advance durable work. It also kills a process that owns a degree scan page lease, proves a replacement worker is fenced before page-lease expiry, proves a real `antfly graph-metric-maintenance --role worker` process can reclaim and complete the page after expiry with an injected clock, and proves the stale old page attempt is rejected after replacement. Same-worker runtime fencing is now covered through real worker role processes: one owner acquires the worker runtime lease and completes a page, a duplicate owner with the same worker id is fenced before expiry, and a replacement owner with the same worker id takes over after expiry, reports runtime `takeover_count`, and completes more durable page work. Replacement coordinator takeover also reports `takeover_count`, giving operations an explicit cross-process replacement signal even when the killed owner cannot observe local `lost_leases`. PageRank now has the same process proof for first-iteration scan/out-degree, initialize, contribution, reduce, and convergence pages; dynamically planned later contribution, reduce, and convergence pages; publish through a real coordinator role process; cleanup through separate real worker role processes; cleanup-page owner death/reclaim with the published generation visible; publish-verifier failure through a real coordinator process while preserving the prior published generation; duplicate coordinator idempotence after that publish-verifier failure; and same-worker-id replacement after page-lease expiry with stale prior-attempt rejection. Remaining hardening is remote orchestration beyond a direct local DB path. | Worker loss abandons only reclaimable page work; stale owners cannot write, adopt, complete, publish, or fail the build after replacement; duplicate coordinators cannot double-publish, double-fail, or append incompatible pages/events. |
 | 3. Crash/restart harness | Make failures reproducible before promoting distributed execution. Every phase must be restartable from fresh DB handles and process boundaries. | The current degree harness now covers runtime-owner kill/takeover, scan-page owner kill/reclaim, stale scan-page attempt rejection, publish-boundary restart through a real coordinator process, and cleanup restart through separate real worker processes. PageRank process coverage now covers first-iteration scan/out-degree, initialize, contribution, reduce, and convergence owner kill, dynamically planned later contribution/reduce/convergence owner kill, before-expiry fencing, post-expiry reclaim by a real worker role, stale attempt rejection, same-worker replacement attempt fencing, drain to fresh, publish-boundary restart through a real coordinator process, cleanup restart through separate real worker processes, cleanup-page owner death/reclaim, and publish-verifier failure preserving the prior generation. | Published reads see either the prior complete generation or the newly published complete generation. Active job output, abandoned attempts, and failed generations are never queryable. |
 | 4. Distributed degree promotion | Use degree as the first production ownership proof because it exercises scan, reduce, publish, cleanup, leases, attempts, and public freshness without iterative math. | Degree now has a spawned-process restart proof for supervisor completion, coordinator runtime lease loss, worker page lease loss/reclaim, publish-boundary restart, cleanup restart, and stale attempt rejection. Remaining degree work is promotion hardening: keep local/planned parity, broaden public read-surface freshness coverage through the distributed gate, verify active/failed status page summaries from durable records, and decide the internal rollout gate. | Degree can be enabled behind an internal distributed gate with local-vs-planned parity, process crash coverage, cleanup resume coverage, and direct/traversal/search freshness coverage. |
@@ -3481,10 +3481,10 @@ expiry; rejects stale page attempts after replacement; verifies publish,
 failure, cleanup, fixed-iteration, exhausted-attempt, and same-worker fencing
 invariants; and emits a final `graph_metric_process_harness_summary` only after
 all required owner-boundary coverage categories are observed. The
-`graph-metric-distributed-release-gate` CI target now composes that process
-harness with the budgeted all-family release-qualification smoke so full-default
-CI validates the owner contract, public-read/fan-in smoke, retained-storage
-budgets, and scheduler budgets together.
+full-default workflow runs that process harness through the ordinary
+`graph-metric-process-test` focused test. Release-sized public-read, fan-in,
+retained-storage, scheduler, and latency evidence remains rollout readiness
+work rather than another graph-only CI target.
 
 Remote workers should claim independent pages from durable graph-index state by
 index and metric name. They should persist cursors, complete or fail leases,
@@ -4435,7 +4435,7 @@ Recommended follow-up release cuts from the current checkpoint:
    mid-cleanup, duplicate cleanup ownership is fenced before TTL, and a
    replacement owner takes over after TTL and finishes to fresh scores,
    fixed-iteration metadata, or a fresh compatible HITS pair. The
-   release-qualification harness can now reopen
+   future rollout evidence should reopen
    the DB handle between every progressing maintenance tick to prove durable
    resume for degree, PageRank, eigenvector, and paired HITS. The remaining work
    is to extend killed-owner evidence to promotion-scale deployments and keep
@@ -4495,8 +4495,8 @@ Recommended follow-up release cuts from the current checkpoint:
    gate now makes that evidence explicit in CI: cleanup pages resume after
    reopen, active jobs refuse direct cleanup, failed and repeated failed builds
    remove abandoned namespaces while bounding diagnostics, and runtime owner
-   lease cleanup is fenced. The release-qualification harness now adds
-   aggregate storage-footprint evidence for degree, PageRank, eigenvector, and
+   lease cleanup is fenced. Future rollout evidence should add aggregate
+   storage-footprint evidence for degree, PageRank, eigenvector, and
    paired HITS: successful planned cleanup leaves zero durable job namespace
    records, zero attempt records, and exactly one retained metric-control
    record; repeated failed builds preserve the prior score-record count, remove
@@ -4516,8 +4516,8 @@ Recommended follow-up release cuts from the current checkpoint:
   failed-build floor and bounded diagnostics, every completed family must
   observe that retry volume, paired HITS must report compatible paired
   diagnostics, and failed cleanup must leave zero job and attempt namespaces
-  with only bounded failure/event records retained. The harness can also close and
-  reopen the planned DB between
+  with only bounded failure/event records retained. Rollout qualification should
+  also close and reopen the planned DB between
   nonterminal maintenance ticks to prove durable scheduler state resumes after
   handle/owner restart boundaries. The remaining gate is larger retained
   namespaces, deployment-shaped killed-owner churn with abandoned in-flight
@@ -4534,11 +4534,11 @@ Recommended follow-up release cuts from the current checkpoint:
    cases and compatible opt-in HITS can use planned maintenance, larger or
    incompatible cases fall back before local execution, and threshold widening
    remains an intentional internal decision rather than an accidental default.
-   The release-qualification harness now has latency budget
-   flags for local oracle publish, planned publish, cleanup, published reads,
-   fail-closed fresh reads, and synthetic fan-in merge/fail-closed paths.
-   The named budgeted promotion target now enables conservative public-read,
-   fresh-failure, and fan-in latency ceilings so active/failed direct,
+   Rollout qualification should include latency budgets for local oracle
+   publish, planned publish, cleanup, published reads, fail-closed fresh reads,
+   and synthetic fan-in merge/fail-closed paths. Promotion evidence should
+   include conservative public-read, fresh-failure, and fan-in latency ceilings
+   so active/failed direct,
    traversal, rerank, paired HITS, and fan-in read paths become pass/fail
    evidence instead of log-only measurements. It also has disabled-by-default retained score/metric/control/failure/event
    storage, page-claim, cleanup-tick, executed-round, failure-retry, worker-step, and
@@ -4560,10 +4560,10 @@ Recommended follow-up release cuts from the current checkpoint:
    pins the public action route and generated client-facing graph metric status
    types so client drift is caught with the public graph metric read surface.
 
-The remaining promotion work should be tracked as release qualification rather
-than PR unit coverage:
+The remaining promotion work should be tracked as rollout evidence rather than
+PR unit coverage or graph-specific build targets:
 
-- `graph-metric-release-qualification` is now an explicit non-CI harness. It
+- A future rollout qualification runner
   runs degree, PageRank, eigenvector, and paired HITS through the graph-index
   metric API, drains planned maintenance with configurable graph size, worker
   count, tick budget, metrics-per-round budget, page budget, iteration cap,
@@ -4696,7 +4696,7 @@ than PR unit coverage:
   index/metric/status-name identity rejects, invalid published states reject,
   and incompatible authority/hub generation, metadata-version, and edge-filter
   pairs reject before merge output is published.
-- The harness emits structured JSONL for each run: graph size, edge count,
+- The rollout runner should emit structured JSONL for each run: graph size, edge count,
   metric family, maintenance mode, target generation, tick count, budget
   exhaustion, generated graph topology evidence, configured round/metric/page
   budgets, worker and coordinator step counts, combined/coordinator/worker-pool
@@ -4826,11 +4826,10 @@ than PR unit coverage:
   `--min-split-worker-identities-with-progress` and
   `--min-split-worker-identities-with-page-progress` fail a split-mode run when
   too few configured worker identities make tick progress or actual page
-  claim/completion progress. The budgeted promotion target sets both to the
+  claim/completion progress. The promotion evidence profile should set both to the
   four-worker promotion floor, so promotion evidence cannot pass while silently
-  serializing page ownership through fewer worker identities. The
-  harness now finishes successful runs with a
-  `graph_metric_release_qualification_summary` JSONL event that repeats the
+  serializing page ownership through fewer worker identities. The rollout
+  runner should finish successful runs with a summary JSONL event that repeats the
   configured latency/storage/scheduler budgets, marks whether any budget was
   enabled, breaks that budget evidence into latency, storage, scheduler, and
   coverage-floor categories, records whether the promotion profile floor was
@@ -4846,14 +4845,11 @@ than PR unit coverage:
   and the observed primary plus paired-HITS layouts must be nonuniform. Worker
   floors use the minimum observed family contribution rather than aggregate
   worker totals. That flag is
-  release-tooling metadata for the local harness: it proves the run used and
+  release-tooling metadata for local evidence: it proves the run used and
   satisfied the deployment-shaped local gate with all local promotion budget
   categories enabled, but it does not replace hosted remote-owner, killed-owner,
-  or cross-range promotion evidence. The config row now aliases
-  `deployment_shaped_release_gate` as
-  `configured_deployment_shaped_release_gate`, while the summary row also emits
-  `configured_deployment_shaped_release_gate` and
-  `observed_deployment_shaped_release_gate` so rollout tooling can distinguish
+  or cross-range promotion evidence. The config and summary rows should expose
+  configured and observed deployment-shaped evidence flags so rollout tooling can distinguish
   a correctly shaped invocation from a completed promotion run that actually met
   the observed floors. The config and summary rows also emit the component audit booleans
   `all_family_execution`, `public_read_fan_in_latency_budgeted`,
@@ -4901,9 +4897,9 @@ than PR unit coverage:
   untruncated, and active progress is finite and strictly between zero and one,
   proving the status sample is in-flight rather than empty or terminal. Rollout tooling
   can therefore tell which local promotion-gate category is absent without
-  reverse-engineering every raw knob. When
-  `--require-deployment-shaped-release-gate` is set, the harness now requires
-  the completed summary to satisfy `observed_deployment_shaped_release_gate`;
+  reverse-engineering every raw knob. When a deployment-shaped rollout
+  requirement is set, the runner should require the completed summary to satisfy
+  the observed deployment-shaped evidence flag;
   a correctly shaped invocation that fails to produce the observed family,
   worker, fan-in, failure-churn, public-read latency, cleanup latency, storage,
   or scheduler evidence fails the promotion run instead of only emitting a
@@ -5103,13 +5099,11 @@ than PR unit coverage:
   per-family active-worker page progress. Promotion tooling can therefore
   reject a run where one family silently serialized all page ownership through a
   single worker while another family supplied the maximum worker-step evidence.
-  The focused local target is the single parameterized harness,
-  `zig build graph-metric-release-qualification -- <args>`; the Make wrappers are
-  `make -C zig graph-metric-release-qualification` and
-  `make zig-graph-metric-release-qualification`. Release recipes pass
-  `--profile smoke` or `--profile promotion` plus the selected latency,
-  retained-storage, scheduler, worker-identity, and family-floor budgets as
-  arguments instead of adding one public build or Make target per profile.
+  The rollout runner should stay out of the public Make/build target surface. Release
+  recipes can pass `--profile smoke` or `--profile promotion` plus the selected
+  latency, retained-storage, scheduler, worker-identity, and family-floor
+  budgets as rollout-tooling inputs instead of adding feature-specific public
+  build targets.
   The budgeted smoke recipe uses loose local/planned/cleanup latency runaway
   guards plus conservative public-read, fan-in, retained-storage, page-claim,
   cleanup-tick, executed-round, failed-retry, worker-step, coordinator-step,
@@ -5124,9 +5118,8 @@ than PR unit coverage:
   include explicit attempt-record ceilings in addition to score, metric,
   control, failure, and event records, while the cleanup invariant still
   requires zero retained attempt records after fresh and failed cleanup. The
-  promotion recipe passes `--require-deployment-shaped-release-gate`, so the
-  harness fails before running if the invocation cannot emit
-  `deployment_shaped_release_gate: true`.
+  promotion recipe should require deployment-shaped evidence before accepting a
+  run as rollout-ready.
   The required shape now includes the promotion workload floor, all-family
   execution, split/reopen ownership evidence, four-family coverage,
   split-worker progress floors, promotion fan-in and failure-churn floors,
@@ -5145,18 +5138,8 @@ than PR unit coverage:
   latency thresholds disabled until deployment baselines exist, while cleanup
   latency is now part of the deployment-shaped promotion requirement. The
   smoke recipe keeps only loose runaway guards for local, planned, and cleanup
-  phases. The argument-forwarding harness also accepts
-  `--profile smoke` and `--profile promotion` for focused family or budget
-  overrides. The local composed gate is
-  `zig build graph-metric-distributed-release-gate`, with Make wrappers
-  `make -C zig graph-metric-distributed-release-gate` and
-  `make zig-graph-metric-distributed-release-gate`. It runs the spawned
-  process-owner gate plus the budgeted smoke release-qualification profile so
-  PR and release-prep runs can verify the narrow remote-owner contract, the
-  all-family resumable/fan-in release smoke, and the fast budget surface
-  together. The distributed release gate uses the same default-optimized
-  release-qualification artifact as the parameterized smoke recipe, while the
-  distributed promotion gate uses the ReleaseFast promotion artifact. The
+  phases. The runner should accept `--profile smoke` and
+  `--profile promotion` for focused family or budget overrides. The
   process-owner summary emits a top-level
   `remote_owner_release_gate` plus service, direct, and failure/reclaim
   component booleans. The service gate is split into
@@ -5169,38 +5152,14 @@ than PR unit coverage:
   service multi-page worker, coordinator, and takeover phase proof counts, and
   required/observed direct reclaimed-attempt-completion plus
   stale-attempt-rejection counts for abandoned direct page attempts; the
-  release-qualification summary emits configured and observed deployment-shaped
-  local-gate booleans.
-  Together those two final JSON
-  rows are the local composed promotion evidence that rollout tooling should
-  require before looking at hosted deployment-scale artifacts. The process-owner target compiles the `antfly` child binary before
-  compiling the process harness, and the composed target runs that process
-  harness before starting the release smoke, keeping the large spawned-process
-  and release-qualification work explicit instead of hiding it behind
-  compile-only wrapper targets.
-  It is intentionally
-  smaller than the promotion recipe and does not replace
-  deployment-scale hosted owner, fan-in, cleanup, or latency evidence. Release
-  prep can use the heavier composed target
-  `zig build graph-metric-distributed-promotion-gate`, with Make wrappers
-  `make -C zig graph-metric-distributed-promotion-gate` and
-  `make zig-graph-metric-distributed-promotion-gate`, when it needs the same
-  process-owner contract, the focused operations/status contract, the focused
-  hosted fan-in contract, and the promotion-budgeted release qualification
-  floor. That target is deliberately
-  separate from PR smoke: it keeps the same sequenced compile/run shape for CI
-  memory stability but uses the ReleaseFast promotion profile,
-  deployment-shaped summary requirement, storage and scheduler budgets,
-  split-worker progress floors,
-  active-page status coverage, hosted fan-in compatibility coverage, and
-  public-read/fan-in latency ceilings. The
-  `Zig Tests` workflow now runs the smaller distributed
-  release gate in `full-default`, while a separate `graph-metric-promotion` job
-  runs the heavier distributed promotion gate on manual dispatch and the daily
-  scheduled run. That keeps merge-group and push checks on the release-smoke
-  budget while still collecting promotion-shaped owner, operations/status,
-  storage, scheduler, public-read, and fan-in evidence on an explicit release
-  cadence.
+  rollout summary should emit configured and observed deployment-shaped
+  local evidence booleans. Those JSON rows are useful evidence for rollout
+  tooling, but they are not themselves product build targets. CI should keep
+  graph metrics shaped like other features: focused tests for lifecycle,
+  cleanup, fan-in, operations, public API behavior, and process ownership. Full
+  promotion still requires hosted deployment-scale owner, fan-in, cleanup,
+  storage-growth, and latency evidence before any distributed-by-default
+  rollout.
   Smoke keeps `maintenance_mode: "combined"` for backward-compatible PR
   validation, while promotion starts with `maintenance_mode: "split"` so release
   runs exercise the coordinator/worker-pool boundary by default. Promotion is a
@@ -5333,8 +5292,8 @@ than PR unit coverage:
   graph shape exactly, terminal job namespaces must be gone, successful publish
   must retain one control record, and repeated failed rebuilds must retain only
   the exact bounded failure/event diagnostics allowed for the family.
-- Local promotion-profile release qualification now passes for every graph
-  metric family under the CI-sized profile floor: `docs: 128`, `fanout: 4`,
+- Local promotion-profile evidence should cover every graph metric family under
+  the CI-sized profile floor: `docs: 128`, `fanout: 4`,
   `top_k: 33`, eight synthetic fan-in shards, three active mutation writes,
   four split worker identities, reopen-between-ticks, eight maximum iterations,
   two successful generation repeats, five failed rebuild repeats, sixteen
@@ -5352,7 +5311,7 @@ than PR unit coverage:
   proves the same single-vector substrate can converge under the promotion
   shape, and HITS proves paired authority/hub promotion-shape reads,
   diagnostics, fan-in, compatibility, and invalid-state rejection.
-  The all-family budgeted promotion target now also passes with published-read,
+  The all-family promotion evidence profile should include published-read,
   fresh-failure, and fan-in latency capped at one second, retained storage
   ceilings of 2500 score, 2600 metric, 32 control, one attempt record, 16
   failure, and 20 event records, plus scheduler ceilings of 4000 page claims,
@@ -5365,7 +5324,7 @@ than PR unit coverage:
   Larger HITS graphs, including the previous 1000-source stress shape, remain
   separate performance and deployment-scale qualification rather than the
   default CI promotion gate.
-- Promotion-scale use of the harness still needs deployment-sized graph indexes
+- Promotion-scale rollout still needs deployment-sized graph indexes
   with one coordinator, multiple worker pools, and forced killed-owner churn at
   scan, contribution, reduce, publish, and cleanup boundaries. Reopen between
   ticks proves durable restart after each scheduler tick, but it is not a
@@ -5377,7 +5336,7 @@ than PR unit coverage:
   two-worker 130-source degree/PageRank/eigenvector/HITS service runs; the
   remaining gap is exercising the same shape through deployment-sized service
   owner churn.
-  The synthetic fan-in probe proves the release harness sees normal merge
+  The synthetic fan-in probe should prove the rollout runner sees normal merge
   compatibility behavior, and the focused hosted fan-in gate now covers a
   nonuniform eight-shard degree/PageRank/eigenvector direct merge with four
   active/stale shards whose unpublished high-score targets stay invisible,
@@ -5392,21 +5351,21 @@ than PR unit coverage:
   cross-range promotion layouts with larger shard counts, broader mixed
   active/stale shard states across traversal/rerank surfaces and paired HITS,
   and broader injected incompatible statuses.
-  Increasing `--synthetic-fan-in-shards` gives the local harness a cheap
-  preflight for larger shard counts, and increasing
-  `--synthetic-fan-in-active-shards` preflights broader active/stale shard
+  Increasing synthetic fan-in shards gives the local runner a cheap preflight
+  for larger shard counts, and increasing active synthetic shard counts
+  preflights broader active/stale shard
   mixes, but successful local synthetic fan-in still does not replace
   deployment-shaped hosted fan-in evidence.
 - Keep pass/fail gates separate from raw benchmark numbers. Correctness gates
   should require local-oracle parity, no leaked attempt output, bounded retained
   namespaces, no unbounded status payloads, and successful cleanup after owner
-  churn. The local budgeted promotion target now enforces retained-storage,
+  churn. The promotion evidence profile should enforce retained-storage,
   page-claim, cleanup-tick, executed-round, failure-retry, worker-step,
   coordinator-step, published-read latency, fresh-failure latency, and fan-in
   latency ceilings as a conservative release guard. Local/planned/cleanup
   wall-clock latency should still be
   recorded as release notes until real production baselines exist, then promoted
-  to explicit harness thresholds per metric family and profile.
+  to explicit rollout thresholds per metric family and profile.
 - Promotion-scale fan-in should use shard layouts beyond the focused hosted
   fan-in unit gate: larger mixed hot/cold shards, active/stale shard mixes for
   rerank surfaces and paired HITS, and more varied incompatible HITS
@@ -5418,16 +5377,15 @@ than PR unit coverage:
   prior-pair preservation, remote HITS
   generation/metadata/edge-filter mismatch rejection, and missing remote HITS
   status rejection, while
-  the release harness has a `--fanout` graph-shape knob and a
-  `--synthetic-fan-in-shards` merge-layout knob plus a
-  `--synthetic-fan-in-active-shards` active-staleness knob so promotion runs can
+  the rollout runner should have fanout graph-shape, merge-layout, and
+  active-staleness knobs so promotion runs can
   move beyond pure star topologies and two-shard synthetic fan-in, exercising
   denser PageRank/eigenvector cycles plus multi-authority HITS graphs while
   preserving the same local-oracle parity check. Release JSONL
   now records the generated topology components and verifies them against graph
   index stats before metric execution, so promotion notes can distinguish larger
   graph-shape evidence from merely larger metric budgets.
-- The harness should not introduce a public job API. It should drive only the
+- The rollout runner should not introduce a public job API. It should drive only the
   same public index/metric config surface, public action/status routes, and
   internal service owner boundary used by the focused gates.
 

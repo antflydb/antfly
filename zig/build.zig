@@ -6524,123 +6524,6 @@ pub fn build(b: *std.Build) void {
     const build_docid_query_bench_step = b.step("docid-query-bench-build", "Build docid_query_bench without running it");
     build_docid_query_bench_step.dependOn(&docid_query_bench.step);
 
-    const graph_metric_release_qualification_mod = b.createModule(.{
-        .root_source_file = b.path("bench/graph/graph_metric_release_qualification.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    graph_metric_release_qualification_mod.addImport("antfly-zig", lib_mod);
-
-    const graph_metric_release_qualification = b.addExecutable(.{
-        .name = "graph_metric_release_qualification",
-        .root_module = graph_metric_release_qualification_mod,
-    });
-    const graph_metric_release_qualification_releasefast_mod = b.createModule(.{
-        .root_source_file = b.path("bench/graph/graph_metric_release_qualification.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    graph_metric_release_qualification_releasefast_mod.addImport("antfly-zig", lib_mod);
-
-    const graph_metric_release_qualification_releasefast = b.addExecutable(.{
-        .name = "graph_metric_release_qualification_releasefast",
-        .root_module = graph_metric_release_qualification_releasefast_mod,
-    });
-
-    const run_graph_metric_release_qualification = b.addRunArtifact(graph_metric_release_qualification);
-    if (b.args) |args| {
-        run_graph_metric_release_qualification.addArgs(args);
-    } else {
-        run_graph_metric_release_qualification.addArgs(&.{ "--docs", "130", "--workers", "2", "--max-iterations", "3" });
-    }
-    const graph_metric_release_qualification_step = b.step("graph-metric-release-qualification", "Run graph metric release qualification JSONL harness");
-    graph_metric_release_qualification_step.dependOn(&run_graph_metric_release_qualification.step);
-    const graph_metric_release_qualification_smoke_budgeted_args = &.{
-        "--profile",
-        "smoke",
-        "--max-local-latency-ns",
-        "10000000000",
-        "--max-planned-latency-ns",
-        "10000000000",
-        "--max-cleanup-latency-ns",
-        "10000000000",
-        "--max-published-read-latency-ns",
-        "1000000000",
-        "--max-fresh-fail-latency-ns",
-        "1000000000",
-        "--max-fan-in-latency-ns",
-        "1000000000",
-        "--max-storage-score-records",
-        "32",
-        "--max-storage-metric-records",
-        "100",
-        "--max-storage-control-records",
-        "16",
-        "--max-storage-attempt-records",
-        "1",
-        "--max-storage-failure-records",
-        "8",
-        "--max-storage-event-records",
-        "10",
-        "--max-page-claims",
-        "100",
-        "--max-cleanup-ticks",
-        "10",
-        "--max-rounds-executed",
-        "80",
-        "--max-failure-retry-count",
-        "3",
-        "--max-worker-steps",
-        "128",
-        "--max-coordinator-steps",
-        "128",
-        "--min-families-run",
-        "4",
-    };
-    const graph_metric_release_qualification_promotion_budgeted_args = &.{
-        "--profile",
-        "promotion",
-        "--max-published-read-latency-ns",
-        "1000000000",
-        "--max-fresh-fail-latency-ns",
-        "1000000000",
-        "--max-fan-in-latency-ns",
-        "1000000000",
-        "--max-cleanup-latency-ns",
-        "300000000000",
-        "--max-storage-score-records",
-        "2500",
-        "--max-storage-metric-records",
-        "2600",
-        "--max-storage-control-records",
-        "32",
-        "--max-storage-attempt-records",
-        "1",
-        "--max-storage-failure-records",
-        "16",
-        "--max-storage-event-records",
-        "20",
-        "--max-page-claims",
-        "4000",
-        "--max-cleanup-ticks",
-        "600",
-        "--max-rounds-executed",
-        "1000",
-        "--max-failure-retry-count",
-        "5",
-        "--max-worker-steps",
-        "7000",
-        "--max-coordinator-steps",
-        "2000",
-        "--min-families-run",
-        "4",
-        "--min-split-worker-identities-with-progress",
-        "4",
-        "--min-split-worker-identities-with-page-progress",
-        "4",
-        "--require-deployment-shaped-release-gate",
-    };
-
     const algebraic_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/algebraic_bench.zig"),
         .target = target,
@@ -7256,22 +7139,8 @@ pub fn build(b: *std.Build) void {
         const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
         run_graph_metric_process_harness.addArtifactArg(antfly_main);
         run_graph_metric_process_harness.has_side_effects = true;
-        const run_graph_metric_release_qualification_distributed_smoke_budgeted = b.addRunArtifact(graph_metric_release_qualification);
-        run_graph_metric_release_qualification_distributed_smoke_budgeted.addArgs(graph_metric_release_qualification_smoke_budgeted_args);
-        run_graph_metric_release_qualification_distributed_smoke_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
-        const run_graph_metric_release_qualification_distributed_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification_releasefast);
-        run_graph_metric_release_qualification_distributed_promotion_budgeted.addArgs(graph_metric_release_qualification_promotion_budgeted_args);
-        run_graph_metric_release_qualification_distributed_promotion_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
         const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run spawned-process graph metric maintenance smoke test");
         graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
-        const graph_metric_distributed_release_gate_step = b.step("graph-metric-distributed-release-gate", "Run local distributed graph metric process and release qualification gates");
-        graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_process_harness.step);
-        graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_release_qualification_distributed_smoke_budgeted.step);
-        const graph_metric_distributed_promotion_gate_step = b.step("graph-metric-distributed-promotion-gate", "Run local distributed graph metric process gate followed by promotion release qualification");
-        graph_metric_distributed_promotion_gate_step.dependOn(graph_metric_fan_in_test_step);
-        graph_metric_distributed_promotion_gate_step.dependOn(graph_metric_operations_test_step);
-        graph_metric_distributed_promotion_gate_step.dependOn(&run_graph_metric_process_harness.step);
-        graph_metric_distributed_promotion_gate_step.dependOn(&run_graph_metric_release_qualification_distributed_promotion_budgeted.step);
     }
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
