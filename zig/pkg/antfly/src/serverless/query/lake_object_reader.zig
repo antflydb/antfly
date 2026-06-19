@@ -125,8 +125,8 @@ fn validatePlannedObjectChecksum(
     body: []const u8,
 ) !void {
     const checksum = metadata.checksum orelse return;
-    if (read.range.offset != 0 or read.range.len != read.object.byte_len) return;
     if (body.len != read.range.len) return error.InvalidLakeRangeRead;
+    if (!try plannedChecksumCoversBody(read, metadata, body.len)) return;
 
     switch (checksum.algorithm) {
         .sha256_hex => {
@@ -157,6 +157,16 @@ fn validatePlannedObjectChecksum(
             if (!std.mem.eql(u8, encoded, checksum.value)) return error.PreconditionFailed;
         },
     }
+}
+
+fn plannedChecksumCoversBody(read: lake_range_io.RangeRead, metadata: object_storage.ObjectMetadata, body_len: usize) !bool {
+    return switch (metadata.checksum_scope) {
+        .object => read.range.offset == 0 and read.range.len == read.object.byte_len,
+        .response_body => {
+            if (metadata.content_length != body_len) return error.InvalidLakeRangeRead;
+            return true;
+        },
+    };
 }
 
 fn hexNibble(value: u8) u8 {
@@ -330,10 +340,14 @@ test "object storage range reader validates returned planned object metadata" {
 test "object storage range reader validates full object checksums" {
     const alloc = std.testing.allocator;
     const ChecksumObjectStorage = struct {
+        const ContentLengthScope = enum { object, body };
+
         checksum: ?struct {
             algorithm: object_storage.ObjectChecksumAlgorithm,
             value: []const u8,
         } = null,
+        checksum_scope: object_storage.ObjectChecksumScope = .object,
+        content_length_scope: ContentLengthScope = .object,
 
         fn client(self: *@This()) object_storage.ObjectStorage {
             return .{
@@ -380,7 +394,8 @@ test "object storage range reader validates full object checksums" {
                         .algorithm = checksum.algorithm,
                         .value = try a.dupe(u8, checksum.value),
                     } else null,
-                    .content_length = full_body.len,
+                    .checksum_scope = self.checksum_scope,
+                    .content_length = if (self.content_length_scope == .body) @intCast(body.len) else full_body.len,
                 },
             };
         }
@@ -437,6 +452,30 @@ test "object storage range reader validates full object checksums" {
     const partial_bytes = try partial_reader.parquetReader().readPlannedAlloc(alloc, partial_read);
     defer alloc.free(partial_bytes);
     try std.testing.expectEqualStrings("2345", partial_bytes);
+
+    var scoped = ChecksumObjectStorage{
+        .checksum = .{
+            .algorithm = .sha256_hex,
+            .value = "38083c7ee9121e17401883566a148aa5c2e2d55dc53bc4a94a026517dbff3c6b",
+        },
+        .checksum_scope = .response_body,
+        .content_length_scope = .body,
+    };
+    var scoped_reader = ObjectStorageRangeReader.init(scoped.client());
+    const scoped_bytes = try scoped_reader.parquetReader().readPlannedAlloc(alloc, partial_read);
+    defer alloc.free(scoped_bytes);
+    try std.testing.expectEqualStrings("2345", scoped_bytes);
+
+    var mismatched_scoped = ChecksumObjectStorage{
+        .checksum = .{
+            .algorithm = .sha256_hex,
+            .value = "0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        .checksum_scope = .response_body,
+        .content_length_scope = .body,
+    };
+    var mismatched_scoped_reader = ObjectStorageRangeReader.init(mismatched_scoped.client());
+    try std.testing.expectError(error.PreconditionFailed, mismatched_scoped_reader.parquetReader().readPlannedAlloc(alloc, partial_read));
 }
 
 test "object storage range reader retries transient planned reads only" {

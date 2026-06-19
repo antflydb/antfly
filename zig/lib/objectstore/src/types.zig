@@ -31,12 +31,18 @@ pub const ObjectChecksum = struct {
     }
 };
 
+pub const ObjectChecksumScope = enum {
+    object,
+    response_body,
+};
+
 pub const ObjectMetadata = struct {
     bucket: []u8,
     key: []u8,
     etag: ?[]u8 = null,
     version_id: ?[]u8 = null,
     checksum: ?ObjectChecksum = null,
+    checksum_scope: ObjectChecksumScope = .object,
     content_length: u64,
     content_type: ?[]u8 = null,
     last_modified_unix_ms: ?i64 = null,
