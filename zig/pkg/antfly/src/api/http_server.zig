@@ -19105,9 +19105,12 @@ test "api http server routes public external lake row queries through configured
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["amount","discount","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
+    const gcs_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"gs://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["amount","discount","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+    ;
 
     const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
+        tables: [2]metadata_table_manager.TableRecord,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -19179,6 +19182,8 @@ test "api http server routes public external lake row queries through configured
         expected_serving_cache_max_bytes: ?usize = null,
         expected_sidecar_count: usize = 0,
         open_count: u32 = 0,
+        s3_open_count: u32 = 0,
+        gcs_open_count: u32 = 0,
 
         fn resolver(self: *@This()) table_reads.ExternalLakeObjectStoreResolver {
             return .{
@@ -19198,7 +19203,13 @@ test "api http server routes public external lake row queries through configured
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.open_count += 1;
             try std.testing.expectEqual(external_source_api.Format.parquet, binding.format);
-            try std.testing.expectEqualStrings("s3://bucket/events", binding.source_uri);
+            if (std.mem.eql(u8, binding.source_uri, "s3://bucket/events")) {
+                self.s3_open_count += 1;
+            } else if (std.mem.eql(u8, binding.source_uri, "gs://bucket/events")) {
+                self.gcs_open_count += 1;
+            } else {
+                return error.UnexpectedLakeSourceUri;
+            }
             try std.testing.expectEqual(self.expected_serving_cache_max_bytes, options.serving_cache_max_bytes);
             try std.testing.expectEqual(self.expected_sidecar_count, options.sidecar_context.sidecars.len);
             return try object_store_support.OpenedObjectStore.initWithClient(inner_alloc, self.memory.client(), "bucket", "events");
@@ -19220,12 +19231,17 @@ test "api http server routes public external lake row queries through configured
     var put = try client.putObject("bucket", "events/part-a.parquet", parquet_object, .{});
     defer put.deinit(alloc);
 
-    var source = FakeSource{ .tables = .{.{
+    var source = FakeSource{ .tables = .{ .{
         .table_id = 1,
         .name = "events",
         .schema_json = schema_json,
         .desired_replica_count = 1,
-    }} };
+    }, .{
+        .table_id = 2,
+        .name = "events_gcs",
+        .schema_json = gcs_schema_json,
+        .desired_replica_count = 1,
+    } } };
     var base_reads = FakeBaseReads{};
     const sidecars = [_]lake_sidecar_manifest.DeclaredArtifact{.{
         .name = "events.amount.vector",
@@ -19409,6 +19425,21 @@ test "api http server routes public external lake row queries through configured
     const query_explain_plan = parsed_query_explain.value.object.get("plan").?.object;
     try std.testing.expectEqualStrings("scan", query_explain_plan.get("operation").?.string);
     try std.testing.expectEqual(@as(i64, 1), query_explain_plan.get("projected_column_count").?.integer);
+
+    var gcs_response = try server.handlePublicTableRowsQuery("events_gcs", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":7}}}", null);
+    defer gcs_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), gcs_response.status);
+    try std.testing.expectEqual(@as(u32, 7), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 6), resolver.s3_open_count);
+    try std.testing.expectEqual(@as(u32, 1), resolver.gcs_open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_gcs = try std.json.parseFromSlice(std.json.Value, alloc, gcs_response.body, .{ .allocate = .alloc_always });
+    defer parsed_gcs.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_gcs.value.object.get("total").?.integer);
+    const gcs_rows = parsed_gcs.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), gcs_rows.len);
+    try std.testing.expectEqual(@as(i64, 10), gcs_rows[0].object.get("amount").?.integer);
 }
 
 test "api http server resolves credentialed external lake rows from node config" {
