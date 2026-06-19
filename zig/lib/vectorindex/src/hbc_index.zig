@@ -2557,26 +2557,23 @@ fn prefetchFlatProbePostingMembers(
         return;
     }
 
-    var ids_stack: [flat_centroid_posting_prefetch_stack_capacity]u64 = undefined;
-    var positions_stack: [flat_centroid_posting_prefetch_stack_capacity]usize = undefined;
-    const use_stack = probes.len <= ids_stack.len;
-    const ids = if (use_stack)
-        ids_stack[0..probes.len]
+    var prefetch_stack: [flat_centroid_posting_prefetch_stack_capacity * 2]u64 = undefined;
+    const prefetch_storage_len = probes.len * 2;
+    const use_stack = prefetch_storage_len <= prefetch_stack.len;
+    const prefetch_storage = if (use_stack)
+        prefetch_stack[0..prefetch_storage_len]
     else
-        try self.alloc.alloc(u64, probes.len);
-    defer if (!use_stack) self.alloc.free(ids);
-    const positions = if (use_stack)
-        positions_stack[0..probes.len]
-    else
-        try self.alloc.alloc(usize, probes.len);
-    defer if (!use_stack) self.alloc.free(positions);
+        try self.alloc.alloc(u64, prefetch_storage_len);
+    defer if (!use_stack) self.alloc.free(prefetch_storage);
+    const ids = prefetch_storage[0..probes.len];
+    const positions = prefetch_storage[probes.len..prefetch_storage_len];
 
     var prefetch_count: usize = 0;
     for (probes, 0..) |probe, i| {
         if (scratch.cachedCurrentPostingMembers(probe.posting_id, probe.state.mutation_version, 0) != null) continue;
         try scratch.notePostingMemberCacheMiss(self.alloc, probe.posting_id);
         ids[prefetch_count] = probe.posting_id;
-        positions[prefetch_count] = i;
+        positions[prefetch_count] = @intCast(i);
         prefetch_count += 1;
     }
     if (prefetch_count == 0) return;
@@ -2587,7 +2584,7 @@ fn prefetchFlatProbePostingMembers(
 
     for (loaded, 0..) |maybe_base_data, i| {
         const base_data = maybe_base_data orelse continue;
-        const probe = probes[positions[i]];
+        const probe = probes[@intCast(positions[i])];
         const header = try posting.PostingFormat.decodeBaseHeader(base_data);
         if (header.posting_id != probe.posting_id) return error.Corrupted;
         if (header.generation < probe.state.mutation_version) continue;

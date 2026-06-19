@@ -985,8 +985,10 @@ implementations cleanly:
    share one backing allocation. Segment-backed flat/two-level posting prefetch
    also checks base member counts against the posting-member cache entry cap
    before decoding full base members, so oversized bases do not inflate query
-   scratch just to be rejected by cache admission. Fold compact delta IDs plus
-   ops are likewise slabbed.
+   scratch just to be rejected by cache admission, and its transient
+   posting-id/probe-position lists share one backing buffer when the probe
+   window exceeds stack scratch. Fold compact delta IDs plus ops are likewise
+   slabbed.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.
