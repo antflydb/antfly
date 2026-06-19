@@ -705,6 +705,12 @@ pub const RoutineSecurity = enum {
     definer,
 };
 
+pub const RoutineParallelSafety = enum {
+    safe,
+    restricted,
+    unsafe,
+};
+
 pub const CreateRoutinePlan = struct {
     kind: RoutineKind,
     routine_name: []const u8,
@@ -714,6 +720,7 @@ pub const CreateRoutinePlan = struct {
     language: ?[]const u8 = null,
     volatility: ?RoutineVolatility = null,
     security: ?RoutineSecurity = null,
+    parallel_safety: ?RoutineParallelSafety = null,
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {

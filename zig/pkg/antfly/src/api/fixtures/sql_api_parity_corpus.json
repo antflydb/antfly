@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "1f77856262484ccc69d6e35d87047b71e29f264b7d51e9838c2196a693ac5592",
-  "source_entry_count": 969,
-  "entry_count": 969,
+  "source_sha256": "0841321a8a75d73a70c1634c341cd858bf0b95ed18ca671192e89f20e4b52baa",
+  "source_entry_count": 970,
+  "entry_count": 970,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3895,6 +3895,17 @@
       "sql": "CREATE FUNCTION costed_audit() RETURNS trigger LANGUAGE plpgsql COST 10"
     },
     {
+      "name": "create parallel safe function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "parallel_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=parallel_audit:args=0:replace=false:returns=trigger:language=plpgsql:parallel=safe",
+      "sql": "CREATE FUNCTION parallel_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE"
+    },
+    {
       "name": "unsupported create function body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
@@ -3906,7 +3917,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF"
     },
     {
       "name": "drop function catalog ddl",

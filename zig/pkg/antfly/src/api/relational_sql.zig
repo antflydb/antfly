@@ -174,6 +174,7 @@ pub const FunctionCatalogPlan = sql_adapter.FunctionCatalogPlan;
 pub const CreateRoutinePlan = sql_adapter.CreateRoutinePlan;
 pub const DropRoutinePlan = sql_adapter.DropRoutinePlan;
 pub const RoutineKind = sql_adapter.RoutineKind;
+pub const RoutineParallelSafety = sql_adapter.RoutineParallelSafety;
 pub const RoutineSecurity = sql_adapter.RoutineSecurity;
 pub const RoutineVolatility = sql_adapter.RoutineVolatility;
 pub const AuthorizationCatalogPlan = sql_adapter.AuthorizationCatalogPlan;
@@ -3523,6 +3524,7 @@ const Parser = struct {
         const language = syntax.language;
         const volatility = syntax.volatility;
         const security = syntax.security;
+        const parallel_safety = syntax.parallel_safety;
         const cost = syntax.cost;
         syntax.routine_name = "";
         syntax.returns_type = null;
@@ -3537,6 +3539,7 @@ const Parser = struct {
             .language = language,
             .volatility = volatility,
             .security = security,
+            .parallel_safety = parallel_safety,
             .cost = cost,
         };
     }
@@ -45208,8 +45211,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=costed_audit:args=0:replace=false:returns=trigger:language=plpgsql:cost=10", cost_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, cost_function));
 
+    var parallel_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION parallel_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE;");
+    defer parallel_function.deinit(alloc);
+    const parallel_function_plan = switch (parallel_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineParallelSafety.safe, parallel_function_plan.parallel_safety.?);
+    const parallel_function_fingerprint = try ddlFingerprintAlloc(alloc, parallel_function);
+    defer alloc.free(parallel_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=parallel_audit:args=0:replace=false:returns=trigger:language=plpgsql:parallel=safe", parallel_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, parallel_function));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -57594,6 +57612,14 @@ fn routineSecurityName(security: RoutineSecurity) []const u8 {
     };
 }
 
+fn routineParallelSafetyName(parallel_safety: RoutineParallelSafety) []const u8 {
+    return switch (parallel_safety) {
+        .safe => "safe",
+        .restricted => "restricted",
+        .unsafe => "unsafe",
+    };
+}
+
 fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutinePlan) ![]u8 {
     var base = if (create.language) |language|
         try std.fmt.allocPrint(
@@ -57635,6 +57661,15 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             alloc,
             "{s}:security={s}",
             .{ base, routineSecurityName(security) },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.parallel_safety) |parallel_safety| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:parallel={s}",
+            .{ base, routineParallelSafetyName(parallel_safety) },
         );
         alloc.free(base);
         base = next;

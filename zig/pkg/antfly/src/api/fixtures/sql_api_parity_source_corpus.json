@@ -4303,6 +4303,17 @@
       "sql": "CREATE FUNCTION costed_audit() RETURNS trigger LANGUAGE plpgsql COST 10"
     },
     {
+      "name": "create parallel safe function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "parallel_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=parallel_audit:args=0:replace=false:returns=trigger:language=plpgsql:parallel=safe",
+      "sql": "CREATE FUNCTION parallel_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE"
+    },
+    {
       "name": "unsupported create function body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
@@ -4314,7 +4325,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF"
     },
     {
       "name": "drop function catalog ddl",

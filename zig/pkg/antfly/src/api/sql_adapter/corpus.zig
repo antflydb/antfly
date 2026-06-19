@@ -3915,6 +3915,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_volatility: bool = false,
     ddl_function_security: bool = false,
     ddl_function_cost: bool = false,
+    ddl_function_parallel: bool = false,
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
@@ -5419,7 +5420,7 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_routine_option = self.unsupported_ddl_routine_option or
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
-                    std.mem.indexOf(u8, entry.sql, " PARALLEL ") != null);
+                    std.mem.indexOf(u8, entry.sql, " LEAKPROOF") != null);
             self.unsupported_ddl_row_security_policy_expression = self.unsupported_ddl_row_security_policy_expression or
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
@@ -5583,6 +5584,7 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_volatility = self.ddl_function_volatility or std.mem.indexOf(u8, entry.plan, ":volatility=") != null;
                     self.ddl_function_security = self.ddl_function_security or std.mem.indexOf(u8, entry.plan, ":security=") != null;
                     self.ddl_function_cost = self.ddl_function_cost or std.mem.indexOf(u8, entry.plan, ":cost=") != null;
+                    self.ddl_function_parallel = self.ddl_function_parallel or std.mem.indexOf(u8, entry.plan, ":parallel=") != null;
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;
@@ -6562,6 +6564,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_function_volatility);
         try std.testing.expect(self.ddl_function_security);
         try std.testing.expect(self.ddl_function_cost);
+        try std.testing.expect(self.ddl_function_parallel);
         try std.testing.expect(self.ddl_function_drop);
         try std.testing.expect(self.ddl_function_drop_cascade);
         try std.testing.expect(self.ddl_procedure_create);

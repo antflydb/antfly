@@ -411,6 +411,7 @@ pub const CreateRoutineSyntax = struct {
     language: ?[]const u8 = null,
     volatility: ?ddl_plan.RoutineVolatility = null,
     security: ?ddl_plan.RoutineSecurity = null,
+    parallel_safety: ?ddl_plan.RoutineParallelSafety = null,
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -2536,6 +2537,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     errdefer if (language) |value| alloc.free(@constCast(value));
     var volatility: ?ddl_plan.RoutineVolatility = null;
     var security: ?ddl_plan.RoutineSecurity = null;
+    var parallel_safety: ?ddl_plan.RoutineParallelSafety = null;
     var cost: ?[]const u8 = null;
     errdefer if (cost) |value| alloc.free(@constCast(value));
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
@@ -2575,6 +2577,19 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             }
             continue;
         }
+        if (cursor.matchKeyword("parallel")) {
+            if (parallel_safety != null) return error.UnsupportedSqlShape;
+            if (cursor.matchKeyword("safe")) {
+                parallel_safety = .safe;
+            } else if (cursor.matchKeyword("restricted")) {
+                parallel_safety = .restricted;
+            } else if (cursor.matchKeyword("unsafe")) {
+                parallel_safety = .unsafe;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+            continue;
+        }
         if (cursor.matchKeyword("cost")) {
             if (cost != null) return error.UnsupportedSqlShape;
             const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
@@ -2596,6 +2611,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .language = language,
         .volatility = volatility,
         .security = security,
+        .parallel_safety = parallel_safety,
         .cost = cost,
     };
     returns_type = null;
@@ -7063,6 +7079,15 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(RoutineKindSyntax.function, cost_function.kind);
     try std.testing.expectEqualStrings("10", cost_function.cost.?);
 
+    var parallel_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql PARALLEL SAFE;");
+    defer lexer.freeTokens(alloc, &parallel_function_tokens);
+    var parallel_function_pos: usize = 0;
+    var parallel_function = try parseCreateRoutineCatalogTailAlloc(alloc, parallel_function_tokens.items, &parallel_function_pos);
+    defer parallel_function.deinit(alloc);
+    try std.testing.expectEqual(parallel_function_tokens.items.len, parallel_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, parallel_function.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineParallelSafety.safe, parallel_function.parallel_safety.?);
+
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);
     var create_procedure_pos: usize = 0;
@@ -7116,7 +7141,7 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(security_tokens.items.len, security_pos);
     try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, security.security.?);
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql PARALLEL SAFE;");
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql LEAKPROOF;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));
