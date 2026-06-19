@@ -8667,19 +8667,11 @@ pub const ApiHttpServer = struct {
         }
 
         for (query.text_patterns) |predicate| {
-            const plan = (try textSidecarCandidatePlanForRowsTextPatternAlloc(
-                self.alloc,
+            var produced = (try self.textSidecarCandidateSetsForRowsTextPatternAlloc(
+                artifacts,
                 sidecars,
                 predicate,
             )) orelse continue;
-            defer if (plan.sidecar_names) |names| self.alloc.free(names);
-
-            var produced = try serverless_query.lakeTextSidecarCandidateSetsFromArtifactStoreAlloc(
-                self.alloc,
-                artifacts,
-                sidecars,
-                plan,
-            );
             defer produced.deinit(self.alloc);
             try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(self.alloc, &sets, produced.sets);
         }
@@ -8793,19 +8785,11 @@ pub const ApiHttpServer = struct {
         errdefer deinitOwnedCandidateSetList(self.alloc, &sets);
 
         for (group.text_patterns) |predicate| {
-            const plan = (try textSidecarCandidatePlanForRowsTextPatternAlloc(
-                self.alloc,
+            var produced = (try self.textSidecarCandidateSetsForRowsTextPatternAlloc(
+                artifacts,
                 sidecars,
                 predicate,
             )) orelse continue;
-            defer if (plan.sidecar_names) |names| self.alloc.free(names);
-
-            var produced = try serverless_query.lakeTextSidecarCandidateSetsFromArtifactStoreAlloc(
-                self.alloc,
-                artifacts,
-                sidecars,
-                plan,
-            );
             defer produced.deinit(self.alloc);
             try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(self.alloc, &sets, produced.sets);
         }
@@ -8825,12 +8809,51 @@ pub const ApiHttpServer = struct {
             group.json_path_exists.len == 0;
     }
 
+    fn textSidecarCandidateSetsForRowsTextPatternAlloc(
+        self: *ApiHttpServer,
+        artifacts: *serverless_artifacts.ArtifactStore,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+        predicate: db_mod.types.RelationalRowsTextPatternPredicate,
+    ) !?serverless_query.LakeOwnedSidecarCandidateSets {
+        const queries = textPatternCandidateQueriesFromPattern(predicate) orelse return null;
+        const sidecar_names = try textSidecarNamesForFieldAlloc(self.alloc, sidecars, predicate.field);
+        if (sidecar_names.len == 0) {
+            self.alloc.free(sidecar_names);
+            return null;
+        }
+        defer self.alloc.free(sidecar_names);
+
+        var sets = std.ArrayListUnmanaged(serverless_query.LakeOwnedSidecarCandidateSet).empty;
+        errdefer deinitOwnedCandidateSetList(self.alloc, &sets);
+
+        for (queries.slice()) |query| {
+            var produced = try serverless_query.lakeTextSidecarCandidateSetsFromArtifactStoreAlloc(
+                self.alloc,
+                artifacts,
+                sidecars,
+                .{
+                    .request = .{
+                        .text = query.text,
+                        .operator = query.operator,
+                        .limit = std.math.maxInt(usize),
+                    },
+                    .sidecar_names = sidecar_names,
+                },
+            );
+            defer produced.deinit(self.alloc);
+            try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(self.alloc, &sets, produced.sets);
+        }
+
+        return .{ .sets = try sets.toOwnedSlice(self.alloc) };
+    }
+
     fn textSidecarCandidatePlanForRowsTextPatternAlloc(
         alloc: std.mem.Allocator,
         sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
         predicate: db_mod.types.RelationalRowsTextPatternPredicate,
     ) !?serverless_query.LakeTextSidecarCandidatePlan {
-        const query = textCandidateQueryFromPattern(predicate) orelse return null;
+        const queries = textPatternCandidateQueriesFromPattern(predicate) orelse return null;
+        const query = queries.slice()[0];
         const sidecar_names = try textSidecarNamesForFieldAlloc(alloc, sidecars, predicate.field);
         if (sidecar_names.len == 0) {
             alloc.free(sidecar_names);
@@ -8846,21 +8869,87 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    const TextPatternCandidateQueries = struct {
+        items: [2]TextPatternCandidateQuery = undefined,
+        len: usize = 0,
+
+        fn append(self: *@This(), query: TextPatternCandidateQuery) void {
+            std.debug.assert(self.len < self.items.len);
+            self.items[self.len] = query;
+            self.len += 1;
+        }
+
+        fn slice(self: *const @This()) []const TextPatternCandidateQuery {
+            return self.items[0..self.len];
+        }
+    };
+
     const TextPatternCandidateQuery = struct {
         text: []const u8,
         operator: serverless_query.QueryOperator,
     };
 
-    fn textCandidateQueryFromPattern(predicate: db_mod.types.RelationalRowsTextPatternPredicate) ?TextPatternCandidateQuery {
+    fn textPatternCandidateQueriesFromPattern(predicate: db_mod.types.RelationalRowsTextPatternPredicate) ?TextPatternCandidateQueries {
         if (predicate.negated or predicate.pattern.len == 0) return null;
         if (containsSqlLikeEscape(predicate.pattern)) return null;
         if (!containsSearchableTextByte(predicate.pattern)) return null;
         if (!containsSqlLikeWildcard(predicate.pattern)) {
-            return .{ .text = predicate.pattern, .operator = .phrase };
+            var queries = TextPatternCandidateQueries{};
+            queries.append(.{ .text = predicate.pattern, .operator = .phrase });
+            return queries;
         }
         const prefix = simpleTrailingPercentPrefix(predicate.pattern) orelse return null;
-        if (!containsSearchableTextByte(prefix) or containsWhitespaceOrControl(prefix)) return null;
-        return .{ .text = prefix, .operator = .prefix_any_term };
+        if (!containsSearchableTextByte(prefix)) return null;
+        if (containsWhitespaceOrControl(prefix)) return textPatternCandidateQueriesFromTrailingPrefix(prefix);
+        var queries = TextPatternCandidateQueries{};
+        queries.append(.{ .text = prefix, .operator = .prefix_any_term });
+        return queries;
+    }
+
+    fn textPatternCandidateQueriesFromTrailingPrefix(prefix: []const u8) ?TextPatternCandidateQueries {
+        var first_token_start: ?usize = null;
+        var last_token_start: ?usize = null;
+        var last_token_end: ?usize = null;
+        var in_token = false;
+
+        for (prefix, 0..) |ch, idx| {
+            if (std.ascii.isWhitespace(ch)) {
+                in_token = false;
+                continue;
+            }
+            if (std.ascii.isControl(ch)) return null;
+            if (!in_token) {
+                if (first_token_start == null) first_token_start = idx;
+                last_token_start = idx;
+                in_token = true;
+            }
+            last_token_end = idx + 1;
+        }
+
+        const first_start = first_token_start orelse return null;
+        const last_start = last_token_start orelse return null;
+        const last_end = last_token_end orelse return null;
+
+        var queries = TextPatternCandidateQueries{};
+        if (last_end == prefix.len) {
+            if (last_start > first_start) {
+                const complete_terms = std.mem.trim(u8, prefix[0..last_start], " \t\r\n");
+                if (containsSearchableTextByte(complete_terms)) {
+                    queries.append(.{ .text = complete_terms, .operator = .all_terms });
+                }
+            }
+            const partial_term = prefix[last_start..last_end];
+            if (containsSearchableTextByte(partial_term)) {
+                queries.append(.{ .text = partial_term, .operator = .prefix_any_term });
+            }
+        } else {
+            const complete_terms = std.mem.trim(u8, prefix, " \t\r\n");
+            if (containsSearchableTextByte(complete_terms)) {
+                queries.append(.{ .text = complete_terms, .operator = .all_terms });
+            }
+        }
+
+        return if (queries.len == 0) null else queries;
     }
 
     fn containsSqlLikeWildcard(pattern: []const u8) bool {
@@ -19817,6 +19906,24 @@ test "api http server lake text candidate planning rejects ambiguous field sidec
     try std.testing.expectEqual(serverless_query.QueryOperator.prefix_any_term, category_prefix_plan.request.operator);
     try std.testing.expectEqualStrings("events.category.simple", category_prefix_plan.sidecar_names.?[0]);
 
+    const category_multi_prefix_queries = ApiHttpServer.textPatternCandidateQueriesFromPattern(.{
+        .field = "category",
+        .pattern = "news ro%",
+    }) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), category_multi_prefix_queries.len);
+    try std.testing.expectEqualStrings("news", category_multi_prefix_queries.items[0].text);
+    try std.testing.expectEqual(serverless_query.QueryOperator.all_terms, category_multi_prefix_queries.items[0].operator);
+    try std.testing.expectEqualStrings("ro", category_multi_prefix_queries.items[1].text);
+    try std.testing.expectEqual(serverless_query.QueryOperator.prefix_any_term, category_multi_prefix_queries.items[1].operator);
+
+    const category_trailing_space_queries = ApiHttpServer.textPatternCandidateQueriesFromPattern(.{
+        .field = "category",
+        .pattern = "news room %",
+    }) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), category_trailing_space_queries.len);
+    try std.testing.expectEqualStrings("news room", category_trailing_space_queries.items[0].text);
+    try std.testing.expectEqual(serverless_query.QueryOperator.all_terms, category_trailing_space_queries.items[0].operator);
+
     try std.testing.expect((try ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
         alloc,
         sidecars[0..],
@@ -19978,7 +20085,7 @@ test "api http server routes public external lake row queries through configured
     };
     const parquet_text_columns = [_]serverless_query.LakeParquetTestPlainByteArrayColumn{
         .{ .column_id = "description", .values = &[_][]const u8{ "alpha", "beta", "gamma" } },
-        .{ .column_id = "category", .values = &[_][]const u8{ "ops", "news", "news" } },
+        .{ .column_id = "category", .values = &[_][]const u8{ "ops", "news", "news room" } },
     };
     const parquet_object = try serverless_query.buildLakeParquetTestPlainI64AndByteArrayObjectAlloc(alloc, &parquet_columns, &parquet_text_columns);
     defer alloc.free(parquet_object);
@@ -20007,7 +20114,7 @@ test "api http server routes public external lake row queries through configured
         try external_rowsource.makeRowRef(external_binding, "part-a.parquet", 0, 2),
     };
     const descriptions = [_][]const u8{ "alpha", "beta", "gamma" };
-    const categories = [_][]const u8{ "ops", "news", "news" };
+    const categories = [_][]const u8{ "ops", "news", "news room" };
     const sidecar_columns = [_]rowsource_api.ColumnVector{
         .{ .name = "description", .values = .{ .bytes = &descriptions } },
         .{ .name = "category", .values = .{ .bytes = &categories } },
@@ -20390,11 +20497,45 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 2), or_text_query_candidates.get("intersected_ref_count").?.integer);
     try std.testing.expect(or_text_query_candidates.get("hydration_possible").?.bool);
 
+    var multi_token_prefix_sidecar_response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"category\",\"op\":\"text_pattern\",\"pattern\":\"news ro%\"}}}", null);
+    defer multi_token_prefix_sidecar_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), multi_token_prefix_sidecar_response.status);
+    try std.testing.expectEqual(@as(u32, 15), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_multi_token_prefix_sidecar = try std.json.parseFromSlice(std.json.Value, alloc, multi_token_prefix_sidecar_response.body, .{ .allocate = .alloc_always });
+    defer parsed_multi_token_prefix_sidecar.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_multi_token_prefix_sidecar.value.object.get("total").?.integer);
+    const multi_token_prefix_sidecar_rows = parsed_multi_token_prefix_sidecar.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), multi_token_prefix_sidecar_rows.len);
+    try std.testing.expectEqual(@as(i64, 30), multi_token_prefix_sidecar_rows[0].object.get("amount").?.integer);
+
+    var multi_token_prefix_query_explain_response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/events/rows/explain",
+        .body = "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"category\",\"op\":\"text_pattern\",\"pattern\":\"news ro%\"}}}",
+    });
+    defer multi_token_prefix_query_explain_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), multi_token_prefix_query_explain_response.status);
+    try std.testing.expectEqual(@as(u32, 16), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_multi_token_prefix_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, multi_token_prefix_query_explain_response.body, .{ .allocate = .alloc_always });
+    defer parsed_multi_token_prefix_query_explain.deinit();
+    const multi_token_prefix_query_explain_plan = parsed_multi_token_prefix_query_explain.value.object.get("plan").?.object;
+    const multi_token_prefix_query_candidates = multi_token_prefix_query_explain_plan.get("sidecar_candidates").?.object;
+    try std.testing.expectEqual(@as(i64, 1), multi_token_prefix_query_candidates.get("supplied_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), multi_token_prefix_query_candidates.get("supplied_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), multi_token_prefix_query_candidates.get("usable_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), multi_token_prefix_query_candidates.get("usable_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), multi_token_prefix_query_candidates.get("intersected_ref_count").?.integer);
+    try std.testing.expect(multi_token_prefix_query_candidates.get("hydration_possible").?.bool);
+
     var gcs_response = try server.handlePublicTableRowsQuery("events_gcs", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":7}}}", null);
     defer gcs_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), gcs_response.status);
-    try std.testing.expectEqual(@as(u32, 15), resolver.open_count);
-    try std.testing.expectEqual(@as(u32, 14), resolver.s3_open_count);
+    try std.testing.expectEqual(@as(u32, 17), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 16), resolver.s3_open_count);
     try std.testing.expectEqual(@as(u32, 1), resolver.gcs_open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
