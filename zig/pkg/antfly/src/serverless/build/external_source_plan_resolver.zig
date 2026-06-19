@@ -181,12 +181,19 @@ fn inventoryForBindingAlloc(
                 source_options.object_uri_base,
             );
             defer alloc.free(metadata_uri);
-            break :blk try lake_iceberg_snapshot.readSnapshotInventoryAlloc(alloc, .{
+            var inventory = try lake_iceberg_snapshot.readSnapshotInventoryAlloc(alloc, .{
                 .client = opened_store.client,
                 .source_id = binding.table_id,
                 .metadata_uri = metadata_uri,
                 .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
             });
+            errdefer inventory.deinit(alloc);
+            try lake_iceberg_snapshot.pinInventoryDataFileObjectVersions(
+                alloc,
+                opened_store.client,
+                &inventory,
+            );
+            break :blk inventory;
         },
         .lance => error.UnsupportedRowsQuery,
     };
@@ -346,6 +353,222 @@ test "remote uri publication resolver pins parquet inventory into artifact store
     try std.testing.expectEqualStrings("events.external-files", plan.artifacts[0].name);
     try std.testing.expectEqualStrings(plan.artifacts[0].artifact_id, plan.base_source.external_parquet.file_inventory_artifact.?);
     try std.testing.expectEqualStrings("schema-v1", plan.base_source.external_parquet.schema_fingerprint);
+}
+
+test "remote uri publication resolver pins iceberg data object identity into artifact store" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var version_hint = try client.putObject("bucket", "events/metadata/version-hint.text", "1\n", .{});
+    defer version_hint.deinit(alloc);
+    var metadata_file = try client.putObject("bucket", "events/metadata/v1.metadata.json", resolverIcebergMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var data_manifest = try buildResolverIcebergDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var manifest_list = try buildResolverIcebergManifestListFixture(alloc, data_manifest.items.len);
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "events/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+    const data_a = try alloc.alloc(u8, 4096);
+    defer alloc.free(data_a);
+    @memset(data_a, 0);
+    var data_a_put = try client.putObject("bucket", "events/data/a.parquet", data_a, .{});
+    defer data_a_put.deinit(alloc);
+
+    var opened_store = try object_store_support.OpenedObjectStore.initWithClient(alloc, client, "bucket", "events");
+    defer opened_store.deinit();
+    var object_resolver = StaticObjectStoreResolver{ .opened_store = opened_store };
+
+    var artifact_impl = MemoryArtifactStore.init(alloc);
+    defer artifact_impl.deinit();
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+
+    var publication = Resolver.init(&artifacts, object_resolver.resolver(), .{});
+    var plan = (try publication.planResolver().resolveAlloc(alloc, .{
+        .namespace = "events",
+        .table_name = "events",
+        .binding = .{
+            .table_id = "events",
+            .format = .iceberg,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "iceberg-schema:7",
+            .write_policy = .read_only,
+        },
+    })).?;
+    defer plan.deinit(alloc);
+
+    const artifact_bytes = artifact_impl.bytes orelse return error.ArtifactNotFound;
+    var decoded = try external_source.decodeInventoryAlloc(alloc, artifact_bytes);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expectEqualStrings("events.external-files", plan.artifacts[0].name);
+    try std.testing.expectEqualStrings(plan.artifacts[0].artifact_id, plan.base_source.external_iceberg.file_inventory_artifact.?);
+    try std.testing.expectEqual(external_source.Format.iceberg, decoded.format);
+    try std.testing.expectEqual(@as(usize, 1), decoded.files.len);
+    try std.testing.expectEqualStrings("s3://bucket/events/data/a.parquet", decoded.files[0].object_uri);
+    try std.testing.expect(decoded.files[0].etag.len != 0);
+    try std.testing.expectEqual(@as(usize, 0), decoded.files[0].version_id.len);
+    try std.testing.expectEqual(@as(?i64, 42), decoded.files[0].data_sequence_number);
+}
+
+fn resolverIcebergMetadataJson() []const u8 {
+    return
+    \\{
+    \\  "format-version": 2,
+    \\  "table-uuid": "uuid-events",
+    \\  "location": "s3://bucket/events",
+    \\  "current-schema-id": 7,
+    \\  "current-snapshot-id": 12,
+    \\  "snapshots": [
+    \\    {
+    \\      "snapshot-id": 12,
+    \\      "sequence-number": 42,
+    \\      "timestamp-ms": 1700000000000,
+    \\      "manifest-list": "s3://bucket/events/metadata/snap-12.avro"
+    \\    }
+    \\  ]
+    \\}
+    ;
+}
+
+fn buildResolverIcebergManifestListFixture(alloc: Allocator, manifest_length: usize) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendResolverIcebergAvroHeader(alloc, &out, resolverIcebergManifestListSchema(), "0123456789abcdef");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendResolverIcebergString(alloc, &block, "s3://bucket/events/metadata/m-a.avro");
+    try appendResolverIcebergLong(alloc, &block, @intCast(manifest_length));
+    try appendResolverIcebergLong(alloc, &block, 0);
+    try appendResolverIcebergLong(alloc, &block, 0);
+    try appendResolverIcebergLong(alloc, &block, 42);
+    try appendResolverIcebergLong(alloc, &block, 1);
+    try appendResolverIcebergLong(alloc, &block, 0);
+    try appendResolverIcebergLong(alloc, &block, 0);
+    try appendResolverIcebergLong(alloc, &block, 3);
+    try appendResolverIcebergLong(alloc, &block, 0);
+    try appendResolverIcebergLong(alloc, &block, 0);
+
+    try appendResolverIcebergAvroBlock(alloc, &out, block.items, 1, "0123456789abcdef");
+    return out;
+}
+
+fn buildResolverIcebergDataManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendResolverIcebergAvroHeader(alloc, &out, resolverIcebergDataManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendResolverIcebergLong(alloc, &block, 1);
+    try appendResolverIcebergLong(alloc, &block, 1);
+    try appendResolverIcebergLong(alloc, &block, 12);
+    try appendResolverIcebergLong(alloc, &block, 1);
+    try appendResolverIcebergLong(alloc, &block, 42);
+    try appendResolverIcebergLong(alloc, &block, 1);
+    try appendResolverIcebergLong(alloc, &block, 43);
+    try appendResolverIcebergLong(alloc, &block, 0);
+    try appendResolverIcebergString(alloc, &block, "s3://bucket/events/data/a.parquet");
+    try appendResolverIcebergString(alloc, &block, "PARQUET");
+    try appendResolverIcebergLong(alloc, &block, 3);
+    try appendResolverIcebergLong(alloc, &block, 4096);
+
+    try appendResolverIcebergAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
+    return out;
+}
+
+fn resolverIcebergManifestListSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_file","fields":[
+    \\{"name":"manifest_path","type":"string"},
+    \\{"name":"manifest_length","type":"long"},
+    \\{"name":"partition_spec_id","type":"int"},
+    \\{"name":"content","type":"int"},
+    \\{"name":"sequence_number","type":"long"},
+    \\{"name":"added_files_count","type":"int"},
+    \\{"name":"existing_files_count","type":"int"},
+    \\{"name":"deleted_files_count","type":"int"},
+    \\{"name":"added_rows_count","type":"long"},
+    \\{"name":"existing_rows_count","type":"long"},
+    \\{"name":"deleted_rows_count","type":"long"}]}
+    ;
+}
+
+fn resolverIcebergDataManifestSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_entry","fields":[
+    \\{"name":"status","type":"int"},
+    \\{"name":"snapshot_id","type":["null","long"]},
+    \\{"name":"data_sequence_number","type":["null","long"]},
+    \\{"name":"file_sequence_number","type":["null","long"]},
+    \\{"name":"data_file","type":{"type":"record","name":"data_file","fields":[
+    \\{"name":"content","type":"int"},
+    \\{"name":"file_path","type":"string"},
+    \\{"name":"file_format","type":"string"},
+    \\{"name":"record_count","type":"long"},
+    \\{"name":"file_size_in_bytes","type":"long"}]}}]}
+    ;
+}
+
+fn appendResolverIcebergAvroHeader(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    schema: []const u8,
+    sync: []const u8,
+) !void {
+    try out.appendSlice(alloc, "Obj\x01");
+    try appendResolverIcebergLong(alloc, out, 2);
+    try appendResolverIcebergString(alloc, out, "avro.schema");
+    try appendResolverIcebergBytes(alloc, out, schema);
+    try appendResolverIcebergString(alloc, out, "avro.codec");
+    try appendResolverIcebergBytes(alloc, out, "null");
+    try appendResolverIcebergLong(alloc, out, 0);
+    try out.appendSlice(alloc, sync);
+}
+
+fn appendResolverIcebergAvroBlock(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    block: []const u8,
+    count: i64,
+    sync: []const u8,
+) !void {
+    try appendResolverIcebergLong(alloc, out, count);
+    try appendResolverIcebergLong(alloc, out, @intCast(block.len));
+    try out.appendSlice(alloc, block);
+    try out.appendSlice(alloc, sync);
+}
+
+fn appendResolverIcebergString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    try appendResolverIcebergBytes(alloc, out, text);
+}
+
+fn appendResolverIcebergBytes(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    try appendResolverIcebergLong(alloc, out, @intCast(bytes.len));
+    try out.appendSlice(alloc, bytes);
+}
+
+fn appendResolverIcebergLong(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: i64) !void {
+    var remaining = resolverIcebergZigzag(value);
+    while (remaining >= 0x80) {
+        try out.append(alloc, @as(u8, @intCast(remaining & 0x7f)) | 0x80);
+        remaining >>= 7;
+    }
+    try out.append(alloc, @intCast(remaining));
+}
+
+fn resolverIcebergZigzag(value: i64) u64 {
+    if (value >= 0) return @as(u64, @intCast(value)) << 1;
+    const magnitude: u64 = @intCast(-(value + 1));
+    return (magnitude << 1) | 1;
 }
 
 const StaticObjectStoreResolver = struct {
