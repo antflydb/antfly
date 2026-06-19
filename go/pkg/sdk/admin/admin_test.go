@@ -1871,6 +1871,13 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "slot fields") {
 		t.Fatalf("invalid slot list error = %v, want slot fields error", err)
 	}
+	badListSlot.SlotName = "standby a"
+	if err := ValidateHAReplicationSlotListResponse(HAReplicationSlotListResponse{
+		SchemaVersion: 1,
+		Slots:         []HAReplicationSlot{badListSlot},
+	}); err == nil || !strings.Contains(err.Error(), "slot fields") {
+		t.Fatalf("invalid slot name error = %v, want slot fields error", err)
+	}
 
 	response.Action.NodeId = ""
 	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
@@ -1887,6 +1894,12 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 		t.Fatalf("invalid slot action error = %v, want invalid action error", err)
 	}
 	response.SlotAction = HAReplicationSlotActionCreate
+
+	response.Slot.SlotName = "standby a"
+	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "slot fields") {
+		t.Fatalf("invalid slot name error = %v, want slot fields error", err)
+	}
+	response.Slot.SlotName = "standby-a"
 
 	response.Slot.TimelineId = 0
 	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "slot fields") {
@@ -2195,6 +2208,9 @@ func TestValidateHAResponseEvidence(t *testing.T) {
 	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(slot)); err != nil {
 		t.Fatalf("ValidateHAReplicationSlotActionResponseEvidence returned error: %v", err)
 	}
+	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(strings.Replace(slot, `"slot_name":"standby-a",`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+		t.Fatalf("missing slot name evidence error = %v, want slot field evidence error", err)
+	}
 	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(strings.Replace(slot, `,"active":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
 		t.Fatalf("missing slot active evidence error = %v, want slot field evidence error", err)
 	}
@@ -2204,6 +2220,9 @@ func TestValidateHAResponseEvidence(t *testing.T) {
 	}
 	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(`{"schema_version":1}`)); err == nil || !strings.Contains(err.Error(), "slots field evidence") {
 		t.Fatalf("missing slot list evidence error = %v, want slots field evidence error", err)
+	}
+	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(strings.Replace(slotList, `,"timeline_id":1`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+		t.Fatalf("missing slot timeline evidence error = %v, want slot field evidence error", err)
 	}
 	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(strings.Replace(slotList, `,"current_lsn":0`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
 		t.Fatalf("missing slot current_lsn evidence error = %v, want slot field evidence error", err)

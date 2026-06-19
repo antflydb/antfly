@@ -69,6 +69,11 @@ func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 			wantErr: "slot",
 		},
 		{
+			name:    "invalid slot name",
+			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"name":"standby-a"`, `"name":"standby a"`, 1),
+			wantErr: "slot",
+		},
+		{
 			name:    "invalid durability mode",
 			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"mode":"remote_write"`, `"mode":"remote-write"`, 1),
 			wantErr: "durability",

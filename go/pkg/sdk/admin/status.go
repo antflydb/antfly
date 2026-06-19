@@ -135,9 +135,9 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 	if strings.TrimSpace(snapshot.Role) != string(HAPrimarySnapshotRolePrimary) {
 		return nil, fmt.Errorf("invalid primary status role")
 	}
-	nodeID := strings.TrimSpace(snapshot.NodeID)
-	if nodeID == "" {
-		return nil, fmt.Errorf("missing primary status node_id")
+	nodeID := snapshot.NodeID
+	if !validHAIdentifier(nodeID) {
+		return nil, fmt.Errorf("invalid primary status node_id %q", snapshot.NodeID)
 	}
 	if !haAdminIdentityJSONComplete(snapshot.Identity) {
 		return nil, fmt.Errorf("missing primary status identity")
@@ -187,7 +187,7 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 			lastError = strings.TrimSpace(*slot.LastError)
 		}
 		parsed.Response.Snapshot.Slots = append(parsed.Response.Snapshot.Slots, HASlotSnapshot{
-			Name:            strings.TrimSpace(slot.Name),
+			Name:            slot.Name,
 			TimelineId:      haUint64StatusValue(slot.TimelineID),
 			Active:          haBoolStatusValue(slot.Active),
 			ReseedRequired:  haBoolStatusValue(slot.ReseedRequired),
@@ -222,6 +222,9 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 			CandidateCount:  haUint64StatusValue(snapshot.Durability.CandidateCount),
 		}
 	}
+	if err := ValidateHAPrimaryStatusResponse(parsed.Response); err != nil {
+		return nil, err
+	}
 	return parsed, nil
 }
 
@@ -252,9 +255,9 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 	if strings.TrimSpace(snapshot.Role) != string(HAStandbySnapshotRoleStandby) {
 		return nil, fmt.Errorf("invalid standby status role")
 	}
-	nodeID := strings.TrimSpace(snapshot.NodeID)
-	if nodeID == "" {
-		return nil, fmt.Errorf("missing standby status node_id")
+	nodeID := snapshot.NodeID
+	if !validHAIdentifier(nodeID) {
+		return nil, fmt.Errorf("invalid standby status node_id %q", snapshot.NodeID)
 	}
 	if !haAdminIdentityJSONComplete(snapshot.Identity) {
 		return nil, fmt.Errorf("missing standby status identity")
@@ -265,7 +268,7 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 	if err := haStandbyStatusJSONConsistent(snapshot); err != nil {
 		return nil, err
 	}
-	return &HAStandbyStatusResponse{
+	response := &HAStandbyStatusResponse{
 		SchemaVersion: schemaVersion,
 		Snapshot: HAStandbySnapshot{
 			Role:                     HAStandbySnapshotRoleStandby,
@@ -286,7 +289,11 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 			CaughtUpToReceived:       haBoolStatusValue(snapshot.CaughtUpToReceived),
 			CanServeSafeReads:        haBoolStatusValue(snapshot.CanServeSafeReads),
 		},
-	}, nil
+	}
+	if err := ValidateHAStandbyStatusResponse(*response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func haIdentityFromStatusJSON(identity haAdminIdentityJSON) HAIdentity {

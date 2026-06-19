@@ -1070,6 +1070,8 @@ type haPromotionResponseEvidence struct {
 }
 
 type haReplicationSlotEvidence struct {
+	SlotName       *string `json:"slot_name"`
+	TimelineId     *uint64 `json:"timeline_id"`
 	RestartLsn     *uint64 `json:"restart_lsn"`
 	ReceivedLsn    *uint64 `json:"received_lsn"`
 	AppliedLsn     *uint64 `json:"applied_lsn"`
@@ -1195,7 +1197,9 @@ func haPromotionResultEvidenceComplete(result haPromotionResultEvidence) bool {
 }
 
 func haReplicationSlotEvidenceComplete(slot haReplicationSlotEvidence) bool {
-	return slot.RestartLsn != nil &&
+	return slot.SlotName != nil &&
+		slot.TimelineId != nil &&
+		slot.RestartLsn != nil &&
 		slot.ReceivedLsn != nil &&
 		slot.AppliedLsn != nil &&
 		slot.SafeReadLsn != nil &&
@@ -1344,9 +1348,9 @@ func validateHAPrimaryRetentionSnapshot(retention HARetentionSnapshot, currentLS
 }
 
 func validateHASlotSnapshot(slot HASlotSnapshot, currentLSN uint64) error {
-	name := strings.TrimSpace(slot.Name)
-	if name == "" {
-		return fmt.Errorf("missing slot snapshot name")
+	name := slot.Name
+	if !validHAIdentifier(name) {
+		return fmt.Errorf("invalid slot snapshot name %q", slot.Name)
 	}
 	if slot.TimelineId == 0 {
 		return fmt.Errorf("slot %s snapshot missing timeline_id", name)
@@ -1781,7 +1785,7 @@ func HAActionReceiptPresent(receipt HAActionReceipt) bool {
 }
 
 func HAReplicationSlotComplete(slot HAReplicationSlot) bool {
-	return strings.TrimSpace(slot.SlotName) != "" &&
+	return validHAIdentifier(slot.SlotName) &&
 		slot.TimelineId > 0
 }
 
