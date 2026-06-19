@@ -3800,6 +3800,7 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
     unsupported_ddl_deferrable_unique_constraint: bool = false,
     unsupported_ddl_deferrable_primary_key: bool = false,
+    unsupported_ddl_transaction_scoped_search_path: bool = false,
     unsupported_write: bool = false,
     unsupported_insert: bool = false,
     unsupported_update: bool = false,
@@ -4931,6 +4932,9 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "deferrable_primary_key") and
                     std.mem.indexOf(u8, entry.sql, " PRIMARY KEY ") != null and
                     std.mem.indexOf(u8, entry.sql, " DEFERRABLE") != null);
+            self.unsupported_ddl_transaction_scoped_search_path = self.unsupported_ddl_transaction_scoped_search_path or
+                (std.mem.eql(u8, entry.classification_reason, "transaction_scoped_search_path") and
+                    std.mem.indexOf(u8, entry.sql, "SET LOCAL search_path") != null);
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
@@ -5883,6 +5887,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_prepare_recursive_cte_statement);
         try std.testing.expect(self.unsupported_ddl_deferrable_unique_constraint);
         try std.testing.expect(self.unsupported_ddl_deferrable_primary_key);
+        try std.testing.expect(self.unsupported_ddl_transaction_scoped_search_path);
         try std.testing.expect(self.read_row_lock_nowait);
         try std.testing.expect(self.read_row_lock_share);
         try std.testing.expect(self.read_row_lock_key_share);

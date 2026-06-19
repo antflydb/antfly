@@ -1567,10 +1567,12 @@ fn isSupportedUpdatedAtTriggerFunction(name: []const u8) bool {
 
 pub fn parseAdapterNoopSetStatementTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
-    if (!cursor.matchKeyword("local")) _ = cursor.matchKeyword("session");
+    const local = cursor.matchKeyword("local");
+    if (!local) _ = cursor.matchKeyword("session");
 
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (std.ascii.eqlIgnoreCase(setting.text, "search_path")) {
+        if (local) return error.UnsupportedSqlShape;
         try parseAdapterNoopPublicSearchPathTail(cursor);
         return;
     }

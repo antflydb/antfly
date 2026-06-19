@@ -3167,6 +3167,7 @@ const Parser = struct {
     fn parseSetSearchPathDdl(self: *@This()) !SetSearchPathPlan {
         var syntax = try sql_adapter.parseSetSearchPathTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
+        if (syntax.local) return error.UnsupportedSqlShape;
         const namespaces = syntax.namespaces;
         syntax.namespaces = &.{};
         return .{ .namespaces = namespaces, .local = syntax.local };
@@ -45080,6 +45081,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer tenant_session.deinit(alloc);
     try std.testing.expectEqualStrings(catalog_resources.default_database_name, tenant_session.session().currentDatabase());
     try std.testing.expectEqualStrings("tenant_schema", tenant_session.session().primarySearchPathNamespace());
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET LOCAL search_path TO public;"));
 
     var empty_path_session = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
         .current_database_name = "tenant_ops",

@@ -129,6 +129,13 @@
       "sql": "SET search_path TO public;"
     },
     {
+      "name": "unsupported local search path session catalog syntax",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=transaction_scoped_search_path",
+      "classification_reason": "transaction_scoped_search_path",
+      "sql": "SET LOCAL search_path TO public;"
+    },
+    {
       "name": "reset search path session catalog syntax",
       "family": "ddl",
       "summary": {
