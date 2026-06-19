@@ -72,14 +72,63 @@ The Go implementation uses mature protocol SDKs:
   - `create_index`
   - `drop_index`
   - `list_indexes`
-  - `lookup`
+  - `get_document`
   - `query`
+  - `describe_query_request`
   - `backup`
   - `restore`
   - `batch`
 - Antfly A2A skills
   - `query-builder`
   - `retrieval`
+
+## MCP Query Request Design
+
+The MCP `query` tool has two modes:
+
+1. Shorthand mode, for common agent calls. This keeps the existing MCP-friendly arguments such as `fullTextSearch`,
+   `fullTextSearchField`, `semanticSearch`, `fields`, `limit`, `orderBy`, `indexes`, and `filterPrefix`.
+2. Raw QueryRequest mode, for the full Antfly query contract. Callers pass `queryRequest`, which is forwarded as the
+   JSON body for `POST /tables/{tableName}/query`.
+
+Example raw QueryRequest call:
+
+```json
+{
+  "tableName": "montessori_copilot_ft",
+  "queryRequest": {
+    "full_text_search": {
+      "match": "individual freedom personality development",
+      "field": "content"
+    },
+    "fields": ["document_title", "page", "content"],
+    "limit": 5
+  }
+}
+```
+
+The raw `queryRequest` path is intentionally generic. It can carry the OpenAPI `QueryRequest` fields such as `query`,
+`full_text_search`, `filter_query`, `exclusion_query`, `semantic_search`, `embedding_template`, `indexes`,
+`embeddings`, `fields`, `limit`, `offset`, `order_by`, `search_after`, `search_before`, `distance_under`,
+`distance_over`, `search_effort`, `merge_config`, `count`, `profile`, `reranker`, `aggregations`, `graph_searches`,
+`expand_strategy`, `document_renderer`, `pruner`, `join`, and `foreign_sources`.
+
+Raw mode rules:
+
+- `tableName` remains the MCP path/table selector.
+- `queryRequest` must be a JSON object.
+- `queryRequest` is mutually exclusive with shorthand query arguments. The adapter does not merge the two modes because
+  precedence rules would otherwise drift from the REST/OpenAPI contract.
+- `queryRequest.table` is rejected on table-scoped MCP calls. Use `tableName` instead.
+- The raw object is validated by the same `/tables/{tableName}/query` path as direct REST calls.
+
+The full OpenAPI schema is not inlined into every `tools/list` response because the schema is large and references
+recursive query/reranker/graph/join definitions. The `query.queryRequest` input schema stays permissive with compact
+top-level field guidance. Clients that need schema help can call `describe_query_request`, which returns a compact,
+structured summary with examples and pointers to:
+
+- `specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest`
+- `specs/openapi/antfly/query.yaml#/components/schemas/Query`
 
 ## Verification
 
@@ -112,7 +161,9 @@ missing A2A tasks.
 - Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP/A2A
   fields and tool payloads.
 - MCP schemas are generated from Antfly MCP tool descriptors and cover the current Go-parity tool arguments. They are
-  not yet derived from generated OpenAPI or Zig request structs.
+  not yet derived from generated OpenAPI or Zig request structs. The raw `queryRequest` field deliberately uses a
+  permissive schema plus the `describe_query_request` helper to avoid inlining the full recursive OpenAPI query schema
+  into every MCP `tools/list` response.
 
 ## Long-Term Direction
 

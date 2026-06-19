@@ -11804,6 +11804,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_query_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"queryRequest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Raw Antfly QueryRequest body") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
@@ -11851,6 +11854,56 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer query_rest_alias_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_rest_alias_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_rest_alias_resp.body, "\"doc:a\"") != null);
+
+    var raw_query_request_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"},\"fields\":[\"title\",\"body\"],\"limit\":5}}}}",
+    });
+    defer raw_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_resp.body, "\"doc:a\"") != null);
+
+    var mixed_query_request_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}},\"limit\":5}}}",
+    });
+    defer mixed_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), mixed_query_request_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "queryRequest cannot be combined") != null);
+
+    var raw_query_request_table_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"table\":\"docs\",\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}}}}}",
+    });
+    defer raw_query_request_table_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), raw_query_request_table_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "queryRequest.table is not allowed") != null);
+
+    var describe_query_request_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_query_request\",\"arguments\":{}}}",
+    });
+    defer describe_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_query_request_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "metadata.yaml#/components/schemas/QueryRequest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"queryRequest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fielded_full_text\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fields\":[\"title\",\"body\"],\"limit\":5") != null);
 }
 
 test "api http server serves table scan as ndjson" {
