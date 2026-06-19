@@ -5031,12 +5031,17 @@ requires a write permission on the table, audits as `copy_from`, and routes to
 the row-batch import surface; `COPY TO STDOUT` requires a read permission,
 audits as `copy_to`, and routes to the row-query export surface. The bridge also
 marks both directions as requiring an external SQL protocol stream so the SQL
-text cannot masquerade as payload. The remaining production layer is the
-streaming executor that decodes the supplied STDIN bytes through typed schema
-validation, defaults, generated columns, checks, unique/FK participants,
-row-policy/authorization checks, 2PC staging, retryable range routing, and
-deterministic error reporting for imports, and encodes query snapshots for
-exports. PostgreSQL `COPY` syntax is therefore an adapter frontend for those
+text cannot masquerade as payload. `COPY FROM STDIN` has an initial native CSV
+executor that converts the supplied stream into the row-batch API. The decoder
+keeps per-field quote metadata, so default CSV `NULL ''` handling distinguishes
+unquoted empty fields from quoted empty strings and `FORCE_NULL`/`FORCE_NOT_NULL`
+follow PostgreSQL CSV semantics before row JSON reaches typed schema validation.
+The remaining production layer is the broader streaming executor contract
+around that decoder: chunked protocol backpressure, defaults, generated columns,
+checks, unique/FK participants, row-policy/authorization checks, 2PC staging,
+retryable range routing, deterministic reject-limit accounting, and export
+encoding of query snapshots. PostgreSQL `COPY` syntax is therefore an adapter
+frontend for those
 contracts, but it must not bypass row-batch, mutation-source, or routed read
 semantics. Until server-file, `PROGRAM`, alternate stream endpoints, binary
 format, legacy OID options, and broader row-filtered `COPY FROM ... WHERE`

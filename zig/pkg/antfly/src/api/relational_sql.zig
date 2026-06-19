@@ -337,6 +337,11 @@ pub const BulkSqlIoExecutionPlan = struct {
     force_not_null_columns: []const []const u8 = &.{},
     force_null_columns: []const []const u8 = &.{},
 };
+
+const BulkSqlIoCsvField = struct {
+    value: []const u8,
+    quoted: bool = false,
+};
 pub const MaterializedViewCatalogPlan = sql_adapter.MaterializedViewCatalogPlan;
 pub const CreateMaterializedViewPlan = sql_adapter.CreateMaterializedViewPlan;
 pub const RefreshMaterializedViewPlan = sql_adapter.RefreshMaterializedViewPlan;
@@ -2106,7 +2111,7 @@ pub fn bulkSqlIoImportRowsBatchFromStdinAlloc(
         }
 
         const fields = try parseBulkSqlCsvRecordAlloc(alloc, line, plan);
-        defer freeStringSlice(alloc, fields);
+        defer freeBulkSqlCsvFields(alloc, fields);
         if (fields.len != plan.columns.len) return error.InvalidRowsRequest;
         const row_json = try bulkSqlIoRowJsonFromCsvFieldsAlloc(alloc, schema, plan, fields);
         defer alloc.free(row_json);
@@ -2126,18 +2131,19 @@ fn parseBulkSqlCsvRecordAlloc(
     alloc: std.mem.Allocator,
     line: []const u8,
     plan: BulkSqlIoExecutionPlan,
-) ![][]const u8 {
-    const delimiter = bulkSqlIoSingleByteOption(plan.delimiter, ',');
-    const quote = bulkSqlIoSingleByteOption(plan.quote, '"');
-    const escape = bulkSqlIoSingleByteOption(plan.escape, quote);
-    var fields = std.ArrayListUnmanaged([]const u8).empty;
+) ![]BulkSqlIoCsvField {
+    const delimiter = try bulkSqlIoSingleByteOption(plan.delimiter, ',');
+    const quote = try bulkSqlIoSingleByteOption(plan.quote, '"');
+    const escape = try bulkSqlIoSingleByteOption(plan.escape, quote);
+    var fields = std.ArrayListUnmanaged(BulkSqlIoCsvField).empty;
     errdefer {
-        for (fields.items) |value| alloc.free(value);
+        for (fields.items) |field| alloc.free(field.value);
         fields.deinit(alloc);
     }
     var field = std.ArrayListUnmanaged(u8).empty;
     errdefer field.deinit(alloc);
     var in_quote = false;
+    var field_quoted = false;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
         const c = line[i];
@@ -2161,23 +2167,45 @@ fn parseBulkSqlCsvRecordAlloc(
         }
         if (c == quote and field.items.len == 0) {
             in_quote = true;
+            field_quoted = true;
             continue;
         }
         if (c == delimiter) {
-            try fields.append(alloc, try field.toOwnedSlice(alloc));
-            field = .empty;
+            try appendBulkSqlCsvFieldAlloc(alloc, &fields, &field, field_quoted);
+            field_quoted = false;
             continue;
         }
         try field.append(alloc, c);
     }
     if (in_quote) return error.InvalidRowsRequest;
-    try fields.append(alloc, try field.toOwnedSlice(alloc));
+    try appendBulkSqlCsvFieldAlloc(alloc, &fields, &field, field_quoted);
     return try fields.toOwnedSlice(alloc);
 }
 
-fn bulkSqlIoSingleByteOption(option: ?[]const u8, default: u8) u8 {
+fn appendBulkSqlCsvFieldAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(BulkSqlIoCsvField),
+    field: *std.ArrayListUnmanaged(u8),
+    quoted: bool,
+) !void {
+    const value = try field.toOwnedSlice(alloc);
+    errdefer alloc.free(value);
+    try fields.append(alloc, .{
+        .value = value,
+        .quoted = quoted,
+    });
+    field.* = .empty;
+}
+
+fn freeBulkSqlCsvFields(alloc: std.mem.Allocator, fields: []const BulkSqlIoCsvField) void {
+    for (fields) |field| alloc.free(field.value);
+    if (fields.len > 0) alloc.free(fields);
+}
+
+fn bulkSqlIoSingleByteOption(option: ?[]const u8, default: u8) !u8 {
     if (option) |value| {
         if (value.len == 1) return value[0];
+        return error.UnsupportedSqlShape;
     }
     return default;
 }
@@ -2186,7 +2214,7 @@ fn bulkSqlIoRowJsonFromCsvFieldsAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
     plan: BulkSqlIoExecutionPlan,
-    fields: []const []const u8,
+    fields: []const BulkSqlIoCsvField,
 ) ![]u8 {
     var row = std.ArrayList(u8).empty;
     errdefer row.deinit(alloc);
@@ -2194,12 +2222,12 @@ fn bulkSqlIoRowJsonFromCsvFieldsAlloc(
     var emitted: usize = 0;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
-    for (plan.columns, fields) |column_name, raw_value| {
+    for (plan.columns, fields) |column_name, field| {
         if (seen.contains(column_name)) return error.InvalidRowsRequest;
         try seen.put(alloc, column_name, {});
         const column = bulkSqlIoFindRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
         if (column.generated != null) return error.InvalidRowsRequest;
-        const value_json = try bulkSqlIoCsvValueJsonAlloc(alloc, column, raw_value, plan);
+        const value_json = try bulkSqlIoCsvValueJsonAlloc(alloc, column, field, plan);
         if (value_json == null) continue;
         defer alloc.free(value_json.?);
         if (emitted != 0) try row.append(alloc, ',');
@@ -2224,17 +2252,22 @@ fn bulkSqlIoFindRelationalColumn(schema: runtime_schema.TableSchema, column_name
 fn bulkSqlIoCsvValueJsonAlloc(
     alloc: std.mem.Allocator,
     column: runtime_schema.RelationalColumn,
-    raw_value: []const u8,
+    field: BulkSqlIoCsvField,
     plan: BulkSqlIoExecutionPlan,
 ) !?[]u8 {
+    const raw_value = field.value;
     if (plan.default_marker) |marker| {
         if (std.mem.eql(u8, raw_value, marker)) return null;
     }
     const null_marker = plan.null_marker orelse "";
     const forced_not_null = bulkSqlIoStringSliceContains(plan.force_not_null_columns, column.name);
     const forced_null = bulkSqlIoStringSliceContains(plan.force_null_columns, column.name);
-    if ((forced_null or (!forced_not_null and std.mem.eql(u8, raw_value, null_marker)))) {
-        return try alloc.dupe(u8, "null");
+    if (std.mem.eql(u8, raw_value, null_marker)) {
+        if (field.quoted) {
+            if (forced_null) return try alloc.dupe(u8, "null");
+        } else if (!forced_not_null) {
+            return try alloc.dupe(u8, "null");
+        }
     }
     return switch (column.field_type) {
         .keyword, .text, .link, .blob, .html, .search_as_you_type, .datetime => try std.json.Stringify.valueAlloc(alloc, raw_value, .{}),
@@ -46498,6 +46531,127 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(copy_from_where_fingerprint);
     try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=1", copy_from_where_fingerprint);
 
+    const copy_runtime_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"new"},"status_key":{"type":"keyword","generated":{"op":"lower","field":"status"}},"amount":{"type":"numeric"},"active":{"type":"boolean"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"checks":[{"name":"amount_non_negative","field":"amount","op":"gte","value":0}]}
+    ;
+    var copy_parsed_schema = try schema_api.parseValidatedTableSchema(alloc, copy_runtime_schema_json);
+    defer copy_parsed_schema.deinit(alloc);
+    const copy_runtime_schema = try schema_api.deriveRuntimeTableSchema(alloc, copy_parsed_schema);
+    defer runtime_schema.freeSchema(alloc, copy_runtime_schema);
+
+    var copy_import = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount, active, metadata) FROM STDIN WITH (FORMAT csv, HEADER true);");
+    defer copy_import.deinit(alloc);
+    const copy_import_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    var copy_import_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_plan,
+        \\id,status,amount,active,metadata
+        \\u1,Ready,42,true,"{""source"":""copy""}"
+        \\.
+        \\
+    );
+    defer copy_import_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), copy_import_batch.writes.len);
+    var copy_import_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_batch.writes[0].value, .{});
+    defer copy_import_row.deinit();
+    try std.testing.expectEqualStrings("u1", copy_import_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("Ready", copy_import_row.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("ready", copy_import_row.value.object.get("status_key").?.string);
+    try std.testing.expectEqual(@as(i64, 42), copy_import_row.value.object.get("amount").?.integer);
+    try std.testing.expect(copy_import_row.value.object.get("active").?.bool);
+    try std.testing.expectEqualStrings("copy", copy_import_row.value.object.get("metadata").?.object.get("source").?.string);
+
+    var copy_import_nulls = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, NULL '');");
+    defer copy_import_nulls.deinit(alloc);
+    const copy_import_nulls_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_nulls) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    var copy_import_nulls_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(
+        alloc,
+        copy_runtime_schema,
+        copy_import_nulls_plan,
+        "u_empty_unquoted,\nu_empty_quoted,\"\"\n",
+    );
+    defer copy_import_nulls_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), copy_import_nulls_batch.writes.len);
+    var unquoted_empty_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_nulls_batch.writes[0].value, .{});
+    defer unquoted_empty_row.deinit();
+    try std.testing.expectEqualStrings("u_empty_unquoted", unquoted_empty_row.value.object.get("id").?.string);
+    try std.testing.expect(unquoted_empty_row.value.object.get("status").? == .null);
+    var quoted_empty_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_nulls_batch.writes[1].value, .{});
+    defer quoted_empty_row.deinit();
+    try std.testing.expectEqualStrings("u_empty_quoted", quoted_empty_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("", quoted_empty_row.value.object.get("status").?.string);
+
+    var copy_import_force_null = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, NULL '', FORCE_NULL (status));");
+    defer copy_import_force_null.deinit(alloc);
+    const copy_import_force_null_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_force_null) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    var copy_import_force_null_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_force_null_plan, "u_force_null,\"\"\n");
+    defer copy_import_force_null_batch.deinit(alloc);
+    var force_null_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_force_null_batch.writes[0].value, .{});
+    defer force_null_row.deinit();
+    try std.testing.expect(force_null_row.value.object.get("status").? == .null);
+
+    var copy_import_force_not_null = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, NULL '', FORCE_NOT_NULL (status));");
+    defer copy_import_force_not_null.deinit(alloc);
+    const copy_import_force_not_null_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_force_not_null) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    var copy_import_force_not_null_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_force_not_null_plan, "u_force_not_null,\n");
+    defer copy_import_force_not_null_batch.deinit(alloc);
+    var force_not_null_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_force_not_null_batch.writes[0].value, .{});
+    defer force_not_null_row.deinit();
+    try std.testing.expectEqualStrings("", force_not_null_row.value.object.get("status").?.string);
+
+    var malformed_copy_import_plan = copy_import_plan;
+    malformed_copy_import_plan.delimiter = "::";
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, malformed_copy_import_plan, "u_bad:ready\n"),
+    );
+
+    var copy_import_filtered = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount) FROM STDIN WITH (FORMAT csv, DEFAULT 'DEFAULT') WHERE status = 'active';");
+    defer copy_import_filtered.deinit(alloc);
+    const copy_import_filtered_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_filtered) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    var copy_import_filtered_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_filtered_plan,
+        \\u2,active,7
+        \\u3,closed,9
+        \\u4,DEFAULT,11
+        \\
+    );
+    defer copy_import_filtered_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), copy_import_filtered_batch.writes.len);
+    var copy_filtered_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_filtered_batch.writes[0].value, .{});
+    defer copy_filtered_row.deinit();
+    try std.testing.expectEqualStrings("u2", copy_filtered_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("active", copy_filtered_row.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("active", copy_filtered_row.value.object.get("status_key").?.string);
+    try std.testing.expectEqual(@as(i64, 7), copy_filtered_row.value.object.get("amount").?.integer);
+
+    var copy_import_generated_column = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status_key) FROM STDIN WITH (FORMAT csv);");
+    defer copy_import_generated_column.deinit(alloc);
+    const copy_import_generated_column_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_generated_column) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_generated_column_plan, "u5,ready\n"),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_from_execution, "u6,ready\nu6,done\n"),
+    );
+
     var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *);");
     defer copy_to.deinit(alloc);
     const copy_to_plan = switch (copy_to) {
@@ -46526,6 +46680,54 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectError(error.UnsupportedSqlShape, bulkSqlIoExecutionPlanFromDdlPlan(copy_binary_plan));
+
+    const csv_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .text, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .text, .nullable = true },
+        .{ .name = "note", .path = "note", .field_type = .text, .nullable = true },
+    };
+    const csv_schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = csv_columns[0..],
+    };
+    const csv_plan_columns = [_][]const u8{ "id", "status", "note" };
+    const csv_plan = BulkSqlIoExecutionPlan{
+        .operation = .import_rows,
+        .native_route = .rows_batch,
+        .stream = .stdin,
+        .codec = .csv,
+        .table_name = "usage_records",
+        .columns = csv_plan_columns[0..],
+        .required_permission = .write,
+        .audit_action = .copy_from,
+    };
+    const csv_fields = try parseBulkSqlCsvRecordAlloc(alloc, "r1,,\"\"", csv_plan);
+    defer freeBulkSqlCsvFields(alloc, csv_fields);
+    try std.testing.expectEqual(@as(usize, 3), csv_fields.len);
+    try std.testing.expect(!csv_fields[1].quoted);
+    try std.testing.expect(csv_fields[2].quoted);
+    const csv_row = try bulkSqlIoRowJsonFromCsvFieldsAlloc(alloc, csv_schema, csv_plan, csv_fields);
+    defer alloc.free(csv_row);
+    try std.testing.expectEqualStrings("{\"id\":\"r1\",\"status\":null,\"note\":\"\"}", csv_row);
+
+    const forced_csv_columns = [_][]const u8{ "status", "note" };
+    const forced_csv_plan = BulkSqlIoExecutionPlan{
+        .operation = .import_rows,
+        .native_route = .rows_batch,
+        .stream = .stdin,
+        .codec = .csv,
+        .table_name = "usage_records",
+        .columns = csv_plan_columns[0..],
+        .required_permission = .write,
+        .audit_action = .copy_from,
+        .force_not_null_columns = forced_csv_columns[0..],
+        .force_null_columns = forced_csv_columns[0..],
+    };
+    const forced_csv_fields = try parseBulkSqlCsvRecordAlloc(alloc, "r2,,\"\"", forced_csv_plan);
+    defer freeBulkSqlCsvFields(alloc, forced_csv_fields);
+    const forced_csv_row = try bulkSqlIoRowJsonFromCsvFieldsAlloc(alloc, csv_schema, forced_csv_plan, forced_csv_fields);
+    defer alloc.free(forced_csv_row);
+    try std.testing.expectEqualStrings("{\"id\":\"r2\",\"status\":\"\",\"note\":null}", forced_csv_row);
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
     defer create_partitioned_table.deinit(alloc);
