@@ -19,13 +19,11 @@
 // content-to-position, and position-to-content attention scores.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const deberta_config = @import("../models/deberta.zig");
-const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 
 pub const Config = deberta_config.Config;
 
@@ -257,7 +255,7 @@ pub fn preplanMetalDebertaEncoderFrame(
 /// the backend (a CT).  Callers that consume the encoder output through
 /// CT ops (gliner_head, future graph-resident pipelines) should use this
 /// variant -- it skips the toFloat32 the legacy `forward` does at the
-/// boundary, so on Metal/MLX the hidden state stays device-resident
+/// boundary, so on Metal the hidden state stays device-resident
 /// across the encoder/head split, and on native it skips one allocation
 /// + memcpy.
 pub fn forwardCt(
@@ -514,7 +512,18 @@ fn buildRelativePositionEmbInfo(
     defer cb.free(ln_w);
     const ln_b = try cb.getWeight("encoder.LayerNorm.bias");
     defer cb.free(ln_b);
-    const normed_rel = try cb.layerNorm(rel_weight, ln_w, ln_b, H, config.layer_norm_eps);
+    const normed_rel = cb.layerNorm(rel_weight, ln_w, ln_b, H, config.layer_norm_eps) catch |err| switch (err) {
+        error.UnsupportedTensorType => blk: {
+            const rel_data = try cb.toFloat32(rel_weight, allocator);
+            defer allocator.free(rel_data);
+            if (rel_data.len % H != 0) return error.InvalidShape;
+            const rel_shape = [_]i32{ @intCast(rel_data.len / H), @intCast(H) };
+            const rel_f32 = try cb.fromFloat32Shape(rel_data, &rel_shape);
+            defer cb.free(rel_f32);
+            break :blk try cb.layerNorm(rel_f32, ln_w, ln_b, H, config.layer_norm_eps);
+        },
+        else => return err,
+    };
     defer cb.free(normed_rel);
 
     // Build bucket IDs for all relative positions: we need unique positions from -(seq_len-1) to +(seq_len-1)
@@ -834,11 +843,9 @@ fn encoderLayer(
     const ffn_out = if (use_tp)
         try linearMaybeShardedToReplicated(cb, ffn_gelu, ffn_o_w, ffn_o_b, total, I, H)
     else blk: {
-        if (isDenseF32Tensor(cb, ffn_o_w)) {
-            if (try cb.linearAdd(ffn_gelu, ffn_o_w, ffn_o_b, attn_normed, total, local_intermediate, H)) |fused| {
-                ffn_out_has_residual = true;
-                break :blk fused;
-            }
+        if (try cb.linearAdd(ffn_gelu, ffn_o_w, ffn_o_b, attn_normed, total, local_intermediate, H)) |fused| {
+            ffn_out_has_residual = true;
+            break :blk fused;
         }
         break :blk try cb.linear(ffn_gelu, ffn_o_w, ffn_o_b, total, local_intermediate, H);
     };
@@ -870,15 +877,8 @@ fn getLayerWeight(cb: *const ComputeBackend, layer: usize, suffix: []const u8, b
 }
 
 fn tensorParallelWorldSize(cb: *const ComputeBackend) usize {
-    if (!build_options.enable_mlx) return 1;
-    const mlx_compute = mlx_compute_mod.MlxCompute.fromComputeBackend(cb) orelse return 1;
-    if (!mlx_compute.tensorParallelEnabled()) return 1;
-    return mlx_compute.tensorParallelWorldSize();
-}
-
-fn isDenseF32Tensor(cb: *const ComputeBackend, tensor: CT) bool {
-    const dtype = cb.tensorDType(tensor) catch return false;
-    return dtype == .f32;
+    _ = cb;
+    return 1;
 }
 
 fn linearReplicatedToMaybeSharded(
@@ -890,13 +890,6 @@ fn linearReplicatedToMaybeSharded(
     input_dim: usize,
     output_dim: usize,
 ) !CT {
-    if (build_options.enable_mlx) {
-        if (mlx_compute_mod.MlxCompute.fromComputeBackend(cb)) |mlx_compute| {
-            if (mlx_compute.tensorParallelEnabled()) {
-                return mlx_compute.linearTensorParallelReplicatedToSharded(input, weight, bias, rows, input_dim, output_dim);
-            }
-        }
-    }
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
 }
 
@@ -909,13 +902,6 @@ fn linearMaybeShardedToReplicated(
     input_dim: usize,
     output_dim: usize,
 ) !CT {
-    if (build_options.enable_mlx) {
-        if (mlx_compute_mod.MlxCompute.fromComputeBackend(cb)) |mlx_compute| {
-            if (mlx_compute.tensorParallelEnabled()) {
-                return mlx_compute.linearTensorParallelShardedToReplicated(input, weight, bias, rows, input_dim, output_dim);
-            }
-        }
-    }
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
 }
 

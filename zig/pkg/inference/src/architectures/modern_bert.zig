@@ -31,7 +31,7 @@
 //   model.layers.N.mlp.Wo.weight          [hidden_size, intermediate_size]
 //   model.final_norm.{weight,bias}
 //
-// Single implementation works with any ComputeBackend (BLAS, MLX, etc).
+// Single implementation works with any ComputeBackend (native, etc).
 
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
@@ -550,7 +550,14 @@ pub fn forwardCapturingActivations(
     captures: *ActivationBuffer,
 ) ![]f32 {
     const result_ct = try forwardCapturingActivationsCT(
-        cb, allocator, config, input_ids, attention_mask, batch, seq_len, captures,
+        cb,
+        allocator,
+        config,
+        input_ids,
+        attention_mask,
+        batch,
+        seq_len,
+        captures,
     );
     defer cb.free(result_ct);
     return cb.toFloat32(result_ct, allocator);
@@ -571,7 +578,7 @@ fn forwardCapturingActivationsCT(
 
     // Collect normed_attn CTs from all layers without downloading them yet.
     // This lets us batch-evaluate all 22 tensors in one GPU sync (one Metal
-    // command buffer submission on MLX) instead of one per layer.
+    // command buffer submission on device backends) instead of one per layer.
     var normed_attn_cts = std.ArrayListUnmanaged(CT).empty;
     defer {
         for (normed_attn_cts.items) |ct| cb.free(ct);
@@ -584,7 +591,14 @@ fn forwardCapturingActivationsCT(
 
     for (0..config.num_hidden_layers) |layer_idx| {
         const layer_result = try encoderLayerWithNormedAttn(
-            cb, allocator, config, hidden, attention_mask, batch, seq_len, layer_idx,
+            cb,
+            allocator,
+            config,
+            hidden,
+            attention_mask,
+            batch,
+            seq_len,
+            layer_idx,
         );
         cb.free(hidden);
         hidden = layer_result.hidden;
@@ -596,7 +610,7 @@ fn forwardCapturingActivationsCT(
         };
     }
 
-    // Batch-download all normed_attn tensors — single GPU sync on MLX.
+    // Batch-download all normed_attn tensors — single GPU sync on Metal.
     const batch_results = try cb.toFloat32Batch(normed_attn_cts.items, allocator);
     defer {
         for (batch_results) |r| allocator.free(r);
@@ -711,7 +725,15 @@ fn encoderLayerWithNormedAttn(
 
     // Bidirectional scaled dot-product attention.
     const attn_out = try cb.scaledDotProductAttention(
-        Q, K, V, attention_mask, window_bias, batch, seq_len, num_heads, head_dim,
+        Q,
+        K,
+        V,
+        attention_mask,
+        window_bias,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
     );
     defer cb.free(attn_out);
 

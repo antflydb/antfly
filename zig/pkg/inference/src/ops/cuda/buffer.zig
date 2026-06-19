@@ -16,6 +16,41 @@ const std = @import("std");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
 
+pub const HostBuffer = struct {
+    ptr: ?*anyopaque = null,
+    len: usize = 0,
+
+    pub fn alloc(ctx: *context_mod.CudaContext, len: usize) driver_mod.Error!HostBuffer {
+        if (len == 0) return .{};
+        const alloc_host = ctx.driver.fns.cuMemAllocHost orelse return error.CudaSymbolMissing;
+        try ctx.makeCurrent();
+        var ptr: ?*anyopaque = null;
+        try ctx.driver.check(alloc_host(&ptr, len));
+        return .{ .ptr = ptr, .len = len };
+    }
+
+    pub fn free(self: *HostBuffer, ctx: *context_mod.CudaContext) void {
+        if (self.ptr) |ptr| {
+            ctx.makeCurrent() catch {};
+            if (ctx.driver.fns.cuMemFreeHost) |free_host| {
+                _ = free_host(ptr);
+            }
+            self.ptr = null;
+            self.len = 0;
+        }
+    }
+
+    pub fn bytes(self: HostBuffer) []u8 {
+        if (self.ptr == null or self.len == 0) return &.{};
+        const ptr: [*]u8 = @ptrCast(self.ptr.?);
+        return ptr[0..self.len];
+    }
+
+    pub fn constBytes(self: HostBuffer) []const u8 {
+        return self.bytes();
+    }
+};
+
 pub const DeviceBuffer = struct {
     ptr: driver_mod.CUdeviceptr = 0,
     len: usize = 0,

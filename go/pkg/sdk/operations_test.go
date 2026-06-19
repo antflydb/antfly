@@ -368,3 +368,152 @@ func TestLinearMergeRejectsOversizedSuccessResponse(t *testing.T) {
 		t.Fatalf("LinearMergeWithOptions error = %v, want response limit error", err)
 	}
 }
+
+func TestExecuteLinearMergeUsesWriteOptions(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.ExecuteLinearMerge(context.Background(), "files", SortedPages(map[string]any{
+		"doc-1": map[string]any{"title": strings.Repeat("x", 128)},
+	}, 1), ExecuteLinearMergeOptions{
+		WriteOptions: WriteOptions{
+			MaxRequestBytes:  64,
+			MaxResponseBytes: 1024,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "encoded request exceeded 64 bytes") {
+		t.Fatalf("ExecuteLinearMerge error = %v, want request limit error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want no request sent after local request limit failure", requests)
+	}
+}
+
+func TestSortedLinearMergePagesRespectsByteLimit(t *testing.T) {
+	records := map[string]any{
+		"a": map[string]any{"text": strings.Repeat("a", 24)},
+		"b": map[string]any{"text": strings.Repeat("b", 24)},
+		"c": map[string]any{"text": strings.Repeat("c", 24)},
+	}
+	allPages, err := SortedLinearMergePages(records, LinearMergePageOptions{MaxRecords: 10})
+	if err != nil {
+		t.Fatalf("SortedLinearMergePages without byte limit: %v", err)
+	}
+	if len(allPages) != 1 {
+		t.Fatalf("pages without byte limit = %d, want 1", len(allPages))
+	}
+
+	oneRecordSize, err := linearMergeRequestSize(map[string]any{
+		"a": records["a"],
+	}, "x", false, "")
+	if err != nil {
+		t.Fatalf("linearMergeRequestSize one record: %v", err)
+	}
+	twoRecordSize, err := linearMergeRequestSize(map[string]any{
+		"a": records["a"],
+		"b": records["b"],
+	}, "x", false, "")
+	if err != nil {
+		t.Fatalf("linearMergeRequestSize two records: %v", err)
+	}
+	pages, err := SortedLinearMergePages(records, LinearMergePageOptions{
+		MaxRecords:      10,
+		MaxRequestBytes: oneRecordSize + (twoRecordSize-oneRecordSize)/2,
+	})
+	if err != nil {
+		t.Fatalf("SortedLinearMergePages with byte limit: %v", err)
+	}
+	if len(pages) != 3 {
+		t.Fatalf("pages with byte limit = %d, want 3", len(pages))
+	}
+	for i, page := range pages {
+		if len(page) != 1 {
+			t.Fatalf("page %d len = %d, want 1", i, len(page))
+		}
+	}
+}
+
+func TestSortedLinearMergePagesRejectsSingleOversizedRecord(t *testing.T) {
+	records := map[string]any{
+		"a": map[string]any{"text": strings.Repeat("a", 128)},
+	}
+	_, err := SortedLinearMergePages(records, LinearMergePageOptions{
+		MaxRecords:      10,
+		MaxRequestBytes: 64,
+	})
+	if err == nil || !strings.Contains(err.Error(), `linear merge record "a"`) {
+		t.Fatalf("SortedLinearMergePages error = %v, want oversized record error", err)
+	}
+}
+
+func TestLinearMergeRequestSizerMatchesEncodedSize(t *testing.T) {
+	records := map[string]any{
+		"a": map[string]any{"text": "alpha", "n": 1},
+		"b": map[string]any{"text": "bravo", "n": 2},
+	}
+	sizer, err := newLinearMergeRequestSizer("cursor", true, SyncLevelFullIndex)
+	if err != nil {
+		t.Fatalf("newLinearMergeRequestSizer: %v", err)
+	}
+
+	total := int64(0)
+	count := 0
+	for _, id := range []string{"a", "b"} {
+		entrySize, err := linearMergeRecordEntrySize(id, records[id])
+		if err != nil {
+			t.Fatalf("linearMergeRecordEntrySize: %v", err)
+		}
+		total += entrySize
+		count++
+	}
+
+	got := sizer.emptyRequestBytes + total + int64(count-1)
+	want, err := linearMergeRequestSize(records, "cursor", true, SyncLevelFullIndex)
+	if err != nil {
+		t.Fatalf("linearMergeRequestSize: %v", err)
+	}
+	if got != want {
+		t.Fatalf("estimated size = %d, want encoded size %d", got, want)
+	}
+}
+
+func TestTransactionCommitUsesWriteOptions(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"committed"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	tx := client.NewTransaction()
+	_, err = tx.CommitWithOptions(context.Background(), map[string]BatchRequest{
+		"files": {
+			Inserts: map[string]any{"doc-1": map[string]any{"title": strings.Repeat("x", 128)}},
+		},
+	}, WriteOptions{
+		MaxRequestBytes:  64,
+		MaxResponseBytes: 1024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "encoded request exceeded 64 bytes") {
+		t.Fatalf("CommitWithOptions error = %v, want request limit error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want no request sent after local request limit failure", requests)
+	}
+}

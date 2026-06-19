@@ -179,7 +179,7 @@ pub fn downloadContentOutcomeAllocWithHeaders(
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
     if (std.mem.startsWith(u8, uri, "data:")) {
-        return .{ .ok = try parseDataUriAlloc(alloc, uri) };
+        return .{ .ok = try parseDataUriAlloc(alloc, uri, security) };
     }
 
     const parsed = try std.Uri.parse(uri);
@@ -228,7 +228,47 @@ fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []u8) void {
     alloc.free(values);
 }
 
-fn parseDataUriAlloc(alloc: Allocator, uri: []const u8) !DownloadedContent {
+pub fn dataUriDecodedSize(uri: []const u8) !usize {
+    const prefix = "data:";
+    if (!std.mem.startsWith(u8, uri, prefix)) return error.InvalidDataUri;
+
+    const payload = uri[prefix.len..];
+    const comma = std.mem.indexOfScalar(u8, payload, ',') orelse return error.InvalidDataUri;
+    const meta = payload[0..comma];
+    const body = payload[comma + 1 ..];
+
+    if (std.mem.endsWith(u8, meta, ";base64")) {
+        return std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
+    }
+
+    return try percentDecodedLen(body);
+}
+
+fn percentDecodedLen(value: []const u8) !usize {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < value.len) {
+        if (value[i] == '%') {
+            if (i + 2 >= value.len) return error.InvalidDataUri;
+            _ = std.fmt.charToDigit(value[i + 1], 16) catch return error.InvalidDataUri;
+            _ = std.fmt.charToDigit(value[i + 2], 16) catch return error.InvalidDataUri;
+            i += 3;
+        } else {
+            i += 1;
+        }
+        len += 1;
+    }
+    return len;
+}
+
+fn validateDownloadSize(decoded_len: usize, security: ?*const ContentSecurityConfig) !void {
+    const max_size = if (security) |cfg| cfg.max_download_size_bytes else null;
+    if (max_size) |max| {
+        if (@as(u64, @intCast(decoded_len)) > max) return error.StreamTooLong;
+    }
+}
+
+fn parseDataUriAlloc(alloc: Allocator, uri: []const u8, security: ?*const ContentSecurityConfig) !DownloadedContent {
     const prefix = "data:";
     if (!std.mem.startsWith(u8, uri, prefix)) return error.InvalidDataUri;
 
@@ -240,6 +280,7 @@ fn parseDataUriAlloc(alloc: Allocator, uri: []const u8) !DownloadedContent {
     if (std.mem.endsWith(u8, meta, ";base64")) {
         const mime = meta[0 .. meta.len - ";base64".len];
         const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
+        try validateDownloadSize(decoded_len, security);
         const decoded = try alloc.alloc(u8, decoded_len);
         errdefer alloc.free(decoded);
         std.base64.standard.Decoder.decode(decoded, body) catch return error.InvalidBase64;
@@ -249,6 +290,8 @@ fn parseDataUriAlloc(alloc: Allocator, uri: []const u8) !DownloadedContent {
         };
     }
 
+    const decoded_len = try percentDecodedLen(body);
+    try validateDownloadSize(decoded_len, security);
     const decoded_body_buf = try alloc.dupe(u8, body);
     var data = decoded_body_buf;
     errdefer alloc.free(data);
@@ -543,6 +586,13 @@ test "download content percent decodes non-base64 data uri" {
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
     try std.testing.expectEqualStrings("alpha beta+gamma", downloaded.data);
+}
+
+test "download content enforces data uri decoded byte limit" {
+    const alloc = std.testing.allocator;
+    var security = ContentSecurityConfig{ .max_download_size_bytes = 4 };
+    try std.testing.expectError(error.StreamTooLong, downloadContentAlloc(alloc, "data:text/plain;base64,aGVsbG8=", &security, null));
+    try std.testing.expectError(error.StreamTooLong, downloadContentAlloc(alloc, "data:text/plain,alpha%20beta", &security, null));
 }
 
 test "download content reads percent encoded file uri" {

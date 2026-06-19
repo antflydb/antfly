@@ -33,7 +33,7 @@ DEBUG_METAL_SCRIPT="$PKG_DIR/scripts/debug_metal_command.sh"
 
 if [[ ! -x "$ANTFLY_BIN" ]]; then
   echo "antfly binary not executable: $ANTFLY_BIN" >&2
-  echo "build it first, for example: cd pkg/inference && zig build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false -Donnx=false -Dpjrt=false" >&2
+  echo "build it first, for example: cd pkg/inference && zig build -Doptimize=ReleaseFast -Dmetal=true -Donnx=false -Dpjrt=false" >&2
   exit 2
 fi
 

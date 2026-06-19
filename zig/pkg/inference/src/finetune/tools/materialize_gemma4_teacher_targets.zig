@@ -103,7 +103,6 @@ pub fn main(init: std.process.Init) !void {
 
 fn parseBackend(value: []const u8) ?gemma4_real.BackendKind {
     if (std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
     return null;
 }
 
@@ -119,7 +118,7 @@ fn usageError() error{InvalidArguments} {
         \\  --top-k N              Teacher tokens per row (default: 8)
         \\  --temperature F        Temperature applied before top-k softmax (default: 1.0)
         \\  --max-examples N       Maximum examples to materialize (default: 0 = all)
-        \\  --backend native|mlx   Teacher inference backend (default: native)
+        \\  --backend native   Teacher inference backend (default: native)
         \\  --gguf-projector P     Required for multimodal inputs unless recorded in the prepared summary
         \\
         \\example: materialize-gemma4-teacher-targets /tmp/gemma4-base /tmp/prepared.json /tmp/prepared.teacher.json --top-k 8 --temperature 2.0

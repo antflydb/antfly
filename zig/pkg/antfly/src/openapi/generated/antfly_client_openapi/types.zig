@@ -3456,8 +3456,6 @@ pub const InferenceBackendRuntimes = struct {
     onnx: ?bool = null,
     /// Whether the Metal backend is built into this runtime
     metal: ?bool = null,
-    /// Whether the MLX backend is built into this runtime
-    mlx: ?bool = null,
     /// Whether the CUDA backend is built into this runtime
     cuda: ?bool = null,
     /// Whether the PJRT/XLA backend is built into this runtime
@@ -3600,6 +3598,209 @@ pub const InferenceEmbeddingUsage = struct {
     prompt_tokens: i64,
     /// Total tokens used
     total_tokens: i64,
+};
+
+pub const PackageKind = enum {
+    extension,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .extension => "extension",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "extension", .extension },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Path-safe extension or package identifier.
+pub const ExtensionIdentifier = []const u8;
+
+/// Capability identifier. Capability names may use colon-delimited namespaces such as read:table.
+pub const CapabilityName = []const u8;
+
+pub const ExtensionScopeKind = enum {
+    cluster,
+    table,
+    embedded_db,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .cluster => "cluster",
+            .table => "table",
+            .embedded_db => "embedded_db",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cluster", .cluster },
+            .{ "table", .table },
+            .{ "embedded_db", .embedded_db },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const PackageArtifact = struct {
+    kind: []const u8,
+    path: []const u8,
+    digest: ?[]const u8 = null,
+};
+
+pub const DataShapeKind = enum {
+    document,
+    row,
+    generated_artifact,
+    extension_relation,
+    endpoint_schema,
+    tool_schema,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document => "document",
+            .row => "row",
+            .generated_artifact => "generated_artifact",
+            .extension_relation => "extension_relation",
+            .endpoint_schema => "endpoint_schema",
+            .tool_schema => "tool_schema",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document", .document },
+            .{ "row", .row },
+            .{ "generated_artifact", .generated_artifact },
+            .{ "extension_relation", .extension_relation },
+            .{ "endpoint_schema", .endpoint_schema },
+            .{ "tool_schema", .tool_schema },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ExtensionObjectKind = enum {
+    data_shape,
+    table_schema,
+    extension_relation,
+    generated_artifact,
+    index,
+    enrichment,
+    resolver,
+    mcp_tool,
+    query_function,
+    api_endpoint,
+    a2a_agent,
+    auth_policy,
+    workflow,
+    maintenance_task,
+    provider_config,
+    text_analyzer,
+    text_tokenizer,
+    provider_adapter,
+    connector,
+    index_backend,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .data_shape => "data_shape",
+            .table_schema => "table_schema",
+            .extension_relation => "extension_relation",
+            .generated_artifact => "generated_artifact",
+            .index => "index",
+            .enrichment => "enrichment",
+            .resolver => "resolver",
+            .mcp_tool => "mcp_tool",
+            .query_function => "query_function",
+            .api_endpoint => "api_endpoint",
+            .a2a_agent => "a2a_agent",
+            .auth_policy => "auth_policy",
+            .workflow => "workflow",
+            .maintenance_task => "maintenance_task",
+            .provider_config => "provider_config",
+            .text_analyzer => "text_analyzer",
+            .text_tokenizer => "text_tokenizer",
+            .provider_adapter => "provider_adapter",
+            .connector => "connector",
+            .index_backend => "index_backend",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "data_shape", .data_shape },
+            .{ "table_schema", .table_schema },
+            .{ "extension_relation", .extension_relation },
+            .{ "generated_artifact", .generated_artifact },
+            .{ "index", .index },
+            .{ "enrichment", .enrichment },
+            .{ "resolver", .resolver },
+            .{ "mcp_tool", .mcp_tool },
+            .{ "query_function", .query_function },
+            .{ "api_endpoint", .api_endpoint },
+            .{ "a2a_agent", .a2a_agent },
+            .{ "auth_policy", .auth_policy },
+            .{ "workflow", .workflow },
+            .{ "maintenance_task", .maintenance_task },
+            .{ "provider_config", .provider_config },
+            .{ "text_analyzer", .text_analyzer },
+            .{ "text_tokenizer", .text_tokenizer },
+            .{ "provider_adapter", .provider_adapter },
+            .{ "connector", .connector },
+            .{ "index_backend", .index_backend },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const UpdateManifestRef = struct {
+    from_version: []const u8,
+    to_version: []const u8,
+    path: []const u8,
+    digest: ?[]const u8 = null,
+};
+
+pub const UpdateExtensionRequest = struct {
+    target_version: ?[]const u8 = null,
+    dry_run: ?bool = null,
+};
+
+pub const DropExtensionRequest = struct {
+    mode: ?[]const u8 = null,
+    dry_run: ?bool = null,
+};
+
+pub const ConfigureExtensionRequest = struct {
+    config_json: []const u8,
+};
+
+pub const ExtensionError = struct {
+    @"error": []const u8,
 };
 
 pub const ExtractionToken = struct {
@@ -4874,6 +5075,51 @@ pub const InferenceschemasConfig = struct {
     style: ?InferenceStyle = null,
 };
 
+pub const PackageDependency = struct {
+    name: ExtensionIdentifier,
+    version_requirement: ?[]const u8 = null,
+    optional: ?bool = null,
+};
+
+pub const RuntimeDecl = struct {
+    name: ExtensionIdentifier,
+    mode: ?[]const u8 = null,
+    artifact: ?[]const u8 = null,
+    config_json: ?[]const u8 = null,
+};
+
+pub const DropExtensionResponse = struct {
+    dropped: ExtensionIdentifier,
+    dry_run: bool,
+};
+
+pub const Capability = struct {
+    name: CapabilityName,
+    scope: ?[]const u8 = null,
+};
+
+pub const ExtensionScope = struct {
+    kind: ExtensionScopeKind,
+    /// Required when kind is table.
+    table_name: ?[]const u8 = null,
+};
+
+pub const DataShapeDecl = struct {
+    name: ExtensionIdentifier,
+    kind: DataShapeKind,
+    version: ?[]const u8 = null,
+    /// JSON object encoded as a string until the public shape language is finalized.
+    schema_json: ?[]const u8 = null,
+};
+
+pub const ExtensionObjectDecl = struct {
+    kind: ExtensionObjectKind,
+    name: ExtensionIdentifier,
+    shape: ?[]const u8 = null,
+    table_name: ?[]const u8 = null,
+    config_json: ?[]const u8 = null,
+};
+
 pub const ExtractionStructureSchema = struct {
     fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
 };
@@ -5635,7 +5881,7 @@ pub const InferenceConfig = struct {
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `mlx` - MLX backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const []const u8 = null,
     /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
     max_concurrent_requests: ?i64 = null,
@@ -5652,6 +5898,46 @@ pub const InferenceConfig = struct {
     /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?InferenceschemasConfig = null,
+};
+
+pub const InstalledExtension = struct {
+    name: ExtensionIdentifier,
+    package_name: ExtensionIdentifier,
+    package_version: []const u8,
+    package_digest: []const u8,
+    scope: ExtensionScope,
+    config_json: ?[]const u8 = null,
+    granted_capabilities: ?[]const Capability = null,
+    installed_at_epoch_ms: ?i64 = null,
+    status: []const u8,
+};
+
+pub const ExtensionMember = struct {
+    extension_name: ExtensionIdentifier,
+    scope: ExtensionScope,
+    object_kind: ExtensionObjectKind,
+    object_name: ExtensionIdentifier,
+    table_name: ?[]const u8 = null,
+    shape_kind: ?DataShapeKind = null,
+    shape_name: ?[]const u8 = null,
+    shape_version: ?[]const u8 = null,
+    owner_metadata_json: ?[]const u8 = null,
+};
+
+pub const InstallExtensionRequest = struct {
+    version: ?[]const u8 = null,
+    scope: ExtensionScope,
+    config_json: ?[]const u8 = null,
+    grants: ?[]const Capability = null,
+    dry_run: ?bool = null,
+};
+
+pub const InstallManifest = struct {
+    scopes_supported: []const ExtensionScopeKind,
+    shapes: ?[]const DataShapeDecl = null,
+    objects: ?[]const ExtensionObjectDecl = null,
+    runtimes: ?[]const RuntimeDecl = null,
+    config_schema_json: ?[]const u8 = null,
 };
 
 pub const ExtractionSchema = struct {
@@ -5903,6 +6189,24 @@ pub const InferenceChunkResponse = struct {
     usage: InferenceGenerateUsage,
     /// Whether result was served from cache
     cache_hit: bool,
+};
+
+pub const PackageManifest = struct {
+    manifest_api_version: []const u8,
+    name: ExtensionIdentifier,
+    version: []const u8,
+    kind: PackageKind,
+    description: ?[]const u8 = null,
+    digest: []const u8,
+    antfly_min_version: ?[]const u8 = null,
+    antfly_max_version: ?[]const u8 = null,
+    trusted: ?bool = null,
+    relocatable: ?bool = null,
+    capabilities_requested: ?[]const Capability = null,
+    dependencies: ?[]const PackageDependency = null,
+    artifacts: ?[]const PackageArtifact = null,
+    install: InstallManifest,
+    updates: ?[]const UpdateManifestRef = null,
 };
 
 pub const ExtractionResponse = struct {
@@ -6164,7 +6468,7 @@ pub const InferenceGenerateRequest = struct {
     cache_dtype: ?[]const u8 = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
     cache_compaction_ratio: ?f32 = null,
-    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native`, `metal`, and `mlx` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
+    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native` and `metal` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
     backend: ?[]const u8 = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
     mode: ?[]const u8 = null,

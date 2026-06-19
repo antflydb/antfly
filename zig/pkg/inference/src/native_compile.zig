@@ -195,7 +195,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -892,7 +891,6 @@ fn writeWholeModelPjrtArtifactForShape(
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -1553,10 +1551,10 @@ fn buildWholeModelSelectionForShape(
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
+        else => return error.UnexpectedBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)

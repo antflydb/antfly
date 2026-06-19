@@ -21,8 +21,8 @@ const Shape = ml.graph.Shape;
 const training_loop_mod = @import("../graph/training_loop.zig");
 const training_mod = @import("../graph/training.zig");
 const checkpoint_mod = ml.graph.checkpoint;
-const BlasCompute = @import("../ops/blas_compute.zig").BlasCompute;
-const WeightStore = @import("../ops/blas_compute.zig").WeightStore;
+const NativeCompute = @import("../ops/native_compute.zig").NativeCompute;
+const WeightStore = @import("../ops/native_compute.zig").WeightStore;
 
 const BenchMode = enum {
     optimizer,
@@ -236,7 +236,7 @@ fn runGraphVariant(
         ws.resident_weights.deinit(allocator);
         ws.lazy_weights.deinit(allocator);
     }
-    var compute = BlasCompute.init(allocator, &ws, null);
+    var compute = NativeCompute.init(allocator, &ws, null);
     var cb = compute.computeBackend();
 
     var loop = training_loop_mod.TrainingLoop.init(allocator, .{

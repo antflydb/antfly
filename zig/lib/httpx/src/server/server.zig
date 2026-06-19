@@ -421,13 +421,26 @@ pub const Context = struct {
     pub fn body(self: *Self) !?[]const u8 {
         if (self.request.body != null) return self.request.body;
         if (self.h2_body_reader) |reader| {
-            const data = try reader.readAll(self.allocator);
+            const data = reader.readAll(self.allocator) catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (self.bodyFramingRequiresEndStream()) return err;
+                    self.h2_body_reader = null;
+                    return null;
+                },
+                else => return err,
+            };
             self.request.body = data;
             self.request.body_owned = true;
             self.h2_body_reader = null;
             return self.request.body;
         }
         return null;
+    }
+
+    fn bodyFramingRequiresEndStream(self: *const Self) bool {
+        if (self.request.headers.get(HeaderName.TRANSFER_ENCODING) != null) return true;
+        const content_length = self.request.headers.getContentLength() orelse return false;
+        return content_length != 0;
     }
 
     /// Reads the request body and hands the raw bytes to a caller-supplied parser.
@@ -2295,6 +2308,55 @@ test "Context.body() buffers from H2StreamReader" {
 
     // h2_body_reader should be consumed (set to null).
     try std.testing.expect(ctx.h2_body_reader == null);
+}
+
+test "Context.body() treats unframed H2 EndOfStream as absent body" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+    s.stream_error = error.EndOfStream;
+
+    var event = Io.Event.unset;
+    var body_reader = Context.H2StreamReader{
+        .h2_stream = &s,
+        .io = std.testing.io,
+        .data_event = &event,
+    };
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+    ctx.h2_body_reader = &body_reader;
+
+    const result = try ctx.body();
+    try std.testing.expect(result == null);
+    try std.testing.expect(ctx.h2_body_reader == null);
+}
+
+test "Context.body() preserves H2 EndOfStream when content length promised bytes" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .POST, "/");
+    defer req.deinit();
+    try req.setHeader(HeaderName.CONTENT_LENGTH, "5");
+
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+    s.stream_error = error.EndOfStream;
+
+    var event = Io.Event.unset;
+    var body_reader = Context.H2StreamReader{
+        .h2_stream = &s,
+        .io = std.testing.io,
+        .data_event = &event,
+    };
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+    ctx.h2_body_reader = &body_reader;
+
+    try std.testing.expectError(error.EndOfStream, ctx.body());
 }
 
 test "Context.parseBody() returns null without a body" {

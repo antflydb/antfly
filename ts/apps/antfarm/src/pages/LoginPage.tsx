@@ -15,8 +15,8 @@ import {
 import type { FormEvent } from "react";
 import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { useAuth } from "../hooks/use-auth";
 import { useApiConfig } from "../hooks/use-api-config";
+import { useAuth } from "../hooks/use-auth";
 
 interface LocationState {
   from?: {

@@ -110,7 +110,7 @@ pub const ExecuteOptions = struct {
     /// caller afterward.  Donated buffers that are not consumed as
     /// outputs are freed by the interpreter at cleanup.
     ///
-    /// This follows the GoMLX pattern: in the decode loop the same-
+    /// This follows the decode-loop pattern: in the decode loop the same-
     /// shaped KV tensors are passed every step, and donation lets
     /// backends reuse them without allocating.
     donate: ?[]const bool = null,
@@ -917,25 +917,9 @@ fn shapeCaptureSetHasAny(capture: []const bool) bool {
 
 fn computeRuntimeShapeCaptureSet(allocator: std.mem.Allocator, graph: *const Graph) ![]bool {
     const capture = try allocator.alloc(bool, graph.nodeCount());
-    @memset(capture, false);
-
-    for (0..graph.nodeCount()) |idx| {
-        const node_id: NodeId = @intCast(idx);
-        const node = graph.node(node_id);
-        if (std.meta.activeTag(node.op) != .reshape or node.num_inputs == 0) continue;
-        const input_id = node.inputs[0];
-        if (input_id == null_node) continue;
-        const producer = graph.node(input_id);
-        if (std.meta.activeTag(producer.op) != .dot_general or producer.num_inputs == 0) continue;
-        const lhs_id = producer.inputs[0];
-        if (lhs_id == null_node) continue;
-        const lhs = graph.node(lhs_id);
-        if (std.meta.activeTag(lhs.op) != .reshape or lhs.num_inputs == 0) continue;
-        const src_id = lhs.inputs[0];
-        if (src_id == null_node) continue;
-        capture[@intCast(lhs_id)] = true;
-        capture[@intCast(src_id)] = true;
-    }
+    // Runtime shape restoration should be a graph-wide execution contract, not
+    // a pattern-specific escape hatch for one exported model layout.
+    @memset(capture, true);
 
     return capture;
 }
@@ -1048,6 +1032,15 @@ fn fillShapeDims(graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64
     return buf[0..rank];
 }
 
+fn runtimeOrDeclaredShape(state: *const ExecState, graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64 {
+    if (state.runtime_shapes) |runtime_shapes| {
+        if (node_id < runtime_shapes.len) {
+            if (runtime_shapes[@intCast(node_id)]) |runtime_shape| return runtime_shape;
+        }
+    }
+    return fillShapeDims(graph, node_id, buf);
+}
+
 fn executeScatterAdd(
     allocator: std.mem.Allocator,
     cb: *const ComputeBackend,
@@ -1153,7 +1146,7 @@ fn positiveResolvedDim(actual: ?[]const i64, shape: Shape, axis: usize) !usize {
     return positiveShapeDim(shape, axis);
 }
 
-/// For shape-tracking backends (MLX), reshape a tensor to its declared
+/// For shape-tracking backends, reshape a tensor to its declared
 /// shape when the declared shape is fully concrete, the actual rank differs,
 /// and element counts match. Returns
 /// the reshaped tensor (owned, caller must free) or null (no reshape
@@ -1174,6 +1167,36 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
         return null;
     }
     return cb.primReshape(val, dims[0..rank]) catch null;
+}
+
+const DispatchTensor = struct {
+    value: CT,
+    shape: []const i64,
+    owned: ?CT = null,
+
+    fn deinit(self: DispatchTensor, cb: *const ComputeBackend) void {
+        if (self.owned) |ct| cb.free(ct);
+    }
+};
+
+fn dispatchTensorWithShape(
+    cb: *const ComputeBackend,
+    state: *const ExecState,
+    graph: *const Graph,
+    node_id: NodeId,
+    value: CT,
+    runtime_buf: *[8]i64,
+    declared_buf: *[8]i64,
+) DispatchTensor {
+    const runtime_shape = runtimeOrDeclaredShape(state, graph, node_id, runtime_buf);
+    if (ensureDeclaredShape(cb, value, graph.node(node_id).output_shape)) |reshaped| {
+        return .{
+            .value = reshaped,
+            .shape = fillShapeDims(graph, node_id, declared_buf),
+            .owned = reshaped,
+        };
+    }
+    return .{ .value = value, .shape = runtime_shape };
 }
 
 fn graphTraceShapesEnabled() bool {
@@ -1374,8 +1397,55 @@ fn resolveRuntimeSplitLastDim(actual: []const i64, target: Shape, input_numel: u
     return null;
 }
 
+fn resolveFlattenedProjectionSuffixDims(src_actual: []const i64, target: Shape, input_numel: usize, out: *[8]i64) ?[]const i64 {
+    const rank = target.rank();
+    if (src_actual.len < 2 or rank <= src_actual.len - 1 or rank > out.len) return null;
+
+    const prefix_rank = src_actual.len - 1;
+    var prefix_numel: usize = 1;
+    for (0..prefix_rank) |i| {
+        const src_dim = src_actual[i];
+        if (src_dim <= 0) return null;
+        const target_dim = target.dim(@intCast(i));
+        if (target_dim > 0 and target_dim != src_dim) return null;
+        out[i] = src_dim;
+        prefix_numel = std.math.mul(usize, prefix_numel, @intCast(src_dim)) catch return null;
+    }
+    if (prefix_numel == 0 or input_numel % prefix_numel != 0) return null;
+    const projected_width = input_numel / prefix_numel;
+    if (projected_width == 0) return null;
+
+    var suffix_product: usize = 1;
+    var unknown_suffix: ?usize = null;
+    for (prefix_rank..rank) |i| {
+        const dim = target.dim(@intCast(i));
+        if (dim > 0) {
+            out[i] = dim;
+            suffix_product = std.math.mul(usize, suffix_product, @intCast(dim)) catch return null;
+        } else if (dim < 0) {
+            if (unknown_suffix != null) return null;
+            unknown_suffix = i;
+            out[i] = dim;
+        } else {
+            return null;
+        }
+    }
+
+    if (unknown_suffix) |idx| {
+        if (suffix_product == 0 or projected_width % suffix_product != 0) return null;
+        out[idx] = @intCast(projected_width / suffix_product);
+    } else if (suffix_product != projected_width) {
+        return null;
+    }
+
+    if (safeElementCountFromDims(out[0..rank]) == input_numel) return out[0..rank];
+    return null;
+}
+
 fn resolveProjectionRestoreFromSourceActual(src_actual: []const i64, target: Shape, input_numel: usize, out: *[8]i64) ?[]const i64 {
     if (resolveRuntimeAlignedDynamicDims(src_actual, target, input_numel, out)) |resolved| return resolved;
+    if (resolveRuntimeSplitLastDim(src_actual, target, input_numel, out)) |resolved| return resolved;
+    if (resolveFlattenedProjectionSuffixDims(src_actual, target, input_numel, out)) |resolved| return resolved;
 
     const rank = target.rank();
     if (src_actual.len == rank + 1 and rank >= 2 and rank <= out.len) {
@@ -2104,9 +2174,9 @@ pub fn executeNode(
             return cb.primAbs(V.get(ins[0]));
         },
         .add, .mul, .sub, .div, .less_than => {
-            // For backends that track tensor shapes (MLX), ensure inputs
+            // For backends that track tensor shapes, ensure inputs
             // match their declared shapes before the binary op. The native
-            // backend uses flat arrays and ignores shapes, but MLX uses
+            // backend uses flat arrays and ignores shapes, but shape-tracking backends use
             // numpy-style broadcasting which requires correct shapes.
             const a_val = V.get(ins[0]);
             const b_val = V.get(ins[1]);
@@ -2324,22 +2394,22 @@ pub fn executeNode(
 
         .reduce_sum => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primReduceSum(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_max => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primReduceMax(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_mean => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primReduceMean(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .argmax => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primArgMax(V.get(ins[0]), attrs.axis, attrs.keepdims, in_shape);
         },
         .reshape => |attrs| {
@@ -2380,18 +2450,18 @@ pub fn executeNode(
         },
         .transpose => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
-            const r = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
-            defer if (r) |v| cb.free(v);
+            var declared_buf: [8]i64 = undefined;
+            const input = dispatchTensorWithShape(cb, state, graph, ins[0], V.get(ins[0]), &sbuf, &declared_buf);
+            defer input.deinit(cb);
             var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
-            const perm = transpose_utils.effectivePerm(attrs, graph.node(ins[0]).output_shape.rank(), &perm_buf);
-            const result = cb.primTranspose(r orelse V.get(ins[0]), perm, in_shape) catch |err| {
+            const perm = transpose_utils.effectivePerm(attrs, input.shape.len, &perm_buf);
+            const result = cb.primTranspose(input.value, perm, input.shape) catch |err| {
                 if (err == error.UnsupportedShape) {
                     const input_node = graph.node(ins[0]);
                     std.log.warn("transpose execution failed node_id={d} input_id={d} shape={any} perm={any}", .{
                         node_id,
                         ins[0],
-                        in_shape,
+                        input.shape,
                         perm,
                     });
                     std.log.warn("transpose input node op={s} declared_shape={any}", .{
@@ -2423,51 +2493,50 @@ pub fn executeNode(
         },
         .broadcast_in_dim => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            var declared_buf: [8]i64 = undefined;
+            const input = dispatchTensorWithShape(cb, state, graph, ins[0], V.get(ins[0]), &sbuf, &declared_buf);
+            defer input.deinit(cb);
             const rank = attrs.target_shape.rank();
             var target_dims: [8]i64 = undefined;
             for (0..rank) |d| target_dims[d] = attrs.target_shape.dim(@intCast(d));
-            const reshaped = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
-            defer if (reshaped) |r| cb.free(r);
             const result = try cb.primBroadcastInDim(
-                reshaped orelse V.get(ins[0]),
+                input.value,
                 target_dims[0..rank],
                 attrs.broadcast_axes[0..attrs.num_axes],
-                in_shape,
+                input.shape,
             );
             return result;
         },
         .dot_general => |attrs| {
             var lbuf: [8]i64 = undefined;
             var rbuf: [8]i64 = undefined;
-            const lhs_shape = fillShapeDims(graph, ins[0], &lbuf);
-            const rhs_shape = fillShapeDims(graph, ins[1], &rbuf);
-            // Reshape inputs to declared shapes for shape-tracking backends.
-            const lhs_r = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
-            defer if (lhs_r) |r| cb.free(r);
-            const rhs_r = ensureDeclaredShape(cb, V.get(ins[1]), graph.node(ins[1]).output_shape);
-            defer if (rhs_r) |r| cb.free(r);
+            var lhs_declared_buf: [8]i64 = undefined;
+            var rhs_declared_buf: [8]i64 = undefined;
+            const lhs = dispatchTensorWithShape(cb, state, graph, ins[0], V.get(ins[0]), &lbuf, &lhs_declared_buf);
+            defer lhs.deinit(cb);
+            const rhs = dispatchTensorWithShape(cb, state, graph, ins[1], V.get(ins[1]), &rbuf, &rhs_declared_buf);
+            defer rhs.deinit(cb);
             const result = cb.primDotGeneral(
-                lhs_r orelse V.get(ins[0]),
-                rhs_r orelse V.get(ins[1]),
-                lhs_shape,
-                rhs_shape,
+                lhs.value,
+                rhs.value,
+                lhs.shape,
+                rhs.shape,
                 attrs.lhs_contracting[0..attrs.num_contracting],
                 attrs.rhs_contracting[0..attrs.num_contracting],
                 attrs.lhs_batch[0..attrs.num_batch],
                 attrs.rhs_batch[0..attrs.num_batch],
             ) catch |err| {
-                if (err == error.UnsupportedShape) {
-                    const lhs_actual = cb.tensorShape(lhs_r orelse V.get(ins[0]), std.heap.page_allocator) catch null;
+                if (err == error.UnsupportedShape or err == error.UnsupportedPrimitiveOp) {
+                    const lhs_actual = cb.tensorShape(lhs.value, std.heap.page_allocator) catch null;
                     defer if (lhs_actual) |shape| std.heap.page_allocator.free(shape);
-                    const rhs_actual = cb.tensorShape(rhs_r orelse V.get(ins[1]), std.heap.page_allocator) catch null;
+                    const rhs_actual = cb.tensorShape(rhs.value, std.heap.page_allocator) catch null;
                     defer if (rhs_actual) |shape| std.heap.page_allocator.free(shape);
                     std.log.warn("dot_general execution failed node_id={d} lhs_id={d} rhs_id={d} lhs_shape={any} rhs_shape={any} lhs_contracting={any} rhs_contracting={any} lhs_batch={any} rhs_batch={any}", .{
                         node_id,
                         ins[0],
                         ins[1],
-                        lhs_shape,
-                        rhs_shape,
+                        lhs.shape,
+                        rhs.shape,
                         attrs.lhs_contracting[0..attrs.num_contracting],
                         attrs.rhs_contracting[0..attrs.num_contracting],
                         attrs.lhs_batch[0..attrs.num_batch],
@@ -2583,15 +2652,15 @@ pub fn executeNode(
                 scatter_values = V.get(ins[0]);
                 indices = V.get(ins[1]);
                 dest_shape = dest_buf[0..rank];
-                values_shape = fillShapeDims(graph, ins[0], &values_buf);
-                indices_shape = fillShapeDims(graph, ins[1], &indices_buf);
+                values_shape = runtimeOrDeclaredShape(state, graph, ins[0], &values_buf);
+                indices_shape = runtimeOrDeclaredShape(state, graph, ins[1], &indices_buf);
             } else {
                 dest = V.get(ins[0]);
                 scatter_values = V.get(ins[1]);
                 indices = V.get(ins[2]);
-                dest_shape = fillShapeDims(graph, ins[0], &dest_buf);
-                values_shape = fillShapeDims(graph, ins[1], &values_buf);
-                indices_shape = fillShapeDims(graph, ins[2], &indices_buf);
+                dest_shape = runtimeOrDeclaredShape(state, graph, ins[0], &dest_buf);
+                values_shape = runtimeOrDeclaredShape(state, graph, ins[1], &values_buf);
+                indices_shape = runtimeOrDeclaredShape(state, graph, ins[2], &indices_buf);
             }
             return executeScatterAdd(
                 std.heap.page_allocator,
@@ -2607,13 +2676,15 @@ pub fn executeNode(
         },
         .gather => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             const result = try cb.primGather(V.get(ins[0]), V.get(ins[1]), attrs.axis, in_shape);
             return result;
         },
         .slice => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
+            var declared_buf: [8]i64 = undefined;
+            const declared_shape = fillShapeDims(graph, ins[0], &declared_buf);
             const rank = @as(usize, attrs.num_axes);
             var starts: [8]i64 = undefined;
             var limits: [8]i64 = undefined;
@@ -2622,6 +2693,9 @@ pub fn executeNode(
                 starts[d] = attrs.starts[d];
                 limits[d] = attrs.limits[d];
                 strides[d] = attrs.strides[d];
+                if (limits[d] < 0 and d < declared_shape.len and d < in_shape.len and declared_shape[d] < 0 and starts[d] == 0 and strides[d] == 1 and in_shape[d] > 0) {
+                    limits[d] = in_shape[d];
+                }
             }
             const result = cb.primSlice(V.get(ins[0]), starts[0..rank], limits[0..rank], strides[0..rank], in_shape) catch |err| {
                 const actual = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
@@ -2690,8 +2764,8 @@ pub fn executeNode(
         .concat_prim => |attrs| {
             var abuf: [8]i64 = undefined;
             var bbuf: [8]i64 = undefined;
-            const a_shape = fillShapeDims(graph, ins[0], &abuf);
-            const b_shape = fillShapeDims(graph, ins[1], &bbuf);
+            const a_shape = runtimeOrDeclaredShape(state, graph, ins[0], &abuf);
+            const b_shape = runtimeOrDeclaredShape(state, graph, ins[1], &bbuf);
             return cb.primConcatPrim(V.get(ins[0]), V.get(ins[1]), attrs.axis, a_shape, b_shape) catch |err| {
                 const a_inputs = graph.node(ins[0]).getInputs();
                 const b_inputs = graph.node(ins[1]).getInputs();
@@ -3629,6 +3703,43 @@ test "shouldReshapeToDeclaredShape preserves concrete runtime batch" {
     ));
 }
 
+test "dispatchTensorWithShape pairs declared reshape with declared shape" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 1, 6 }));
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{6});
+    defer cb_val.free(x_ct);
+
+    const runtime_shape = [_]i64{6};
+    const runtime_shapes = [_]?[]const i64{runtime_shape[0..]};
+    const state = ExecState{
+        .attention_layer = 0,
+        .options = .{},
+        .runtime_shapes = runtime_shapes[0..],
+    };
+
+    var runtime_buf: [8]i64 = undefined;
+    var declared_buf: [8]i64 = undefined;
+    const input = dispatchTensorWithShape(&cb_val, &state, &g, x, x_ct, &runtime_buf, &declared_buf);
+    defer input.deinit(&cb_val);
+
+    try std.testing.expect(input.owned != null);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 6 }, input.shape);
+
+    const actual_shape = try cb_val.tensorShape(input.value, allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 6 }, actual_shape);
+}
+
 test "resolveRuntimeReshapeDims preserves runtime batch for exported singleton reshape" {
     var out: [8]i64 = undefined;
     const resolved = resolveRuntimeReshapeDims(
@@ -3699,6 +3810,18 @@ test "resolveProjectionRestoreFromSourceActual restores packed attention output 
     ) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqualSlices(i64, &.{ 3, 512, 128 }, resolved);
+}
+
+test "resolveProjectionRestoreFromSourceActual restores nomic qkv projection suffix" {
+    var out: [8]i64 = undefined;
+    const resolved = resolveProjectionRestoreFromSourceActual(
+        &.{ 1, 512, 768 },
+        Shape.init(.f32, &.{ -1, -1, 3, 12, 64 }),
+        1 * 512 * 3 * 12 * 64,
+        &out,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 512, 3, 12, 64 }, resolved);
 }
 
 test "isLeadingAxisFlatten validates only true leading-axis flatten" {
@@ -4470,4 +4593,421 @@ test "reshape preserves runtime batch for exported singleton target" {
     const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
     defer allocator.free(actual_shape);
     try std.testing.expectEqualSlices(i64, &.{ 2, 6, 2, 2 }, actual_shape);
+}
+
+test "runtime shape drives symbolic reduce" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 3 }));
+    const reduced = try builder.reduceSum(x, &.{1});
+    try g.markOutput(reduced);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    var input: [2 * 4 * 3]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @floatFromInt(i + 1);
+    const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 2, 4, 3 });
+    defer cb_val.free(x_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 1, 3 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 22, 26, 30, 70, 74, 78 }, actual);
+}
+
+test "runtime shape drives symbolic slice" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 3 }));
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = 3;
+    attrs.starts = .{ 0, 1, 0, 0, 0, 0, 0, 0 };
+    attrs.limits = .{ -1, 3, 3, 0, 0, 0, 0, 0 };
+    attrs.strides = .{ 1, 1, 1, 0, 0, 0, 0, 0 };
+    const sliced = try g.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(.f32, &.{ -1, 2, 3 }),
+        .inputs = .{ x, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(sliced);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    var input: [2 * 4 * 3]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @floatFromInt(i + 1);
+    const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 2, 4, 3 });
+    defer cb_val.free(x_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 3 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{
+        4,  5,  6,
+        7,  8,  9,
+        16, 17, 18,
+        19, 20, 21,
+    }, actual);
+}
+
+test "runtime shape drives symbolic concat" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const a = try builder.parameter("a", Shape.init(.f32, &.{ -1, -1, 3 }));
+    const b = try builder.parameter("b", Shape.init(.f32, &.{ -1, -1, 3 }));
+    const joined = try builder.concat(a, b, 1);
+    try g.markOutput(joined);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    var a_input: [2 * 2 * 3]f32 = undefined;
+    for (&a_input, 0..) |*value, i| value.* = @floatFromInt(i + 1);
+    var b_input: [2 * 3 * 3]f32 = undefined;
+    for (&b_input, 0..) |*value, i| value.* = @floatFromInt(i + 101);
+
+    const a_ct = try cb_val.fromFloat32Shape(&a_input, &.{ 2, 2, 3 });
+    defer cb_val.free(a_ct);
+    const b_ct = try cb_val.fromFloat32Shape(&b_input, &.{ 2, 3, 3 });
+    defer cb_val.free(b_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = a, .value = a_ct },
+        .{ .node_id = b, .value = b_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 5, 3 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{
+        1,   2,   3,
+        4,   5,   6,
+        101, 102, 103,
+        104, 105, 106,
+        107, 108, 109,
+        7,   8,   9,
+        10,  11,  12,
+        110, 111, 112,
+        113, 114, 115,
+        116, 117, 118,
+    }, actual);
+}
+
+test "runtime shape drives symbolic batched dot_general" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const a = try builder.parameter("a", Shape.init(.f32, &.{ -1, -1, 3 }));
+    const b = try builder.parameter("b", Shape.init(.f32, &.{ -1, 3, 2 }));
+    const product = try builder.matmul3D(a, b);
+    try g.markOutput(product);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const a_input = [_]f32{
+        1,  2,  3,
+        4,  5,  6,
+        7,  8,  9,
+        10, 11, 12,
+    };
+    const b_input = [_]f32{
+        1, 0,
+        0, 1,
+        1, 1,
+        2, 0,
+        0, 2,
+        1, 1,
+    };
+
+    const a_ct = try cb_val.fromFloat32Shape(&a_input, &.{ 2, 2, 3 });
+    defer cb_val.free(a_ct);
+    const b_ct = try cb_val.fromFloat32Shape(&b_input, &.{ 2, 3, 2 });
+    defer cb_val.free(b_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = a, .value = a_ct },
+        .{ .node_id = b, .value = b_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{
+        4,  5,
+        10, 11,
+        23, 25,
+        32, 34,
+    }, actual);
+}
+
+test "runtime shape drives symbolic argmax" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 3 }));
+    const out = try builder.argMax(x, 1, true);
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const input = [_]f32{
+        1,  9,  3,
+        4,  2,  6,
+        7,  5,  8,
+        10, 1,  0,
+        11, 3,  4,
+        5,  12, 6,
+        7,  8,  13,
+        9,  10, 2,
+    };
+    const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 2, 4, 3 });
+    defer cb_val.free(x_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 1, 3 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 0, 2, 0, 1, 2 }, actual);
+}
+
+test "runtime shape drives symbolic broadcast_in_dim" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, 1, 3 }));
+    var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = Shape.init(.f32, &.{ -1, 4, 3 }) };
+    attrs.broadcast_axes = .{ 0, 1, 2, 0, 0, 0, 0, 0 };
+    attrs.num_axes = 3;
+    const out = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = attrs },
+        .output_shape = attrs.target_shape,
+        .inputs = .{ x, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const input = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 2, 1, 3 });
+    defer cb_val.free(x_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4, 3 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{
+        1, 2, 3,
+        1, 2, 3,
+        1, 2, 3,
+        1, 2, 3,
+        4, 5, 6,
+        4, 5, 6,
+        4, 5, 6,
+        4, 5, 6,
+    }, actual);
+}
+
+test "runtime shape drives symbolic scatter_add" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const dest = try builder.parameter("dest", Shape.init(.f32, &.{ -1, 2 }));
+    const values = try builder.parameter("values", Shape.init(.f32, &.{ -1, 2 }));
+    const indices = try builder.parameter("indices", Shape.init(.i64, &.{-1}));
+    const out = try builder.scatterAdd(dest, values, indices, 0);
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const dest_ct = try cb_val.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &.{ 3, 2 });
+    defer cb_val.free(dest_ct);
+    const values_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer cb_val.free(values_ct);
+    const indices_ct = try cb_val.fromFloat32Shape(&.{ 0, 1, 0 }, &.{3});
+    defer cb_val.free(indices_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = dest, .value = dest_ct },
+        .{ .node_id = values, .value = values_ct },
+        .{ .node_id = indices, .value = indices_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 16, 28, 33, 44, 50, 60 }, actual);
+}
+
+test "reshape restores batched flattened projection shape before gather" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 6 }));
+    const flattened = try builder.reshape(x, Shape.init(.f32, &.{ -1, 6 }));
+    const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 6, 6 }));
+    const projected = try builder.matmul(flattened, weight);
+    const attention = try builder.reshape(projected, Shape.init(.f32, &.{ -1, -1, 2, 3 }));
+    const indices = try builder.parameter("indices", Shape.init(.i64, &.{2}));
+    const gathered = try g.addNode(.{
+        .op = .{ .gather = .{ .axis = 1 } },
+        .output_shape = Shape.init(.f32, &.{ -1, 2, 2, 3 }),
+        .inputs = .{ attention, indices, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(gathered);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    var input: [2 * 4 * 6]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @floatFromInt(i + 1);
+    var identity: [6 * 6]f32 = .{0} ** (6 * 6);
+    for (0..6) |i| identity[i * 6 + i] = 1.0;
+
+    const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 2, 4, 6 });
+    defer cb_val.free(x_ct);
+    const weight_ct = try cb_val.fromFloat32Shape(&identity, &.{ 6, 6 });
+    defer cb_val.free(weight_ct);
+    const indices_ct = try cb_val.fromFloat32Shape(&.{ 1, 3 }, &.{2});
+    defer cb_val.free(indices_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+        .{ .node_id = weight, .value = weight_ct },
+        .{ .node_id = indices, .value = indices_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2, 3 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{
+        7,  8,  9,
+        10, 11, 12,
+        19, 20, 21,
+        22, 23, 24,
+        31, 32, 33,
+        34, 35, 36,
+        43, 44, 45,
+        46, 47, 48,
+    }, actual);
 }

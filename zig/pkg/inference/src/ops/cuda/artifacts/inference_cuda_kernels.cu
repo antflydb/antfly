@@ -12,9 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <mma.h>
+
+using namespace nvcuda;
+
 extern "C" __global__ void termite_fill_f32(float* dst, unsigned int n, float value) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = value;
+}
+
+extern "C" __global__ void termite_cast_f32_to_f16(unsigned short* dst, const float* src, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half_as_ushort(__float2half_rn(src[i]));
+}
+
+extern "C" __global__ void termite_cast_f32_to_bf16(unsigned short* dst, const float* src, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat16_as_ushort(__float2bfloat16_rn(src[i]));
 }
 
 extern "C" __global__ void termite_linear_f32(
@@ -563,6 +579,30 @@ extern "C" __global__ void termite_take_rows_f32(
     dst[idx] = src_row < source_rows ? input[src_row * dim + col] : 0.0f;
 }
 
+extern "C" __global__ void termite_gliner_gather_concat_relu_f32(
+    float* dst,
+    const float* start,
+    const float* end,
+    const unsigned int* start_rows,
+    const unsigned int* end_rows,
+    unsigned int source_rows,
+    unsigned int rows,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int out_dim = dim * 2u;
+    unsigned int count = rows * out_dim;
+    if (idx >= count) return;
+    unsigned int row = idx / out_dim;
+    unsigned int col = idx - row * out_dim;
+    bool is_end = col >= dim;
+    unsigned int inner_col = is_end ? col - dim : col;
+    unsigned int src_row = is_end ? end_rows[row] : start_rows[row];
+    const float* src = is_end ? end : start;
+    float y = src_row < source_rows ? src[src_row * dim + inner_col] : 0.0f;
+    dst[idx] = y < 0.0f ? 0.0f : y;
+}
+
 extern "C" __global__ void termite_gliner_word_embeddings_f32(
     float* dst,
     const float* hidden,
@@ -870,6 +910,112 @@ __device__ float termite_half_to_float(unsigned short h) {
     return sign ? -value : value;
 }
 
+__device__ float termite_bf16_to_float(unsigned short h) {
+    return __uint_as_float(((unsigned int)h) << 16);
+}
+
+extern "C" __global__ void termite_embedding_lookup_weight_f16_f32(
+    float* dst,
+    const unsigned short* weight,
+    const long long* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int row = idx / dim;
+    unsigned int col = idx - row * dim;
+    unsigned long long id = (unsigned long long)ids[row];
+    dst[idx] = termite_half_to_float(weight[id * dim + col]);
+}
+
+extern "C" __global__ void termite_embedding_lookup_weight_bf16_f32(
+    float* dst,
+    const unsigned short* weight,
+    const long long* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int row = idx / dim;
+    unsigned int col = idx - row * dim;
+    unsigned long long id = (unsigned long long)ids[row];
+    dst[idx] = termite_bf16_to_float(weight[id * dim + col]);
+}
+
+template <bool HasBias, bool IsBf16>
+__device__ void termite_linear_weight16_f32_common(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = rows * out_dim;
+    if (idx >= total) return;
+    unsigned int row = idx / out_dim;
+    unsigned int col = idx - row * out_dim;
+    float acc = HasBias ? bias[col] : 0.0f;
+    for (unsigned int k = 0; k < in_dim; ++k) {
+        unsigned short raw = weight[col * in_dim + k];
+        float w = IsBf16 ? termite_bf16_to_float(raw) : termite_half_to_float(raw);
+        acc += input[row * in_dim + k] * w;
+    }
+    dst[idx] = acc;
+}
+
+extern "C" __global__ void termite_linear_weight_f16_f32(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_linear_weight16_f32_common<false, false>(dst, input, weight, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_bias_weight_f16_f32(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_linear_weight16_f32_common<true, false>(dst, input, weight, bias, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_weight_bf16_f32(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_linear_weight16_f32_common<false, true>(dst, input, weight, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_bias_weight_bf16_f32(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_linear_weight16_f32_common<true, true>(dst, input, weight, bias, rows, in_dim, out_dim);
+}
+
 extern "C" __global__ void termite_linear_q8_0_f32(
     float* dst,
     const float* input,
@@ -895,6 +1041,343 @@ extern "C" __global__ void termite_linear_q8_0_f32(
         }
     }
     dst[idx] = acc;
+}
+
+__device__ float termite_q8_0_value(const unsigned char* bp, unsigned int lane) {
+    unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+    float d = termite_half_to_float(h);
+    signed char q = (signed char)bp[2u + lane];
+    return (float)q * d;
+}
+
+__device__ __forceinline__ float termite_warp_reduce_sum(float v) {
+    v += __shfl_down_sync(0xffffffffu, v, 16);
+    v += __shfl_down_sync(0xffffffffu, v, 8);
+    v += __shfl_down_sync(0xffffffffu, v, 4);
+    v += __shfl_down_sync(0xffffffffu, v, 2);
+    v += __shfl_down_sync(0xffffffffu, v, 1);
+    return v;
+}
+
+__device__ float termite_q8_0_value_broadcast_scale(const unsigned char* bp, unsigned int lane) {
+    float d = 0.0f;
+    if (lane == 0u) {
+        unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        d = termite_half_to_float(h);
+    }
+    d = __shfl_sync(0xffffffffu, d, 0);
+    signed char q = (signed char)bp[2u + lane];
+    return (float)q * d;
+}
+
+template <unsigned int ROWS_PER_BLOCK, unsigned int COLS, unsigned int MODE>
+__device__ void termite_q8_0_tile_rows_cols(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int col_tile = blockIdx.x * COLS;
+    unsigned int row_base = blockIdx.y * ROWS_PER_BLOCK;
+    unsigned int tid = threadIdx.x;
+    unsigned int row_blocks = in_dim / 32u;
+    unsigned int block_tiles = in_dim / 256u;
+    __shared__ float partial[ROWS_PER_BLOCK][COLS][256];
+    float acc[ROWS_PER_BLOCK][COLS];
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+        #pragma unroll
+        for (unsigned int c = 0; c < COLS; ++c) acc[r][c] = 0.0f;
+    }
+    if (tid < 256u) {
+        unsigned int sub_block = tid >> 5;
+        unsigned int lane = tid & 31u;
+        for (unsigned int tile = 0; tile < block_tiles; ++tile) {
+            unsigned int block = tile * 8u + sub_block;
+            float x[ROWS_PER_BLOCK];
+            #pragma unroll
+            for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                unsigned int row = row_base + r;
+                x[r] = row < rows ? input[row * in_dim + block * 32u + lane] : 0.0f;
+            }
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 34u;
+                    float q = termite_q8_0_value(bp, lane);
+                    #pragma unroll
+                    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                        acc[r][c] += x[r] * q;
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) partial[r][c][tid] = acc[r][c];
+        }
+    }
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            #pragma unroll
+            for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                #pragma unroll
+                for (unsigned int c = 0; c < COLS; ++c) partial[r][c][tid] += partial[r][c][tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            unsigned int row = row_base + r;
+            if (row >= rows) continue;
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col >= out_dim) continue;
+                unsigned int idx = row * out_dim + col;
+                float y = partial[r][c][0];
+                if (MODE == 1u || MODE == 2u || MODE == 3u || MODE == 4u) y += bias[col];
+                if (MODE == 2u) y = 0.5f * y * (1.0f + tanhf(0.7978845608028654f * (y + 0.044715f * y * y * y)));
+                if (MODE == 3u) y += residual[idx];
+                if (MODE == 4u && y < 0.0f) y = 0.0f;
+                dst[idx] = y;
+            }
+        }
+    }
+}
+
+template <unsigned int ROWS_PER_BLOCK, unsigned int COLS, unsigned int MODE>
+__device__ void termite_q8_0_tile_rows_cols_fast(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int col_tile = blockIdx.x * COLS;
+    unsigned int row_base = blockIdx.y * ROWS_PER_BLOCK;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31u;
+    unsigned int warp = tid >> 5;
+    unsigned int row_blocks = in_dim / 32u;
+    unsigned int block_tiles = in_dim / 256u;
+    __shared__ float warp_partial[ROWS_PER_BLOCK][COLS][8];
+    float acc[ROWS_PER_BLOCK][COLS];
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+        #pragma unroll
+        for (unsigned int c = 0; c < COLS; ++c) acc[r][c] = 0.0f;
+    }
+    if (tid < 256u) {
+        unsigned int sub_block = warp;
+        for (unsigned int tile = 0; tile < block_tiles; ++tile) {
+            unsigned int block = tile * 8u + sub_block;
+            float x[ROWS_PER_BLOCK];
+            #pragma unroll
+            for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                unsigned int row = row_base + r;
+                x[r] = row < rows ? input[row * in_dim + block * 32u + lane] : 0.0f;
+            }
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 34u;
+                    float q = termite_q8_0_value_broadcast_scale(bp, lane);
+                    #pragma unroll
+                    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                        acc[r][c] += x[r] * q;
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                float sum = termite_warp_reduce_sum(acc[r][c]);
+                if (lane == 0u) warp_partial[r][c][warp] = sum;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            unsigned int row = row_base + r;
+            if (row >= rows) continue;
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col >= out_dim) continue;
+                float y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0; w < 8u; ++w) y += warp_partial[r][c][w];
+                unsigned int idx = row * out_dim + col;
+                if (MODE == 1u || MODE == 2u || MODE == 3u || MODE == 4u) y += bias[col];
+                if (MODE == 2u) y = 0.5f * y * (1.0f + tanhf(0.7978845608028654f * (y + 0.044715f * y * y * y)));
+                if (MODE == 3u) y += residual[idx];
+                if (MODE == 4u && y < 0.0f) y = 0.0f;
+                dst[idx] = y;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void termite_linear_q8_0_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_add_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_0_f32(
@@ -951,6 +1434,284 @@ __device__ float termite_q4k_value(const unsigned char* bp, unsigned int value_i
     float scale = d * (float)termite_q4k_scale(scales, sub);
     float minv = dmin * (float)termite_q4k_min(scales, sub);
     return scale * (float)q - minv;
+}
+
+__device__ float termite_q4k_value_broadcast_scale(const unsigned char* bp, unsigned int value_index, unsigned int lane) {
+    unsigned int sub = value_index / 32u;
+    unsigned int chunk = value_index / 64u;
+    float d = 0.0f;
+    float dmin = 0.0f;
+    int scale_i = 0;
+    int min_i = 0;
+    if (lane == 0u) {
+        unsigned short dh = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        unsigned short dminh = (unsigned short)bp[2] | ((unsigned short)bp[3] << 8);
+        d = termite_half_to_float(dh);
+        dmin = termite_half_to_float(dminh);
+        const unsigned char* scales = bp + 4u;
+        scale_i = termite_q4k_scale(scales, sub);
+        min_i = termite_q4k_min(scales, sub);
+    }
+    d = __shfl_sync(0xffffffffu, d, 0);
+    dmin = __shfl_sync(0xffffffffu, dmin, 0);
+    scale_i = __shfl_sync(0xffffffffu, scale_i, 0);
+    min_i = __shfl_sync(0xffffffffu, min_i, 0);
+    const unsigned char* qs = bp + 16u;
+    unsigned char packed = qs[chunk * 32u + lane];
+    unsigned int q = (sub & 1u) == 0u ? (unsigned int)(packed & 0x0fu) : (unsigned int)(packed >> 4u);
+    return (d * (float)scale_i) * (float)q - (dmin * (float)min_i);
+}
+
+static constexpr unsigned int TERMITE_QTC_M = 64u;
+static constexpr unsigned int TERMITE_QTC_N = 32u;
+static constexpr unsigned int TERMITE_QTC_K = 16u;
+static constexpr unsigned int TERMITE_QTC_THREADS = 256u;
+
+__device__ __forceinline__ half termite_half_from_le(const unsigned char* src) {
+    unsigned short bits = (unsigned short)src[0] | ((unsigned short)src[1] << 8);
+    return __ushort_as_half(bits);
+}
+
+__device__ __forceinline__ half termite_q8_0_tc_value_at(
+    const unsigned char* packed,
+    unsigned int out_dim,
+    unsigned int col,
+    unsigned int row_blocks,
+    unsigned int k_abs
+) {
+    unsigned int block = k_abs / 32u;
+    unsigned int lane = k_abs & 31u;
+    unsigned int block_index = col * row_blocks + block;
+    unsigned int block_count = out_dim * row_blocks;
+    half d = termite_half_from_le(packed + block_index * 2u);
+    signed char q = (signed char)packed[block_count * 2u + block_index * 32u + lane];
+    return __float2half_rn((float)q * __half2float(d));
+}
+
+__device__ __forceinline__ half termite_q4_k_tc_value_at(
+    const unsigned char* packed,
+    unsigned int out_dim,
+    unsigned int col,
+    unsigned int row_blocks,
+    unsigned int k_abs
+) {
+    unsigned int block = k_abs / 256u;
+    unsigned int in_block = k_abs & 255u;
+    unsigned int sub = in_block / 32u;
+    unsigned int chunk = in_block / 64u;
+    unsigned int lane = in_block & 31u;
+    unsigned int block_index = col * row_blocks + block;
+    unsigned int block_count = out_dim * row_blocks;
+    const unsigned char* meta = packed + block_index * 20u;
+    const unsigned char* qs = packed + block_count * 20u + block_index * 128u;
+    half dh = termite_half_from_le(meta);
+    half dminh = termite_half_from_le(meta + 2u);
+    float d = __half2float(dh);
+    float dmin = __half2float(dminh);
+    unsigned char packed_q = qs[chunk * 32u + lane];
+    unsigned int q = (sub & 1u) == 0u ? (unsigned int)(packed_q & 0x0fu) : (unsigned int)(packed_q >> 4u);
+    float scale = d * (float)meta[4u + sub];
+    float minv = dmin * (float)meta[12u + sub];
+    return __float2half_rn(scale * (float)q - minv);
+}
+
+template <unsigned int MODE, bool Q4K>
+__device__ void termite_qtc_hmma_tile(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int tid = threadIdx.x;
+    unsigned int warp = tid >> 5;
+    if (warp >= 8u) return;
+    unsigned int warp_m = warp & 3u;
+    unsigned int warp_n = warp >> 2;
+    unsigned int row_base = blockIdx.y * TERMITE_QTC_M;
+    unsigned int col_base = blockIdx.x * TERMITE_QTC_N;
+    unsigned int row_blocks = Q4K ? (in_dim / 256u) : (in_dim / 32u);
+
+    __shared__ half a_tile[TERMITE_QTC_M * TERMITE_QTC_K];
+    __shared__ half b_tile[TERMITE_QTC_K * TERMITE_QTC_N];
+    __shared__ float c_tile[TERMITE_QTC_M * TERMITE_QTC_N];
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    for (unsigned int k_base = 0; k_base < in_dim; k_base += TERMITE_QTC_K) {
+        for (unsigned int i = tid; i < TERMITE_QTC_M * TERMITE_QTC_K; i += TERMITE_QTC_THREADS) {
+            unsigned int local_row = i / TERMITE_QTC_K;
+            unsigned int local_k = i - local_row * TERMITE_QTC_K;
+            unsigned int row = row_base + local_row;
+            unsigned int k_abs = k_base + local_k;
+            float x = (row < rows && k_abs < in_dim) ? input[row * in_dim + k_abs] : 0.0f;
+            a_tile[i] = __float2half_rn(x);
+        }
+        for (unsigned int i = tid; i < TERMITE_QTC_K * TERMITE_QTC_N; i += TERMITE_QTC_THREADS) {
+            unsigned int local_k = i / TERMITE_QTC_N;
+            unsigned int local_col = i - local_k * TERMITE_QTC_N;
+            unsigned int col = col_base + local_col;
+            unsigned int k_abs = k_base + local_k;
+            half w = __float2half_rn(0.0f);
+            if (col < out_dim && k_abs < in_dim) {
+                w = Q4K
+                    ? termite_q4_k_tc_value_at(packed_weight, out_dim, col, row_blocks, k_abs)
+                    : termite_q8_0_tc_value_at(packed_weight, out_dim, col, row_blocks, k_abs);
+            }
+            b_tile[i] = w;
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+        wmma::load_matrix_sync(a_frag, a_tile + warp_m * 16u * TERMITE_QTC_K, TERMITE_QTC_K);
+        wmma::load_matrix_sync(b_frag, b_tile + warp_n * 16u, TERMITE_QTC_N);
+        wmma::mma_sync(acc, a_frag, b_frag, acc);
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(c_tile + warp_m * 16u * TERMITE_QTC_N + warp_n * 16u, acc, TERMITE_QTC_N, wmma::mem_row_major);
+    __syncthreads();
+
+    for (unsigned int i = tid; i < TERMITE_QTC_M * TERMITE_QTC_N; i += TERMITE_QTC_THREADS) {
+        unsigned int local_row = i / TERMITE_QTC_N;
+        unsigned int local_col = i - local_row * TERMITE_QTC_N;
+        unsigned int row = row_base + local_row;
+        unsigned int col = col_base + local_col;
+        if (row >= rows || col >= out_dim) continue;
+        unsigned int idx = row * out_dim + col;
+        float y = c_tile[i];
+        if (MODE == 1u || MODE == 2u || MODE == 3u || MODE == 4u || MODE == 5u) y += bias[col];
+        if (MODE == 2u) y = 0.5f * y * (1.0f + tanhf(0.7978845608028654f * (y + 0.044715f * y * y * y)));
+        if (MODE == 3u) y += residual[idx];
+        if (MODE == 4u) y = y / (1.0f + expf(-1.702f * y));
+        if (MODE == 5u) y = fmaxf(y, 0.0f);
+        dst[idx] = y;
+    }
+}
+
+extern "C" __global__ void termite_linear_q8_0_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<0u, false>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<1u, false>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<2u, false>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_add_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<3u, false>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<0u, true>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_gelu_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<2u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<3u, true>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<4u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_relu_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<5u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 template <unsigned int COLS, unsigned int MODE>
@@ -1021,6 +1782,7 @@ __device__ void termite_q4k_tile_rows_cols(
     const float* input,
     const unsigned char* weight,
     const float* bias,
+    const float* residual,
     unsigned int rows,
     unsigned int in_dim,
     unsigned int out_dim
@@ -1085,8 +1847,190 @@ __device__ void termite_q4k_tile_rows_cols(
                 if (col >= out_dim) continue;
                 unsigned int idx = row * out_dim + col;
                 float y = partial[r][c][0] + bias[col];
+                if (MODE == 2u) y = 0.5f * y * (1.0f + tanhf(0.7978845608028654f * (y + 0.044715f * y * y * y)));
+                if (MODE == 3u) y += residual[idx];
                 if (MODE == 4u && y < 0.0f) y = 0.0f;
                 dst[idx] = y;
+            }
+        }
+    }
+}
+
+template <unsigned int ROWS_PER_BLOCK, unsigned int COLS, unsigned int MODE>
+__device__ void termite_q4k_tile_rows_cols_fast(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int col_tile = blockIdx.x * COLS;
+    unsigned int row_base = blockIdx.y * ROWS_PER_BLOCK;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31u;
+    unsigned int warp = tid >> 5;
+    unsigned int row_blocks = in_dim / 256u;
+    __shared__ float warp_partial[ROWS_PER_BLOCK][COLS][8];
+    float acc[ROWS_PER_BLOCK][COLS];
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+        #pragma unroll
+        for (unsigned int c = 0; c < COLS; ++c) acc[r][c] = 0.0f;
+    }
+    if (tid < 256u) {
+        for (unsigned int block = 0; block < row_blocks; ++block) {
+            float x[ROWS_PER_BLOCK];
+            #pragma unroll
+            for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                unsigned int row = row_base + r;
+                x[r] = row < rows ? input[row * in_dim + block * 256u + tid] : 0.0f;
+            }
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
+                    float q = termite_q4k_value_broadcast_scale(bp, tid, lane);
+                    #pragma unroll
+                    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                        acc[r][c] += x[r] * q;
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                float sum = termite_warp_reduce_sum(acc[r][c]);
+                if (lane == 0u) warp_partial[r][c][warp] = sum;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            unsigned int row = row_base + r;
+            if (row >= rows) continue;
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col >= out_dim) continue;
+                float y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0; w < 8u; ++w) y += warp_partial[r][c][w];
+                unsigned int idx = row * out_dim + col;
+                if (MODE == 1u || MODE == 2u || MODE == 3u || MODE == 4u) y += bias[col];
+                if (MODE == 2u) y = 0.5f * y * (1.0f + tanhf(0.7978845608028654f * (y + 0.044715f * y * y * y)));
+                if (MODE == 3u) y += residual[idx];
+                if (MODE == 4u && y < 0.0f) y = 0.0f;
+                dst[idx] = y;
+            }
+        }
+    }
+}
+
+template <unsigned int ROWS_PER_BLOCK, unsigned int COLS, bool RELU, bool SEPARATE_INPUTS>
+__device__ void termite_q4k_pair_tile_rows_cols(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const float* input_b,
+    const unsigned char* weight_a,
+    const float* bias_a,
+    const unsigned char* weight_b,
+    const float* bias_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int col_tile = blockIdx.x * COLS;
+    unsigned int row_base = blockIdx.y * ROWS_PER_BLOCK;
+    unsigned int tid = threadIdx.x;
+    unsigned int row_blocks = in_dim / 256u;
+    __shared__ float partial_a[ROWS_PER_BLOCK][COLS][256];
+    __shared__ float partial_b[ROWS_PER_BLOCK][COLS][256];
+    float acc_a[ROWS_PER_BLOCK][COLS];
+    float acc_b[ROWS_PER_BLOCK][COLS];
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+        #pragma unroll
+        for (unsigned int c = 0; c < COLS; ++c) {
+            acc_a[r][c] = 0.0f;
+            acc_b[r][c] = 0.0f;
+        }
+    }
+    if (tid < 256u) {
+        for (unsigned int block = 0; block < row_blocks; ++block) {
+            float x_a[ROWS_PER_BLOCK];
+            float x_b[ROWS_PER_BLOCK];
+            #pragma unroll
+            for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                unsigned int row = row_base + r;
+                x_a[r] = row < rows ? input[row * in_dim + block * 256u + tid] : 0.0f;
+                x_b[r] = SEPARATE_INPUTS && row < rows ? input_b[row * in_dim + block * 256u + tid] : x_a[r];
+            }
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp_a = weight_a + (col * row_blocks + block) * 144u;
+                    const unsigned char* bp_b = weight_b + (col * row_blocks + block) * 144u;
+                    float qa = termite_q4k_value(bp_a, tid);
+                    float qb = termite_q4k_value(bp_b, tid);
+                    #pragma unroll
+                    for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                        acc_a[r][c] += x_a[r] * qa;
+                        acc_b[r][c] += x_b[r] * qb;
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                partial_a[r][c][tid] = acc_a[r][c];
+                partial_b[r][c][tid] = acc_b[r][c];
+            }
+        }
+    }
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            #pragma unroll
+            for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+                #pragma unroll
+                for (unsigned int c = 0; c < COLS; ++c) {
+                    partial_a[r][c][tid] += partial_a[r][c][tid + stride];
+                    partial_b[r][c][tid] += partial_b[r][c][tid + stride];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS_PER_BLOCK; ++r) {
+            unsigned int row = row_base + r;
+            if (row >= rows) continue;
+            #pragma unroll
+            for (unsigned int c = 0; c < COLS; ++c) {
+                unsigned int col = col_tile + c;
+                if (col >= out_dim) continue;
+                unsigned int idx = row * out_dim + col;
+                float y_a = partial_a[r][c][0] + bias_a[col];
+                float y_b = partial_b[r][c][0] + bias_b[col];
+                if (RELU) {
+                    if (y_a < 0.0f) y_a = 0.0f;
+                    if (y_b < 0.0f) y_b = 0.0f;
+                }
+                dst_a[idx] = y_a;
+                dst_b[idx] = y_b;
             }
         }
     }
@@ -1124,7 +2068,106 @@ extern "C" __global__ void termite_linear_q4_k_bias_f32_tile4_r2(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_q4k_tile_rows_cols<2u, 4u, 1u>(dst, input, weight, bias, rows, in_dim, out_dim);
+    termite_q4k_tile_rows_cols<2u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_gelu_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols<2u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols_fast<2u, 8u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_gelu_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols_fast<2u, 8u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_add_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols_fast<2u, 8u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols_fast<4u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_gelu_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols_fast<4u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_bias_add_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols_fast<4u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_quick_gelu_f32_tile4(
@@ -1160,7 +2203,101 @@ extern "C" __global__ void termite_linear_q4_k_bias_relu_f32_tile4_r2(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_q4k_tile_rows_cols<2u, 4u, 4u>(dst, input, weight, bias, rows, in_dim, out_dim);
+    termite_q4k_tile_rows_cols<2u, 4u, 4u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_span_bias_f32_tile8_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols<2u, 8u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_span_bias_relu_f32_tile8_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols<2u, 8u, 4u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_span_bias_f32_tile4_r8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols<8u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_span_bias_relu_f32_tile4_r8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_rows_cols<8u, 4u, 4u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_span_pair_bias_f32_tile8_r2(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const unsigned char* weight_a,
+    const float* bias_a,
+    const unsigned char* weight_b,
+    const float* bias_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_pair_tile_rows_cols<2u, 8u, false, false>(dst_a, dst_b, input, nullptr, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_span_pair_bias_relu_f32_tile8_r2(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const unsigned char* weight_a,
+    const float* bias_a,
+    const unsigned char* weight_b,
+    const float* bias_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_pair_tile_rows_cols<2u, 8u, true, false>(dst_a, dst_b, input, nullptr, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_span_pair2_bias_f32_tile8_r2(
+    float* dst_a,
+    float* dst_b,
+    const float* input_a,
+    const float* input_b,
+    const unsigned char* weight_a,
+    const float* bias_a,
+    const unsigned char* weight_b,
+    const float* bias_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_pair_tile_rows_cols<2u, 8u, false, true>(dst_a, dst_b, input_a, input_b, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tile4(

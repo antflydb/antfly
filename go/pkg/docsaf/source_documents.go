@@ -85,6 +85,11 @@ type SourceDocumentOptions struct {
 	// prefix.
 	BaseURL string
 
+	// MaxInlineBytes rejects InlineContent rows larger than this many source
+	// bytes. Non-positive values disable the guard. Production sync should prefer
+	// BaseURL over InlineContent for large files.
+	MaxInlineBytes int64
+
 	// IDPrefix optionally namespaces source document IDs.
 	IDPrefix string
 }
@@ -137,6 +142,9 @@ func SourceDocumentFromContentItem(item ContentItem, opts SourceDocumentOptions)
 		sourceURL = strings.TrimRight(opts.BaseURL, "/") + "/" + strings.TrimLeft(sourcePath, "/")
 	}
 	if opts.InlineContent {
+		if opts.MaxInlineBytes > 0 && int64(len(item.Content)) > opts.MaxInlineBytes {
+			return SourceDocument{}, fmt.Errorf("source document %q is %d bytes, exceeding inline content limit %d bytes; use BaseURL for large files", item.Path, len(item.Content), opts.MaxInlineBytes)
+		}
 		sourceURL = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(item.Content)
 	}
 	if sourceURL == "" {

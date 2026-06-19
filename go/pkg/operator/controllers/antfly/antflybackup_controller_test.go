@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -92,7 +93,8 @@ func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
 	}
 
 	spec := r.buildCronJobSpec(backup, cluster)
-	cmd := spec.JobTemplate.Spec.Template.Spec.Containers[0].Args[0]
+	container := spec.JobTemplate.Spec.Template.Spec.Containers[0]
+	cmd := container.Args[0]
 
 	// Command should start with the antfly backup command
 	if !strings.HasPrefix(cmd, "/antfly backup") {
@@ -104,9 +106,12 @@ func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
 		t.Errorf("backup name not properly quoted in backup-id: %s", cmd)
 	}
 
-	// URL should be shell-quoted
-	if !strings.Contains(cmd, "--url 'http://my-cluster-public-api.default.svc.cluster.local'") {
-		t.Errorf("URL not properly quoted: %s", cmd)
+	if strings.Contains(cmd, "--url") {
+		t.Errorf("command should not use stale --url flag: %s", cmd)
+	}
+
+	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://my-cluster-public-api.default.svc.cluster.local" {
+		t.Errorf("ANTFLY_URL = %q, want cluster public API URL", got)
 	}
 
 	// Location should be shell-quoted
@@ -241,9 +246,22 @@ func TestBuildCronJobSpec_SwarmStillUsesPublicAPIService(t *testing.T) {
 	}
 
 	spec := r.buildCronJobSpec(backup, cluster)
-	cmd := spec.JobTemplate.Spec.Template.Spec.Containers[0].Args[0]
+	container := spec.JobTemplate.Spec.Template.Spec.Containers[0]
+	cmd := container.Args[0]
 
-	if !strings.Contains(cmd, "--url 'http://swarm-cluster-public-api.default.svc.cluster.local'") {
-		t.Fatalf("expected backup URL to continue using public-api service in swarm mode, got: %s", cmd)
+	if strings.Contains(cmd, "--url") {
+		t.Fatalf("expected backup command to use ANTFLY_URL instead of --url, got: %s", cmd)
 	}
+	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://swarm-cluster-public-api.default.svc.cluster.local" {
+		t.Fatalf("expected backup URL to continue using public-api service in swarm mode, got: %q", got)
+	}
+}
+
+func envValue(env []corev1.EnvVar, name string) string {
+	for _, item := range env {
+		if item.Name == name {
+			return item.Value
+		}
+	}
+	return ""
 }

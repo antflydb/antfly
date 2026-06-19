@@ -14,13 +14,9 @@
 
 const build_options = @import("build_options");
 
+pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
 pub const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
-    pub fn metalDeviceAvailable() bool {
-        return false;
-    }
-};
-pub const mlx_backend = if (build_options.enable_mlx) @import("backends/mlx.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;
     }
@@ -31,6 +27,7 @@ pub const ops = @import("ops/ops.zig");
 pub const run = @import("run/root.zig");
 pub const util = @import("util/util.zig");
 pub const native_backend_guard = @import("native_backend_guard.zig");
+pub const native_backend_choice = @import("native_backend_choice.zig");
 pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
@@ -74,6 +71,7 @@ pub const finetune = struct {
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
 pub const architectures = struct {
+    pub const session_factory = @import("architectures/session_factory.zig");
     pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
     pub const bert_graph = @import("architectures/bert_graph.zig");
@@ -97,8 +95,6 @@ pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
     pub const gpu_hosted_store = @import("ops/gpu_hosted_store.zig");
     pub const metal = if (build_options.enable_metal) @import("ops/metal_compute.zig") else struct {};
-    pub const blas = @import("ops/blas_compute.zig");
-    pub const mlx = if (build_options.enable_mlx) @import("ops/mlx_compute.zig") else struct {};
     pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
     pub const wasm = if (build_options.enable_wasm) @import("ops/wasm_compute.zig") else struct {};
 };

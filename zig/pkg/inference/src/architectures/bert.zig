@@ -14,16 +14,14 @@
 
 // BERT encoder architecture using abstract ComputeBackend ops.
 //
-// Single implementation works with any backend (native, MLX, etc).
+// Single implementation works with any ComputeBackend implementation.
 // The compute backend handles all hardware-specific execution.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const bert_config = @import("../models/bert.zig");
-const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 
 pub const Config = bert_config.Config;
 
@@ -307,10 +305,8 @@ fn getLayerWeight(cb: *const ComputeBackend, _: std.mem.Allocator, layer: usize,
 }
 
 fn tensorParallelWorldSize(cb: *const ComputeBackend) usize {
-    if (!build_options.enable_mlx) return 1;
-    const mlx_compute = mlx_compute_mod.MlxCompute.fromComputeBackend(cb) orelse return 1;
-    if (!mlx_compute.tensorParallelEnabled()) return 1;
-    return mlx_compute.tensorParallelWorldSize();
+    _ = cb;
+    return 1;
 }
 
 fn linearReplicatedToMaybeSharded(
@@ -322,13 +318,6 @@ fn linearReplicatedToMaybeSharded(
     input_dim: usize,
     output_dim: usize,
 ) !CT {
-    if (build_options.enable_mlx) {
-        if (mlx_compute_mod.MlxCompute.fromComputeBackend(cb)) |mlx_compute| {
-            if (mlx_compute.tensorParallelEnabled()) {
-                return mlx_compute.linearTensorParallelReplicatedToSharded(input, weight, bias, rows, input_dim, output_dim);
-            }
-        }
-    }
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
 }
 
@@ -341,12 +330,5 @@ fn linearMaybeShardedToReplicated(
     input_dim: usize,
     output_dim: usize,
 ) !CT {
-    if (build_options.enable_mlx) {
-        if (mlx_compute_mod.MlxCompute.fromComputeBackend(cb)) |mlx_compute| {
-            if (mlx_compute.tensorParallelEnabled()) {
-                return mlx_compute.linearTensorParallelShardedToReplicated(input, weight, bias, rows, input_dim, output_dim);
-            }
-        }
-    }
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
 }

@@ -30,6 +30,13 @@ pub const Routes = struct {
     pub const internal_node_shutdown_suffix = "/shutdown";
     pub const internal_node_status_suffix = "/status";
     pub const internal_schema_progress = "/internal/v1/schema-progress";
+    pub const internal_extensions_prefix = "/internal/v1/extensions/";
+    pub const internal_extension_restore = "/internal/v1/extensions/restore";
+    pub const internal_extension_update_suffix = "/update";
+    pub const internal_extension_drop_suffix = "/drop";
+    pub const internal_extension_enable_suffix = "/enable";
+    pub const internal_extension_disable_suffix = "/disable";
+    pub const internal_extension_config_suffix = "/config";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const internal_table_restore_suffix = "/restore";
     pub const internal_table_schema_suffix = "/schema";
@@ -53,6 +60,10 @@ pub const Routes = struct {
         source_ordinal: u32,
     };
 
+    pub const InternalExtensionPath = struct {
+        name: []const u8,
+    };
+
     pub fn matchTableRanges(path: []const u8) ?u64 {
         return matchNumericPath(path, table_ranges_prefix, table_ranges_suffix);
     }
@@ -71,6 +82,30 @@ pub const Routes = struct {
 
     pub fn matchInternalNode(path: []const u8) ?u64 {
         return matchNodeIDPath(path, internal_nodes_prefix, "");
+    }
+
+    pub fn matchInternalExtension(path: []const u8) ?InternalExtensionPath {
+        return matchInternalExtensionPath(path, "");
+    }
+
+    pub fn matchInternalExtensionUpdate(path: []const u8) ?InternalExtensionPath {
+        return matchInternalExtensionPath(path, internal_extension_update_suffix);
+    }
+
+    pub fn matchInternalExtensionDrop(path: []const u8) ?InternalExtensionPath {
+        return matchInternalExtensionPath(path, internal_extension_drop_suffix);
+    }
+
+    pub fn matchInternalExtensionEnable(path: []const u8) ?InternalExtensionPath {
+        return matchInternalExtensionPath(path, internal_extension_enable_suffix);
+    }
+
+    pub fn matchInternalExtensionDisable(path: []const u8) ?InternalExtensionPath {
+        return matchInternalExtensionPath(path, internal_extension_disable_suffix);
+    }
+
+    pub fn matchInternalExtensionConfig(path: []const u8) ?InternalExtensionPath {
+        return matchInternalExtensionPath(path, internal_extension_config_suffix);
     }
 
     pub fn matchInternalTableSplit(path: []const u8) ?InternalTablePath {
@@ -151,6 +186,15 @@ pub const Routes = struct {
         if (middle.len == 0 or std.mem.indexOfScalar(u8, middle, '/') != null) return null;
         return .{ .table_name = middle };
     }
+
+    fn matchInternalExtensionPath(path: []const u8, suffix: []const u8) ?InternalExtensionPath {
+        if (std.mem.eql(u8, path, internal_extension_restore)) return null;
+        if (!std.mem.startsWith(u8, path, internal_extensions_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, suffix)) return null;
+        const middle = path[internal_extensions_prefix.len .. path.len - suffix.len];
+        if (middle.len == 0 or std.mem.indexOfScalar(u8, middle, '/') != null) return null;
+        return .{ .name = middle };
+    }
 };
 
 test "metadata routes match dynamic paths" {
@@ -164,6 +208,14 @@ test "metadata routes match dynamic paths" {
     try std.testing.expectEqual(@as(?u64, null), Routes.matchInternalNode("/internal/v1/nodes/0"));
     try std.testing.expectEqual(@as(?u64, null), Routes.matchInternalNode("/internal/v1/nodes/3/shutdown"));
     try std.testing.expectEqual(@as(?u64, null), Routes.matchInternalNode("/internal/v1/nodes/3/status"));
+    try std.testing.expectEqualStrings("memoryaf", Routes.matchInternalExtension("/internal/v1/extensions/memoryaf").?.name);
+    try std.testing.expectEqualStrings("memoryaf", Routes.matchInternalExtensionUpdate("/internal/v1/extensions/memoryaf/update").?.name);
+    try std.testing.expectEqualStrings("memoryaf", Routes.matchInternalExtensionDrop("/internal/v1/extensions/memoryaf/drop").?.name);
+    try std.testing.expectEqualStrings("memoryaf", Routes.matchInternalExtensionEnable("/internal/v1/extensions/memoryaf/enable").?.name);
+    try std.testing.expectEqualStrings("memoryaf", Routes.matchInternalExtensionDisable("/internal/v1/extensions/memoryaf/disable").?.name);
+    try std.testing.expectEqualStrings("memoryaf", Routes.matchInternalExtensionConfig("/internal/v1/extensions/memoryaf/config").?.name);
+    try std.testing.expect(Routes.matchInternalExtension("/internal/v1/extensions/restore") == null);
+    try std.testing.expect(Routes.matchInternalExtension("/internal/v1/extensions/memoryaf/update") == null);
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTable("/internal/v1/tables/docs").?.table_name);
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTableRestore("/internal/v1/tables/docs/restore").?.table_name);
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTableSchema("/internal/v1/tables/docs/schema").?.table_name);

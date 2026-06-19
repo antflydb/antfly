@@ -5,6 +5,7 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { isProductEnabled } from "@/config/products";
 import { TableContext } from "@/contexts/table-context";
 import { useApi } from "@/hooks/use-api-config";
+import { normalizeTablesResponse } from "@/lib/table-utils";
 
 export function TableProvider({ children }: { children: ReactNode }) {
   const apiClient = useApi();
@@ -15,6 +16,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
   const [tables, setTables] = useState<TableStatus[]>([]);
   const [isLoadingTables, setIsLoadingTables] = useState(() => isProductEnabled("antfly"));
   const [embeddingIndexes, setEmbeddingIndexes] = useState<string[]>([]);
+  const [graphIndexes, setGraphIndexes] = useState<string[]>([]);
   const [chatIndexes, setChatIndexes] = useState<string[]>([]);
   const [isLoadingIndexes, setIsLoadingIndexes] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState("");
@@ -82,9 +84,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
     setIsLoadingTables(true);
     try {
       const response = await apiClient.tables.list();
-      if (response && Array.isArray(response)) {
-        setTables(response as TableStatus[]);
-      }
+      setTables(normalizeTablesResponse(response));
     } catch {
       setTables([]);
     } finally {
@@ -108,6 +108,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
     const fetchIndexes = async () => {
       if (!selectedTable) {
         setEmbeddingIndexes([]);
+        setGraphIndexes([]);
         setChatIndexes([]);
         setSelectedIndex("");
         return;
@@ -133,7 +134,12 @@ export function TableProvider({ children }: { children: ReactNode }) {
           )
           .map((idx: { config?: { name?: string } }) => idx.config?.name || "")
           .filter(Boolean);
+        const graphIdxs = indexes
+          .filter((idx: { config?: { type?: string } }) => idx.config?.type === "graph")
+          .map((idx: { config?: { name?: string } }) => idx.config?.name || "")
+          .filter(Boolean);
         setEmbeddingIndexes(embeddingIdxs);
+        setGraphIndexes(graphIdxs);
         setChatIndexes(chatIdxs);
         if (embeddingIdxs.length > 0) {
           setSelectedIndex(embeddingIdxs[0]);
@@ -142,6 +148,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
         }
       } catch {
         setEmbeddingIndexes([]);
+        setGraphIndexes([]);
         setChatIndexes([]);
         setSelectedIndex("");
       } finally {
@@ -159,6 +166,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
         selectedTable,
         setSelectedTable,
         embeddingIndexes,
+        graphIndexes,
         chatIndexes,
         isLoadingIndexes,
         selectedIndex,

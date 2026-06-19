@@ -16,7 +16,7 @@
 //
 // Two pathways:
 // 1. ortgenai (ONNX Runtime GenAI) — for models with genai_config.json
-// 2. Native autoregressive decoding — for native/MLX backends using GPT arch forward pass
+// 2. Native autoregressive decoding — for native backends using GPT arch forward pass
 //
 // The native path runs gpt_arch.forward() to get logits, samples the next token,
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
@@ -25,7 +25,6 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
-const decoder_bitnet_runtime = if (build_options.enable_mlx) @import("../backends/decoder_bitnet_runtime.zig") else struct {};
 const tokenizer_mod = @import("inference_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -307,18 +306,6 @@ fn disablePagedKvDebug() bool {
     return getenvBool("TERMITE_DISABLE_PAGED_KV");
 }
 
-fn enableMlxGreedyDeviceDecodeDebug() bool {
-    return getenvBool("TERMITE_MLX_GREEDY_DEVICE_DECODE");
-}
-
-fn enableMlxDeviceTokenHandoffDebug() bool {
-    return getenvBool("TERMITE_MLX_DEVICE_TOKEN_HANDOFF");
-}
-
-fn enableMlxRawMetalWholeTokenDebug() bool {
-    return getenvBool("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN");
-}
-
 fn enableGenerationStageDebug() bool {
     return getenvBool("TERMITE_GEN_STAGE_DEBUG");
 }
@@ -353,46 +340,6 @@ fn hasSamplingPenalties(config: GenerationConfig) bool {
     return config.repetition_penalty != 1.0 or
         config.frequency_penalty != 0 or
         config.presence_penalty != 0;
-}
-
-pub const DecoderRuntimeDebugStats = struct {
-    forward_attempts: u64 = 0,
-    flag_disabled: u64 = 0,
-    backend_not_mlx: u64 = 0,
-    scheduler_blocked: u64 = 0,
-    graph_blocked: u64 = 0,
-    first_token_blocked: u64 = 0,
-    kv_missing: u64 = 0,
-    non_greedy: u64 = 0,
-    grammar_blocked: u64 = 0,
-    prepare_attempts: u64 = 0,
-    prepare_flag_disabled: u64 = 0,
-    prepare_backend_not_mlx: u64 = 0,
-    prepare_kv_missing: u64 = 0,
-    prepare_scheduler_blocked: u64 = 0,
-    prepare_graph_blocked: u64 = 0,
-    prepare_arch_blocked: u64 = 0,
-    prepare_model_blocked: u64 = 0,
-    prepare_calls: u64 = 0,
-    input_attempts: u64 = 0,
-    input_flag_disabled: u64 = 0,
-    input_backend_not_mlx: u64 = 0,
-    input_kv_missing: u64 = 0,
-    input_arch_blocked: u64 = 0,
-    input_model_blocked: u64 = 0,
-    input_seq_empty: u64 = 0,
-    input_successes: u64 = 0,
-};
-
-var decoder_runtime_debug_stats = DecoderRuntimeDebugStats{};
-const decoder_runtime_layer_count: usize = 2;
-
-pub fn resetDecoderRuntimeDebugStats() void {
-    decoder_runtime_debug_stats = .{};
-}
-
-pub fn getDecoderRuntimeDebugStats() DecoderRuntimeDebugStats {
-    return decoder_runtime_debug_stats;
 }
 
 pub const NativeDecodeState = struct {
@@ -2052,11 +1999,6 @@ pub const NativeGenerationPipeline = struct {
         finish_reason: []const u8,
     };
 
-    const DeviceDecodeOutcome = struct {
-        token: usize,
-        token_tensor: ?ops.CT = null,
-    };
-
     fn emitDecodedDelta(
         self: *NativeGenerationPipeline,
         generated_token_ids: []const i64,
@@ -2105,8 +2047,6 @@ pub const NativeGenerationPipeline = struct {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var tokens_generated: usize = 0;
         var finish_reason: []const u8 = "length";
-        var device_token_tensor: ?ops.CT = null;
-        defer if (device_token_tensor) |tensor| self.cb.free(tensor);
         debugGenerationStage(
             "standardDecode enter seq_len={d} max_tokens={d} prefill_cached={}",
             .{ seq_len.*, max_tokens, prefill_last_logits.* != null },
@@ -2114,11 +2054,9 @@ pub const NativeGenerationPipeline = struct {
 
         while (tokens_generated < max_tokens) {
             var used_decode_microbatch = false;
-            var next_device_token_tensor: ?ops.CT = null;
-            errdefer if (next_device_token_tensor) |tensor| self.cb.free(tensor);
             debugGenerationStage(
-                "standardDecode iter={d} seq_len={d} device_token_handoff={}",
-                .{ tokens_generated, seq_len.*, device_token_tensor != null },
+                "standardDecode iter={d} seq_len={d}",
+                .{ tokens_generated, seq_len.* },
             );
             const outcome: SampleOutcome = blk: {
                 if (tokens_generated == 0) {
@@ -2126,21 +2064,6 @@ pub const NativeGenerationPipeline = struct {
                         prefill_greedy_token.* = null;
                         break :blk .{ .token = token, .grammar_complete = false };
                     }
-                }
-
-                if (try self.forwardGreedyDeviceDecodeToken(
-                    token_ids,
-                    seq_len.*,
-                    tokens_generated,
-                    decode_state,
-                    config,
-                    token_table,
-                    json_grammar,
-                    gbnf_grammar,
-                    device_token_tensor,
-                )) |token| {
-                    next_device_token_tensor = token.token_tensor;
-                    break :blk .{ .token = token.token, .grammar_complete = false };
                 }
 
                 var owns_last_logits = false;
@@ -2218,20 +2141,9 @@ pub const NativeGenerationPipeline = struct {
 
             // Check EOS
             if (self.gpt_config.eos_token_id >= 0 and @as(i32, @intCast(next_token)) == self.gpt_config.eos_token_id) {
-                if (next_device_token_tensor) |tensor| {
-                    self.cb.free(tensor);
-                    next_device_token_tensor = null;
-                }
                 finish_reason = "stop";
                 break;
             }
-
-            if (next_device_token_tensor == null and self.shouldSeedMlxDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
-                next_device_token_tensor = try self.makeDeviceTokenTensor(next_token);
-            }
-            if (device_token_tensor) |tensor| self.cb.free(tensor);
-            device_token_tensor = next_device_token_tensor;
-            next_device_token_tensor = null;
 
             token_ids[seq_len.*] = @intCast(next_token);
             seq_len.* += 1;
@@ -2273,251 +2185,6 @@ pub const NativeGenerationPipeline = struct {
             .{ tokens_generated, finish_reason },
         );
         return .{ .tokens_generated = tokens_generated, .finish_reason = finish_reason };
-    }
-
-    fn forwardGreedyDeviceDecodeToken(
-        self: *NativeGenerationPipeline,
-        token_ids: []const i64,
-        seq_len: usize,
-        tokens_generated: usize,
-        decode_state: *NativeDecodeState,
-        config: GenerationConfig,
-        token_table: ?*const grammar_mod.TokenByteTable,
-        json_grammar: *const ?grammar_mod.JsonGrammar,
-        gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
-        input_token_tensor: ?ops.CT,
-    ) !?DeviceDecodeOutcome {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        decoder_runtime_debug_stats.forward_attempts += 1;
-        if (self.cb.kind() != .mlx) {
-            decoder_runtime_debug_stats.backend_not_mlx += 1;
-            return null;
-        }
-        if (!enableMlxGreedyDeviceDecodeDebug() and !enableMlxDeviceTokenHandoffDebug() and !enableMlxRawMetalWholeTokenDebug()) {
-            decoder_runtime_debug_stats.flag_disabled += 1;
-            return null;
-        }
-        if (self.scheduler != null) {
-            decoder_runtime_debug_stats.scheduler_blocked += 1;
-            return null;
-        }
-        if (self.graph_cache != null or self.compiled_partition_backend != null) {
-            decoder_runtime_debug_stats.graph_blocked += 1;
-            return null;
-        }
-        if (tokens_generated == 0) {
-            decoder_runtime_debug_stats.first_token_blocked += 1;
-            return null;
-        }
-        if (decode_runtime.kvView() == null) {
-            decoder_runtime_debug_stats.kv_missing += 1;
-            return null;
-        }
-        if (!isPureGreedyConfig(config)) {
-            decoder_runtime_debug_stats.non_greedy += 1;
-            return null;
-        }
-        if (token_table != null or json_grammar.* != null or gbnf_grammar != null) {
-            decoder_runtime_debug_stats.grammar_blocked += 1;
-            return null;
-        }
-
-        try self.prepareMlxRawMetalWholeTokenDecode(decode_state);
-        if (try self.forwardRawMetalWholeTokenInputSlice(
-            token_ids,
-            seq_len,
-            decode_state,
-        )) |token| {
-            return .{ .token = token };
-        }
-        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-        const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
-        if (enableMlxDeviceTokenHandoffDebug()) {
-            if (input_token_tensor) |token_tensor| {
-                if (try gpt_arch.forwardGreedyLastTokenFromTokenTensor(
-                    &self.cb,
-                    self.allocator,
-                    self.gpt_config,
-                    token_tensor,
-                    1,
-                    seq_len,
-                    &decode_context,
-                )) |result| {
-                    return .{
-                        .token = result.token_id,
-                        .token_tensor = result.token_tensor,
-                    };
-                }
-            }
-        }
-
-        const input_ids = token_ids[seq_len - 1 .. seq_len];
-        return .{ .token = try gpt_arch.forwardGreedyLastToken(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            input_ids,
-            1,
-            seq_len,
-            &decode_context,
-        ) };
-    }
-
-    fn prepareMlxRawMetalWholeTokenDecode(
-        self: *NativeGenerationPipeline,
-        decode_state: *NativeDecodeState,
-    ) !void {
-        if (comptime !build_options.enable_mlx) return;
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        decoder_runtime_debug_stats.prepare_attempts += 1;
-        if (!enableMlxRawMetalWholeTokenDebug()) {
-            decoder_runtime_debug_stats.prepare_flag_disabled += 1;
-            return;
-        }
-        if (self.cb.kind() != .mlx) {
-            decoder_runtime_debug_stats.prepare_backend_not_mlx += 1;
-            return;
-        }
-        const kv_view = decode_runtime.kvView() orelse {
-            decoder_runtime_debug_stats.prepare_kv_missing += 1;
-            return;
-        };
-        if (self.scheduler != null) {
-            decoder_runtime_debug_stats.prepare_scheduler_blocked += 1;
-            return;
-        }
-        if (self.graph_cache != null or self.compiled_partition_backend != null) {
-            decoder_runtime_debug_stats.prepare_graph_blocked += 1;
-            return;
-        }
-
-        const cfg = self.gpt_config;
-        if (cfg.family != .bitnet) {
-            decoder_runtime_debug_stats.prepare_arch_blocked += 1;
-            return;
-        }
-        if (cfg.usesMoe() or cfg.hasPle() or cfg.isMultimodal()) {
-            decoder_runtime_debug_stats.prepare_model_blocked += 1;
-            return;
-        }
-        if (cfg.sliding_window != 0) {
-            decoder_runtime_debug_stats.prepare_model_blocked += 1;
-            return;
-        }
-
-        if (!build_options.enable_mlx) {
-            decoder_runtime_debug_stats.prepare_backend_not_mlx += 1;
-            return;
-        }
-
-        decoder_runtime_debug_stats.prepare_calls += 1;
-        _ = try self.cb.decoderRuntimePrepareGreedy(&.{
-            .hidden_size = @intCast(cfg.hidden_size),
-            .intermediate_size = @intCast(cfg.intermediate_size),
-            .num_layers = @intCast(cfg.num_hidden_layers),
-            .num_heads = @intCast(cfg.num_attention_heads),
-            .num_kv_heads = @intCast(cfg.effectiveKVHeads()),
-            .head_dim = @intCast(cfg.headDim()),
-            .vocab_size = @intCast(cfg.vocab_size),
-            .kv_tokens = kv_view.token_count,
-        });
-
-        if (!(try decoder_bitnet_runtime.prepareDecodeRuntime(
-            &self.cb,
-            self.allocator,
-            cfg,
-            kv_view.token_count,
-            decoder_runtime_layer_count,
-        ))) {
-            decoder_runtime_debug_stats.prepare_model_blocked += 1;
-        }
-    }
-
-    fn forwardRawMetalWholeTokenInputSlice(
-        self: *NativeGenerationPipeline,
-        token_ids: []const i64,
-        seq_len: usize,
-        decode_state: *NativeDecodeState,
-    ) !?usize {
-        if (comptime !build_options.enable_mlx) return null;
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        decoder_runtime_debug_stats.input_attempts += 1;
-        if (!build_options.enable_mlx) {
-            decoder_runtime_debug_stats.input_backend_not_mlx += 1;
-            return null;
-        }
-        if (!enableMlxRawMetalWholeTokenDebug()) {
-            decoder_runtime_debug_stats.input_flag_disabled += 1;
-            return null;
-        }
-        if (self.cb.kind() != .mlx) {
-            decoder_runtime_debug_stats.input_backend_not_mlx += 1;
-            return null;
-        }
-        _ = decode_runtime.kvView() orelse {
-            decoder_runtime_debug_stats.input_kv_missing += 1;
-            return null;
-        };
-
-        const cfg = self.gpt_config;
-        if (cfg.family != .bitnet) {
-            decoder_runtime_debug_stats.input_arch_blocked += 1;
-            return null;
-        }
-        if (cfg.usesMoe() or cfg.hasPle() or cfg.isMultimodal()) {
-            decoder_runtime_debug_stats.input_model_blocked += 1;
-            return null;
-        }
-        if (cfg.sliding_window != 0) {
-            decoder_runtime_debug_stats.input_model_blocked += 1;
-            return null;
-        }
-        if (seq_len == 0) {
-            decoder_runtime_debug_stats.input_seq_empty += 1;
-            return null;
-        }
-
-        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-        const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
-        const token = (try decoder_bitnet_runtime.forwardGreedyToken(
-            &self.cb,
-            self.allocator,
-            cfg,
-            decoder_runtime_layer_count,
-            token_ids[seq_len - 1],
-            seq_len,
-            &decode_context,
-        )) orelse return null;
-        decoder_runtime_debug_stats.input_successes += 1;
-        return @intCast(token);
-    }
-
-    fn shouldSeedMlxDeviceTokenHandoff(
-        self: *NativeGenerationPipeline,
-        tokens_generated: usize,
-        decode_state: *NativeDecodeState,
-        config: GenerationConfig,
-        token_table: ?*const grammar_mod.TokenByteTable,
-        json_grammar: *const ?grammar_mod.JsonGrammar,
-        gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
-    ) bool {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        _ = tokens_generated;
-        if (self.cb.kind() != .mlx) return false;
-        if (!enableMlxDeviceTokenHandoffDebug()) return false;
-        if (self.scheduler != null) return false;
-        if (self.graph_cache != null or self.compiled_partition_backend != null) return false;
-        if (decode_runtime.kvView() == null) return false;
-        if (!isPureGreedyConfig(config)) return false;
-        if (token_table != null or json_grammar.* != null or gbnf_grammar != null) return false;
-        if (self.gpt_config.hasPle()) return false;
-        return true;
-    }
-
-    fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
-        const data = [_]i32{@intCast(token_id)};
-        const shape = [_]i32{1};
-        return try self.cb.fromInt32Shape(&data, &shape);
     }
 
     fn forwardLastLogits(
@@ -4529,7 +4196,7 @@ test "native decode state paged kv grows in pages" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 8,
@@ -4555,7 +4222,7 @@ test "native decode state chunked prefill appends incrementally" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 8,
@@ -4579,7 +4246,7 @@ test "native decode state maps to gpt decode context" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 8,
         .num_kv_heads = 8,
@@ -4802,7 +4469,7 @@ test "native decode state deinit releases paged sequence" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 8,
@@ -4823,7 +4490,7 @@ test "native decode state reports retained kv window offsets after trim" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 2,
         .num_kv_heads = 8,

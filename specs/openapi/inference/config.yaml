@@ -1013,10 +1013,6 @@ components:
           type: boolean
           description: Whether the Metal backend is built into this runtime
           example: true
-        mlx:
-          type: boolean
-          description: Whether the MLX backend is built into this runtime
-          example: true
         cuda:
           type: boolean
           description: Whether the CUDA backend is built into this runtime
@@ -1447,7 +1443,6 @@ components:
             - `native` - Native CPU backend
             - `onnx` - ONNX Runtime backend
             - `metal` - Apple Metal backend
-            - `mlx` - MLX backend
             - `cuda` - NVIDIA CUDA backend
             - `xla` - PJRT/XLA compiled backend
 

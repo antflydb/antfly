@@ -21,6 +21,7 @@
 // Output: logits [batch, num_words, max_width, num_labels]
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
@@ -108,13 +109,23 @@ fn profileElapsed(start_ns: u64) u64 {
     return monotonicNowNs() - start_ns;
 }
 
+fn syncProfileEnabled(profile: ?*ForwardProfile) bool {
+    if (profile == null) return false;
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    return platform.env.getenvBool("TERMITE_GLINER_SYNC_PROFILE");
+}
+
+fn profileSyncTensor(cb: *const ComputeBackend, profile: ?*ForwardProfile, tensor: CT) !void {
+    if (syncProfileEnabled(profile)) try cb.evalTensor(tensor);
+}
+
 /// Run the full GLiNER2 forward pass.  Takes the encoder hidden state
 /// as a CT (the output of `deberta_arch.forwardCt`) and returns logits
 /// as a CT as well, so the encoder/head boundary stays on the backend
 /// without a toFloat32 + fromFloat32Shape round-trip.  The internal
 /// f32-only helpers (extractWord/Label embeddings) materialise the
 /// hidden tensor once via `cb.toFloat32` -- on native that's a
-/// memcpy + free, on Metal/MLX one device->host transfer instead of
+/// memcpy + free, on Metal one device->host transfer instead of
 /// the prior device->host->device->host pattern.
 pub fn forwardCt(
     cb: *const ComputeBackend,
@@ -207,15 +218,18 @@ pub fn forwardCtProfiledWithLabelMarkers(
             var timer = profileStart(profile);
             const span_ct = try spanMarkerForwardFromWordCt(cb, allocator, word_ct, span_info.start_indices, span_info.end_indices, batch, num_words, num_spans, H, profile);
             defer cb.free(span_ct);
+            try profileSyncTensor(cb, profile, span_ct);
             if (profile) |p| p.span_marker_ns += profileElapsed(timer);
 
             timer = profileStart(profile);
             const label_ct = try countLstmForwardFromCt(cb, allocator, label_hidden_ct, num_labels, H);
             defer cb.free(label_ct);
+            try profileSyncTensor(cb, profile, label_ct);
             if (profile) |p| p.label_projection_ns += profileElapsed(timer);
 
             timer = profileStart(profile);
             const logits_ct = try cb.linearNoBias(span_ct, label_ct, total_spans, H, num_labels);
+            try profileSyncTensor(cb, profile, logits_ct);
             if (profile) |p| p.logits_ns += profileElapsed(timer);
             return .{
                 .logits = logits_ct,
@@ -245,15 +259,18 @@ pub fn forwardCtProfiledWithLabelMarkers(
     timer = profileStart(profile);
     const span_ct = try spanMarkerForwardCt(cb, allocator, word_result.embeddings, span_info.start_indices, span_info.end_indices, batch, num_words, num_spans, H, profile);
     defer cb.free(span_ct);
+    try profileSyncTensor(cb, profile, span_ct);
     if (profile) |p| p.span_marker_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
     const label_ct = try countLstmForwardCt(cb, allocator, label_result.embeddings, num_labels, H);
     defer cb.free(label_ct);
+    try profileSyncTensor(cb, profile, label_ct);
     if (profile) |p| p.label_projection_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
     const logits_ct = try cb.linearNoBias(span_ct, label_ct, total_spans, H, num_labels);
+    try profileSyncTensor(cb, profile, logits_ct);
     if (profile) |p| p.logits_ns += profileElapsed(timer);
     return .{
         .logits = logits_ct,
@@ -535,6 +552,8 @@ fn spanMarkerForwardFromWordCt(
     const end_proj = span_projections.second;
     defer cb.free(start_proj);
     defer cb.free(end_proj);
+    try profileSyncTensor(cb, profile, start_proj);
+    try profileSyncTensor(cb, profile, end_proj);
     if (profile) |p| p.span_start_end_mlp_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
@@ -553,22 +572,46 @@ fn spanMarkerForwardFromWordCt(
         }
     }
 
-    const gathered_start = try cb.embeddingLookup(start_proj, start_ids, total_spans, H);
-    defer cb.free(gathered_start);
-    const gathered_end = try cb.embeddingLookup(end_proj, end_ids, total_spans, H);
-    defer cb.free(gathered_end);
+    const start_rows = try allocator.alloc(u32, total_spans);
+    defer allocator.free(start_rows);
+    const end_rows = try allocator.alloc(u32, total_spans);
+    defer allocator.free(end_rows);
+    for (0..total_spans) |i| {
+        start_rows[i] = @intCast(start_ids[i]);
+        end_rows[i] = @intCast(end_ids[i]);
+    }
 
-    const concat_ct = try cb.concat(gathered_start, gathered_end, total_spans, H, H);
-    defer cb.free(concat_ct);
+    timer = profileStart(profile);
+    const concat_relu = if (try cb.glinerGatherConcatRelu(&.{
+        .start = start_proj,
+        .end = end_proj,
+        .start_rows = start_rows,
+        .end_rows = end_rows,
+        .source_rows = total_words,
+        .rows = total_spans,
+        .dim = H,
+    })) |fused| fused else blk: {
+        const gathered_start = (try cb.takeRows(start_proj, start_rows, total_spans, H)) orelse
+            try cb.embeddingLookup(start_proj, start_ids, total_spans, H);
+        defer cb.free(gathered_start);
+        const gathered_end = (try cb.takeRows(end_proj, end_rows, total_spans, H)) orelse
+            try cb.embeddingLookup(end_proj, end_ids, total_spans, H);
+        defer cb.free(gathered_end);
 
-    // ReLU on concatenated [start, end] before out_project (matches ONNX graph)
-    const concat_relu = try cb.relu(concat_ct);
+        const concat_ct = try cb.concat(gathered_start, gathered_end, total_spans, H, H);
+        defer cb.free(concat_ct);
+
+        // ReLU on concatenated [start, end] before out_project (matches ONNX graph)
+        break :blk try cb.relu(concat_ct);
+    };
     defer cb.free(concat_relu);
+    try profileSyncTensor(cb, profile, concat_relu);
     if (profile) |p| p.span_gather_concat_relu_ns += profileElapsed(timer);
 
     // out_project MLP: 2H → 4H → H
     timer = profileStart(profile);
     const out = try mlp2(cb, concat_relu, total_spans, H * 2, 4 * H, H, "span_rep.span_rep_layer.out_project", profile);
+    try profileSyncTensor(cb, profile, out);
     if (profile) |p| p.span_out_project_ns += profileElapsed(timer);
     return out;
 }
@@ -634,6 +677,7 @@ fn mlp2(
         .out_dim = out_dim,
         .activation = .relu,
     })) |fused| {
+        try profileSyncTensor(cb, profile, fused);
         if (profile) |p| p.span_out_project_first_linear_ns += profileElapsed(timer);
         return fused;
     }
@@ -647,12 +691,14 @@ fn mlp2(
         break :blk try cb.relu(h1);
     };
     defer cb.free(h1_relu);
+    try profileSyncTensor(cb, profile, h1_relu);
     if (profile) |p| p.span_out_project_first_linear_ns += profileElapsed(timer);
 
     if (profile) |p| p.span_out_project_relu_ns += 0;
 
     timer = profileStart(profile);
     const out = try cb.linear(h1_relu, w2, b2, rows, hidden_dim, out_dim);
+    try profileSyncTensor(cb, profile, out);
     if (profile) |p| p.span_out_project_second_linear_ns += profileElapsed(timer);
     return out;
 }
@@ -686,17 +732,13 @@ fn mlp2SharedInputPair(
     defer cb.free(b1_b);
 
     var timer = profileStart(profile);
-    const first_layers = try cb.linearPair(input, w1_a, b1_a, w1_b, b1_b, rows, in_dim, hidden_dim);
-    defer cb.free(first_layers.first);
-    defer cb.free(first_layers.second);
+    const first_relu_layers = try cb.linearPairRelu(input, w1_a, b1_a, w1_b, b1_b, rows, in_dim, hidden_dim);
+    defer cb.free(first_relu_layers.first);
+    defer cb.free(first_relu_layers.second);
+    try profileSyncTensor(cb, profile, first_relu_layers.first);
+    try profileSyncTensor(cb, profile, first_relu_layers.second);
     if (profile) |p| p.span_start_end_first_linear_ns += profileElapsed(timer);
-
-    timer = profileStart(profile);
-    const first_relu = try cb.relu(first_layers.first);
-    defer cb.free(first_relu);
-    const second_relu = try cb.relu(first_layers.second);
-    defer cb.free(second_relu);
-    if (profile) |p| p.span_start_end_relu_ns += profileElapsed(timer);
+    if (profile) |p| p.span_start_end_relu_ns += 0;
 
     const w2_a_name = std.fmt.bufPrint(&buf_a, "{s}.3.weight", .{prefix_a}) catch return error.NameTooLong;
     const w2_a = try cb.getWeight(w2_a_name);
@@ -713,9 +755,13 @@ fn mlp2SharedInputPair(
     defer cb.free(b2_b);
 
     timer = profileStart(profile);
-    const first = try cb.linear(first_relu, w2_a, b2_a, rows, hidden_dim, out_dim);
+    const second_layers = try cb.linearPairInputs(first_relu_layers.first, first_relu_layers.second, w2_a, b2_a, w2_b, b2_b, rows, hidden_dim, out_dim);
+    const first = second_layers.first;
+    const second = second_layers.second;
     errdefer cb.free(first);
-    const second = try cb.linear(second_relu, w2_b, b2_b, rows, hidden_dim, out_dim);
+    errdefer cb.free(second);
+    try profileSyncTensor(cb, profile, first);
+    try profileSyncTensor(cb, profile, second);
     if (profile) |p| p.span_start_end_second_linear_ns += profileElapsed(timer);
     return .{ .first = first, .second = second };
 }
@@ -958,7 +1004,7 @@ fn miniTransformerLayerCpu(
     // Use the backend's `splitLastDim3` op rather than round-tripping the
     // QKV tensor through f32.  On native compute it operates directly on
     // the underlying f32 view (zero extra alloc beyond the three split
-    // buffers); on Metal/MLX the split stays device-resident.
+    // buffers); on Metal the split stays device-resident.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();

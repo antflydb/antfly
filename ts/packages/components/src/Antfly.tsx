@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo } from "react";
+import { type ReactNode, useEffect, useRef } from "react";
 import Listener from "./Listener";
 import { type SharedAction, type SharedState, useSharedContext } from "./SharedContext";
 import { SharedContextProvider } from "./SharedContextProvider";
@@ -37,7 +37,15 @@ function SharedConfigSync({
 
 export default function Antfly({ children, url, table, onChange, headers = {} }: AntflyProps) {
   const headersKey = JSON.stringify(headers);
-  const stableHeaders = useMemo(() => headers, [headersKey]);
+  const stableHeadersRef = useRef(headers);
+  const headersKeyRef = useRef(headersKey);
+
+  if (headersKeyRef.current !== headersKey) {
+    headersKeyRef.current = headersKey;
+    stableHeadersRef.current = headers;
+  }
+
+  const stableHeaders = stableHeadersRef.current;
 
   const initialState: SharedState = {
     url,

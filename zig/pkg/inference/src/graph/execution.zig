@@ -351,7 +351,6 @@ const FallbackNativeBackend = struct {
 fn backendKindForGraphPartition(kind: contracts.BackendKind) contracts.BackendKind {
     return switch (kind) {
         .metal => .metal,
-        .mlx => .mlx,
         .onnx => .onnx,
         .pjrt => .pjrt,
         .wasm => .wasm,
@@ -772,8 +771,8 @@ test "shouldUsePartitionedGraphExecution requires explicit sharding config" {
     const fake_cb_b = @as(*const ops.ComputeBackend, @ptrFromInt(0x2000));
 
     var mesh = try device_mesh.DeviceMesh.init(allocator, &.{
-        .{ .id = 0, .backend = fake_cb_a, .kind = .mlx },
-        .{ .id = 1, .backend = fake_cb_b, .kind = .mlx },
+        .{ .id = 0, .backend = fake_cb_a, .kind = .metal },
+        .{ .id = 1, .backend = fake_cb_b, .kind = .metal },
     });
     defer mesh.deinit();
 
@@ -797,7 +796,7 @@ test "shouldUsePartitionedGraphExecution requires multiple mesh devices" {
     const fake_cb = @as(*const ops.ComputeBackend, @ptrFromInt(0x3000));
 
     var mesh = try device_mesh.DeviceMesh.init(allocator, &.{
-        .{ .id = 0, .backend = fake_cb, .kind = .mlx },
+        .{ .id = 0, .backend = fake_cb, .kind = .metal },
     });
     defer mesh.deinit();
 

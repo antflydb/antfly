@@ -56,27 +56,6 @@ fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []con
     return b.fmt("onnxruntime/{s}-{s}", .{ platform_str, arch_str });
 }
 
-fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
-    if (target.result.os.tag != .macos) return false;
-    const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
-    const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
-    return pathExists(b, header) and pathExists(b, library);
-}
-
-fn defaultMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
-    const roots = [_][]const u8{
-        "/opt/homebrew",
-        "/opt/homebrew/opt/mlx-c",
-        "/usr/local",
-        "/usr/local/opt/mlx-c",
-        "/usr",
-    };
-    for (roots) |root| {
-        if (mlxRootAvailable(b, target, root)) return root;
-    }
-    return null;
-}
-
 fn pathExists(b: *std.Build, path: []const u8) bool {
     const io = b.graph.io;
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
@@ -118,7 +97,6 @@ fn configureSystemBlas(
 }
 
 /// Link the Metal framework and compile the standalone Metal kernels.
-/// No MLX dependency — the `.m` file uses Foundation + Metal/MPS.
 fn configureMetal(
     b: *std.Build,
     module: *std.Build.Module,
@@ -132,22 +110,6 @@ fn configureMetal(
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.addCSourceFile(.{ .file = b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
-}
-
-/// Link libmlxc for the MLX numerics backend. Independent of Metal.
-fn configureMlx(
-    b: *std.Build,
-    module: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
-) void {
-    if (!enable_mlx or target.result.os.tag != .macos) return;
-    if (mlx_root) |root| {
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-    }
-    module.linkSystemLibrary("mlxc", .{});
 }
 
 fn configureOnnxRuntime(
@@ -170,15 +132,12 @@ fn configureNativeTool(
     target: std.Build.ResolvedTarget,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
     enable_metal: bool,
 ) void {
     if (enable_system_blas) {
         configureSystemBlas(b, artifact.root_module, target, blas_root);
     }
     configureMetal(b, artifact.root_module, target, enable_metal);
-    configureMlx(b, artifact.root_module, target, enable_mlx, mlx_root);
     artifact.root_module.link_libc = true;
 }
 
@@ -209,17 +168,7 @@ pub fn build(b: *std.Build) void {
     const enable_onnx = if (enable_wasm or !link_libc) false else (onnx_option orelse false);
     const onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root (default: ./onnxruntime/<platform>)");
     const effective_onnx_root = onnx_root_opt orelse defaultOnnxRuntimeRoot(b, target);
-    const mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with lib/libmlxc.dylib");
-    const mlx_option = b.option(bool, "mlx", "Enable MLX backend (macOS only)");
-    const mlx_requested = if (enable_wasm or !link_libc) false else (mlx_option orelse false);
-    // Metal kernels are independent of MLX, but MLX decoder paths currently
-    // dispatch through Metal kernels. Disabling Metal therefore disables MLX.
-    const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (mlx_requested or target.result.os.tag == .macos));
-    const enable_mlx = enable_metal and mlx_requested;
-    const effective_mlx_root = if (enable_mlx)
-        mlx_root_opt orelse defaultMlxRoot(b, target)
-    else
-        mlx_root_opt;
+    const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (target.result.os.tag == .macos));
     if (enable_onnx) {
         const onnx_runtime_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{effective_onnx_root})) and
             pathExists(b, b.fmt("{s}/lib", .{effective_onnx_root}));
@@ -227,16 +176,14 @@ pub fn build(b: *std.Build) void {
             @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
         }
     }
-    if (enable_mlx) {
-        const root = effective_mlx_root orelse @panic("-Dmlx=true requires an MLX C install; pass -Dmlx-root=<path>");
-        if (!mlxRootAvailable(b, target, root)) {
-            @panic("-Dmlx=true requires an MLX C install with include/mlx/c/mlx.h and lib/libmlxc.dylib");
-        }
-    }
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
-    const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
-    if (!std.mem.eql(u8, cuda_artifacts, "portable")) {
-        @panic("invalid -Dcuda-artifacts (expected portable; fatbin is not implemented yet)");
+    const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX or portable PTX") orelse "fatbin";
+    if (!std.mem.eql(u8, cuda_artifacts, "portable") and !std.mem.eql(u8, cuda_artifacts, "fatbin")) {
+        @panic("invalid -Dcuda-artifacts (expected portable or fatbin)");
+    }
+    const cuda_libraries = b.option([]const u8, "cuda-libs", "CUDA library acceleration policy: auto, off, or required") orelse "auto";
+    if (!std.mem.eql(u8, cuda_libraries, "auto") and !std.mem.eql(u8, cuda_libraries, "off") and !std.mem.eql(u8, cuda_libraries, "required")) {
+        @panic("invalid -Dcuda-libs (expected auto, off, or required)");
     }
     const enable_pjrt = if (enable_wasm or !link_libc) false else (b.option(bool, "pjrt", "Enable PJRT backend (TPU/CPU via dlopen)") orelse false);
     const blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
@@ -268,11 +215,10 @@ pub fn build(b: *std.Build) void {
         .backend = .{
             .enable_onnx = enable_onnx,
             .onnx_root = effective_onnx_root,
-            .enable_mlx = enable_mlx,
-            .mlx_root = effective_mlx_root,
             .enable_metal = enable_metal,
             .enable_cuda = enable_cuda,
             .cuda_artifacts = cuda_artifacts,
+            .cuda_libraries = cuda_libraries,
             .enable_pjrt = enable_pjrt,
             .enable_native = enable_native,
             .enable_system_blas = enable_system_blas,
@@ -408,7 +354,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, bench_exe.root_module, target, blas_root);
     }
     configureMetal(b, bench_exe.root_module, target, enable_metal);
-    configureMlx(b, bench_exe.root_module, target, enable_mlx, effective_mlx_root);
     bench_exe.root_module.link_libc = true;
 
     const run_bench = b.addRunArtifact(bench_exe);
@@ -451,7 +396,7 @@ pub fn build(b: *std.Build) void {
     });
     training_bench_exe.root_module.addImport("build_options", build_options_mod);
     training_bench_exe.root_module.addImport("ml", ml_mod);
-    configureNativeTool(b, training_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
+    configureNativeTool(b, training_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     const run_training_bench = b.addRunArtifact(training_bench_exe);
     if (b.args) |args| {
         run_training_bench.addArgs(args);
@@ -507,7 +452,7 @@ pub fn build(b: *std.Build) void {
     gliner2_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_bench_exe.root_module.addImport("antfly_platform", platform_mod);
     gliner2_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
+    configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_bench = b.addRunArtifact(gliner2_bench_exe);
     if (b.args) |args| {
@@ -534,7 +479,7 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, gliner2_e2e_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
+    configureNativeTool(b, gliner2_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
     if (b.args) |args| {
@@ -561,7 +506,7 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_native_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
+    configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
     if (b.args) |args| {
@@ -588,7 +533,7 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
+    configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
     if (b.args) |args| {
@@ -596,6 +541,33 @@ pub fn build(b: *std.Build) void {
     }
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
+
+    const reranker_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-reranker-e2e-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/reranker_e2e.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    reranker_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
+    reranker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
+    reranker_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    reranker_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    configureNativeTool(b, reranker_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
+    if (b.args) |args| {
+        run_reranker_e2e_bench.addArgs(args);
+    }
+    const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
+    reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
 
     const audio_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-audio-bench",
@@ -660,7 +632,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, tests.root_module, target, blas_root);
     }
     configureMetal(b, tests.root_module, target, enable_metal);
-    configureMlx(b, tests.root_module, target, enable_mlx, effective_mlx_root);
     configureOnnxRuntime(b, tests.root_module, enable_onnx, effective_onnx_root);
     tests.root_module.link_libc = link_libc;
 
@@ -682,8 +653,6 @@ pub fn build(b: *std.Build) void {
         .antfly_platform_mod = platform_mod,
         .enable_system_blas = enable_system_blas,
         .blas_root = blas_root,
-        .enable_mlx = enable_mlx,
-        .mlx_root = effective_mlx_root,
         .enable_metal = enable_metal,
     };
     finetune_tools.register(finetune_ctx);
@@ -736,7 +705,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, wasm_compute_tests.root_module, target, blas_root);
     }
     configureMetal(b, wasm_compute_tests.root_module, target, enable_metal);
-    configureMlx(b, wasm_compute_tests.root_module, target, enable_mlx, effective_mlx_root);
     configureOnnxRuntime(b, wasm_compute_tests.root_module, enable_onnx, effective_onnx_root);
     wasm_compute_tests.root_module.link_libc = true;
     const run_wasm_compute_tests = b.addRunArtifact(wasm_compute_tests);
@@ -792,7 +760,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, web_projector_tests.root_module, target, blas_root);
     }
     configureMetal(b, web_projector_tests.root_module, target, enable_metal);
-    configureMlx(b, web_projector_tests.root_module, target, enable_mlx, effective_mlx_root);
     configureOnnxRuntime(b, web_projector_tests.root_module, enable_onnx, effective_onnx_root);
     web_projector_tests.root_module.link_libc = true;
     const run_web_projector_tests = b.addRunArtifact(web_projector_tests);

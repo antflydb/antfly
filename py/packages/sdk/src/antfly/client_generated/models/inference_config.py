@@ -61,7 +61,6 @@ class InferenceConfig:
             - `native` - Native CPU backend
             - `onnx` - ONNX Runtime backend
             - `metal` - Apple Metal backend
-            - `mlx` - MLX backend
             - `cuda` - NVIDIA CUDA backend
             - `xla` - PJRT/XLA compiled backend
 

@@ -85,7 +85,7 @@ They are not the docsaf-to-Antfly synchronization model.
 
 ## CLI Shape
 
-`examples/docsaf` now prepares and syncs source rows:
+`go/pkg/docsaf/cmd/docsaf` prepares and syncs source rows:
 
 ```bash
 docsaf prepare --dir ./docs --base-url s3://docs-bucket --output docs.json

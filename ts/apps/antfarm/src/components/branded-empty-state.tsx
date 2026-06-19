@@ -6,7 +6,7 @@ export function NoTablesState({ onCreate }: { onCreate?: () => void }) {
   return (
     <AntyEmptyState
       title="No tables yet"
-      description="Create your first table to start indexing and searching your data."
+      description="Create a table, add data, create an index, then search or ask questions over it."
       action={
         onCreate ? (
           <Button variant="brand" onClick={onCreate}>
@@ -116,7 +116,7 @@ export function FirstRunState() {
   return (
     <AntyEmptyState
       title="Welcome to Antfarm"
-      description="Your Antfly dashboard is ready. Create a table to get started."
+      description="Start with a table, add data, create an index, then search or ask questions."
     />
   );
 }

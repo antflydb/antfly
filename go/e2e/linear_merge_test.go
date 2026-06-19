@@ -25,7 +25,7 @@ import (
 // TestLinearMerge_IdempotentSync tests that running the same linear merge twice
 // should skip unchanged documents on the second run.
 //
-// This test reproduces the issue where `go run ./examples/docsaf/main.go sync`
+// This test reproduces the issue where `docsaf sync`
 // would re-insert all documents every time instead of skipping unchanged ones.
 func TestLinearMerge_IdempotentSync(t *testing.T) {
 	if testing.Short() {

@@ -21,8 +21,15 @@ pub const CUcontext = ?*anyopaque;
 pub const CUstream = ?*anyopaque;
 pub const CUmodule = ?*anyopaque;
 pub const CUfunction = ?*anyopaque;
+pub const CUgraph = ?*anyopaque;
+pub const CUgraphExec = ?*anyopaque;
 pub const CUjit_option = c_uint;
+pub const CUstreamCaptureMode = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
+
+pub const CU_STREAM_CAPTURE_MODE_GLOBAL: CUstreamCaptureMode = 0;
+pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode = 1;
+pub const CU_STREAM_CAPTURE_MODE_RELAXED: CUstreamCaptureMode = 2;
 
 pub const CU_JIT_INFO_LOG_BUFFER: CUjit_option = 3;
 pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: CUjit_option = 4;
@@ -56,9 +63,17 @@ pub const CudaDriver = struct {
         cuStreamDestroy: *const fn (hStream: CUstream) callconv(.c) CUresult,
         cuMemAlloc: *const fn (dptr: *CUdeviceptr, bytesize: usize) callconv(.c) CUresult,
         cuMemFree: *const fn (dptr: CUdeviceptr) callconv(.c) CUresult,
+        cuMemAllocHost: ?*const fn (pp: *?*anyopaque, bytesize: usize) callconv(.c) CUresult,
+        cuMemFreeHost: ?*const fn (p: ?*anyopaque) callconv(.c) CUresult,
         cuMemcpyHtoDAsync: *const fn (dstDevice: CUdeviceptr, srcHost: ?*const anyopaque, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
         cuMemcpyDtoHAsync: *const fn (dstHost: ?*anyopaque, srcDevice: CUdeviceptr, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
         cuMemcpyDtoDAsync: *const fn (dstDevice: CUdeviceptr, srcDevice: CUdeviceptr, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
+        cuStreamBeginCapture: ?*const fn (hStream: CUstream, mode: CUstreamCaptureMode) callconv(.c) CUresult,
+        cuStreamEndCapture: ?*const fn (hStream: CUstream, phGraph: *CUgraph) callconv(.c) CUresult,
+        cuGraphInstantiateWithFlags: ?*const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: c_ulonglong) callconv(.c) CUresult,
+        cuGraphLaunch: ?*const fn (hGraphExec: CUgraphExec, hStream: CUstream) callconv(.c) CUresult,
+        cuGraphExecDestroy: ?*const fn (hGraphExec: CUgraphExec) callconv(.c) CUresult,
+        cuGraphDestroy: ?*const fn (hGraph: CUgraph) callconv(.c) CUresult,
         cuModuleLoadDataEx: *const fn (module: *CUmodule, image: ?*const anyopaque, numOptions: c_uint, options: ?[*]CUjit_option, optionValues: ?[*]?*anyopaque) callconv(.c) CUresult,
         cuModuleUnload: *const fn (hmod: CUmodule) callconv(.c) CUresult,
         cuModuleGetFunction: *const fn (hfunc: *CUfunction, hmod: CUmodule, name: [*:0]const u8) callconv(.c) CUresult,
@@ -99,9 +114,17 @@ pub const CudaDriver = struct {
                 .cuStreamDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamDestroy), "cuStreamDestroy") catch return error.CudaSymbolMissing,
                 .cuMemAlloc = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemAlloc), "cuMemAlloc_v2") catch return error.CudaSymbolMissing,
                 .cuMemFree = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemFree), "cuMemFree_v2") catch return error.CudaSymbolMissing,
+                .cuMemAllocHost = lookupOptional(&lib, *const fn (pp: *?*anyopaque, bytesize: usize) callconv(.c) CUresult, "cuMemAllocHost_v2"),
+                .cuMemFreeHost = lookupOptional(&lib, *const fn (p: ?*anyopaque) callconv(.c) CUresult, "cuMemFreeHost"),
                 .cuMemcpyHtoDAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyHtoDAsync), "cuMemcpyHtoDAsync_v2") catch return error.CudaSymbolMissing,
                 .cuMemcpyDtoHAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyDtoHAsync), "cuMemcpyDtoHAsync_v2") catch return error.CudaSymbolMissing,
                 .cuMemcpyDtoDAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyDtoDAsync), "cuMemcpyDtoDAsync_v2") catch return error.CudaSymbolMissing,
+                .cuStreamBeginCapture = lookupOptional(&lib, *const fn (hStream: CUstream, mode: CUstreamCaptureMode) callconv(.c) CUresult, "cuStreamBeginCapture_v2"),
+                .cuStreamEndCapture = lookupOptional(&lib, *const fn (hStream: CUstream, phGraph: *CUgraph) callconv(.c) CUresult, "cuStreamEndCapture"),
+                .cuGraphInstantiateWithFlags = lookupOptional(&lib, *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: c_ulonglong) callconv(.c) CUresult, "cuGraphInstantiateWithFlags"),
+                .cuGraphLaunch = lookupOptional(&lib, *const fn (hGraphExec: CUgraphExec, hStream: CUstream) callconv(.c) CUresult, "cuGraphLaunch"),
+                .cuGraphExecDestroy = lookupOptional(&lib, *const fn (hGraphExec: CUgraphExec) callconv(.c) CUresult, "cuGraphExecDestroy"),
+                .cuGraphDestroy = lookupOptional(&lib, *const fn (hGraph: CUgraph) callconv(.c) CUresult, "cuGraphDestroy"),
                 .cuModuleLoadDataEx = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleLoadDataEx), "cuModuleLoadDataEx") catch return error.CudaSymbolMissing,
                 .cuModuleUnload = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleUnload), "cuModuleUnload") catch return error.CudaSymbolMissing,
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,
@@ -140,6 +163,10 @@ pub const CudaDriver = struct {
 
 fn lookup(lib: *std.DynLib, comptime T: type, name: [:0]const u8) Error!T {
     return lib.lookup(T, name) orelse error.CudaSymbolMissing;
+}
+
+fn lookupOptional(lib: *std.DynLib, comptime T: type, name: [:0]const u8) ?T {
+    return lib.lookup(T, name);
 }
 
 test "cuda driver unavailable probe does not crash" {

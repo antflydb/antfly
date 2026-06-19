@@ -278,6 +278,9 @@ type ExecuteLinearMergeOptions struct {
 	DryRun bool
 	// SyncLevel controls how long the server waits for indexes before responding.
 	SyncLevel SyncLevel
+	// WriteOptions controls per-request and per-response byte limits. Non-positive
+	// values use SDK defaults.
+	WriteOptions WriteOptions
 	// OnBatch is called after each batch completes. If nil, progress is silent.
 	OnBatch func(batch int, result *LinearMergeResult)
 }
@@ -310,12 +313,12 @@ func (c *AntflyClient) ExecuteLinearMerge(ctx context.Context, tableName string,
 			continue
 		}
 
-		batchResult, err := c.LinearMerge(ctx, tableName, LinearMergeRequest{
+		batchResult, err := c.LinearMergeWithOptions(ctx, tableName, LinearMergeRequest{
 			Records:      page,
 			LastMergedId: cursor,
 			DryRun:       opts.DryRun,
 			SyncLevel:    opts.SyncLevel,
-		})
+		}, opts.WriteOptions)
 		if err != nil {
 			return result, fmt.Errorf("batch %d failed: %w", result.Batches+1, err)
 		}
@@ -336,11 +339,11 @@ func (c *AntflyClient) ExecuteLinearMerge(ctx context.Context, tableName string,
 
 	// Final cleanup: delete orphaned records beyond the last cursor
 	if cursor != "" && !opts.DryRun {
-		cleanupResult, err := c.LinearMerge(ctx, tableName, LinearMergeRequest{
+		cleanupResult, err := c.LinearMergeWithOptions(ctx, tableName, LinearMergeRequest{
 			Records:      map[string]any{},
 			LastMergedId: cursor,
 			SyncLevel:    opts.SyncLevel,
-		})
+		}, opts.WriteOptions)
 		if err != nil {
 			return result, fmt.Errorf("final cleanup failed: %w", err)
 		}
@@ -348,6 +351,161 @@ func (c *AntflyClient) ExecuteLinearMerge(ctx context.Context, tableName string,
 	}
 
 	return result, nil
+}
+
+// LinearMergePageOptions controls sorted linear-merge page construction.
+type LinearMergePageOptions struct {
+	// MaxRecords is the maximum records per page. Non-positive values use all
+	// records in one page unless MaxRequestBytes forces a split.
+	MaxRecords int
+	// MaxRequestBytes is the encoded linear-merge request budget per page.
+	// Non-positive values disable byte-aware splitting.
+	MaxRequestBytes int64
+	// DryRun and SyncLevel are included in the request-size estimate so callers
+	// can use the same options with ExecuteLinearMerge.
+	DryRun    bool
+	SyncLevel SyncLevel
+}
+
+// SortedLinearMergePages builds sorted linear-merge pages that respect both a
+// record-count cap and an encoded request-size cap. It is intended for examples
+// and import tools that hold the input set in memory and want to stay below API
+// payload limits with margin.
+func SortedLinearMergePages(records map[string]any, opts LinearMergePageOptions) ([]map[string]any, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(records))
+	longestID := 0
+	for id := range records {
+		ids = append(ids, id)
+		if len(id) > longestID {
+			longestID = len(id)
+		}
+	}
+	slices.Sort(ids)
+
+	maxRecords := opts.MaxRecords
+	if maxRecords <= 0 {
+		maxRecords = len(records)
+	}
+	pageCapacity := min(maxRecords, len(records))
+	cursorEstimate := strings.Repeat("x", longestID)
+	pages := make([]map[string]any, 0, (len(records)+maxRecords-1)/maxRecords)
+	page := make(map[string]any, pageCapacity)
+	sizer, err := newLinearMergeRequestSizer(cursorEstimate, opts.DryRun, opts.SyncLevel)
+	if err != nil {
+		return nil, err
+	}
+	pageRecordBytes := int64(0)
+
+	for _, id := range ids {
+		if len(page) >= maxRecords {
+			if err := validateLinearMergePageSize(page, cursorEstimate, opts); err != nil {
+				return nil, err
+			}
+			pages = append(pages, page)
+			page = make(map[string]any, pageCapacity)
+			pageRecordBytes = 0
+		}
+
+		entrySize, err := linearMergeRecordEntrySize(id, records[id])
+		if err != nil {
+			return nil, err
+		}
+		candidateSize := sizer.requestSize(pageRecordBytes, len(page), entrySize)
+		if opts.MaxRequestBytes > 0 && len(page) > 0 {
+			if candidateSize > opts.MaxRequestBytes {
+				if err := validateLinearMergePageSize(page, cursorEstimate, opts); err != nil {
+					return nil, err
+				}
+				pages = append(pages, page)
+				page = make(map[string]any, pageCapacity)
+				pageRecordBytes = 0
+				candidateSize = sizer.requestSize(0, 0, entrySize)
+			}
+		}
+
+		if opts.MaxRequestBytes > 0 && candidateSize > opts.MaxRequestBytes {
+			size, err := linearMergeRequestSize(map[string]any{id: records[id]}, cursorEstimate, opts.DryRun, opts.SyncLevel)
+			if err != nil {
+				return nil, err
+			}
+			if size > opts.MaxRequestBytes {
+				return nil, fmt.Errorf("linear merge record %q encodes to %d bytes, exceeding max request size %d", id, size, opts.MaxRequestBytes)
+			}
+		}
+		page[id] = records[id]
+		pageRecordBytes += entrySize
+	}
+
+	if len(page) > 0 {
+		if err := validateLinearMergePageSize(page, cursorEstimate, opts); err != nil {
+			return nil, err
+		}
+		pages = append(pages, page)
+	}
+	return pages, nil
+}
+
+type linearMergeRequestSizer struct {
+	emptyRequestBytes int64
+}
+
+func newLinearMergeRequestSizer(lastMergedID string, dryRun bool, syncLevel SyncLevel) (linearMergeRequestSizer, error) {
+	size, err := linearMergeRequestSize(map[string]any{}, lastMergedID, dryRun, syncLevel)
+	if err != nil {
+		return linearMergeRequestSizer{}, err
+	}
+	return linearMergeRequestSizer{emptyRequestBytes: size}, nil
+}
+
+func (s linearMergeRequestSizer) requestSize(existingRecordBytes int64, existingRecords int, nextRecordBytes int64) int64 {
+	recordCount := existingRecords + 1
+	commaBytes := int64(0)
+	if recordCount > 1 {
+		commaBytes = int64(recordCount - 1)
+	}
+	return s.emptyRequestBytes + existingRecordBytes + nextRecordBytes + commaBytes
+}
+
+func linearMergeRecordEntrySize(id string, record any) (int64, error) {
+	key, err := json.Marshal(id)
+	if err != nil {
+		return 0, err
+	}
+	value, err := json.Marshal(record)
+	if err != nil {
+		return 0, err
+	}
+	return int64(len(key) + 1 + len(value)), nil
+}
+
+func validateLinearMergePageSize(page map[string]any, lastMergedID string, opts LinearMergePageOptions) error {
+	if opts.MaxRequestBytes <= 0 {
+		return nil
+	}
+	size, err := linearMergeRequestSize(page, lastMergedID, opts.DryRun, opts.SyncLevel)
+	if err != nil {
+		return err
+	}
+	if size > opts.MaxRequestBytes {
+		return fmt.Errorf("linear merge page encodes to %d bytes, exceeding max request size %d", size, opts.MaxRequestBytes)
+	}
+	return nil
+}
+
+func linearMergeRequestSize(records map[string]any, lastMergedID string, dryRun bool, syncLevel SyncLevel) (int64, error) {
+	body, err := boundedJSONBody(LinearMergeRequest{
+		Records:      records,
+		LastMergedId: lastMergedID,
+		DryRun:       dryRun,
+		SyncLevel:    syncLevel,
+	}, 0)
+	if err != nil {
+		return 0, err
+	}
+	return int64(body.Len()), nil
 }
 
 // WaitForTable polls the table status until at least one shard is ready
@@ -782,6 +940,14 @@ func (tx *Transaction) Read(ctx context.Context, table, key string) (map[string]
 // Returns a TransactionCommitResult with status "committed" or "aborted".
 // An error is returned only for transport/server failures, not for version conflicts.
 func (tx *Transaction) Commit(ctx context.Context, writes map[string]BatchRequest) (*TransactionCommitResult, error) {
+	return tx.CommitWithOptions(ctx, writes, WriteOptions{})
+}
+
+// CommitWithOptions submits the transaction's read set and writes with request
+// and response size bounds.
+func (tx *Transaction) CommitWithOptions(ctx context.Context, writes map[string]BatchRequest, opts WriteOptions) (*TransactionCommitResult, error) {
+	opts = normalizeWriteOptions(opts)
+
 	// Convert SDK BatchRequest to oapi types
 	oapiTables := make(map[string]oapi.BatchRequest, len(writes))
 	for tableName, br := range writes {
@@ -819,16 +985,23 @@ func (tx *Transaction) Commit(ctx context.Context, writes map[string]BatchReques
 		ReadSet: tx.readSet,
 		Tables:  oapiTables,
 	}
+	reqBodyReader, err := boundedJSONBody(reqBody, opts.MaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling commit transaction request: %w", err)
+	}
 
-	resp, err := tx.client.client.CommitTransaction(ctx, reqBody)
+	resp, err := tx.client.client.CommitTransactionWithBody(ctx, "application/json", reqBodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("commit transaction failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, truncated, err := readLimitedBody(resp.Body, opts.MaxResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("commit transaction response exceeded %d bytes", opts.MaxResponseBytes)
 	}
 
 	// Both 200 (committed) and 409 (conflict/aborted) return TransactionCommitResponse

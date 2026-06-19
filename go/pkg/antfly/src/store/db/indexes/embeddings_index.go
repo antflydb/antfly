@@ -408,16 +408,14 @@ func (i *EmbeddingIndex) Close() (err error) {
 	if i == nil {
 		return nil
 	}
-	if i.egCancel == nil {
-		return nil
-	}
 	// Cancel context to signal goroutines to stop
-	i.egCancel()
+	if i.egCancel != nil {
+		i.egCancel()
+	}
 
 	// Wait for background goroutines (plexer) to finish BEFORE closing resources they use
 	if i.eg != nil {
 		if err := i.eg.Wait(); err != nil {
-			i.zstdReader.Close()
 			if errors.Is(err, context.Canceled) || errors.Is(err, inflight.ErrBufferClosed) ||
 				errors.Is(err, bleve.ErrorIndexClosed) {
 				// These are expected errors during shutdown
@@ -428,11 +426,15 @@ func (i *EmbeddingIndex) Close() (err error) {
 	}
 
 	// Now safe to close resources since plexer has stopped
-	if err := i.walBuf.Close(); err != nil && !errors.Is(err, inflight.ErrBufferClosed) {
-		return fmt.Errorf("closing WAL buffer: %w", err)
+	if i.walBuf != nil {
+		if err := i.walBuf.Close(); err != nil && !errors.Is(err, inflight.ErrBufferClosed) {
+			return fmt.Errorf("closing WAL buffer: %w", err)
+		}
 	}
-	if err := i.idx.Close(); err != nil {
-		return fmt.Errorf("closing vector index: %w", err)
+	if i.idx != nil {
+		if err := i.idx.Close(); err != nil {
+			return fmt.Errorf("closing vector index: %w", err)
+		}
 	}
 	// Close the separate indexDB instance
 	if i.indexDB != nil {
@@ -440,7 +442,9 @@ func (i *EmbeddingIndex) Close() (err error) {
 			i.logger.Warn("Error closing indexDB", zap.Error(err))
 		}
 	}
-	i.zstdReader.Close()
+	if i.zstdReader != nil {
+		i.zstdReader.Close()
+	}
 	return nil
 }
 

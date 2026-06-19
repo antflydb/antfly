@@ -60,7 +60,6 @@ const Options = struct {
     backend: []const u8 = "auto",
     compiled_required: bool = false,
     production_metal_gate: bool = false,
-    production_mlx_gate: bool = false,
     num_classes_override: ?[]const u8 = null,
 
     min_train_examples: usize = 100,
@@ -247,8 +246,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     try runCommand(init, allocator, "train-gliner2-autodiff", train_gliner2_autodiff.main, train_args_list.items);
 
     const metal_required = std.mem.eql(u8, opts.backend, "metal");
-    const mlx_required = std.mem.eql(u8, opts.backend, "mlx");
-    const device_optimizer_required = metal_required or mlx_required;
+    const device_optimizer_required = metal_required;
     const min_device_trainable_bytes: ?usize = opts.min_device_trainable_bytes orelse if (device_optimizer_required) @as(usize, 1) else null;
     var run_summary = try validation.validateRun(allocator, opts.out_dir, .{
         .require_loss_decrease = opts.require_loss_decrease,
@@ -263,14 +261,10 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .min_entity_tokens = opts.min_entity_tokens,
         .require_backend = if (metal_required)
             "Metal"
-        else if (mlx_required)
-            "MLX (Apple Silicon)"
         else
             null,
         .require_optimizer_backend = if (metal_required)
             "metal"
-        else if (mlx_required)
-            "mlx"
         else
             null,
         .max_device_trainable_transfer_count = opts.max_device_trainable_transfer_count orelse opts.max_device_resident_transfer_count,
@@ -508,9 +502,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\out_dir: {s}
         \\entity_types: {s}
         \\objective: {s}
-        \\production_metal_gate: {}
-        \\production_mlx_gate: {}
-        \\backend: {s}
+        \\production_metal_gate: {}        \\backend: {s}
         \\compiled_required: {}
         \\max_examples: {s}
         \\seq_len: {s}
@@ -540,7 +532,6 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.entity_types_csv,
         opts.objective,
         opts.production_metal_gate,
-        opts.production_mlx_gate,
         opts.backend,
         opts.compiled_required,
         opts.max_examples,
@@ -631,8 +622,6 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.compiled_required = true;
         } else if (std.mem.eql(u8, arg, "--production-metal-gate")) {
             applyProductionMetalGateDefaults(&opts);
-        } else if (std.mem.eql(u8, arg, "--production-mlx-gate")) {
-            applyProductionMlxGateDefaults(&opts);
         } else if (std.mem.eql(u8, arg, "--num-classes")) {
             opts.num_classes_override = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--min-train-examples")) {
@@ -796,42 +785,6 @@ fn applyProductionMetalGateDefaults(opts: *Options) void {
     opts.min_entity_f1 = "0.15";
 }
 
-fn applyProductionMlxGateDefaults(opts: *Options) void {
-    opts.production_mlx_gate = true;
-    opts.epochs = "1";
-    opts.batch_size = "1";
-    opts.max_examples = "200";
-    opts.seq_len = "32";
-    opts.span_loss = "bce";
-    opts.backend = "mlx";
-    opts.compiled_required = true;
-    opts.min_train_examples = 200;
-    opts.min_eval_examples = 200;
-    opts.min_total_entities = 100;
-    opts.min_unique_labels = 3;
-    opts.min_positive_span_labels = 100;
-    opts.min_steps = 200;
-    opts.min_supervised_tokens = 1000;
-    opts.min_entity_tokens = 100;
-    opts.max_avg_step_wall_ms = 10000.0;
-    opts.max_device_trainable_transfer_count = 0;
-    opts.max_device_resident_transfer_count = 0;
-    opts.min_device_trainable_bytes = 1;
-    opts.require_loss_decrease = true;
-    opts.skip_semantic_eval = false;
-    opts.semantic_require_entitylike_span = true;
-    opts.quality_eval = true;
-    opts.quality_max_examples = "25";
-    opts.quality_min_prediction_score = "0.03";
-    opts.quality_sweep_thresholds = "0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30";
-    opts.quality_nms_overlap = "0.0";
-    opts.quality_max_predictions_per_example = "3";
-    opts.quality_top_k_per_label = "1";
-    opts.quality_best_span_per_label_start = true;
-    opts.quality_require_entitylike_span = true;
-    opts.min_entity_f1 = "0.15";
-}
-
 fn parseUsizeArg(args: *std.process.Args.Iterator, name: []const u8) !usize {
     return std.fmt.parseUnsigned(usize, args.next() orelse {
         std.debug.print("error: missing value for {s}\n", .{name});
@@ -910,10 +863,9 @@ fn printUsage() void {
         \\  --span-label-positive-weights CSV Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight FLOAT     Negative span-label loss weight (default: 1)
         \\  --span-hard-negative-weight FLOAT Extra negative weight for spans overlapping gold entities (default: 1)
-        \\  --backend auto|metal|mlx|native  Training backend (default: auto)
+        \\  --backend auto|metal|native  Training backend (default: auto)
         \\  --compiled-required              Fail if requested compiled backend falls back
         \\  --production-metal-gate          Canonical 200-step resident Metal gate
-        \\  --production-mlx-gate            Canonical 200-step strict MLX gate
         \\  --materialized-dir DIR           Also materialize merged model artifacts
         \\  --dry-run                        Print the gate shape without touching model/data files
         \\
@@ -936,24 +888,6 @@ fn printUsage() void {
         \\  --min-device-trainable-bytes N
         \\
     , .{});
-}
-
-test "production MLX gate defaults require compiled resident optimizer" {
-    var opts = Options{};
-    applyProductionMlxGateDefaults(&opts);
-
-    try std.testing.expect(opts.production_mlx_gate);
-    try std.testing.expectEqualStrings("mlx", opts.backend);
-    try std.testing.expect(opts.compiled_required);
-    try std.testing.expectEqual(@as(usize, 200), opts.min_train_examples);
-    try std.testing.expectEqual(@as(usize, 200), opts.min_steps);
-    try std.testing.expectEqual(@as(?u64, 0), opts.max_device_resident_transfer_count);
-    try std.testing.expectEqual(@as(?usize, 1), opts.min_device_trainable_bytes);
-    try std.testing.expect(opts.semantic_require_entitylike_span);
-    try std.testing.expect(opts.quality_eval);
-    try std.testing.expectEqualStrings("25", opts.quality_max_examples.?);
-    try std.testing.expectEqualStrings("0.15", opts.min_entity_f1.?);
-    try std.testing.expect(opts.quality_require_entitylike_span);
 }
 
 test "production Metal gate defaults include shaped quality eval" {

@@ -22,6 +22,7 @@
 
 const std = @import("std");
 
+const build_options = @import("build_options");
 const inference = @import("inference_internal");
 const backends = inference.backends;
 const graph_runtime = inference.graph.runtime;
@@ -32,8 +33,8 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
-    mlx,
     onnx,
+    cuda,
 };
 
 const OutputFormat = enum {
@@ -383,8 +384,8 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
         .auto => &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .metal => &.{backends.BackendType.metal},
-        .mlx => &.{backends.BackendType.mlx},
         .onnx => &.{backends.BackendType.onnx},
+        .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
     };
 }
 
@@ -443,8 +444,8 @@ fn parseBackend(value: []const u8) ?BackendChoice {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     if (std.ascii.eqlIgnoreCase(value, "onnx")) return .onnx;
+    if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
     return null;
 }
 
@@ -526,7 +527,7 @@ fn printCsv(opts: Options, result: Result) void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|mlx|onnx] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
         \\
     , .{});
 }

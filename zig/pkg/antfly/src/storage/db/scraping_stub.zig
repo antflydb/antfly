@@ -13,3 +13,8 @@
 // limitations.
 
 pub const RemoteContentConfig = opaque {};
+
+pub fn dataUriDecodedSize(uri: []const u8) !usize {
+    _ = uri;
+    return 0;
+}

@@ -3016,7 +3016,7 @@ pub const IndexManager = struct {
 
             const index_path = try self.indexPath(name);
             defer self.alloc.free(index_path);
-            var artifact_refs = try self.artifactRefsFromConfig(cfg);
+            var artifact_refs = self.bestEffortArtifactRefsFromConfig(cfg);
             defer artifact_refs.deinit(self.alloc);
             const cleanup_artifacts = cfg.kind == .dense_vector or cfg.kind == .sparse_vector;
             const owned_chunk_name = if (cleanup_artifacts) blk: {
@@ -4134,11 +4134,29 @@ pub const IndexManager = struct {
         }
     }
 
+    fn bestEffortArtifactRefsFromConfig(self: *IndexManager, cfg: types.IndexConfig) ArtifactRefs {
+        return self.artifactRefsFromConfig(cfg) catch |err| {
+            std.log.warn("status-only index artifact refs unavailable name={s} kind={s} err={s}", .{
+                cfg.name,
+                @tagName(cfg.kind),
+                @errorName(err),
+            });
+            return .{};
+        };
+    }
+
     fn chunkArtifactsReferencedElsewhereIncludingStatusOnly(self: *IndexManager, exclude_index_name: []const u8, chunk_name: []const u8) !bool {
         if (self.chunkArtifactsReferencedElsewhere(exclude_index_name, chunk_name)) return true;
         for (self.status_only_index_configs) |cfg| {
             if (std.mem.eql(u8, cfg.name, exclude_index_name)) continue;
-            var refs = try self.artifactRefsFromConfig(cfg);
+            var refs = self.artifactRefsFromConfig(cfg) catch |err| {
+                std.log.warn("status-only chunk artifact reference check skipped name={s} kind={s} err={s}", .{
+                    cfg.name,
+                    @tagName(cfg.kind),
+                    @errorName(err),
+                });
+                return true;
+            };
             defer refs.deinit(self.alloc);
             if (refs.chunk_name) |configured| {
                 if (std.mem.eql(u8, configured, chunk_name)) return true;
@@ -4151,7 +4169,14 @@ pub const IndexManager = struct {
         if (self.embeddingArtifactsReferencedElsewhere(exclude_index_name, embedding_name)) return true;
         for (self.status_only_index_configs) |cfg| {
             if (std.mem.eql(u8, cfg.name, exclude_index_name)) continue;
-            var refs = try self.artifactRefsFromConfig(cfg);
+            var refs = self.artifactRefsFromConfig(cfg) catch |err| {
+                std.log.warn("status-only embedding artifact reference check skipped name={s} kind={s} err={s}", .{
+                    cfg.name,
+                    @tagName(cfg.kind),
+                    @errorName(err),
+                });
+                return true;
+            };
             defer refs.deinit(self.alloc);
             if (refs.embedding_name) |configured| {
                 if (std.mem.eql(u8, configured, embedding_name)) return true;
@@ -16065,6 +16090,36 @@ test "remove status-only dense config drops owned generated artifacts" {
     const stored_doc = try store.get(alloc, doc_internal_key);
     defer alloc.free(stored_doc);
     try std.testing.expectEqualStrings("{\"body\":\"alpha concept overview\"}", stored_doc);
+}
+
+test "remove status-only malformed dense config drops catalog entry" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "status-only-malformed-remove");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const cfg: types.IndexConfig = .{
+        .name = "bad_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":",
+    };
+    try manager.ensureConfiguredIndexDir(cfg);
+    try manager.recordFailedIndexLoad(cfg, error.InvalidIndexConfig);
+
+    try std.testing.expect(manager.get("bad_dense") != null);
+    try std.testing.expect(manager.loadFailure("bad_dense") != null);
+
+    try std.testing.expect(try manager.remove(&store, "bad_dense"));
+    try std.testing.expect(manager.get("bad_dense") == null);
+    try std.testing.expect(manager.loadFailure("bad_dense") == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.status_only_index_configs.len);
 }
 
 test "dense artifact preload session reuses cached raw values across calls" {

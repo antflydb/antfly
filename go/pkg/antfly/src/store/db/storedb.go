@@ -276,8 +276,11 @@ func (s *StoreDB) AddIndex(
 }
 
 func (s *StoreDB) DeleteIndex(ctx context.Context, name string) error {
-	if !s.coreDB.HasIndex(name) {
-		// Retries shouldn't fail if the index already exists
+	// Drop the index if it is loaded OR has a persisted config. An index that failed
+	// to open at startup (for example corrupt artifacts) is absent from the live
+	// manager but still has a config and on-disk artifacts that must be cleaned up.
+	if !s.coreDB.HasIndex(name) && !s.coreDB.HasIndexConfig(name) {
+		// Already gone; retries shouldn't fail.
 		return nil
 	}
 	return s.syncWriteOp(ctx, NewDeleteIndexOp(name))

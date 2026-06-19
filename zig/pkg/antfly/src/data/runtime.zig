@@ -73,6 +73,7 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
     help: bool = false,
 
@@ -87,12 +88,14 @@ const ResolvedPaths = struct {
     replica_catalog_path: []u8,
     snapshot_root_dir: []u8,
     auth_store_root_dir: []u8,
+    extension_package_store_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
         alloc.free(self.auth_store_root_dir);
+        alloc.free(self.extension_package_store_dir);
     }
 };
 
@@ -6544,6 +6547,13 @@ const RemoteMetadataSource = struct {
                 .drop_index = remoteDropIndex,
                 .wait_table_lifecycle = remoteWaitTableLifecycle,
                 .wait_table_projection = remoteWaitTableProjection,
+                .install_extension = remoteInstallExtension,
+                .update_extension = remoteUpdateExtension,
+                .drop_extension = remoteDropExtension,
+                .enable_extension = remoteEnableExtension,
+                .disable_extension = remoteDisableExtension,
+                .configure_extension = remoteConfigureExtension,
+                .restore_extensions = remoteRestoreExtensions,
             },
         };
     }
@@ -6712,6 +6722,139 @@ const RemoteMetadataSource = struct {
                 try client.dropIndex(base_uri, ctx.table_name, ctx.index_name);
             }
         }.call, .{ .table_name = table_name, .index_name = index_name });
+        self.invalidateCache();
+    }
+
+    fn remoteInstallExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.InstallExtensionRequest,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.installExtension(base_uri, ctx.extension_name, ctx.body);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name, .body = body });
+        if (!req.dry_run) self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteUpdateExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.UpdateExtensionRequest,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.updateExtension(base_uri, ctx.extension_name, ctx.body);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name, .body = body });
+        if (!req.dry_run) self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteDropExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.DropExtensionRequest,
+    ) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.dropExtension(base_uri, ctx.extension_name, ctx.body);
+            }
+        }.call, .{ .extension_name = extension_name, .body = body });
+        if (!req.dry_run) self.invalidateCache();
+    }
+
+    fn remoteEnableExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.enableExtension(base_uri, ctx.extension_name);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name });
+        self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteDisableExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.disableExtension(base_uri, ctx.extension_name);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name });
+        self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteConfigureExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.ConfigureExtensionRequest,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.configureExtension(base_uri, ctx.extension_name, ctx.body);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name, .body = body });
+        self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteRestoreExtensions(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        installed: []const antfly.extensions.InstalledExtension,
+        members: []const antfly.extensions.ExtensionMember,
+        dependencies: []const antfly.extensions.ExtensionDependency,
+    ) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, .{
+            .installed_extensions = installed,
+            .extension_members = members,
+            .extension_dependencies = dependencies,
+        });
+        defer alloc.free(body);
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
+                try client.restoreExtensions(base_uri, ctx);
+            }
+        }.call, body);
         self.invalidateCache();
     }
 
@@ -6922,6 +7065,10 @@ fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_a
         .restore_progresses = try cloneRestoreProgressesOwned(alloc, snapshot.restore_progresses),
         .replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses),
         .replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints),
+        .extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages),
+        .installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions),
+        .extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members),
+        .extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies),
         .split_transitions = try cloneSplitTransitionsOwned(alloc, snapshot.split_transitions),
         .merge_transitions = try cloneMergeTransitionsOwned(alloc, snapshot.merge_transitions),
         .split_observations = try cloneSplitObservationsOwned(alloc, snapshot.split_observations),
@@ -7823,6 +7970,26 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
         alloc.free(record.reseed_exact_cutover_path);
     }
     if (snapshot.replication_source_action_hints.len > 0) alloc.free(snapshot.replication_source_action_hints);
+    for (snapshot.extension_packages) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_packages.len > 0) alloc.free(snapshot.extension_packages);
+    for (snapshot.installed_extensions) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.installed_extensions.len > 0) alloc.free(snapshot.installed_extensions);
+    for (snapshot.extension_members) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_members.len > 0) alloc.free(snapshot.extension_members);
+    for (snapshot.extension_dependencies) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_dependencies.len > 0) alloc.free(snapshot.extension_dependencies);
     for (snapshot.split_transitions) |record| antfly.metadata.table_manager.freeSplitTransitionRecord(alloc, record);
     alloc.free(snapshot.split_transitions);
     for (snapshot.merge_transitions) |record| antfly.metadata.table_manager.freeMergeTransitionRecord(alloc, record);
@@ -7952,6 +8119,90 @@ fn cloneMergedGroupStatusesOwned(
     errdefer alloc.free(out);
     for (statuses, 0..) |status, i| {
         out[i] = status;
+    }
+    return out;
+}
+
+fn cloneExtensionPackagesOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.PackageManifest,
+) ![]antfly.extensions.PackageManifest {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.PackageManifest, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.clonePackageManifestAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneInstalledExtensionsOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.InstalledExtension,
+) ![]antfly.extensions.InstalledExtension {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.InstalledExtension, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.cloneInstalledExtensionAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneExtensionMembersOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.ExtensionMember,
+) ![]antfly.extensions.ExtensionMember {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.ExtensionMember, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.cloneExtensionMemberAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneExtensionDependenciesOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.ExtensionDependency,
+) ![]antfly.extensions.ExtensionDependency {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.ExtensionDependency, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.cloneExtensionDependencyAlloc(alloc, record);
+        initialized += 1;
     }
     return out;
 }
@@ -8138,6 +8389,7 @@ pub fn runFromIterator(
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     }, metadata_api_urls.urls);
@@ -8272,6 +8524,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extension-package-store")) {
+            cfg.extension_package_store_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -8299,6 +8555,8 @@ fn resolvePaths(
     defer alloc.free(local_base);
     const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
     defer alloc.free(metadata_base);
+    const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
+    errdefer alloc.free(extension_package_store_dir);
 
     if (cli.replica_root_dir != null and cli.replica_catalog_path != null) {
         const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
@@ -8326,6 +8584,7 @@ fn resolvePaths(
             .replica_catalog_path = replica_catalog_path,
             .snapshot_root_dir = snapshot_root_dir,
             .auth_store_root_dir = auth_store_root_dir,
+            .extension_package_store_dir = extension_package_store_dir,
         };
     }
 
@@ -8366,6 +8625,7 @@ fn resolvePaths(
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
         .auth_store_root_dir = auth_store_root_dir,
+        .extension_package_store_dir = extension_package_store_dir,
     };
 }
 
@@ -8374,6 +8634,39 @@ fn ensureDirAndParent(io: std.Io, replica_root_dir: []const u8, replica_catalog_
     if (std.fs.path.dirname(replica_catalog_path)) |parent| {
         try fs_paths.createDirPathPortable(io, parent);
     }
+}
+
+fn resolveExtensionPackageStoreDir(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+) ![]u8 {
+    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    defer alloc.free(env_var_z);
+    return try resolveExtensionPackageStoreDirWithEnv(
+        alloc,
+        cli_path,
+        local_base,
+        platform.env.getenvSlice(env_var_z),
+    );
+}
+
+fn resolveExtensionPackageStoreDirWithEnv(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+    env_path: ?[]const u8,
+) ![]u8 {
+    if (cli_path) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    if (env_path) |path| {
+        if (std.mem.trim(u8, path, " \t\r\n").len > 0) {
+            return try normalizeResolvedPathAlloc(alloc, path);
+        }
+    }
+
+    const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+    defer alloc.free(raw);
+    return try normalizeResolvedPathAlloc(alloc, raw);
 }
 
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -8389,14 +8682,13 @@ fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 
             else => return err,
         };
         if (resolved_z) |resolved| {
+            defer alloc.free(resolved);
             const resolved_prefix = resolved[0..resolved.len];
-            if (probe.len == path.len) return resolved_prefix;
+            if (probe.len == path.len) return try alloc.dupe(u8, resolved_prefix);
 
             const suffix_start: usize = if (probe.len == 1) 1 else probe.len + 1;
             const suffix = path[suffix_start..];
-            const joined = try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
-            alloc.free(resolved_prefix);
-            return joined;
+            return try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
         }
 
         const parent = std.fs.path.dirname(probe) orelse return try alloc.dupe(u8, path);
@@ -8507,6 +8799,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Data raft snapshot root directory
+        \\  --extension-package-store <path> Extension package store directory
         \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
@@ -8590,6 +8883,14 @@ test "data runtime cli accepts secret store path" {
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
 }
 
+test "data runtime cli accepts extension package store path" {
+    const argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
 test "data runtime resolves metadata api urls from common config" {
     const alloc = std.testing.allocator;
     const orchestration_urls = try alloc.alloc(antfly.common.config.Config.MetadataConfig.NodeUrl, 2);
@@ -8630,6 +8931,19 @@ test "data runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/data/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/data/snapshots", resolved.snapshot_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
+}
+
+test "data runtime resolves extension package store env before local default" {
+    const alloc = std.testing.allocator;
+
+    const env_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, null, "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(env_resolved);
+    try std.testing.expectEqualStrings("/antfly-extension-env", env_resolved);
+
+    const cli_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, "/antfly-cli-extensions", "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(cli_resolved);
+    try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
 }
 
 test "data runtime parses optional split store registration flags" {
