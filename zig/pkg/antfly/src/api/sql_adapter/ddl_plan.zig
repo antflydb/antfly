@@ -2006,6 +2006,7 @@ fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Rel
     if (generated.field) |field| alloc.free(field);
     freeStringSlice(alloc, generated.fields);
     if (generated.separator.len > 0) alloc.free(generated.separator);
+    if (generated.expression) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
 }
 
 fn freeDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) void {

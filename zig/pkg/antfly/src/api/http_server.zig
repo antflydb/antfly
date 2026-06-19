@@ -8664,6 +8664,16 @@ pub const ApiHttpServer = struct {
         return out;
     }
 
+    fn externalLakeSidecarContextForRowsAggregateAlloc(
+        self: *ApiHttpServer,
+        aggregate: db_mod.types.RelationalRowsAggregateRequest,
+    ) !OwnedExternalLakeSidecarRequestContext {
+        if (aggregate.source.text_patterns.len == 0) {
+            return .{ .base = self.cfg.external_lake_sidecar_context };
+        }
+        return try self.externalLakeSidecarContextForRowsQueryAlloc(aggregate.source);
+    }
+
     fn externalLakeSidecarContextForRowsExplainAlloc(
         self: *ApiHttpServer,
         schema: runtime_schema_mod.TableSchema,
@@ -8682,7 +8692,13 @@ pub const ApiHttpServer = struct {
                 try self.applyRowsQueryPlanRowFilter(table_name, authenticated_identity, schema, &plan);
                 break :blk try self.externalLakeSidecarContextForRowsQueryAlloc(plan.query);
             },
-            .aggregate, .window, .join, .lateral => .{ .base = self.cfg.external_lake_sidecar_context },
+            .aggregate => blk: {
+                var plan = relational_rows_api.parseRowsAggregatePlanRequest(self.alloc, body, schema) catch return error.InvalidRowsRequest;
+                defer plan.deinit(self.alloc);
+                try self.applyRowsAggregatePlanRowFilter(table_name, authenticated_identity, schema, &plan);
+                break :blk try self.externalLakeSidecarContextForRowsAggregateAlloc(plan.aggregate);
+            },
+            .window, .join, .lateral => .{ .base = self.cfg.external_lake_sidecar_context },
         };
     }
 
@@ -9149,7 +9165,6 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
-        const source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
         const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
@@ -9166,11 +9181,34 @@ pub const ApiHttpServer = struct {
         const result_schema = relational_rows_api.rowsReadPlanOutputColumnsAlloc(self.alloc, schema, .{ .aggregate = plan }) catch return try textResponse(self.alloc, 400, "invalid rows aggregate request");
         defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
+        var sidecar_context = if (schema.external_base_source != null)
+            try self.externalLakeSidecarContextForRowsAggregateAlloc(plan.aggregate)
+        else
+            OwnedExternalLakeSidecarRequestContext{ .base = self.cfg.external_lake_sidecar_context };
+        defer sidecar_context.deinit(self.alloc);
+        var lake_source: ?table_reads.OpenedExternalObjectStorageLakeRowsSource = null;
+        defer if (lake_source) |*source| source.deinit();
+        const source = if (schema.external_base_source != null) blk: {
+            lake_source = self.openPublicExternalLakeRowsSourceWithOptionsAlloc(
+                schema,
+                self.externalLakeRowsSourceOptionsWithSidecarContext(sidecar_context.context()),
+            ) catch |err| switch (err) {
+                error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
+                error.ExternalLakeCredentialRefNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.ExternalLakeCredentialScopeMismatch => return try textResponse(self.alloc, 403, "forbidden"),
+                error.InvalidRowsRequest => return try textResponse(self.alloc, 404, "not found"),
+                error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
+                else => return err,
+            };
+            break :blk lake_source.?.source();
+        } else self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
+
         var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
             else => {
                 std.log.err("public table rows aggregate failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "rows aggregate failed");
@@ -19616,10 +19654,25 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 20), text_sidecar_rows[0].object.get("amount").?.integer);
     try std.testing.expect(text_sidecar_rows[0].object.get("description") == null);
 
+    var text_aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"source\":{\"where\":{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"}},\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}", null);
+    defer text_aggregate_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), text_aggregate_response.status);
+    try std.testing.expectEqual(@as(u32, 4), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_text_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, text_aggregate_response.body, .{ .allocate = .alloc_always });
+    defer parsed_text_aggregate.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_text_aggregate.value.object.get("total_groups").?.integer);
+    const text_aggregate_rows = parsed_text_aggregate.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), text_aggregate_rows.len);
+    try std.testing.expectEqual(@as(i64, 8), text_aggregate_rows[0].object.get("tenant").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_aggregate_rows[0].object.get("row_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), text_aggregate_rows[0].object.get("amount_sum").?.integer);
+
     var aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"net_amount_sum\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]}},{\"name\":\"large_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter\":{\"field\":\"amount\",\"op\":\"gte\",\"value\":20}},{\"name\":\"rank_two_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter_in\":[{\"field\":\"rank\",\"op\":\"in\",\"value\":[2]}]}]}}", null);
     defer aggregate_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), aggregate_response.status);
-    try std.testing.expectEqual(@as(u32, 4), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 5), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, aggregate_response.body, .{ .allocate = .alloc_always });
@@ -19646,7 +19699,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer source_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), source_response.status);
-    try std.testing.expectEqual(@as(u32, 5), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 6), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_source = try std.json.parseFromSlice(std.json.Value, alloc, source_response.body, .{ .allocate = .alloc_always });
@@ -19668,7 +19721,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), explain_response.status);
-    try std.testing.expectEqual(@as(u32, 6), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 7), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_explain = try std.json.parseFromSlice(std.json.Value, alloc, explain_response.body, .{ .allocate = .alloc_always });
@@ -19712,7 +19765,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer query_explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), query_explain_response.status);
-    try std.testing.expectEqual(@as(u32, 7), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 8), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, query_explain_response.body, .{ .allocate = .alloc_always });
@@ -19738,7 +19791,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer text_query_explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), text_query_explain_response.status);
-    try std.testing.expectEqual(@as(u32, 8), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 9), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_text_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, text_query_explain_response.body, .{ .allocate = .alloc_always });
@@ -19752,11 +19805,34 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 1), text_query_candidates.get("intersected_ref_count").?.integer);
     try std.testing.expect(text_query_candidates.get("hydration_possible").?.bool);
 
+    var text_aggregate_explain_response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/events/rows/explain",
+        .body = "{\"aggregate\":{\"source\":{\"where\":{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"}},\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}",
+    });
+    defer text_aggregate_explain_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), text_aggregate_explain_response.status);
+    try std.testing.expectEqual(@as(u32, 10), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_text_aggregate_explain = try std.json.parseFromSlice(std.json.Value, alloc, text_aggregate_explain_response.body, .{ .allocate = .alloc_always });
+    defer parsed_text_aggregate_explain.deinit();
+    try std.testing.expectEqualStrings("aggregate", parsed_text_aggregate_explain.value.object.get("explained_operation").?.string);
+    const text_aggregate_explain_plan = parsed_text_aggregate_explain.value.object.get("plan").?.object;
+    try std.testing.expectEqualStrings("group_by", text_aggregate_explain_plan.get("operation").?.string);
+    const text_aggregate_candidates = text_aggregate_explain_plan.get("sidecar_candidates").?.object;
+    try std.testing.expectEqual(@as(i64, 1), text_aggregate_candidates.get("supplied_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_aggregate_candidates.get("supplied_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_aggregate_candidates.get("usable_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_aggregate_candidates.get("usable_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), text_aggregate_candidates.get("intersected_ref_count").?.integer);
+    try std.testing.expect(text_aggregate_candidates.get("hydration_possible").?.bool);
+
     var gcs_response = try server.handlePublicTableRowsQuery("events_gcs", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":7}}}", null);
     defer gcs_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), gcs_response.status);
-    try std.testing.expectEqual(@as(u32, 9), resolver.open_count);
-    try std.testing.expectEqual(@as(u32, 8), resolver.s3_open_count);
+    try std.testing.expectEqual(@as(u32, 11), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 10), resolver.s3_open_count);
     try std.testing.expectEqual(@as(u32, 1), resolver.gcs_open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 

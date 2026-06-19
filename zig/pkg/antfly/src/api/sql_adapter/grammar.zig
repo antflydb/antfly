@@ -3448,6 +3448,7 @@ pub fn parseDdlGeneratedExpressionAlloc(
     pos: *usize,
 ) !runtime_schema.RelationalGeneratedValue {
     const cursor = parser.Cursor.init(tokens, pos);
+    const start = cursor.checkpoint();
     if (cursor.peekKeyword("lower") or cursor.peekKeyword("upper") or cursor.peekFunctionCallIf(sqlKeywordIsMd5Function)) {
         const op: runtime_schema.RelationalGeneratedOp = if (cursor.matchKeyword("lower"))
             .lower
@@ -3469,9 +3470,378 @@ pub fn parseDdlGeneratedExpressionAlloc(
         separator_transferred = true;
         return .{ .op = op, .field = field, .separator = separator };
     }
-    if (cursor.matchKeyword("concat")) return try parseDdlGeneratedConcatExpressionAlloc(alloc, cursor, tokens, pos, .concat);
-    if (cursor.matchKeyword("concat_ws")) return try parseDdlGeneratedConcatExpressionAlloc(alloc, cursor, tokens, pos, .concat_ws);
-    return error.UnsupportedSqlShape;
+    if (cursor.matchKeyword("concat")) return parseDdlGeneratedConcatExpressionAlloc(alloc, cursor, tokens, pos, .concat) catch |err| {
+        cursor.restore(start);
+        if (err != error.UnsupportedSqlShape) return err;
+        return try parseDdlGeneratedRowExpressionGeneratedValueAlloc(alloc, cursor);
+    };
+    if (cursor.matchKeyword("concat_ws")) return parseDdlGeneratedConcatExpressionAlloc(alloc, cursor, tokens, pos, .concat_ws) catch |err| {
+        cursor.restore(start);
+        if (err != error.UnsupportedSqlShape) return err;
+        return try parseDdlGeneratedRowExpressionGeneratedValueAlloc(alloc, cursor);
+    };
+    cursor.restore(start);
+    return try parseDdlGeneratedRowExpressionGeneratedValueAlloc(alloc, cursor);
+}
+
+fn parseDdlGeneratedRowExpressionGeneratedValueAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) !runtime_schema.RelationalGeneratedValue {
+    const expression = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    const separator = try alloc.dupe(u8, "");
+    var separator_transferred = false;
+    errdefer if (!separator_transferred) alloc.free(separator);
+    expression_transferred = true;
+    separator_transferred = true;
+    return .{
+        .op = .expression,
+        .separator = separator,
+        .expression = expression,
+    };
+}
+
+fn parseDdlGeneratedRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    return try parseDdlGeneratedConcatPipeExpressionAlloc(alloc, cursor);
+}
+
+fn parseDdlGeneratedConcatPipeExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    var expression = try parseDdlGeneratedAdditiveExpressionAlloc(alloc, cursor);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    while (cursor.matchToken(.pipe_concat) != null) {
+        const rhs = try parseDdlGeneratedAdditiveExpressionAlloc(alloc, cursor);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs);
+        const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 2);
+        operands[0] = expression;
+        operands[1] = rhs;
+        expression_transferred = true;
+        rhs_transferred = true;
+        expression = try ddlGeneratedOperationExpressionAlloc(alloc, .concat, operands);
+        expression_transferred = false;
+    }
+    expression_transferred = true;
+    return expression;
+}
+
+fn parseDdlGeneratedAdditiveExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    var expression = try parseDdlGeneratedMultiplicativeExpressionAlloc(alloc, cursor);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    while (true) {
+        const kind: runtime_schema.RelationalRowsExpressionKind = if (cursor.matchToken(.plus) != null)
+            .add
+        else if (cursor.matchToken(.minus) != null)
+            .sub
+        else
+            break;
+        const rhs = try parseDdlGeneratedMultiplicativeExpressionAlloc(alloc, cursor);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs);
+        const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 2);
+        operands[0] = expression;
+        operands[1] = rhs;
+        expression_transferred = true;
+        rhs_transferred = true;
+        expression = try ddlGeneratedOperationExpressionAlloc(alloc, kind, operands);
+        expression_transferred = false;
+    }
+    expression_transferred = true;
+    return expression;
+}
+
+fn parseDdlGeneratedMultiplicativeExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    var expression = try parseDdlGeneratedPrimaryExpressionAlloc(alloc, cursor);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    while (true) {
+        const kind: runtime_schema.RelationalRowsExpressionKind = if (cursor.matchToken(.star) != null)
+            .mul
+        else if (cursor.matchToken(.slash) != null)
+            .div
+        else if (cursor.matchToken(.percent) != null)
+            .mod
+        else
+            break;
+        const rhs = try parseDdlGeneratedPrimaryExpressionAlloc(alloc, cursor);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs);
+        const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 2);
+        operands[0] = expression;
+        operands[1] = rhs;
+        expression_transferred = true;
+        rhs_transferred = true;
+        expression = try ddlGeneratedOperationExpressionAlloc(alloc, kind, operands);
+        expression_transferred = false;
+    }
+    expression_transferred = true;
+    return expression;
+}
+
+fn parseDdlGeneratedPrimaryExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    if (cursor.matchToken(.lparen) != null) {
+        const expression = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+        try cursor.expectToken(.rparen);
+        expression_transferred = true;
+        return expression;
+    }
+    if (cursor.matchToken(.minus) != null) {
+        const number = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+        const value_json = try std.fmt.allocPrint(alloc, "-{s}", .{number.text});
+        return try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
+    }
+    if (cursor.peekFunctionCall("cast")) return try parseDdlGeneratedCastExpressionAlloc(alloc, cursor);
+    if (cursor.peekFunctionCallIf(sqlKeywordIsJsonExtractPathFunction)) return try parseDdlGeneratedJsonExtractPathExpressionAlloc(alloc, cursor);
+    if (cursor.peekKind(.identifier) and cursor.pos.* + 1 < cursor.tokens.len and cursor.tokens[cursor.pos.* + 1].kind == .lparen) {
+        return try parseDdlGeneratedFunctionExpressionAlloc(alloc, cursor);
+    }
+    const literal_start = cursor.checkpoint();
+    if (sql_value.parseSqlUntypedValueJsonAlloc(alloc, cursor.tokens, cursor.pos)) |value_json| {
+        return try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
+    } else |_| {
+        cursor.restore(literal_start);
+    }
+    const field = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    return try ddlGeneratedFieldExpressionAlloc(alloc, field.text);
+}
+
+fn parseDdlGeneratedFunctionExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) !runtime_schema.RelationalRowsExpression {
+    const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const kind = ddlGeneratedFunctionExpressionKind(name.text) orelse return error.UnsupportedSqlShape;
+    try cursor.expectToken(.lparen);
+    var operands = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpression).empty;
+    errdefer freeDdlGeneratedExpressionList(alloc, &operands);
+    if (cursor.matchToken(.rparen) == null) {
+        while (true) {
+            const operand = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+            try operands.append(alloc, operand);
+            if (cursor.matchToken(.comma) == null) break;
+        }
+        try cursor.expectToken(.rparen);
+    }
+    if (operands.items.len == 0) return error.UnsupportedSqlShape;
+    const owned_operands = try operands.toOwnedSlice(alloc);
+    return try ddlGeneratedOperationExpressionAlloc(alloc, kind, owned_operands);
+}
+
+fn parseDdlGeneratedCastExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) !runtime_schema.RelationalRowsExpression {
+    try cursor.expectKeyword("cast");
+    try cursor.expectToken(.lparen);
+    const operand = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
+    try cursor.expectKeyword("as");
+    const type_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const cast_type = ddlGeneratedCastType(type_token.text) orelse return error.UnsupportedSqlShape;
+    try cursor.expectToken(.rparen);
+    const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
+    operands[0] = operand;
+    operand_transferred = true;
+    return try ddlGeneratedCastExpressionAlloc(alloc, operands, cast_type);
+}
+
+fn parseDdlGeneratedJsonExtractPathExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+) !runtime_schema.RelationalRowsExpression {
+    const function_name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const as_text = std.ascii.eqlIgnoreCase(function_name.text, "json_extract_path_text") or
+        std.ascii.eqlIgnoreCase(function_name.text, "jsonb_extract_path_text");
+    try cursor.expectToken(.lparen);
+    const root = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    var root_transferred = false;
+    errdefer if (!root_transferred) runtime_schema.freeRelationalRowsExpression(alloc, root);
+    try cursor.expectToken(.comma);
+    var path = std.ArrayListUnmanaged(u8).empty;
+    errdefer path.deinit(alloc);
+    while (true) {
+        const path_part = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+        if (path.items.len != 0) try path.append(alloc, '.');
+        try path.appendSlice(alloc, path_part.text);
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
+    operands[0] = root;
+    root_transferred = true;
+    const owned_path = try path.toOwnedSlice(alloc);
+    return try ddlGeneratedJsonExtractExpressionAlloc(alloc, operands, owned_path, as_text);
+}
+
+fn ddlGeneratedFunctionExpressionKind(name: []const u8) ?runtime_schema.RelationalRowsExpressionKind {
+    if (std.ascii.eqlIgnoreCase(name, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(name, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(name, "initcap")) return .initcap;
+    if (std.ascii.eqlIgnoreCase(name, "trim") or std.ascii.eqlIgnoreCase(name, "btrim")) return .trim;
+    if (std.ascii.eqlIgnoreCase(name, "ltrim")) return .ltrim;
+    if (std.ascii.eqlIgnoreCase(name, "rtrim")) return .rtrim;
+    if (std.ascii.eqlIgnoreCase(name, "replace")) return .replace;
+    if (std.ascii.eqlIgnoreCase(name, "regexp_replace")) return .regexp_replace;
+    if (std.ascii.eqlIgnoreCase(name, "translate")) return .translate;
+    if (std.ascii.eqlIgnoreCase(name, "substring") or std.ascii.eqlIgnoreCase(name, "substr")) return .substring;
+    if (std.ascii.eqlIgnoreCase(name, "overlay")) return .overlay;
+    if (std.ascii.eqlIgnoreCase(name, "split_part")) return .split_part;
+    if (std.ascii.eqlIgnoreCase(name, "strpos")) return .strpos;
+    if (std.ascii.eqlIgnoreCase(name, "left")) return .left;
+    if (std.ascii.eqlIgnoreCase(name, "right")) return .right;
+    if (std.ascii.eqlIgnoreCase(name, "lpad")) return .lpad;
+    if (std.ascii.eqlIgnoreCase(name, "rpad")) return .rpad;
+    if (std.ascii.eqlIgnoreCase(name, "repeat")) return .repeat;
+    if (std.ascii.eqlIgnoreCase(name, "reverse")) return .reverse;
+    if (std.ascii.eqlIgnoreCase(name, "starts_with")) return .starts_with;
+    if (std.ascii.eqlIgnoreCase(name, "ends_with")) return .ends_with;
+    if (std.ascii.eqlIgnoreCase(name, "ascii")) return .ascii;
+    if (std.ascii.eqlIgnoreCase(name, "chr")) return .chr;
+    if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
+    if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
+    if (std.ascii.eqlIgnoreCase(name, "length") or std.ascii.eqlIgnoreCase(name, "char_length") or std.ascii.eqlIgnoreCase(name, "character_length")) return .length;
+    if (std.ascii.eqlIgnoreCase(name, "octet_length")) return .octet_length;
+    if (std.ascii.eqlIgnoreCase(name, "bit_length")) return .bit_length;
+    if (std.ascii.eqlIgnoreCase(name, "coalesce")) return .coalesce;
+    if (std.ascii.eqlIgnoreCase(name, "nullif")) return .nullif;
+    if (std.ascii.eqlIgnoreCase(name, "greatest")) return .greatest;
+    if (std.ascii.eqlIgnoreCase(name, "least")) return .least;
+    if (std.ascii.eqlIgnoreCase(name, "abs")) return .abs;
+    if (std.ascii.eqlIgnoreCase(name, "round")) return .round;
+    if (std.ascii.eqlIgnoreCase(name, "trunc")) return .trunc;
+    if (std.ascii.eqlIgnoreCase(name, "floor")) return .floor;
+    if (std.ascii.eqlIgnoreCase(name, "ceil")) return .ceil;
+    if (std.ascii.eqlIgnoreCase(name, "sqrt")) return .sqrt;
+    if (std.ascii.eqlIgnoreCase(name, "sign")) return .sign;
+    if (std.ascii.eqlIgnoreCase(name, "power")) return .power;
+    if (std.ascii.eqlIgnoreCase(name, "mod")) return .mod;
+    if (std.ascii.eqlIgnoreCase(name, "date_trunc")) return .date_trunc;
+    if (std.ascii.eqlIgnoreCase(name, "date_bin")) return .date_bin;
+    if (std.ascii.eqlIgnoreCase(name, "date_part")) return .date_part;
+    if (std.ascii.eqlIgnoreCase(name, "json_typeof") or std.ascii.eqlIgnoreCase(name, "jsonb_typeof")) return .json_typeof;
+    if (std.ascii.eqlIgnoreCase(name, "json_array_length") or std.ascii.eqlIgnoreCase(name, "jsonb_array_length")) return .json_array_length;
+    if (std.ascii.eqlIgnoreCase(name, "json_build_object") or std.ascii.eqlIgnoreCase(name, "jsonb_build_object")) return .json_build_object;
+    if (std.ascii.eqlIgnoreCase(name, "to_jsonb")) return .to_jsonb;
+    if (std.ascii.eqlIgnoreCase(name, "array_length") or std.ascii.eqlIgnoreCase(name, "cardinality")) return .array_length;
+    if (std.ascii.eqlIgnoreCase(name, "array_position")) return .array_position;
+    if (std.ascii.eqlIgnoreCase(name, "array_positions")) return .array_positions;
+    if (std.ascii.eqlIgnoreCase(name, "array_append")) return .array_append;
+    if (std.ascii.eqlIgnoreCase(name, "array_prepend")) return .array_prepend;
+    if (std.ascii.eqlIgnoreCase(name, "array_cat")) return .array_cat;
+    if (std.ascii.eqlIgnoreCase(name, "array_remove")) return .array_remove;
+    if (std.ascii.eqlIgnoreCase(name, "array_replace")) return .array_replace;
+    if (std.ascii.eqlIgnoreCase(name, "array_to_string")) return .array_to_string;
+    if (std.ascii.eqlIgnoreCase(name, "string_to_array")) return .string_to_array;
+    return null;
+}
+
+fn ddlGeneratedCastType(name: []const u8) ?runtime_schema.RelationalRowsExpressionCastType {
+    if (std.ascii.eqlIgnoreCase(name, "text") or std.ascii.eqlIgnoreCase(name, "varchar") or std.ascii.eqlIgnoreCase(name, "uuid")) return .text;
+    if (std.ascii.eqlIgnoreCase(name, "numeric") or std.ascii.eqlIgnoreCase(name, "integer") or std.ascii.eqlIgnoreCase(name, "int") or std.ascii.eqlIgnoreCase(name, "bigint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "boolean") or std.ascii.eqlIgnoreCase(name, "bool")) return .bool;
+    if (std.ascii.eqlIgnoreCase(name, "timestamp") or std.ascii.eqlIgnoreCase(name, "timestamptz") or std.ascii.eqlIgnoreCase(name, "datetime")) return .datetime;
+    return null;
+}
+
+fn ddlGeneratedFieldExpressionAlloc(alloc: std.mem.Allocator, field: []const u8) !runtime_schema.RelationalRowsExpression {
+    return .{
+        .kind = .field,
+        .field = try alloc.dupe(u8, field),
+        .value_json = try alloc.dupe(u8, ""),
+        .json_path = try alloc.dupe(u8, ""),
+    };
+}
+
+fn ddlGeneratedValueExpressionWithOwnedJsonAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+) !runtime_schema.RelationalRowsExpression {
+    errdefer alloc.free(@constCast(value_json));
+    return .{
+        .kind = .value,
+        .field = try alloc.dupe(u8, ""),
+        .value_json = value_json,
+        .json_path = try alloc.dupe(u8, ""),
+    };
+}
+
+fn ddlGeneratedOperationExpressionAlloc(
+    alloc: std.mem.Allocator,
+    kind: runtime_schema.RelationalRowsExpressionKind,
+    operands: []const runtime_schema.RelationalRowsExpression,
+) !runtime_schema.RelationalRowsExpression {
+    errdefer {
+        for (operands) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        alloc.free(@constCast(operands));
+    }
+    return .{
+        .kind = kind,
+        .field = try alloc.dupe(u8, ""),
+        .value_json = try alloc.dupe(u8, ""),
+        .json_path = try alloc.dupe(u8, ""),
+        .operands = operands,
+    };
+}
+
+fn ddlGeneratedCastExpressionAlloc(
+    alloc: std.mem.Allocator,
+    operands: []const runtime_schema.RelationalRowsExpression,
+    cast_type: runtime_schema.RelationalRowsExpressionCastType,
+) !runtime_schema.RelationalRowsExpression {
+    var expression = try ddlGeneratedOperationExpressionAlloc(alloc, .cast, operands);
+    expression.cast_type = cast_type;
+    return expression;
+}
+
+fn ddlGeneratedJsonExtractExpressionAlloc(
+    alloc: std.mem.Allocator,
+    operands: []const runtime_schema.RelationalRowsExpression,
+    json_path: []const u8,
+    as_text: bool,
+) !runtime_schema.RelationalRowsExpression {
+    errdefer {
+        for (operands) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        alloc.free(@constCast(operands));
+        alloc.free(@constCast(json_path));
+    }
+    return .{
+        .kind = .json_extract,
+        .field = try alloc.dupe(u8, ""),
+        .value_json = try alloc.dupe(u8, ""),
+        .json_path = json_path,
+        .json_as_text = as_text,
+        .operands = operands,
+    };
+}
+
+fn freeDdlGeneratedExpressionList(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpression),
+) void {
+    for (list.items) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    list.deinit(alloc);
 }
 
 fn parseDdlGeneratedConcatExpressionAlloc(
@@ -5468,6 +5838,7 @@ fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Rel
     if (generated.field) |field| alloc.free(@constCast(field));
     freeStringSlice(alloc, generated.fields);
     alloc.free(@constCast(generated.separator));
+    if (generated.expression) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
 }
 
 fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: ddl_plan.SequenceAlterOperation) void {
@@ -6794,17 +7165,51 @@ test "sql adapter grammar parses ddl generated expressions" {
     var single_concat_tokens = try lexer.tokenizeAlloc(alloc, "concat(status)");
     defer lexer.freeTokens(alloc, &single_concat_tokens);
     var single_concat_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, single_concat_tokens.items, &single_concat_pos));
+    const single_concat = try parseDdlGeneratedExpressionAlloc(alloc, single_concat_tokens.items, &single_concat_pos);
+    defer freeDdlGeneratedValue(alloc, single_concat);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, single_concat.op);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat, single_concat.expression.?.kind);
 
     var mismatched_separator_tokens = try lexer.tokenizeAlloc(alloc, "concat(tenant_id, ':', status, '-', id)");
     defer lexer.freeTokens(alloc, &mismatched_separator_tokens);
     var mismatched_separator_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, mismatched_separator_tokens.items, &mismatched_separator_pos));
+    const mismatched_separator = try parseDdlGeneratedExpressionAlloc(alloc, mismatched_separator_tokens.items, &mismatched_separator_pos);
+    defer freeDdlGeneratedValue(alloc, mismatched_separator);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, mismatched_separator.op);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat, mismatched_separator.expression.?.kind);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "replace(status, 'a', 'b')");
-    defer lexer.freeTokens(alloc, &unsupported_tokens);
-    var unsupported_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+    var replace_tokens = try lexer.tokenizeAlloc(alloc, "replace(status, 'a', 'b')");
+    defer lexer.freeTokens(alloc, &replace_tokens);
+    var replace_pos: usize = 0;
+    const replace = try parseDdlGeneratedExpressionAlloc(alloc, replace_tokens.items, &replace_pos);
+    defer freeDdlGeneratedValue(alloc, replace);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, replace.op);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.replace, replace.expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 3), replace.expression.?.operands.len);
+
+    var arithmetic_tokens = try lexer.tokenizeAlloc(alloc, "round((amount + fee) * 100)");
+    defer lexer.freeTokens(alloc, &arithmetic_tokens);
+    var arithmetic_pos: usize = 0;
+    const arithmetic = try parseDdlGeneratedExpressionAlloc(alloc, arithmetic_tokens.items, &arithmetic_pos);
+    defer freeDdlGeneratedValue(alloc, arithmetic);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, arithmetic.op);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.round, arithmetic.expression.?.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.mul, arithmetic.expression.?.operands[0].kind);
+
+    var json_extract_tokens = try lexer.tokenizeAlloc(alloc, "jsonb_extract_path_text(metadata, 'source')");
+    defer lexer.freeTokens(alloc, &json_extract_tokens);
+    var json_extract_pos: usize = 0;
+    const json_extract = try parseDdlGeneratedExpressionAlloc(alloc, json_extract_tokens.items, &json_extract_pos);
+    defer freeDdlGeneratedValue(alloc, json_extract);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, json_extract.op);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.json_extract, json_extract.expression.?.kind);
+    try std.testing.expect(json_extract.expression.?.json_as_text);
+    try std.testing.expectEqualStrings("source", json_extract.expression.?.json_path);
+
+    var volatile_tokens = try lexer.tokenizeAlloc(alloc, "now()");
+    defer lexer.freeTokens(alloc, &volatile_tokens);
+    var volatile_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, volatile_tokens.items, &volatile_pos));
 }
 
 test "sql adapter grammar parses ddl unique expressions" {

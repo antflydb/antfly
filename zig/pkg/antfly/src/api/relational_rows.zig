@@ -3765,7 +3765,7 @@ fn validateLakeRowsAggregateSourceSupported(source: OwnedRowsQueryRequest) !void
     if (source.distinct_on.len != 0 or source.distinct_on_expressions.len != 0) return error.UnsupportedRowsQuery;
     if (source.json_extract.len != 0 or source.array_length.len != 0 or source.coalesce.len != 0 or source.field_aliases.len != 0 or source.expressions.len != 0) return error.UnsupportedRowsQuery;
     if (source.array_any.len != 0 or source.array_contains.len != 0 or source.array_eq.len != 0 or source.in_predicates.len != 0) return error.UnsupportedRowsQuery;
-    if (source.json_contains.len != 0 or source.json_path_eq.len != 0 or source.json_path_exists.len != 0 or source.text_patterns.len != 0) return error.UnsupportedRowsQuery;
+    if (source.json_contains.len != 0 or source.json_path_eq.len != 0 or source.json_path_exists.len != 0) return error.UnsupportedRowsQuery;
     if (source.or_predicates.len != 0 or source.not_predicates.len != 0 or source.access_or_predicates.len != 0 or source.access_not_predicates.len != 0) return error.UnsupportedRowsQuery;
     if (source.expression_predicates.len != 0 or source.expression_or_predicates.len != 0 or source.expression_not_predicates.len != 0 or source.expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
     if (source.predicates.len > 1) return error.UnsupportedRowsQuery;
@@ -3780,6 +3780,14 @@ fn lakeRowsAggregateProjectedColumnsAlloc(
     var columns = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeLakeProjectedColumnList(alloc, &columns);
 
+    if (lakeRowsQueryHasResidualPredicates(request.source)) {
+        for (request.source.predicates) |predicate| {
+            try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
+        }
+    }
+    for (request.source.text_patterns) |predicate| {
+        try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
+    }
     for (request.group_by) |field| {
         try appendLakeProjectedColumnAlloc(alloc, &columns, field);
     }
@@ -4410,6 +4418,7 @@ fn lakeRowsAggregateGroupsAlloc(
     }
 
     for (rows) |row| {
+        if (lakeRowsQueryHasResidualPredicates(request.source) and !try lakeRowsQueryResidualPredicatesMatchAlloc(alloc, request.source, row)) continue;
         const group_index = if (!grouped)
             @as(usize, 0)
         else
