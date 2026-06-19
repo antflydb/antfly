@@ -8741,7 +8741,7 @@ pub const ApiHttpServer = struct {
         sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
         predicate: db_mod.types.RelationalRowsTextPatternPredicate,
     ) !?serverless_query.LakeTextSidecarCandidatePlan {
-        const term = textCandidateTermFromPattern(predicate) orelse return null;
+        const query = textCandidateQueryFromPattern(predicate) orelse return null;
         const sidecar_names = try textSidecarNamesForFieldAlloc(alloc, sidecars, predicate.field);
         if (sidecar_names.len == 0) {
             alloc.free(sidecar_names);
@@ -8749,21 +8749,62 @@ pub const ApiHttpServer = struct {
         }
         return .{
             .request = .{
-                .text = term,
-                .operator = .any_terms,
+                .text = query.text,
+                .operator = query.operator,
                 .limit = std.math.maxInt(usize),
             },
             .sidecar_names = sidecar_names,
         };
     }
 
-    fn textCandidateTermFromPattern(predicate: db_mod.types.RelationalRowsTextPatternPredicate) ?[]const u8 {
-        if (predicate.negated or predicate.case_insensitive or predicate.pattern.len == 0) return null;
-        for (predicate.pattern) |ch| {
-            if (ch == '%' or ch == '_' or ch == '\\') return null;
-            if (!std.ascii.isAlphanumeric(ch)) return null;
+    const TextPatternCandidateQuery = struct {
+        text: []const u8,
+        operator: serverless_query.QueryOperator,
+    };
+
+    fn textCandidateQueryFromPattern(predicate: db_mod.types.RelationalRowsTextPatternPredicate) ?TextPatternCandidateQuery {
+        if (predicate.negated or predicate.pattern.len == 0) return null;
+        if (containsSqlLikeEscape(predicate.pattern)) return null;
+        if (!containsSearchableTextByte(predicate.pattern)) return null;
+        if (!containsSqlLikeWildcard(predicate.pattern)) {
+            return .{ .text = predicate.pattern, .operator = .phrase };
         }
-        return predicate.pattern;
+        const prefix = simpleTrailingPercentPrefix(predicate.pattern) orelse return null;
+        if (!containsSearchableTextByte(prefix) or containsWhitespaceOrControl(prefix)) return null;
+        return .{ .text = prefix, .operator = .prefix_any_term };
+    }
+
+    fn containsSqlLikeWildcard(pattern: []const u8) bool {
+        for (pattern) |ch| {
+            if (ch == '%' or ch == '_') return true;
+        }
+        return false;
+    }
+
+    fn containsSqlLikeEscape(pattern: []const u8) bool {
+        return std.mem.indexOfScalar(u8, pattern, '\\') != null;
+    }
+
+    fn containsSearchableTextByte(pattern: []const u8) bool {
+        for (pattern) |ch| {
+            if (!std.ascii.isWhitespace(ch) and !std.ascii.isControl(ch)) return true;
+        }
+        return false;
+    }
+
+    fn containsWhitespaceOrControl(pattern: []const u8) bool {
+        for (pattern) |ch| {
+            if (std.ascii.isWhitespace(ch) or std.ascii.isControl(ch)) return true;
+        }
+        return false;
+    }
+
+    fn simpleTrailingPercentPrefix(pattern: []const u8) ?[]const u8 {
+        if (pattern.len < 2 or pattern[pattern.len - 1] != '%') return null;
+        for (pattern[0 .. pattern.len - 1]) |ch| {
+            if (ch == '%' or ch == '_') return null;
+        }
+        return pattern[0 .. pattern.len - 1];
     }
 
     fn textSidecarNamesForFieldAlloc(
@@ -19613,6 +19654,43 @@ test "api http server lake text candidate planning rejects ambiguous field sidec
     defer alloc.free(category_plan.sidecar_names.?);
     try std.testing.expectEqual(@as(usize, 1), category_plan.sidecar_names.?.len);
     try std.testing.expectEqualStrings("events.category.simple", category_plan.sidecar_names.?[0]);
+    try std.testing.expectEqual(serverless_query.QueryOperator.phrase, category_plan.request.operator);
+
+    const category_phrase_plan = (try ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
+        alloc,
+        sidecars[0..],
+        .{ .field = "category", .pattern = "News Room", .case_insensitive = true },
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(category_phrase_plan.sidecar_names.?);
+    try std.testing.expectEqualStrings("News Room", category_phrase_plan.request.text);
+    try std.testing.expectEqual(serverless_query.QueryOperator.phrase, category_phrase_plan.request.operator);
+    try std.testing.expectEqualStrings("events.category.simple", category_phrase_plan.sidecar_names.?[0]);
+
+    const category_prefix_plan = (try ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
+        alloc,
+        sidecars[0..],
+        .{ .field = "category", .pattern = "new%" },
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(category_prefix_plan.sidecar_names.?);
+    try std.testing.expectEqualStrings("new", category_prefix_plan.request.text);
+    try std.testing.expectEqual(serverless_query.QueryOperator.prefix_any_term, category_prefix_plan.request.operator);
+    try std.testing.expectEqualStrings("events.category.simple", category_prefix_plan.sidecar_names.?[0]);
+
+    try std.testing.expect((try ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
+        alloc,
+        sidecars[0..],
+        .{ .field = "category", .pattern = "%news" },
+    )) == null);
+    try std.testing.expect((try ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
+        alloc,
+        sidecars[0..],
+        .{ .field = "category", .pattern = "ne_s" },
+    )) == null);
+    try std.testing.expect((try ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
+        alloc,
+        sidecars[0..],
+        .{ .field = "category", .pattern = "news\\%" },
+    )) == null);
 
     try std.testing.expectError(
         error.AmbiguousLakeSidecarCandidateSource,
