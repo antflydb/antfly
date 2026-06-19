@@ -4017,6 +4017,9 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_role_setting_database_scope: bool = false,
     unsupported_ddl_role_setting_reset: bool = false,
     unsupported_ddl_role_setting_expression: bool = false,
+    unsupported_ddl_routine_function_body: bool = false,
+    unsupported_ddl_routine_procedure_body: bool = false,
+    unsupported_ddl_routine_option: bool = false,
     unsupported_ddl_row_security_policy_expression: bool = false,
     unsupported_ddl_row_security_policy_replacement: bool = false,
     unsupported_ddl_row_security_policy_targeting: bool = false,
@@ -5269,6 +5272,18 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
                     std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
                     std.mem.indexOf(u8, entry.sql, "current_setting") != null);
+            self.unsupported_ddl_routine_function_body = self.unsupported_ddl_routine_function_body or
+                (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
+                    std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
+                    std.mem.indexOf(u8, entry.sql, " AS ") != null);
+            self.unsupported_ddl_routine_procedure_body = self.unsupported_ddl_routine_procedure_body or
+                (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
+                    std.mem.startsWith(u8, entry.sql, "CREATE PROCEDURE ") and
+                    std.mem.indexOf(u8, entry.sql, " AS ") != null);
+            self.unsupported_ddl_routine_option = self.unsupported_ddl_routine_option or
+                (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
+                    std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
+                    std.mem.indexOf(u8, entry.sql, " STABLE") != null);
             self.unsupported_ddl_row_security_policy_expression = self.unsupported_ddl_row_security_policy_expression or
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
@@ -6250,6 +6265,9 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_role_setting_database_scope);
         try std.testing.expect(self.unsupported_ddl_role_setting_reset);
         try std.testing.expect(self.unsupported_ddl_role_setting_expression);
+        try std.testing.expect(self.unsupported_ddl_routine_function_body);
+        try std.testing.expect(self.unsupported_ddl_routine_procedure_body);
+        try std.testing.expect(self.unsupported_ddl_routine_option);
         try std.testing.expect(self.unsupported_ddl_row_security_policy_expression);
         try std.testing.expect(self.unsupported_ddl_row_security_policy_replacement);
         try std.testing.expect(self.unsupported_ddl_row_security_policy_targeting);

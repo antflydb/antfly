@@ -3813,6 +3813,20 @@
       "sql": "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql"
     },
     {
+      "name": "unsupported create function body",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=routine_body_plan",
+      "classification_reason": "routine_body_plan",
+      "sql": "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$"
+    },
+    {
+      "name": "unsupported create function routine option",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=routine_option_plan",
+      "classification_reason": "routine_option_plan",
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql STABLE"
+    },
+    {
       "name": "drop function catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3833,6 +3847,13 @@
       },
       "plan": "ddl:create_procedure:name=rotate_usage:args=0:replace=false:returns=:language=plpgsql",
       "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql"
+    },
+    {
+      "name": "unsupported create procedure body",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=routine_body_plan",
+      "classification_reason": "routine_body_plan",
+      "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS $$BEGIN NULL; END$$"
     },
     {
       "name": "drop procedure catalog ddl",

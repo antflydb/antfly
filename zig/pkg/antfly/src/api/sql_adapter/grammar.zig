@@ -2410,7 +2410,6 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     errdefer if (returns_type) |value| alloc.free(@constCast(value));
     var language: ?[]const u8 = null;
     errdefer if (language) |value| alloc.free(@constCast(value));
-    var body_seen = false;
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
         if (cursor.matchKeyword("returns")) {
             if (kind != .function or returns_type != null) return error.UnsupportedSqlShape;
@@ -2420,12 +2419,6 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         if (cursor.matchKeyword("language")) {
             if (language != null) return error.UnsupportedSqlShape;
             language = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
-            continue;
-        }
-        if (cursor.matchKeyword("as")) {
-            if (body_seen) return error.UnsupportedSqlShape;
-            if (cursor.matchToken(.string) == null) return error.UnsupportedSqlShape;
-            body_seen = true;
             continue;
         }
         return error.UnsupportedSqlShape;
@@ -6580,7 +6573,7 @@ test "sql adapter grammar parses extension catalog tails" {
 test "sql adapter grammar parses routine catalog tails" {
     const alloc = std.testing.allocator;
 
-    var create_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION public.normalize_status(input text) RETURNS text LANGUAGE sql AS 'select lower(input)';");
+    var create_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION public.normalize_status(input text) RETURNS text LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_function_tokens);
     var create_function_pos: usize = 0;
     var create_function = try parseCreateRoutineCatalogTailAlloc(alloc, create_function_tokens.items, &create_function_pos);
@@ -6592,7 +6585,7 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqualStrings("text", create_function.returns_type.?);
     try std.testing.expectEqualStrings("sql", create_function.language.?);
 
-    var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql AS 'select 1';");
+    var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);
     var create_procedure_pos: usize = 0;
     var create_procedure = try parseCreateRoutineCatalogTailAlloc(alloc, create_procedure_tokens.items, &create_procedure_pos);
@@ -6631,6 +6624,16 @@ test "sql adapter grammar parses routine catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+
+    var body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql AS 'select lower(input)';");
+    defer lexer.freeTokens(alloc, &body_tokens);
+    var body_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, body_tokens.items, &body_pos));
+
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql STABLE;");
+    defer lexer.freeTokens(alloc, &option_tokens);
+    var option_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));
 }
 
 test "sql adapter grammar parses sequence catalog tails" {

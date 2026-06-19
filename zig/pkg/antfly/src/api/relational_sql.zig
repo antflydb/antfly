@@ -44956,11 +44956,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql", replace_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_function));
 
-    var create_function_body = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;");
-    defer create_function_body.deinit(alloc);
-    const create_function_body_fingerprint = try ddlFingerprintAlloc(alloc, create_function_body);
-    defer alloc.free(create_function_body_fingerprint);
-    try std.testing.expectEqualStrings("ddl:create_function:name=audit_body:args=0:replace=false:returns=trigger:language=plpgsql", create_function_body_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql STABLE;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
