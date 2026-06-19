@@ -65114,6 +65114,96 @@ test "postgres sql adapter joined mutation consumes cross-schema CTE source rows
     try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"synced\",\"quantity\":42}", rows.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"t2\",\"status\":\"open\",\"quantity\":2}", rows.rows[1]);
+
+    const delete_txn_id = try target_db.beginTransaction(31_100);
+    var delete_committed = false;
+    defer if (!delete_committed) target_db.abortTransaction(delete_txn_id, 31_101) catch {};
+    const delete_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-joined-cross-schema-cte-delete",
+        .txn_id = delete_txn_id,
+    };
+
+    var delete_lowered = try lowerDeleteJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "WITH stale_sources AS (SELECT source_pk FROM source_records WHERE source_status = 'stale') DELETE FROM usage_records USING stale_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, status",
+        target_schema,
+        source_schema,
+        &.{},
+        delete_claim,
+    );
+    defer delete_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", delete_lowered.target_table_name);
+    try std.testing.expectEqualStrings("source_records", delete_lowered.source_table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_lowered.mutation.req.kind);
+    try std.testing.expectEqual(@as(usize, 1), delete_lowered.mutation.req.ctes.len);
+    try std.testing.expectEqualStrings("stale_sources", delete_lowered.mutation.req.ctes[0].name);
+    try std.testing.expectEqualStrings("stale_sources", delete_lowered.mutation.req.join.right.source_cte);
+
+    var delete_target_candidates = try target_db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(
+        alloc,
+        target_schema,
+        delete_lowered.mutation.req,
+        null,
+    );
+    errdefer {
+        for (delete_target_candidates) |*candidate| candidate.deinit(alloc);
+        if (delete_target_candidates.len > 0) alloc.free(delete_target_candidates);
+    }
+    var delete_source_rows = try source_db.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(
+        alloc,
+        source_schema,
+        delete_lowered.mutation.req,
+        null,
+    );
+    defer delete_source_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), delete_source_rows.total);
+    try std.testing.expectEqual(@as(usize, 1), delete_source_rows.rows.len);
+
+    var delete_joined_candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(
+        alloc,
+        delete_lowered.mutation.req,
+        &delete_target_candidates,
+        delete_source_rows.rows,
+    );
+    errdefer {
+        for (delete_joined_candidates) |*candidate| candidate.deinit(alloc);
+        if (delete_joined_candidates.len > 0) alloc.free(delete_joined_candidates);
+    }
+    var delete_plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(
+        alloc,
+        delete_lowered.mutation.req,
+        &delete_joined_candidates,
+    );
+    defer delete_plan.deinit(alloc);
+
+    var delete_result = try target_db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(
+        alloc,
+        target_schema,
+        source_schema,
+        delete_lowered.mutation.req,
+        delete_plan.matched,
+        delete_plan.candidates,
+    );
+    defer delete_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), delete_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), delete_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), delete_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t2\",\"status\":\"open\"}", delete_result.returning_rows[0]);
+
+    try target_db.commitTransaction(delete_txn_id, 31_110);
+    delete_committed = true;
+
+    var rows_after_delete = try target_db.queryRelationalRows(alloc, target_schema, .{
+        .select = select[0..],
+        .order_by = order_by[0..],
+    });
+    defer rows_after_delete.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), rows_after_delete.total);
+    try std.testing.expectEqual(@as(usize, 1), rows_after_delete.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"synced\",\"quantity\":42}", rows_after_delete.rows[0]);
 }
 
 test "postgres sql adapter merge mutation batch executes through relational storage" {
