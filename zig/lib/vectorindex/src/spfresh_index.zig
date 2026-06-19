@@ -611,6 +611,26 @@ fn appendFlatCentroidEntry(
     });
 }
 
+fn appendFlatCentroidEntryOwned(
+    self: anytype,
+    entries: *std.ArrayListUnmanaged(FlatCentroidEntry),
+    posting_id: u64,
+    parent: u64,
+    level: u16,
+    state: types.PostingState,
+    bounds_radius: f32,
+    centroid: []f32,
+) !void {
+    try entries.append(self.alloc, .{
+        .posting_id = posting_id,
+        .parent = parent,
+        .level = level,
+        .state = state,
+        .bounds_radius = bounds_radius,
+        .centroid = centroid,
+    });
+}
+
 fn deinitFlatCentroidEntries(alloc: std.mem.Allocator, entries: *std.ArrayListUnmanaged(FlatCentroidEntry)) void {
     for (entries.items) |entry| {
         alloc.free(entry.centroid);
@@ -833,7 +853,8 @@ fn buildFlatCentroidDirectoryFromRecords(self: anytype, txn: anytype, root_node:
     for (records) |*record| {
         if (record.member_count == 0 or record.centroid.len != dims) continue;
         const state = try state_lookup.stateForRecord(self, txn, record);
-        try appendFlatCentroidEntry(self, &entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
+        try appendFlatCentroidEntryOwned(self, &entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
+        record.centroid = &.{};
     }
     const posting_count = try appendFlatCentroidBlocksFromEntries(self, &blocks, &entries, dims, block_size);
 
@@ -862,7 +883,8 @@ fn buildFlatCentroidDirectoryFromRecordProbes(self: anytype, txn: anytype, root_
         defer record.deinit(self.alloc);
         if (record.member_count == 0 or record.centroid.len != dims) continue;
         const state = try state_lookup.stateForRecord(self, txn, &record);
-        try appendFlatCentroidEntry(self, &entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
+        try appendFlatCentroidEntryOwned(self, &entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
+        record.centroid = &.{};
     }
     const posting_count = try appendFlatCentroidBlocksFromEntries(self, &blocks, &entries, dims, block_size);
 
