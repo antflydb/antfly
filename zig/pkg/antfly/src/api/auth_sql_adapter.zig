@@ -625,7 +625,7 @@ test "sql auth adapter creates roles and applies table grants through user manag
 
     var recreated = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_writer;")).?;
     defer recreated.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedRoleSetting, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
     var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';")).?;
     defer altered.deinit(alloc);
     const tenant_setting = try manager.getRoleSetting("role:app_writer", "app.tenant_id");
@@ -645,7 +645,7 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "app.tenant_id"));
     var reset_missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET app.tenant_id;")).?;
     defer reset_missing.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedRoleSetting, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET statement_timeout;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET statement_timeout;"));
     var altered_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';")).?;
     defer altered_again.deinit(alloc);
     try manager.removeRoleFromUser("alice", "role:app_writer");

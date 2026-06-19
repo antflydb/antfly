@@ -1434,7 +1434,8 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
             });
             defer resp.deinit(ctx.server.alloc);
             if (resp.status < 200 or resp.status >= 300) {
-                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", resp.body);
+                const failed_body = try alloc.dupe(u8, resp.body);
+                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", failed_body);
                 return;
             }
             const parsed: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch .{ .string = resp.body };
