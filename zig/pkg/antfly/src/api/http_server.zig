@@ -279,6 +279,7 @@ pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
+    ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
     swarm_mode: bool = false,
@@ -1739,8 +1740,13 @@ pub const ApiHttpServer = struct {
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return false;
         if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
+        if (std.mem.eql(u8, path, routes.Routes.ai_catalog) and self.cfg.ard_public_catalog_enabled) return false;
         if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
         return !std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix);
+    }
+
+    fn requestCarriesAuthentication(_: *const ApiHttpServer, req: http_common.HttpRequest) bool {
+        return req.authorization != null or req.header(trusted_principal_header) != null;
     }
 
     pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
@@ -1889,7 +1895,12 @@ pub const ApiHttpServer = struct {
             return try jsonResponse(self.alloc, .{ .status = "ready" });
         }
 
-        if (self.requiresAuthentication(uri_parts.path)) {
+        const route_requires_authentication = self.requiresAuthentication(uri_parts.path);
+        const should_authenticate_optional_ard_catalog =
+            !route_requires_authentication and
+            std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog) and
+            self.requestCarriesAuthentication(req);
+        if (route_requires_authentication or should_authenticate_optional_ard_catalog) {
             authenticated_identity = self.authenticateRequest(.{
                 .authorization = req.authorization,
                 .trusted_principal = req.header(trusted_principal_header),
@@ -1901,12 +1912,14 @@ pub const ApiHttpServer = struct {
             };
             const identity = authenticated_identity.?;
 
-            if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) {
+            if (route_requires_authentication and requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) {
                 return try textResponse(self.alloc, 403, "forbidden");
             }
-            if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
-                if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
-                    return try textResponse(self.alloc, 403, "forbidden");
+            if (route_requires_authentication) {
+                if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
+                    if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
+                        return try textResponse(self.alloc, 403, "forbidden");
+                    }
                 }
             }
         }
@@ -10322,6 +10335,13 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer unauthorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
 
+    var unauthorized_well_known = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer unauthorized_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_well_known.status);
+
     const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
     const payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -10346,6 +10366,15 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "\"type\":\"application/mcp-server+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Extensions OpenAPI") == null);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Auth OpenAPI") == null);
+
+    var authorized_well_known = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer authorized_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), authorized_well_known.status);
+    try std.testing.expect(std.mem.indexOf(u8, authorized_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 
     var forbidden_spec = try server.handle(.{
         .method = .GET,
@@ -10376,6 +10405,39 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expectEqual(@as(u16, 200), admin_spec.status);
     try std.testing.expectEqualStrings("application/yaml", admin_spec.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, admin_spec.body, "title: Antfly Extensions API") != null);
+
+    var public_catalog_server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .auth_enabled = true,
+            .user_manager = &auth.manager,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+            .ard_public_catalog_enabled = true,
+        },
+        source.iface(),
+        null,
+        null,
+    );
+    defer public_catalog_server.deinit();
+
+    var public_well_known = try public_catalog_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer public_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), public_well_known.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/ai-registry+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/mcp-server+json\"") == null);
+
+    var public_flag_authenticated_well_known = try public_catalog_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer public_flag_authenticated_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), public_flag_authenticated_well_known.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_flag_authenticated_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 }
 
 test "api http server serves ARD OpenAPI, skill, resource, and registry endpoints" {

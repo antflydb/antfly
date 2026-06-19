@@ -65,6 +65,7 @@ const CliConfig = struct {
     auth_enabled: ?bool = null,
     ard_publisher_domain: ?[]const u8 = null,
     ard_display_name: ?[]const u8 = null,
+    ard_public_catalog_enabled: bool = false,
     metadata_apis: std.ArrayListUnmanaged([]const u8) = .empty,
     node_id: ?u64 = null,
     store_id: ?u64 = null,
@@ -7804,6 +7805,7 @@ pub fn runFromIterator(
             .trusted_principal_issuer = trusted_principal_issuer,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
+            .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
@@ -7909,6 +7911,15 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--ard-display-name")) {
             cfg.ard_display_name = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-public-catalog")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.ard_public_catalog_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--ard-public-catalog=")) {
+            cfg.ard_public_catalog_enabled = parseBoolFlag(arg["--ard-public-catalog=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--metadata-api")) {
@@ -8218,6 +8229,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --auth <true|false>            Enable auth middleware and local user store
         \\  --ard-publisher-domain <name>  ARD did:web publisher domain (default: antfly.local)
         \\  --ard-display-name <name>      ARD catalog host display name (default: Antfly)
+        \\  --ard-public-catalog <bool>    Publish anonymous /.well-known ARD bootstrap when auth is enabled
         \\  --metadata-api <uri>           Metadata orchestration/API URL (repeat for multiple endpoints)
         \\  --node-id <id>                 Register this split data process as metadata node <id>
         \\  --store-id <id>                Register this split data process as metadata store <id>
@@ -8326,12 +8338,14 @@ test "data runtime cli accepts ARD identity flags" {
         "tenant.example.com",
         "--ard-display-name",
         "Tenant Antfly",
+        "--ard-public-catalog=true",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("tenant.example.com", cfg.ard_publisher_domain.?);
     try std.testing.expectEqualStrings("Tenant Antfly", cfg.ard_display_name.?);
+    try std.testing.expect(cfg.ard_public_catalog_enabled);
 }
 
 test "data runtime resolves metadata api urls from common config" {

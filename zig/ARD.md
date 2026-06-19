@@ -66,6 +66,8 @@ Behavior:
 - If auth is absent and public ARD publishing is disabled, return `401`.
 - In public mode, serve with `Content-Type: application/json` and crawler-friendly CORS.
 
+For authenticated deployments, public ARD publishing is controlled by `--ard-public-catalog <bool>` and defaults to disabled. Local/no-auth deployments may still serve the public bootstrap catalog because there is no tenant auth layer available to enforce.
+
 The public bootstrap catalog should not include tenant-installed extensions, table names, private MCP profiles, private OpenAPI specs, or per-tenant skills. It may include entries such as:
 
 - an `application/ai-registry+json` entry pointing at `/ard/v1`
@@ -458,7 +460,7 @@ Later:
 Use `/ard/v1/catalog` as the primary authenticated integration point. Make `/.well-known/ai-catalog.json` auth-aware and safe by default:
 
 - authenticated request: tenant-scoped catalog
-- unauthenticated request with public publishing disabled: `401`
-- unauthenticated request with public publishing enabled: public bootstrap catalog only
+- unauthenticated request with public publishing disabled in an authenticated deployment: `401`
+- unauthenticated request with `--ard-public-catalog true`: public bootstrap catalog only
 
 This preserves ARD compatibility without leaking tenant topology, extension inventory, table names, or profile-specific tools.
