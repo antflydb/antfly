@@ -1965,7 +1965,7 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
     options: CommitOptions,
 ) !DirectoryCompactionResult {
     if (segment_ids.len == 0) return error.NoPostingSegmentsToCompact;
-    try rejectDuplicateSegmentIds(segment_ids);
+    const segment_ids_strictly_ascending = try validateSegmentIdsAndReturnStrictlyAscending(segment_ids);
 
     var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, .{
         .manifest_path = options.manifest_path,
@@ -1981,7 +1981,7 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
         alloc.free(selected);
     }
 
-    if (isStrictlyAscendingU64(segment_ids)) {
+    if (segment_ids_strictly_ascending) {
         var segment_id_index: usize = 0;
         for (manifest.segments) |entry| {
             while (segment_id_index < segment_ids.len and segment_ids[segment_id_index] < entry.meta.segment_id) {
@@ -5166,14 +5166,27 @@ fn isStrictlyAscendingU64(values: []const u64) bool {
 }
 
 fn rejectDuplicateSegmentIds(segment_ids: []const u64) !void {
-    if (segment_ids.len < 2) return;
+    _ = try validateSegmentIdsAndReturnStrictlyAscending(segment_ids);
+}
+
+fn validateSegmentIdsAndReturnStrictlyAscending(segment_ids: []const u64) !bool {
+    if (segment_ids.len < 2) return true;
+    var strictly_ascending = true;
     var i: usize = 1;
+    while (i < segment_ids.len) : (i += 1) {
+        if (segment_ids[i] == segment_ids[i - 1]) return error.DuplicatePostingSegmentId;
+        if (segment_ids[i] < segment_ids[i - 1]) strictly_ascending = false;
+    }
+    if (strictly_ascending) return true;
+
+    i = 1;
     while (i < segment_ids.len) : (i += 1) {
         var j: usize = 0;
         while (j < i) : (j += 1) {
             if (segment_ids[i] == segment_ids[j]) return error.DuplicatePostingSegmentId;
         }
     }
+    return false;
 }
 
 fn appendU16(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u16) !void {
@@ -6909,6 +6922,10 @@ pub fn testDirectoryCompactionCanReplaceSelectedSegments() !void {
     try std.testing.expect(isStrictlyAscendingU64(&.{ 1, 2, 3 }));
     try std.testing.expect(!isStrictlyAscendingU64(&.{ 2, 1, 3 }));
     try std.testing.expect(!isStrictlyAscendingU64(&.{ 1, 1, 2 }));
+    try std.testing.expect(try validateSegmentIdsAndReturnStrictlyAscending(&.{ 1, 2, 3 }));
+    try std.testing.expect(!(try validateSegmentIdsAndReturnStrictlyAscending(&.{ 2, 1, 3 })));
+    try std.testing.expectError(error.DuplicatePostingSegmentId, validateSegmentIdsAndReturnStrictlyAscending(&.{ 1, 1, 2 }));
+    try std.testing.expectError(error.DuplicatePostingSegmentId, validateSegmentIdsAndReturnStrictlyAscending(&.{ 2, 1, 2 }));
 
     var writer_1 = Writer.init(alloc);
     defer writer_1.deinit();
