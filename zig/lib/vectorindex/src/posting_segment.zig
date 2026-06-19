@@ -82,11 +82,31 @@ pub const SegmentMeta = struct {
     max_delta_sequence: u64 = 0,
     byte_len: usize = 0,
     entry_count: usize = 0,
+    base_count: usize = 0,
+    delta_value_count: usize = 0,
+    centroid_directory_count: usize = 0,
     index_offset: usize = 0,
     index_checksum: u32 = 0,
 
     pub fn mayContainPosting(self: SegmentMeta, posting_id: PostingId) bool {
         return self.entry_count != 0 and posting_id >= self.min_posting_id and posting_id <= self.max_posting_id;
+    }
+
+    pub fn hasKnownKindCounts(self: SegmentMeta) bool {
+        return self.base_count != 0 or self.delta_value_count != 0 or self.centroid_directory_count != 0;
+    }
+
+    pub fn mayContainKind(self: SegmentMeta, kind: EntryKind) bool {
+        if (!self.hasKnownKindCounts()) return self.entry_count != 0;
+        return switch (kind) {
+            .base => self.base_count != 0,
+            .delta => self.delta_value_count != 0,
+            .centroid_directory => self.centroid_directory_count != 0,
+        };
+    }
+
+    pub fn mayContainPointKind(self: SegmentMeta, posting_id: PostingId, kind: EntryKind) bool {
+        return self.mayContainPosting(posting_id) and self.mayContainKind(kind);
     }
 };
 
@@ -940,6 +960,7 @@ pub const LazyDirectorySnapshot = struct {
         while (segment_index > 0) {
             segment_index -= 1;
             const entry = self.manifest.segments[segment_index];
+            if (!entry.meta.mayContainKind(.base)) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             var has_candidate = false;
@@ -1323,7 +1344,7 @@ pub const LazyDirectorySnapshot = struct {
             segment_index -= 1;
             const entry = self.manifest.segments[segment_index];
             if (best_manifest_entry != null and entry.meta.segment_id <= best_segment_id) continue;
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (!entry.meta.mayContainPointKind(posting_id, kind)) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
@@ -1357,7 +1378,7 @@ pub const LazyDirectorySnapshot = struct {
             segment_index -= 1;
             const entry = self.manifest.segments[segment_index];
             if (best_manifest_entry != null and entry.meta.segment_id <= best_segment_id) continue;
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (!entry.meta.mayContainPointKind(posting_id, .base)) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
@@ -1447,6 +1468,7 @@ pub const LazyDirectorySnapshot = struct {
             while (segment_index > 0) {
                 segment_index -= 1;
                 const entry = self.manifest.segments[segment_index];
+                if (!entry.meta.mayContainKind(.centroid_directory)) continue;
                 if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
                 try appendSegmentCentroidDirectoryRecordCandidatesAlloc(alloc, self.io, self.dir, .{
                     .meta = entry.meta,
@@ -1455,6 +1477,7 @@ pub const LazyDirectorySnapshot = struct {
             }
         } else {
             for (self.manifest.segments) |entry| {
+                if (!entry.meta.mayContainKind(.centroid_directory)) continue;
                 if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
                 try appendSegmentCentroidDirectoryRecordCandidatesAlloc(alloc, self.io, self.dir, .{
                     .meta = entry.meta,
@@ -1558,7 +1581,7 @@ fn encodedManifestEntriesSize(entries: anytype) !usize {
 }
 
 fn manifestEntryEncodedSize(entry: anytype) usize {
-    return 8 * @sizeOf(u64) + 2 * @sizeOf(u32) + entry.path.len;
+    return 11 * @sizeOf(u64) + 2 * @sizeOf(u32) + entry.path.len;
 }
 
 pub fn decodeManifestAlloc(alloc: Allocator, data: []const u8) !OwnedManifest {
@@ -2273,6 +2296,7 @@ pub fn readSegmentPointValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
 
 fn readSegmentPointIndexEntryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, kind: EntryKind) !?IndexEntry {
     if (kind == .delta) return error.InvalidPostingSegmentEntryKind;
+    if (!entry.meta.mayContainPointKind(posting_id, kind)) return null;
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index.deinit(alloc);
@@ -2400,6 +2424,7 @@ fn postingIdAtSortedPosition(posting_ids: []const PostingId, position: usize) !P
 }
 
 pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId) !?posting.PostingBaseHeader {
+    if (!entry.meta.mayContainPointKind(posting_id, .base)) return null;
     const found = (try readSegmentPointIndexEntryAlloc(alloc, io, dir, entry, posting_id, .base)) orelse return null;
 
     var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
@@ -4007,6 +4032,11 @@ pub const Reader = struct {
         var i: usize = 0;
         while (i < self.entry_count) : (i += 1) {
             const entry = try self.indexEntry(i);
+            switch (entry.kind) {
+                .base => meta.base_count += 1,
+                .delta => meta.delta_value_count += 1,
+                .centroid_directory => meta.centroid_directory_count += 1,
+            }
             if (i == 0) {
                 meta.min_posting_id = entry.posting_id;
                 meta.max_posting_id = entry.posting_id;
@@ -4184,6 +4214,10 @@ fn validateManifestEntry(entry: ManifestEntry) !void {
     if (entry.meta.byte_len == 0) return error.InvalidPostingSegmentManifest;
     if (entry.meta.min_posting_id > entry.meta.max_posting_id) return error.InvalidPostingSegmentManifest;
     if (entry.meta.min_delta_sequence != 0 and entry.meta.max_delta_sequence < entry.meta.min_delta_sequence) return error.InvalidPostingSegmentManifest;
+    const kind_count = std.math.add(usize, entry.meta.base_count, entry.meta.delta_value_count) catch return error.InvalidPostingSegmentManifest;
+    const total_kind_count = std.math.add(usize, kind_count, entry.meta.centroid_directory_count) catch return error.InvalidPostingSegmentManifest;
+    if (total_kind_count != 0 and total_kind_count != entry.meta.entry_count) return error.InvalidPostingSegmentManifest;
+    if (entry.meta.delta_value_count == 0 and entry.meta.hasKnownKindCounts() and entry.meta.max_delta_sequence != 0) return error.InvalidPostingSegmentManifest;
 }
 
 fn validateSegmentDataMatchesMeta(data: []const u8, expected: SegmentMeta) !void {
@@ -4381,6 +4415,7 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
     candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
     skip_superseded_candidates: bool,
 ) !void {
+    if (!entry.meta.mayContainKind(.centroid_directory)) return;
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
@@ -4431,6 +4466,7 @@ fn nextCentroidDirectoryReadRange(
     candidates: *const std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
     skip_superseded_candidates: bool,
 ) !?ValueIndexRange {
+    if (!meta.mayContainKind(.centroid_directory)) return null;
     var index = start_index;
     while (index < meta.entry_count) {
         const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
@@ -5015,6 +5051,9 @@ fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
         lhs.max_delta_sequence == rhs.max_delta_sequence and
         lhs.byte_len == rhs.byte_len and
         lhs.entry_count == rhs.entry_count and
+        lhs.base_count == rhs.base_count and
+        lhs.delta_value_count == rhs.delta_value_count and
+        lhs.centroid_directory_count == rhs.centroid_directory_count and
         lhs.index_offset == rhs.index_offset and
         lhs.index_checksum == rhs.index_checksum;
 }
@@ -5180,6 +5219,9 @@ fn appendManifestEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry
     try appendU64(alloc, out, entry.meta.max_delta_sequence);
     try appendU64(alloc, out, @intCast(entry.meta.byte_len));
     try appendU64(alloc, out, @intCast(entry.meta.entry_count));
+    try appendU64(alloc, out, @intCast(entry.meta.base_count));
+    try appendU64(alloc, out, @intCast(entry.meta.delta_value_count));
+    try appendU64(alloc, out, @intCast(entry.meta.centroid_directory_count));
     try appendU64(alloc, out, @intCast(entry.meta.index_offset));
     try appendU32(alloc, out, entry.meta.index_checksum);
     try appendU32(alloc, out, @intCast(entry.path.len));
@@ -5194,6 +5236,9 @@ fn appendManifestEntryAssumeCapacity(out: *std.ArrayListUnmanaged(u8), entry: an
     appendU64AssumeCapacity(out, entry.meta.max_delta_sequence);
     appendU64AssumeCapacity(out, @intCast(entry.meta.byte_len));
     appendU64AssumeCapacity(out, @intCast(entry.meta.entry_count));
+    appendU64AssumeCapacity(out, @intCast(entry.meta.base_count));
+    appendU64AssumeCapacity(out, @intCast(entry.meta.delta_value_count));
+    appendU64AssumeCapacity(out, @intCast(entry.meta.centroid_directory_count));
     appendU64AssumeCapacity(out, @intCast(entry.meta.index_offset));
     appendU32AssumeCapacity(out, entry.meta.index_checksum);
     appendU32AssumeCapacity(out, @intCast(entry.path.len));
@@ -5201,7 +5246,7 @@ fn appendManifestEntryAssumeCapacity(out: *std.ArrayListUnmanaged(u8), entry: an
 }
 
 fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedManifestEntry {
-    const fixed_size = 8 * @sizeOf(u64) + 2 * @sizeOf(u32);
+    const fixed_size = 11 * @sizeOf(u64) + 2 * @sizeOf(u32);
     if (pos.* > data.len or data.len - pos.* < fixed_size) return error.CorruptedPostingSegmentManifest;
     const segment_id = readU64(data[pos.*..][0..8]);
     pos.* += 8;
@@ -5216,6 +5261,12 @@ fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedMani
     const byte_len_u64 = readU64(data[pos.*..][0..8]);
     pos.* += 8;
     const entry_count_u64 = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const base_count_u64 = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const delta_value_count_u64 = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const centroid_directory_count_u64 = readU64(data[pos.*..][0..8]);
     pos.* += 8;
     const index_offset_u64 = readU64(data[pos.*..][0..8]);
     pos.* += 8;
@@ -5236,6 +5287,9 @@ fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedMani
         .max_delta_sequence = max_delta_sequence,
         .byte_len = std.math.cast(usize, byte_len_u64) orelse return error.CorruptedPostingSegmentManifest,
         .entry_count = std.math.cast(usize, entry_count_u64) orelse return error.CorruptedPostingSegmentManifest,
+        .base_count = std.math.cast(usize, base_count_u64) orelse return error.CorruptedPostingSegmentManifest,
+        .delta_value_count = std.math.cast(usize, delta_value_count_u64) orelse return error.CorruptedPostingSegmentManifest,
+        .centroid_directory_count = std.math.cast(usize, centroid_directory_count_u64) orelse return error.CorruptedPostingSegmentManifest,
         .index_offset = std.math.cast(usize, index_offset_u64) orelse return error.CorruptedPostingSegmentManifest,
         .index_checksum = index_checksum,
     };
@@ -6294,6 +6348,9 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     try std.testing.expectEqual(@as(usize, 0), try reader_1.deltaCount(8));
     try std.testing.expect(meta_1.mayContainPosting(7));
     try std.testing.expectEqual(@as(usize, 2), meta_1.entry_count);
+    try std.testing.expectEqual(@as(usize, 1), meta_1.base_count);
+    try std.testing.expectEqual(@as(usize, 1), meta_1.delta_value_count);
+    try std.testing.expectEqual(@as(usize, 0), meta_1.centroid_directory_count);
     try std.testing.expectEqual(delta_10_sequence, meta_1.min_delta_sequence);
     try std.testing.expectEqual(delta_10_sequence, meta_1.max_delta_sequence);
     try std.testing.expectEqual(segment_1.len, meta_1.byte_len);
@@ -6489,6 +6546,9 @@ pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
                 .max_delta_sequence = 20,
                 .byte_len = 4096,
                 .entry_count = 12,
+                .base_count = 4,
+                .delta_value_count = 5,
+                .centroid_directory_count = 3,
                 .index_offset = 3200,
                 .index_checksum = 0x1234abcd,
             },
@@ -6501,6 +6561,9 @@ pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
                 .max_posting_id = 12,
                 .byte_len = 2048,
                 .entry_count = 3,
+                .base_count = 2,
+                .delta_value_count = 0,
+                .centroid_directory_count = 1,
                 .index_offset = 1800,
                 .index_checksum = 0x4567cdef,
             },
@@ -6525,6 +6588,9 @@ pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
         try std.testing.expectEqual(expected.meta.max_delta_sequence, actual.meta.max_delta_sequence);
         try std.testing.expectEqual(expected.meta.byte_len, actual.meta.byte_len);
         try std.testing.expectEqual(expected.meta.entry_count, actual.meta.entry_count);
+        try std.testing.expectEqual(expected.meta.base_count, actual.meta.base_count);
+        try std.testing.expectEqual(expected.meta.delta_value_count, actual.meta.delta_value_count);
+        try std.testing.expectEqual(expected.meta.centroid_directory_count, actual.meta.centroid_directory_count);
         try std.testing.expectEqual(expected.meta.index_offset, actual.meta.index_offset);
         try std.testing.expectEqual(expected.meta.index_checksum, actual.meta.index_checksum);
         try std.testing.expectEqualStrings(expected.path, actual.path);
@@ -6931,6 +6997,9 @@ pub fn testBuildSegmentProducesManifestReadyMetadata() !void {
     try std.testing.expectEqual(@as(PostingId, 9), built.meta.max_posting_id);
     try std.testing.expectEqual(built.data.len, built.meta.byte_len);
     try std.testing.expectEqual(@as(usize, 1), built.meta.entry_count);
+    try std.testing.expectEqual(@as(usize, 1), built.meta.base_count);
+    try std.testing.expectEqual(@as(usize, 0), built.meta.delta_value_count);
+    try std.testing.expectEqual(@as(usize, 0), built.meta.centroid_directory_count);
 
     const path = try segmentPathAlloc(alloc, built.meta.segment_id);
     defer alloc.free(path);
@@ -8508,6 +8577,34 @@ pub fn testLazyCentroidRecordLoadSkipsSupersededSegments() !void {
     try std.testing.expectEqual(@as(u64, 4), records[0].mutation_version);
 }
 
+pub fn testLazyCentroidScanSkipsBaseOnlyBeforeByteLimit() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(7, base);
+    var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
+    defer committed.deinit(alloc);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{
+        .max_segment_bytes = committed.entry.meta.byte_len - 1,
+    });
+    defer lazy.deinit(alloc);
+
+    const records = try lazy.snapshot().loadCentroidDirectoryRecordsAlloc(alloc);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
 pub fn testCentroidCandidateScanSkipsFullyCoveredRangeBeforeValueRead() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9502,6 +9599,10 @@ test "posting segment lazy directory store uses newest point records by segment 
 
 test "posting segment lazy centroid record load skips superseded segments" {
     try testLazyCentroidRecordLoadSkipsSupersededSegments();
+}
+
+test "posting segment lazy centroid scan skips base-only segment before byte limit" {
+    try testLazyCentroidScanSkipsBaseOnlyBeforeByteLimit();
 }
 
 test "posting segment centroid scan skips fully covered range before value read" {
