@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "7308ca70e95555b853af95c61c369b4f2f4ba303b95d98ac6715df149d39a0eb",
-  "source_entry_count": 994,
-  "entry_count": 994,
+  "source_sha256": "794b204ed1eb6c7b6f304c425466b2e184896279f36d37d3a61c78037149f4af",
+  "source_entry_count": 995,
+  "entry_count": 995,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4114,6 +4114,17 @@
       },
       "plan": "ddl:create_function:name=status_label_nested:args=2:replace=false:returns=text:language=sql:body=sql_expression:hook=expression:expr=concat_ws[value[223a22]+lower[field[source:arg1]]+coalesce[field[source:arg2]+value[226d697373696e6722]]]",
       "sql": "CREATE FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS $$SELECT concat_ws(':', lower($1), coalesce($2, 'missing'))$$"
+    },
+    {
+      "name": "create sql expression function minmax nested body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "clamp_amount",
+        "operations": 3
+      },
+      "plan": "ddl:create_function:name=clamp_amount:args=3:replace=false:returns=numeric:language=sql:body=sql_expression:hook=expression:expr=least[greatest[field[source:arg1]+field[source:arg2]]+field[source:arg3]]",
+      "sql": "CREATE FUNCTION clamp_amount(numeric, numeric, numeric) RETURNS numeric LANGUAGE sql AS $$SELECT least(greatest($1, $2), $3)$$"
     },
     {
       "name": "create sql expression function multi argument add body catalog ddl",

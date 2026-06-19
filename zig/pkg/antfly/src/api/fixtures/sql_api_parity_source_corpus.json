@@ -4528,6 +4528,17 @@
       "sql": "CREATE FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS $$SELECT concat_ws(':', lower($1), coalesce($2, 'missing'))$$"
     },
     {
+      "name": "create sql expression function minmax nested body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "clamp_amount",
+        "operations": 3
+      },
+      "plan": "ddl:create_function:name=clamp_amount:args=3:replace=false:returns=numeric:language=sql:body=sql_expression:hook=expression:expr=least[greatest[field[source:arg1]+field[source:arg2]]+field[source:arg3]]",
+      "sql": "CREATE FUNCTION clamp_amount(numeric, numeric, numeric) RETURNS numeric LANGUAGE sql AS $$SELECT least(greatest($1, $2), $3)$$"
+    },
+    {
       "name": "create sql expression function multi argument add body catalog ddl",
       "family": "ddl",
       "summary": {

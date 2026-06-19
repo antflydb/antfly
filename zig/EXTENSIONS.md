@@ -501,6 +501,11 @@ Expose narrow interfaces, not arbitrary internal structs:
 - Query functions:
   - pure functions over JSON/scalars/vectors
   - deterministic flag, cost estimate, memory limit
+  - manifest-only `query_function` objects persist as extension members with
+    validated `config_json` metadata: `native_expression`, bounded `arity`, and
+    optional `sql_names` aliases. The runtime binding resolver exposes only
+    ready installed extensions and clones stable native bindings, so disabled
+    or dropped extensions cannot publish SQL-visible function hooks.
 - MCP tools and app-facing endpoints:
   - tool name, description, and JSON schema
   - handler mode: declarative Antfly API template, WASM, sidecar, or native

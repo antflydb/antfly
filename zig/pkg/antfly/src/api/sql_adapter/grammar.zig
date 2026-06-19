@@ -2934,7 +2934,7 @@ fn routineFunctionExpressionAlloc(
     switch (kind) {
         .lower, .upper, .md5 => if (operands_list.items.len != 1) return error.UnsupportedSqlShape,
         .concat => if (operands_list.items.len < 1) return error.UnsupportedSqlShape,
-        .concat_ws, .coalesce => if (operands_list.items.len < 2) return error.UnsupportedSqlShape,
+        .concat_ws, .coalesce, .greatest, .least => if (operands_list.items.len < 2) return error.UnsupportedSqlShape,
         .nullif => if (operands_list.items.len != 2) return error.UnsupportedSqlShape,
         else => return error.UnsupportedSqlShape,
     }
@@ -2952,6 +2952,8 @@ fn routineFunctionExpressionKind(name: []const u8) ?runtime_schema.RelationalRow
     if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
     if (std.ascii.eqlIgnoreCase(name, "coalesce")) return .coalesce;
     if (std.ascii.eqlIgnoreCase(name, "nullif")) return .nullif;
+    if (std.ascii.eqlIgnoreCase(name, "greatest")) return .greatest;
+    if (std.ascii.eqlIgnoreCase(name, "least")) return .least;
     return null;
 }
 

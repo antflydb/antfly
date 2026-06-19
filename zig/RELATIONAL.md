@@ -5139,9 +5139,9 @@ transforms, and `RETURNING`; routine argument references normalize to
 uses. The routine runtime clones those typed body expressions and can execute
 expression hooks through the shared `relational_rows.expressionValueJsonAlloc`
 evaluator, so supported functions such as ordinal identity, `lower`, `upper`,
-`md5`, `concat`, `concat_ws`, `coalesce`, `nullif`, nested allowlisted
-function calls, and simple bounded numeric addition over argument or literal
-operands are not opaque SQL strings.
+`md5`, `concat`, `concat_ws`, `coalesce`, `nullif`, `greatest`, `least`,
+nested allowlisted function calls, and simple bounded numeric addition over
+argument or literal operands are not opaque SQL strings.
 Table-schema and table-storage application still reject routine-catalog plans
 because routines are catalog/runtime objects, not schema JSON mutations.
 Routine bodies and routine options that do not yet have typed metadata remain
@@ -5659,7 +5659,11 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    aliases such as `"uuid-ossp"` -> `uuid_ossp` before installing a package,
    rejects ambiguous SQL-name aliases, rejects transactional use until metadata
    DDL has a unified boundary, and emits extension metadata transition commands
-   instead of mutating relational schema JSON. PL/pgSQL
+   instead of mutating relational schema JSON. Manifest-only extension packages
+   can now publish validated `query_function` members carrying bounded
+   `native_expression` metadata and optional SQL aliases; the extension catalog
+   exposes ready-only native function bindings so SQL-visible extension
+   functions have a typed Antfly hook instead of opaque package metadata. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended

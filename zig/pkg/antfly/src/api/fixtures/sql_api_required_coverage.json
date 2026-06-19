@@ -223,6 +223,7 @@
     "ddl_function_setting",
     "ddl_function_sql_expression_body",
     "ddl_function_sql_expression_concat_body",
+    "ddl_function_sql_expression_minmax_body",
     "ddl_function_sql_expression_multi_arg_body",
     "ddl_function_sql_expression_nested_body",
     "ddl_function_support",

@@ -364,6 +364,20 @@ test "sql routine runtime executes nested safe expression bodies" {
     const active = try runtime.executeExpressionRoutineArgsAlloc(alloc, "status_label_nested", &.{ "\"TENANT\"", "\"active\"" });
     defer alloc.free(active);
     try std.testing.expectEqualStrings("\"tenant:active\"", active);
+
+    var clamp_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION clamp_amount(numeric, numeric, numeric) RETURNS numeric LANGUAGE sql AS 'SELECT least(greatest($1, $2), $3)';",
+    );
+    defer clamp_plan.deinit(alloc);
+    try runtime.apply(switch (clamp_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const clamped = try runtime.executeExpressionRoutineArgsAlloc(alloc, "clamp_amount", &.{ "5", "10", "8" });
+    defer alloc.free(clamped);
+    try std.testing.expectEqualStrings("8", clamped);
 }
 
 test "sql routine runtime applies returns-null null-input policy before execution" {

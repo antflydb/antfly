@@ -178,8 +178,10 @@ const TestService = struct {
     installed: []const extension_domain.InstalledExtension = &.{},
     proposed: usize = 0,
     installed_upserts: usize = 0,
+    extension_member_upserts: usize = 0,
     installed_removes: usize = 0,
     saw_uuid_ossp_package: bool = false,
+    saw_gen_random_uuid_function: bool = false,
 
     pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
         return .{
@@ -205,6 +207,14 @@ const TestService = struct {
             self.installed_upserts += delta.upsert_installed_extensions.len;
             inline for (delta.upsert_installed_extensions) |installed| {
                 if (std.mem.eql(u8, installed.package_name, "uuid_ossp")) self.saw_uuid_ossp_package = true;
+            }
+        }
+        if (@hasField(Delta, "upsert_extension_members")) {
+            self.extension_member_upserts += delta.upsert_extension_members.len;
+            inline for (delta.upsert_extension_members) |member| {
+                if (member.object_kind == .query_function and std.mem.eql(u8, member.object_name, "gen_random_uuid")) {
+                    self.saw_gen_random_uuid_function = true;
+                }
             }
         }
         if (@hasField(Delta, "remove_installed_extensions")) {
@@ -240,6 +250,21 @@ const test_uuid_ossp_package = extension_domain.PackageManifest{
     .install = .{ .scopes_supported = &.{.cluster} },
 };
 
+const test_pgcrypto_package = extension_domain.PackageManifest{
+    .name = "pgcrypto",
+    .version = "1.0.0",
+    .digest = "sha256:pgcrypto",
+    .sql_names = &.{"pgcrypto"},
+    .install = .{
+        .scopes_supported = &.{.cluster},
+        .objects = &.{.{
+            .kind = .query_function,
+            .name = "gen_random_uuid",
+            .config_json = "{\"native_expression\":\"uuid_v4\",\"arity\":0,\"sql_names\":[\"gen_random_uuid\"]}",
+        }},
+    },
+};
+
 const test_postgis_installed = extension_domain.InstalledExtension{
     .name = "postgis",
     .package_name = "postgis",
@@ -268,6 +293,19 @@ test "sql extension adapter resolves package from manifest sql name" {
 
     try std.testing.expect(!applied.noop);
     try std.testing.expect(service.saw_uuid_ossp_package);
+}
+
+test "sql extension adapter installs query function members through lifecycle" {
+    const alloc = std.testing.allocator;
+    var service = TestService{ .packages = &.{test_pgcrypto_package} };
+    var applied = (try executeRelationalSqlDdlOnService(&service, alloc, "CREATE EXTENSION pgcrypto;")).?;
+    defer applied.deinit(alloc);
+
+    try std.testing.expect(!applied.noop);
+    try std.testing.expectEqual(@as(usize, 1), service.proposed);
+    try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
+    try std.testing.expectEqual(@as(usize, 1), service.extension_member_upserts);
+    try std.testing.expect(service.saw_gen_random_uuid_function);
 }
 
 test "sql extension adapter requires manifest sql name aliases" {
