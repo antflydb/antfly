@@ -51,12 +51,14 @@ pub const IcebergDeleteFile = struct {
     snapshot_id: i64,
     data_sequence_number: i64,
     file_sequence_number: i64,
+    equality_ids: []i32 = &.{},
     record_count: u64,
     file_size_in_bytes: u64,
 
     pub fn deinit(self: *IcebergDeleteFile, alloc: Allocator) void {
         alloc.free(self.file_path);
         alloc.free(self.file_format);
+        if (self.equality_ids.len > 0) alloc.free(self.equality_ids);
         self.* = undefined;
     }
 
@@ -70,6 +72,13 @@ pub const IcebergDeleteFile = struct {
         if (!std.ascii.eqlIgnoreCase(self.file_format, "PARQUET")) return error.UnsupportedIcebergDataFileFormat;
         if (self.record_count == 0) return error.InvalidIcebergDeleteManifest;
         if (self.file_size_in_bytes == 0) return error.InvalidIcebergDeleteManifest;
+        if (self.content == .equality_deletes and self.equality_ids.len == 0) return error.InvalidIcebergDeleteManifest;
+        for (self.equality_ids, 0..) |field_id, idx| {
+            if (field_id < 0) return error.InvalidIcebergDeleteManifest;
+            for (self.equality_ids[0..idx]) |previous| {
+                if (previous == field_id) return error.InvalidIcebergDeleteManifest;
+            }
+        }
     }
 };
 
@@ -645,12 +654,18 @@ fn appendDeleteFileFromEntryAlloc(
         .snapshot_id = entry.snapshot_id,
         .data_sequence_number = entry.data_sequence_number,
         .file_sequence_number = entry.file_sequence_number,
+        .equality_ids = try cloneI32SliceAlloc(alloc, entry.equality_ids),
         .record_count = entry.record_count,
         .file_size_in_bytes = entry.file_size_in_bytes,
     };
     errdefer delete_file.deinit(alloc);
     try delete_file.validate();
     try out.append(alloc, delete_file);
+}
+
+fn cloneI32SliceAlloc(alloc: Allocator, source: []const i32) ![]i32 {
+    if (source.len == 0) return &.{};
+    return try alloc.dupe(i32, source);
 }
 
 fn deinitDeleteFileItems(alloc: Allocator, files: []IcebergDeleteFile) void {
@@ -1047,6 +1062,43 @@ test "iceberg snapshot reader plans active delete files" {
     try std.testing.expectEqual(@as(u64, 1024), plan.files[0].file_size_in_bytes);
 }
 
+test "iceberg snapshot reader plans equality delete files with equality ids" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var delete_manifest = try buildEqualityDeleteManifestFixture(alloc);
+    defer delete_manifest.deinit(alloc);
+    var manifest_list = try buildDeleteManifestListFixture(alloc, delete_manifest.items.len);
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "t/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var delete_manifest_put = try client.putObject("bucket", "t/metadata/d-a.avro", delete_manifest.items, .{});
+    defer delete_manifest_put.deinit(alloc);
+
+    var plan = try readSnapshotDeletePlanAlloc(alloc, .{
+        .client = client,
+        .source_id = "events",
+        .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json",
+        .requested_snapshot_id = "12",
+    });
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.activeFileCount());
+    try std.testing.expectEqual(@as(usize, 0), plan.activePositionDeleteFileCount());
+    try std.testing.expectEqual(@as(usize, 1), plan.activeEqualityDeleteFileCount());
+    try std.testing.expectEqual(iceberg_avro.DataFileContent.equality_deletes, plan.files[0].content);
+    try std.testing.expectEqualStrings("s3://bucket/t/deletes/eq-a.parquet", plan.files[0].file_path);
+    try std.testing.expectEqualStrings("PARQUET", plan.files[0].file_format);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2 }, plan.files[0].equality_ids);
+    try std.testing.expectEqual(@as(u64, 1), plan.files[0].record_count);
+    try std.testing.expectEqual(@as(u64, 1024), plan.files[0].file_size_in_bytes);
+}
+
 test "iceberg snapshot reader scans position delete parquet files into row refs" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -1375,6 +1427,27 @@ fn buildDeleteManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
     return out;
 }
 
+fn buildEqualityDeleteManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendAvroHeader(alloc, &out, equalityDeleteManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendDataManifestRecordWithEqualityIds(
+        alloc,
+        &block,
+        .added,
+        "s3://bucket/t/deletes/eq-a.parquet",
+        1,
+        1024,
+        &[_]i32{ 1, 2 },
+    );
+
+    try appendAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
+    return out;
+}
+
 fn buildInactiveDeleteManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -1421,6 +1494,23 @@ fn dataManifestSchema() []const u8 {
     ;
 }
 
+fn equalityDeleteManifestSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_entry","fields":[
+    \\{"name":"status","type":"int"},
+    \\{"name":"snapshot_id","type":["null","long"]},
+    \\{"name":"data_sequence_number","type":["null","long"]},
+    \\{"name":"file_sequence_number","type":["null","long"]},
+    \\{"name":"data_file","type":{"type":"record","name":"data_file","fields":[
+    \\{"name":"content","type":"int"},
+    \\{"name":"file_path","type":"string"},
+    \\{"name":"file_format","type":"string"},
+    \\{"name":"record_count","type":"long"},
+    \\{"name":"file_size_in_bytes","type":"long"},
+    \\{"name":"equality_ids","type":{"type":"array","items":"int"}}]}}]}
+    ;
+}
+
 fn appendDataManifestRecord(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1442,6 +1532,38 @@ fn appendDataManifestRecord(
     try appendString(alloc, out, "PARQUET");
     try appendLong(alloc, out, record_count);
     try appendLong(alloc, out, file_size_in_bytes);
+}
+
+fn appendDataManifestRecordWithEqualityIds(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    status: iceberg_avro.ManifestEntryStatus,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: i64,
+    equality_ids: []const i32,
+) !void {
+    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, 1);
+    try appendLong(alloc, out, 12);
+    try appendLong(alloc, out, 1);
+    try appendLong(alloc, out, 42);
+    try appendLong(alloc, out, 1);
+    try appendLong(alloc, out, 43);
+    try appendLong(alloc, out, @intFromEnum(iceberg_avro.DataFileContent.equality_deletes));
+    try appendString(alloc, out, file_path);
+    try appendString(alloc, out, "PARQUET");
+    try appendLong(alloc, out, record_count);
+    try appendLong(alloc, out, file_size_in_bytes);
+    try appendArrayInts(alloc, out, equality_ids);
+}
+
+fn appendArrayInts(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), values: []const i32) !void {
+    if (values.len > 0) {
+        try appendLong(alloc, out, @intCast(values.len));
+        for (values) |value| try appendLong(alloc, out, value);
+    }
+    try appendLong(alloc, out, 0);
 }
 
 fn appendAvroHeader(

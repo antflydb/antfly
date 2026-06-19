@@ -263,8 +263,8 @@ Deletes and updates from external table formats are snapshot concerns:
 
 - Raw Parquet prefix mode is a convenience mode with append/replace semantics
   based on object changes.
-- Iceberg mode honors position deletes and equality deletes before producing
-  visible rows.
+- Iceberg mode honors position deletes before producing visible rows, and must
+  honor equality deletes the same way once equality matching is complete.
 - Antfly sidecar indexes are versioned by snapshot id and garbage-collected
   after snapshot retention allows it.
 
@@ -291,7 +291,8 @@ Required catalog state:
 - Statistics: min/max/null counts, distinct counts when available, dictionary
   values when bounded, bloom/page-index metadata when available.
 - Delete metadata for Iceberg: position delete files, equality delete
-  predicates, sequence numbers, and applicability to data files.
+  predicates, equality field ids, sequence numbers, and applicability to data
+  files.
 - Sidecar index lifecycle: built snapshot id, source file ids, generation,
   freshness, rebuild/reconcile status.
 
@@ -556,8 +557,10 @@ The concrete work left for the data-lake path is therefore:
    scanning now exist for the first path. Position-delete files are scanned with
    projected `file_path`/`pos` columns, converted through the scan-result
    row-ref adapter, and passed through the common `lake_rows` delete filter.
-   The remaining work is to implement active equality-delete matching and
-   complete schema evolution checks.
+   Equality-delete manifest entries now preserve validated `equality_ids`, so
+   the future matcher can map delete rows to Iceberg schema field ids instead
+   of reparsing manifests. The remaining work is to implement active
+   equality-delete matching and complete schema evolution checks.
 5. Complete sidecar builders over real external row refs: full-text, dense
    vector, sparse, graph, algebraic group-by, and algebraic expression-fold
    paths now consume pinned `RowSource` batches and publish declared sidecar

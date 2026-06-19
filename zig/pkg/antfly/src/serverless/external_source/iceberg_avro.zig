@@ -90,6 +90,7 @@ pub const DataFileEntry = struct {
     file_path: []u8,
     file_format: []u8,
     partition_values: []PartitionValue = &.{},
+    equality_ids: []i32 = &.{},
     record_count: u64,
     file_size_in_bytes: u64,
 
@@ -98,6 +99,7 @@ pub const DataFileEntry = struct {
         alloc.free(self.file_format);
         for (self.partition_values) |*partition| partition.deinit(alloc);
         if (self.partition_values.len > 0) alloc.free(self.partition_values);
+        if (self.equality_ids.len > 0) alloc.free(self.equality_ids);
         self.* = undefined;
     }
 
@@ -107,6 +109,13 @@ pub const DataFileEntry = struct {
         if (!std.ascii.eqlIgnoreCase(self.file_format, "PARQUET")) return error.UnsupportedIcebergDataFileFormat;
         if (self.record_count == 0) return error.InvalidIcebergDataManifest;
         if (self.file_size_in_bytes == 0) return error.InvalidIcebergDataManifest;
+        if (self.content == .equality_deletes and self.equality_ids.len == 0) return error.InvalidIcebergDataManifest;
+        for (self.equality_ids, 0..) |field_id, idx| {
+            if (field_id < 0) return error.InvalidIcebergDataManifest;
+            for (self.equality_ids[0..idx]) |previous| {
+                if (previous == field_id) return error.InvalidIcebergDataManifest;
+            }
+        }
         for (self.partition_values, 0..) |partition, idx| {
             try partition.validate();
             for (self.partition_values[0..idx]) |previous| {
@@ -700,6 +709,7 @@ const DataFileScratch = struct {
     file_path: ?[]u8 = null,
     file_format: ?[]u8 = null,
     partition_values: []PartitionValue = &.{},
+    equality_ids: []i32 = &.{},
     record_count: u64 = 0,
     file_size_in_bytes: u64 = 0,
 
@@ -708,6 +718,7 @@ const DataFileScratch = struct {
         if (self.file_format) |format| alloc.free(format);
         for (self.partition_values) |*partition| partition.deinit(alloc);
         if (self.partition_values.len > 0) alloc.free(self.partition_values);
+        if (self.equality_ids.len > 0) alloc.free(self.equality_ids);
         self.* = undefined;
     }
 };
@@ -749,6 +760,8 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
     data_file.file_format = null;
     const partition_values = data_file.partition_values;
     data_file.partition_values = &.{};
+    const equality_ids = data_file.equality_ids;
+    data_file.equality_ids = &.{};
     var entry = DataFileEntry{
         .status = status,
         .snapshot_id = scratch.snapshot_id,
@@ -758,6 +771,7 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
         .file_path = file_path,
         .file_format = file_format,
         .partition_values = partition_values,
+        .equality_ids = equality_ids,
         .record_count = data_file.record_count,
         .file_size_in_bytes = data_file.file_size_in_bytes,
     };
@@ -787,6 +801,9 @@ fn readDataFileRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.V
         } else if (std.mem.eql(u8, name, "partition")) {
             if (scratch.partition_values.len != 0) return error.InvalidIcebergDataManifest;
             scratch.partition_values = try readPartitionRecordAlloc(alloc, reader, field_type);
+        } else if (std.mem.eql(u8, name, "equality_ids")) {
+            if (scratch.equality_ids.len != 0) return error.InvalidIcebergDataManifest;
+            scratch.equality_ids = try readJsonAvroIntArrayAlloc(alloc, reader, field_type);
         } else if (std.mem.eql(u8, name, "record_count")) {
             scratch.record_count = try nonNegativeDataU64(try readJsonAvroLong(reader, field_type));
         } else if (std.mem.eql(u8, name, "file_size_in_bytes")) {
@@ -826,6 +843,33 @@ fn readPartitionRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.
     }
 
     return try partitions.toOwnedSlice(alloc);
+}
+
+fn readJsonAvroIntArrayAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]i32 {
+    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return &.{};
+    const object = try jsonObject(value_schema);
+    if (!jsonTypeNameEql(value_schema, "array")) return error.InvalidIcebergDataManifest;
+    const item_schema = object.get("items") orelse return error.InvalidIcebergDataManifest;
+    if (!jsonTypeNameEql(item_schema, "int")) return error.InvalidIcebergDataManifest;
+
+    var values = std.ArrayListUnmanaged(i32).empty;
+    errdefer values.deinit(alloc);
+    while (true) {
+        var block_count = try reader.readLong();
+        if (block_count == 0) break;
+        if (block_count < 0) {
+            block_count = -block_count;
+            const block_size = try reader.readLong();
+            if (block_size < 0) return error.InvalidIcebergDataManifest;
+        }
+        const count = std.math.cast(usize, block_count) orelse return error.InvalidIcebergDataManifest;
+        for (0..count) |_| {
+            const value = std.math.cast(i32, try reader.readLong()) orelse return error.InvalidIcebergDataManifest;
+            if (value < 0) return error.InvalidIcebergDataManifest;
+            try values.append(alloc, value);
+        }
+    }
+    return try values.toOwnedSlice(alloc);
 }
 
 fn readJsonAvroPartitionStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) !?[]u8 {
@@ -1139,6 +1183,69 @@ test "iceberg avro data-manifest decoder reads parquet data files" {
     try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", manifest.entries[1].file_path);
 }
 
+fn buildEqualityDeleteManifestFixture(
+    alloc: Allocator,
+    codec: []const u8,
+    equality_ids: []const i32,
+) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "Obj\x01");
+    try appendLong(alloc, &out, 2);
+    try appendString(alloc, &out, "avro.schema");
+    try appendBytes(alloc, &out, equalityDeleteManifestSchema());
+    try appendString(alloc, &out, "avro.codec");
+    try appendBytes(alloc, &out, codec);
+    try appendLong(alloc, &out, 0);
+    const sync = "fedcba9876543210";
+    try out.appendSlice(alloc, sync);
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendDataManifestRecordWithContentAndEqualityIds(
+        alloc,
+        &block,
+        .added,
+        .equality_deletes,
+        "s3://bucket/t/delete/eq-a.parquet",
+        "PARQUET",
+        1,
+        1024,
+        equality_ids,
+    );
+
+    const encoded_block = try encodeFixtureBlockAlloc(alloc, codec, block.items);
+    defer if (encoded_block.owned) |owned| alloc.free(owned);
+    try appendLong(alloc, &out, 1);
+    try appendLong(alloc, &out, @intCast(encoded_block.bytes.len));
+    try out.appendSlice(alloc, encoded_block.bytes);
+    try out.appendSlice(alloc, sync);
+    return out;
+}
+
+test "iceberg avro data-manifest decoder preserves equality delete ids" {
+    const alloc = std.testing.allocator;
+    var fixture = try buildEqualityDeleteManifestFixture(alloc, "null", &[_]i32{ 1, 2 });
+    defer fixture.deinit(alloc);
+
+    var manifest = try parseDataManifestAlloc(alloc, fixture.items);
+    defer manifest.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), manifest.entries.len);
+    try std.testing.expectEqual(ManifestEntryStatus.added, manifest.entries[0].status);
+    try std.testing.expectEqual(DataFileContent.equality_deletes, manifest.entries[0].content);
+    try std.testing.expectEqualStrings("s3://bucket/t/delete/eq-a.parquet", manifest.entries[0].file_path);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2 }, manifest.entries[0].equality_ids);
+
+    var empty_ids = try buildEqualityDeleteManifestFixture(alloc, "null", &.{});
+    defer empty_ids.deinit(alloc);
+    try std.testing.expectError(error.InvalidIcebergDataManifest, parseDataManifestAlloc(alloc, empty_ids.items));
+
+    var duplicate_ids = try buildEqualityDeleteManifestFixture(alloc, "null", &[_]i32{ 1, 1 });
+    defer duplicate_ids.deinit(alloc);
+    try std.testing.expectError(error.InvalidIcebergDataManifest, parseDataManifestAlloc(alloc, duplicate_ids.items));
+}
+
 test "iceberg avro data-manifest decoder rejects unsupported data file format" {
     const alloc = std.testing.allocator;
     var fixture = try buildDataManifestFixture(alloc, "null", "ORC", 7);
@@ -1420,6 +1527,28 @@ fn dataManifestSchema(_: u8) []const u8 {
     ;
 }
 
+fn equalityDeleteManifestSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_entry","fields":[
+    \\{"name":"status","type":"int"},
+    \\{"name":"snapshot_id","type":["null","long"]},
+    \\{"name":"data_sequence_number","type":["null","long"]},
+    \\{"name":"file_sequence_number","type":["null","long"]},
+    \\{"name":"data_file","type":{"type":"record","name":"data_file","fields":[
+    \\{"name":"content","type":"int"},
+    \\{"name":"file_path","type":"string"},
+    \\{"name":"file_format","type":"string"},
+    \\{"name":"partition","type":{"type":"record","name":"partition","fields":[
+    \\{"name":"region","type":"string"}]}},
+    \\{"name":"record_count","type":"long"},
+    \\{"name":"file_size_in_bytes","type":"long"},
+    \\{"name":"equality_ids","type":{"type":"array","items":"int"}},
+    \\{"name":"column_sizes","type":{"type":"map","values":"long"}},
+    \\{"name":"key_metadata","type":["null","bytes"]},
+    \\{"name":"split_offsets","type":{"type":"array","items":"long"}}]}}]}
+    ;
+}
+
 fn appendDataManifestRecord(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1447,10 +1576,48 @@ fn appendDataManifestRecord(
     try appendArrayLongs(alloc, out);
 }
 
+fn appendDataManifestRecordWithContentAndEqualityIds(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    status: ManifestEntryStatus,
+    content: DataFileContent,
+    file_path: []const u8,
+    file_format: []const u8,
+    record_count: i64,
+    file_size_in_bytes: i64,
+    equality_ids: []const i32,
+) !void {
+    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, 1);
+    try appendLong(alloc, out, 123);
+    try appendLong(alloc, out, 1);
+    try appendLong(alloc, out, 44);
+    try appendLong(alloc, out, 1);
+    try appendLong(alloc, out, 45);
+    try appendLong(alloc, out, @intFromEnum(content));
+    try appendString(alloc, out, file_path);
+    try appendString(alloc, out, file_format);
+    try appendString(alloc, out, "us-west");
+    try appendLong(alloc, out, record_count);
+    try appendLong(alloc, out, file_size_in_bytes);
+    try appendArrayInts(alloc, out, equality_ids);
+    try appendMapLongs(alloc, out);
+    try appendLong(alloc, out, 0);
+    try appendArrayLongs(alloc, out);
+}
+
 fn appendMapLongs(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
     try appendLong(alloc, out, 1);
     try appendString(alloc, out, "id");
     try appendLong(alloc, out, 64);
+    try appendLong(alloc, out, 0);
+}
+
+fn appendArrayInts(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), values: []const i32) !void {
+    if (values.len > 0) {
+        try appendLong(alloc, out, @intCast(values.len));
+        for (values) |value| try appendLong(alloc, out, value);
+    }
     try appendLong(alloc, out, 0);
 }
 
