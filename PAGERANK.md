@@ -4898,7 +4898,8 @@ than PR unit coverage:
   reclaimed probe page persists cursor-bearing progress, active status pages
   carry leased, detailed, cursor-bearing, and progress-bearing page counts,
   active status truncation is zero, terminal fresh/failed work is empty and
-  untruncated, and active progress is finite in `[0, 1]`. Rollout tooling
+  untruncated, and active progress is finite and strictly between zero and one,
+  proving the status sample is in-flight rather than empty or terminal. Rollout tooling
   can therefore tell which local promotion-gate category is absent without
   reverse-engineering every raw knob. When
   `--require-deployment-shaped-release-gate` is set, the harness now requires

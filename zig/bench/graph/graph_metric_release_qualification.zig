@@ -1761,8 +1761,8 @@ fn verifyStatusAndWorkEvidence(cfg: Config, family: Family, result: FamilyResult
         result.active_status_pages > cfg.max_status_pages or
         result.active_status_pages_truncated or
         !std.math.isFinite(result.active_status_progress) or
-        result.active_status_progress < 0.0 or
-        result.active_status_progress > 1.0)
+        result.active_status_progress <= 0.0 or
+        result.active_status_progress >= 1.0)
     {
         return error.GraphMetricReleaseQualificationActiveStatusEvidenceMismatch;
     }
@@ -2390,8 +2390,8 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
         summary.max_observed_active_status_pages < summary.min_observed_active_status_pages or
         !std.math.isFinite(summary.min_active_status_progress) or
         !std.math.isFinite(summary.max_active_status_progress) or
-        summary.min_active_status_progress < 0.0 or
-        summary.max_active_status_progress > 1.0 or
+        summary.min_active_status_progress <= 0.0 or
+        summary.max_active_status_progress >= 1.0 or
         summary.max_active_status_progress < summary.min_active_status_progress or
         summary.total_failed_terminal_pending_work != 0 or
         summary.total_failed_active_builds != 0 or
@@ -7660,8 +7660,8 @@ fn observedPromotionOperationsFloor(cfg: Config, summary: ReleaseSummary) bool {
         summary.total_failed_status_pages_truncated == 0 and
         std.math.isFinite(summary.min_active_status_progress) and
         std.math.isFinite(summary.max_active_status_progress) and
-        summary.min_active_status_progress >= 0.0 and
-        summary.max_active_status_progress <= 1.0;
+        summary.min_active_status_progress > 0.0 and
+        summary.max_active_status_progress < 1.0;
 }
 
 fn observedRetainedStorageBudget(cfg: Config, summary: ReleaseSummary) bool {
