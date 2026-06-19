@@ -436,6 +436,8 @@ const ReleaseSummary = struct {
     total_active_status_cursor_pages: usize = 0,
     total_active_status_progress_pages: usize = 0,
     total_active_status_pages_truncated: usize = 0,
+    min_observed_active_status_pages: usize = 0,
+    max_observed_active_status_pages: usize = 0,
     min_active_status_progress: f64 = 0.0,
     max_active_status_progress: f64 = 0.0,
     total_failed_terminal_pending_work: usize = 0,
@@ -652,6 +654,11 @@ const ReleaseSummary = struct {
         self.total_active_status_cursor_pages += result.active_status_cursor_pages;
         self.total_active_status_progress_pages += result.active_status_progress_pages;
         self.total_active_status_pages_truncated += @intFromBool(result.active_status_pages_truncated);
+        self.min_observed_active_status_pages = if (first)
+            result.active_status_pages
+        else
+            @min(self.min_observed_active_status_pages, result.active_status_pages);
+        self.max_observed_active_status_pages = @max(self.max_observed_active_status_pages, result.active_status_pages);
         self.min_active_status_progress = if (first)
             result.active_status_progress
         else
@@ -2277,6 +2284,9 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
         summary.total_active_status_cursor_pages != summary.total_active_status_pages or
         summary.total_active_status_progress_pages != summary.total_active_status_pages or
         summary.total_active_status_pages_truncated != 0 or
+        summary.min_observed_active_status_pages == 0 or
+        summary.max_observed_active_status_pages > cfg.max_status_pages or
+        summary.max_observed_active_status_pages < summary.min_observed_active_status_pages or
         !std.math.isFinite(summary.min_active_status_progress) or
         !std.math.isFinite(summary.max_active_status_progress) or
         summary.min_active_status_progress < 0.0 or
@@ -7527,6 +7537,9 @@ fn observedPromotionOperationsFloor(cfg: Config, summary: ReleaseSummary) bool {
         summary.total_active_status_cursor_pages == summary.total_active_status_pages and
         summary.total_active_status_progress_pages == summary.total_active_status_pages and
         summary.total_active_status_pages_truncated == 0 and
+        summary.min_observed_active_status_pages != 0 and
+        summary.max_observed_active_status_pages <= cfg.max_status_pages and
+        summary.max_observed_active_status_pages >= summary.min_observed_active_status_pages and
         summary.total_active_work_active_builds == summary.families_run and
         summary.total_active_work_active_pages != 0 and
         summary.total_active_work_failed_pages == 0 and
@@ -7866,8 +7879,8 @@ fn emitReleaseSummary(out: anytype, cfg: Config, summary: ReleaseSummary) !void 
         .{ max_allowed_pre_drain_metrics_scanned, summary.total_pre_drain_metrics_scanned, summary.max_observed_pre_drain_metrics_scanned, summary.total_pre_drain_queued_builds, summary.total_pre_drain_paused_metrics, summary.total_fresh_terminal_pending_work, summary.total_fresh_active_builds, summary.total_fresh_active_pages, summary.total_fresh_failed_pages, summary.total_fresh_paused_metrics, summary.total_fresh_truncated_pages, summary.total_fresh_status_pages, summary.total_fresh_status_pages_truncated, summary.total_active_work_active_builds, summary.total_active_work_active_pages, summary.total_active_work_failed_pages, summary.total_active_work_paused_metrics, summary.total_active_work_truncated_pages },
     );
     try out.print(
-        ",\"total_active_page_probe_claimed\":{d},\"total_active_page_probe_reclaimed\":{d},\"total_active_status_pages\":{d},\"total_active_status_leased_pages\":{d},\"total_active_status_detailed_pages\":{d},\"total_active_status_cursor_pages\":{d},\"total_active_status_progress_pages\":{d},\"total_active_status_pages_truncated\":{d},\"min_active_status_progress\":{d:.12},\"max_active_status_progress\":{d:.12},\"total_failed_terminal_pending_work\":{d},\"total_failed_active_builds\":{d},\"total_failed_active_pages\":{d},\"total_failed_failed_pages\":{d},\"total_failed_paused_metrics\":{d},\"total_failed_truncated_pages\":{d},\"total_failed_status_pages\":{d},\"total_failed_status_pages_truncated\":{d}",
-        .{ summary.total_active_page_probe_claimed, summary.total_active_page_probe_reclaimed, summary.total_active_status_pages, summary.total_active_status_leased_pages, summary.total_active_status_detailed_pages, summary.total_active_status_cursor_pages, summary.total_active_status_progress_pages, summary.total_active_status_pages_truncated, summary.min_active_status_progress, summary.max_active_status_progress, summary.total_failed_terminal_pending_work, summary.total_failed_active_builds, summary.total_failed_active_pages, summary.total_failed_failed_pages, summary.total_failed_paused_metrics, summary.total_failed_truncated_pages, summary.total_failed_status_pages, summary.total_failed_status_pages_truncated },
+        ",\"total_active_page_probe_claimed\":{d},\"total_active_page_probe_reclaimed\":{d},\"total_active_status_pages\":{d},\"total_active_status_leased_pages\":{d},\"total_active_status_detailed_pages\":{d},\"total_active_status_cursor_pages\":{d},\"total_active_status_progress_pages\":{d},\"total_active_status_pages_truncated\":{d},\"min_observed_active_status_pages\":{d},\"max_observed_active_status_pages\":{d},\"min_active_status_progress\":{d:.12},\"max_active_status_progress\":{d:.12},\"total_failed_terminal_pending_work\":{d},\"total_failed_active_builds\":{d},\"total_failed_active_pages\":{d},\"total_failed_failed_pages\":{d},\"total_failed_paused_metrics\":{d},\"total_failed_truncated_pages\":{d},\"total_failed_status_pages\":{d},\"total_failed_status_pages_truncated\":{d}",
+        .{ summary.total_active_page_probe_claimed, summary.total_active_page_probe_reclaimed, summary.total_active_status_pages, summary.total_active_status_leased_pages, summary.total_active_status_detailed_pages, summary.total_active_status_cursor_pages, summary.total_active_status_progress_pages, summary.total_active_status_pages_truncated, summary.min_observed_active_status_pages, summary.max_observed_active_status_pages, summary.min_active_status_progress, summary.max_active_status_progress, summary.total_failed_terminal_pending_work, summary.total_failed_active_builds, summary.total_failed_active_pages, summary.total_failed_failed_pages, summary.total_failed_paused_metrics, summary.total_failed_truncated_pages, summary.total_failed_status_pages, summary.total_failed_status_pages_truncated },
     );
     try out.print(
         ",\"expected_primary_pre_publish_not_ready_surfaces\":{d},\"total_primary_pre_publish_not_ready_surfaces\":{d},\"expected_hits_paired_pre_publish_not_ready_surfaces\":{d},\"total_hits_paired_pre_publish_not_ready_surfaces\":{d},\"expected_primary_published_read_surfaces\":{d},\"total_primary_published_read_surfaces\":{d},\"expected_primary_fresh_rejections\":{d},\"total_primary_fresh_rejections\":{d},\"total_active_published_score_count\":{d},\"total_failed_published_score_count\":{d},\"total_profile_entries\":{d},\"expected_hits_paired_published_read_surfaces\":{d},\"total_hits_paired_published_read_surfaces\":{d},\"expected_hits_paired_fresh_rejections\":{d},\"total_hits_paired_fresh_rejections\":{d},\"total_hits_active_paired_published_score_count\":{d},\"total_hits_failed_paired_published_score_count\":{d}",

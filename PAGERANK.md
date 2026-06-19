@@ -4871,7 +4871,11 @@ than PR unit coverage:
   `promotion_failure_churn_floor_observed` and
   `promotion_operations_floor_observed`. The latency observed flag is
   true only when published-read, fresh-fail, and fan-in latency caps are
-  configured and the max observed surfaces stay within them. The cleanup
+  configured and the max observed surfaces stay within them. The promotion
+  operations floor also emits `min_observed_active_status_pages` and
+  `max_observed_active_status_pages`; the observed flag stays false unless each
+  family produced at least one active status page and the largest observed
+  active status page count stayed within `max_status_pages`. The cleanup
   latency observed flag is true only when a cleanup latency cap is configured
   and the max observed cleanup phase stays within it. The
   retained-storage observed flag is true only when configured score, metric,
