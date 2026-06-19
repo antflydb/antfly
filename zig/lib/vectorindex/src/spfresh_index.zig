@@ -1170,11 +1170,8 @@ pub fn selectFlatRabitqPostings(
     var probe_collector = FlatProbeCollector.init(probes[0..probe_limit]);
 
     const max_block_postings = @max(self.config.flat_centroid_block_size, @as(usize, 1));
-    const distance_capacity = if (self.config.use_quantization and directory.posting_quantized != null and directory.posting_count != 0)
-        @max(directory.posting_count, @max(directory.blocks.len, max_block_postings))
-    else
-        @max(directory.blocks.len, max_block_postings);
-    try scratch.ensureDistanceCapacity(self.alloc, distance_capacity);
+    const base_distance_capacity = @max(directory.blocks.len, max_block_postings);
+    try scratch.ensureDistanceCapacity(self.alloc, base_distance_capacity);
     var selected_block_storage = scratch.positions[0..directory.blocks.len];
     var selected_blocks: []usize = selected_block_storage[0..0];
     if (self.config.centroid_directory_mode == .two_level_rabitq and directory.blocks.len > 1) {
@@ -1255,6 +1252,9 @@ pub fn selectFlatRabitqPostings(
         if (directory.posting_quantized) |*posting_q| break :global posting_q;
         break :global null;
     };
+    if (global_posting_quantized != null) {
+        try scratch.ensureDistanceCapacity(self.alloc, @max(base_distance_capacity, directory.posting_count));
+    }
     const quantized_posting_candidate_limit = if (self.config.use_quantization and selected_blocks.len != 0)
         @min(
             if (global_posting_quantized != null) directory.posting_count else max_block_postings,
