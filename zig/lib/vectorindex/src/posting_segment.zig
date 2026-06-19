@@ -1473,15 +1473,17 @@ pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
     try validateManifest(manifest);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    try out.ensureTotalCapacity(alloc, try encodedManifestSize(manifest));
-    try out.appendSlice(alloc, &manifest_magic);
-    try appendU16(alloc, &out, version);
-    try appendU32(alloc, &out, @intCast(manifest.segments.len));
-    try appendU64(alloc, &out, manifest.next_segment_id);
+    const encoded_size = try encodedManifestSize(manifest);
+    try out.ensureTotalCapacity(alloc, encoded_size);
+    out.appendSliceAssumeCapacity(&manifest_magic);
+    appendU16AssumeCapacity(&out, version);
+    appendU32AssumeCapacity(&out, @intCast(manifest.segments.len));
+    appendU64AssumeCapacity(&out, manifest.next_segment_id);
     for (manifest.segments) |entry| {
-        try appendManifestEntry(alloc, &out, entry);
+        appendManifestEntryAssumeCapacity(&out, entry);
     }
-    try appendU32(alloc, &out, manifestChecksum(out.items));
+    appendU32AssumeCapacity(&out, manifestChecksum(out.items));
+    std.debug.assert(out.items.len == encoded_size);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -4760,6 +4762,20 @@ fn appendManifestEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry
     try appendU32(alloc, out, entry.meta.index_checksum);
     try appendU32(alloc, out, @intCast(entry.path.len));
     try out.appendSlice(alloc, entry.path);
+}
+
+fn appendManifestEntryAssumeCapacity(out: *std.ArrayListUnmanaged(u8), entry: ManifestEntry) void {
+    appendU64AssumeCapacity(out, entry.meta.segment_id);
+    appendU64AssumeCapacity(out, entry.meta.min_posting_id);
+    appendU64AssumeCapacity(out, entry.meta.max_posting_id);
+    appendU64AssumeCapacity(out, entry.meta.min_delta_sequence);
+    appendU64AssumeCapacity(out, entry.meta.max_delta_sequence);
+    appendU64AssumeCapacity(out, @intCast(entry.meta.byte_len));
+    appendU64AssumeCapacity(out, @intCast(entry.meta.entry_count));
+    appendU64AssumeCapacity(out, @intCast(entry.meta.index_offset));
+    appendU32AssumeCapacity(out, entry.meta.index_checksum);
+    appendU32AssumeCapacity(out, @intCast(entry.path.len));
+    out.appendSliceAssumeCapacity(entry.path);
 }
 
 fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedManifestEntry {
