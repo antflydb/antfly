@@ -131,6 +131,8 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "backup") or std.mem.eql(u8, subcommand, "export")) return try backup(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "restore")) return try restore(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "import")) return try importBackup(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "check")) return try check(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "compact") or std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(init.gpa, init.io, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -510,6 +512,31 @@ fn restoreFromBackupFile(
     cli.writeStdout(io, "}\n");
 }
 
+fn check(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    requireNoMoreArgs(args);
+
+    const report = try antfly.lsm_backend.AfliteContainerStorage.checkFile(allocator, path);
+    const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn vacuum(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    requireNoMoreArgs(args);
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    const report = try lite.storage.vacuum();
+    const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
 fn pinLiteStorage(opts: *db_mod.OpenOptions, storage: antfly.lsm_backend.Storage) void {
     opts.storage = storage;
     opts.index_backends.text_lsm_storage = storage;
@@ -852,6 +879,9 @@ fn printUsage(argv0: []const u8) void {
         \\  export <db.aflite> --out backup.afb
         \\  restore <backup.afb> --out <db.aflite> [--replace]
         \\  import <db.aflite> --from <backup.afb> [--replace]
+        \\  check <db.aflite>
+        \\  compact <db.aflite>
+        \\  vacuum <db.aflite>
         \\
     , .{argv0});
 }
