@@ -762,6 +762,10 @@ pub const Catalog = struct {
     ) !void {
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
+            const all_segment_records_after_generation = if (min_generation) |generation|
+                segment.meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.min_delta_sequence) > generation
+            else
+                true;
             if (min_generation) |generation| {
                 if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= generation) continue;
             }
@@ -770,7 +774,10 @@ pub const Catalog = struct {
             var iter = reader.deltas(posting_id);
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
-                if (min_generation) |generation| {
+                if (all_segment_records_after_generation) {
+                    try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
+                    while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
+                } else if (min_generation) |generation| {
                     if (posting.PostingFormat.deltaSequenceGeneration(delta_value.sequence) > generation) {
                         try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
                         while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
@@ -794,6 +801,10 @@ pub const Catalog = struct {
     ) !void {
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
+            const all_segment_records_after_generation = if (min_generation) |generation|
+                segment.meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.min_delta_sequence) > generation
+            else
+                true;
             if (min_generation) |generation| {
                 if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= generation) continue;
             }
@@ -802,7 +813,10 @@ pub const Catalog = struct {
             var iter = reader.deltas(posting_id);
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
-                if (min_generation) |generation| {
+                if (all_segment_records_after_generation) {
+                    try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
+                    while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
+                } else if (min_generation) |generation| {
                     if (posting.PostingFormat.deltaSequenceGeneration(delta_value.sequence) > generation) {
                         try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
                         while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);

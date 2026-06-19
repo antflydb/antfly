@@ -111,7 +111,8 @@ Current status:
   record. The same key-boundary fast path is now used by LSM delta replay for
   fold/materialization and latest-op scans, so all-live tail values do not pay a
   generation test on every decoded record. Committed segment catalog replay uses
-  the same min-sequence shortcut for all-live delta values.
+  segment min/max delta-sequence metadata to skip all-stale segments and to take
+  the all-live append path for every delta value in fully newer segments.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
