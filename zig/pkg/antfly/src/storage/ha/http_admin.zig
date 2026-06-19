@@ -470,14 +470,14 @@ pub const Server = struct {
             .primary => blk: {
                 const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
                 const decision = if (self.ctx.fence_store) |fence_store|
-                    if (self.ctx.primary_node_id) |node_id|
+                    if (self.primaryNodeID()) |node_id|
                         write_gate.evaluateFencedPrimary(.{
                             .primary = primary,
                             .fence_store = fence_store,
                             .node_id = node_id,
                         }, request.request)
                     else
-                        ha_admin.evaluatePrimaryWrite(primary, request.request)
+                        return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable")
                 else
                     ha_admin.evaluatePrimaryWrite(primary, request.request);
                 break :blk decision catch |err| {
@@ -3202,6 +3202,46 @@ test "storage.ha http admin rejects invalid primary node id before typed action 
         try std.testing.expectEqual(@as(u16, 409), response.status);
         try expectContains(response.body, "PrimaryNodeIDUnavailable");
         try std.testing.expect(primary.slot("standby-a") == null);
+    }
+}
+
+test "storage.ha http admin rejects invalid fenced primary node id in typed write check" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-write-check-primary-node-id");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+
+    const invalid_ids = [_][]const u8{
+        "",
+        " primary-a",
+        "primary-a ",
+        "primary/a",
+        "primary a",
+    };
+
+    for (invalid_ids) |node_id| {
+        var server = Server.init(alloc, .{
+            .primary = &primary,
+            .primary_node_id = node_id,
+            .fence_store = &fence_store,
+        });
+        defer server.deinit();
+
+        var response = try server.handle(.{
+            .method = .POST,
+            .uri = admin_api.routes.ha_write_check,
+            .content_type = "application/json",
+            .body = "{\"role\":\"primary\"}",
+        });
+        defer response.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 409), response.status);
+        try expectContains(response.body, "PrimaryNodeIDUnavailable");
     }
 }
 
