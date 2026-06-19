@@ -3482,6 +3482,7 @@ pub const DirectoryBatchWriter = struct {
         std.debug.assert(kind != .delta);
         for (self.writer.entries.items) |*entry| {
             if (entry.posting_id != posting_id or entry.kind != kind or entry.sequence != 0) continue;
+            if (std.mem.eql(u8, entry.value, value)) return true;
             const owned = try self.alloc.dupe(u8, value);
             const old_len = entry.value.len;
             self.alloc.free(entry.value);
@@ -3503,6 +3504,10 @@ pub const DirectoryBatchWriter = struct {
         std.debug.assert(kind != .delta);
         for (self.writer.entries.items) |*entry| {
             if (entry.posting_id != posting_id or entry.kind != kind or entry.sequence != 0) continue;
+            if (std.mem.eql(u8, entry.value, value)) {
+                self.alloc.free(value);
+                return true;
+            }
             const old_len = entry.value.len;
             const next_pending_value_bytes = if (value.len >= old_len)
                 std.math.add(usize, self.pending_value_bytes, value.len - old_len) catch return error.PostingSegmentTooLarge
@@ -6039,7 +6044,15 @@ pub fn testDirectoryBatchWriterCoalescesPendingPointRecords() !void {
     defer batcher.deinit();
 
     try batcher.appendBase(7, old_base);
+    const pending_bytes_after_old_base = batcher.pending_value_bytes;
+    try batcher.appendBase(7, old_base);
+    try std.testing.expectEqual(@as(usize, 1), batcher.pendingEntries());
+    try std.testing.expectEqual(pending_bytes_after_old_base, batcher.pending_value_bytes);
     try batcher.appendCentroidDirectory(7, old_centroid);
+    const pending_bytes_after_old_centroid = batcher.pending_value_bytes;
+    try batcher.appendCentroidDirectory(7, old_centroid);
+    try std.testing.expectEqual(@as(usize, 2), batcher.pendingEntries());
+    try std.testing.expectEqual(pending_bytes_after_old_centroid, batcher.pending_value_bytes);
     try batcher.appendBase(7, new_base);
     try batcher.appendCentroidDirectory(7, new_centroid);
     try std.testing.expectEqual(@as(usize, 2), batcher.pendingEntries());

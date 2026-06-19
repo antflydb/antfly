@@ -245,7 +245,9 @@ Current status:
   micro-batch append primitive. The runtime batcher also coalesces pending
   posting-base and centroid-directory point records so a publish window keeps
   only the latest point value while the immutable segment writer continues to
-  reject duplicate exact keys. Pending segment delta micro-batches now count
+  reject duplicate exact keys; identical pending point replacements now keep the
+  existing owned value buffer and byte accounting instead of reallocating a
+  no-op replacement. Pending segment delta micro-batches now count
   their exact encoded value bytes while still buffered as records, so
   `max_pending_value_bytes` bounds delta batches as well as point values and
   pending-tail stats expose the same encoded-byte total to fold policy.
