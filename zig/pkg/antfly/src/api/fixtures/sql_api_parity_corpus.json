@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "664b5e92874f02661f49138376615afea3a8c2e1a16f20e0528f4e15da5bb973",
-  "source_entry_count": 903,
-  "entry_count": 903,
+  "source_sha256": "04f77a692154d7cafc3e0c07ff735b9370802ba802279c92c2abd66aacbc59a3",
+  "source_entry_count": 906,
+  "entry_count": 906,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3041,6 +3041,27 @@
       },
       "plan": "ddl:create_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id",
       "sql": "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'))"
+    },
+    {
+      "name": "unsupported row security literal policy expression",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_security_policy_plan",
+      "classification_reason": "row_security_policy_plan",
+      "sql": "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = 'tenant-a')"
+    },
+    {
+      "name": "unsupported row security policy replacement",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_security_policy_plan",
+      "classification_reason": "row_security_policy_plan",
+      "sql": "ALTER POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'))"
+    },
+    {
+      "name": "unsupported row security per-role policy targeting",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_security_policy_plan",
+      "classification_reason": "row_security_policy_plan",
+      "sql": "CREATE POLICY usage_records_tenant_policy ON usage_records TO app_reader USING (tenant_id = current_setting('app.tenant_id'))"
     },
     {
       "name": "row security drop policy catalog ddl",

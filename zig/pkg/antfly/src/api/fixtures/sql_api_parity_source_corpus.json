@@ -3452,6 +3452,27 @@
       "sql": "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'))"
     },
     {
+      "name": "unsupported row security literal policy expression",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_security_policy_plan",
+      "classification_reason": "row_security_policy_plan",
+      "sql": "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = 'tenant-a')"
+    },
+    {
+      "name": "unsupported row security policy replacement",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_security_policy_plan",
+      "classification_reason": "row_security_policy_plan",
+      "sql": "ALTER POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'))"
+    },
+    {
+      "name": "unsupported row security per-role policy targeting",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=row_security_policy_plan",
+      "classification_reason": "row_security_policy_plan",
+      "sql": "CREATE POLICY usage_records_tenant_policy ON usage_records TO app_reader USING (tenant_id = current_setting('app.tenant_id'))"
+    },
+    {
       "name": "row security drop policy catalog ddl",
       "family": "ddl",
       "summary": {

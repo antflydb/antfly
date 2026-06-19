@@ -4009,6 +4009,9 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_prepare_transaction_plan: bool = false,
     unsupported_ddl_commit_prepared_transaction_plan: bool = false,
     unsupported_ddl_rollback_prepared_transaction_plan: bool = false,
+    unsupported_ddl_row_security_policy_expression: bool = false,
+    unsupported_ddl_row_security_policy_replacement: bool = false,
+    unsupported_ddl_row_security_policy_targeting: bool = false,
     unsupported_ddl_row_rewrite_expression_plan: bool = false,
     unsupported_ddl_transaction_scoped_search_path: bool = false,
     unsupported_write: bool = false,
@@ -5226,6 +5229,17 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_rollback_prepared_transaction_plan = self.unsupported_ddl_rollback_prepared_transaction_plan or
                 (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
                     std.mem.startsWith(u8, entry.sql, "ROLLBACK PREPARED "));
+            self.unsupported_ddl_row_security_policy_expression = self.unsupported_ddl_row_security_policy_expression or
+                (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
+                    std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
+                    std.mem.indexOf(u8, entry.sql, "current_setting") == null);
+            self.unsupported_ddl_row_security_policy_replacement = self.unsupported_ddl_row_security_policy_replacement or
+                (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
+                    std.mem.startsWith(u8, entry.sql, "ALTER POLICY "));
+            self.unsupported_ddl_row_security_policy_targeting = self.unsupported_ddl_row_security_policy_targeting or
+                (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
+                    std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
+                    std.mem.indexOf(u8, entry.sql, " TO ") != null);
             self.unsupported_ddl_row_rewrite_expression_plan = self.unsupported_ddl_row_rewrite_expression_plan or
                 (std.mem.eql(u8, entry.classification_reason, "row_rewrite_expression_plan") and
                     std.mem.indexOf(u8, entry.sql, " USING ") != null);
@@ -6188,6 +6202,9 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_prepare_transaction_plan);
         try std.testing.expect(self.unsupported_ddl_commit_prepared_transaction_plan);
         try std.testing.expect(self.unsupported_ddl_rollback_prepared_transaction_plan);
+        try std.testing.expect(self.unsupported_ddl_row_security_policy_expression);
+        try std.testing.expect(self.unsupported_ddl_row_security_policy_replacement);
+        try std.testing.expect(self.unsupported_ddl_row_security_policy_targeting);
         try std.testing.expect(self.unsupported_ddl_row_rewrite_expression_plan);
         try std.testing.expect(self.unsupported_ddl_transaction_scoped_search_path);
         try std.testing.expect(self.read_row_lock_nowait);
