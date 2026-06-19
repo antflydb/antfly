@@ -2077,8 +2077,9 @@ func HAIsRetryable(err error) bool {
 	return false
 }
 
-// NewHAClient creates a typed HA admin client. The base URL may be either the
-// Antfly server root or an explicit /admin/v1 admin API root.
+// NewHAClient creates a typed HA admin client. The base URL may be the Antfly
+// server root, an explicit /admin/v1 admin API root, or the /admin/v1/ha HA
+// root advertised to operators.
 func NewHAClient(baseURL string, httpClient *http.Client) (*HAClient, error) {
 	opts := []oapi.ClientOption{}
 	if httpClient != nil {
@@ -2133,6 +2134,9 @@ func normalizeAdminBaseURL(baseURL string) (string, error) {
 		return "", fmt.Errorf("invalid HA admin base URL %q", baseURL)
 	}
 	trimmed := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(trimmed, HAPath) {
+		return strings.TrimSuffix(trimmed, HAPath) + adminV1Path, nil
+	}
 	return strings.TrimSuffix(trimmed, adminV1Path) + adminV1Path, nil
 }
 

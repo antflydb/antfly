@@ -1234,6 +1234,31 @@ func TestHAClientAcceptsAdminRootURL(t *testing.T) {
 	}
 }
 
+func TestHAClientAcceptsHARootURL(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/v1/ha/fence/current" {
+			t.Fatalf("path = %s, want /admin/v1/ha/fence/current", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"schema_version":1,"held":false}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL+"/admin/v1/ha", server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.CurrentFence(context.Background())
+	if err != nil {
+		t.Fatalf("CurrentFence returned error: %v", err)
+	}
+	if resp.Held {
+		t.Fatalf("Held = true, want false")
+	}
+}
+
 func TestHAClientRejectsInvalidBaseURLs(t *testing.T) {
 	t.Parallel()
 
