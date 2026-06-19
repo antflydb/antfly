@@ -30,6 +30,7 @@ pub const GroupByRequest = struct {
     group_column: []const u8,
     value_column: []const u8 = &.{},
     op: algebraic_segment.AggregateOp,
+    deleted_row_refs: []const rowsource.RowRef = &.{},
 };
 
 pub const GroupResult = struct {
@@ -139,6 +140,7 @@ pub const ScanRequest = struct {
     projected_columns: []const []const u8,
     predicate: ?Predicate = null,
     limit: ?usize = null,
+    deleted_row_refs: []const rowsource.RowRef = &.{},
 };
 
 pub const ScanResult = HydrateResult;
@@ -183,7 +185,7 @@ pub fn executeGroupByAlloc(
 ) !GroupByResult {
     try validateRequest(request);
     if (materialized) |reader| {
-        if (materializedMatches(reader.*, request)) {
+        if (request.deleted_row_refs.len == 0 and materializedMatches(reader.*, request)) {
             return try resultFromAlgebraicAlloc(alloc, reader.*);
         }
     }
@@ -215,6 +217,7 @@ pub fn scanRowsAlloc(
             null;
 
         for (0..batch.rowCount()) |row_idx| {
+            if (containsRowRef(request.deleted_row_refs, batch.row_refs[row_idx])) continue;
             if (request.predicate) |predicate| {
                 if (!try predicateMatches(predicate, predicate_column.?, row_idx)) continue;
             }
@@ -252,15 +255,18 @@ pub fn scanRowsWithSidecarsAlloc(
 
     if (try usableCandidateRefsAlloc(alloc, request.sidecars, selection, request.candidates)) |usable| {
         defer alloc.free(usable.row_refs);
-        var hydrated = try hydrateRowsForBindingAlloc(
+        const live_refs = try rowRefsExcludingDeletedAlloc(alloc, usable.row_refs, request.scan.deleted_row_refs);
+        defer alloc.free(live_refs);
+        var hydrated = try hydrateRowsForBindingExcludingDeletedAlloc(
             alloc,
             source,
             usable.binding,
             usable.row_refs,
+            request.scan.deleted_row_refs,
             request.scan.projected_columns,
         );
         errdefer hydrated.deinit(alloc);
-        if (@as(usize, @intCast(hydrated.total)) != usable.row_refs.len) {
+        if (@as(usize, @intCast(hydrated.total)) != live_refs.len) {
             return error.LakeSidecarCandidateHydrationMismatch;
         }
         return .{
@@ -332,7 +338,17 @@ pub fn hydrateRowsAlloc(
     wanted_refs: []const rowsource.RowRef,
     projected_columns: []const []const u8,
 ) !HydrateResult {
-    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, projected_columns);
+    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, &.{}, projected_columns);
+}
+
+pub fn hydrateRowsExcludingDeletedAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    wanted_refs: []const rowsource.RowRef,
+    deleted_row_refs: []const rowsource.RowRef,
+    projected_columns: []const []const u8,
+) !HydrateResult {
+    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, deleted_row_refs, projected_columns);
 }
 
 pub fn hydrateRowsForBindingAlloc(
@@ -343,7 +359,19 @@ pub fn hydrateRowsForBindingAlloc(
     projected_columns: []const []const u8,
 ) !HydrateResult {
     try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
-    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, projected_columns);
+    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, &.{}, projected_columns);
+}
+
+pub fn hydrateRowsForBindingExcludingDeletedAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    wanted_refs: []const rowsource.RowRef,
+    deleted_row_refs: []const rowsource.RowRef,
+    projected_columns: []const []const u8,
+) !HydrateResult {
+    try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
+    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, deleted_row_refs, projected_columns);
 }
 
 fn hydrateRowsInternalAlloc(
@@ -351,6 +379,7 @@ fn hydrateRowsInternalAlloc(
     source: rowsource.Source,
     binding: ?source_binding.Binding,
     wanted_refs: []const rowsource.RowRef,
+    deleted_row_refs: []const rowsource.RowRef,
     projected_columns: []const []const u8,
 ) !HydrateResult {
     if (wanted_refs.len == 0) return .{ .rows = try alloc.alloc(ProjectedRow, 0), .total = 0 };
@@ -367,6 +396,7 @@ fn hydrateRowsInternalAlloc(
             try source_binding.validateBatchSnapshotAgainstBinding(sidecar_binding, batch);
         }
         for (batch.row_refs, 0..) |row_ref, row_idx| {
+            if (containsRowRef(deleted_row_refs, row_ref)) continue;
             if (!containsRowRef(wanted_refs, row_ref)) continue;
             try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, projected_columns));
             if (rows.items.len == wanted_refs.len) break;
@@ -382,6 +412,20 @@ const UsableCandidateRefs = struct {
     binding: source_binding.Binding,
     row_refs: []rowsource.RowRef,
 };
+
+fn rowRefsExcludingDeletedAlloc(
+    alloc: Allocator,
+    row_refs: []const rowsource.RowRef,
+    deleted_row_refs: []const rowsource.RowRef,
+) ![]rowsource.RowRef {
+    if (row_refs.len == 0) return try alloc.alloc(rowsource.RowRef, 0);
+    var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
+    errdefer out.deinit(alloc);
+    for (row_refs) |row_ref| {
+        if (!containsRowRef(deleted_row_refs, row_ref)) try out.append(alloc, row_ref);
+    }
+    return try out.toOwnedSlice(alloc);
+}
 
 fn validateRequest(request: GroupByRequest) !void {
     if (request.group_column.len == 0) return error.InvalidLakeRowsQuery;
@@ -560,6 +604,7 @@ fn resultFromSourceAlloc(
         }
 
         for (0..batch.rowCount()) |row_idx| {
+            if (containsRowRef(request.deleted_row_refs, batch.row_refs[row_idx])) continue;
             if (group_column.nulls.isNull(row_idx)) continue;
             const key = group_column.values.bytes[row_idx];
             if (key.len == 0) continue;
@@ -735,6 +780,50 @@ test "lake rows group-by scans RowSource batches" {
     try std.testing.expectEqual(@as(usize, 2), result.groups.len);
     try std.testing.expectEqual(@as(i64, 11), result.find("t1").?.sum_i64);
     try std.testing.expectEqual(@as(i64, 20), result.find("t2").?.sum_i64);
+    try std.testing.expectEqual(.rowsource_scan, result.source);
+}
+
+test "lake rows group-by excludes deleted row refs" {
+    const alloc = std.testing.allocator;
+    const external = @import("../../storage/rowsource/external.zig");
+
+    const binding = external.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external.makeRowRef(binding, "file-a.parquet", 0, 0),
+        try external.makeRowRef(binding, "file-a.parquet", 0, 1),
+        try external.makeRowRef(binding, "file-b.parquet", 1, 0),
+    };
+    const tenants = [_][]const u8{ "t1", "t1", "t2" };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try external.BatchSource.init(binding, &batches);
+
+    const deleted = [_]rowsource.RowRef{row_refs[1]};
+    var result = try executeGroupByAlloc(alloc, batch_source.rowSource(), .{
+        .group_column = "tenant",
+        .value_column = "amount",
+        .op = .sum_i64,
+        .deleted_row_refs = &deleted,
+    }, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.groups.len);
+    try std.testing.expectEqual(@as(i64, 10), result.find("t1").?.sum_i64);
+    try std.testing.expectEqual(@as(i64, 30), result.find("t2").?.sum_i64);
     try std.testing.expectEqual(.rowsource_scan, result.source);
 }
 
@@ -940,6 +1029,55 @@ test "lake rows scans external rows through the same projection contract" {
     try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
 }
 
+test "lake rows scans exclude deleted row refs before predicates and limits" {
+    const alloc = std.testing.allocator;
+    const external = @import("../../storage/rowsource/external.zig");
+
+    const binding = external.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external.makeRowRef(binding, "file-a.parquet", 0, 0),
+        try external.makeRowRef(binding, "file-a.parquet", 0, 1),
+        try external.makeRowRef(binding, "file-b.parquet", 1, 0),
+    };
+    const tenants = [_][]const u8{ "t2", "t2", "t2" };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try external.BatchSource.init(binding, &batches);
+
+    const projection = [_][]const u8{"amount"};
+    const deleted = [_]rowsource.RowRef{row_refs[0]};
+    var result = try scanRowsAlloc(alloc, batch_source.rowSource(), .{
+        .projected_columns = &projection,
+        .predicate = .{
+            .column = "tenant",
+            .op = .eq_bytes,
+            .bytes_value = "t2",
+        },
+        .limit = 1,
+        .deleted_row_refs = &deleted,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
+}
+
 test "lake rows hydrates projected cells by row ref" {
     const alloc = std.testing.allocator;
     const local = @import("../../storage/rowsource/local.zig");
@@ -970,6 +1108,49 @@ test "lake rows hydrates projected cells by row ref" {
     try std.testing.expect(rowRefsEqual(wanted[0], result.rows[0].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqualStrings("{\"tier\":\"pro\"}", result.rows[0].find("attrs").?.value.?.json);
+}
+
+test "lake rows hydration excludes deleted row refs" {
+    const alloc = std.testing.allocator;
+    const external = @import("../../storage/rowsource/external.zig");
+
+    const binding = external.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external.makeRowRef(binding, "file-a.parquet", 0, 0),
+        try external.makeRowRef(binding, "file-a.parquet", 0, 1),
+    };
+    const amounts = [_]i64{ 10, 20 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try external.BatchSource.init(binding, &batches);
+
+    const projection = [_][]const u8{"amount"};
+    const deleted = [_]rowsource.RowRef{row_refs[0]};
+    var result = try hydrateRowsExcludingDeletedAlloc(
+        alloc,
+        batch_source.rowSource(),
+        &row_refs,
+        &deleted,
+        &projection,
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
 }
 
 test "lake rows binding-aware hydration rejects stale external candidates" {
@@ -1116,6 +1297,84 @@ test "lake rows sidecar scan hydrates selected external candidates" {
     try std.testing.expect(rowRefsEqual(row_refs[2], result.rows[1].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
+}
+
+test "lake rows sidecar scan excludes deleted candidate refs" {
+    const alloc = std.testing.allocator;
+    const external = @import("../../storage/rowsource/external.zig");
+    const artifact_ref = @import("../manifest/artifact_ref.zig");
+
+    const external_binding = external.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+        try external.makeRowRef(external_binding, "file-a.parquet", 0, 1),
+        try external.makeRowRef(external_binding, "file-b.parquet", 1, 0),
+    };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = external_binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try external.BatchSource.init(external_binding, &batches);
+
+    const declaration = sidecar_manifest.DeclaredArtifact{
+        .name = "events.embedding.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_iceberg,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "iceberg-9",
+            .schema_fingerprint = "schema-v2",
+            .column_bindings = &[_][]const u8{"embedding"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = artifact_ref.ArtifactKind.vector_segment,
+            .name = "events.embedding.vector",
+            .artifact_id = "vector-1",
+            .byte_len = 128,
+            .checksum = "len:128",
+        },
+    };
+    const candidate_refs = [_]rowsource.RowRef{ row_refs[2], row_refs[1] };
+    const deleted = [_]rowsource.RowRef{row_refs[2]};
+    const candidates = [_]SidecarCandidateSet{.{
+        .sidecar_name = "events.embedding.vector",
+        .row_refs = &candidate_refs,
+    }};
+    const projection = [_][]const u8{"amount"};
+
+    var result = try scanRowsWithSidecarsAlloc(alloc, batch_source.rowSource(), .{
+        .scan = .{ .projected_columns = &projection, .deleted_row_refs = &deleted },
+        .base_source = .{ .external_iceberg = .{
+            .format = .iceberg,
+            .source_uri = "s3://bucket/warehouse/events",
+            .snapshot_id = "iceberg-9",
+            .schema_fingerprint = "schema-v2",
+        } },
+        .sidecars = &[_]sidecar_manifest.DeclaredArtifact{declaration},
+        .desired_sidecars = &[_]lake_sidecar_selection.DesiredSidecar{.{ .kind = .vector }},
+        .sidecar_policy = .{ .require_requested = true },
+        .candidates = &candidates,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(SidecarScanSource.sidecar_hydration, result.source);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
 }
 
 test "lake rows sidecar scan intersects multiple selected candidate sets" {

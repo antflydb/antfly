@@ -917,10 +917,12 @@ Iceberg external sources pin reads to a table metadata file and snapshot id,
 then derive the row inventory from that snapshot's manifest list and data
 manifests. Active Iceberg delete manifests are parsed into a typed delete plan,
 and position-delete rows can be mapped to Antfly external row refs once the data
-file inventory has row-group metadata. Full query execution still fails closed
-when active Iceberg deletes are present until delete-file row decoding and scan
-filtering are wired into the lake row-source executor. Equality deletes remain
-tracked in the delete plan but unsupported for row filtering.
+file inventory has row-group metadata. Lake row-source scans, group-by aggregation, sidecar
+hydration, and direct row-ref hydration can exclude deleted row refs before
+predicate, limit, and hydration accounting. Full query execution still fails
+closed when active Iceberg deletes are present until position-delete file
+decoding feeds that row-ref filter. Equality deletes remain tracked in the
+delete plan but unsupported for row filtering.
 
 ### SQL adapter boundary
 
