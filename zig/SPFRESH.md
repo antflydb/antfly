@@ -308,7 +308,10 @@ Current status:
   membership checks do not prefer buffered operations over newer committed
   operations, and the segment runtime exposes sequence-bearing latest-record
   helpers so that path no longer has to allocate whole delta tails just to
-  compare one vector's latest op. Segment committed-plus-pending scratch replay
+  compare one vector's latest op. Committed latest-record scans now walk the
+  segment delta index newest-first and read each candidate value through
+  reusable scratch, avoiding a full posting-range value read when the newest
+  value answers the single-member lookup. Segment committed-plus-pending scratch replay
   also now sorts the two delta sources inside retained replay scratch and
   applies them in-place instead of allocating a separate materialized member
   slice; canonical base/delta query replay uses merge-style sorted delta

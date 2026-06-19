@@ -1134,18 +1134,18 @@ pub const LazyDirectorySnapshot = struct {
             var stack_index: [stack_index_max_bytes]u8 = undefined;
             const index_data = try readSegmentIndexWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, &stack_index);
             defer index_data.deinit(alloc);
-            var stack_values: [stack_delta_value_range_max_bytes]u8 = undefined;
 
-            const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, index_data.data, posting_id, &stack_values)) orelse continue;
-            defer range.deinit(alloc);
+            const range = (try deltaIndexRange(index_data.data, entry.meta.entry_count, posting_id)) orelse continue;
+            var value_scratch: [stack_delta_value_range_max_bytes]u8 = undefined;
             var delta_index = range.past_index;
             while (delta_index > range.first_index) {
                 delta_index -= 1;
-                const found = try deltaIndexEntryFromRange(index_data.data, range, delta_index);
+                const found = try deltaIndexEntryFromIndexData(index_data.data, delta_index);
                 if (best_record != null and found.sequence <= best_sequence) break;
-                const value = try deltaValueFromEntryRange(range, found);
+                const value_buffer = try readSegmentEntryValueWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, found, &value_scratch);
+                defer value_buffer.deinit(alloc);
                 try latestDeltaValueRecordAfterGenerationForMember(
-                    value,
+                    value_buffer.data,
                     vector_id,
                     base_generation,
                     posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
@@ -2771,6 +2771,15 @@ const ValueIndexRange = struct {
     past_index: usize,
 };
 
+const SegmentValueBuffer = struct {
+    data: []u8,
+    owned: bool,
+
+    fn deinit(self: SegmentValueBuffer, alloc: Allocator) void {
+        if (self.owned) alloc.free(self.data);
+    }
+};
+
 pub const ValueLocation = struct {
     offset: usize,
     len: usize,
@@ -3902,6 +3911,29 @@ fn readSegmentEntryValuePrefixInto(io: std.Io, dir: std.Io.Dir, entry: ManifestE
     const prefix_end = std.math.add(usize, found.offset, out.len) catch return error.CorruptedPostingSegment;
     if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset or prefix_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
     try readFileRangeInto(io, dir, entry.path, @intCast(found.offset), out);
+}
+
+fn readSegmentEntryValueWithScratchAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    found: IndexEntry,
+    scratch: []u8,
+) !SegmentValueBuffer {
+    _ = try checkedSegmentValueEnd(entry.meta, found);
+
+    if (found.len <= scratch.len) {
+        const data = scratch[0..found.len];
+        try readFileRangeInto(io, dir, entry.path, @intCast(found.offset), data);
+        try found.location().verifyValue(data);
+        return .{ .data = data, .owned = false };
+    }
+
+    const data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(found.offset), found.len);
+    errdefer alloc.free(data);
+    try found.location().verifyValue(data);
+    return .{ .data = data, .owned = true };
 }
 
 fn batchPointValueReadLess(_: void, lhs: BatchPointValueRead, rhs: BatchPointValueRead) bool {
