@@ -1331,13 +1331,15 @@ fn bindingsEqual(a: source_binding.Binding, b: source_binding.Binding) bool {
         std.mem.eql(u8, a.snapshot_id, b.snapshot_id) and
         std.mem.eql(u8, a.schema_fingerprint, b.schema_fingerprint) and
         std.mem.eql(u8, a.index_config_hash, b.index_config_hash) and
-        stringSlicesEqual(a.column_bindings, b.column_bindings);
+        stringSlicesEqual(a.column_bindings, b.column_bindings) and
+        source_binding.sameColumnKinds(a, b);
 }
 
 fn rebuildReason(desired: source_binding.Binding, published: source_binding.Binding) []const u8 {
     if (!source_binding.sameSourceSnapshot(desired, published)) return "source snapshot changed";
     if (!std.mem.eql(u8, desired.index_config_hash, published.index_config_hash)) return "index config changed";
     if (!stringSlicesEqual(desired.column_bindings, published.column_bindings)) return "column bindings changed";
+    if (!source_binding.sameColumnKinds(desired, published)) return "column kind bindings changed";
     return "source binding changed";
 }
 
@@ -1358,35 +1360,7 @@ fn lessString(_: void, lhs: []const u8, rhs: []const u8) bool {
 }
 
 fn cloneBindingAlloc(alloc: Allocator, binding: source_binding.Binding) !source_binding.Binding {
-    const source_id = try alloc.dupe(u8, binding.source_id);
-    errdefer alloc.free(source_id);
-    const snapshot_id = try alloc.dupe(u8, binding.snapshot_id);
-    errdefer alloc.free(snapshot_id);
-    const schema_fingerprint = try alloc.dupe(u8, binding.schema_fingerprint);
-    errdefer alloc.free(schema_fingerprint);
-    const index_config_hash = try alloc.dupe(u8, binding.index_config_hash);
-    errdefer alloc.free(index_config_hash);
-    const column_bindings = try alloc.alloc([]const u8, binding.column_bindings.len);
-    errdefer alloc.free(column_bindings);
-    var initialized: usize = 0;
-    errdefer {
-        for (column_bindings[0..initialized]) |column| alloc.free(column);
-    }
-    for (binding.column_bindings, 0..) |column, idx| {
-        column_bindings[idx] = try alloc.dupe(u8, column);
-        initialized += 1;
-    }
-
-    return .{
-        .sidecar_kind = binding.sidecar_kind,
-        .source_kind = binding.source_kind,
-        .row_ref_kind = binding.row_ref_kind,
-        .source_id = source_id,
-        .snapshot_id = snapshot_id,
-        .schema_fingerprint = schema_fingerprint,
-        .column_bindings = column_bindings,
-        .index_config_hash = index_config_hash,
-    };
+    return try source_binding.cloneAlloc(alloc, binding);
 }
 
 fn cloneBuildSpecAlloc(alloc: Allocator, build_spec: BuildSpec) !BuildSpec {
@@ -1434,12 +1408,7 @@ fn cloneBuildSpecAlloc(alloc: Allocator, build_spec: BuildSpec) !BuildSpec {
 }
 
 fn freeOwnedBinding(alloc: Allocator, binding: source_binding.Binding) void {
-    alloc.free(binding.source_id);
-    alloc.free(binding.snapshot_id);
-    alloc.free(binding.schema_fingerprint);
-    for (binding.column_bindings) |column| alloc.free(column);
-    alloc.free(binding.column_bindings);
-    alloc.free(binding.index_config_hash);
+    source_binding.freeOwned(alloc, binding);
 }
 
 fn freeOwnedDesiredArtifact(alloc: Allocator, artifact: *DesiredArtifact) void {

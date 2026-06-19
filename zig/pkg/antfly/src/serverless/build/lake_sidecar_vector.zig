@@ -309,35 +309,7 @@ fn declaredArtifactAlloc(
 }
 
 fn cloneBindingAlloc(alloc: Allocator, binding: source_binding.Binding) !source_binding.Binding {
-    const source_id = try alloc.dupe(u8, binding.source_id);
-    errdefer alloc.free(source_id);
-    const snapshot_id = try alloc.dupe(u8, binding.snapshot_id);
-    errdefer alloc.free(snapshot_id);
-    const schema_fingerprint = try alloc.dupe(u8, binding.schema_fingerprint);
-    errdefer alloc.free(schema_fingerprint);
-    const index_config_hash = try alloc.dupe(u8, binding.index_config_hash);
-    errdefer alloc.free(index_config_hash);
-    const column_bindings = try alloc.alloc([]const u8, binding.column_bindings.len);
-    errdefer alloc.free(column_bindings);
-    var initialized: usize = 0;
-    errdefer {
-        for (column_bindings[0..initialized]) |column| alloc.free(column);
-    }
-    for (binding.column_bindings, 0..) |column, idx| {
-        column_bindings[idx] = try alloc.dupe(u8, column);
-        initialized += 1;
-    }
-
-    return .{
-        .sidecar_kind = binding.sidecar_kind,
-        .source_kind = binding.source_kind,
-        .row_ref_kind = binding.row_ref_kind,
-        .source_id = source_id,
-        .snapshot_id = snapshot_id,
-        .schema_fingerprint = schema_fingerprint,
-        .column_bindings = column_bindings,
-        .index_config_hash = index_config_hash,
-    };
+    return try source_binding.cloneAlloc(alloc, binding);
 }
 
 fn freeOwnedDeclaration(alloc: Allocator, declaration: sidecar_manifest.DeclaredArtifact) void {
@@ -349,12 +321,7 @@ fn freeOwnedDeclaration(alloc: Allocator, declaration: sidecar_manifest.Declared
 }
 
 fn freeOwnedBinding(alloc: Allocator, binding: source_binding.Binding) void {
-    alloc.free(binding.source_id);
-    alloc.free(binding.snapshot_id);
-    alloc.free(binding.schema_fingerprint);
-    for (binding.column_bindings) |column| alloc.free(column);
-    alloc.free(binding.column_bindings);
-    alloc.free(binding.index_config_hash);
+    source_binding.freeOwned(alloc, binding);
 }
 
 fn freeVectorEntries(alloc: Allocator, entries: []vector_segment.Entry) void {

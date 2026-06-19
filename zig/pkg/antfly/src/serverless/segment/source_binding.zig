@@ -39,12 +39,16 @@ pub const Binding = struct {
     snapshot_id: []const u8,
     schema_fingerprint: []const u8,
     column_bindings: []const []const u8 = &.{},
+    column_kinds: []const rowsource.ColumnKind = &.{},
     index_config_hash: []const u8,
 
     pub fn validate(self: Binding) !void {
         if (self.snapshot_id.len == 0) return error.InvalidSidecarSourceBinding;
         if (self.schema_fingerprint.len == 0) return error.InvalidSidecarSourceBinding;
         if (self.index_config_hash.len == 0) return error.InvalidSidecarSourceBinding;
+        if (self.column_kinds.len != 0 and self.column_kinds.len != self.column_bindings.len) {
+            return error.InvalidSidecarSourceBinding;
+        }
         for (self.column_bindings) |column| {
             if (column.len == 0) return error.InvalidSidecarSourceBinding;
         }
@@ -91,10 +95,34 @@ pub fn bindingFromSnapshot(
     };
 }
 
+pub fn bindingFromSnapshotWithColumnKinds(
+    sidecar_kind: SidecarKind,
+    source_kind: rowsource.SourceKind,
+    snapshot: rowsource.SnapshotRef,
+    schema_fingerprint: []const u8,
+    column_bindings: []const []const u8,
+    column_kinds: []const rowsource.ColumnKind,
+    index_config_hash: []const u8,
+) Binding {
+    var binding = bindingFromSnapshot(
+        sidecar_kind,
+        source_kind,
+        snapshot,
+        schema_fingerprint,
+        column_bindings,
+        index_config_hash,
+    );
+    binding.column_kinds = column_kinds;
+    return binding;
+}
+
 pub fn validateBatchAgainstBinding(binding: Binding, batch: rowsource.ColumnBatch) !void {
     try validateBatchSnapshotAgainstBinding(binding, batch);
-    for (binding.column_bindings) |column| {
-        if (batch.findColumn(column) == null) return error.SidecarSourceBindingMismatch;
+    for (binding.column_bindings, 0..) |column, idx| {
+        const batch_column = batch.findColumn(column) orelse return error.SidecarSourceBindingMismatch;
+        if (binding.column_kinds.len != 0 and batch_column.kind() != binding.column_kinds[idx]) {
+            return error.SidecarSourceBindingMismatch;
+        }
     }
 }
 
@@ -126,6 +154,59 @@ pub fn sameSourceSnapshot(a: Binding, b: Binding) bool {
         std.mem.eql(u8, a.source_id, b.source_id) and
         std.mem.eql(u8, a.snapshot_id, b.snapshot_id) and
         std.mem.eql(u8, a.schema_fingerprint, b.schema_fingerprint);
+}
+
+pub fn sameColumnKinds(a: Binding, b: Binding) bool {
+    if (a.column_kinds.len != b.column_kinds.len) return false;
+    for (a.column_kinds, b.column_kinds) |left, right| {
+        if (left != right) return false;
+    }
+    return true;
+}
+
+pub fn cloneAlloc(alloc: std.mem.Allocator, binding: Binding) !Binding {
+    const source_id = try alloc.dupe(u8, binding.source_id);
+    errdefer alloc.free(source_id);
+    const snapshot_id = try alloc.dupe(u8, binding.snapshot_id);
+    errdefer alloc.free(snapshot_id);
+    const schema_fingerprint = try alloc.dupe(u8, binding.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+    const index_config_hash = try alloc.dupe(u8, binding.index_config_hash);
+    errdefer alloc.free(index_config_hash);
+    const column_bindings = try alloc.alloc([]const u8, binding.column_bindings.len);
+    errdefer alloc.free(column_bindings);
+    var initialized: usize = 0;
+    errdefer {
+        for (column_bindings[0..initialized]) |column| alloc.free(column);
+    }
+    for (binding.column_bindings, 0..) |column, idx| {
+        column_bindings[idx] = try alloc.dupe(u8, column);
+        initialized += 1;
+    }
+    const column_kinds = try alloc.dupe(rowsource.ColumnKind, binding.column_kinds);
+    errdefer alloc.free(column_kinds);
+
+    return .{
+        .sidecar_kind = binding.sidecar_kind,
+        .source_kind = binding.source_kind,
+        .row_ref_kind = binding.row_ref_kind,
+        .source_id = source_id,
+        .snapshot_id = snapshot_id,
+        .schema_fingerprint = schema_fingerprint,
+        .column_bindings = column_bindings,
+        .column_kinds = column_kinds,
+        .index_config_hash = index_config_hash,
+    };
+}
+
+pub fn freeOwned(alloc: std.mem.Allocator, binding: Binding) void {
+    alloc.free(@constCast(binding.source_id));
+    alloc.free(@constCast(binding.snapshot_id));
+    alloc.free(@constCast(binding.schema_fingerprint));
+    for (binding.column_bindings) |column| alloc.free(@constCast(column));
+    alloc.free(@constCast(binding.column_bindings));
+    alloc.free(@constCast(binding.column_kinds));
+    alloc.free(@constCast(binding.index_config_hash));
 }
 
 pub fn rowRefMatchesKind(row_ref: rowsource.RowRef, kind: RowRefKind) bool {
@@ -386,6 +467,33 @@ test "sidecar source binding validates batches and creates stable row-ref keys" 
     var wrong_snapshot = batch;
     wrong_snapshot.snapshot = .{ .table_id = "orders", .snapshot_id = "manifest-10" };
     try std.testing.expectError(error.SidecarSourceBindingMismatch, validateBatchAgainstBinding(binding, wrong_snapshot));
+
+    const typed_binding = bindingFromSnapshotWithColumnKinds(
+        .text,
+        .serverless_fragment,
+        batch.snapshot,
+        "schema-v1",
+        &[_][]const u8{"body"},
+        &[_]rowsource.ColumnKind{.bytes},
+        "sha256:text",
+    );
+    try validateBatchAgainstBinding(typed_binding, batch);
+
+    const wrong_kind_binding = bindingFromSnapshotWithColumnKinds(
+        .text,
+        .serverless_fragment,
+        batch.snapshot,
+        "schema-v1",
+        &[_][]const u8{"body"},
+        &[_]rowsource.ColumnKind{.json},
+        "sha256:text",
+    );
+    try std.testing.expectError(error.SidecarSourceBindingMismatch, validateBatchAgainstBinding(wrong_kind_binding, batch));
+
+    const cloned = try cloneAlloc(alloc, typed_binding);
+    defer freeOwned(alloc, cloned);
+    try std.testing.expect(sameColumnKinds(typed_binding, cloned));
+    try validateBatchAgainstBinding(cloned, batch);
 }
 
 test "sidecar source binding validates external row-ref batches" {
