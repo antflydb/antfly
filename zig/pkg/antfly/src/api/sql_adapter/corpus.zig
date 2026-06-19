@@ -690,6 +690,7 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         const entry = try parseFixtureEntryAlloc(alloc, entry_value);
         errdefer freeFixtureEntry(alloc, entry);
         if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
+        try validateSourceCorpusEntryMetadata(entry);
         try seen_names.put(alloc, entry.name, {});
         try entries.append(alloc, entry);
     }
@@ -1359,7 +1360,12 @@ pub fn corpusDdlFixtureAppliesFromEmptyCatalog(entry: AppParityCorpusEntry) !boo
     };
 }
 
-pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
+const AppParityCorpusMetadataMode = enum {
+    source,
+    generated_fixture,
+};
+
+fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpusMetadataMode) !void {
     if (entry.name.len == 0 or entry.sql.len == 0 or entry.plan.len == 0) return error.TestUnexpectedResult;
     if (!corpusPlanMatchesFamily(entry.family, entry.plan)) return error.TestUnexpectedResult;
     if (corpusFixtureFamilyNeedsReason(entry.family) and entry.classification_reason.len == 0) {
@@ -1529,7 +1535,7 @@ pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
     if (entry.apply_setup_sql.len > 0 and !corpusFixtureFamilyAllowsSetupSql(entry.family)) {
         return error.TestUnexpectedResult;
     }
-    if (entry.family == .ddl and entry.apply_setup_sql.len > 0 and entry.applied_plan.len == 0) {
+    if (mode == .generated_fixture and entry.family == .ddl and entry.apply_setup_sql.len > 0 and entry.applied_plan.len == 0) {
         return error.TestUnexpectedResult;
     }
     for (entry.apply_setup_sql) |setup_sql| {
@@ -1568,9 +1574,17 @@ pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
         return error.TestUnexpectedResult;
     }
     if (entry.resolver_exists == true and entry.resolver_row_json.len == 0) return error.TestUnexpectedResult;
-    if (try corpusDdlFixtureRequiresAppliedPlan(entry)) {
+    if (mode == .generated_fixture and try corpusDdlFixtureRequiresAppliedPlan(entry)) {
         if (entry.applied_plan.len == 0) return error.TestUnexpectedResult;
     }
+}
+
+pub fn validateSourceCorpusEntryMetadata(entry: AppParityCorpusEntry) !void {
+    return validateCorpusMetadataCore(entry, .source);
+}
+
+pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
+    return validateCorpusMetadataCore(entry, .generated_fixture);
 }
 
 pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
@@ -3066,6 +3080,48 @@ test "sql adapter source corpus rejects duplicate entry names" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed.value));
+}
+
+test "sql adapter source corpus validates entry metadata while allowing derived applied plans" {
+    const alloc = std.testing.allocator;
+    const valid_source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "comment metadata source entry",
+        \\      "family": "ddl",
+        \\      "summary": {"ddl_tag": "comment_metadata", "table_name": "usage_records"},
+        \\      "plan": "ddl:comment:on=table:table=usage_records",
+        \\      "apply_setup_sql": ["CREATE TABLE usage_records (id text PRIMARY KEY)"],
+        \\      "sql": "COMMENT ON TABLE usage_records IS 'runtime records'"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_valid = try std.json.parseFromSlice(std.json.Value, alloc, valid_source_json, .{});
+    defer parsed_valid.deinit();
+    const valid_root = try parseSourceCorpusRootAlloc(alloc, parsed_valid.value);
+    defer freeSourceCorpusRoot(alloc, valid_root);
+    try std.testing.expectEqual(@as(usize, 1), valid_root.entries.len);
+
+    const invalid_source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "bad family plan",
+        \\      "family": "query",
+        \\      "summary": {"table_name": "usage_records"},
+        \\      "plan": "insert:table=usage_records",
+        \\      "sql": "SELECT id FROM usage_records"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_invalid = try std.json.parseFromSlice(std.json.Value, alloc, invalid_source_json, .{});
+    defer parsed_invalid.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_invalid.value));
 }
 
 test "sql adapter corpus encodes fixture roots and entries" {
