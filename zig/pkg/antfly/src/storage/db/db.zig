@@ -24,6 +24,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
+const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
@@ -232,6 +233,7 @@ pub const OpenOptions = struct {
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default },
+    primary_runtime_store: ?*backend_erased_mod.Store = null,
     storage: ?lsm_backend_mod.Storage = null,
     lsm_cache: ?*lsm_backend_mod.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
@@ -2394,6 +2396,12 @@ fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_runt
 }
 
 fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
+    if (opts.primary_runtime_store) |runtime_store| {
+        return .{
+            .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+        };
+    }
+
     const zpath = try alloc.dupeZ(u8, path);
     defer alloc.free(zpath);
 
@@ -2618,6 +2626,7 @@ pub const DB = struct {
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
                 .primary_backend = effective_primary_backend,
+                .primary_runtime_store = opts.primary_runtime_store,
                 .storage = opts.storage,
                 .lsm_cache = opts.lsm_cache,
                 .hbc_cache = opts.hbc_cache,
@@ -5789,6 +5798,7 @@ pub const DB = struct {
             .map_size = opts.map_size,
             .no_sync = opts.no_sync,
             .primary_backend = opts.primary_backend,
+            .primary_runtime_store = opts.primary_runtime_store,
             .storage = opts.storage,
             .index_backends = opts.index_backends,
         });

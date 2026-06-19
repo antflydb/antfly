@@ -13,6 +13,7 @@
 // limitations.
 
 test {
+    _ = @import("storage/lite/backend.zig");
     _ = @import("storage/lite/docstore.zig");
     _ = @import("storage/lite/native.zig");
 }

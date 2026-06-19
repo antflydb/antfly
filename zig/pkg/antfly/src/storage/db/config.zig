@@ -24,6 +24,7 @@ else
 const graph_mod = @import("../../graph/graph.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
+const backend_erased_mod = @import("../backend_erased.zig");
 
 const mib: u64 = 1024 * 1024;
 const gib: u64 = 1024 * mib;
@@ -180,6 +181,7 @@ pub const CoreOpenOptions = struct {
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = primary_lsm_options_default },
+    primary_runtime_store: ?*backend_erased_mod.Store = null,
     storage: ?lsm_backend_mod.Storage = null,
     lsm_cache: ?*lsm_backend_mod.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,

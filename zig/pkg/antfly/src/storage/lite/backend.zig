@@ -14,7 +14,9 @@
 
 const std = @import("std");
 const db_mod = @import("../db/db.zig");
+const backend_erased = @import("../backend_erased.zig");
 const lsm_backend = @import("../lsm_backend/mod.zig");
+const docstore = @import("docstore.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -47,7 +49,8 @@ pub const Handle = struct {
     allocator: Allocator,
     engine: EngineKind,
     bridge_storage: ?*lsm_backend.AfliteContainerStorage = null,
-    native_file: ?native.NativeFile = null,
+    native_docstore: ?*docstore.Store = null,
+    native_runtime_store: ?*backend_erased.Store = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         return switch (opts.engine) {
@@ -66,9 +69,15 @@ pub const Handle = struct {
                 }
             },
             .native_single_file => {
-                if (self.native_file) |*file| {
-                    file.close();
-                    self.native_file = null;
+                if (self.native_runtime_store) |runtime_store| {
+                    runtime_store.deinit();
+                    self.allocator.destroy(runtime_store);
+                    self.native_runtime_store = null;
+                }
+                if (self.native_docstore) |store| {
+                    store.close();
+                    self.allocator.destroy(store);
+                    self.native_docstore = null;
                 }
             },
         }
@@ -86,14 +95,18 @@ pub const Handle = struct {
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.external_derived_checkpoints = false;
             },
-            .native_single_file => return error.NativeBackendDoesNotExposeDbStorage,
+            .native_single_file => {
+                opts.primary_backend = .{ .mem = .{} };
+                opts.primary_runtime_store = self.native_runtime_store.?;
+                opts.external_derived_checkpoints = false;
+            },
         }
     }
 
     pub fn check(self: *Handle) !CheckReport {
         return switch (self.engine) {
             .bridge_lsm_container => toCheckReport(try self.bridge_storage.?.check()),
-            .native_single_file => try self.native_file.?.check(),
+            .native_single_file => try self.native_docstore.?.file.check(),
         };
     }
 
@@ -122,22 +135,23 @@ fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOpti
 }
 
 fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
-    const file = native.NativeFile.open(allocator, path, opts.read_only) catch |err| switch (err) {
-        error.FileNotFound => {
-            if (opts.read_only) return err;
-            return .{
-                .allocator = allocator,
-                .engine = .native_single_file,
-                .native_file = try native.NativeFile.create(allocator, path),
-            };
-        },
-        else => return err,
-    };
+    const store = try allocator.create(docstore.Store);
+    errdefer allocator.destroy(store);
+
+    store.* = try docstore.Store.open(allocator, path, opts.read_only);
+    errdefer store.close();
+
+    const runtime_store = try allocator.create(backend_erased.Store);
+    errdefer allocator.destroy(runtime_store);
+
+    runtime_store.* = try store.runtimeStore(allocator);
+    errdefer runtime_store.deinit();
 
     return .{
         .allocator = allocator,
         .engine = .native_single_file,
-        .native_file = file,
+        .native_docstore = store,
+        .native_runtime_store = runtime_store,
     };
 }
 
@@ -185,15 +199,78 @@ test "lite backend native engine creates and checks aflite file" {
     var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
     defer handle.deinit();
 
-    try handle.native_file.?.putDocument("doc:1", "value");
+    try handle.native_docstore.?.file.putDocument("doc:1", "value");
 
     const report = try handle.check();
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.record_count);
 
     var db_opts = db_mod.OpenOptions{};
-    try std.testing.expectError(error.NativeBackendDoesNotExposeDbStorage, handle.configureDbOpenOptions(&db_opts));
+    try handle.configureDbOpenOptions(&db_opts);
+    try std.testing.expect(db_opts.primary_runtime_store != null);
+    try std.testing.expect(db_opts.primary_backend == .mem);
     try std.testing.expectError(error.NativeVacuumNotImplemented, handle.vacuum());
+}
+
+test "lite backend native engine can back db primary documents" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-db.aflite");
+    defer allocator.free(path);
+
+    {
+        var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+        defer handle.deinit();
+
+        var db_opts = db_mod.OpenOptions{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        try handle.configureDbOpenOptions(&db_opts);
+
+        var db = try db_mod.DB.open(allocator, path, db_opts);
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:lite-native",
+                .value = "{\"name\":\"native\"}",
+            }},
+            .sync_level = .write,
+        });
+
+        const value = try db.get(allocator, "doc:lite-native") orelse return error.MissingNativeLiteDocument;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("{\"name\":\"native\"}", value);
+    }
+
+    {
+        var handle = try Handle.open(allocator, path, .{
+            .engine = .native_single_file,
+            .read_only = true,
+        });
+        defer handle.deinit();
+
+        var db_opts = db_mod.OpenOptions{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        try handle.configureDbOpenOptions(&db_opts);
+
+        var db = try db_mod.DB.open(allocator, path, db_opts);
+        defer db.close();
+
+        const value = try db.get(allocator, "doc:lite-native") orelse return error.MissingNativeLiteDocument;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("{\"name\":\"native\"}", value);
+    }
 }
 
 test "lite backend native read-only open requires an existing file" {
