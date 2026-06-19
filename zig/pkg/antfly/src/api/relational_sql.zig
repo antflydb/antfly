@@ -334,6 +334,8 @@ pub const BulkSqlIoExecutionPlan = struct {
     null_marker: ?[]const u8 = null,
     default_marker: ?[]const u8 = null,
     encoding: ?[]const u8 = null,
+    force_quote_all: bool = false,
+    force_quote_columns: []const []const u8 = &.{},
     force_not_null_columns: []const []const u8 = &.{},
     force_null_columns: []const []const u8 = &.{},
 };
@@ -2062,6 +2064,8 @@ pub fn bulkSqlIoExecutionPlanFromDdlPlan(plan: BulkIoPlan) !BulkSqlIoExecutionPl
                 .null_marker = plan.null_marker,
                 .default_marker = plan.default_marker,
                 .encoding = plan.encoding,
+                .force_quote_all = plan.force_quote_all,
+                .force_quote_columns = plan.force_quote_columns,
                 .force_not_null_columns = plan.force_not_null_columns,
                 .force_null_columns = plan.force_null_columns,
             };
@@ -2084,6 +2088,8 @@ pub fn bulkSqlIoExecutionPlanFromDdlPlan(plan: BulkIoPlan) !BulkSqlIoExecutionPl
                 .escape = plan.escape,
                 .null_marker = plan.null_marker,
                 .encoding = plan.encoding,
+                .force_quote_all = plan.force_quote_all,
+                .force_quote_columns = plan.force_quote_columns,
             };
         },
     }
@@ -2167,6 +2173,125 @@ pub fn bulkSqlIoImportRowsBatchFromStdinAlloc(
     }
     try body.appendSlice(alloc, "]}");
     return try relational_rows.parseRowsBatchRequest(alloc, body.items, schema);
+}
+
+pub fn bulkSqlIoExportRowsCsvToStdoutAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    result: db_mod.types.RelationalRowsQueryResult,
+) ![]u8 {
+    if (plan.operation != .export_rows or plan.native_route != .rows_query or plan.stream != .stdout) return error.UnsupportedSqlShape;
+    if (plan.codec != .csv) return error.UnsupportedSqlShape;
+    if (plan.encoding) |encoding| {
+        if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    const columns = try bulkSqlIoExportColumnsAlloc(alloc, schema, plan);
+    defer alloc.free(columns);
+
+    const delimiter = try bulkSqlIoSingleByteOption(plan.delimiter, ',');
+    const quote = try bulkSqlIoSingleByteOption(plan.quote, '"');
+    const escape = try bulkSqlIoSingleByteOption(plan.escape, quote);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    if (plan.header) {
+        for (columns, 0..) |column_name, i| {
+            if (i != 0) try writer.writeByte(delimiter);
+            try appendBulkSqlIoCsvField(writer, column_name, delimiter, quote, escape, false);
+        }
+        try writer.writeByte('\n');
+    }
+
+    for (result.rows) |row_json| {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        for (columns, 0..) |column_name, i| {
+            if (i != 0) try writer.writeByte(delimiter);
+            const value = parsed.value.object.get(column_name);
+            const field = try bulkSqlIoCsvFieldFromJsonValueAlloc(alloc, value, plan);
+            defer alloc.free(field);
+            const force_quote = plan.force_quote_all or bulkSqlIoStringSliceContains(plan.force_quote_columns, column_name);
+            try appendBulkSqlIoCsvField(writer, field, delimiter, quote, escape, force_quote);
+        }
+        try writer.writeByte('\n');
+    }
+
+    return try out.toOwnedSlice();
+}
+
+fn bulkSqlIoExportColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+) ![]const []const u8 {
+    const count = if (plan.columns.len == 0) schema.relational_columns.len else plan.columns.len;
+    const columns = try alloc.alloc([]const u8, count);
+    errdefer alloc.free(columns);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    if (plan.columns.len == 0) {
+        for (schema.relational_columns, 0..) |column, i| {
+            columns[i] = column.name;
+            try seen.put(alloc, column.name, {});
+        }
+    } else {
+        for (plan.columns, 0..) |column_name, i| {
+            if (seen.contains(column_name)) return error.InvalidRowsRequest;
+            _ = bulkSqlIoFindRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
+            try seen.put(alloc, column_name, {});
+            columns[i] = column_name;
+        }
+    }
+    return columns;
+}
+
+fn bulkSqlIoCsvFieldFromJsonValueAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+    plan: BulkSqlIoExecutionPlan,
+) ![]u8 {
+    const value = maybe_value orelse return try alloc.dupe(u8, plan.null_marker orelse "");
+    return switch (value) {
+        .null => try alloc.dupe(u8, plan.null_marker orelse ""),
+        .string => |raw| try alloc.dupe(u8, raw),
+        .bool => |raw| try alloc.dupe(u8, if (raw) "true" else "false"),
+        .integer, .float, .object, .array => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn appendBulkSqlIoCsvField(
+    writer: anytype,
+    field: []const u8,
+    delimiter: u8,
+    quote: u8,
+    escape: u8,
+    force_quote: bool,
+) !void {
+    var needs_quote = force_quote;
+    for (field) |c| {
+        if (c == delimiter or c == quote or c == escape or c == '\n' or c == '\r') {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (!needs_quote) {
+        try writer.writeAll(field);
+        return;
+    }
+    try writer.writeByte(quote);
+    for (field) |c| {
+        if (c == quote or c == escape) try writer.writeByte(escape);
+        try writer.writeByte(c);
+    }
+    try writer.writeByte(quote);
 }
 
 fn parseBulkSqlCsvRecordAlloc(

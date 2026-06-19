@@ -1337,6 +1337,14 @@ pub const TableReadSource = struct {
             plan: db_mod.types.RelationalRowsQueryPlan,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_query_plan_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
         rows_aggregate_plan: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1657,6 +1665,18 @@ pub const TableReadSource = struct {
     ) !?db_mod.types.RelationalRowsQueryResult {
         const fn_ptr = self.vtable.rows_query_plan orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsQueryPlanCatalog(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_query_plan_catalog orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, runtime_schema, plan, consistency);
     }
 
     pub fn rowsAggregatePlan(
@@ -2887,6 +2907,7 @@ pub const ProvisionedTableReadSource = struct {
                 .relational_temporal_unique_owner_lookup_group_local = ProvisionedTableReadSource.relationalTemporalUniqueOwnerLookupGroupLocal,
                 .relational_temporal_unique_overlap_owner_lookup_group_local = ProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
+                .rows_query_plan_catalog = rowsQueryPlanCatalogNative,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
@@ -3280,6 +3301,20 @@ pub const ProvisionedTableReadSource = struct {
         return try rowsQueryPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
     }
 
+    fn rowsQueryPlanCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try rowsQueryPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
     fn rowsAggregatePlan(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3589,6 +3624,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .relational_temporal_unique_owner_lookup_group_local = HostedProvisionedTableReadSource.relationalTemporalUniqueOwnerLookupGroupLocal,
                 .relational_temporal_unique_overlap_owner_lookup_group_local = HostedProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
+                .rows_query_plan_catalog = HostedProvisionedTableReadSource.rowsQueryPlanCatalogNative,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
@@ -3900,6 +3936,20 @@ pub const HostedProvisionedTableReadSource = struct {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const routed_source = self.source();
         return try rowsQueryPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsQueryPlanCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try rowsQueryPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
     }
 
     fn rowsAggregatePlan(
@@ -5866,6 +5916,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .relational_temporal_unique_owner_lookup_group_local = relationalTemporalUniqueOwnerLookupGroupLocal,
                 .relational_temporal_unique_overlap_owner_lookup_group_local = relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
+                .rows_query_plan_catalog = rowsQueryPlanCatalog,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .lake_rows_scan = lakeRowsScan,
                 .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
@@ -5975,6 +6026,14 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
         return try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsQueryPlanCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsQueryPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source == null) return try self.base.rowsQueryPlanCatalog(alloc, target, runtime_schema, plan, consistency);
+        var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
+        defer lake_source.deinit();
+        return try lake_source.source().rowsQueryPlan(alloc, target.table_name, runtime_schema, plan, consistency);
     }
 
     fn rowsAggregatePlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsAggregatePlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsAggregateResult {
