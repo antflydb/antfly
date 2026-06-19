@@ -213,6 +213,8 @@ pub const MergeNotMatchedArm = struct {
 pub const LoweredMergeMutationPlan = struct {
     target_table_name: []const u8,
     source_table_name: []const u8,
+    ctes: []const db_mod.types.RelationalRowsCte = &.{},
+    source: db_mod.types.RelationalRowsQueryRequest = .{},
     match_fields: []const MergeFieldMapping = &.{},
     matched_arms: []const MergeMatchedArm = &.{},
     not_matched_arms: []const MergeNotMatchedArm = &.{},
@@ -221,6 +223,12 @@ pub const LoweredMergeMutationPlan = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.target_table_name);
         alloc.free(self.source_table_name);
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.source.deinit(alloc);
         freeMergeFieldMappings(alloc, self.match_fields);
         freeMergeMatchedArms(alloc, self.matched_arms);
         freeMergeNotMatchedArms(alloc, self.not_matched_arms);

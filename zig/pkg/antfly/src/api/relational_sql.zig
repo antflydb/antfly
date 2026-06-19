@@ -9660,6 +9660,44 @@ const Parser = struct {
     }
 
     fn parseMergeMutationPlan(self: *@This()) !LoweredMergeMutationPlan {
+        if (!self.peekKeyword("with")) return try self.parseMergeMutationBody(&.{}, null);
+
+        var base_table_name: ?[]const u8 = null;
+        defer if (base_table_name) |table| self.alloc.free(table);
+        const previous_schema = self.schema;
+        self.schema = self.joined_source_schema orelse self.schema;
+        var ctes = self.parseCtesForPlanAlloc(&base_table_name) catch |err| {
+            self.schema = previous_schema;
+            return err;
+        };
+        self.schema = previous_schema;
+        errdefer {
+            for (ctes) |cte| {
+                var owned = cte;
+                owned.deinit(self.alloc);
+            }
+            if (ctes.len > 0) self.alloc.free(ctes);
+        }
+
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = ctes;
+        defer self.available_ctes = previous_available_ctes;
+
+        var final = try self.parseMergeMutationBody(ctes, &base_table_name);
+        errdefer final.deinit(self.alloc);
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        _ = base_table_name orelse return error.UnsupportedSqlShape;
+        final.ctes = ctes;
+        ctes = &.{};
+        return final;
+    }
+
+    fn parseMergeMutationBody(
+        self: *@This(),
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) !LoweredMergeMutationPlan {
         try self.expectKeyword("merge");
         try self.expectKeyword("into");
         const target_table = try self.parseTableAliasAlloc();
@@ -9668,6 +9706,30 @@ const Parser = struct {
         const source_table = try self.parseTableAliasAlloc();
         defer freeTableAlias(self.alloc, source_table);
         if (std.mem.eql(u8, target_table.alias, source_table.alias)) return error.UnsupportedSqlShape;
+
+        var source = db_mod.types.RelationalRowsQueryRequest{};
+        errdefer source.deinit(self.alloc);
+        var resolved_source_table = source_table.name;
+        const base_source_schema = self.joined_source_schema orelse self.schema;
+        const previous_joined_source_schema = self.joined_source_schema;
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        if (ctes.len != 0) {
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, base_source_schema, ctes);
+            if (relational_rows.rowsPlannedCteSchema(planned_ctes, source_table.name)) |cte_schema| {
+                source.source_cte = try self.alloc.dupe(u8, source_table.name);
+                self.joined_source_schema = cte_schema;
+                resolved_source_table = (base_table_name orelse return error.UnsupportedSqlShape).* orelse return error.UnsupportedSqlShape;
+            } else {
+                const base_ptr = base_table_name orelse return error.UnsupportedSqlShape;
+                if (base_ptr.*) |base| {
+                    if (!std.mem.eql(u8, base, source_table.name)) return error.UnsupportedSqlShape;
+                } else {
+                    base_ptr.* = try self.alloc.dupe(u8, source_table.name);
+                }
+            }
+        }
+        defer self.joined_source_schema = previous_joined_source_schema;
 
         try self.expectKeyword("on");
         var match_fields = std.ArrayListUnmanaged(MergeFieldMapping).empty;
@@ -9856,12 +9918,15 @@ const Parser = struct {
             const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
             returning = try self.parseReturningProjectionAlloc(&returning_qualifiers);
         }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        if (ctes.len == 0) {
+            if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+            if (!self.atEnd()) return error.UnsupportedSqlShape;
+        }
 
         return .{
             .target_table_name = try self.alloc.dupe(u8, target_table.name),
-            .source_table_name = try self.alloc.dupe(u8, source_table.name),
+            .source_table_name = try self.alloc.dupe(u8, resolved_source_table),
+            .source = source,
             .match_fields = try match_fields.toOwnedSlice(self.alloc),
             .matched_arms = try matched_arms.toOwnedSlice(self.alloc),
             .not_matched_arms = try not_matched_arms.toOwnedSlice(self.alloc),
@@ -58380,10 +58445,12 @@ fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWritePlan
         .merge_mutation => |merge| blk: {
             var fingerprint = try std.fmt.allocPrint(
                 alloc,
-                "merge_mutation:target={s}:source={s}:match={d}:matched_pred={d}:matched_update={d}:matched_delete={d}:matched_noop={d}:not_matched_pred={d}:not_matched_insert={d}:not_matched_noop={d}:returning={d}:returning_expr={d}:returning_all={d}",
+                "merge_mutation:target={s}:source={s}:ctes={d}:source_cte={d}:match={d}:matched_pred={d}:matched_update={d}:matched_delete={d}:matched_noop={d}:not_matched_pred={d}:not_matched_insert={d}:not_matched_noop={d}:returning={d}:returning_expr={d}:returning_all={d}",
                 .{
                     merge.target_table_name,
                     merge.source_table_name,
+                    merge.ctes.len,
+                    @as(u8, if (merge.source.source_cte.len > 0) 1 else 0),
                     merge.match_fields.len,
                     mergeMatchedPredicateCount(merge.matched_arms),
                     mergeMatchedUpdateCount(merge.matched_arms),
@@ -58407,6 +58474,7 @@ fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWritePlan
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "not_matched_expr_not", mergeNotMatchedExpressionNotPredicateCount(merge.not_matched_arms));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "matched_arms", if (merge.matched_arms.len > 1) merge.matched_arms.len else 0);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "not_matched_arms", if (merge.not_matched_arms.len > 1) merge.not_matched_arms.len else 0);
+            fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, merge.ctes);
             break :blk fingerprint;
         },
     };
@@ -58767,6 +58835,7 @@ fn expectAppParityWriteSummary(summary: AppParityPlanSummary, lowered: LoweredWr
         },
         .merge_mutation => |merge_mutation| {
             try expectOptionalTableName(summary.table_name, merge_mutation.target_table_name);
+            try expectOptionalUsize(summary.ctes, merge_mutation.ctes.len);
             try expectOptionalUsize(summary.join_on, merge_mutation.match_fields.len);
             try expectOptionalUsize(summary.matched_predicates, mergeMatchedPredicateCount(merge_mutation.matched_arms));
             try expectOptionalUsize(summary.operations, mergeMatchedUpdateCount(merge_mutation.matched_arms));
@@ -59474,7 +59543,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .offset = 3 },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -59698,7 +59767,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1 },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -59706,7 +59775,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status)",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .select = 2 },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -59714,7 +59783,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status)",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .select = 2 },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc);
 
     try validateAppParityFixtureMetadata(.{
@@ -59762,7 +59831,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.id",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .returning = 1, .returning_all = false },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=1:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=1:returning_expr=0:returning_all=0",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -59946,7 +60015,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1 },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=0:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=0:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -60138,7 +60207,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .row_claim_skip_locked = false },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -60170,7 +60239,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'old' THEN UPDATE SET status = source.status",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .matched_predicates = 1 },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -60178,7 +60247,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN DELETE",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .matched_delete = true },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -60186,7 +60255,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .matched_delete = false, .matched_do_nothing = false, .not_matched_do_nothing = false },
-        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{

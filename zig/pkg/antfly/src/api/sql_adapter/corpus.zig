@@ -4180,6 +4180,7 @@ pub const AppParityCorpusCoverage = struct {
     read_row_lock_share: bool = false,
     read_row_lock_key_share: bool = false,
     query_row_lock_no_key_update: bool = false,
+    merge_mutation_cte: bool = false,
     merge_mutation_typed_plan: bool = false,
     merge_mutation_default_expressions: bool = false,
     unsupported_write_truncate_multi_table: bool = false,
@@ -4191,7 +4192,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_read_row_lock_target: bool = false,
     unsupported_update_source_row_lock_target: bool = false,
     unsupported_update_joined_source_row_lock_target: bool = false,
-    unsupported_merge_mutation_cte: bool = false,
     update_identity_rewrite: bool = false,
     unsupported_delete_multi_output_subquery_selector: bool = false,
     unsupported_update_joined_multi_output_subquery_selector: bool = false,
@@ -5224,7 +5224,12 @@ pub const AppParityCorpusCoverage = struct {
                     (std.mem.startsWith(u8, entry.sql, "WITH ") and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":ctes=", 1));
             },
-            .merge_mutation => self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.startsWith(u8, entry.plan, "merge_mutation:"),
+            .merge_mutation => {
+                self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.startsWith(u8, entry.plan, "merge_mutation:");
+                self.merge_mutation_cte = self.merge_mutation_cte or
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
+            },
             .adapter_noop_ddl => self.adapter_noop_ddl = true,
             .unsupported => self.unsupported_query = true,
             .unsupported_read => self.unsupported_read = true,
@@ -5367,11 +5372,6 @@ pub const AppParityCorpusCoverage = struct {
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF source") != null);
         } else if (entry.family == .unsupported_delete_joined_source) {
             self.unsupported_delete_joined_multi_output_subquery_selector = self.unsupported_delete_joined_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
-        } else if (entry.family == .unsupported_merge_mutation) {
-            self.unsupported_merge_mutation_cte = self.unsupported_merge_mutation_cte or
-                (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
-                    std.mem.startsWith(u8, entry.sql, "WITH ") and
-                    std.mem.indexOf(u8, entry.sql, " MERGE ") != null);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -6323,7 +6323,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_row_lock_target);
         try std.testing.expect(self.unsupported_update_source_row_lock_target);
         try std.testing.expect(self.unsupported_update_joined_source_row_lock_target);
-        try std.testing.expect(self.unsupported_merge_mutation_cte);
+        try std.testing.expect(self.merge_mutation_cte);
         try std.testing.expect(self.update_identity_rewrite);
         try std.testing.expect(self.unsupported_delete_multi_output_subquery_selector);
         try std.testing.expect(self.unsupported_update_joined_multi_output_subquery_selector);

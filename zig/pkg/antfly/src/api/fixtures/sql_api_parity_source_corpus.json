@@ -92,6 +92,13 @@
       "sql": "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
     },
     {
+      "name": "unsupported recursive cte merge mutation plan",
+      "family": "unsupported_merge_mutation",
+      "plan": "unsupported:merge_mutation:requires=recursive_cte_stream_plan",
+      "classification_reason": "recursive_cte_stream_plan",
+      "sql": "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
+    },
+    {
       "name": "unsupported deferrable unique constraint",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=deferrable_unique_constraint",
@@ -5285,7 +5292,7 @@
         "operations": 1,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status)"
     },
     {
@@ -5298,7 +5305,7 @@
         "returning": 2,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=archived_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=3:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=archived_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=3:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archive_id\":{\"type\":\"keyword\"},\"archive_status\":{\"type\":\"keyword\"},\"archive_amount\":{\"type\":\"numeric\"}},\"required\":[\"archive_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"archive_id\"]}}",
       "sql": "MERGE INTO usage_records AS target USING archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = source.archive_status WHEN NOT MATCHED THEN INSERT (id, status, amount) VALUES (source.archive_id, source.archive_status, source.archive_amount) RETURNING target.id, target.status"
     },
@@ -5313,7 +5320,7 @@
         "matched_predicates": 1,
         "not_matched_predicates": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=1:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'open' THEN UPDATE SET status = source.status WHEN NOT MATCHED AND source.status = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
     },
     {
@@ -5325,7 +5332,7 @@
         "matched_predicates": 1,
         "matched_delete": true
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND source.status = 'deleted' THEN DELETE"
     },
     {
@@ -5339,7 +5346,7 @@
         "not_matched_predicates": 1,
         "not_matched_do_nothing": true
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'locked' THEN DO NOTHING WHEN NOT MATCHED AND source.status = 'ignored' THEN DO NOTHING"
     },
     {
@@ -5352,7 +5359,7 @@
         "returning_all": false,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.id, lower(target.status) AS status_key"
     },
     {
@@ -5363,7 +5370,7 @@
         "select": 1,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, upper(source.status))"
     },
     {
@@ -5374,7 +5381,7 @@
         "select": 1,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = DEFAULT WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, DEFAULT)"
     },
     {
@@ -5386,7 +5393,7 @@
         "operations": 1,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_pred=1:not_matched_expr_pred=1",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_pred=1:not_matched_expr_pred=1",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND lower(target.status) = lower(source.status) THEN UPDATE SET status = source.status WHEN NOT MATCHED AND lower(source.status) = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
     },
     {
@@ -5398,7 +5405,7 @@
         "operations": 1,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_or=2:not_matched_expr_not=1",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_or=2:not_matched_expr_not=1",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND (lower(target.status) = lower(source.status) OR upper(source.status) = 'READY') THEN UPDATE SET status = source.status WHEN NOT MATCHED AND NOT (lower(source.status) = 'blocked') THEN INSERT (id, status) VALUES (source.id, source.status)"
     },
     {
@@ -5413,7 +5420,7 @@
         "not_matched_predicates": 1,
         "not_matched_do_nothing": true
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=2:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:matched_expr_pred=1:not_matched_expr_pred=1:matched_arms=2:not_matched_arms=2",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=2:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:matched_expr_pred=1:not_matched_expr_pred=1:matched_arms=2:not_matched_arms=2",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'locked' THEN DO NOTHING WHEN MATCHED AND lower(source.status) != lower(target.status) THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED AND source.status = 'ignored' THEN DO NOTHING WHEN NOT MATCHED AND lower(source.status) = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
     },
     {
@@ -5426,7 +5433,7 @@
         "returning": 1,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=source_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN NOT MATCHED AND source.status = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status) RETURNING target.id, lower(target.status) AS status_key"
     },
     {
@@ -5438,7 +5445,7 @@
         "returning": 2,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=prices:source=prices:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
+      "plan": "merge_mutation:target=prices:source=prices:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
       "apply_setup_sql": [
         "CREATE TABLE prices (sku text NOT NULL, source_id text, valid_from numeric NOT NULL, valid_to numeric NOT NULL, status text, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS))"
       ],
@@ -5823,10 +5830,15 @@
       "sql": "WITH stale_sources AS (SELECT id, status FROM source_records WHERE status = 'stale') DELETE FROM usage_records USING stale_sources AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id"
     },
     {
-      "name": "unsupported cte-backed merge mutation",
-      "family": "unsupported_merge_mutation",
-      "plan": "unsupported:merge_mutation:requires=cte_mutation_source_plan",
-      "classification_reason": "cte_mutation_source_plan",
+      "name": "cte-backed merge mutation",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=archived_records:ctes=1:source_cte=1:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
       "sql": "WITH ready_sources AS (SELECT id, status FROM archived_records WHERE status = 'ready') MERGE INTO usage_records AS target USING ready_sources AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status"
     },
     {

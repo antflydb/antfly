@@ -1390,9 +1390,11 @@ source-side CTE update/delete forms into that native request when the CTE is
 non-recursive and source-side only, including direct joined forms such as
 `WITH ... UPDATE ... FROM source_cte` / `WITH ... DELETE ... USING source_cte`
 and semijoin selectors such as `WHERE id IN (SELECT id FROM source_cte)`.
-`WITH ... MERGE` and recursive CTE-backed writes still fail closed under
-`cte_mutation_source_plan` until they are lowered through the same typed
-dependency and source-side CTE contract.
+Non-recursive `WITH ... MERGE` now lowers into the same typed MERGE plan with
+owned source CTE metadata and a source-side CTE reference, so the source stream
+remains an Antfly row-plan input rather than SQL text attached to execution.
+Recursive CTE-backed writes still fail closed under `recursive_cte_stream_plan`
+until recursive stream planning has a bounded native execution model.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.
