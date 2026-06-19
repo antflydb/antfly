@@ -913,6 +913,15 @@ Unsupported plan features such as CTE ranges, grouped aggregates, expression
 aggregates, ordering, joins, windows, and broader predicates still fail closed
 until the lake executor implements those typed shapes directly.
 
+Iceberg external sources pin reads to a table metadata file and snapshot id,
+then derive the row inventory from that snapshot's manifest list and data
+manifests. Active Iceberg delete manifests are parsed into a typed delete plan,
+and position-delete rows can be mapped to Antfly external row refs once the data
+file inventory has row-group metadata. Full query execution still fails closed
+when active Iceberg deletes are present until delete-file row decoding and scan
+filtering are wired into the lake row-source executor. Equality deletes remain
+tracked in the delete plan but unsupported for row filtering.
+
 ### SQL adapter boundary
 
 Relational mode is the storage and API substrate that a SQL DSL can target. It
