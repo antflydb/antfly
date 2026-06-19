@@ -3322,6 +3322,7 @@ pub fn build(b: *std.Build) void {
             "ARD search supports publisher and metadata filters",
             "ARD search validates federation and returns referral envelope",
             "ARD explore returns requested facet buckets over scoped entries",
+            "ARD catalog entries contain required value or reference fields",
             "ARD catalog resolves artifact urls against configured base url",
             "ARD MCP descriptors resolve endpoints against configured base url",
             "ARD catalog hides admin-only built-in skills from non-admin entries",

@@ -2350,7 +2350,48 @@ fn trimTrailingSlashes(value: []const u8) []const u8 {
 }
 
 test "ARD catalog entries contain required value or reference fields" {
-    const body = try catalogJsonAlloc(std.testing.allocator, .{ .mode = .tenant });
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "docsaf",
+        .version = "1.0.0",
+        .digest = "sha256:docs",
+        .trusted = true,
+        .capabilities_requested = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .artifacts = &.{.{ .kind = .wasm, .path = "docsaf.wasm", .digest = "sha256:docs-wasm" }},
+        .install = .{ .scopes_supported = &.{.table} },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "docsaf",
+        .package_name = "docsaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:docs",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .granted_capabilities = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "docsaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .mcp_tool,
+            .object_name = "search_docs",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"description\":\"Search docs\",\"input_schema\":{\"type\":\"object\"}}",
+        },
+        .{
+            .extension_name = "docsaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .skill,
+            .object_name = "docs",
+            .owner_metadata_json = "{\"displayName\":\"Docsaf Skill\",\"description\":\"Use Docsaf from ARD.\",\"tags\":[\"docs\"],\"capabilities\":[\"docs-search\"],\"body\":\"# Docsaf\"}",
+        },
+    };
+    const ctx: ExtensionCatalogContext = .{
+        .extension_packages = &packages,
+        .installed_extensions = &installed,
+        .extension_members = &members,
+    };
+
+    const body = try catalogJsonWithExtensionsAlloc(std.testing.allocator, .{ .mode = .tenant }, ctx);
     defer std.testing.allocator.free(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -2360,7 +2401,11 @@ test "ARD catalog entries contain required value or reference fields" {
     try std.testing.expect(root.get("specVersion") != null);
     try std.testing.expect(root.get("host").?.object.get("trustManifest") != null);
     const entries = root.get("entries").?.array.items;
-    try std.testing.expect(entries.len >= 9);
+    try std.testing.expect(entries.len >= 13);
+    _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension-package:docsaf:1.0.0");
+    _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:installed");
+    _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:mcp");
+    _ = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:skill:docs");
     for (entries) |entry| {
         const object = entry.object;
         try std.testing.expect(object.get("identifier") != null);
