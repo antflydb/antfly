@@ -147,10 +147,11 @@ Current status:
   posting-delta-record buffers also grow geometrically across reused query
   scratch handles; member-id scratch starts empty and grows on first
   materialization instead of being allocated at the configured max leaf size for
-  every query scratch. Distance/error-bound scratch also starts empty and grows
-  on first scoring use instead of being allocated for the initial candidate
-  ceiling. The grouped query/distance slabs now grow geometrically
-  instead of resizing exactly to each transient candidate count. Small
+  every query scratch. Query-result and distance/error-bound scratch also start
+  empty and grow on first metadata/rerank/scoring use instead of being
+  allocated for the initial candidate ceiling. The grouped query/distance slabs
+  now grow geometrically instead of resizing exactly to each transient
+  candidate count. Small
   transformed-vector matrix loads now use stack-backed lookup, vector-view, and
   batch-vector scratch before falling back to heap allocation.
 - Delete-heavy posting mutations now switch `PostingStore.removeMembers` from

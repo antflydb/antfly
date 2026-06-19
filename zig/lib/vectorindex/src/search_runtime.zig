@@ -208,7 +208,8 @@ pub const SearchScratch = struct {
         max_posting_member_cache_bytes: u64,
         max_posting_member_cache_entry_bytes: u64,
     ) !SearchScratch {
-        const max_candidates = @max(max_branching, max_leaf);
+        _ = max_branching;
+        _ = max_leaf;
         const estimate = try quantizer.RaBitQuantizer.EstimateScratch.init(alloc, dims);
         errdefer {
             var tmp = estimate;
@@ -220,9 +221,6 @@ pub const SearchScratch = struct {
         const transformed_query = vector_storage[0..dims];
         const centroid = vector_storage[dims .. 2 * dims];
         const vector = vector_storage[2 * dims .. 3 * dims];
-        const query_storage = try allocateQueryStorage(alloc, max_candidates);
-        errdefer alloc.free(query_storage);
-        const query_views = carveQueryStorage(query_storage, max_candidates);
         return .{
             .dims = dims,
             .estimate = estimate,
@@ -232,15 +230,15 @@ pub const SearchScratch = struct {
             .vector = vector,
             .vector_batch = &.{},
             .member_ids = &.{},
-            .query_storage = query_storage,
-            .vector_ids = query_views.vector_ids,
-            .metadata = query_views.metadata,
-            .flags = query_views.flags,
-            .positions = query_views.positions,
-            .lookups = query_views.lookups,
-            .key_views = query_views.key_views,
-            .values = query_views.values,
-            .vector_views = query_views.vector_views,
+            .query_storage = &.{},
+            .vector_ids = &.{},
+            .metadata = &.{},
+            .flags = &.{},
+            .positions = &.{},
+            .lookups = &.{},
+            .key_views = &.{},
+            .values = &.{},
+            .vector_views = &.{},
             .distance_storage = &.{},
             .distances = &.{},
             .error_bounds = &.{},
@@ -251,10 +249,8 @@ pub const SearchScratch = struct {
             ),
             .scratch_allocation_count = initialScratchAllocationCount(.{
                 vector_storage,
-                query_storage,
             }),
-            .scratch_allocation_bytes = byteLen(vector_storage) +
-                byteLen(query_storage),
+            .scratch_allocation_bytes = byteLen(vector_storage),
         };
     }
 
@@ -293,6 +289,10 @@ pub const SearchScratch = struct {
 
     pub fn ensureDistanceOnlyCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         try self.ensureDistanceStorageCapacity(alloc, needed);
+    }
+
+    pub fn ensureQueryCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        try self.ensureQueryStorageCapacity(alloc, needed);
     }
 
     fn ensureQueryStorageCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -924,15 +924,16 @@ test "SearchScratch grows distance capacity without vector fetch buffers" {
     defer scratch.deinit(alloc);
 
     const vector_batch_len = scratch.vector_batch.len;
-    const vector_ids_len = scratch.vector_ids.len;
+    try std.testing.expectEqual(@as(usize, 0), scratch.query_storage.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_ids.len);
 
     try scratch.ensureDistanceCapacity(alloc, 5);
 
     try std.testing.expect(scratch.positions.len >= 5);
+    try std.testing.expect(scratch.vector_ids.len >= 5);
     try std.testing.expect(scratch.distances.len >= 5);
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expectEqual(vector_batch_len, scratch.vector_batch.len);
-    try std.testing.expectEqual(vector_ids_len, scratch.vector_ids.len);
 }
 
 test "SearchScratch grows distance-only capacity without query slab" {
@@ -940,16 +941,18 @@ test "SearchScratch grows distance-only capacity without query slab" {
     var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
     defer scratch.deinit(alloc);
 
+    try std.testing.expectEqual(@as(usize, 0), scratch.query_storage.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.positions.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_ids.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.distance_storage.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.distances.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.error_bounds.len);
-    const positions_len = scratch.positions.len;
-    const vector_ids_len = scratch.vector_ids.len;
 
     try scratch.ensureDistanceOnlyCapacity(alloc, 5);
 
-    try std.testing.expectEqual(positions_len, scratch.positions.len);
-    try std.testing.expectEqual(vector_ids_len, scratch.vector_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.query_storage.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.positions.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_ids.len);
     try std.testing.expect(scratch.distances.len >= 5);
     try std.testing.expect(scratch.error_bounds.len >= 5);
 }

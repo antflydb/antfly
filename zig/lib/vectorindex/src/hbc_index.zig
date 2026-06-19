@@ -4604,6 +4604,7 @@ pub fn populateMetadata(self: anytype, txn: anytype, results: *search_results.Se
 fn populateMetadataWithScratch(self: anytype, txn: anytype, results: *search_results.SearchResults, scratch: anytype) !void {
     try self.bindTxnLike(txn);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
+        try scratch.ensureQueryCapacity(self.alloc, results.items.items.len);
         try populateMetadataBatchedWithScratch(self, txn, results, scratch.lookups, scratch.key_views, scratch.values);
         return;
     }
