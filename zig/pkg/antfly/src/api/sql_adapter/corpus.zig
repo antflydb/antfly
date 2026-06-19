@@ -683,8 +683,15 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         for (entries.items) |entry| freeFixtureEntry(alloc, entry);
         entries.deinit(alloc);
     }
+    var seen_names = std.StringHashMapUnmanaged(void){};
+    defer seen_names.deinit(alloc);
+
     for (entry_values) |entry_value| {
-        try entries.append(alloc, try parseFixtureEntryAlloc(alloc, entry_value));
+        const entry = try parseFixtureEntryAlloc(alloc, entry_value);
+        errdefer freeFixtureEntry(alloc, entry);
+        if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
+        try seen_names.put(alloc, entry.name, {});
+        try entries.append(alloc, entry);
     }
 
     return .{
@@ -3030,6 +3037,35 @@ test "sql adapter corpus parses source corpus root entries" {
     try std.testing.expectEqualStrings("prepare statement protocol plan", root.entries[0].name);
     try std.testing.expectEqual(AppParityCorpusPlanFamily.ddl, root.entries[0].family);
     try std.testing.expectEqual(AppParityDdlTag.prepare_statement, root.entries[0].summary.ddl_tag.?);
+}
+
+test "sql adapter source corpus rejects duplicate entry names" {
+    const alloc = std.testing.allocator;
+    const source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "duplicate source entry",
+        \\      "family": "ddl",
+        \\      "summary": {"ddl_tag": "show_search_path"},
+        \\      "plan": "ddl:session:show_search_path",
+        \\      "sql": "SHOW search_path"
+        \\    },
+        \\    {
+        \\      "name": "duplicate source entry",
+        \\      "family": "ddl",
+        \\      "summary": {"ddl_tag": "discard_all"},
+        \\      "plan": "ddl:session:discard_all",
+        \\      "sql": "DISCARD ALL"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed.value));
 }
 
 test "sql adapter corpus encodes fixture roots and entries" {
@@ -6272,7 +6308,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.update_joined_source_row_assignment_constructor);
     }
 
-    pub fn expectSeededBooleanAssignmentCoverage(self: @This()) !void {
+    pub fn expectBooleanAssignmentCoverage(self: @This()) !void {
         try std.testing.expect(self.conflict_boolean_expression_update);
         try std.testing.expect(self.update_source_boolean_expression_update);
         try std.testing.expect(self.update_joined_source_boolean_expression_update);

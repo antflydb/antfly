@@ -54469,29 +54469,6 @@ fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityE
     };
 }
 
-fn appParityCombinedCorpusAlloc(
-    alloc: std.mem.Allocator,
-    seed_corpus: []const AppParityCorpusEntry,
-    source_corpus: []const AppParityCorpusEntry,
-) ![]const AppParityCorpusEntry {
-    var seen_names = std.StringHashMapUnmanaged(void){};
-    defer seen_names.deinit(alloc);
-
-    var combined = try std.ArrayListUnmanaged(AppParityCorpusEntry).initCapacity(alloc, seed_corpus.len + source_corpus.len);
-    errdefer combined.deinit(alloc);
-    for (seed_corpus) |entry| {
-        if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
-        try seen_names.put(alloc, entry.name, {});
-        combined.appendAssumeCapacity(entry);
-    }
-    for (source_corpus) |entry| {
-        if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
-        try seen_names.put(alloc, entry.name, {});
-        combined.appendAssumeCapacity(entry);
-    }
-    return try combined.toOwnedSlice(alloc);
-}
-
 fn expectOptionalUsize(expected: ?usize, actual: usize) !void {
     if (expected) |value| try std.testing.expectEqual(value, actual);
 }
@@ -58427,26 +58404,6 @@ fn validateAppParityFixtureMetadata(
     return validateAppParityFixtureMetadataWithBaseSchema(entry, "", seen_names, alloc);
 }
 
-test "app parity combined source corpus rejects duplicate names" {
-    const alloc = std.testing.allocator;
-    const seed = [_]AppParityCorpusEntry{.{
-        .name = "duplicate source entry",
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .show_search_path },
-        .plan = "ddl:session:show_search_path",
-        .sql = "SHOW search_path",
-    }};
-    const source = [_]AppParityCorpusEntry{.{
-        .name = "duplicate source entry",
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .discard_all },
-        .plan = "ddl:session:discard_all",
-        .sql = "DISCARD ALL",
-    }};
-
-    try std.testing.expectError(error.TestUnexpectedResult, appParityCombinedCorpusAlloc(alloc, &seed, &source));
-}
-
 test "app parity fixture metadata requires typed summary anchors" {
     const alloc = std.testing.allocator;
     var seen = std.StringHashMapUnmanaged(void){};
@@ -59960,17 +59917,14 @@ test "postgres sql adapter classifies application parity corpus" {
         .txn_id = txn_id,
     };
 
-    const corpus = [_]AppParityCorpusEntry{};
-
     var external_source = try parseAppParityExternalSourceCorpusAlloc(alloc);
     defer external_source.deinit(alloc);
-    const combined_corpus = try appParityCombinedCorpusAlloc(alloc, &corpus, external_source.root.entries);
-    defer alloc.free(combined_corpus);
+    const corpus = external_source.root.entries;
 
-    try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, combined_corpus);
+    try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, corpus);
 
     var coverage = AppParityCorpusCoverage{};
-    for (combined_corpus) |entry| {
+    for (corpus) |entry| {
         errdefer std.debug.print("application parity corpus entry failed: {s}\n", .{entry.name});
         try coverage.observe(alloc, entry);
         try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
@@ -59981,7 +59935,7 @@ test "postgres sql adapter classifies application parity corpus" {
     try coverage.expectRegexpCoverage();
     try coverage.expectArrayCoverage();
     try coverage.expectRowAssignmentCoverage();
-    try coverage.expectSeededBooleanAssignmentCoverage();
+    try coverage.expectBooleanAssignmentCoverage();
     try coverage.expectJsonSetCoverage();
     try coverage.expectJsonExpressionCoverage();
     try coverage.expectConflictBooleanGuardCoverage();
