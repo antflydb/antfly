@@ -297,6 +297,35 @@ test "storage.ha chaos rejects noncontiguous records and follows timeline switch
     }
 }
 
+test "storage.ha chaos rejects out-of-order WAL without poisoning receive cursor" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "out-of-order");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    try std.testing.expectError(error.UnexpectedRecordLsn, standby.receive(baseRecord(identity, 2, "two-before-one")));
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), standby.nextReceiveLsn());
+
+    try std.testing.expectEqual(@as(u64, 1), try standby.receive(baseRecord(identity, 1, "one")));
+    try std.testing.expectError(error.UnexpectedRecordLsn, standby.receive(baseRecord(identity, 3, "three-before-two")));
+    try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), standby.nextReceiveLsn());
+
+    try std.testing.expectEqual(@as(u64, 2), try standby.receive(baseRecord(identity, 2, "two")));
+    try std.testing.expectEqual(@as(u64, 3), try standby.receive(baseRecord(identity, 3, "three")));
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(usize, 3), try standby.applyAvailable(&capture, ApplyCapture.apply));
+    try std.testing.expectEqualStrings("one", capture.payloads.items[0]);
+    try std.testing.expectEqualStrings("two", capture.payloads.items[1]);
+    try std.testing.expectEqualStrings("three", capture.payloads.items[2]);
+}
+
 test "storage.ha chaos crash during apply preserves remote write and blocks remote apply" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "apply-crash");
