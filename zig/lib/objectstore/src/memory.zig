@@ -349,10 +349,14 @@ test "memory client supports put get stat list and delete" {
     var got = try client.getObject("bucket", "a/one", .{});
     defer got.deinit(alloc);
     try std.testing.expectEqualStrings("alpha", got.body);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, got.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings(put.etag.?, got.metadata.checksum.?.value);
 
     var meta = try client.statObject("bucket", "a/one");
     defer meta.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings(put.etag.?, meta.checksum.?.value);
 
     var listed = try client.listObjects("bucket", .{ .prefix = "a/" });
     defer listed.deinit(alloc);

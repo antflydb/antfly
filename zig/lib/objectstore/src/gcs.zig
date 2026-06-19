@@ -971,7 +971,7 @@ test "json api client get object uses metadata then media with auth and range" {
                     try expectHeader(headers, "Authorization", "Bearer token-123");
                     return .{
                         .status = 200,
-                        .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"folder/doc.txt\",\"etag\":\"etag-1\",\"generation\":\"42\",\"size\":\"11\",\"contentType\":\"text/plain\"}"),
+                        .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"folder/doc.txt\",\"etag\":\"etag-1\",\"generation\":\"42\",\"size\":\"11\",\"contentType\":\"text/plain\",\"md5Hash\":\"md5-body\"}"),
                     };
                 },
                 1 => {
@@ -1010,6 +1010,8 @@ test "json api client get object uses metadata then media with auth and range" {
     try std.testing.expectEqualStrings("folder/doc.txt", result.metadata.key);
     try std.testing.expectEqualStrings("etag-1", result.metadata.etag.?);
     try std.testing.expectEqualStrings("42", result.metadata.version_id.?);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.md5_base64, result.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("md5-body", result.metadata.checksum.?.value);
     try std.testing.expectEqualStrings("text/plain", result.metadata.content_type.?);
 }
 

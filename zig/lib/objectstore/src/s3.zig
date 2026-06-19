@@ -1305,6 +1305,7 @@ test "s3 client signs and issues object operations through request fn" {
         content_type: ?[]const u8 = null,
         content_length: ?u64 = null,
         version_id: ?[]const u8 = null,
+        checksum_sha256: ?[]const u8 = null,
         expect_body: ?[]const u8 = null,
     };
 
@@ -1339,6 +1340,7 @@ test "s3 client signs and issues object operations through request fn" {
                 .content_type = if (step.content_type) |value| try req_alloc.dupe(u8, value) else null,
                 .content_length = step.content_length,
                 .version_id = if (step.version_id) |value| try req_alloc.dupe(u8, value) else null,
+                .checksum_sha256 = if (step.checksum_sha256) |value| try req_alloc.dupe(u8, value) else null,
             };
         }
 
@@ -1354,9 +1356,9 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .HEAD, .url_contains = "/bucket", .status = 404 },
         .{ .method = .PUT, .url_contains = "/bucket", .status = 200 },
         .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_body = "hello" },
-        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
-        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 200, .body = "hello", .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
-        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
+        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_sha256 = "sha256-head" },
+        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 200, .body = "hello", .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_sha256 = "sha256-get" },
+        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_sha256 = "sha256-head" },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };
@@ -1387,10 +1389,14 @@ test "s3 client signs and issues object operations through request fn" {
     defer get.deinit(alloc);
     try std.testing.expectEqualStrings("hello", get.body);
     try std.testing.expectEqualStrings("etag-head", get.metadata.etag.?);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, get.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("sha256-get", get.metadata.checksum.?.value);
 
     var meta = try client.statObject("bucket", "docs/a.txt");
     defer meta.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("sha256-head", meta.checksum.?.value);
 
     var listed = try client.listObjects("bucket", .{ .prefix = "docs/" });
     defer listed.deinit(alloc);

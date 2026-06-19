@@ -95,6 +95,8 @@ const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const parseOwnedJsonObjectMapAlloc = json_helpers.parseOwnedJsonObjectMapAlloc;
 
+pub const default_external_lake_serving_cache_max_bytes: usize = 64 * 1024 * 1024;
+
 const TestSseEvent = struct {
     event: []const u8,
     data: []const u8,
@@ -259,13 +261,15 @@ pub const ApiHttpServerConfig = struct {
     /// bindings only.
     external_lake_object_store_resolver: ?table_reads.ExternalLakeObjectStoreResolver = null,
     /// Optional per-open serving range-cache budget for external lake row reads.
-    /// When set, opened external lake sources own an object-range cache with the
-    /// named lake-serving policy.
+    /// Defaults to `default_external_lake_serving_cache_max_bytes`. Opened
+    /// external lake sources own an object-range cache with the named
+    /// lake-serving policy unless deployments explicitly set this to a
+    /// different value.
     external_lake_serving_cache_max_bytes: ?usize = null,
     /// Optional durable range-cache directory for external lake row reads.
-    /// Requires `external_lake_serving_cache_max_bytes` so the in-memory cache
-    /// retains the serving admission policy while using this directory as a
-    /// validated backing store.
+    /// Uses the effective serving cache budget so the in-memory cache retains
+    /// the serving admission policy while using this directory as a validated
+    /// backing store.
     external_lake_persistent_cache_root_dir: ?[]const u8 = null,
     /// Optional sidecar declarations/candidates for external lake routing.
     /// Operator/query layers can install this while concrete sidecar query
@@ -1553,7 +1557,7 @@ pub const ApiHttpServer = struct {
 
     fn externalLakeRowsSourceOptions(self: *const ApiHttpServer) table_reads.ExternalObjectStorageLakeRowsSourceOptions {
         return .{
-            .serving_cache_max_bytes = self.cfg.external_lake_serving_cache_max_bytes,
+            .serving_cache_max_bytes = self.cfg.external_lake_serving_cache_max_bytes orelse default_external_lake_serving_cache_max_bytes,
             .persistent_cache_root_dir = self.cfg.external_lake_persistent_cache_root_dir,
             .sidecar_context = self.cfg.external_lake_sidecar_context,
         };
