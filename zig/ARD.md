@@ -202,9 +202,10 @@ Aggregate MCP entry:
 Extension-scoped MCP entry:
 
 - `type`: `application/mcp-server+json`
-- `url`: `/ard/v1/resources/mcp/extensions/{extension}` or `data`: embedded MCP server descriptor
+- `url`: `/ard/v1/resources/mcp/extensions/{extension}`
 - `metadata.endpoint`: `/mcp/v1/extensions/{extension}`
 - Visible only when the extension is installed, ready, and visible to the identity.
+- The resource descriptor should include only MCP tools visible to the same identity.
 
 MCP profile entry:
 

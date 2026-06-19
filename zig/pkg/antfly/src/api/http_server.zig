@@ -2090,7 +2090,13 @@ pub const ApiHttpServer = struct {
             const rest = uri_parts.path[routes.Routes.ard_v1_resources_prefix.len..];
             if (std.mem.startsWith(u8, rest, "mcp/")) {
                 const name = rest["mcp/".len..];
-                const body = (try ard_catalog.mcpDescriptorJsonAlloc(self.alloc, name)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+                var snapshot_opt = if (std.mem.startsWith(u8, name, "extensions/")) try self.source.adminSnapshot() else null;
+                defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+                const body = (try ard_catalog.mcpDescriptorJsonAlloc(
+                    self.alloc,
+                    name,
+                    if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
+                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
             }
             return try jsonErrorResponse(self.alloc, 404, "not found");
@@ -10833,6 +10839,27 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension-package:memoryaf:1.0.0") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") != null);
+
+    var ard_extension_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/docsaf",
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_extension_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_extension_mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"endpoint\":\"/mcp/v1/extensions/docsaf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"store_doc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_memories\"") == null);
+
+    var hidden_extension_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/memoryaf",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_extension_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_extension_mcp_resource.status);
 
     var ard_filtered_catalog_resp = try server.handle(.{
         .method = .GET,

@@ -445,11 +445,22 @@ pub fn skillMarkdownAlloc(alloc: std.mem.Allocator, slug: []const u8) !?[]u8 {
     return try alloc.dupe(u8, skill.body);
 }
 
-pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
+pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, extension_context: ?ExtensionCatalogContext) !?[]u8 {
     if (std.mem.eql(u8, name, "profiles/copilot")) {
         return try alloc.dupe(u8,
             \\{"name":"antfly-copilot","endpoint":"/mcp/v1/extensions/profiles/copilot","profile":"copilot","description":"Profile-scoped Antfly MCP server for Copilot-style clients.","capabilities":["table-search","retrieval","query-builder","extension-tools"]}
         );
+    }
+    if (std.mem.startsWith(u8, name, "extensions/")) {
+        const extension_name = name["extensions/".len..];
+        if (extension_name.len == 0 or std.mem.indexOfScalar(u8, extension_name, '/') != null) return null;
+        const ctx = extension_context orelse return null;
+        for (ctx.installed_extensions) |installed| {
+            if (!std.mem.eql(u8, installed.name, extension_name)) continue;
+            if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) return null;
+            return try extensionMcpDescriptorJsonAlloc(alloc, installed, ctx);
+        }
+        return null;
     }
     if (!std.mem.eql(u8, name, "default")) return null;
     return try alloc.dupe(u8,
@@ -1064,17 +1075,48 @@ fn writeExtensionMcpFields(writer: *std.Io.Writer, publisher_domain: []const u8,
     try writeStringFmt(writer, "Antfly Extension MCP {s}", .{installed.name});
     try writer.writeAll(",\"type\":\"application/mcp-server+json\",\"description\":");
     try writeStringFmt(writer, "MCP server for visible tools owned by Antfly extension {s}.", .{installed.name});
-    try writer.writeAll(",\"data\":{\"name\":");
-    try std.json.Stringify.value(installed.name, .{}, writer);
-    try writer.writeAll(",\"endpoint\":");
-    try writeStringFmt(writer, "/mcp/v1/extensions/{s}", .{installed.name});
-    try writer.writeAll("},\"tags\":[\"mcp\",\"extension\"],\"capabilities\":");
+    try writer.writeAll(",\"url\":");
+    try writeStringFmt(writer, "/ard/v1/resources/mcp/extensions/{s}", .{installed.name});
+    try writer.writeAll(",\"tags\":[\"mcp\",\"extension\"],\"capabilities\":");
     try writeCapabilitiesFromGrants(writer, installed.granted_capabilities);
     try writer.writeAll(",\"metadata\":{\"endpoint\":");
     try writeStringFmt(writer, "/mcp/v1/extensions/{s}", .{installed.name});
     try writer.writeAll(",\"extension\":");
     try std.json.Stringify.value(installed.name, .{}, writer);
     try writer.writeByte('}');
+}
+
+fn extensionMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, installed: extension_domain.InstalledExtension, ctx: ExtensionCatalogContext) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+
+    try writer.writer.writeAll("{\"name\":");
+    try std.json.Stringify.value(installed.name, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"endpoint\":");
+    try writeStringFmt(&writer.writer, "/mcp/v1/extensions/{s}", .{installed.name});
+    try writer.writer.writeAll(",\"extension\":");
+    try std.json.Stringify.value(installed.name, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"tools\":[");
+    var first = true;
+    for (ctx.extension_members) |member| {
+        if (member.object_kind != .mcp_tool) continue;
+        if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+        if (!(try extensionMcpMemberVisible(alloc, installed, member, ctx.permissions))) continue;
+        if (first) {
+            first = false;
+        } else {
+            try writer.writer.writeByte(',');
+        }
+        try writer.writer.writeAll("{\"name\":");
+        try std.json.Stringify.value(member.object_name, .{}, &writer.writer);
+        if (member.table_name.len > 0) {
+            try writer.writer.writeAll(",\"table\":");
+            try std.json.Stringify.value(member.table_name, .{}, &writer.writer);
+        }
+        try writer.writer.writeByte('}');
+    }
+    try writer.writer.writeAll("]}");
+    return try writer.toOwnedSlice();
 }
 
 fn writeExtensionScopeString(writer: *std.Io.Writer, scope: extension_domain.ExtensionScope) !void {
