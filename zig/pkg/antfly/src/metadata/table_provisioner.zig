@@ -37,6 +37,7 @@ pub const ProvisionSummary = struct {
     indexes_added: usize = 0,
     indexes_removed: usize = 0,
     enrichments_added: usize = 0,
+    enrichments_updated: usize = 0,
     enrichments_removed: usize = 0,
     resolvers_added: usize = 0,
     resolvers_updated: usize = 0,
@@ -181,6 +182,7 @@ pub fn reconcileReplicaRootWithOptions(
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
         summary.enrichments_added += index_summary.enrichments_added;
+        summary.enrichments_updated += index_summary.enrichments_updated;
         summary.enrichments_removed += index_summary.enrichments_removed;
         summary.resolvers_added += index_summary.resolvers_added;
         summary.resolvers_updated += index_summary.resolvers_updated;
@@ -225,7 +227,7 @@ pub fn reconcileDbIndexesWithOptions(
     try validateDesiredEnrichments(desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
 
-    const enrichments_added = try ensureEnrichments(alloc, db, desired_enrichments.items);
+    const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
         .drain_backfill = options.drain_resolver_backfill,
     });
@@ -233,7 +235,7 @@ pub fn reconcileDbIndexesWithOptions(
     const index_summary = try ensureIndexes(alloc, db, indexes_json);
     const enrichments_removed = try removeMissingEnrichments(alloc, db, desired_enrichments.items);
     const indexes_removed = missing_indexes_removed + index_summary.removed;
-    if (index_summary.added > 0 or indexes_removed > 0 or enrichments_added > 0 or enrichments_removed > 0 or resolver_summary.changed()) {
+    if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
             try db.core.index_manager.syncAll(false);
@@ -244,7 +246,8 @@ pub fn reconcileDbIndexesWithOptions(
         .dbs_opened = 0,
         .indexes_added = index_summary.added,
         .indexes_removed = indexes_removed,
-        .enrichments_added = enrichments_added,
+        .enrichments_added = enrichment_summary.added,
+        .enrichments_updated = enrichment_summary.updated,
         .enrichments_removed = enrichments_removed,
         .resolvers_added = resolver_summary.added,
         .resolvers_updated = resolver_summary.updated,
@@ -613,22 +616,25 @@ fn collectDesiredEnrichmentsFromJson(
     try collectDesiredEnrichments(alloc, parsed.value, out);
 }
 
-fn ensureEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
-    if (desired.len == 0) return 0;
+const EnrichmentEnsureSummary = struct {
+    added: usize = 0,
+    updated: usize = 0,
 
-    const existing = try db.listEnrichments(alloc);
-    defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
-
-    var added: usize = 0;
-    for (desired) |cfg| {
-        if (findEnrichment(existing, cfg.kind, cfg.name)) |existing_cfg| {
-            if (!enrichmentConfigsEqual(existing_cfg, cfg)) return error.ConflictingEnrichmentConfig;
-            continue;
-        }
-        try db.addEnrichment(cfg);
-        added += 1;
+    fn changed(self: EnrichmentEnsureSummary) bool {
+        return self.added > 0 or self.updated > 0;
     }
-    return added;
+};
+
+fn ensureEnrichments(db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !EnrichmentEnsureSummary {
+    var summary: EnrichmentEnsureSummary = .{};
+    for (desired) |cfg| {
+        switch (try db.upsertEnrichment(cfg)) {
+            .added => summary.added += 1,
+            .updated => summary.updated += 1,
+            .unchanged => {},
+        }
+    }
+    return summary;
 }
 
 fn collectDesiredEnrichments(
@@ -1416,7 +1422,7 @@ test "table provisioner rejects conflicting inline enrichment definitions" {
     ));
 }
 
-test "table provisioner rejects changed enrichment config under the same name" {
+test "table provisioner updates changed enrichment config under the same name" {
     const alloc = std.heap.c_allocator;
     const path = "/tmp/antfly-metadata-table-provisioner-changed-enrichment";
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -1426,20 +1432,18 @@ test "table provisioner rejects changed enrichment config under the same name" {
 
     const first_indexes_json =
         \\{
-        \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
+        \\  "enrichments":[
         \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":512,"chunk_overlap":50}
         \\  ]}
-        \\}
     ;
     const second_indexes_json =
         \\{
-        \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
-        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":256,"chunk_overlap":50}
+        \\  "enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":256,"chunk_overlap":25,"full_text_index":true}
         \\  ]}
-        \\}
     ;
 
-    _ = try reconcileReplicaRoot(
+    const first_summary = try reconcileReplicaRoot(
         alloc,
         path,
         100,
@@ -1456,7 +1460,9 @@ test "table provisioner rejects changed enrichment config under the same name" {
             .end_key = "doc:z",
         }},
     );
-    try std.testing.expectError(error.ConflictingEnrichmentConfig, reconcileReplicaRoot(
+    try std.testing.expectEqual(@as(usize, 1), first_summary.enrichments_added);
+
+    const second_summary = try reconcileReplicaRoot(
         alloc,
         path,
         100,
@@ -1472,7 +1478,21 @@ test "table provisioner rejects changed enrichment config under the same name" {
             .start_key = "doc:a",
             .end_key = "doc:z",
         }},
-    ));
+    );
+    try std.testing.expectEqual(@as(usize, 0), second_summary.enrichments_added);
+    try std.testing.expectEqual(@as(usize, 1), second_summary.enrichments_updated);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    const cfg = findEnrichment(enrichments, .chunk, "document_chunks_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 256), cfg.chunk_size);
+    try std.testing.expectEqual(@as(u32, 25), cfg.chunk_overlap);
+    try std.testing.expect(cfg.full_text_index);
 }
 
 test "table provisioner compares full text index configs semantically" {

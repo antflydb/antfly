@@ -20,6 +20,7 @@ import base64
 import json
 import struct
 import time
+from urllib.parse import quote
 import pytest
 import requests
 
@@ -267,6 +268,44 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert "document_units_v1" in encoded_detail
     assert "document_chunks_v1" in encoded_detail
     assert "full_text_index" in encoded_detail
+
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 256,
+                "chunk_overlap": 25,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+    replaced = stateful_api.get_table(table_name)
+    replaced_detail = json.dumps(replaced, sort_keys=True)
+    assert '"chunk_size": 256' in replaced_detail
+    assert '"chunk_overlap": 25' in replaced_detail
+
+    decoded_name = "document chunks v2"
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 128,
+                "chunk_overlap": 10,
+            },
+        )
+        == {}
+    )
+    decoded_table = stateful_api.get_table(table_name)
+    decoded_detail = json.dumps(decoded_table, sort_keys=True)
+    assert decoded_name in decoded_detail
+    assert quote(decoded_name, safe="") not in decoded_detail
 
 
 def test_stateful_table_rejects_document_full_text_create_index_with_inline_enrichments(stateful_api):

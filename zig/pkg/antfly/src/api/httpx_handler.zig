@@ -2121,8 +2121,11 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handlePutArtifactEnrichment(ctx.allocator, table_name, artifact_name, body_data, self.api_server.tableApi());
+        var resp = try public_table_http.handlePutArtifactEnrichment(alloc, table_name, decoded_artifact_name, body_data, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -2130,7 +2133,10 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        var resp = try public_table_http.handleDeleteArtifactEnrichment(ctx.allocator, table_name, artifact_name, self.api_server.tableApi());
+        const alloc = ctx.allocator;
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        var resp = try public_table_http.handleDeleteArtifactEnrichment(alloc, table_name, decoded_artifact_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
 

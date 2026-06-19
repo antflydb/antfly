@@ -6575,6 +6575,12 @@ pub const DB = struct {
         try self.core.addEnrichment(cfg);
     }
 
+    pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.upsertEnrichment(cfg);
+    }
+
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         {
             lockApply(self);

@@ -2781,6 +2781,53 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
     }
 
+    pub const EnrichmentUpsertResult = enum {
+        added,
+        updated,
+        unchanged,
+    };
+
+    pub fn upsertEnrichment(self: *IndexManager, store: anytype, cfg: types.EnrichmentConfig) !EnrichmentUpsertResult {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var internal = try enrichmentFromPublic(self.alloc, cfg);
+        defer internal.deinit(self.alloc);
+
+        try validateEnrichmentConfig(self, internal);
+
+        for (self.enrichments.items) |*entry| {
+            if (entry.kind != internal.kind or !std.mem.eql(u8, entry.name, internal.name)) continue;
+            if (internalEnrichmentConfigsEqual(entry.*, internal)) return .unchanged;
+
+            var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
+            errdefer replacement.deinit(self.alloc);
+            var previous = entry.*;
+            entry.* = replacement;
+            const has_generated_enrichment_targets = self.computeGeneratedEnrichmentTargetCache() catch |err| {
+                entry.* = previous;
+                replacement.deinit(self.alloc);
+                return err;
+            };
+            self.persistEnrichmentCatalog(store) catch |err| {
+                entry.* = previous;
+                replacement.deinit(self.alloc);
+                return err;
+            };
+            previous.deinit(self.alloc);
+            self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
+            return .updated;
+        }
+
+        const enrichment_checkpoint = self.enrichments.items.len;
+        errdefer self.truncateEnrichments(enrichment_checkpoint);
+
+        try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal));
+        const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
+        try self.persistEnrichmentCatalog(store);
+        self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
+        return .added;
+    }
+
     pub fn removeEnrichment(self: *IndexManager, store: anytype, kind: types.EnrichmentKind, name: []const u8) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -11812,6 +11859,21 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
+}
+
+fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) bool {
+    return a.kind == b.kind and
+        std.mem.eql(u8, a.name, b.name) and
+        std.mem.eql(u8, a.source_field, b.source_field) and
+        std.mem.eql(u8, a.source_template, b.source_template) and
+        std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
+        a.expected_dims == b.expected_dims and
+        a.chunk_size == b.chunk_size and
+        a.chunk_overlap == b.chunk_overlap and
+        std.mem.eql(u8, a.chunker_json, b.chunker_json) and
+        a.full_text_index == b.full_text_index and
+        std.mem.eql(u8, a.content_type, b.content_type) and
+        std.mem.eql(u8, a.producer_json, b.producer_json);
 }
 
 fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types.EnrichmentKind {
