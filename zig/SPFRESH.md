@@ -135,14 +135,16 @@ Current status:
   manifest length and configured segment cap, avoiding growth churn while
   choosing bounded compaction inputs, and manifest encode, replacement,
   summary, and planning can consume owned decoded manifest entries directly
-  instead of allocating temporary borrowed-entry views. Segment garbage and
-  temporary-file cleanup now track live canonical basenames and delete through
-  the opened postings directory, and manifest temp matching compares entry names
-  against the configured manifest basename in place, avoiding per-file path
-  allocation while scanning maintenance directories. Lazy segment base-data
-  batch reads also use stack-backed newest-segment tracking for small unsorted
-  manifests, so recovery/fallback snapshots do not allocate an extra segment-id
-  array just to resolve winners.
+  instead of allocating temporary borrowed-entry views. Whole-directory segment
+  compaction now uses a replace-all manifest helper instead of allocating a
+  remove-id array for every input segment. Segment garbage and temporary-file
+  cleanup now track live canonical basenames and delete through the opened
+  postings directory, and manifest temp matching compares entry names against
+  the configured manifest basename in place, avoiding per-file path allocation
+  while scanning maintenance directories. Lazy segment base-data batch reads
+  also use stack-backed newest-segment tracking for small unsorted manifests, so
+  recovery/fallback snapshots do not allocate an extra segment-id array just to
+  resolve winners.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and

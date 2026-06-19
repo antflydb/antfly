@@ -1604,6 +1604,33 @@ fn replaceManifestSegmentsEntriesWithStatsAlloc(
     };
 }
 
+fn replaceAllManifestSegmentsEntriesWithStatsAlloc(
+    alloc: Allocator,
+    next_segment_id: u64,
+    entries: anytype,
+    new_entries: []const ManifestEntry,
+) !ManifestReplacementResult {
+    try validateManifestEntries(next_segment_id, entries);
+    for (new_entries) |entry| try validateManifestEntry(entry);
+
+    var replacement_next_segment_id = next_segment_id;
+    for (new_entries) |entry| {
+        replacement_next_segment_id = @max(replacement_next_segment_id, std.math.add(u64, entry.meta.segment_id, 1) catch return error.PostingSegmentManifestTooLarge);
+    }
+
+    const encoded = try encodeManifestEntriesAlloc(alloc, replacement_next_segment_id, new_entries);
+    return .{
+        .encoded = encoded,
+        .stats = .{
+            .input_segments = entries.len,
+            .removed_segments = entries.len,
+            .added_segments = new_entries.len,
+            .output_segments = new_entries.len,
+            .next_segment_id = replacement_next_segment_id,
+        },
+    };
+}
+
 pub fn summarizeManifest(manifest: Manifest) !DirectoryManifestStats {
     return try summarizeManifestEntries(manifest.next_segment_id, manifest.segments);
 }
@@ -1907,10 +1934,6 @@ pub fn compactDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
     defer compacted.deinit(alloc);
     if (compacted.segment.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
-    const remove_segment_ids = try alloc.alloc(u64, store.manifest.segments.len);
-    defer alloc.free(remove_segment_ids);
-    for (store.manifest.segments, 0..) |entry, i| remove_segment_ids[i] = entry.meta.segment_id;
-
     const written = try writeSegmentFileAlloc(alloc, io, dir, compacted.segment);
     errdefer alloc.free(written.path);
     const new_entry = ManifestEntry{
@@ -1918,7 +1941,7 @@ pub fn compactDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
         .path = written.path,
     };
 
-    var replacement = try replaceManifestSegmentsEntriesWithStatsAlloc(alloc, store.manifest.next_segment_id, store.manifest.segments, remove_segment_ids, &.{new_entry});
+    var replacement = try replaceAllManifestSegmentsEntriesWithStatsAlloc(alloc, store.manifest.next_segment_id, store.manifest.segments, &.{new_entry});
     defer replacement.deinit(alloc);
 
     try writeManifestFileAlloc(alloc, io, dir, options.manifest_path, replacement.encoded);
