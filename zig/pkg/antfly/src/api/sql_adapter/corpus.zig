@@ -1566,7 +1566,8 @@ pub fn corpusFixtureExecutionPlanIsStructured(entry: AppParityCorpusEntry) bool 
     if (entry.execution_plan.len == 0) return true;
     if (!corpusFixtureAllowsExecutionPlan(entry)) return false;
     return std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=") or
-        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=");
+        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=") or
+        unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
 }
 
 const AppParityCorpusMetadataMode = enum {
@@ -3034,14 +3035,54 @@ fn consumeAppliedWorkItems(text: []const u8, index: *usize, expected_count: usiz
     var count: usize = 0;
     while (count < expected_count) : (count += 1) {
         if (!(consumeLiteral(text, index, "rebuild/table/derived_artifacts") or
-            consumeLiteral(text, index, "validate/table/constraints") or
-            consumeLiteral(text, index, "rewrite/table/row_images")))
+            consumeLiteral(text, index, "validate/table/constraints")))
         {
-            return false;
+            if (!consumeLiteral(text, index, "rewrite/table/row_images")) return false;
+            if (consumeLiteral(text, index, "(expr=")) {
+                if (!consumeAppliedRewriteExpression(text, index)) return false;
+            }
         }
         if (count + 1 < expected_count and !consumeLiteral(text, index, ",")) return false;
     }
     return true;
+}
+
+fn consumeAppliedRewriteExpression(text: []const u8, index: *usize) bool {
+    if (!(consumeLiteral(text, index, "identity") or
+        consumeLiteral(text, index, "lower") or
+        consumeLiteral(text, index, "upper") or
+        consumeLiteral(text, index, "md5") or
+        consumeLiteral(text, index, "add_literal")))
+    {
+        return false;
+    }
+    if (!consumeLiteral(text, index, ":target=")) return false;
+    if (!consumeIdentifierValue(text, index)) return false;
+    if (!consumeLiteral(text, index, ":source=")) return false;
+    if (!consumeIdentifierValue(text, index)) return false;
+    if (consumeLiteral(text, index, ":literal=")) {
+        if (!consumeJsonNumberValue(text, index)) return false;
+    }
+    return consumeLiteral(text, index, ")");
+}
+
+fn consumeIdentifierValue(text: []const u8, index: *usize) bool {
+    const start = index.*;
+    while (index.* < text.len and (std.ascii.isAlphanumeric(text[index.*]) or text[index.*] == '_')) : (index.* += 1) {}
+    return index.* > start;
+}
+
+fn consumeJsonNumberValue(text: []const u8, index: *usize) bool {
+    const start = index.*;
+    if (index.* < text.len and text[index.*] == '-') index.* += 1;
+    while (index.* < text.len and text[index.*] >= '0' and text[index.*] <= '9') : (index.* += 1) {}
+    if (index.* < text.len and text[index.*] == '.') {
+        index.* += 1;
+        const fraction_start = index.*;
+        while (index.* < text.len and text[index.*] >= '0' and text[index.*] <= '9') : (index.* += 1) {}
+        if (index.* == fraction_start) return false;
+    }
+    return index.* > start;
 }
 
 pub const SqlParameterScan = union(enum) {
@@ -3969,6 +4010,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_role_drop: bool = false,
     ddl_privilege_grant: bool = false,
     ddl_privilege_revoke: bool = false,
+    ddl_copy_binary_execution_unsupported: bool = false,
     ddl_copy_from: bool = false,
     ddl_copy_from_execution_contract: bool = false,
     ddl_copy_default_marker: bool = false,
@@ -4189,7 +4231,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
-    unsupported_ddl_row_rewrite_expression_plan: bool = false,
     unsupported_write: bool = false,
     unsupported_write_recursive_cte_insert: bool = false,
     unsupported_write_recursive_cte_update: bool = false,
@@ -4514,6 +4555,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_alter_column_not_null: bool = false,
     ddl_drop_column_not_null: bool = false,
     ddl_alter_column_type: bool = false,
+    ddl_alter_column_rewrite_expression: bool = false,
     ddl_rename_column: bool = false,
     ddl_rename_constraint: bool = false,
     adapter_noop_transaction: bool = false,
@@ -5439,9 +5481,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
                     std.mem.indexOf(u8, entry.sql, " SUPPORT ") != null);
-            self.unsupported_ddl_row_rewrite_expression_plan = self.unsupported_ddl_row_rewrite_expression_plan or
-                (std.mem.eql(u8, entry.classification_reason, "row_rewrite_expression_plan") and
-                    std.mem.indexOf(u8, entry.sql, " USING ") != null);
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
@@ -5626,6 +5665,9 @@ pub const AppParityCorpusCoverage = struct {
                 .revoke_privilege => self.ddl_privilege_revoke = true,
                 .copy_from => {
                     self.ddl_copy_from = true;
+                    self.ddl_copy_binary_execution_unsupported = self.ddl_copy_binary_execution_unsupported or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":format=", "binary") and
+                            sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
                     self.ddl_copy_from_execution_contract = self.ddl_copy_from_execution_contract or
                         std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:");
                     self.ddl_copy_default_marker = self.ddl_copy_default_marker or sql_adapter.planHasExactStringToken(entry.plan, ":default_marker_hex=", "6e2f61");
@@ -5645,6 +5687,9 @@ pub const AppParityCorpusCoverage = struct {
                 },
                 .copy_to => {
                     self.ddl_copy_to = true;
+                    self.ddl_copy_binary_execution_unsupported = self.ddl_copy_binary_execution_unsupported or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":format=", "binary") and
+                            sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
                     self.ddl_copy_to_execution_contract = self.ddl_copy_to_execution_contract or
                         std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:");
                     self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");
@@ -5926,6 +5971,9 @@ pub const AppParityCorpusCoverage = struct {
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
                     self.ddl_alter_column_type = self.ddl_alter_column_type or std.mem.indexOf(u8, entry.sql, " TYPE ") != null or std.mem.indexOf(u8, entry.sql, " SET DATA TYPE ") != null;
+                    self.ddl_alter_column_rewrite_expression = self.ddl_alter_column_rewrite_expression or
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":alter_type_rewrite_expr=") and
+                            std.mem.indexOf(u8, entry.applied_plan, "rewrite/table/row_images(expr=") != null;
                     self.ddl_rename_column = self.ddl_rename_column or std.mem.indexOf(u8, entry.sql, "RENAME COLUMN") != null;
                     self.ddl_rename_constraint = self.ddl_rename_constraint or std.mem.indexOf(u8, entry.sql, "RENAME CONSTRAINT") != null;
                     self.ddl_drop_update_policy = self.ddl_drop_update_policy or std.mem.indexOf(u8, entry.sql, "DROP TRIGGER") != null;

@@ -4287,6 +4287,17 @@
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (OIDS true)"
     },
     {
+      "name": "copy binary format parses but execution bridge rejects",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_to",
+        "table_name": "usage_records"
+      },
+      "plan": "ddl:copy_to:table=usage_records:columns=0:endpoint=STDOUT:format=binary:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "unsupported:ddl:requires=bulk_io_plan",
+      "sql": "COPY usage_records TO STDOUT WITH (FORMAT binary)"
+    },
+    {
       "name": "create function catalog ddl",
       "family": "ddl",
       "summary": {
@@ -8158,18 +8169,26 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1:alter_type_rewrite_expr=1",
       "apply_setup_sql": [
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);"
       ],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(expr=identity:target=updated_at_ns:source=updated_at_ns)",
       "sql": "ALTER TABLE usage_records ALTER COLUMN updated_at_ns TYPE timestamptz USING updated_at_ns::timestamptz;"
     },
     {
-      "name": "unsupported schema alter column computed rewrite expression",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=row_rewrite_expression_plan",
-      "classification_reason": "row_rewrite_expression_plan",
+      "name": "schema alter column computed rewrite expression",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_table",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1:alter_type_rewrite_expr=1",
+      "apply_setup_sql": [
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, amount bigint);"
+      ],
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(expr=add_literal:target=amount:source=amount:literal=1)",
       "sql": "ALTER TABLE usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;"
     },
     {

@@ -375,6 +375,8 @@ pub const DropUpdatePolicyOperation = sql_adapter.DropUpdatePolicyOperation;
 pub const AlterColumnDefaultOperation = sql_adapter.AlterColumnDefaultOperation;
 pub const AlterColumnNullabilityOperation = sql_adapter.AlterColumnNullabilityOperation;
 pub const AlterColumnTypeOperation = sql_adapter.AlterColumnTypeOperation;
+pub const AlterColumnRewriteExpression = sql_adapter.AlterColumnRewriteExpression;
+pub const AlterColumnRewriteOperation = sql_adapter.AlterColumnRewriteOperation;
 pub const CreateIndexPlan = sql_adapter.CreateIndexPlan;
 pub const DdlIndexMethod = sql_adapter.DdlIndexMethod;
 pub const DdlIndexOpClass = sql_adapter.DdlIndexOpClass;
@@ -383,6 +385,7 @@ pub const AppliedDdlWorkAction = sql_adapter.AppliedDdlWorkAction;
 pub const AppliedDdlWorkSubject = sql_adapter.AppliedDdlWorkSubject;
 pub const AppliedDdlWorkReason = sql_adapter.AppliedDdlWorkReason;
 pub const AppliedDdlWorkItem = sql_adapter.AppliedDdlWorkItem;
+pub const AppliedDdlRewriteExpression = sql_adapter.AppliedDdlRewriteExpression;
 
 const InsertColumnSpec = union(enum) {
     column: []const u8,
@@ -2330,6 +2333,29 @@ fn schemaJsonFromTableClonePlanAlloc(
     return try schemaJsonFromCreateTablePlanAlloc(alloc, create_table);
 }
 
+const AppliedDdlRewriteExpressionSource = struct {
+    operation: AlterColumnRewriteOperation,
+    target_column: []const u8,
+    source_column: []const u8,
+    literal_json: ?[]const u8 = null,
+};
+
+fn alterTableRewriteExpressionSource(plan: AlterTablePlan) ?AppliedDdlRewriteExpressionSource {
+    for (plan.operations) |operation| switch (operation) {
+        .alter_column_type => |alter_type| {
+            const rewrite = alter_type.rewrite_expression orelse continue;
+            return .{
+                .operation = rewrite.operation,
+                .target_column = alter_type.column_name,
+                .source_column = rewrite.source_column,
+                .literal_json = rewrite.literal_json,
+            };
+        },
+        else => {},
+    };
+    return null;
+}
+
 pub fn applyDdlPlanToSchemaJsonAlloc(
     alloc: std.mem.Allocator,
     current_schema_json: []const u8,
@@ -2345,6 +2371,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
                     true,
                     true,
                     true,
+                    null,
                 );
                 if (!create_table.if_not_exists) return error.InvalidSqlCatalog;
                 return .{ .schema_json = try alloc.dupe(u8, current_schema_json) };
@@ -2357,6 +2384,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
             table_clone.options.indexes,
             table_clone.options.constraints or table_clone.options.checks,
             false,
+            null,
         ),
         .drop_table => |drop_table| {
             if (current_schema_json.len == 0) {
@@ -2490,12 +2518,17 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
         },
     }
     const schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+    const rewrite_source = switch (plan) {
+        .alter_table => |alter_table| alterTableRewriteExpressionSource(alter_table),
+        else => null,
+    };
     result = try appliedDdlSchemaJsonWithFlagsAlloc(
         alloc,
         schema_json,
         result.requires_rebuild,
         result.validation_required,
         result.rewrite_required,
+        rewrite_source,
     );
     errdefer result.deinit(alloc);
     try validateDdlAppliedSchemaJsonAlloc(alloc, result.schema_json);
@@ -2508,12 +2541,30 @@ pub fn appliedDdlTableWorkItemsForFlagsAlloc(
     validation_required: bool,
     rewrite_required: bool,
 ) ![]const AppliedDdlWorkItem {
+    return try appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(alloc, requires_rebuild, validation_required, rewrite_required, null);
+}
+
+fn appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(
+    alloc: std.mem.Allocator,
+    requires_rebuild: bool,
+    validation_required: bool,
+    rewrite_required: bool,
+    rewrite_expression: ?AppliedDdlRewriteExpressionSource,
+) ![]const AppliedDdlWorkItem {
     const count: usize =
         (if (requires_rebuild) @as(usize, 1) else 0) +
         (if (validation_required) @as(usize, 1) else 0) +
         (if (rewrite_required) @as(usize, 1) else 0);
     if (count == 0) return &.{};
     var items = try alloc.alloc(AppliedDdlWorkItem, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |item| {
+            var mutable = item;
+            mutable.deinit(alloc);
+        }
+        alloc.free(items);
+    }
     var i: usize = 0;
     if (requires_rebuild) {
         items[i] = .{
@@ -2522,6 +2573,7 @@ pub fn appliedDdlTableWorkItemsForFlagsAlloc(
             .reason = .derived_artifacts,
         };
         i += 1;
+        initialized = i;
     }
     if (validation_required) {
         items[i] = .{
@@ -2530,13 +2582,33 @@ pub fn appliedDdlTableWorkItemsForFlagsAlloc(
             .reason = .constraints,
         };
         i += 1;
+        initialized = i;
     }
     if (rewrite_required) {
+        const owned_rewrite: ?AppliedDdlRewriteExpression = if (rewrite_expression) |rewrite| blk: {
+            const target_column = try alloc.dupe(u8, rewrite.target_column);
+            errdefer alloc.free(target_column);
+            const source_column = try alloc.dupe(u8, rewrite.source_column);
+            errdefer alloc.free(source_column);
+            const literal_json = if (rewrite.literal_json) |literal|
+                try alloc.dupe(u8, literal)
+            else
+                null;
+            break :blk .{
+                .operation = rewrite.operation,
+                .target_column = target_column,
+                .source_column = source_column,
+                .literal_json = literal_json,
+            };
+        } else null;
         items[i] = .{
             .action = .rewrite,
             .subject = .table,
             .reason = .row_images,
+            .rewrite_expression = owned_rewrite,
         };
+        i += 1;
+        initialized = i;
     }
     return items;
 }
@@ -2547,9 +2619,10 @@ fn appliedDdlSchemaJsonWithFlagsAlloc(
     requires_rebuild: bool,
     validation_required: bool,
     rewrite_required: bool,
+    rewrite_expression: ?AppliedDdlRewriteExpressionSource,
 ) !AppliedDdlSchemaJson {
     errdefer alloc.free(schema_json);
-    const work_items = try appliedDdlTableWorkItemsForFlagsAlloc(alloc, requires_rebuild, validation_required, rewrite_required);
+    const work_items = try appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(alloc, requires_rebuild, validation_required, rewrite_required, rewrite_expression);
     return .{
         .schema_json = schema_json,
         .requires_rebuild = requires_rebuild,
@@ -4858,15 +4931,19 @@ const Parser = struct {
             const collation = try self.parseOptionalDdlCollationAlloc(ddl_type.field_type);
             var collation_transferred = false;
             errdefer if (!collation_transferred) if (collation) |value| self.alloc.free(value);
-            try self.consumeOptionalDdlAlterColumnUsingIdentity(type_header.column_name);
+            var rewrite_expression = try self.parseOptionalDdlAlterColumnRewriteExpressionAlloc(type_header.column_name);
+            var rewrite_transferred = false;
+            errdefer if (!rewrite_transferred) if (rewrite_expression) |*rewrite| rewrite.deinit(self.alloc);
             try self.appendAlterTableOperation(operations, .{ .alter_column_type = .{
                 .column_name = type_header.column_name,
                 .field_type = ddl_type.field_type,
                 .array_item_type = ddl_type.array_item_type,
                 .collation = collation,
+                .rewrite_expression = rewrite_expression,
             } });
             type_header_transferred = true;
             collation_transferred = true;
+            rewrite_transferred = true;
             return;
         }
 
@@ -4926,9 +5003,48 @@ const Parser = struct {
         return error.UnsupportedSqlShape;
     }
 
-    fn consumeOptionalDdlAlterColumnUsingIdentity(self: *@This(), column_name: []const u8) !void {
-        const using = try sql_adapter.parseOptionalAlterTableColumnUsing(self.tokens, &self.pos) orelse return;
-        if (!std.mem.eql(u8, using.column_name, column_name)) return error.UnsupportedSqlShape;
+    fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(self: *@This(), column_name: []const u8) !?AlterColumnRewriteExpression {
+        if (!self.matchKeyword("using")) return null;
+        const wrapped = self.match(.lparen) != null;
+        const first = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        const operation: AlterColumnRewriteOperation = blk: {
+            if (self.match(.lparen)) |_| {
+                const function_operation: AlterColumnRewriteOperation = if (std.ascii.eqlIgnoreCase(first.text, "lower"))
+                    .lower
+                else if (std.ascii.eqlIgnoreCase(first.text, "upper"))
+                    .upper
+                else if (std.ascii.eqlIgnoreCase(first.text, "md5"))
+                    .md5
+                else
+                    return error.UnsupportedSqlShape;
+                const source = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+                if (!std.mem.eql(u8, source.text, column_name)) return error.UnsupportedSqlShape;
+                try self.expect(.rparen);
+                if (wrapped) try self.expect(.rparen);
+                return .{
+                    .operation = function_operation,
+                    .source_column = try self.alloc.dupe(u8, source.text),
+                };
+            }
+            if (!std.mem.eql(u8, first.text, column_name)) return error.UnsupportedSqlShape;
+            if (self.match(.plus)) |_| {
+                const literal = self.match(.number) orelse return error.UnsupportedSqlShape;
+                if (wrapped) try self.expect(.rparen);
+                const source_column = try self.alloc.dupe(u8, first.text);
+                errdefer self.alloc.free(source_column);
+                return .{
+                    .operation = .add_literal,
+                    .source_column = source_column,
+                    .literal_json = try self.alloc.dupe(u8, literal.text),
+                };
+            }
+            if (wrapped) try self.expect(.rparen);
+            break :blk .identity;
+        };
+        return .{
+            .operation = operation,
+            .source_column = try self.alloc.dupe(u8, first.text),
+        };
     }
 
     fn parseAlterTableAddColumnOperation(
@@ -38801,6 +38917,10 @@ fn freeAlterTableOperation(alloc: std.mem.Allocator, operation: AlterTableOperat
         .alter_column_type => |alter_column_type| {
             alloc.free(alter_column_type.column_name);
             if (alter_column_type.collation) |collation| alloc.free(collation);
+            if (alter_column_type.rewrite_expression) |rewrite| {
+                var mutable_rewrite = rewrite;
+                mutable_rewrite.deinit(alloc);
+            }
         },
         .add_unique_constraint => |constraint| freeDdlUniqueConstraint(alloc, constraint),
         .add_foreign_key => |foreign_key| freeDdlForeignKey(alloc, foreign_key),
@@ -56543,6 +56663,7 @@ const AlterTablePlanFingerprintCounts = struct {
     set_not_null: usize = 0,
     drop_not_null: usize = 0,
     alter_type: usize = 0,
+    alter_type_rewrite_expr: usize = 0,
     add_unique: usize = 0,
     add_foreign_key: usize = 0,
     add_check: usize = 0,
@@ -56599,7 +56720,10 @@ fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerpri
                 counts.set_not_null += 1;
             }
         },
-        .alter_column_type => counts.alter_type += 1,
+        .alter_column_type => |alter| {
+            counts.alter_type += 1;
+            if (alter.rewrite_expression != null) counts.alter_type_rewrite_expr += 1;
+        },
         .add_unique_constraint => |constraint| {
             counts.add_unique += 1;
             addUniqueTimingFingerprintCounts(&counts.constraint_timing, &.{constraint});
@@ -58029,6 +58153,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "set_not_null", counts.set_not_null);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_not_null", counts.drop_not_null);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "alter_type", counts.alter_type);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "alter_type_rewrite_expr", counts.alter_type_rewrite_expr);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_unique", counts.add_unique);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_fk", counts.add_foreign_key);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_check", counts.add_check);
@@ -58129,6 +58254,45 @@ fn appliedDdlWorkReasonName(reason: AppliedDdlWorkReason) []const u8 {
     };
 }
 
+fn alterColumnRewriteOperationName(operation: AlterColumnRewriteOperation) []const u8 {
+    return switch (operation) {
+        .identity => "identity",
+        .lower => "lower",
+        .upper => "upper",
+        .md5 => "md5",
+        .add_literal => "add_literal",
+    };
+}
+
+fn appliedDdlWorkItemFingerprintAlloc(alloc: std.mem.Allocator, item: AppliedDdlWorkItem) ![]u8 {
+    const base = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}/{s}",
+        .{
+            appliedDdlWorkActionName(item.action),
+            appliedDdlWorkSubjectName(item.subject),
+            appliedDdlWorkReasonName(item.reason),
+        },
+    );
+    if (item.rewrite_expression) |rewrite| {
+        const with_expression = if (rewrite.literal_json) |literal|
+            try std.fmt.allocPrint(
+                alloc,
+                "{s}(expr={s}:target={s}:source={s}:literal={s})",
+                .{ base, alterColumnRewriteOperationName(rewrite.operation), rewrite.target_column, rewrite.source_column, literal },
+            )
+        else
+            try std.fmt.allocPrint(
+                alloc,
+                "{s}(expr={s}:target={s}:source={s})",
+                .{ base, alterColumnRewriteOperationName(rewrite.operation), rewrite.target_column, rewrite.source_column },
+            );
+        alloc.free(base);
+        return with_expression;
+    }
+    return base;
+}
+
 fn appendAppliedDdlWorkItemsFingerprintAlloc(
     alloc: std.mem.Allocator,
     owned_base: []u8,
@@ -58148,15 +58312,15 @@ fn appendAppliedDdlWorkItemsFingerprintAlloc(
     var work = try alloc.dupe(u8, "");
     defer alloc.free(work);
     for (work_items, 0..) |item, i| {
+        const item_fingerprint = try appliedDdlWorkItemFingerprintAlloc(alloc, item);
+        defer alloc.free(item_fingerprint);
         const next = try std.fmt.allocPrint(
             alloc,
-            "{s}{s}{s}/{s}/{s}",
+            "{s}{s}{s}",
             .{
                 work,
                 if (i == 0) "" else ",",
-                appliedDdlWorkActionName(item.action),
-                appliedDdlWorkSubjectName(item.subject),
-                appliedDdlWorkReasonName(item.reason),
+                item_fingerprint,
             },
         );
         alloc.free(work);
@@ -58586,6 +58750,16 @@ fn expectDdlExecutionCorpusPlan(
     lowered: LoweredDdlPlan,
 ) !void {
     if (entry.execution_plan.len == 0) return;
+    if (std.mem.startsWith(u8, entry.execution_plan, "unsupported:")) {
+        switch (lowered) {
+            .bulk_io => |plan| try std.testing.expectError(error.UnsupportedSqlShape, bulkSqlIoExecutionPlanFromDdlPlan(plan)),
+            else => return error.TestUnexpectedResult,
+        }
+        const fingerprint = try sql_adapter.unsupportedFingerprintAlloc(alloc, .ddl, .bulk_io_plan);
+        defer alloc.free(fingerprint);
+        try expectAppParityPlan(entry.execution_plan, fingerprint);
+        return;
+    }
     const fingerprint = switch (lowered) {
         .bulk_io => |plan| blk: {
             const execution_plan = try bulkSqlIoExecutionPlanFromDdlPlan(plan);

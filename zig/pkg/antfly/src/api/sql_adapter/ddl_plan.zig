@@ -496,6 +496,27 @@ pub const AlterColumnTypeOperation = struct {
     field_type: runtime_schema.AntflyType,
     array_item_type: ?runtime_schema.AntflyType = null,
     collation: ?[]const u8 = null,
+    rewrite_expression: ?AlterColumnRewriteExpression = null,
+};
+
+pub const AlterColumnRewriteOperation = enum {
+    identity,
+    lower,
+    upper,
+    md5,
+    add_literal,
+};
+
+pub const AlterColumnRewriteExpression = struct {
+    operation: AlterColumnRewriteOperation,
+    source_column: []const u8,
+    literal_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.source_column);
+        if (self.literal_json) |literal| alloc.free(literal);
+        self.* = undefined;
+    }
 };
 
 pub const CreateIndexPlan = struct {
@@ -556,10 +577,30 @@ pub const AppliedDdlWorkReason = enum {
     row_images,
 };
 
+pub const AppliedDdlRewriteExpression = struct {
+    operation: AlterColumnRewriteOperation,
+    target_column: []const u8,
+    source_column: []const u8,
+    literal_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.target_column);
+        alloc.free(self.source_column);
+        if (self.literal_json) |literal| alloc.free(literal);
+        self.* = undefined;
+    }
+};
+
 pub const AppliedDdlWorkItem = struct {
     action: AppliedDdlWorkAction,
     subject: AppliedDdlWorkSubject,
     reason: AppliedDdlWorkReason,
+    rewrite_expression: ?AppliedDdlRewriteExpression = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.rewrite_expression) |*rewrite| rewrite.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const AppliedDdlSchemaJson = struct {
@@ -577,6 +618,10 @@ pub const AppliedDdlSchemaJson = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.schema_json.len > 0) alloc.free(self.schema_json);
+        for (self.work_items) |item| {
+            var mutable = item;
+            mutable.deinit(alloc);
+        }
         if (self.work_items.len > 0) alloc.free(self.work_items);
         self.* = undefined;
     }
@@ -2163,6 +2208,10 @@ fn freeAlterTableOperation(alloc: std.mem.Allocator, operation: AlterTableOperat
         .alter_column_type => |alter_column_type| {
             alloc.free(alter_column_type.column_name);
             if (alter_column_type.collation) |collation| alloc.free(collation);
+            if (alter_column_type.rewrite_expression) |rewrite| {
+                var mutable_rewrite = rewrite;
+                mutable_rewrite.deinit(alloc);
+            }
         },
         .add_unique_constraint => |constraint| freeDdlUniqueConstraint(alloc, constraint),
         .add_foreign_key => |foreign_key| freeDdlForeignKey(alloc, foreign_key),

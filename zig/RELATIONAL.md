@@ -5032,7 +5032,11 @@ semantics. Until server-file, `PROGRAM`, alternate stream endpoints, binary
 format, legacy OID options, and broader row-filtered `COPY FROM ... WHERE`
 predicate families have native bulk-I/O endpoint and validation contracts, the
 source parity corpus requires them to fail closed under `bulk_io_plan` or at the
-execution-bridge boundary.
+execution-bridge boundary. The generated fixture can pin either a concrete
+`bulk_sql_io` execution fingerprint or an execution-stage unsupported
+fingerprint, so parseable PostgreSQL syntax such as `COPY ... WITH (FORMAT
+binary)` remains visible as typed bulk-I/O intent while the bridge rejects it
+before storage can receive bytes.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,
@@ -5504,10 +5508,12 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    constraints, foreign keys, and checks still describe a valid relational
    schema; type changes that would leave existing collation metadata on a
    non-text storage column fail closed. Generated-column result types are not
-   overwritten by column-type DDL. Identity `USING` clauses such
-   as `USING field::target_type` or `USING (field)::target_type` normalize to
-   the same typed rewrite; computed rewrite expressions still fail closed until
-   they have a native rewrite plan. `ALTER TABLE ... RENAME COLUMN` lowers to a typed rewrite
+   overwritten by column-type DDL. Identity `USING` clauses such as
+   `USING field::target_type` or `USING (field)::target_type`, deterministic
+   same-column case/hash functions, and numeric `USING field + literal`
+   expressions now lower to typed rewrite work items with explicit target,
+   source, operation, and literal metadata; arbitrary SQL rewrite expressions
+   still fail closed until they map to the same native rewrite plan. `ALTER TABLE ... RENAME COLUMN` lowers to a typed rewrite
    mutation that renames the column and rewrites table-local references in
    primary keys, child-side foreign keys, unique constraints, checks, generated
    columns, partial predicates, and required-field metadata. `ALTER TABLE ...
