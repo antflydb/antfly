@@ -2378,11 +2378,6 @@ fn parseBulkSqlCsvRecordAlloc(
     while (i < line.len) : (i += 1) {
         const c = line[i];
         if (in_quote) {
-            if (c == escape and i + 1 < line.len) {
-                i += 1;
-                try field.append(alloc, line[i]);
-                continue;
-            }
             if (c == quote) {
                 if (i + 1 < line.len and line[i + 1] == quote) {
                     i += 1;
@@ -2390,6 +2385,11 @@ fn parseBulkSqlCsvRecordAlloc(
                     continue;
                 }
                 in_quote = false;
+                continue;
+            }
+            if (c == escape and i + 1 < line.len) {
+                i += 1;
+                try field.append(alloc, line[i]);
                 continue;
             }
             try field.append(alloc, c);
@@ -47048,7 +47048,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(copy_import_row.value.object.get("active").?.bool);
     try std.testing.expectEqualStrings("copy", copy_import_row.value.object.get("metadata").?.object.get("source").?.string);
 
-    var copy_import_nulls = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, NULL '');");
+    var copy_import_nulls = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount) FROM STDIN WITH (FORMAT csv, NULL '');");
     defer copy_import_nulls.deinit(alloc);
     const copy_import_nulls_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_nulls) {
         .bulk_io => |plan| plan,
@@ -47058,7 +47058,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         alloc,
         copy_runtime_schema,
         copy_import_nulls_plan,
-        "u_empty_unquoted,\nu_empty_quoted,\"\"\n",
+        "u_empty_unquoted,,0\nu_empty_quoted,\"\",0\n",
     );
     defer copy_import_nulls_batch.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), copy_import_nulls_batch.writes.len);
@@ -47071,25 +47071,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("u_empty_quoted", quoted_empty_row.value.object.get("id").?.string);
     try std.testing.expectEqualStrings("", quoted_empty_row.value.object.get("status").?.string);
 
-    var copy_import_force_null = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, NULL '', FORCE_NULL (status));");
+    var copy_import_force_null = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount) FROM STDIN WITH (FORMAT csv, NULL '', FORCE_NULL (status));");
     defer copy_import_force_null.deinit(alloc);
     const copy_import_force_null_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_force_null) {
         .bulk_io => |plan| plan,
         else => return error.TestUnexpectedResult,
     });
-    var copy_import_force_null_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_force_null_plan, "u_force_null,\"\"\n");
+    var copy_import_force_null_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_force_null_plan, "u_force_null,\"\",0\n");
     defer copy_import_force_null_batch.deinit(alloc);
     var force_null_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_force_null_batch.writes[0].value, .{});
     defer force_null_row.deinit();
     try std.testing.expect(force_null_row.value.object.get("status").? == .null);
 
-    var copy_import_force_not_null = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, NULL '', FORCE_NOT_NULL (status));");
+    var copy_import_force_not_null = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount) FROM STDIN WITH (FORMAT csv, NULL '', FORCE_NOT_NULL (status));");
     defer copy_import_force_not_null.deinit(alloc);
     const copy_import_force_not_null_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_force_not_null) {
         .bulk_io => |plan| plan,
         else => return error.TestUnexpectedResult,
     });
-    var copy_import_force_not_null_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_force_not_null_plan, "u_force_not_null,\n");
+    var copy_import_force_not_null_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_force_not_null_plan, "u_force_not_null,,0\n");
     defer copy_import_force_not_null_batch.deinit(alloc);
     var force_not_null_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_force_not_null_batch.writes[0].value, .{});
     defer force_not_null_row.deinit();

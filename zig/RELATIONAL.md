@@ -5125,19 +5125,21 @@ which stores routine records in a native runtime catalog. Safe
 typed routine body hook carrying the same row-expression AST used by generated
 columns, row rewrites, checks, expression indexes, predicates, update
 transforms, and `RETURNING`; routine argument references normalize to
-`field[source:arg1]` inside that AST. The routine runtime clones those typed
-body expressions and can execute expression hooks through the shared
-`relational_rows.expressionValueJsonAlloc` evaluator, so supported functions
-such as single-argument `lower`, `upper`, `md5`, identity, and simple numeric
-addition are not opaque SQL strings. Table-schema and table-storage application
-still reject routine-catalog plans because routines are catalog/runtime objects,
-not schema JSON mutations. Routine bodies and routine options that do not yet
-have typed metadata remain unsupported and are pinned in the source parity
-corpus under `routine_body_plan` and `routine_option_plan` until there is a
-broader native mutation-hook/catalog contract: deterministic hook identity,
-declared row inputs and outputs, allowed side effects, dependency tracking,
-schema promotion, authorization hooks, replay behavior, and repair/rebuild
-semantics. Storage should never execute or persist opaque PL/pgSQL bodies as
+`field[source:argN]` by ordinal inside that AST, so `$1`, `$2`, `arg1`, and
+`arg2` bind to the same typed argument object fields that the routine runtime
+uses. The routine runtime clones those typed body expressions and can execute
+expression hooks through the shared `relational_rows.expressionValueJsonAlloc`
+evaluator, so supported functions such as ordinal identity, `lower`, `upper`,
+`md5`, and simple bounded numeric addition over argument or literal operands
+are not opaque SQL strings. Table-schema and table-storage application still
+reject routine-catalog plans because routines are catalog/runtime objects, not
+schema JSON mutations. Routine bodies and routine options that do not yet have
+typed metadata remain unsupported and are pinned in the source parity corpus
+under `routine_body_plan` and `routine_option_plan` until there is a broader
+native mutation-hook/catalog contract: deterministic hook identity, declared
+row inputs and outputs, allowed side effects, dependency tracking, schema
+promotion, authorization hooks, replay behavior, and repair/rebuild semantics.
+Storage should never execute or persist opaque PL/pgSQL bodies as
 part of the relational model.
 
 | 0a. SQL table-reference normalization | Keep SQL table-reference sugar out of storage and typed request contracts. | Golden corpus entries now pin `ONLY` as an adapter-only no-op for index targets, single-table reads, inserts, point deletes, claimed mutation sources, truncate, and joined mutation sources, including `public.`-qualified table names. | Table-reference spelling changes produce the same Antfly typed plan or fail closed before storage. |

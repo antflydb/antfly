@@ -2828,25 +2828,32 @@ fn parseSqlRoutineBodyPlanAlloc(
     if (std.mem.endsWith(u8, expression, ";")) {
         expression = std.mem.trim(u8, expression[0 .. expression.len - 1], " \t\r\n");
     }
-    if (std.ascii.eqlIgnoreCase(expression, "$1") or std.ascii.eqlIgnoreCase(expression, "arg1")) {
-        return .{
-            .kind = .sql_expression,
-            .hook = .expression,
-            .expression = try routineArgumentExpressionAlloc(alloc),
-        };
+    var expression_tokens = try lexer.tokenizeAlloc(alloc, expression);
+    defer lexer.freeTokens(alloc, &expression_tokens);
+    if (expression_tokens.items.len == 1) {
+        if (routineArgumentIndex(expression_tokens.items[0].text)) |argument_index| {
+            return .{
+                .kind = .sql_expression,
+                .hook = .expression,
+                .expression = try routineArgumentExpressionAlloc(alloc, argument_index),
+            };
+        }
     }
     inline for (.{ "lower", "upper", "md5" }) |fn_name| {
-        const prefix = fn_name ++ "(";
-        if (std.ascii.startsWithIgnoreCase(expression, prefix) and std.mem.endsWith(u8, expression, ")")) {
-            const inner = std.mem.trim(u8, expression[prefix.len .. expression.len - 1], " \t\r\n");
-            if (!std.ascii.eqlIgnoreCase(inner, "$1") and !std.ascii.eqlIgnoreCase(inner, "arg1")) return error.UnsupportedSqlShape;
+        if (expression_tokens.items.len == 4 and
+            expression_tokens.items[0].kind == .identifier and
+            std.ascii.eqlIgnoreCase(expression_tokens.items[0].text, fn_name) and
+            expression_tokens.items[1].kind == .lparen and
+            expression_tokens.items[3].kind == .rparen)
+        {
+            const argument_index = routineArgumentIndex(expression_tokens.items[2].text) orelse return error.UnsupportedSqlShape;
             const kind: runtime_schema.RelationalRowsExpressionKind = if (std.ascii.eqlIgnoreCase(fn_name, "lower"))
                 .lower
             else if (std.ascii.eqlIgnoreCase(fn_name, "upper"))
                 .upper
             else
                 .md5;
-            const operand = try routineArgumentExpressionAlloc(alloc);
+            const operand = try routineArgumentExpressionAlloc(alloc, argument_index);
             var operand_transferred = false;
             errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
             const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
@@ -2859,25 +2866,18 @@ fn parseSqlRoutineBodyPlanAlloc(
             };
         }
     }
-    if (std.mem.startsWith(u8, expression, "$1 + ") or std.ascii.startsWithIgnoreCase(expression, "arg1 + ")) {
-        const literal_start: usize = if (std.mem.startsWith(u8, expression, "$1 + ")) "$1 + ".len else "arg1 + ".len;
-        const literal = std.mem.trim(u8, expression[literal_start..], " \t\r\n");
-        _ = std.fmt.parseFloat(f64, literal) catch return error.UnsupportedSqlShape;
-        const operand = try routineArgumentExpressionAlloc(alloc);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
-        const value_json = try alloc.dupe(u8, literal);
-        var value_transferred = false;
-        errdefer if (!value_transferred) alloc.free(value_json);
-        const value = try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
-        value_transferred = true;
-        var value_expression_transferred = false;
-        errdefer if (!value_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, value);
+    if (expression_tokens.items.len == 3 and expression_tokens.items[1].kind == .plus) {
+        const lhs = try routineAddOperandExpressionAlloc(alloc, expression_tokens.items[0]);
+        var lhs_transferred = false;
+        errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+        const rhs = try routineAddOperandExpressionAlloc(alloc, expression_tokens.items[2]);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs);
         const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 2);
-        operands[0] = operand;
-        operands[1] = value;
-        operand_transferred = true;
-        value_expression_transferred = true;
+        operands[0] = lhs;
+        operands[1] = rhs;
+        lhs_transferred = true;
+        rhs_transferred = true;
         return .{
             .kind = .sql_expression,
             .hook = .expression,
@@ -2887,8 +2887,47 @@ fn parseSqlRoutineBodyPlanAlloc(
     return error.UnsupportedSqlShape;
 }
 
-fn routineArgumentExpressionAlloc(alloc: std.mem.Allocator) !runtime_schema.RelationalRowsExpression {
-    const field = try alloc.dupe(u8, "arg1");
+fn routineArgumentIndex(text: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const digits = if (std.mem.startsWith(u8, trimmed, "$"))
+        trimmed[1..]
+    else if (std.ascii.startsWithIgnoreCase(trimmed, "arg"))
+        trimmed["arg".len..]
+    else
+        return null;
+    if (digits.len == 0) return null;
+    for (digits) |byte| {
+        if (byte < '0' or byte > '9') return null;
+    }
+    const index = std.fmt.parseInt(usize, digits, 10) catch return null;
+    if (index == 0) return null;
+    return index;
+}
+
+fn routineAddOperandExpressionAlloc(
+    alloc: std.mem.Allocator,
+    token: Token,
+) !runtime_schema.RelationalRowsExpression {
+    if (token.kind == .placeholder or token.kind == .identifier) {
+        if (routineArgumentIndex(token.text)) |argument_index| {
+            return try routineArgumentExpressionAlloc(alloc, argument_index);
+        }
+    }
+    if (token.kind != .number) return error.UnsupportedSqlShape;
+    _ = std.fmt.parseFloat(f64, token.text) catch return error.UnsupportedSqlShape;
+    const value_json = try alloc.dupe(u8, token.text);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    const value = try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
+    value_transferred = true;
+    return value;
+}
+
+fn routineArgumentExpressionAlloc(
+    alloc: std.mem.Allocator,
+    argument_index: usize,
+) !runtime_schema.RelationalRowsExpression {
+    const field = try std.fmt.allocPrint(alloc, "arg{d}", .{argument_index});
     errdefer alloc.free(field);
     const value_json = try alloc.dupe(u8, "");
     errdefer alloc.free(value_json);
@@ -7636,6 +7675,37 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqualStrings("work_mem", current_setting_function.settings[0].name);
     try std.testing.expectEqual(@as(usize, 0), current_setting_function.settings[0].values.len);
     try std.testing.expect(current_setting_function.settings[0].from_current);
+
+    var second_arg_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION second_arg(text, text) RETURNS text LANGUAGE sql AS 'SELECT upper($2)';");
+    defer lexer.freeTokens(alloc, &second_arg_body_tokens);
+    var second_arg_body_pos: usize = 0;
+    var second_arg_body = try parseCreateRoutineCatalogTailAlloc(alloc, second_arg_body_tokens.items, &second_arg_body_pos);
+    defer second_arg_body.deinit(alloc);
+    try std.testing.expectEqual(second_arg_body_tokens.items.len, second_arg_body_pos);
+    try std.testing.expectEqual(@as(usize, 2), second_arg_body.argument_count);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.sql_expression, second_arg_body.body.?.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.upper, second_arg_body.body.?.expression.kind);
+    try std.testing.expectEqualStrings("arg2", second_arg_body.body.?.expression.operands[0].field);
+
+    var add_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION add_amounts(numeric, numeric) RETURNS numeric LANGUAGE sql AS 'SELECT $1+$2';");
+    defer lexer.freeTokens(alloc, &add_body_tokens);
+    var add_body_pos: usize = 0;
+    var add_body = try parseCreateRoutineCatalogTailAlloc(alloc, add_body_tokens.items, &add_body_pos);
+    defer add_body.deinit(alloc);
+    try std.testing.expectEqual(add_body_tokens.items.len, add_body_pos);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, add_body.body.?.expression.kind);
+    try std.testing.expectEqualStrings("arg1", add_body.body.?.expression.operands[0].field);
+    try std.testing.expectEqualStrings("arg2", add_body.body.?.expression.operands[1].field);
+
+    var literal_add_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION shift_amount(numeric) RETURNS numeric LANGUAGE sql AS 'SELECT 1 + arg1';");
+    defer lexer.freeTokens(alloc, &literal_add_body_tokens);
+    var literal_add_body_pos: usize = 0;
+    var literal_add_body = try parseCreateRoutineCatalogTailAlloc(alloc, literal_add_body_tokens.items, &literal_add_body_pos);
+    defer literal_add_body.deinit(alloc);
+    try std.testing.expectEqual(literal_add_body_tokens.items.len, literal_add_body_pos);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, literal_add_body.body.?.expression.kind);
+    try std.testing.expectEqualStrings("1", literal_add_body.body.?.expression.operands[0].value_json);
+    try std.testing.expectEqualStrings("arg1", literal_add_body.body.?.expression.operands[1].field);
 
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);

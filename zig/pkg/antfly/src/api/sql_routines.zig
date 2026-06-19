@@ -100,13 +100,23 @@ pub const Runtime = struct {
         routine_name: []const u8,
         argument_json: []const u8,
     ) ![]u8 {
+        return try self.executeExpressionRoutineArgsAlloc(alloc, routine_name, &.{argument_json});
+    }
+
+    pub fn executeExpressionRoutineArgsAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        routine_name: []const u8,
+        argument_json: []const []const u8,
+    ) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const routine = self.findRoutineLocked(.function, routine_name, 1) orelse return error.RoutineNotFound;
+        const routine = self.findRoutineLocked(.function, routine_name, argument_json.len) orelse return error.RoutineNotFound;
         const body = routine.body orelse return error.RoutineBodyNotExecutable;
         if (body.kind != .sql_expression or body.hook != .expression) return error.RoutineBodyNotExecutable;
-        const row_json = try std.fmt.allocPrint(alloc, "{{\"arg1\":{s}}}", .{argument_json});
+        const row_json = try routineArgumentObjectJsonAlloc(alloc, argument_json, routine.null_input);
         defer alloc.free(row_json);
+        if (std.mem.eql(u8, row_json, "null")) return try alloc.dupe(u8, "null");
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
         defer parsed.deinit();
         return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, body.expression);
@@ -159,6 +169,30 @@ pub const Runtime = struct {
         return null;
     }
 };
+
+fn routineArgumentObjectJsonAlloc(
+    alloc: std.mem.Allocator,
+    argument_json: []const []const u8,
+    null_input: ?relational_sql.RoutineNullInput,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (argument_json, 0..) |json, i| {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value == .null and null_input == .returns_null) {
+            out.deinit();
+            return try alloc.dupe(u8, "null");
+        }
+        if (i > 0) try writer.writeByte(',');
+        try writer.print("\"arg{d}\":", .{i + 1});
+        try std.json.Stringify.value(parsed.value, .{}, writer);
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
 
 fn cloneCreateRoutineRecordAlloc(alloc: std.mem.Allocator, plan: relational_sql.CreateRoutinePlan) !RoutineRecord {
     const name = try alloc.dupe(u8, plan.routine_name);
@@ -273,6 +307,46 @@ test "sql routine runtime stores and executes safe expression bodies" {
     const out = try runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"ACTIVE\"");
     defer alloc.free(out);
     try std.testing.expectEqualStrings("\"active\"", out);
+}
+
+test "sql routine runtime executes bounded multi argument expression bodies" {
+    const alloc = std.testing.allocator;
+    var plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION add_amounts(numeric, numeric) RETURNS numeric LANGUAGE sql AS 'SELECT $1 + $2';",
+    );
+    defer plan.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try runtime.apply(switch (plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const out = try runtime.executeExpressionRoutineArgsAlloc(alloc, "add_amounts", &.{ "2", "3.5" });
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("5.5", out);
+}
+
+test "sql routine runtime applies returns-null null-input policy before execution" {
+    const alloc = std.testing.allocator;
+    var plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION strict_normalize_status(text) RETURNS text LANGUAGE sql STRICT AS 'SELECT lower($1)';",
+    );
+    defer plan.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try runtime.apply(switch (plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const out = try runtime.executeExpressionRoutineAlloc(alloc, "strict_normalize_status", "null");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("null", out);
 }
 
 test "sql routine runtime preserves typed catalog metadata" {

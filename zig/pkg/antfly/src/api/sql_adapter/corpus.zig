@@ -4064,6 +4064,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_transform: bool = false,
     ddl_function_setting: bool = false,
     ddl_function_sql_expression_body: bool = false,
+    ddl_function_sql_expression_multi_arg_body: bool = false,
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
@@ -5739,6 +5740,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_setting = self.ddl_function_setting or std.mem.indexOf(u8, entry.plan, ":settings=") != null;
                     self.ddl_function_sql_expression_body = self.ddl_function_sql_expression_body or
                         std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null;
+                    self.ddl_function_sql_expression_multi_arg_body = self.ddl_function_sql_expression_multi_arg_body or
+                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                            std.mem.indexOf(u8, entry.plan, "arg2") != null);
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;
