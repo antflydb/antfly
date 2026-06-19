@@ -1142,16 +1142,18 @@ pub const LazyDirectorySnapshot = struct {
                 delta_index -= 1;
                 const found = try deltaIndexEntryFromIndexData(index_data.data, delta_index);
                 if (best_record != null and found.sequence <= best_sequence) break;
-                const value_buffer = try readSegmentEntryValueWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, found, &value_scratch);
-                defer value_buffer.deinit(alloc);
-                try latestDeltaValueRecordAfterGenerationForMember(
-                    value_buffer.data,
-                    vector_id,
-                    base_generation,
-                    posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
-                    &best_sequence,
-                    &best_record,
-                );
+                {
+                    const value_buffer = try readSegmentEntryValueWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, found, &value_scratch);
+                    defer value_buffer.deinit(alloc);
+                    try latestDeltaValueRecordAfterGenerationForMember(
+                        value_buffer.data,
+                        vector_id,
+                        base_generation,
+                        posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
+                        &best_sequence,
+                        &best_record,
+                    );
+                }
             }
         }
         return best_record;
