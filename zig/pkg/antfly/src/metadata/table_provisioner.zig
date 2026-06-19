@@ -526,7 +526,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
 
         const existing = findIndexConfig(current, entry.key_ptr.*);
         if (existing) |existing_cfg| {
-            if (existing_cfg.kind == kind and kind != .full_text) continue;
+            if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) continue;
         }
 
         const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
@@ -561,6 +561,13 @@ fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: d
     if (a.kind != b.kind) return false;
     if (a.kind == .full_text) return fullTextIndexConfigsEqual(alloc, a.config_json, b.config_json);
     return std.mem.eql(u8, a.config_json, b.config_json);
+}
+
+fn indexKindConfigReconcileDeferred(kind: db_mod.types.IndexKind) bool {
+    return switch (kind) {
+        .dense_vector, .sparse_vector, .graph => true,
+        .full_text, .algebraic => false,
+    };
 }
 
 fn fullTextIndexConfigsEqual(alloc: std.mem.Allocator, a_json: []const u8, b_json: []const u8) !bool {
@@ -957,10 +964,14 @@ fn schemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
 
 fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (value != .object) return .full_text;
-    const type_value = value.object.get("type") orelse return .full_text;
+    const type_value = value.object.get("type") orelse {
+        if (looksLikeStoredAlgebraicIndexConfig(value)) return .algebraic;
+        return .full_text;
+    };
     if (type_value != .string) return error.InvalidCreateTableRequest;
     if (std.mem.eql(u8, type_value.string, "full_text")) return .full_text;
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
+    if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
     if (std.mem.eql(u8, type_value.string, "embeddings")) {
         const sparse = if (value.object.get("sparse")) |sparse_value| switch (sparse_value) {
             .bool => sparse_value.bool,
@@ -971,9 +982,20 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     return error.UnsupportedCreateTableRequest;
 }
 
+fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
+    if (value != .object) return false;
+    if (value.object.get("schema_version") == null and
+        (value.object.get("version") == null or value.object.get("table") == null)) return false;
+    return value.object.get("group_fields") != null or
+        value.object.get("measure_fields") != null or
+        value.object.get("time_fields") != null or
+        value.object.get("materializations") != null;
+}
+
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
-    switch (try parseIndexKind(value)) {
+    const kind = try parseIndexKind(value);
+    switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
         else => {},
     }
@@ -984,14 +1006,7 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     var first = true;
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "type") or
-            std.mem.eql(u8, entry.key_ptr.*, "name") or
-            std.mem.eql(u8, entry.key_ptr.*, "description") or
-            std.mem.eql(u8, entry.key_ptr.*, "version") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
-        {
-            continue;
-        }
+        if (skipPublicIndexMetadataField(kind, entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -1002,6 +1017,18 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn skipPublicIndexMetadataField(kind: db_mod.types.IndexKind, field: []const u8) bool {
+    if (std.mem.eql(u8, field, "type") or
+        std.mem.eql(u8, field, "name") or
+        std.mem.eql(u8, field, "description") or
+        std.mem.eql(u8, field, "enrichments") or
+        std.mem.eql(u8, field, "derive_from_schema"))
+    {
+        return true;
+    }
+    return kind != .algebraic and std.mem.eql(u8, field, "version");
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -1109,6 +1136,64 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+}
+
+test "table provisioner reconciles stored algebraic metadata without public type" {
+    const path = "/tmp/antfly-metadata-table-provisioner-algebraic-existing";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
+    defer std.testing.allocator.free(db_path);
+    try fs_paths.createDirPathPortable(io_impl.io(), db_path);
+
+    const config_json =
+        \\{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}
+    ;
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "alg", .kind = .algebraic, .config_json = config_json });
+
+    const indexes_json =
+        \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
+    ;
+    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json);
+    try std.testing.expectEqual(@as(usize, 0), summary.added);
+    try std.testing.expectEqual(@as(usize, 0), summary.removed);
+    try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
+}
+
+test "table provisioner extracts public algebraic metadata as internal config" {
+    const alloc = std.testing.allocator;
+    const index_json =
+        \\{"type":"algebraic","version":1,"table":"docs","schema_version":2,"derive_from_schema":true,"group_fields":[{"name":"customer","path":"customer","type":"string"}],"materializations":[]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(db_mod.types.IndexKind.algebraic, try parseIndexKind(parsed.value));
+    const config_json = try extractIndexConfigJson(alloc, "alg", parsed.value);
+    defer alloc.free(config_json);
+    var config = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer config.deinit();
+
+    try std.testing.expect(config.value.object.get("type") == null);
+    try std.testing.expect(config.value.object.get("derive_from_schema") == null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"schema_version\":2") != null);
+}
+
+test "table provisioner recognizes legacy stored algebraic metadata" {
+    const alloc = std.testing.allocator;
+    const index_json =
+        \\{"version":1,"table":"docs","materializations":[]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(db_mod.types.IndexKind.algebraic, try parseIndexKind(parsed.value));
 }
 
 test "table provisioner registers top-level enrichments without creating enrichment index" {
