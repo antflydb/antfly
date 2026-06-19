@@ -245,17 +245,6 @@ const static_entries = [_]Entry{
 
 const tenant_entries = [_]Entry{
     .{
-        .identifier_suffix = "mcp:default",
-        .display_name = "Antfly MCP Server",
-        .media_type = "application/mcp-server+json",
-        .description = "Aggregate Antfly MCP server for built-in and visible extension tools.",
-        .data = "{\"name\":\"antfly\",\"endpoint\":\"/mcp/v1\"}",
-        .metadata = "{\"endpoint\":\"/mcp/v1\"}",
-        .tags = &.{ "mcp", "tools" },
-        .capabilities = &.{ "table-search", "retrieval", "query-builder", "extension-tools" },
-        .representative_queries = &.{ "search an Antfly table", "list extension MCP tools", "run a retrieval workflow" },
-    },
-    .{
         .identifier_suffix = "openapi:ard",
         .display_name = "Antfly ARD OpenAPI",
         .media_type = "application/openapi+yaml",
@@ -325,6 +314,18 @@ const tenant_entries = [_]Entry{
     },
 };
 
+const aggregate_mcp_entry = Entry{
+    .identifier_suffix = "mcp:default",
+    .display_name = "Antfly MCP Server",
+    .media_type = "application/mcp-server+json",
+    .description = "Aggregate Antfly MCP server for built-in and visible extension tools.",
+    .url = "/ard/v1/resources/mcp/default",
+    .metadata = "{\"endpoint\":\"/mcp/v1\"}",
+    .tags = &.{ "mcp", "tools" },
+    .capabilities = &.{ "table-search", "retrieval", "query-builder", "extension-tools" },
+    .representative_queries = &.{ "search an Antfly table", "list extension MCP tools", "run a retrieval workflow" },
+};
+
 const copilot_mcp_profile_entry = Entry{
     .identifier_suffix = "mcp-profile:copilot",
     .display_name = "Antfly Copilot MCP Profile",
@@ -349,6 +350,7 @@ pub fn catalogJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: Catalog
     var first = true;
     try writeScopedEntries(&writer.writer, options, &first, null, null);
     if (options.mode == .tenant) {
+        try writeAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, null, null);
         try writeCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, null, null);
         if (extension_context) |ctx| try writeExtensionEntries(alloc, &writer.writer, options, &first, ctx, null, null);
     }
@@ -374,6 +376,7 @@ pub fn searchJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     var matched: usize = 0;
     try writeMatchedEntries(&writer.writer, options, &first, request.text, request.filter, &matched);
     if (options.mode == .tenant) {
+        try writeSearchAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, &matched);
         try writeSearchCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, &matched);
         if (extension_context) |ctx| try writeMatchedExtensionEntries(alloc, &writer.writer, options, &first, ctx, request.text, request.filter, &matched);
     }
@@ -398,6 +401,7 @@ fn exploreJsonWithExtensionsAlloc(
     var matched: usize = 0;
     try collectStaticFacets(alloc, facets.slice(), options, request.text, request.filter, &matched);
     if (options.mode == .tenant) {
+        try collectAggregateMcpFacets(alloc, facets.slice(), options, extension_context, request.text, request.filter, &matched);
         try collectCopilotMcpProfileFacets(alloc, facets.slice(), options, extension_context, request.text, request.filter, &matched);
         if (extension_context) |ctx| try collectExtensionFacets(alloc, facets.slice(), options, ctx, request.text, request.filter, &matched);
     }
@@ -438,6 +442,7 @@ pub fn agentsJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     var count: usize = 0;
     try writeAgentEntries(&writer.writer, options, &first, &count);
     if (options.mode == .tenant) {
+        try writeAgentAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, &count);
         try writeAgentCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, &count);
         if (extension_context) |ctx| try writeAgentExtensionEntries(alloc, &writer.writer, options, &first, ctx, &count);
     }
@@ -487,9 +492,8 @@ pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, extens
         return null;
     }
     if (!std.mem.eql(u8, name, "default")) return null;
-    return try alloc.dupe(u8,
-        \\{"name":"antfly","endpoint":"/mcp/v1","description":"Aggregate Antfly MCP server for built-in and visible extension tools.","capabilities":["table-search","retrieval","query-builder","extension-tools"]}
-    );
+    if (!(try aggregateMcpVisible(alloc, extension_context))) return null;
+    return try aggregateMcpDescriptorJsonAlloc(alloc, extension_context);
 }
 
 const SearchRequest = struct {
@@ -934,6 +938,64 @@ fn writeAgentExtensionEntries(
         try writeExtensionMcpEntry(writer, options.publisher_domain, first, installed);
         count.* += 1;
     }
+}
+
+fn collectAggregateMcpFacets(
+    alloc: std.mem.Allocator,
+    facets: []FacetAccumulator,
+    options: CatalogOptions,
+    extension_context: ?ExtensionCatalogContext,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    matched: *usize,
+) !void {
+    if (!(try aggregateMcpVisible(alloc, extension_context))) return;
+    if (!catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry) or !entryMatches(aggregate_mcp_entry, options.publisher_domain, text, filter)) return;
+    matched.* += 1;
+    try addEntryFacets(alloc, facets, options.publisher_domain, aggregate_mcp_entry);
+}
+
+fn writeAggregateMcpEntry(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: CatalogOptions,
+    first: *bool,
+    extension_context: ?ExtensionCatalogContext,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+) !void {
+    if (!(try aggregateMcpVisible(alloc, extension_context))) return;
+    if (!catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry) or !entryMatches(aggregate_mcp_entry, options.publisher_domain, text, filter)) return;
+    try writeEntry(writer, options.publisher_domain, first, aggregate_mcp_entry);
+}
+
+fn writeSearchAggregateMcpEntry(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: CatalogOptions,
+    first: *bool,
+    extension_context: ?ExtensionCatalogContext,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    matched: *usize,
+) !void {
+    if (!(try aggregateMcpVisible(alloc, extension_context))) return;
+    if (!catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry) or !entryMatches(aggregate_mcp_entry, options.publisher_domain, text, filter)) return;
+    try writeSearchEntry(writer, options.publisher_domain, first, aggregate_mcp_entry, matched, text);
+}
+
+fn writeAgentAggregateMcpEntry(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: CatalogOptions,
+    first: *bool,
+    extension_context: ?ExtensionCatalogContext,
+    count: *usize,
+) !void {
+    if (!(try aggregateMcpVisible(alloc, extension_context))) return;
+    if (!isAgentLike(aggregate_mcp_entry) or !catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry)) return;
+    try writeEntry(writer, options.publisher_domain, first, aggregate_mcp_entry);
+    count.* += 1;
 }
 
 fn collectCopilotMcpProfileFacets(
@@ -1392,11 +1454,27 @@ const builtin_mcp_tools = [_]BuiltinMcpTool{
     .{ .kind = .batch, .name = "batch" },
 };
 
+fn aggregateMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, extension_context: ?ExtensionCatalogContext) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+
+    try writer.writer.writeAll("{\"name\":\"antfly\",\"endpoint\":\"/mcp/v1\",\"description\":\"Aggregate Antfly MCP server for built-in and visible extension tools.\",\"capabilities\":[\"table-search\",\"retrieval\",\"query-builder\",\"extension-tools\"],\"tools\":[");
+    try writeVisibleMcpTools(alloc, &writer.writer, extension_context);
+    try writer.writer.writeAll("]}");
+    return try writer.toOwnedSlice();
+}
+
 fn copilotMcpProfileDescriptorJsonAlloc(alloc: std.mem.Allocator, extension_context: ?ExtensionCatalogContext) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
 
     try writer.writer.writeAll("{\"name\":\"antfly-copilot\",\"endpoint\":\"/mcp/v1/extensions/profiles/copilot\",\"profile\":\"copilot\",\"description\":\"Profile-scoped Antfly MCP server for Copilot-style clients.\",\"capabilities\":[\"table-search\",\"retrieval\",\"query-builder\",\"extension-tools\"],\"tools\":[");
+    try writeVisibleMcpTools(alloc, &writer.writer, extension_context);
+    try writer.writer.writeAll("]}");
+    return try writer.toOwnedSlice();
+}
+
+fn writeVisibleMcpTools(alloc: std.mem.Allocator, writer: *std.Io.Writer, extension_context: ?ExtensionCatalogContext) !void {
     var first = true;
     const permissions = if (extension_context) |ctx| ctx.permissions else null;
     for (builtin_mcp_tools) |tool| {
@@ -1404,11 +1482,11 @@ fn copilotMcpProfileDescriptorJsonAlloc(alloc: std.mem.Allocator, extension_cont
         if (first) {
             first = false;
         } else {
-            try writer.writer.writeByte(',');
+            try writer.writeByte(',');
         }
-        try writer.writer.writeAll("{\"name\":");
-        try std.json.Stringify.value(tool.name, .{}, &writer.writer);
-        try writer.writer.writeAll(",\"source\":\"builtin\"}");
+        try writer.writeAll("{\"name\":");
+        try std.json.Stringify.value(tool.name, .{}, writer);
+        try writer.writeAll(",\"source\":\"builtin\"}");
     }
     if (extension_context) |ctx| {
         for (ctx.installed_extensions) |installed| {
@@ -1420,22 +1498,20 @@ fn copilotMcpProfileDescriptorJsonAlloc(alloc: std.mem.Allocator, extension_cont
                 if (first) {
                     first = false;
                 } else {
-                    try writer.writer.writeByte(',');
+                    try writer.writeByte(',');
                 }
-                try writer.writer.writeAll("{\"name\":");
-                try std.json.Stringify.value(member.object_name, .{}, &writer.writer);
-                try writer.writer.writeAll(",\"source\":\"extension\",\"extension\":");
-                try std.json.Stringify.value(installed.name, .{}, &writer.writer);
+                try writer.writeAll("{\"name\":");
+                try std.json.Stringify.value(member.object_name, .{}, writer);
+                try writer.writeAll(",\"source\":\"extension\",\"extension\":");
+                try std.json.Stringify.value(installed.name, .{}, writer);
                 if (member.table_name.len > 0) {
-                    try writer.writer.writeAll(",\"table\":");
-                    try std.json.Stringify.value(member.table_name, .{}, &writer.writer);
+                    try writer.writeAll(",\"table\":");
+                    try std.json.Stringify.value(member.table_name, .{}, writer);
                 }
-                try writer.writer.writeByte('}');
+                try writer.writeByte('}');
             }
         }
     }
-    try writer.writer.writeAll("]}");
-    return try writer.toOwnedSlice();
 }
 
 const ExtensionSkillRoute = struct {
@@ -1747,17 +1823,31 @@ fn installedExtensionHasVisibleMcpTool(
     return false;
 }
 
+fn aggregateMcpVisible(alloc: std.mem.Allocator, extension_context: ?ExtensionCatalogContext) !bool {
+    return try visibleMcpToolCount(alloc, extension_context) > 0;
+}
+
 fn copilotMcpProfileVisible(alloc: std.mem.Allocator, extension_context: ?ExtensionCatalogContext) !bool {
+    return try visibleMcpToolCount(alloc, extension_context) > 0;
+}
+
+fn visibleMcpToolCount(alloc: std.mem.Allocator, extension_context: ?ExtensionCatalogContext) !usize {
+    var count: usize = 0;
     const permissions = if (extension_context) |ctx| ctx.permissions else null;
     for (builtin_mcp_tools) |tool| {
-        if (builtinMcpToolVisible(tool.kind, permissions)) return true;
+        if (builtinMcpToolVisible(tool.kind, permissions)) count += 1;
     }
     if (extension_context) |ctx| {
         for (ctx.installed_extensions) |installed| {
-            if (try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions)) return true;
+            if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) continue;
+            for (ctx.extension_members) |member| {
+                if (member.object_kind != .mcp_tool) continue;
+                if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+                if (try extensionMemberVisible(alloc, installed, member, ctx.permissions)) count += 1;
+            }
         }
     }
-    return false;
+    return count;
 }
 
 fn builtinMcpToolVisible(kind: BuiltinMcpToolKind, permissions: ?[]const usermgr.Permission) bool {

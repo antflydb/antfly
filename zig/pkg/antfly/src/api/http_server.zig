@@ -2100,7 +2100,7 @@ pub const ApiHttpServer = struct {
             const rest = uri_parts.path[routes.Routes.ard_v1_resources_prefix.len..];
             if (std.mem.startsWith(u8, rest, "mcp/")) {
                 const name = rest["mcp/".len..];
-                var snapshot_opt = if (std.mem.startsWith(u8, name, "extensions/") or std.mem.startsWith(u8, name, "profiles/")) try self.source.adminSnapshot() else null;
+                var snapshot_opt = if (std.mem.eql(u8, name, "default") or std.mem.startsWith(u8, name, "extensions/") or std.mem.startsWith(u8, name, "profiles/")) try self.source.adminSnapshot() else null;
                 defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
@@ -10866,6 +10866,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") != null);
 
     var hidden_memory_skill = try server.handle(.{
@@ -10895,6 +10896,19 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer hidden_extension_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_mcp_resource.status);
+
+    var aggregate_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+        .headers = &trusted_principal_headers,
+    });
+    defer aggregate_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), aggregate_mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"search_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"store_doc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"search_memories\"") == null);
 
     const memory_payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -10984,6 +10998,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer no_permission_profile_catalog.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), no_permission_profile_catalog.status);
     try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly Copilot MCP Profile") == null);
+    try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly MCP Server") == null);
 
     var no_permission_profile_resource = try server.handle(.{
         .method = .GET,
@@ -10992,6 +11007,14 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer no_permission_profile_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), no_permission_profile_resource.status);
+
+    var no_permission_aggregate_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+        .headers = &no_permission_headers,
+    });
+    defer no_permission_aggregate_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), no_permission_aggregate_resource.status);
 
     var ard_search_resp = try server.handle(.{
         .method = .POST,
