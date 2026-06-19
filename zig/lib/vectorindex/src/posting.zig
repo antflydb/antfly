@@ -816,6 +816,17 @@ pub const PostingFormat = struct {
     ) !usize {
         if (ids.len == 0) return base_member_count;
         stableSortCompactOpsByVector(ids, ops);
+        return try applySortedCompactOpsToSortedScratchAssumeSorted(alloc, scratch, base_member_count, ids, ops);
+    }
+
+    pub fn applySortedCompactOpsToSortedScratchAssumeSorted(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_member_count: usize,
+        ids: []VectorId,
+        ops: []PostingDeltaOp,
+    ) !usize {
+        if (ids.len == 0) return base_member_count;
         const original_base_members = scratch.member_ids[0..base_member_count];
         const final_count = sortedCompactOpsMaterializedCount(original_base_members, ids, ops);
         if (canApplySortedCompactOpsForwardInPlace(original_base_members, ids, ops)) {
@@ -1007,6 +1018,16 @@ pub const PostingFormat = struct {
     ) !usize {
         if (records.len == 0) return base_member_count;
         stableSortDeltaRecordsByVector(records);
+        return try applySortedDeltaRecordsToSortedScratchAssumeSorted(alloc, scratch, base_member_count, records);
+    }
+
+    pub fn applySortedDeltaRecordsToSortedScratchAssumeSorted(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_member_count: usize,
+        records: []PostingDeltaRecord,
+    ) !usize {
+        if (records.len == 0) return base_member_count;
         const original_base_members = scratch.member_ids[0..base_member_count];
         const final_count = sortedDeltaRecordsMaterializedCount(original_base_members, records);
         if (canApplySortedDeltaRecordsForwardInPlace(original_base_members, records)) {
@@ -7717,6 +7738,31 @@ test "posting sorted delta replay expands in place when output shifts right" {
     try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
 }
 
+test "posting sorted delta replay assume-sorted skips resort" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20, 30 };
+    try scratch.ensureMemberIdCapacity(alloc, base_members.len);
+    @memcpy(scratch.member_ids[0..base_members.len], base_members[0..]);
+
+    var records = [_]PostingDeltaRecord{
+        .{ .sequence = 2, .op = .insert, .vector_id = 15 },
+        .{ .sequence = 1, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = 3, .op = .insert, .vector_id = 40 },
+    };
+
+    const out_count = try PostingFormat.applySortedDeltaRecordsToSortedScratchAssumeSorted(alloc, &scratch, base_members.len, records[0..]);
+
+    const expected = [_]VectorId{ 10, 15, 30, 40 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+    try std.testing.expectEqual(@as(VectorId, 15), records[0].vector_id);
+    try std.testing.expectEqual(@as(VectorId, 20), records[1].vector_id);
+    try std.testing.expectEqual(@as(VectorId, 40), records[2].vector_id);
+}
+
 test "posting sorted delta replay skips empty tails without touching scratch capacity" {
     const alloc = std.testing.allocator;
     var scratch = PostingQueryMaterializeTestScratch{};
@@ -7753,6 +7799,28 @@ test "posting sorted compact op replay expands in place when output shifts right
     try std.testing.expectEqual(@as(usize, expected.len), out_count);
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_ids.len);
     try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting sorted compact op replay assume-sorted skips resort" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20, 30 };
+    try scratch.ensureMemberIdCapacity(alloc, base_members.len);
+    @memcpy(scratch.member_ids[0..base_members.len], base_members[0..]);
+
+    var ids = [_]VectorId{ 15, 20, 40 };
+    var ops = [_]PostingDeltaOp{ .insert, .tombstone, .insert };
+
+    const out_count = try PostingFormat.applySortedCompactOpsToSortedScratchAssumeSorted(alloc, &scratch, base_members.len, ids[0..], ops[0..]);
+
+    const expected = [_]VectorId{ 10, 15, 30, 40 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+    try std.testing.expectEqual(@as(VectorId, 15), ids[0]);
+    try std.testing.expectEqual(@as(VectorId, 20), ids[1]);
+    try std.testing.expectEqual(@as(VectorId, 40), ids[2]);
 }
 
 test "posting sorted compact op replay skips empty tails without touching scratch capacity" {

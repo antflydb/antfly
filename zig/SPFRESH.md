@@ -1094,7 +1094,9 @@ implementations cleanly:
     file/runtime boundary. Query scratch replay applies that combined stream
     directly into retained member scratch, using sorted merge for canonical bases
     and avoiding a second owned materialized member buffer on pending-overlay
-    reads while preserving canonical sorted output. Fold replay for committed
+    reads while preserving canonical sorted output; segment materialization now
+    also reuses no-resort sorted replay helpers after its own delta ordering
+    pass instead of sorting the same record buffer twice. Fold replay for committed
     segment bases can now stream the same sorted delta summary straight from the
     encoded base bytes into the replacement base encoder, so large committed
     bases do not need a decoded member slice during fold. Query replay, lazy

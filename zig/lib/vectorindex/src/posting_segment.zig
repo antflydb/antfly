@@ -4501,7 +4501,7 @@ fn applyBufferedDeltaRecordsIntoScratch(
 
     if (base_members_are_sorted and records.len <= compact_sorted_delta_scratch_max_records) {
         if (records.len > compact_sorted_delta_max_records) {
-            member_count.* = try posting.PostingFormat.applySortedDeltaRecordsToSortedScratch(
+            member_count.* = try posting.PostingFormat.applySortedDeltaRecordsToSortedScratchAssumeSorted(
                 alloc,
                 scratch,
                 member_count.*,
@@ -4515,7 +4515,7 @@ fn applyBufferedDeltaRecordsIntoScratch(
             compact_ids[i] = record.vector_id;
             compact_ops[i] = record.op;
         }
-        member_count.* = try posting.PostingFormat.applySortedCompactOpsToSortedScratch(
+        member_count.* = try posting.PostingFormat.applySortedCompactOpsToSortedScratchAssumeSorted(
             alloc,
             scratch,
             member_count.*,
