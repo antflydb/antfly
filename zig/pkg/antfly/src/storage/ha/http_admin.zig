@@ -569,11 +569,14 @@ pub const Server = struct {
         ) catch return try textResponse(self.alloc, 400, "invalid HA base backup finish request");
         defer parsed.deinit();
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
+        const manifest_path = validateAdminHAPath(parsed.value.manifest_path, .manifest) catch |err| {
+            return try textResponse(self.alloc, 400, @errorName(err));
+        };
 
         var plan = admin_cli.Plan{
             .output = .json,
             .command = .{ .seed = .{ .finish = .{
-                .manifest_path = parsed.value.manifest_path,
+                .manifest_path = manifest_path,
             } } },
         };
         defer plan.deinit(self.alloc);
@@ -611,12 +614,21 @@ pub const Server = struct {
         ) catch return try textResponse(self.alloc, 400, "invalid HA standby bootstrap request");
         defer parsed.deinit();
         const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
+        const manifest_path = validateAdminHAPath(parsed.value.manifest_path, .manifest) catch |err| {
+            return try textResponse(self.alloc, 400, @errorName(err));
+        };
+        const content_root = if (parsed.value.content_root) |root|
+            validateAdminHAPath(root, .content_root) catch |err| {
+                return try textResponse(self.alloc, 400, @errorName(err));
+            }
+        else
+            null;
 
         var plan = admin_cli.Plan{
             .output = .json,
             .command = .{ .seed = .{ .bootstrap = .{
-                .manifest_path = parsed.value.manifest_path,
-                .content_root = parsed.value.content_root,
+                .manifest_path = manifest_path,
+                .content_root = content_root,
             } } },
         };
         defer plan.deinit(self.alloc);
@@ -980,6 +992,31 @@ pub const Server = struct {
 };
 
 const bearer_prefix = "Bearer ";
+
+const AdminHAPathField = enum {
+    manifest,
+    content_root,
+};
+
+fn validateAdminHAPath(raw: []const u8, field: AdminHAPathField) ![]const u8 {
+    switch (validation.classifyHAString(raw)) {
+        .ok => {},
+        .missing => return switch (field) {
+            .manifest => error.ManifestPathMissing,
+            .content_root => error.ContentRootMissing,
+        },
+        .padded => return adminHAPathInvalidError(field),
+    }
+    if (!validation.isAbsoluteNormalizedPath(raw)) return adminHAPathInvalidError(field);
+    return raw;
+}
+
+fn adminHAPathInvalidError(field: AdminHAPathField) anyerror {
+    return switch (field) {
+        .manifest => error.ManifestPathInvalid,
+        .content_root => error.ContentRootInvalid,
+    };
+}
 
 fn bearerAuthorizationMatches(expected_token: []const u8, authorization: []const u8) bool {
     if (!std.mem.startsWith(u8, authorization, bearer_prefix)) return false;
@@ -1933,11 +1970,15 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
 }
 
 fn allocPrintPath(alloc: Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
-    return try std.fmt.allocPrint(
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const rel = try std.fmt.allocPrint(
         alloc,
         ".zig-cache/tmp/ha-http-admin-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
         .{ std.testing.random_seed, nonce },
     );
+    defer alloc.free(rel);
+    return try std.fs.path.join(alloc, &.{ cwd, rel });
 }
 
 fn testIdentity() standby_mod.Identity {
@@ -2960,6 +3001,99 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try expectContains(typed_bootstrap.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_bootstrap.body, "\"checkpoint_lsn\":2");
     try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
+}
+
+test "storage.ha http admin validates typed seed manifest paths before file access" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "seed-path-validation");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    });
+    defer server.deinit();
+
+    const invalid_manifest_paths = [_]struct {
+        path: []const u8,
+        error_name: []const u8,
+    }{
+        .{ .path = "", .error_name = "ManifestPathMissing" },
+        .{ .path = " /tmp/base.afha", .error_name = "ManifestPathInvalid" },
+        .{ .path = "/tmp/base.afha ", .error_name = "ManifestPathInvalid" },
+        .{ .path = "relative/base.afha", .error_name = "ManifestPathInvalid" },
+        .{ .path = "/tmp/../base.afha", .error_name = "ManifestPathInvalid" },
+        .{ .path = "/tmp//base.afha", .error_name = "ManifestPathInvalid" },
+    };
+
+    for (invalid_manifest_paths) |case| {
+        const finish_body = try std.fmt.allocPrint(alloc, "{{\"manifest_path\":\"{s}\"}}", .{case.path});
+        defer alloc.free(finish_body);
+        var finish = try server.handle(.{
+            .method = .POST,
+            .uri = admin_api.routes.ha_base_backups_finish,
+            .content_type = "application/json",
+            .body = finish_body,
+        });
+        defer finish.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), finish.status);
+        try expectContains(finish.body, case.error_name);
+
+        const bootstrap_body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"manifest_path\":\"{s}\",\"content_root\":\"/tmp/base\"}}",
+            .{case.path},
+        );
+        defer alloc.free(bootstrap_body);
+        var bootstrap = try server.handle(.{
+            .method = .POST,
+            .uri = admin_api.routes.ha_standby_bootstrap,
+            .content_type = "application/json",
+            .body = bootstrap_body,
+        });
+        defer bootstrap.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), bootstrap.status);
+        try expectContains(bootstrap.body, case.error_name);
+    }
+
+    const valid_missing_manifest = "/tmp/antfly-ha-valid-missing.afha";
+    const invalid_content_roots = [_]struct {
+        root: []const u8,
+        error_name: []const u8,
+    }{
+        .{ .root = "", .error_name = "ContentRootMissing" },
+        .{ .root = " /tmp/base", .error_name = "ContentRootInvalid" },
+        .{ .root = "/tmp/base ", .error_name = "ContentRootInvalid" },
+        .{ .root = "relative/base", .error_name = "ContentRootInvalid" },
+        .{ .root = "/tmp/../base", .error_name = "ContentRootInvalid" },
+        .{ .root = "/tmp//base", .error_name = "ContentRootInvalid" },
+    };
+
+    for (invalid_content_roots) |case| {
+        const bootstrap_body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"manifest_path\":\"{s}\",\"content_root\":\"{s}\"}}",
+            .{ valid_missing_manifest, case.root },
+        );
+        defer alloc.free(bootstrap_body);
+        var bootstrap = try server.handle(.{
+            .method = .POST,
+            .uri = admin_api.routes.ha_standby_bootstrap,
+            .content_type = "application/json",
+            .body = bootstrap_body,
+        });
+        defer bootstrap.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), bootstrap.status);
+        try expectContains(bootstrap.body, case.error_name);
+    }
 }
 
 test "storage.ha http admin returns route method and command errors" {

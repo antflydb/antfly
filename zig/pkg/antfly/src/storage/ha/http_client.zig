@@ -1174,11 +1174,15 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
 }
 
 fn allocPrintPath(alloc: Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
-    return try std.fmt.allocPrint(
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const rel = try std.fmt.allocPrint(
         alloc,
         ".zig-cache/tmp/ha-http-client-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
         .{ std.testing.random_seed, nonce },
     );
+    defer alloc.free(rel);
+    return try std.fs.path.join(alloc, &.{ cwd, rel });
 }
 
 fn testIdentity() standby_mod.Identity {
