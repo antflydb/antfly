@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const db_mod = @import("../db/db.zig");
 const backend_erased = @import("../backend_erased.zig");
 const bridge = @import("bridge.zig");
@@ -24,6 +25,44 @@ const Allocator = std.mem.Allocator;
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
 pub const VacuumReport = bridge.ContainerStorage.VacuumReport;
+
+pub const Profile = enum {
+    native,
+    hosted,
+};
+
+pub const Capabilities = struct {
+    freestanding_build: bool = builtin.os.tag == .freestanding,
+    hosted_profile: bool = false,
+    manual_maintenance: bool = false,
+    background_enrichment_runtime: bool = true,
+    ttl_cleanup_runtime: bool = true,
+    transaction_recovery_runtime: bool = true,
+    local_template_rendering: bool = true,
+    remote_template_rendering: bool = true,
+    remote_template_host_callbacks: bool = false,
+    generated_enrichment_planning: bool = true,
+    dense_vector_search: bool = true,
+    sparse_vector_search: bool = true,
+};
+
+pub fn capabilitiesForProfile(profile: Profile) Capabilities {
+    const freestanding = builtin.os.tag == .freestanding;
+    const hosted = profile == .hosted;
+    return .{
+        .hosted_profile = hosted,
+        .manual_maintenance = hosted,
+        .background_enrichment_runtime = !hosted and !freestanding,
+        .ttl_cleanup_runtime = !hosted and !freestanding,
+        .transaction_recovery_runtime = !hosted and !freestanding,
+        .local_template_rendering = true,
+        .remote_template_rendering = !freestanding,
+        .remote_template_host_callbacks = freestanding,
+        .generated_enrichment_planning = true,
+        .dense_vector_search = true,
+        .sparse_vector_search = true,
+    };
+}
 
 pub const EngineKind = enum {
     /// Compatibility bridge for pre-native `.aflite` files and explicit
@@ -242,6 +281,22 @@ fn hasNativeMagic(allocator: Allocator, path: []const u8) !bool {
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "lite backend capabilities distinguish native and hosted profiles" {
+    const native_caps = capabilitiesForProfile(.native);
+    try std.testing.expect(!native_caps.hosted_profile);
+    try std.testing.expect(!native_caps.manual_maintenance);
+    try std.testing.expect(native_caps.generated_enrichment_planning);
+    try std.testing.expect(native_caps.dense_vector_search);
+    try std.testing.expect(native_caps.sparse_vector_search);
+
+    const hosted_caps = capabilitiesForProfile(.hosted);
+    try std.testing.expect(hosted_caps.hosted_profile);
+    try std.testing.expect(hosted_caps.manual_maintenance);
+    try std.testing.expect(!hosted_caps.background_enrichment_runtime);
+    try std.testing.expect(!hosted_caps.ttl_cleanup_runtime);
+    try std.testing.expect(!hosted_caps.transaction_recovery_runtime);
 }
 
 test "lite backend native engine creates and checks aflite file" {

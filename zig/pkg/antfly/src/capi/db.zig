@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const antfly = @import("antfly-zig");
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
@@ -34,21 +33,6 @@ const schema_mod = antfly.schema;
 const lite_backend = antfly.lite.backend;
 const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
-
-const LiteCapabilities = struct {
-    freestanding_build: bool = builtin.os.tag == .freestanding,
-    hosted_profile: bool = false,
-    manual_maintenance: bool = false,
-    background_enrichment_runtime: bool = builtin.os.tag != .freestanding,
-    ttl_cleanup_runtime: bool = builtin.os.tag != .freestanding,
-    transaction_recovery_runtime: bool = builtin.os.tag != .freestanding,
-    local_template_rendering: bool = true,
-    remote_template_rendering: bool = builtin.os.tag != .freestanding,
-    remote_template_host_callbacks: bool = builtin.os.tag == .freestanding,
-    generated_enrichment_planning: bool = true,
-    dense_vector_search: bool = true,
-    sparse_vector_search: bool = true,
-};
 
 fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
@@ -1619,7 +1603,7 @@ pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: *?*anyo
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    out_buf.* = stringifyJson(LiteCapabilities{}) catch return .internal;
+    out_buf.* = stringifyJson(lite_backend.capabilitiesForProfile(.native)) catch return .internal;
     return .ok;
 }
 

@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const support = @import("embedded_support");
 const db_mod = support.db;
 const db_core = support.db_core;
@@ -42,25 +41,8 @@ pub const OpenOptions = struct {
     enrichment: ?support.enrichment_runtime.Config = null,
 };
 
-pub const Profile = enum {
-    native,
-    hosted,
-};
-
-pub const Capabilities = struct {
-    freestanding_build: bool = builtin.os.tag == .freestanding,
-    hosted_profile: bool = false,
-    manual_maintenance: bool = false,
-    background_enrichment_runtime: bool = true,
-    ttl_cleanup_runtime: bool = true,
-    transaction_recovery_runtime: bool = true,
-    local_template_rendering: bool = true,
-    remote_template_rendering: bool = true,
-    remote_template_host_callbacks: bool = false,
-    generated_enrichment_planning: bool = true,
-    dense_vector_search: bool = true,
-    sparse_vector_search: bool = true,
-};
+pub const Profile = support.lite.backend.Profile;
+pub const Capabilities = support.lite.backend.Capabilities;
 
 pub const DB = struct {
     allocator: Allocator,
@@ -237,21 +219,7 @@ pub const DB = struct {
 };
 
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
-    const freestanding = builtin.os.tag == .freestanding;
-    const hosted = profile == .hosted;
-    return .{
-        .hosted_profile = hosted,
-        .manual_maintenance = hosted,
-        .background_enrichment_runtime = !hosted and !freestanding,
-        .ttl_cleanup_runtime = !hosted and !freestanding,
-        .transaction_recovery_runtime = !hosted and !freestanding,
-        .local_template_rendering = true,
-        .remote_template_rendering = !freestanding,
-        .remote_template_host_callbacks = freestanding,
-        .generated_enrichment_planning = true,
-        .dense_vector_search = true,
-        .sparse_vector_search = true,
-    };
+    return support.lite.backend.capabilitiesForProfile(profile);
 }
 
 pub fn setRemoteTemplateRenderer(renderer: ?RemoteTemplateRenderer) void {
