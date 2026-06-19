@@ -554,11 +554,16 @@ const ReleaseSummary = struct {
     total_observed_published_read_latency_ns: u64 = 0,
     total_observed_fresh_fail_latency_ns: u64 = 0,
     total_observed_fan_in_latency_ns: u64 = 0,
+    min_observed_local_latency_ns: u64 = 0,
     max_observed_local_latency_ns: u64 = 0,
+    min_observed_planned_latency_ns: u64 = 0,
     max_observed_planned_latency_ns: u64 = 0,
     max_observed_cleanup_latency_ns: u64 = 0,
+    min_observed_published_read_latency_ns: u64 = 0,
     max_observed_published_read_latency_ns: u64 = 0,
+    min_observed_fresh_fail_latency_ns: u64 = 0,
     max_observed_fresh_fail_latency_ns: u64 = 0,
+    min_observed_fan_in_latency_ns: u64 = 0,
     max_observed_fan_in_latency_ns: u64 = 0,
     min_observed_storage_score_records: usize = 0,
     max_observed_storage_score_records: usize = 0,
@@ -861,11 +866,31 @@ const ReleaseSummary = struct {
         self.total_observed_published_read_latency_ns += published_read_latency_ns;
         self.total_observed_fresh_fail_latency_ns += fresh_fail_latency_ns;
         self.total_observed_fan_in_latency_ns += fan_in_latency_ns;
+        self.min_observed_local_latency_ns = if (first)
+            result.local_latency_ns
+        else
+            @min(self.min_observed_local_latency_ns, result.local_latency_ns);
         self.max_observed_local_latency_ns = @max(self.max_observed_local_latency_ns, result.local_latency_ns);
+        self.min_observed_planned_latency_ns = if (first)
+            result.planned_latency_ns
+        else
+            @min(self.min_observed_planned_latency_ns, result.planned_latency_ns);
         self.max_observed_planned_latency_ns = @max(self.max_observed_planned_latency_ns, result.planned_latency_ns);
         self.max_observed_cleanup_latency_ns = @max(self.max_observed_cleanup_latency_ns, result.cleanup_latency_ns);
+        self.min_observed_published_read_latency_ns = if (first)
+            published_read_latency_ns
+        else
+            @min(self.min_observed_published_read_latency_ns, published_read_latency_ns);
         self.max_observed_published_read_latency_ns = @max(self.max_observed_published_read_latency_ns, published_read_latency_ns);
+        self.min_observed_fresh_fail_latency_ns = if (first)
+            fresh_fail_latency_ns
+        else
+            @min(self.min_observed_fresh_fail_latency_ns, fresh_fail_latency_ns);
         self.max_observed_fresh_fail_latency_ns = @max(self.max_observed_fresh_fail_latency_ns, fresh_fail_latency_ns);
+        self.min_observed_fan_in_latency_ns = if (first)
+            fan_in_latency_ns
+        else
+            @min(self.min_observed_fan_in_latency_ns, fan_in_latency_ns);
         self.max_observed_fan_in_latency_ns = @max(self.max_observed_fan_in_latency_ns, fan_in_latency_ns);
         self.min_observed_storage_score_records = if (first)
             @min(result.fresh_storage_score_records, result.failed_storage_score_records)
@@ -2217,18 +2242,28 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
             summary.total_observed_published_read_latency_ns == 0 or
             summary.total_observed_fresh_fail_latency_ns == 0 or
             summary.total_observed_fan_in_latency_ns == 0 or
+            summary.min_observed_local_latency_ns == 0 or
             summary.max_observed_local_latency_ns == 0 or
+            summary.min_observed_planned_latency_ns == 0 or
             summary.max_observed_planned_latency_ns == 0 or
+            summary.min_observed_published_read_latency_ns == 0 or
             summary.max_observed_published_read_latency_ns == 0 or
+            summary.min_observed_fresh_fail_latency_ns == 0 or
             summary.max_observed_fresh_fail_latency_ns == 0 or
+            summary.min_observed_fan_in_latency_ns == 0 or
             summary.max_observed_fan_in_latency_ns == 0))
     {
         return error.GraphMetricReleaseQualificationLatencyEvidenceMissing;
     }
-    if (summary.max_observed_local_latency_ns > summary.total_local_latency_ns or
+    if (summary.min_observed_local_latency_ns > summary.max_observed_local_latency_ns or
+        summary.max_observed_local_latency_ns > summary.total_local_latency_ns or
+        summary.min_observed_planned_latency_ns > summary.max_observed_planned_latency_ns or
         summary.max_observed_planned_latency_ns > summary.total_planned_latency_ns or
+        summary.min_observed_published_read_latency_ns > summary.max_observed_published_read_latency_ns or
         summary.max_observed_published_read_latency_ns > summary.total_observed_published_read_latency_ns or
+        summary.min_observed_fresh_fail_latency_ns > summary.max_observed_fresh_fail_latency_ns or
         summary.max_observed_fresh_fail_latency_ns > summary.total_observed_fresh_fail_latency_ns or
+        summary.min_observed_fan_in_latency_ns > summary.max_observed_fan_in_latency_ns or
         summary.max_observed_fan_in_latency_ns > summary.total_observed_fan_in_latency_ns)
     {
         return error.GraphMetricReleaseQualificationLatencyEvidenceMissing;
@@ -7676,9 +7711,15 @@ fn observedRetainedStorageBudget(cfg: Config, summary: ReleaseSummary) bool {
 fn observedPublicReadAndFanInLatencyBudget(cfg: Config, summary: ReleaseSummary) bool {
     return hasPublicReadAndFanInLatencyBudgets(cfg) and
         summary.families_run != 0 and
+        summary.min_observed_published_read_latency_ns != 0 and
         summary.max_observed_published_read_latency_ns != 0 and
+        summary.min_observed_fresh_fail_latency_ns != 0 and
         summary.max_observed_fresh_fail_latency_ns != 0 and
+        summary.min_observed_fan_in_latency_ns != 0 and
         summary.max_observed_fan_in_latency_ns != 0 and
+        summary.min_observed_published_read_latency_ns <= summary.max_observed_published_read_latency_ns and
+        summary.min_observed_fresh_fail_latency_ns <= summary.max_observed_fresh_fail_latency_ns and
+        summary.min_observed_fan_in_latency_ns <= summary.max_observed_fan_in_latency_ns and
         summary.max_observed_published_read_latency_ns <= cfg.max_published_read_latency_ns and
         summary.max_observed_fresh_fail_latency_ns <= cfg.max_fresh_fail_latency_ns and
         summary.max_observed_fan_in_latency_ns <= cfg.max_fan_in_latency_ns;
@@ -7947,8 +7988,8 @@ fn emitReleaseSummary(out: anytype, cfg: Config, summary: ReleaseSummary) !void 
         .{ summary.total_failure_retry_count, summary.total_failure_recent_events, summary.total_failure_recent_failures, summary.total_failure_expected_error_records, summary.total_failure_failed_events, summary.total_paired_failure_recent_events, summary.total_paired_failure_recent_failures, summary.total_paired_failure_expected_error_records, summary.total_paired_failure_failed_events },
     );
     try out.print(
-        ",\"max_local_latency_ns\":{d},\"total_local_latency_ns\":{d},\"max_observed_local_latency_ns\":{d},\"max_planned_latency_ns\":{d},\"total_planned_latency_ns\":{d},\"max_observed_planned_latency_ns\":{d},\"max_cleanup_latency_ns\":{d},\"max_observed_cleanup_latency_ns\":{d},\"max_published_read_latency_ns\":{d},\"total_observed_published_read_latency_ns\":{d},\"max_observed_published_read_latency_ns\":{d},\"max_fresh_fail_latency_ns\":{d},\"total_observed_fresh_fail_latency_ns\":{d},\"max_observed_fresh_fail_latency_ns\":{d},\"max_fan_in_latency_ns\":{d},\"total_observed_fan_in_latency_ns\":{d},\"max_observed_fan_in_latency_ns\":{d}",
-        .{ cfg.max_local_latency_ns, summary.total_local_latency_ns, summary.max_observed_local_latency_ns, cfg.max_planned_latency_ns, summary.total_planned_latency_ns, summary.max_observed_planned_latency_ns, cfg.max_cleanup_latency_ns, summary.max_observed_cleanup_latency_ns, cfg.max_published_read_latency_ns, summary.total_observed_published_read_latency_ns, summary.max_observed_published_read_latency_ns, cfg.max_fresh_fail_latency_ns, summary.total_observed_fresh_fail_latency_ns, summary.max_observed_fresh_fail_latency_ns, cfg.max_fan_in_latency_ns, summary.total_observed_fan_in_latency_ns, summary.max_observed_fan_in_latency_ns },
+        ",\"max_local_latency_ns\":{d},\"total_local_latency_ns\":{d},\"min_observed_local_latency_ns\":{d},\"max_observed_local_latency_ns\":{d},\"max_planned_latency_ns\":{d},\"total_planned_latency_ns\":{d},\"min_observed_planned_latency_ns\":{d},\"max_observed_planned_latency_ns\":{d},\"max_cleanup_latency_ns\":{d},\"max_observed_cleanup_latency_ns\":{d},\"max_published_read_latency_ns\":{d},\"total_observed_published_read_latency_ns\":{d},\"min_observed_published_read_latency_ns\":{d},\"max_observed_published_read_latency_ns\":{d},\"max_fresh_fail_latency_ns\":{d},\"total_observed_fresh_fail_latency_ns\":{d},\"min_observed_fresh_fail_latency_ns\":{d},\"max_observed_fresh_fail_latency_ns\":{d},\"max_fan_in_latency_ns\":{d},\"total_observed_fan_in_latency_ns\":{d},\"min_observed_fan_in_latency_ns\":{d},\"max_observed_fan_in_latency_ns\":{d}",
+        .{ cfg.max_local_latency_ns, summary.total_local_latency_ns, summary.min_observed_local_latency_ns, summary.max_observed_local_latency_ns, cfg.max_planned_latency_ns, summary.total_planned_latency_ns, summary.min_observed_planned_latency_ns, summary.max_observed_planned_latency_ns, cfg.max_cleanup_latency_ns, summary.max_observed_cleanup_latency_ns, cfg.max_published_read_latency_ns, summary.total_observed_published_read_latency_ns, summary.min_observed_published_read_latency_ns, summary.max_observed_published_read_latency_ns, cfg.max_fresh_fail_latency_ns, summary.total_observed_fresh_fail_latency_ns, summary.min_observed_fresh_fail_latency_ns, summary.max_observed_fresh_fail_latency_ns, cfg.max_fan_in_latency_ns, summary.total_observed_fan_in_latency_ns, summary.min_observed_fan_in_latency_ns, summary.max_observed_fan_in_latency_ns },
     );
     try out.print(
         ",\"max_storage_score_records\":{d},\"min_observed_storage_score_records\":{d},\"max_observed_storage_score_records\":{d},\"max_storage_metric_records\":{d},\"min_observed_storage_metric_records\":{d},\"max_observed_storage_metric_records\":{d},\"max_storage_control_records\":{d},\"min_observed_storage_control_records\":{d},\"max_observed_storage_control_records\":{d},\"max_storage_attempt_records\":{d},\"min_observed_storage_attempt_records\":{d},\"max_observed_storage_attempt_records\":{d},\"max_storage_failure_records\":{d},\"min_observed_storage_failure_records\":{d},\"max_observed_storage_failure_records\":{d},\"max_storage_event_records\":{d},\"min_observed_storage_event_records\":{d},\"max_observed_storage_event_records\":{d}",

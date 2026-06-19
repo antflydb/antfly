@@ -4969,8 +4969,11 @@ than PR unit coverage:
   pair, so release tooling can distinguish no separate cleanup work from
   measured cleanup work without relying on per-family rows. The summary latency
   totals are verified too: successful runs must report nonzero local/planned
-  execution, public-read, fresh-failure, and fan-in latency evidence, and each
-  observed maximum must be bounded by the matching total. When latency,
+  execution, public-read, fresh-failure, and fan-in latency evidence. The final
+  row emits min/max per-family latency evidence for those required surfaces, and
+  verification requires every minimum to be nonzero, every minimum to be no
+  larger than its maximum, and every maximum to be bounded by the matching
+  total. When latency,
   storage, page-claim, cleanup-tick, executed-round, failed-retry, worker-step,
   or coordinator-step ceilings are configured, the final summary re-checks
   those ceilings against the observed maxima, so promotion tooling can trust the
