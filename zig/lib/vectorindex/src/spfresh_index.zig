@@ -36,6 +36,7 @@ pub const FlatCentroidBlock = struct {
     posting_offset: usize = 0,
     vector_storage: []f32 = &.{},
     centroid: []f32,
+    centroid_measure: f32 = 0,
     radius: f32 = 0,
     radii: []f32,
     centroids: []f32,
@@ -722,6 +723,7 @@ fn appendFlatCentroidBlockFromEntries(
     if (self.config.metric == .cosine and vectors.centroid.len > 0) {
         _ = vec.normalize(vectors.centroid);
     }
+    const block_centroid_measure = vec.vectorMeasureForMetric(vectors.centroid, self.config.metric);
     var block_radius: f32 = 0;
     for (0..entries.len) |i| {
         const centroid = vectors.centroids[i * dims ..][0..dims];
@@ -738,6 +740,7 @@ fn appendFlatCentroidBlockFromEntries(
         .posting_offset = posting_offset,
         .vector_storage = vectors.storage,
         .centroid = vectors.centroid,
+        .centroid_measure = block_centroid_measure,
         .radius = block_radius,
         .radii = vectors.radii,
         .centroids = vectors.centroids,
@@ -1197,7 +1200,7 @@ pub fn selectFlatRabitqPostings(
                 }
             } else {
                 for (directory.blocks, 0..) |*block, block_index| {
-                    distances[block_index] = vec.distanceToQuery(query, query_measure, block.centroid, self.config.metric);
+                    distances[block_index] = vec.distanceToQueryWithCandidateMeasure(query, query_measure, block.centroid, block.centroid_measure, self.config.metric);
                     error_bounds[block_index] = centroidBlockProbeErrorBound(self.config.metric, distances[block_index], block.radius);
                 }
                 profile.centroid_directory_block_centroids_scored += @intCast(directory.blocks.len);

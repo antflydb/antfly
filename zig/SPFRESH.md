@@ -2499,7 +2499,10 @@ while selecting one centroid block, but recall/performance still need to be
 measured against packed HBC at larger posting counts.
 The two-level query path also reuses distance-only scratch for coarse block
 selection, so scoring block centroids does not grow vector-fetch buffers by the
-number of centroid blocks. The optimized gate checks the resulting
+number of centroid blocks. Directory blocks also retain the coarse centroid's
+metric measure, so non-quantized block scoring can use the same precomputed
+candidate-measure path as posting-centroid scoring instead of recomputing block
+centroid norms/measures on every query. The optimized gate checks the resulting
 `search_workspace_bytes` ratio against the flat directory row. Write/read bench
 rows now also emit the observed effective block-probe limit and selected block
 count, so adaptive two-level rows can prove how many coarse blocks they actually
