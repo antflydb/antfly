@@ -220,8 +220,6 @@ pub const SearchScratch = struct {
         const transformed_query = vector_storage[0..dims];
         const centroid = vector_storage[dims .. 2 * dims];
         const vector = vector_storage[2 * dims .. 3 * dims];
-        const member_ids = try alloc.alloc(u64, max_leaf);
-        errdefer alloc.free(member_ids);
         const query_storage = try allocateQueryStorage(alloc, max_candidates);
         errdefer alloc.free(query_storage);
         const query_views = carveQueryStorage(query_storage, max_candidates);
@@ -235,7 +233,7 @@ pub const SearchScratch = struct {
             .centroid = centroid,
             .vector = vector,
             .vector_batch = &.{},
-            .member_ids = member_ids,
+            .member_ids = &.{},
             .query_storage = query_storage,
             .vector_ids = query_views.vector_ids,
             .metadata = query_views.metadata,
@@ -255,12 +253,10 @@ pub const SearchScratch = struct {
             ),
             .scratch_allocation_count = initialScratchAllocationCount(.{
                 vector_storage,
-                member_ids,
                 query_storage,
                 distance_storage,
             }),
             .scratch_allocation_bytes = byteLen(vector_storage) +
-                byteLen(member_ids) +
                 byteLen(query_storage) +
                 byteLen(distance_storage),
         };
@@ -964,6 +960,7 @@ test "SearchScratch grows hot posting buffers geometrically" {
     var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
     defer scratch.deinit(alloc);
 
+    try std.testing.expectEqual(@as(usize, 0), scratch.member_ids.len);
     try scratch.ensureMemberIdCapacity(alloc, 3);
     try std.testing.expectEqual(@as(usize, 8), scratch.member_ids.len);
 

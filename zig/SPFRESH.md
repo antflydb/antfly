@@ -145,7 +145,9 @@ Current status:
   geometric growth shape for appended-id/live arrays, reducing allocator churn
   on hash-backed overlay replay. Search scratch member-id, vector-batch, and
   posting-delta-record buffers also grow geometrically across reused query
-  scratch handles, and the grouped query/distance slabs now grow geometrically
+  scratch handles; member-id scratch starts empty and grows on first
+  materialization instead of being allocated at the configured max leaf size for
+  every query scratch. The grouped query/distance slabs now grow geometrically
   instead of resizing exactly to each transient candidate count. Small
   transformed-vector matrix loads now use stack-backed lookup, vector-view, and
   batch-vector scratch before falling back to heap allocation.
