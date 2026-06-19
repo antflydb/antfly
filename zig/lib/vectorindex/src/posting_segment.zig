@@ -2881,7 +2881,7 @@ pub const Writer = struct {
     }
 
     pub fn build(self: *Writer) ![]u8 {
-        std.mem.sort(PendingEntry, self.entries.items, {}, pendingEntryLessThan);
+        sortPendingEntriesIfNeeded(self.entries.items);
         try rejectDuplicateEntries(self.entries.items);
 
         var out = std.ArrayListUnmanaged(u8).empty;
@@ -4593,6 +4593,16 @@ fn pendingEntryLessThan(_: void, lhs: PendingEntry, rhs: PendingEntry) bool {
     return compareEntryKey(lhs.posting_id, lhs.kind, lhs.sequence, rhs.posting_id, rhs.kind, rhs.sequence) == .lt;
 }
 
+fn sortPendingEntriesIfNeeded(entries: []PendingEntry) void {
+    var index: usize = 1;
+    while (index < entries.len) : (index += 1) {
+        if (pendingEntryLessThan({}, entries[index], entries[index - 1])) {
+            std.mem.sort(PendingEntry, entries, {}, pendingEntryLessThan);
+            return;
+        }
+    }
+}
+
 fn manifestEntryLessThan(_: void, lhs: ManifestEntry, rhs: ManifestEntry) bool {
     return lhs.meta.segment_id < rhs.meta.segment_id;
 }
@@ -5050,6 +5060,42 @@ pub fn testRejectsDuplicateLogicalEntries() !void {
     try writer.appendBase(1, "a");
     try writer.appendBase(1, "b");
     try std.testing.expectError(error.DuplicatePostingSegmentEntry, writer.build());
+}
+
+pub fn testSortPendingEntriesIfNeededSkipsOrderedInput() !void {
+    const alloc = std.testing.allocator;
+    const a = try alloc.dupe(u8, "a");
+    defer alloc.free(a);
+    const b = try alloc.dupe(u8, "b");
+    defer alloc.free(b);
+    const c = try alloc.dupe(u8, "c");
+    defer alloc.free(c);
+
+    var ordered = [_]PendingEntry{
+        .{ .posting_id = 1, .kind = .base, .sequence = 0, .value = a },
+        .{ .posting_id = 1, .kind = .delta, .sequence = 7, .value = b },
+        .{ .posting_id = 2, .kind = .base, .sequence = 0, .value = c },
+    };
+    sortPendingEntriesIfNeeded(&ordered);
+    try std.testing.expectEqual(@as(PostingId, 1), ordered[0].posting_id);
+    try std.testing.expectEqual(EntryKind.base, ordered[0].kind);
+    try std.testing.expectEqual(@as(PostingId, 1), ordered[1].posting_id);
+    try std.testing.expectEqual(EntryKind.delta, ordered[1].kind);
+    try std.testing.expectEqual(@as(u64, 7), ordered[1].sequence);
+    try std.testing.expectEqual(@as(PostingId, 2), ordered[2].posting_id);
+
+    var unordered = [_]PendingEntry{
+        .{ .posting_id = 2, .kind = .base, .sequence = 0, .value = c },
+        .{ .posting_id = 1, .kind = .delta, .sequence = 7, .value = b },
+        .{ .posting_id = 1, .kind = .base, .sequence = 0, .value = a },
+    };
+    sortPendingEntriesIfNeeded(&unordered);
+    try std.testing.expectEqual(@as(PostingId, 1), unordered[0].posting_id);
+    try std.testing.expectEqual(EntryKind.base, unordered[0].kind);
+    try std.testing.expectEqual(@as(PostingId, 1), unordered[1].posting_id);
+    try std.testing.expectEqual(EntryKind.delta, unordered[1].kind);
+    try std.testing.expectEqual(@as(u64, 7), unordered[1].sequence);
+    try std.testing.expectEqual(@as(PostingId, 2), unordered[2].posting_id);
 }
 
 pub fn testValidatesFooterAndVersion() !void {
@@ -7579,6 +7625,10 @@ test "posting segment point value range reads verify index and value" {
 
 test "posting segment rejects duplicate logical entries" {
     try testRejectsDuplicateLogicalEntries();
+}
+
+test "posting segment skips sorting ordered pending entries" {
+    try testSortPendingEntriesIfNeededSkipsOrderedInput();
 }
 
 test "posting segment validates footer and version" {

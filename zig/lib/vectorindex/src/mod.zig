@@ -203,6 +203,10 @@ test "posting segment rejects duplicate logical entries" {
     try posting_segment.testRejectsDuplicateLogicalEntries();
 }
 
+test "posting segment skips sorting ordered pending entries" {
+    try posting_segment.testSortPendingEntriesIfNeededSkipsOrderedInput();
+}
+
 test "posting segment validates footer and version" {
     try posting_segment.testValidatesFooterAndVersion();
 }
