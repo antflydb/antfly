@@ -4259,6 +4259,7 @@ pub fn build(b: *std.Build) void {
             "postgres sql adapter",
             "api http server resolves relational rows by unique selector",
             "api http server executes public relational row plan endpoints",
+            "api http server applies SQL routine catalog plans through native runtime",
             "api http server routes public external lake row queries through configured resolver",
             "api http server resolves credentialed external lake rows from node config",
             "relational rows query projects typed expression outputs",
