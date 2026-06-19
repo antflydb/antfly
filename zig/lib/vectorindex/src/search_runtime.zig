@@ -298,6 +298,10 @@ pub const SearchScratch = struct {
         try self.ensureDistanceStorageCapacity(alloc, needed);
     }
 
+    pub fn ensureDistanceOnlyCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        try self.ensureDistanceStorageCapacity(alloc, needed);
+    }
+
     fn ensureQueryStorageCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.positions.len >= needed) return;
         const capacity = nextScratchCapacity(self.positions.len, needed);
@@ -924,6 +928,22 @@ test "SearchScratch grows distance capacity without vector fetch buffers" {
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expectEqual(vector_batch_len, scratch.vector_batch.len);
     try std.testing.expectEqual(vector_ids_len, scratch.vector_ids.len);
+}
+
+test "SearchScratch grows distance-only capacity without query slab" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    const positions_len = scratch.positions.len;
+    const vector_ids_len = scratch.vector_ids.len;
+
+    try scratch.ensureDistanceOnlyCapacity(alloc, 5);
+
+    try std.testing.expectEqual(positions_len, scratch.positions.len);
+    try std.testing.expectEqual(vector_ids_len, scratch.vector_ids.len);
+    try std.testing.expect(scratch.distances.len >= 5);
+    try std.testing.expect(scratch.error_bounds.len >= 5);
 }
 
 test "SearchScratch grows hot posting buffers geometrically" {
