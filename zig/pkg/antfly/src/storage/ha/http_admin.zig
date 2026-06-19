@@ -966,14 +966,14 @@ pub const Server = struct {
 
     fn primaryNodeID(self: *const Server) ?[]const u8 {
         if (self.ctx.primary_node_id) |node_id| {
-            if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) return node_id;
+            if (validation.isIdentifier(node_id)) return node_id;
         }
         return null;
     }
 
     fn standbyNodeID(self: *const Server) ?[]const u8 {
         if (self.ctx.standby_node_id) |node_id| {
-            if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) return node_id;
+            if (validation.isIdentifier(node_id)) return node_id;
         }
         return null;
     }
@@ -3031,6 +3031,79 @@ test "storage.ha http admin requires node id before typed action receipts" {
     try std.testing.expectEqual(@as(u16, 409), response.status);
     try expectContains(response.body, "PrimaryNodeIDUnavailable");
     try std.testing.expect(primary.slot("standby-a") == null);
+}
+
+test "storage.ha http admin rejects invalid primary node id before typed action receipts" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-primary-node-id");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+
+    const invalid_ids = [_][]const u8{
+        "",
+        " primary-a",
+        "primary-a ",
+        "primary/a",
+        "primary a",
+    };
+
+    for (invalid_ids) |node_id| {
+        var server = Server.init(alloc, .{
+            .primary = &primary,
+            .primary_node_id = node_id,
+        });
+        defer server.deinit();
+
+        var response = try server.handle(.{
+            .method = .POST,
+            .uri = admin_api.routes.ha_replication_slots,
+            .content_type = "application/json",
+            .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
+        });
+        defer response.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 409), response.status);
+        try expectContains(response.body, "PrimaryNodeIDUnavailable");
+        try std.testing.expect(primary.slot("standby-a") == null);
+    }
+}
+
+test "storage.ha http admin rejects invalid standby node id in typed status" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-standby-node-id");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    const invalid_ids = [_][]const u8{
+        "",
+        " standby-a",
+        "standby-a ",
+        "standby/a",
+        "standby a",
+    };
+
+    for (invalid_ids) |node_id| {
+        var server = Server.init(alloc, .{
+            .standby = &standby,
+            .standby_node_id = node_id,
+        });
+        defer server.deinit();
+
+        var response = try server.handle(.{
+            .method = .GET,
+            .uri = admin_api.routes.ha_standby_status,
+        });
+        defer response.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 409), response.status);
+        try expectContains(response.body, "StandbyNodeIDUnavailable");
+    }
 }
 
 test "storage.ha http admin returns method errors for generated admin routes" {

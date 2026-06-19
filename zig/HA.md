@@ -688,6 +688,16 @@ The direct answers to the HA review questions are:
   base-backup/reseed, sync commit, fencing, former-primary repair, observability,
   compatibility, e2e, operator e2e, and crash/sim coverage are all in place.
 
+These answers imply a concrete implementation boundary: Antfly should share the
+cheap string classification logic, not hide all HA validation behind one generic
+validator. A generic `validateHAString` name is too broad because paths, node
+ids, slot names, URLs, and token environment variables have different safety
+rules and different user-facing error types. The shared helper should only
+answer whether a value is present and whether its exact bytes include forbidden
+leading or trailing whitespace; the caller must still apply the field-specific
+policy. That keeps the code reusable without making operator-visible failures
+generic or silently normalizing durable HA identity.
+
 The HA string helper should be generic only at the whitespace/presence
 classification layer:
 
