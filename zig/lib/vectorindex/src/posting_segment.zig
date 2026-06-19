@@ -1594,13 +1594,17 @@ pub fn replaceManifestSegmentsWithStatsAlloc(
 }
 
 pub fn summarizeManifest(manifest: Manifest) !DirectoryManifestStats {
-    try validateManifest(manifest);
+    return try summarizeManifestEntries(manifest.next_segment_id, manifest.segments);
+}
+
+fn summarizeManifestEntries(next_segment_id: u64, entries: anytype) !DirectoryManifestStats {
+    try validateManifestEntries(next_segment_id, entries);
     var stats = DirectoryManifestStats{
-        .segments = manifest.segments.len,
-        .next_segment_id = manifest.next_segment_id,
+        .segments = entries.len,
+        .next_segment_id = next_segment_id,
     };
     var saw_segment = false;
-    for (manifest.segments) |entry| {
+    for (entries) |entry| {
         stats.bytes = std.math.add(usize, stats.bytes, entry.meta.byte_len) catch return error.PostingSegmentTooLarge;
         stats.entries = std.math.add(usize, stats.entries, entry.meta.entry_count) catch return error.PostingSegmentTooLarge;
         if (!saw_segment) {
@@ -1628,28 +1632,27 @@ pub fn summarizeManifest(manifest: Manifest) !DirectoryManifestStats {
 pub fn summarizeDirectoryManifestAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryManifestStats {
     var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, options);
     defer manifest.deinit(alloc);
-    const entries = try manifestEntryViewAlloc(alloc, manifest.segments);
-    defer alloc.free(entries);
-    return try summarizeManifest(.{
-        .next_segment_id = manifest.next_segment_id,
-        .segments = entries,
-    });
+    return try summarizeManifestEntries(manifest.next_segment_id, manifest.segments);
 }
 
 pub fn planDirectoryCompactionAlloc(alloc: Allocator, manifest: Manifest, options: DirectoryCompactionPlanOptions) !DirectoryCompactionPlan {
-    try validateManifest(manifest);
+    return try planDirectoryCompactionEntriesAlloc(alloc, manifest.next_segment_id, manifest.segments, options);
+}
+
+fn planDirectoryCompactionEntriesAlloc(alloc: Allocator, next_segment_id: u64, entries: anytype, options: DirectoryCompactionPlanOptions) !DirectoryCompactionPlan {
+    try validateManifestEntries(next_segment_id, entries);
     const min_input_segments = @max(options.min_input_segments, 1);
 
     var stats = DirectoryCompactionPlanStats{
-        .manifest_segments = manifest.segments.len,
+        .manifest_segments = entries.len,
     };
     var selected_ids = std.ArrayListUnmanaged(u64).empty;
     errdefer selected_ids.deinit(alloc);
-    try selected_ids.ensureTotalCapacity(alloc, maxDirectoryCompactionSelectedSegments(manifest.segments.len, options.max_input_segments));
+    try selected_ids.ensureTotalCapacity(alloc, maxDirectoryCompactionSelectedSegments(entries.len, options.max_input_segments));
 
     var selected_bytes: usize = 0;
     var selected_entries: usize = 0;
-    for (manifest.segments) |entry| {
+    for (entries) |entry| {
         if (options.max_input_segments != 0 and selected_ids.items.len >= options.max_input_segments) {
             stats.stopped_on_segment_limit = true;
             break;
@@ -1689,12 +1692,7 @@ pub fn planDirectoryCompactionFromDirectoryAlloc(
 ) !DirectoryCompactionPlan {
     var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, store_options);
     defer manifest.deinit(alloc);
-    const entries = try manifestEntryViewAlloc(alloc, manifest.segments);
-    defer alloc.free(entries);
-    return try planDirectoryCompactionAlloc(alloc, .{
-        .next_segment_id = manifest.next_segment_id,
-        .segments = entries,
-    }, plan_options);
+    return try planDirectoryCompactionEntriesAlloc(alloc, manifest.next_segment_id, manifest.segments, plan_options);
 }
 
 fn maxDirectoryCompactionSelectedSegments(manifest_segments: usize, max_input_segments: usize) usize {
@@ -2025,16 +2023,10 @@ pub fn maintainDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir
     };
     defer manifest.deinit(alloc);
 
-    const entries = try manifestEntryViewAlloc(alloc, manifest.segments);
-    defer alloc.free(entries);
-    const manifest_view = Manifest{
-        .next_segment_id = manifest.next_segment_id,
-        .segments = entries,
-    };
-    stats.manifest = try summarizeManifest(manifest_view);
+    stats.manifest = try summarizeManifestEntries(manifest.next_segment_id, manifest.segments);
 
     if (options.compact) {
-        var plan = try planDirectoryCompactionAlloc(alloc, manifest_view, options.plan);
+        var plan = try planDirectoryCompactionEntriesAlloc(alloc, manifest.next_segment_id, manifest.segments, options.plan);
         defer plan.deinit(alloc);
         stats.plan = plan.stats;
         if (plan.segment_ids.len != 0) {
@@ -3909,10 +3901,14 @@ fn appendIndexEntryAssumeCapacity(out: *std.ArrayListUnmanaged(u8), entry: Index
 }
 
 fn validateManifest(manifest: Manifest) !void {
+    try validateManifestEntries(manifest.next_segment_id, manifest.segments);
+}
+
+fn validateManifestEntries(next_segment_id: u64, entries: anytype) !void {
     var previous_segment_id: ?u64 = null;
-    for (manifest.segments) |entry| {
-        try validateManifestEntry(entry);
-        if (entry.meta.segment_id >= manifest.next_segment_id) return error.InvalidPostingSegmentManifest;
+    for (entries) |entry| {
+        try validateManifestEntry(.{ .meta = entry.meta, .path = entry.path });
+        if (entry.meta.segment_id >= next_segment_id) return error.InvalidPostingSegmentManifest;
         if (previous_segment_id) |previous| {
             if (previous >= entry.meta.segment_id) return error.InvalidPostingSegmentManifest;
         }

@@ -133,11 +133,13 @@ Current status:
   same exact-size/assume-capacity path for segment metadata entries. Directory
   compaction planning also pre-reserves its selected segment-id list from the
   manifest length and configured segment cap, avoiding growth churn while
-  choosing bounded compaction inputs. Segment garbage and temporary-file cleanup
-  now track live canonical basenames and delete through the opened postings
-  directory, and manifest temp matching compares entry names against the
-  configured manifest basename in place, avoiding per-file path allocation while
-  scanning maintenance directories.
+  choosing bounded compaction inputs, and manifest summary/planning can consume
+  owned decoded manifest entries directly instead of allocating temporary
+  borrowed-entry views. Segment garbage and temporary-file cleanup now track
+  live canonical basenames and delete through the opened postings directory, and
+  manifest temp matching compares entry names against the configured manifest
+  basename in place, avoiding per-file path allocation while scanning
+  maintenance directories.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
