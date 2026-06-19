@@ -237,6 +237,7 @@ pub fn encodeIndexList(
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses);
@@ -320,6 +321,7 @@ pub fn encodeIndexConfigMap(
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -429,6 +431,10 @@ const ApiIndexType = enum {
 
 fn indexesJsonSource(indexes_json: []const u8) []const u8 {
     return if (indexes_json.len > 0) indexes_json else tables_api.default_indexes_json;
+}
+
+fn isReservedIndexMetadataEntry(name: []const u8) bool {
+    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
 
 fn expectedTableGroupIds(

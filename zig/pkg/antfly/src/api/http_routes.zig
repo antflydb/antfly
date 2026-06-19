@@ -106,6 +106,7 @@ pub const Routes = struct {
     pub const reprocess_suffix = "/reprocess";
     pub const reprocess_jobs_suffix = "/reprocess-jobs";
     pub const reprocess_jobs_marker = "/reprocess-jobs/";
+    pub const enrichment_suffix = "/enrichment";
     pub const advance_suffix = "/advance";
     pub const cancel_suffix = "/cancel";
     pub const placement_update_suffix = ":placement";
@@ -496,6 +497,23 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
         const effective_path = path[0 .. path.len - reprocess_suffix.len];
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
+    }
+
+    pub fn matchTableArtifactEnrichment(path: []const u8) ?TableArtifact {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, enrichment_suffix)) return null;
+        const effective_path = path[0 .. path.len - enrichment_suffix.len];
         const rest = effective_path[tables_prefix.len..];
         const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
         if (artifacts_index == 0) return null;

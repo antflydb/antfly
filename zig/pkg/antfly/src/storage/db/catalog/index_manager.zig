@@ -3384,6 +3384,7 @@ pub const IndexManager = struct {
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .full_text_index = chunk_cfg.full_text_index,
                     });
                 }
                 if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
@@ -3399,6 +3400,7 @@ pub const IndexManager = struct {
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .full_text_index = chunk_cfg.full_text_index,
                     });
                 }
             } else if (entry.embedding_name) |embedding_name| {
@@ -3418,6 +3420,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                     if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
@@ -3433,6 +3436,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                 } else {
@@ -3474,6 +3478,7 @@ pub const IndexManager = struct {
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .full_text_index = chunk_cfg.full_text_index,
                     });
                 }
                 try requests.append(alloc, .{
@@ -3487,6 +3492,7 @@ pub const IndexManager = struct {
                     .chunk_size = chunk_cfg.chunk_size,
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                    .full_text_index = chunk_cfg.full_text_index,
                 });
             } else if (entry.embedding_name) |embedding_name| {
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
@@ -3505,6 +3511,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                     if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
@@ -3519,6 +3526,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                 } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
@@ -4380,7 +4388,9 @@ pub const IndexManager = struct {
         if (resolved.chunk_name != null) return true;
 
         for (self.enrichments.items) |cfg| {
-            if (cfg.kind != .chunk or cfg.chunker_json.len == 0) continue;
+            if (cfg.kind != .chunk) continue;
+            if (cfg.full_text_index) return true;
+            if (cfg.chunker_json.len == 0) continue;
             if (try chunking_types.parseHasFullTextIndexFromSlice(alloc, cfg.chunker_json)) return true;
         }
         return false;
@@ -6404,6 +6414,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
                     changed = (try self.ensureEmbeddingEnrichment(.{
@@ -6431,6 +6442,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
                 }
@@ -6464,7 +6476,8 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.chunk_size != cfg.chunk_size or
                 existing.chunk_overlap != cfg.chunk_overlap or
-                !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json))
+                !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json) or
+                existing.full_text_index != cfg.full_text_index)
             {
                 return error.ConflictingEnrichmentConfig;
             }
@@ -11654,6 +11667,7 @@ const GeneratorConfig = struct {
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []u8 = &.{},
+    full_text_index: bool = false,
 
     fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
         alloc.free(self.source_field);
@@ -11794,6 +11808,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
@@ -11818,6 +11833,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };

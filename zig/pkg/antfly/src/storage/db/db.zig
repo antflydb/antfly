@@ -13516,6 +13516,7 @@ fn getOrCreateChunks(
 }
 
 fn shouldStoreChunkArtifacts(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    if (request.full_text_index) return true;
     if (request.chunker_json.len == 0) return true;
     if (try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json)) return true;
     return try chunking_types_mod.parseStoreChunksFromSlice(alloc, request.chunker_json);
@@ -13627,7 +13628,8 @@ fn computeChunkRequestDerived(
         try appendChunkArtifactWrites(alloc, request.doc_key, request.source_field, artifact_name, chunks, artifact_writes, true);
     }
 
-    const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
+    const include_default_full_text = request.full_text_index or
+        try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
     const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, include_default_full_text);
     defer {
         for (text_indexes) |name| alloc.free(name);
@@ -14370,7 +14372,9 @@ fn appendDocumentUnitStoredChunkFullTextDocuments(
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
 
-        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        const include_default_full_text = entry.full_text_index or
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
+        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
         defer {
             for (chunk_text_indexes) |name| alloc.free(name);
             alloc.free(chunk_text_indexes);
@@ -14493,7 +14497,9 @@ fn appendDocumentUnitChunkWrites(
         defer chunker_mod.freeChunks(alloc, chunks);
         if (chunks.len == 0) continue;
 
-        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        const include_default_full_text = entry.full_text_index or
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
+        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
         defer {
             for (text_indexes) |name| alloc.free(name);
             alloc.free(text_indexes);
@@ -15804,7 +15810,8 @@ fn computeChunkRequest(
         try appendChunkArtifactWrites(alloc, request.doc_key, request.source_field, artifact_name, chunks, artifact_writes, true);
     }
 
-    const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
+    const include_default_full_text = request.full_text_index or
+        try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
     const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, include_default_full_text);
     defer {
         for (text_indexes) |name| alloc.free(name);
@@ -17167,7 +17174,8 @@ fn shouldPrecomputeGeneratedRequest(
         .all => true,
         .full_text_only => blk: {
             if (request.kind != .chunk_text) break :blk false;
-            const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(self.alloc, request.chunker_json);
+            const include_default_full_text = request.full_text_index or
+                try chunking_types_mod.parseHasFullTextIndexFromSlice(self.alloc, request.chunker_json);
             const text_indexes = try self.core.index_manager.textIndexesForChunk(self.alloc, request.artifact_name, include_default_full_text);
             defer {
                 for (text_indexes) |name| self.alloc.free(name);

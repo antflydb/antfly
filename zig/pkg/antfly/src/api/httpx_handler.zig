@@ -1484,13 +1484,12 @@ pub const AntflyApiHandler = struct {
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
         const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(table_name, &storage_status_buf);
-        var arena_impl = std.heap.ArenaAllocator.init(alloc);
-        defer arena_impl.deinit();
-        const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_name, storage_statuses)) orelse {
+        const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(alloc, &snapshot, table_name, storage_statuses)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
-        return ctx.json(response);
+        defer alloc.free(body);
+        return respondApiResponseBody(ctx, 200, body);
     }
 
     pub fn createTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

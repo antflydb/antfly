@@ -225,13 +225,57 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     assert detail["config"]["type"] == "full_text"
 
 
-def test_stateful_table_accepts_document_full_text_create_index_with_inline_enrichments(stateful_api):
-    table_name = f"document_full_text_{time.time_ns()}"
+def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(stateful_api):
+    table_name = f"artifact_enrichment_{time.time_ns()}"
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
     assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_units_v1/enrichment",
+            {
+                "kind": "asset",
+                "field": "url",
+                "content_type": "application/json",
+                "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+            },
+        )
+        == {}
+    )
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 512,
+                "chunk_overlap": 50,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+
+    detail = stateful_api.get_index(table_name, "full_text_index_v0")
+    assert detail["config"]["name"] == "full_text_index_v0"
+    assert detail["config"]["type"] == "full_text"
+
+    table = stateful_api.get_table(table_name)
+    encoded_detail = json.dumps(table, sort_keys=True)
+    assert "document_units_v1" in encoded_detail
+    assert "document_chunks_v1" in encoded_detail
+    assert "full_text_index" in encoded_detail
+
+
+def test_stateful_table_rejects_document_full_text_create_index_with_inline_enrichments(stateful_api):
+    table_name = f"document_full_text_rejected_{time.time_ns()}"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+
+    with pytest.raises(requests.HTTPError) as exc_info:
         stateful_api.create_index(
             table_name,
             "document_text",
@@ -258,16 +302,7 @@ def test_stateful_table_accepts_document_full_text_create_index_with_inline_enri
                 ],
             },
         )
-        == {}
-    )
-
-    detail = stateful_api.get_index(table_name, "document_text")
-    assert detail["config"]["name"] == "document_text"
-    assert detail["config"]["type"] == "full_text"
-    assert detail["config"]["artifact_name"] == "document_chunks_v1"
-    encoded_detail = json.dumps(detail, sort_keys=True)
-    assert "document_units_v1" in encoded_detail
-    assert "document_chunks_v1" in encoded_detail
+    assert exc_info.value.response.status_code == 400
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):

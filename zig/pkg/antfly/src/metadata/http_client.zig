@@ -309,6 +309,39 @@ pub const MetadataHttpClient = struct {
         try self.requestNoBody(base_uri, .DELETE, path, error.IndexNotFound, null);
     }
 
+    pub fn putArtifactEnrichment(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        enrichment_name: []const u8,
+        enrichment_json: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_enrichments_infix,
+            enrichment_name,
+        });
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .PUT, path, enrichment_json, error.InvalidExtensionEnrichment, error.TableNotFound, null);
+    }
+
+    pub fn deleteArtifactEnrichment(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        enrichment_name: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_enrichments_infix,
+            enrichment_name,
+        });
+        defer self.alloc.free(path);
+        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, null);
+    }
+
     pub fn requestTableSplit(
         self: *MetadataHttpClient,
         base_uri: []const u8,

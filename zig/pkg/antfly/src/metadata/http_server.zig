@@ -106,6 +106,8 @@ pub const AdminSource = struct {
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
+        put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
+        delete_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) anyerror!void = null,
         upsert_node: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) anyerror!void = null,
         request_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         cancel_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
@@ -177,6 +179,16 @@ pub const AdminSource = struct {
     pub fn dropIndex(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_index orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn putArtifactEnrichment(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+        const fn_ptr = self.vtable.put_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, enrichment_name, enrichment_json);
+    }
+
+    pub fn deleteArtifactEnrichment(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+        const fn_ptr = self.vtable.delete_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, enrichment_name);
     }
 
     pub fn upsertNode(self: AdminSource, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
@@ -299,6 +311,8 @@ pub const AdminSource = struct {
                 .update_schema = metadataServiceUpdateSchema,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
+                .put_artifact_enrichment = metadataServicePutArtifactEnrichment,
+                .delete_artifact_enrichment = metadataServiceDeleteArtifactEnrichment,
                 .upsert_node = metadataServiceUpsertNode,
                 .request_node_shutdown = metadataServiceRequestNodeShutdown,
                 .cancel_node_shutdown = metadataServiceCancelNodeShutdown,
@@ -336,6 +350,8 @@ pub const AdminSource = struct {
                 .update_schema = metadataHttpServiceUpdateSchema,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
+                .put_artifact_enrichment = metadataHttpServicePutArtifactEnrichment,
+                .delete_artifact_enrichment = metadataHttpServiceDeleteArtifactEnrichment,
                 .upsert_node = metadataHttpServiceUpsertNode,
                 .request_node_shutdown = metadataHttpServiceRequestNodeShutdown,
                 .cancel_node_shutdown = metadataHttpServiceCancelNodeShutdown,
@@ -456,6 +472,35 @@ pub const AdminSource = struct {
         if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
+        defer alloc.free(indexes_json);
+        var updated = table.*;
+        updated.indexes_json = indexes_json;
+        try svc.upsertTable(updated);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServicePutArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        var updated = table.*;
+        updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
+        defer alloc.free(updated.indexes_json);
+        try svc.upsertTable(updated);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceDeleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
@@ -730,6 +775,35 @@ pub const AdminSource = struct {
         if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
+        defer alloc.free(indexes_json);
+        var updated = table.*;
+        updated.indexes_json = indexes_json;
+        try svc.upsertTable(updated);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServicePutArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        var updated = table.*;
+        updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
+        defer alloc.free(updated.indexes_json);
+        try svc.upsertTable(updated);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceDeleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
@@ -1238,6 +1312,16 @@ pub const MetadataHttpServer = struct {
                     };
                     return try textResponse(self.alloc, 202, "accepted");
                 }
+                if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
+                    self.source.putArtifactEnrichment(self.alloc, table_enrichment.table_name, table_enrichment.enrichment_name, req.body) catch |err| switch (err) {
+                        error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
+                        else => return err,
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
             },
             .DELETE => {
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
@@ -1267,6 +1351,15 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
                     self.source.dropIndex(self.alloc, table_index.table_name, table_index.index_name) catch |err| switch (err) {
                         error.TableNotFound, error.IndexNotFound => return try textResponse(self.alloc, 404, "index not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        else => return err,
+                    };
+                    return try textResponse(self.alloc, 204, "");
+                }
+                if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
+                    self.source.deleteArtifactEnrichment(self.alloc, table_enrichment.table_name, table_enrichment.enrichment_name) catch |err| switch (err) {
+                        error.TableNotFound, error.EnrichmentNotFound => return try textResponse(self.alloc, 404, "artifact enrichment not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return err,
@@ -2349,6 +2442,15 @@ fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: [
         if (member.object_kind != .index) continue;
         const member_table = extensionMemberTableName(member) orelse continue;
         if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, index_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsEnrichment(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, enrichment_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .enrichment) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, enrichment_name)) return true;
     }
     return false;
 }
