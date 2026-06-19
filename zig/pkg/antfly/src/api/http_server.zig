@@ -2122,6 +2122,7 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
                     name,
+                    self.cfg.ard_base_url,
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
@@ -10572,6 +10573,16 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
+
+    var hosted_server = ApiHttpServer.init(std.testing.allocator, .{ .ard_base_url = "https://tenant.example.com/" }, source.iface(), null, null);
+    defer hosted_server.deinit();
+    var hosted_mcp_resource = try hosted_server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+    });
+    defer hosted_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), hosted_mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_mcp_resource.body, "\"endpoint\":\"https://tenant.example.com/mcp/v1\"") != null);
 
     var search = try server.handle(.{
         .method = .POST,

@@ -402,10 +402,10 @@ pub fn extensionSkillMarkdownAlloc(alloc: std.mem.Allocator, route: []const u8, 
     return null;
 }
 
-pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, extension_context: ?ExtensionCatalogContext) !?[]u8 {
+pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, base_url: ?[]const u8, extension_context: ?ExtensionCatalogContext) !?[]u8 {
     if (std.mem.eql(u8, name, "profiles/copilot")) {
         if (!(try copilotMcpProfileVisible(alloc, extension_context))) return null;
-        return try copilotMcpProfileDescriptorJsonAlloc(alloc, extension_context);
+        return try copilotMcpProfileDescriptorJsonAlloc(alloc, base_url, extension_context);
     }
     if (std.mem.startsWith(u8, name, "extensions/")) {
         const extension_name = name["extensions/".len..];
@@ -414,13 +414,13 @@ pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, extens
         for (ctx.installed_extensions) |installed| {
             if (!std.mem.eql(u8, installed.name, extension_name)) continue;
             if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) return null;
-            return try extensionMcpDescriptorJsonAlloc(alloc, installed, ctx);
+            return try extensionMcpDescriptorJsonAlloc(alloc, installed, base_url, ctx);
         }
         return null;
     }
     if (!std.mem.eql(u8, name, "default")) return null;
     if (!(try aggregateMcpVisible(alloc, extension_context))) return null;
-    return try aggregateMcpDescriptorJsonAlloc(alloc, extension_context);
+    return try aggregateMcpDescriptorJsonAlloc(alloc, base_url, extension_context);
 }
 
 const SearchRequest = struct {
@@ -1326,14 +1326,14 @@ fn writeExtensionSkillFields(
     try writer.writeByte('}');
 }
 
-fn extensionMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, installed: extension_domain.InstalledExtension, ctx: ExtensionCatalogContext) ![]u8 {
+fn extensionMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, installed: extension_domain.InstalledExtension, base_url: ?[]const u8, ctx: ExtensionCatalogContext) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
 
     try writer.writer.writeAll("{\"name\":");
     try std.json.Stringify.value(installed.name, .{}, &writer.writer);
     try writer.writer.writeAll(",\"endpoint\":");
-    try writeStringFmt(&writer.writer, "/mcp/v1/extensions/{s}", .{installed.name});
+    try writeUrlFmt(&writer.writer, base_url, "/mcp/v1/extensions/{s}", .{installed.name});
     try writer.writer.writeAll(",\"extension\":");
     try std.json.Stringify.value(installed.name, .{}, &writer.writer);
     try writer.writer.writeAll(",\"tools\":[");
@@ -1392,21 +1392,25 @@ const builtin_mcp_tools = [_]BuiltinMcpTool{
     .{ .kind = .batch, .name = "batch" },
 };
 
-fn aggregateMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, extension_context: ?ExtensionCatalogContext) ![]u8 {
+fn aggregateMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, base_url: ?[]const u8, extension_context: ?ExtensionCatalogContext) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
 
-    try writer.writer.writeAll("{\"name\":\"antfly\",\"endpoint\":\"/mcp/v1\",\"description\":\"Aggregate Antfly MCP server for built-in and visible extension tools.\",\"capabilities\":[\"table-search\",\"retrieval\",\"query-builder\",\"extension-tools\"],\"tools\":[");
+    try writer.writer.writeAll("{\"name\":\"antfly\",\"endpoint\":");
+    try writeUrlValue(&writer.writer, base_url, "/mcp/v1");
+    try writer.writer.writeAll(",\"description\":\"Aggregate Antfly MCP server for built-in and visible extension tools.\",\"capabilities\":[\"table-search\",\"retrieval\",\"query-builder\",\"extension-tools\"],\"tools\":[");
     try writeVisibleMcpTools(alloc, &writer.writer, extension_context);
     try writer.writer.writeAll("]}");
     return try writer.toOwnedSlice();
 }
 
-fn copilotMcpProfileDescriptorJsonAlloc(alloc: std.mem.Allocator, extension_context: ?ExtensionCatalogContext) ![]u8 {
+fn copilotMcpProfileDescriptorJsonAlloc(alloc: std.mem.Allocator, base_url: ?[]const u8, extension_context: ?ExtensionCatalogContext) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
 
-    try writer.writer.writeAll("{\"name\":\"antfly-copilot\",\"endpoint\":\"/mcp/v1/extensions/profiles/copilot\",\"profile\":\"copilot\",\"description\":\"Profile-scoped Antfly MCP server for Copilot-style clients.\",\"capabilities\":[\"table-search\",\"retrieval\",\"query-builder\",\"extension-tools\"],\"tools\":[");
+    try writer.writer.writeAll("{\"name\":\"antfly-copilot\",\"endpoint\":");
+    try writeUrlValue(&writer.writer, base_url, "/mcp/v1/extensions/profiles/copilot");
+    try writer.writer.writeAll(",\"profile\":\"copilot\",\"description\":\"Profile-scoped Antfly MCP server for Copilot-style clients.\",\"capabilities\":[\"table-search\",\"retrieval\",\"query-builder\",\"extension-tools\"],\"tools\":[");
     try writeVisibleMcpTools(alloc, &writer.writer, extension_context);
     try writer.writer.writeAll("]}");
     return try writer.toOwnedSlice();
@@ -2412,6 +2416,46 @@ test "ARD catalog resolves artifact urls against configured base url" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/extensions/v1/packages/docsaf/versions/1.0.0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/extensions/v1/installed/docsaf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/ard/v1/resources/mcp/extensions/docsaf\"") != null);
+}
+
+test "ARD MCP descriptors resolve endpoints against configured base url" {
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "docsaf",
+        .package_name = "docsaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:docs",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .granted_capabilities = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "docsaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .mcp_tool,
+        .object_name = "search_docs",
+        .table_name = "docs",
+        .owner_metadata_json = "{\"description\":\"Search docs\",\"input_schema\":{\"type\":\"object\"}}",
+    }};
+    const ctx: ExtensionCatalogContext = .{
+        .installed_extensions = &installed,
+        .extension_members = &members,
+    };
+
+    const aggregate = (try mcpDescriptorJsonAlloc(std.testing.allocator, "default", "https://tenant.example.com/", ctx)).?;
+    defer std.testing.allocator.free(aggregate);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate, "\"endpoint\":\"https://tenant.example.com/mcp/v1\"") != null);
+
+    const extension = (try mcpDescriptorJsonAlloc(std.testing.allocator, "extensions/docsaf", "https://tenant.example.com/", ctx)).?;
+    defer std.testing.allocator.free(extension);
+    try std.testing.expect(std.mem.indexOf(u8, extension, "\"endpoint\":\"https://tenant.example.com/mcp/v1/extensions/docsaf\"") != null);
+
+    const profile = (try mcpDescriptorJsonAlloc(std.testing.allocator, "profiles/copilot", "https://tenant.example.com/", ctx)).?;
+    defer std.testing.allocator.free(profile);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "\"endpoint\":\"https://tenant.example.com/mcp/v1/extensions/profiles/copilot\"") != null);
+
+    const local = (try mcpDescriptorJsonAlloc(std.testing.allocator, "default", null, ctx)).?;
+    defer std.testing.allocator.free(local);
+    try std.testing.expect(std.mem.indexOf(u8, local, "\"endpoint\":\"/mcp/v1\"") != null);
 }
 
 test "ARD catalog hides admin-only built-in skills from non-admin entries" {
