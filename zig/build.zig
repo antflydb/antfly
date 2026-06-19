@@ -7284,6 +7284,9 @@ pub fn build(b: *std.Build) void {
         run_graph_metric_release_qualification_distributed_promotion_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
         const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run spawned-process graph metric maintenance smoke test");
         graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
+        const graph_metric_distributed_release_gate_build_step = b.step("graph-metric-distributed-release-gate-build", "Build local distributed graph metric process and release qualification harnesses without running them");
+        graph_metric_distributed_release_gate_build_step.dependOn(&graph_metric_process_harness.step);
+        graph_metric_distributed_release_gate_build_step.dependOn(&graph_metric_release_qualification.step);
         const graph_metric_distributed_release_gate_step = b.step("graph-metric-distributed-release-gate", "Run local distributed graph metric process and release qualification gates");
         graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_process_harness.step);
         graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_release_qualification_distributed_smoke_budgeted.step);

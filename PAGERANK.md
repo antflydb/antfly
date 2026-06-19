@@ -5189,6 +5189,12 @@ than PR unit coverage:
   compiling the process harness, and the composed target runs that process
   harness before starting the release smoke, keeping the three large Zig
   executables out of the same parallel compile window for CI memory stability.
+  Compile-only jobs that only need to validate the distributed gate artifacts
+  can use `zig build graph-metric-distributed-release-gate-build`, or the Make
+  wrappers `make -C zig graph-metric-distributed-release-gate-build` and
+  `make zig-graph-metric-distributed-release-gate-build`, to build the child
+  `antfly` binary, process harness, and release-qualification harness without
+  running the five-minute spawned-process qualification.
   It is intentionally
   smaller than the promotion-budgeted target and does not replace
   deployment-scale hosted owner, fan-in, cleanup, or latency evidence. Release
