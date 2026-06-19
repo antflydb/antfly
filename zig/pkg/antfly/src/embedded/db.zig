@@ -60,8 +60,10 @@ pub const Capabilities = struct {
 };
 
 pub const DB = struct {
+    allocator: Allocator,
     inner: db_mod.DB,
     profile: Profile,
+    owned_lite_storage: ?*support.lsm_backend.AfliteContainerStorage = null,
 
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return try openWithProfile(alloc, path, opts, .native);
@@ -71,15 +73,52 @@ pub const DB = struct {
         return try openWithProfile(alloc, path, opts, .hosted);
     }
 
+    pub fn openLite(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
+        return try openLiteWithProfile(alloc, path, opts, .native);
+    }
+
+    pub fn openLiteHosted(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
+        return try openLiteWithProfile(alloc, path, opts, .hosted);
+    }
+
     pub fn openWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         return .{
+            .allocator = alloc,
             .inner = try db_mod.DB.open(alloc, path, toDbOpenOptions(opts, profile)),
             .profile = profile,
         };
     }
 
+    pub fn openLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
+        var lite_storage = try alloc.create(support.lsm_backend.AfliteContainerStorage);
+        errdefer alloc.destroy(lite_storage);
+
+        lite_storage.* = try support.lsm_backend.AfliteContainerStorage.open(alloc, path);
+        errdefer lite_storage.deinit();
+
+        var lite_opts = opts;
+        pinLiteStorage(&lite_opts, lite_storage.storage());
+
+        const inner = db_mod.DB.open(alloc, path, toDbOpenOptions(lite_opts, profile)) catch |err| {
+            lite_storage.deinit();
+            alloc.destroy(lite_storage);
+            return err;
+        };
+
+        return .{
+            .allocator = alloc,
+            .inner = inner,
+            .profile = profile,
+            .owned_lite_storage = lite_storage,
+        };
+    }
+
     pub fn close(self: *DB) void {
         self.inner.close();
+        if (self.owned_lite_storage) |lite_storage| {
+            lite_storage.deinit();
+            self.allocator.destroy(lite_storage);
+        }
         self.* = undefined;
     }
 
@@ -209,4 +248,75 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         resolved.transaction_recovery = .{ .enabled = false };
     }
     return resolved;
+}
+
+fn pinLiteStorage(opts: *OpenOptions, storage: support.lsm_storage.Storage) void {
+    opts.storage = storage;
+    opts.index_backends.text_lsm_storage = storage;
+    opts.index_backends.dense_lsm_storage = storage;
+    opts.index_backends.sparse_lsm_storage = storage;
+    opts.index_backends.graph_lsm_storage = storage;
+}
+
+fn testLitePath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "embedded db openLite persists documents in aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite.aflite");
+    defer alloc.free(path);
+
+    const opts = OpenOptions{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    };
+
+    {
+        var db = try DB.openLite(alloc, path, opts);
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:lite",
+                .value = "{\"title\":\"lite persisted\"}",
+            }},
+            .sync_level = .write,
+        });
+    }
+
+    {
+        var reopened = try DB.openLite(alloc, path, opts);
+        defer reopened.close();
+
+        var result = (try reopened.lookup(alloc, "doc:lite", .{})) orelse return error.MissingLiteDocument;
+        defer result.deinit(alloc);
+
+        try std.testing.expect(std.mem.indexOf(u8, result.json, "\"lite persisted\"") != null);
+    }
+}
+
+test "embedded db openLiteHosted exposes manual maintenance capabilities" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite-hosted.aflite");
+    defer alloc.free(path);
+
+    var db = try DB.openLiteHosted(alloc, path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer db.close();
+
+    const caps = db.capabilities();
+    try std.testing.expect(caps.hosted_profile);
+    try std.testing.expect(caps.manual_maintenance);
+    try std.testing.expect(!caps.background_enrichment_runtime);
+    try std.testing.expect(!caps.ttl_cleanup_runtime);
+    try std.testing.expect(!caps.transaction_recovery_runtime);
 }

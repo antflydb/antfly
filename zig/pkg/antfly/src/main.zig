@@ -54,6 +54,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, subcommand, "swarm")) return try cmd.swarm.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -168,6 +169,7 @@ fn printUsage(argv0: []const u8) void {
         \\  swarm
         \\  inference
         \\  serverless
+        \\  lite           Embedded Antfly Lite databases (*.aflite)
         \\
         \\client subcommands:
         \\  table          Manage tables (create, drop, list, get)

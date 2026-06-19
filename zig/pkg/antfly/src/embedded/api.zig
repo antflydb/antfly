@@ -52,6 +52,24 @@ pub const Api = struct {
         };
     }
 
+    pub fn openLite(allocator: Allocator, path: []const u8, opts: OpenOptions) !Api {
+        return .{
+            .allocator = allocator,
+            .db = try embedded_db.DB.openLiteWithProfile(allocator, path, opts.db, opts.profile),
+            .table_name = try allocator.dupe(u8, opts.table_name),
+            .semantic_resolver = opts.semantic_resolver,
+        };
+    }
+
+    pub fn openLiteHosted(allocator: Allocator, path: []const u8, opts: OpenOptions) !Api {
+        return .{
+            .allocator = allocator,
+            .db = try embedded_db.DB.openLiteHosted(allocator, path, opts.db),
+            .table_name = try allocator.dupe(u8, opts.table_name),
+            .semantic_resolver = opts.semantic_resolver,
+        };
+    }
+
     pub fn close(self: *Api) void {
         self.db.close();
         self.allocator.free(self.table_name);
@@ -511,5 +529,51 @@ test "embedded api hosted profile persists text index across reopen over storage
         );
         defer alloc.free(lookup_json);
         try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"alpha hosted reopen\"") != null);
+    }
+}
+
+test "embedded api openLite round-trips batch lookup over aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var api = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer api.close();
+
+        const batch_json = try api.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:a\":{\"title\":\"alpha lite api\"}}}",
+        );
+        defer alloc.free(batch_json);
+        try std.testing.expect(std.mem.indexOf(u8, batch_json, "\"inserted\":1") != null);
+    }
+
+    {
+        var reopened = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer reopened.close();
+
+        const lookup_json = try reopened.lookupJson(
+            alloc,
+            "doc:a",
+            "{\"fields\":[\"title\"]}",
+        );
+        defer alloc.free(lookup_json);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"found\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"alpha lite api\"") != null);
     }
 }

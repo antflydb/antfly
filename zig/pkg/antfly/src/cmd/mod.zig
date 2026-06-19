@@ -22,6 +22,7 @@ pub const serverless_swarm = @import("serverless_swarm.zig");
 pub const swarm = @import("swarm.zig");
 pub const inference = @import("inference.zig");
 pub const cli = @import("cli/mod.zig");
+pub const lite = @import("lite.zig");
 
 test "cmd module compiles" {
     _ = data;
@@ -34,4 +35,5 @@ test "cmd module compiles" {
     _ = swarm;
     _ = inference;
     _ = cli;
+    _ = lite;
 }
