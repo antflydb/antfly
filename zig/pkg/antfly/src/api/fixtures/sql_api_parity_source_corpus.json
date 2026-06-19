@@ -13,6 +13,39 @@
       "sql": "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1"
     },
     {
+      "name": "prepare insert statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "insert_usage_plan",
+        "operations": 1
+      },
+      "plan": "ddl:prepare_statement:name=insert_usage_plan:params=1:subject=write:statement=insert",
+      "sql": "PREPARE insert_usage_plan(text) AS INSERT INTO usage_records (id, status) VALUES ($1, 'prepared')"
+    },
+    {
+      "name": "prepare truncate statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "truncate_usage_plan",
+        "operations": 0
+      },
+      "plan": "ddl:prepare_statement:name=truncate_usage_plan:params=0:subject=write:statement=truncate",
+      "sql": "PREPARE truncate_usage_plan AS TRUNCATE usage_records"
+    },
+    {
+      "name": "prepare ddl statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "create_usage_plan",
+        "operations": 0
+      },
+      "plan": "ddl:prepare_statement:name=create_usage_plan:params=0:subject=ddl:statement=ddl",
+      "sql": "PREPARE create_usage_plan AS CREATE TABLE prepared_usage_records (id uuid)"
+    },
+    {
       "name": "prepare cte-backed insert statement protocol plan",
       "family": "ddl",
       "summary": {

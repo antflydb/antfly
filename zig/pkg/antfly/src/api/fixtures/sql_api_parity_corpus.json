@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "13e682d63b239f8803126611717f73e6438a6a6809a891d0673b16b6193f6c7b",
-  "source_entry_count": 954,
-  "entry_count": 954,
+  "source_sha256": "e6749aaa84f07e494370a467f2535770253a8ce9af02e147a9fe1a36f0f6098a",
+  "source_entry_count": 957,
+  "entry_count": 957,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -17,6 +17,39 @@
       },
       "plan": "ddl:prepare_statement:name=usage_plan:params=1:subject=read:statement=read",
       "sql": "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1"
+    },
+    {
+      "name": "prepare insert statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "insert_usage_plan",
+        "operations": 1
+      },
+      "plan": "ddl:prepare_statement:name=insert_usage_plan:params=1:subject=write:statement=insert",
+      "sql": "PREPARE insert_usage_plan(text) AS INSERT INTO usage_records (id, status) VALUES ($1, 'prepared')"
+    },
+    {
+      "name": "prepare truncate statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "truncate_usage_plan",
+        "operations": 0
+      },
+      "plan": "ddl:prepare_statement:name=truncate_usage_plan:params=0:subject=write:statement=truncate",
+      "sql": "PREPARE truncate_usage_plan AS TRUNCATE usage_records"
+    },
+    {
+      "name": "prepare ddl statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "create_usage_plan",
+        "operations": 0
+      },
+      "plan": "ddl:prepare_statement:name=create_usage_plan:params=0:subject=ddl:statement=ddl",
+      "sql": "PREPARE create_usage_plan AS CREATE TABLE prepared_usage_records (id uuid)"
     },
     {
       "name": "prepare cte-backed insert statement protocol plan",

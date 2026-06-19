@@ -8692,6 +8692,36 @@ test "sql adapter grammar parses prepared statement syntax" {
     try std.testing.expectEqual(PreparedStatementStatementSyntax.read, prepare.statement_family);
     try std.testing.expectEqual(prepare_tokens.items.len, prepare_pos);
 
+    var prepare_insert_tokens = try lexer.tokenizeAlloc(alloc, "insert_plan(text) AS INSERT INTO usage_records (id) VALUES ($1);");
+    defer lexer.freeTokens(alloc, &prepare_insert_tokens);
+    var prepare_insert_pos: usize = 0;
+    const prepare_insert = try parsePrepareStatementTail(prepare_insert_tokens.items, &prepare_insert_pos);
+    try std.testing.expectEqualStrings("insert_plan", prepare_insert.statement_name);
+    try std.testing.expectEqual(@as(usize, 1), prepare_insert.parameter_count);
+    try std.testing.expectEqual(PreparedStatementSubjectSyntax.write, prepare_insert.statement_kind);
+    try std.testing.expectEqual(PreparedStatementStatementSyntax.insert, prepare_insert.statement_family);
+    try std.testing.expectEqual(prepare_insert_tokens.items.len, prepare_insert_pos);
+
+    var prepare_truncate_tokens = try lexer.tokenizeAlloc(alloc, "truncate_plan AS TRUNCATE usage_records;");
+    defer lexer.freeTokens(alloc, &prepare_truncate_tokens);
+    var prepare_truncate_pos: usize = 0;
+    const prepare_truncate = try parsePrepareStatementTail(prepare_truncate_tokens.items, &prepare_truncate_pos);
+    try std.testing.expectEqualStrings("truncate_plan", prepare_truncate.statement_name);
+    try std.testing.expectEqual(@as(usize, 0), prepare_truncate.parameter_count);
+    try std.testing.expectEqual(PreparedStatementSubjectSyntax.write, prepare_truncate.statement_kind);
+    try std.testing.expectEqual(PreparedStatementStatementSyntax.truncate, prepare_truncate.statement_family);
+    try std.testing.expectEqual(prepare_truncate_tokens.items.len, prepare_truncate_pos);
+
+    var prepare_ddl_tokens = try lexer.tokenizeAlloc(alloc, "ddl_plan AS CREATE TABLE prepared_usage_records (id uuid);");
+    defer lexer.freeTokens(alloc, &prepare_ddl_tokens);
+    var prepare_ddl_pos: usize = 0;
+    const prepare_ddl = try parsePrepareStatementTail(prepare_ddl_tokens.items, &prepare_ddl_pos);
+    try std.testing.expectEqualStrings("ddl_plan", prepare_ddl.statement_name);
+    try std.testing.expectEqual(@as(usize, 0), prepare_ddl.parameter_count);
+    try std.testing.expectEqual(PreparedStatementSubjectSyntax.ddl, prepare_ddl.statement_kind);
+    try std.testing.expectEqual(PreparedStatementStatementSyntax.ddl, prepare_ddl.statement_family);
+    try std.testing.expectEqual(prepare_ddl_tokens.items.len, prepare_ddl_pos);
+
     var prepare_merge_tokens = try lexer.tokenizeAlloc(alloc, "merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
     defer lexer.freeTokens(alloc, &prepare_merge_tokens);
     var prepare_merge_pos: usize = 0;

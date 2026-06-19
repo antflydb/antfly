@@ -3991,8 +3991,11 @@ pub const AppParityCorpusCoverage = struct {
     ddl_prepare_statement_read_subject: bool = false,
     ddl_prepare_statement_write_subject: bool = false,
     ddl_prepare_statement_params: bool = false,
+    ddl_prepare_statement_ddl_family: bool = false,
+    ddl_prepare_statement_insert_family: bool = false,
     ddl_prepare_statement_read_family: bool = false,
     ddl_prepare_statement_insert_source_family: bool = false,
+    ddl_prepare_statement_truncate_family: bool = false,
     ddl_prepare_statement_update_family: bool = false,
     ddl_prepare_statement_delete_family: bool = false,
     ddl_prepare_statement_merge_family: bool = false,
@@ -5686,8 +5689,11 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_prepare_statement_read_subject = self.ddl_prepare_statement_read_subject or sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "read");
                     self.ddl_prepare_statement_write_subject = self.ddl_prepare_statement_write_subject or sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
                     self.ddl_prepare_statement_params = self.ddl_prepare_statement_params or sql_adapter.planHasNonZeroToken(entry.plan, ":params=");
+                    self.ddl_prepare_statement_ddl_family = self.ddl_prepare_statement_ddl_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "ddl");
+                    self.ddl_prepare_statement_insert_family = self.ddl_prepare_statement_insert_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "insert");
                     self.ddl_prepare_statement_read_family = self.ddl_prepare_statement_read_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "read");
                     self.ddl_prepare_statement_insert_source_family = self.ddl_prepare_statement_insert_source_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "insert_source");
+                    self.ddl_prepare_statement_truncate_family = self.ddl_prepare_statement_truncate_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "truncate");
                     self.ddl_prepare_statement_update_family = self.ddl_prepare_statement_update_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "update");
                     self.ddl_prepare_statement_delete_family = self.ddl_prepare_statement_delete_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "delete");
                     self.ddl_prepare_statement_merge_family = self.ddl_prepare_statement_merge_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "merge");
@@ -6572,8 +6578,11 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_prepare_statement_read_subject);
         try std.testing.expect(self.ddl_prepare_statement_write_subject);
         try std.testing.expect(self.ddl_prepare_statement_params);
+        try std.testing.expect(self.ddl_prepare_statement_ddl_family);
+        try std.testing.expect(self.ddl_prepare_statement_insert_family);
         try std.testing.expect(self.ddl_prepare_statement_read_family);
         try std.testing.expect(self.ddl_prepare_statement_insert_source_family);
+        try std.testing.expect(self.ddl_prepare_statement_truncate_family);
         try std.testing.expect(self.ddl_prepare_statement_update_family);
         try std.testing.expect(self.ddl_prepare_statement_delete_family);
         try std.testing.expect(self.ddl_prepare_statement_merge_family);

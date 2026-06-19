@@ -4564,9 +4564,12 @@ captures statement name, parameter or argument count, the broad subject
 before the lowerer allocates the public intent plan. A `PREPARE ... AS WITH ...`
 subject uses the same final-statement CTE classifier as ordinary SQL dispatch,
 so CTE-backed `UPDATE`, `DELETE`, `INSERT`, `TRUNCATE`, and `MERGE` subjects
-are writes while recursive CTE subjects fail closed. They still fail closed when applied to storage until Antfly has a native
-prepared-plan cache keyed by typed plan fingerprints, parameter schemas, catalog
-epochs, authorization context, and invalidation rules. `DECLARE ... [BINARY]
+are writes while recursive CTE subjects fail closed. The parity corpus requires
+direct prepared `SELECT`, `INSERT`, `TRUNCATE`, DDL, and CTE-backed
+insert-source/update/delete/merge families to keep that metadata durable. They
+still fail closed when applied to storage until Antfly has a native prepared-plan
+cache keyed by typed plan fingerprints, parameter schemas, catalog epochs,
+authorization context, and invalidation rules. `DECLARE ... [BINARY]
 [NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH [direction] [FROM|IN]
 cursor`, shorthand `FETCH cursor`, bare-count `FETCH n cursor`, and `CLOSE
 cursor|ALL` lower to typed cursor-portal intents that capture portal name,
