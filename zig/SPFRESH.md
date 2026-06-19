@@ -126,7 +126,10 @@ Current status:
   repeated base-header decode for postings with many sealed delta values.
   Compaction candidate collection also reserves per all-live delta value and
   pre-counts large mixed values before appending candidates, so maintenance does
-  not grow the global candidate array one surviving record at a time.
+  not grow the global candidate array one surviving record at a time. Segment
+  writers now use assume-capacity value, index, and footer appends after the
+  exact encoded size has been reserved, removing repeated allocator capacity
+  checks from immutable segment construction.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and

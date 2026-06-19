@@ -2960,15 +2960,16 @@ pub const Writer = struct {
 
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(self.alloc);
-        try out.ensureTotalCapacity(self.alloc, try encodedSegmentSizeForPendingEntries(self.entries.items));
+        const encoded_size = try encodedSegmentSizeForPendingEntries(self.entries.items);
+        try out.ensureTotalCapacity(self.alloc, encoded_size);
 
-        try appendPendingEntryValuesForKind(self.alloc, &out, self.entries.items, value_offsets, .base);
-        try appendPendingEntryValuesForKind(self.alloc, &out, self.entries.items, value_offsets, .centroid_directory);
-        try appendPendingEntryValuesForKind(self.alloc, &out, self.entries.items, value_offsets, .delta);
+        appendPendingEntryValuesForKindAssumeCapacity(&out, self.entries.items, value_offsets, .base);
+        appendPendingEntryValuesForKindAssumeCapacity(&out, self.entries.items, value_offsets, .centroid_directory);
+        appendPendingEntryValuesForKindAssumeCapacity(&out, self.entries.items, value_offsets, .delta);
 
         const index_offset = out.items.len;
         for (self.entries.items, value_offsets) |entry, value_offset| {
-            try appendIndexEntry(self.alloc, &out, .{
+            appendIndexEntryAssumeCapacity(&out, .{
                 .posting_id = entry.posting_id,
                 .kind = entry.kind,
                 .sequence = entry.sequence,
@@ -2979,12 +2980,13 @@ pub const Writer = struct {
         }
         const index_end = out.items.len;
         const stored_index_checksum = indexChecksum(out.items[index_offset..index_end]);
-        try appendU64(self.alloc, &out, @intCast(index_offset));
-        try appendU64(self.alloc, &out, @intCast(self.entries.items.len));
-        try appendU32(self.alloc, &out, stored_index_checksum);
-        try appendU32(self.alloc, &out, segmentChecksum(out.items));
-        try appendU16(self.alloc, &out, version);
-        try out.appendSlice(self.alloc, &magic);
+        appendU64AssumeCapacity(&out, @intCast(index_offset));
+        appendU64AssumeCapacity(&out, @intCast(self.entries.items.len));
+        appendU32AssumeCapacity(&out, stored_index_checksum);
+        appendU32AssumeCapacity(&out, segmentChecksum(out.items));
+        appendU16AssumeCapacity(&out, version);
+        out.appendSliceAssumeCapacity(&magic);
+        std.debug.assert(out.items.len == encoded_size);
         return try out.toOwnedSlice(self.alloc);
     }
 
@@ -3011,6 +3013,19 @@ fn appendPendingEntryValuesForKind(
         if (entry.kind != kind) continue;
         value_offsets[index] = out.items.len;
         try out.appendSlice(alloc, entry.value);
+    }
+}
+
+fn appendPendingEntryValuesForKindAssumeCapacity(
+    out: *std.ArrayListUnmanaged(u8),
+    entries: []const PendingEntry,
+    value_offsets: []usize,
+    kind: EntryKind,
+) void {
+    for (entries, 0..) |entry, index| {
+        if (entry.kind != kind) continue;
+        value_offsets[index] = out.items.len;
+        out.appendSliceAssumeCapacity(entry.value);
     }
 }
 
@@ -3870,6 +3885,15 @@ fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: I
     try appendU64(alloc, out, @intCast(entry.offset));
     try appendU64(alloc, out, @intCast(entry.len));
     try appendU32(alloc, out, entry.value_checksum);
+}
+
+fn appendIndexEntryAssumeCapacity(out: *std.ArrayListUnmanaged(u8), entry: IndexEntry) void {
+    appendU64AssumeCapacity(out, entry.posting_id);
+    out.appendAssumeCapacity(@intFromEnum(entry.kind));
+    appendU64AssumeCapacity(out, entry.sequence);
+    appendU64AssumeCapacity(out, @intCast(entry.offset));
+    appendU64AssumeCapacity(out, @intCast(entry.len));
+    appendU32AssumeCapacity(out, entry.value_checksum);
 }
 
 fn validateManifest(manifest: Manifest) !void {
@@ -5109,16 +5133,34 @@ fn appendU16(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u16) !vo
     try out.appendSlice(alloc, &buf);
 }
 
+fn appendU16AssumeCapacity(out: *std.ArrayListUnmanaged(u8), value: u16) void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &buf, value, .big);
+    out.appendSliceAssumeCapacity(&buf);
+}
+
 fn appendU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, value, .big);
     try out.appendSlice(alloc, &buf);
 }
 
+fn appendU32AssumeCapacity(out: *std.ArrayListUnmanaged(u8), value: u32) void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
+    out.appendSliceAssumeCapacity(&buf);
+}
+
 fn appendU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, value, .big);
     try out.appendSlice(alloc, &buf);
+}
+
+fn appendU64AssumeCapacity(out: *std.ArrayListUnmanaged(u8), value: u64) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .big);
+    out.appendSliceAssumeCapacity(&buf);
 }
 
 fn readU16(bytes: *const [2]u8) u16 {
