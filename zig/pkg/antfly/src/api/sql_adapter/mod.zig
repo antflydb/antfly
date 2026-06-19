@@ -276,6 +276,7 @@ pub const RoutineKind = ddl_plan.RoutineKind;
 pub const RoutineKindSyntax = grammar.RoutineKindSyntax;
 pub const RowSecurityCatalogPlan = ddl_plan.RowSecurityCatalogPlan;
 pub const RowSecurityCurrentSettingPredicate = ddl_plan.RowSecurityCurrentSettingPredicate;
+pub const RowSecurityLiteralPredicate = ddl_plan.RowSecurityLiteralPredicate;
 pub const RowSecurityPolicyPredicate = ddl_plan.RowSecurityPolicyPredicate;
 pub const SavepointNamePlan = ddl_plan.SavepointNamePlan;
 pub const SavepointTransactionPlan = ddl_plan.SavepointTransactionPlan;

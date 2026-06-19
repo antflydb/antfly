@@ -273,6 +273,7 @@
     "ddl_row_security_disable",
     "ddl_row_security_drop_policy",
     "ddl_row_security_enable",
+    "ddl_row_security_literal_policy",
     "ddl_savepoint_transaction",
     "ddl_schema_namespace_create",
     "ddl_schema_namespace_create_if_not_exists",

@@ -1498,21 +1498,34 @@ fn parseRowSecurityPolicyPredicateAlloc(
     var field_transferred = false;
     errdefer if (!field_transferred) alloc.free(field);
     try cursor.expectToken(.eq);
-    try cursor.expectKeyword("current_setting");
-    try cursor.expectToken(.lparen);
-    const setting_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
-    if (setting_token.text.len == 0) return error.UnsupportedSqlShape;
-    const setting_name = try alloc.dupe(u8, setting_token.text);
-    var setting_transferred = false;
-    errdefer if (!setting_transferred) alloc.free(setting_name);
-    try cursor.expectToken(.rparen);
+    if (cursor.matchKeyword("current_setting")) {
+        try cursor.expectToken(.lparen);
+        const setting_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+        if (setting_token.text.len == 0) return error.UnsupportedSqlShape;
+        const setting_name = try alloc.dupe(u8, setting_token.text);
+        var setting_transferred = false;
+        errdefer if (!setting_transferred) alloc.free(setting_name);
+        try cursor.expectToken(.rparen);
+        try cursor.expectToken(.rparen);
+
+        field_transferred = true;
+        setting_transferred = true;
+        return .{ .current_setting_equals = .{
+            .field = field,
+            .setting_name = setting_name,
+        } };
+    }
+
+    const value_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
     try cursor.expectToken(.rparen);
 
     field_transferred = true;
-    setting_transferred = true;
-    return .{ .current_setting_equals = .{
+    value_transferred = true;
+    return .{ .literal_equals = .{
         .field = field,
-        .setting_name = setting_name,
+        .value_json = value_json,
     } };
 }
 
@@ -6378,7 +6391,20 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqualStrings("tenant_id", predicate.field);
     try std.testing.expectEqualStrings("app.tenant_id", predicate.setting_name);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a');");
+    var literal_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy_literal ON usage_records USING (tenant_id = 'tenant-a');");
+    defer lexer.freeTokens(alloc, &literal_tokens);
+    var literal_pos: usize = 0;
+    var literal = try parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, literal_tokens.items, &literal_pos);
+    defer literal.deinit(alloc);
+    try std.testing.expectEqual(literal_tokens.items.len, literal_pos);
+    const literal_predicate = switch (literal.predicate) {
+        .literal_equals => |literal_predicate| literal_predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("tenant_id", literal_predicate.field);
+    try std.testing.expectEqualStrings("\"tenant-a\"", literal_predicate.value_json);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

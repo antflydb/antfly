@@ -3945,6 +3945,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_enable: bool = false,
     ddl_row_security_disable: bool = false,
     ddl_row_security_create_policy: bool = false,
+    ddl_row_security_literal_policy: bool = false,
     ddl_row_security_drop_policy: bool = false,
     ddl_database_create: bool = false,
     ddl_database_alter: bool = false,
@@ -5630,7 +5631,10 @@ pub const AppParityCorpusCoverage = struct {
                 .detach_table_partition => self.ddl_partition_detach = true,
                 .enable_row_security => self.ddl_row_security_enable = true,
                 .disable_row_security => self.ddl_row_security_disable = true,
-                .create_row_policy => self.ddl_row_security_create_policy = true,
+                .create_row_policy => {
+                    self.ddl_row_security_create_policy = true;
+                    self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
+                },
                 .drop_row_policy => self.ddl_row_security_drop_policy = true,
                 .create_database => self.ddl_database_create = true,
                 .alter_database => {
@@ -6590,6 +6594,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_row_security_enable);
         try std.testing.expect(self.ddl_row_security_disable);
         try std.testing.expect(self.ddl_row_security_create_policy);
+        try std.testing.expect(self.ddl_row_security_literal_policy);
         try std.testing.expect(self.ddl_row_security_drop_policy);
         try std.testing.expect(self.ddl_database_create);
         try std.testing.expect(self.ddl_database_alter);

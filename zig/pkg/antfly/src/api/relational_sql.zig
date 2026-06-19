@@ -273,6 +273,7 @@ pub const CreateRowSecurityPolicyPlan = sql_adapter.CreateRowSecurityPolicyPlan;
 pub const DropRowSecurityPolicyPlan = sql_adapter.DropRowSecurityPolicyPlan;
 pub const RowSecurityPolicyPredicate = sql_adapter.RowSecurityPolicyPredicate;
 pub const RowSecurityCurrentSettingPredicate = sql_adapter.RowSecurityCurrentSettingPredicate;
+pub const RowSecurityLiteralPredicate = sql_adapter.RowSecurityLiteralPredicate;
 pub const DomainCatalogPlan = sql_adapter.DomainCatalogPlan;
 pub const CreateDomainPlan = sql_adapter.CreateDomainPlan;
 pub const AlterDomainPlan = sql_adapter.AlterDomainPlan;
@@ -45482,6 +45483,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id", create_row_policy_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_row_policy));
 
+    var create_literal_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_active_policy ON usage_records USING (status = 'active');");
+    defer create_literal_row_policy.deinit(alloc);
+    const create_literal_row_policy_plan = switch (create_literal_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .create_policy => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const create_literal_row_policy_predicate = switch (create_literal_row_policy_plan.predicate) {
+        .literal_equals => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", create_literal_row_policy_predicate.field);
+    try std.testing.expectEqualStrings("\"active\"", create_literal_row_policy_predicate.value_json);
+    const create_literal_row_policy_fingerprint = try ddlFingerprintAlloc(alloc, create_literal_row_policy);
+    defer alloc.free(create_literal_row_policy_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_active_policy:table=usage_records:kind=literal_eq:field=status:value_json_hex=2261637469766522", create_literal_row_policy_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_literal_row_policy));
+
     var drop_row_policy = try lowerDdlPlanAlloc(alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;");
     defer drop_row_policy.deinit(alloc);
     const drop_row_policy_plan = switch (drop_row_policy) {
@@ -56848,6 +56869,15 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     "ddl:create_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
                     .{ create.policy_name, create.table_name, predicate.field, predicate.setting_name },
                 ),
+                .literal_equals => |predicate| blk: {
+                    const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, predicate.value_json);
+                    defer alloc.free(value_json_hex);
+                    break :blk try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:create_row_policy:policy={s}:table={s}:kind=literal_eq:field={s}:value_json_hex={s}",
+                        .{ create.policy_name, create.table_name, predicate.field, value_json_hex },
+                    );
+                },
             },
             .drop_policy => |drop| try std.fmt.allocPrint(
                 alloc,
