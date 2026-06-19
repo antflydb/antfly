@@ -45,6 +45,7 @@ const base_data_batch_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const base_data_batch_best_segment_stack_capacity: usize = 512;
 const base_data_batch_unresolved_stack_capacity: usize = 512;
 const base_data_batch_point_read_stack_capacity: usize = 512;
+const selected_compaction_segment_stack_capacity: usize = 64;
 const writer_value_offsets_stack_capacity: usize = 512;
 const stack_index_max_bytes: usize = 64 * 1024;
 const stack_base_value_range_max_bytes: usize = 64 * 1024;
@@ -1974,11 +1975,16 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
     });
     defer manifest.deinit(alloc);
 
-    const selected = try alloc.alloc(SegmentBlob, segment_ids.len);
+    var selected_stack: [selected_compaction_segment_stack_capacity]SegmentBlob = undefined;
+    const use_selected_stack = segment_ids.len <= selected_stack.len;
+    const selected = if (use_selected_stack)
+        selected_stack[0..segment_ids.len]
+    else
+        try alloc.alloc(SegmentBlob, segment_ids.len);
     var selected_count: usize = 0;
     defer {
         for (selected[0..selected_count]) |segment| alloc.free(segment.data);
-        alloc.free(selected);
+        if (!use_selected_stack) alloc.free(selected);
     }
 
     if (segment_ids_strictly_ascending) {
