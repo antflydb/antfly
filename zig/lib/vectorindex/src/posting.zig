@@ -803,7 +803,7 @@ pub const PostingFormat = struct {
             return try materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, base_data, header);
         }
         sortDeltaRecordsBySequenceIfNeeded(records);
-        stableSortDeltaRecordsByVector(records);
+        sortDeltaRecordsByVectorIfNeeded(records);
         return try materializeSortedBaseWithDeltaRecordsIntoScratchAssumeSorted(alloc, scratch, base_data, records);
     }
 
@@ -1077,7 +1077,7 @@ pub const PostingFormat = struct {
         records: []PostingDeltaRecord,
     ) !usize {
         if (records.len == 0) return base_member_count;
-        stableSortDeltaRecordsByVector(records);
+        sortDeltaRecordsByVectorIfNeeded(records);
         return try applySortedDeltaRecordsToSortedScratchAssumeSorted(alloc, scratch, base_member_count, records);
     }
 
@@ -1340,6 +1340,16 @@ pub const PostingFormat = struct {
                 records[j] = records[j - 1];
             }
             records[j] = record;
+        }
+    }
+
+    fn sortDeltaRecordsByVectorIfNeeded(records: []PostingDeltaRecord) void {
+        var i: usize = 1;
+        while (i < records.len) : (i += 1) {
+            if (records[i].vector_id < records[i - 1].vector_id) {
+                stableSortDeltaRecordsByVector(records);
+                return;
+            }
         }
     }
 
@@ -7835,6 +7845,37 @@ test "posting sorted delta replay assume-sorted skips resort" {
     try std.testing.expectEqual(@as(VectorId, 15), records[0].vector_id);
     try std.testing.expectEqual(@as(VectorId, 20), records[1].vector_id);
     try std.testing.expectEqual(@as(VectorId, 40), records[2].vector_id);
+}
+
+test "posting delta record vector sort skips already ordered records" {
+    var records = [_]PostingDeltaRecord{
+        .{ .sequence = 1, .op = .insert, .vector_id = 10 },
+        .{ .sequence = 2, .op = .tombstone, .vector_id = 10 },
+        .{ .sequence = 3, .op = .insert, .vector_id = 20 },
+    };
+
+    PostingFormat.sortDeltaRecordsByVectorIfNeeded(records[0..]);
+
+    try std.testing.expectEqual(@as(u64, 1), records[0].sequence);
+    try std.testing.expectEqual(@as(u64, 2), records[1].sequence);
+    try std.testing.expectEqual(@as(u64, 3), records[2].sequence);
+}
+
+test "posting delta record vector sort preserves duplicate record order" {
+    var records = [_]PostingDeltaRecord{
+        .{ .sequence = 3, .op = .insert, .vector_id = 20 },
+        .{ .sequence = 1, .op = .insert, .vector_id = 10 },
+        .{ .sequence = 2, .op = .tombstone, .vector_id = 10 },
+    };
+
+    PostingFormat.sortDeltaRecordsByVectorIfNeeded(records[0..]);
+
+    try std.testing.expectEqual(@as(VectorId, 10), records[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 1), records[0].sequence);
+    try std.testing.expectEqual(@as(VectorId, 10), records[1].vector_id);
+    try std.testing.expectEqual(@as(u64, 2), records[1].sequence);
+    try std.testing.expectEqual(@as(VectorId, 20), records[2].vector_id);
+    try std.testing.expectEqual(@as(u64, 3), records[2].sequence);
 }
 
 test "posting sorted delta replay skips empty tails without touching scratch capacity" {
