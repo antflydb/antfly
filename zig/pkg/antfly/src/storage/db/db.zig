@@ -4202,7 +4202,6 @@ pub const DB = struct {
             .wait_for_sync_level = false,
             .bypass_ha_write_gate = true,
             .ha_applied_lsn_marker = applied_lsn_marker,
-            .suppress_derived_replay_append = true,
         });
     }
 
@@ -36807,6 +36806,7 @@ test "db full-text chunk consumer returns parent and chunk modes" {
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
+        .start_index_workers = false,
     });
     defer db.close();
 
@@ -36825,11 +36825,9 @@ test "db full-text chunk consumer returns parent and chunk modes" {
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
         },
-        .sync_level = .write,
+        .sync_level = .full_text,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -36878,6 +36876,7 @@ test "db full-text chunk consumer filters expired parents under ttl" {
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
+        .start_index_workers = false,
     });
     defer db.close();
 
@@ -36903,16 +36902,13 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     try db.batch(.{
         .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .timestamp_ns = now_ns - 2 * ttl_duration_ns,
-        .sync_level = .write,
+        .sync_level = .full_text,
     });
     try db.batch(.{
         .writes = &.{.{ .key = "doc:fresh", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .timestamp_ns = now_ns,
-        .sync_level = .write,
+        .sync_level = .full_text,
     });
-
-    try db.enrichment_runtime.?.waitForApplied(2);
-    try waitForDerivedReplayTarget(&db);
 
     var chunk_result = try waitForSearchResult(alloc, &db, .{
         .index_name = "ft_chunks",
@@ -36976,6 +36972,7 @@ test "db full-text chunk parent paging applies after grouping" {
             .owner_id = "worker-a",
             .dense_embedder = deterministic.interface(),
         },
+        .start_index_workers = false,
     });
     defer db.close();
 
@@ -36995,11 +36992,8 @@ test "db full-text chunk parent paging applies after grouping" {
             .{ .key = "doc:a", .value = "{\"body\":\"alpha alpha alpha alpha\"}" },
             .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
         },
-        .sync_level = .write,
+        .sync_level = .full_text,
     });
-
-    try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
 
     var result = try waitForSearchResult(alloc, &db, .{
         .index_name = "ft_chunks",

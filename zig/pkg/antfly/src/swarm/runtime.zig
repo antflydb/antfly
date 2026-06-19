@@ -3183,7 +3183,8 @@ test "parse cli accepts secret store path" {
 test "parse cli accepts extension package store path" {
     var argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
 }
 
@@ -3199,7 +3200,8 @@ test "parse cli accepts ARD identity flags" {
         "true",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
     try std.testing.expectEqualStrings("tenant.example.com", cfg.ard_publisher_domain.?);
     try std.testing.expectEqualStrings("Tenant Antfly", cfg.ard_display_name.?);
