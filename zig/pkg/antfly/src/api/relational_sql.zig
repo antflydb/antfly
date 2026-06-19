@@ -3608,6 +3608,7 @@ const Parser = struct {
         const delimiter = syntax.delimiter;
         const quote = syntax.quote;
         const escape = syntax.escape;
+        const null_marker = syntax.null_marker;
         syntax.table_name = "";
         syntax.columns = &.{};
         syntax.endpoint = "";
@@ -3615,6 +3616,7 @@ const Parser = struct {
         syntax.delimiter = null;
         syntax.quote = null;
         syntax.escape = null;
+        syntax.null_marker = null;
         return .{
             .direction = bulkIoDirectionFromSyntax(syntax.direction),
             .table_name = table_name,
@@ -3625,6 +3627,7 @@ const Parser = struct {
             .delimiter = delimiter,
             .quote = quote,
             .escape = escape,
+            .null_marker = null_marker,
         };
     }
 
@@ -45186,12 +45189,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(copy_from_plan.delimiter == null);
     try std.testing.expect(copy_from_plan.quote == null);
     try std.testing.expect(copy_from_plan.escape == null);
+    try std.testing.expect(copy_from_plan.null_marker == null);
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default", copy_from_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default", copy_from_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
-    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '!');");
+    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '');");
     defer copy_from_header.deinit(alloc);
     const copy_from_header_plan = switch (copy_from_header) {
         .bulk_io => |plan| plan,
@@ -45201,15 +45205,16 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings(",", copy_from_header_plan.delimiter.?);
     try std.testing.expectEqualStrings("\"", copy_from_header_plan.quote.?);
     try std.testing.expectEqualStrings("!", copy_from_header_plan.escape.?);
+    try std.testing.expectEqualStrings("", copy_from_header_plan.null_marker.?);
     const copy_from_header_fingerprint = try ddlFingerprintAlloc(alloc, copy_from_header);
     defer alloc.free(copy_from_header_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c:quote_hex=22:escape_hex=21", copy_from_header_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty", copy_from_header_fingerprint);
 
     var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv);");
     defer copy_to.deinit(alloc);
     const copy_to_fingerprint = try ddlFingerprintAlloc(alloc, copy_to);
     defer alloc.free(copy_to_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default", copy_to_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default", copy_to_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
@@ -56627,17 +56632,19 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             defer alloc.free(quote_hex);
             const escape_hex = try bulkIoByteOptionHexAlloc(alloc, plan.escape);
             defer alloc.free(escape_hex);
+            const null_marker_hex = try bulkIoStringOptionHexAlloc(alloc, plan.null_marker);
+            defer alloc.free(null_marker_hex);
             break :blk if (plan.format) |format|
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, delimiter_hex, quote_hex, escape_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, delimiter_hex, quote_hex, escape_hex, null_marker_hex },
                 )
             else
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, delimiter_hex, quote_hex, escape_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, delimiter_hex, quote_hex, escape_hex, null_marker_hex },
                 );
         },
         .table_partition_catalog => |plan| switch (plan) {
@@ -57234,6 +57241,18 @@ fn bulkIoByteOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]co
     const value = option orelse return try alloc.dupe(u8, "default");
     if (value.len != 1) return error.UnsupportedSqlShape;
     return try std.fmt.allocPrint(alloc, "{x:0>2}", .{value[0]});
+}
+
+fn bulkIoStringOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]const u8 {
+    const value = option orelse return try alloc.dupe(u8, "default");
+    if (value.len == 0) return try alloc.dupe(u8, "empty");
+    const out = try alloc.alloc(u8, value.len * 2);
+    const hex = "0123456789abcdef";
+    for (value, 0..) |byte, i| {
+        out[i * 2] = hex[byte >> 4];
+        out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+    return out;
 }
 
 fn tablePartitionMethodName(method: TablePartitionMethod) []const u8 {
