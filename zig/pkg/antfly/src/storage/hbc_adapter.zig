@@ -1300,6 +1300,67 @@ pub const HBCIndex = struct {
         member_count: usize,
     };
 
+    const ClockStorage = struct {
+        storage: []u64,
+        keys: []u64,
+        refs: []bool,
+    };
+
+    const ClockStorageViews = struct {
+        keys: []u64,
+        refs: []bool,
+    };
+
+    fn allocClockStorage(alloc: Allocator, capacity: usize) !ClockStorage {
+        const storage = try alloc.alloc(u64, clockStorageWordLen(capacity));
+        errdefer alloc.free(storage);
+        const views = carveClockStorage(storage, capacity);
+        @memset(views.keys, 0);
+        @memset(views.refs, false);
+        return .{
+            .storage = storage,
+            .keys = views.keys,
+            .refs = views.refs,
+        };
+    }
+
+    fn clockStorageWordLen(capacity: usize) usize {
+        const byte_count = clockStorageByteLen(capacity);
+        return std.math.divCeil(usize, byte_count, @sizeOf(u64)) catch unreachable;
+    }
+
+    fn clockStorageByteLen(capacity: usize) usize {
+        var offset: usize = 0;
+        addClockStorageSlice(u64, &offset, capacity);
+        addClockStorageSlice(bool, &offset, capacity);
+        return std.mem.alignForward(usize, offset, @alignOf(u64));
+    }
+
+    fn addClockStorageSlice(comptime T: type, offset: *usize, capacity: usize) void {
+        comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
+        offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+        offset.* += capacity * @sizeOf(T);
+    }
+
+    fn carveClockStorage(storage: []u64, capacity: usize) ClockStorageViews {
+        const raw_bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
+        var offset: usize = 0;
+        return .{
+            .keys = carveClockStorageSlice(u64, raw_bytes, &offset, capacity),
+            .refs = carveClockStorageSlice(bool, raw_bytes, &offset, capacity),
+        };
+    }
+
+    fn carveClockStorageSlice(comptime T: type, raw_bytes: []align(@alignOf(u64)) u8, offset: *usize, capacity: usize) []T {
+        comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
+        offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+        const byte_len = capacity * @sizeOf(T);
+        const aligned: []align(@alignOf(T)) u8 = @alignCast(raw_bytes[offset.* .. offset.* + byte_len]);
+        const out = std.mem.bytesAsSlice(T, aligned);
+        offset.* += byte_len;
+        return out;
+    }
+
     alloc: Allocator,
     env_owner: EnvOwner,
     store: vectorindex_store.NamespaceStore,
@@ -1320,23 +1381,27 @@ pub const HBCIndex = struct {
     rot: vec.RandomOrthogonalTransformer,
     node_cache: std.AutoHashMapUnmanaged(u64, *NodeCacheEntry),
     node_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
+    node_clock_storage: []u64,
     node_clock_keys: []u64,
     node_clock_refs: []bool,
     node_clock_hand: usize,
     pinned_node_cache: std.AutoHashMapUnmanaged(u64, *NodeCacheEntry),
     quantized_cache: std.AutoHashMapUnmanaged(u64, *QuantizedCacheEntry),
     quantized_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
+    quantized_clock_storage: []u64,
     quantized_clock_keys: []u64,
     quantized_clock_refs: []bool,
     quantized_clock_hand: usize,
     pinned_quantized_cache: std.AutoHashMapUnmanaged(u64, *QuantizedCacheEntry),
     vector_cache: std.AutoHashMapUnmanaged(u64, *VectorCacheEntry),
     vector_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
+    vector_clock_storage: []u64,
     vector_clock_keys: []u64,
     vector_clock_refs: []bool,
     vector_clock_hand: usize,
     metadata_cache: std.AutoHashMapUnmanaged(u64, *MetadataCacheEntry),
     metadata_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
+    metadata_clock_storage: []u64,
     metadata_clock_keys: []u64,
     metadata_clock_refs: []bool,
     metadata_clock_hand: usize,
@@ -1896,30 +1961,14 @@ pub const HBCIndex = struct {
         );
         errdefer rot.deinit();
 
-        const node_clock_keys = try alloc.alloc(u64, effective_config.max_cached_nodes);
-        errdefer alloc.free(node_clock_keys);
-        const node_clock_refs = try alloc.alloc(bool, effective_config.max_cached_nodes);
-        errdefer alloc.free(node_clock_refs);
-        const quantized_clock_keys = try alloc.alloc(u64, effective_config.max_cached_nodes);
-        errdefer alloc.free(quantized_clock_keys);
-        const quantized_clock_refs = try alloc.alloc(bool, effective_config.max_cached_nodes);
-        errdefer alloc.free(quantized_clock_refs);
-        const vector_clock_keys = try alloc.alloc(u64, effective_config.max_cached_vectors);
-        errdefer alloc.free(vector_clock_keys);
-        const vector_clock_refs = try alloc.alloc(bool, effective_config.max_cached_vectors);
-        errdefer alloc.free(vector_clock_refs);
-        const metadata_clock_keys = try alloc.alloc(u64, effective_config.max_cached_metadata);
-        errdefer alloc.free(metadata_clock_keys);
-        const metadata_clock_refs = try alloc.alloc(bool, effective_config.max_cached_metadata);
-        errdefer alloc.free(metadata_clock_refs);
-        @memset(node_clock_keys, 0);
-        @memset(node_clock_refs, false);
-        @memset(quantized_clock_keys, 0);
-        @memset(quantized_clock_refs, false);
-        @memset(vector_clock_keys, 0);
-        @memset(vector_clock_refs, false);
-        @memset(metadata_clock_keys, 0);
-        @memset(metadata_clock_refs, false);
+        const node_clock = try allocClockStorage(alloc, effective_config.max_cached_nodes);
+        errdefer alloc.free(node_clock.storage);
+        const quantized_clock = try allocClockStorage(alloc, effective_config.max_cached_nodes);
+        errdefer alloc.free(quantized_clock.storage);
+        const vector_clock = try allocClockStorage(alloc, effective_config.max_cached_vectors);
+        errdefer alloc.free(vector_clock.storage);
+        const metadata_clock = try allocClockStorage(alloc, effective_config.max_cached_metadata);
+        errdefer alloc.free(metadata_clock.storage);
 
         var posting_segment_manifest_data: ?[]u8 = null;
         defer if (posting_segment_manifest_data) |data| alloc.free(data);
@@ -1960,25 +2009,29 @@ pub const HBCIndex = struct {
             .rot = rot,
             .node_cache = .empty,
             .node_cache_slots = .empty,
-            .node_clock_keys = node_clock_keys,
-            .node_clock_refs = node_clock_refs,
+            .node_clock_storage = node_clock.storage,
+            .node_clock_keys = node_clock.keys,
+            .node_clock_refs = node_clock.refs,
             .node_clock_hand = 0,
             .pinned_node_cache = .empty,
             .quantized_cache = .empty,
             .quantized_cache_slots = .empty,
-            .quantized_clock_keys = quantized_clock_keys,
-            .quantized_clock_refs = quantized_clock_refs,
+            .quantized_clock_storage = quantized_clock.storage,
+            .quantized_clock_keys = quantized_clock.keys,
+            .quantized_clock_refs = quantized_clock.refs,
             .quantized_clock_hand = 0,
             .pinned_quantized_cache = .empty,
             .vector_cache = .empty,
             .vector_cache_slots = .empty,
-            .vector_clock_keys = vector_clock_keys,
-            .vector_clock_refs = vector_clock_refs,
+            .vector_clock_storage = vector_clock.storage,
+            .vector_clock_keys = vector_clock.keys,
+            .vector_clock_refs = vector_clock.refs,
             .vector_clock_hand = 0,
             .metadata_cache = .empty,
             .metadata_cache_slots = .empty,
-            .metadata_clock_keys = metadata_clock_keys,
-            .metadata_clock_refs = metadata_clock_refs,
+            .metadata_clock_storage = metadata_clock.storage,
+            .metadata_clock_keys = metadata_clock.keys,
+            .metadata_clock_refs = metadata_clock.refs,
             .metadata_clock_hand = 0,
             .resource_manager = null,
             .shared_cache = null,
@@ -2513,14 +2566,10 @@ pub const HBCIndex = struct {
             self.clearLocalQuantizedCacheLocked();
             self.cache_mu.unlockExclusive();
         }
-        self.alloc.free(self.node_clock_keys);
-        self.alloc.free(self.node_clock_refs);
-        self.alloc.free(self.quantized_clock_keys);
-        self.alloc.free(self.quantized_clock_refs);
-        self.alloc.free(self.vector_clock_keys);
-        self.alloc.free(self.vector_clock_refs);
-        self.alloc.free(self.metadata_clock_keys);
-        self.alloc.free(self.metadata_clock_refs);
+        self.alloc.free(self.node_clock_storage);
+        self.alloc.free(self.quantized_clock_storage);
+        self.alloc.free(self.vector_clock_storage);
+        self.alloc.free(self.metadata_clock_storage);
         if (self.hilbert) |*hilbert| hilbert.deinit();
         if (self.cached_scratch) |*scratch| {
             self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| scratch.bytes());

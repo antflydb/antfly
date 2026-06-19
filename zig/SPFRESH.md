@@ -858,6 +858,9 @@ implementations cleanly:
    RaBitQ estimate scratch now slabs query-diff and four query-code buffers
    behind one backing allocation, so retained query/routing scratch no longer
    pins five small allocations per estimator.
+   Local HBC cache clock metadata now slabs key/ref arrays behind one backing
+   allocation per cache kind, reducing retained allocation count without
+   changing eviction behavior.
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed
