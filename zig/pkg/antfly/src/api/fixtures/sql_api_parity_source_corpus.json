@@ -3846,10 +3846,14 @@
       "sql": "ALTER POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'))"
     },
     {
-      "name": "unsupported row security per-role policy targeting",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=row_security_policy_plan",
-      "classification_reason": "row_security_policy_plan",
+      "name": "row security targeted policy catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_row_policy",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:create_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:roles=1:role=app_reader",
       "sql": "CREATE POLICY usage_records_tenant_policy ON usage_records TO app_reader USING (tenant_id = current_setting('app.tenant_id'))"
     },
     {

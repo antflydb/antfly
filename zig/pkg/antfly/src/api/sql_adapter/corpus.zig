@@ -3952,6 +3952,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_disable: bool = false,
     ddl_row_security_create_policy: bool = false,
     ddl_row_security_literal_policy: bool = false,
+    ddl_row_security_targeted_policy: bool = false,
     ddl_row_security_alter_policy: bool = false,
     ddl_row_security_drop_policy: bool = false,
     ddl_database_create: bool = false,
@@ -4147,7 +4148,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
     unsupported_ddl_row_security_policy_expression: bool = false,
-    unsupported_ddl_row_security_policy_targeting: bool = false,
     unsupported_ddl_row_rewrite_expression_plan: bool = false,
     unsupported_ddl_transaction_scoped_search_path: bool = false,
     unsupported_write: bool = false,
@@ -5424,10 +5424,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
                     std.mem.indexOf(u8, entry.sql, "current_setting") == null);
-            self.unsupported_ddl_row_security_policy_targeting = self.unsupported_ddl_row_security_policy_targeting or
-                (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
-                    std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
-                    std.mem.indexOf(u8, entry.sql, " TO ") != null);
             self.unsupported_ddl_row_rewrite_expression_plan = self.unsupported_ddl_row_rewrite_expression_plan or
                 (std.mem.eql(u8, entry.classification_reason, "row_rewrite_expression_plan") and
                     std.mem.indexOf(u8, entry.sql, " USING ") != null);
@@ -5636,6 +5632,7 @@ pub const AppParityCorpusCoverage = struct {
                 .create_row_policy => {
                     self.ddl_row_security_create_policy = true;
                     self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
+                    self.ddl_row_security_targeted_policy = self.ddl_row_security_targeted_policy or std.mem.indexOf(u8, entry.plan, ":roles=") != null;
                 },
                 .alter_row_policy => self.ddl_row_security_alter_policy = true,
                 .drop_row_policy => self.ddl_row_security_drop_policy = true,
@@ -6602,6 +6599,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_row_security_disable);
         try std.testing.expect(self.ddl_row_security_create_policy);
         try std.testing.expect(self.ddl_row_security_literal_policy);
+        try std.testing.expect(self.ddl_row_security_targeted_policy);
         try std.testing.expect(self.ddl_row_security_alter_policy);
         try std.testing.expect(self.ddl_row_security_drop_policy);
         try std.testing.expect(self.ddl_database_create);
@@ -6754,7 +6752,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_routine_procedure_body);
         try std.testing.expect(self.unsupported_ddl_routine_option);
         try std.testing.expect(self.unsupported_ddl_row_security_policy_expression);
-        try std.testing.expect(self.unsupported_ddl_row_security_policy_targeting);
         try std.testing.expect(self.unsupported_ddl_row_rewrite_expression_plan);
         try std.testing.expect(self.unsupported_ddl_transaction_scoped_search_path);
         try std.testing.expect(self.read_row_lock_nowait);

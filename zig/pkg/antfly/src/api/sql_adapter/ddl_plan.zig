@@ -1952,11 +1952,13 @@ pub const AlterRowSecurityPlan = struct {
 pub const CreateRowSecurityPolicyPlan = struct {
     policy_name: []const u8,
     table_name: []const u8,
+    role_targets: []const []const u8 = &.{},
     predicate: RowSecurityPolicyPredicate,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.policy_name);
         alloc.free(self.table_name);
+        freeStringSlice(alloc, self.role_targets);
         self.predicate.deinit(alloc);
         self.* = undefined;
     }
@@ -1965,11 +1967,13 @@ pub const CreateRowSecurityPolicyPlan = struct {
 pub const AlterRowSecurityPolicyPlan = struct {
     policy_name: []const u8,
     table_name: []const u8,
+    role_targets: []const []const u8 = &.{},
     predicate: RowSecurityPolicyPredicate,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.policy_name);
         alloc.free(self.table_name);
+        freeStringSlice(alloc, self.role_targets);
         self.predicate.deinit(alloc);
         self.* = undefined;
     }

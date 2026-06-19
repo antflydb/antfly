@@ -4913,13 +4913,17 @@ lower to typed row-security catalog plans. The current runtime subset preserves
 table identity, policy identity, enable intent, request-setting equality
 predicates such as `tenant_id = current_setting('app.tenant_id')`, and scalar
 literal equality predicates such as `status = 'active'` as native policy
-metadata rather than raw SQL. `CREATE POLICY` tails parse in
+metadata rather than raw SQL. `CREATE POLICY ... TO role[, ...]` and
+`ALTER POLICY ... TO role[, ...]` preserve ordered role-target metadata on the
+same typed policy plan, so role scoping is catalog data rather than SQL text
+hidden in the adapter. `CREATE POLICY` tails parse in
 `api/sql_adapter/grammar.zig`, so the SQL lowerer only transfers owned grammar
 syntax into typed row-security catalog plans. Public API execution maps each
 supported policy to a hidden native row-filter policy subject, converts
 `current_setting('app.<key>')` to `{"$auth":"settings.app.<key>"}`, stores
-literal equality as a native `term` row filter, and merges enabled-table filters
-into every user's effective row filters before row-query, aggregate, join,
+literal equality as a native `term` row filter, applies role targets during
+effective-policy resolution, and merges enabled-table filters into every
+matching user's effective row filters before row-query, aggregate, join,
 lateral, window, and document query execution. Those setting references are
 resolved from the authenticated user's effective native role settings; a missing
 setting fails closed during request filter resolution. Creating a policy stores
@@ -4928,11 +4932,10 @@ ENABLE ROW LEVEL SECURITY` marks that table as RLS-enabled in the native auth
 policy store. `ALTER POLICY ... USING (...)` replaces the hidden policy
 subject's native row-filter metadata and fails if the policy does not already
 exist. `DROP POLICY` removes the hidden policy subject for that table, while
-`DROP POLICY IF EXISTS` is an idempotent no-op. Compound policy expressions and
-per-role `TO ...` policy targeting still fail closed until they have durable
-native policy state, request-context bindings, and planner/executor validation;
-the source parity corpus pins both shapes under the stable
-`row_security_policy_plan` reason.
+`DROP POLICY IF EXISTS` is an idempotent no-op. Compound policy expressions
+still fail closed until they have durable native policy state,
+request-context bindings, and planner/executor validation; the source parity
+corpus pins that shape under the stable `row_security_policy_plan` reason.
 `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` clears the native table enable bit
 idempotently; stored policies remain catalog metadata but stop contributing
 effective row filters until the table is enabled again. Storage must not

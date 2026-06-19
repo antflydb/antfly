@@ -4498,6 +4498,7 @@ const Parser = struct {
         return .{
             .policy_name = syntax.policy_name,
             .table_name = syntax.table_name,
+            .role_targets = syntax.role_targets,
             .predicate = syntax.predicate,
         };
     }
@@ -4510,6 +4511,7 @@ const Parser = struct {
         return .{
             .policy_name = syntax.policy_name,
             .table_name = syntax.table_name,
+            .role_targets = syntax.role_targets,
             .predicate = syntax.predicate,
         };
     }
@@ -45592,6 +45594,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id", create_row_policy_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_row_policy));
 
+    var targeted_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));");
+    defer targeted_row_policy.deinit(alloc);
+    const targeted_row_policy_plan = switch (targeted_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .create_policy => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), targeted_row_policy_plan.role_targets.len);
+    try std.testing.expectEqualStrings("app_reader", targeted_row_policy_plan.role_targets[0]);
+    try std.testing.expectEqualStrings("app_writer", targeted_row_policy_plan.role_targets[1]);
+    const targeted_row_policy_fingerprint = try ddlFingerprintAlloc(alloc, targeted_row_policy);
+    defer alloc.free(targeted_row_policy_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_targeted_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:roles=2:role=app_reader:role=app_writer", targeted_row_policy_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, targeted_row_policy));
+
     var create_literal_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_active_policy ON usage_records USING (status = 'active');");
     defer create_literal_row_policy.deinit(alloc);
     const create_literal_row_policy_plan = switch (create_literal_row_policy) {
@@ -56978,35 +56997,43 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 .{ if (alter.enabled) "enable" else "disable", alter.table_name },
             ),
             .create_policy => |create| switch (create.predicate) {
-                .current_setting_equals => |predicate| try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:create_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
-                    .{ create.policy_name, create.table_name, predicate.field, predicate.setting_name },
-                ),
+                .current_setting_equals => |predicate| blk: {
+                    const base = try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:create_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
+                        .{ create.policy_name, create.table_name, predicate.field, predicate.setting_name },
+                    );
+                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
+                },
                 .literal_equals => |predicate| blk: {
                     const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, predicate.value_json);
                     defer alloc.free(value_json_hex);
-                    break :blk try std.fmt.allocPrint(
+                    const base = try std.fmt.allocPrint(
                         alloc,
                         "ddl:create_row_policy:policy={s}:table={s}:kind=literal_eq:field={s}:value_json_hex={s}",
                         .{ create.policy_name, create.table_name, predicate.field, value_json_hex },
                     );
+                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
                 },
             },
             .alter_policy => |alter| switch (alter.predicate) {
-                .current_setting_equals => |predicate| try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:alter_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
-                    .{ alter.policy_name, alter.table_name, predicate.field, predicate.setting_name },
-                ),
+                .current_setting_equals => |predicate| blk: {
+                    const base = try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
+                        .{ alter.policy_name, alter.table_name, predicate.field, predicate.setting_name },
+                    );
+                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, alter.role_targets);
+                },
                 .literal_equals => |predicate| blk: {
                     const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, predicate.value_json);
                     defer alloc.free(value_json_hex);
-                    break :blk try std.fmt.allocPrint(
+                    const base = try std.fmt.allocPrint(
                         alloc,
                         "ddl:alter_row_policy:policy={s}:table={s}:kind=literal_eq:field={s}:value_json_hex={s}",
                         .{ alter.policy_name, alter.table_name, predicate.field, value_json_hex },
                     );
+                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, alter.role_targets);
                 },
             },
             .drop_policy => |drop| try std.fmt.allocPrint(
@@ -57656,6 +57683,23 @@ fn bulkIoByteOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]co
     const value = option orelse return try alloc.dupe(u8, "default");
     if (value.len != 1) return error.UnsupportedSqlShape;
     return try std.fmt.allocPrint(alloc, "{x:0>2}", .{value[0]});
+}
+
+fn appendRowSecurityRoleTargetsAlloc(
+    alloc: std.mem.Allocator,
+    base: []u8,
+    role_targets: []const []const u8,
+) ![]u8 {
+    if (role_targets.len == 0) return base;
+    var out = try std.fmt.allocPrint(alloc, "{s}:roles={d}", .{ base, role_targets.len });
+    alloc.free(base);
+    errdefer alloc.free(out);
+    for (role_targets) |role| {
+        const next = try std.fmt.allocPrint(alloc, "{s}:role={s}", .{ out, role });
+        alloc.free(out);
+        out = next;
+    }
+    return out;
 }
 
 fn bulkIoStringOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]const u8 {
