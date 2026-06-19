@@ -4303,6 +4303,17 @@
       "sql": "CREATE FUNCTION costed_audit() RETURNS trigger LANGUAGE plpgsql COST 10"
     },
     {
+      "name": "create rows function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "rows_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=rows_audit:args=0:replace=false:returns=trigger:language=plpgsql:rows=10",
+      "sql": "CREATE FUNCTION rows_audit() RETURNS trigger LANGUAGE plpgsql ROWS 10"
+    },
+    {
       "name": "create parallel safe function catalog ddl",
       "family": "ddl",
       "summary": {
@@ -4369,7 +4380,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql ROWS 10"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql CALLED ON NULL INPUT"
     },
     {
       "name": "drop function catalog ddl",

@@ -738,6 +738,7 @@ pub const CreateRoutinePlan = struct {
     transform_types: []const []const u8 = &.{},
     settings: []const RoutineSetting = &.{},
     cost: ?[]const u8 = null,
+    rows: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.routine_name);
@@ -751,6 +752,7 @@ pub const CreateRoutinePlan = struct {
         }
         if (self.settings.len > 0) alloc.free(@constCast(self.settings));
         if (self.cost) |cost| alloc.free(cost);
+        if (self.rows) |rows| alloc.free(rows);
         self.* = undefined;
     }
 };

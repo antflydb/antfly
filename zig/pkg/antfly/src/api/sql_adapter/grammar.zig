@@ -417,6 +417,7 @@ pub const CreateRoutineSyntax = struct {
     transform_types: []const []const u8 = &.{},
     settings: []const ddl_plan.RoutineSetting = &.{},
     cost: ?[]const u8 = null,
+    rows: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.routine_name));
@@ -426,6 +427,7 @@ pub const CreateRoutineSyntax = struct {
         freeStringSlice(alloc, self.transform_types);
         freeRoutineSettingSlice(alloc, self.settings);
         if (self.cost) |cost| alloc.free(@constCast(cost));
+        if (self.rows) |rows| alloc.free(@constCast(rows));
         self.* = undefined;
     }
 };
@@ -2556,6 +2558,8 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     errdefer if (!settings_transferred) freeRoutineSettingList(alloc, &settings);
     var cost: ?[]const u8 = null;
     errdefer if (cost) |value| alloc.free(@constCast(value));
+    var rows: ?[]const u8 = null;
+    errdefer if (rows) |value| alloc.free(@constCast(value));
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
         if (cursor.matchKeyword("returns")) {
             if (kind != .function or returns_type != null) return error.UnsupportedSqlShape;
@@ -2632,6 +2636,14 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             cost = try alloc.dupe(u8, token.text);
             continue;
         }
+        if (cursor.matchKeyword("rows")) {
+            if (rows != null) return error.UnsupportedSqlShape;
+            const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+            const parsed = std.fmt.parseFloat(f64, token.text) catch return error.UnsupportedSqlShape;
+            if (!(parsed > 0)) return error.UnsupportedSqlShape;
+            rows = try alloc.dupe(u8, token.text);
+            continue;
+        }
         if (cursor.matchKeyword("set")) {
             var setting = try parseRoutineSettingAlloc(alloc, cursor, tokens, pos);
             var setting_transferred = false;
@@ -2662,11 +2674,13 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .transform_types = transform_types,
         .settings = owned_settings,
         .cost = cost,
+        .rows = rows,
     };
     returns_type = null;
     language = null;
     support_function = null;
     cost = null;
+    rows = null;
     return out;
 }
 
@@ -7184,6 +7198,15 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(RoutineKindSyntax.function, cost_function.kind);
     try std.testing.expectEqualStrings("10", cost_function.cost.?);
 
+    var rows_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql ROWS 10;");
+    defer lexer.freeTokens(alloc, &rows_function_tokens);
+    var rows_function_pos: usize = 0;
+    var rows_function = try parseCreateRoutineCatalogTailAlloc(alloc, rows_function_tokens.items, &rows_function_pos);
+    defer rows_function.deinit(alloc);
+    try std.testing.expectEqual(rows_function_tokens.items.len, rows_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, rows_function.kind);
+    try std.testing.expectEqualStrings("10", rows_function.rows.?);
+
     var parallel_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql PARALLEL SAFE;");
     defer lexer.freeTokens(alloc, &parallel_function_tokens);
     var parallel_function_pos: usize = 0;
@@ -7299,7 +7322,7 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(security_tokens.items.len, security_pos);
     try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, security.security.?);
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql ROWS 10;");
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql CALLED ON NULL INPUT;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));
