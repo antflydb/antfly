@@ -5927,15 +5927,28 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    expression)` rather than independent `NOT scalar` and `NOT expression`
    filters. A final set operation over a
    single named CTE source keeps the `source_cte` row-query contract and applies
-   final `ORDER BY` / `LIMIT` / `FETCH` after predicate composition; different
-   CTE sources wait for an explicit stream-composition plan. Overlapping `UNION ALL`,
-   mismatched expression outputs, cross-table branches, branch
-   ordering/pagination, and other general set-operation streams still fail
-   closed as `set_operation_plan`.
+   final `ORDER BY` / `LIMIT` / `FETCH` after predicate composition. When a
+   same-table two-arm set operation cannot be safely collapsed into one
+   predicate tree, the adapter can now lower it to an explicit native
+   set-operation read plan if both branches project compatible output column
+   names and field types and have no branch-local ordering or pagination. The
+   executor runs each branch through the typed row-query vtable and combines
+   projected row JSON with PostgreSQL-style branch semantics: `UNION ALL`
+   preserves duplicate rows and left-then-right order, while `UNION`,
+   `INTERSECT`, and `EXCEPT` perform exact projected-row JSON distinct,
+   intersection, and left-minus-right operations. The SQL/API corpus pins the
+   overlapping `UNION ALL` case that cannot be represented by ordinary OR
+   composition, compatible expression-projection set operations, and
+   catalog-routed cross-table set operations. Cross-table branches are admitted
+   only when the catalog supplies the right table's relational schema, so the
+   adapter remains fail-closed for unknown sources and type-incompatible branch
+   outputs. Different CTE sources, branch ordering/pagination, set-result tail
+   ordering/pagination, recursive CTEs, and other general set-operation streams
+   still fail closed as `set_operation_plan`.
    The broader production shape needs branch output-schema reconciliation,
-   duplicate semantics, ordering/pagination after the combined stream, routed
-   owner-range merge behavior, bounded materialization or spill, and
-   deterministic result metadata before PostgreSQL syntax can lower into it.
+   routed owner-range merge behavior, bounded materialization or spill, and
+   deterministic result metadata for cross-table and CTE-mixed streams before
+   PostgreSQL syntax can lower into those forms.
 
 9. **Aggregates, windows, and ordered streams.**
    `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `HAVING`, aggregate

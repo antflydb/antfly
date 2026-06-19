@@ -1513,12 +1513,21 @@ pub fn corpusFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_t
         .delete_joined_source,
         .merge_mutation,
         => planHasExactStringToken(entry.plan, ":source=", source_table_name),
-        .read,
+        .read => planHasExactStringToken(entry.plan, ":right=", source_table_name) or
+            setOperationPlanHasRightTable(entry.plan, source_table_name),
         .join,
         .lateral,
         => planHasExactStringToken(entry.plan, ":right=", source_table_name),
         else => false,
     };
+}
+
+fn setOperationPlanHasRightTable(plan: []const u8, source_table_name: []const u8) bool {
+    const token = ":right=right:table=";
+    const index = std.mem.indexOf(u8, plan, token) orelse return false;
+    const value_start = index + token.len;
+    const value_end = std.mem.indexOfScalarPos(u8, plan, value_start, ':') orelse plan.len;
+    return std.mem.eql(u8, plan[value_start..value_end], source_table_name);
 }
 
 pub fn corpusFixtureSqlParameterCoverageMatches(entry: AppParityCorpusEntry) bool {
@@ -3663,6 +3672,10 @@ test "sql adapter corpus owns fixture family policies" {
         .{ .family = .insert_source, .plan = "insert_source:table=usage_records:source_table=usage_sources" },
         "other_sources",
     ));
+    try std.testing.expect(corpusFixturePlanMatchesSourceTable(
+        .{ .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records" },
+        "archived_records",
+    ));
     try std.testing.expect(corpusFixtureSqlParameterCoverageMatches(.{
         .family = .query,
         .sql = "SELECT id FROM usage_records WHERE tenant_id = $1",
@@ -4229,6 +4242,7 @@ pub const AppParityCorpusCoverage = struct {
     read_cte_window_expression: bool = false,
     read_join_cross_table_source_schema_classifier: bool = false,
     read_lateral_cross_table_source_schema_classifier: bool = false,
+    read_set_operation_cross_table_source_schema_classifier: bool = false,
     query: bool = false,
     aggregate: bool = false,
     join: bool = false,
@@ -4333,6 +4347,7 @@ pub const AppParityCorpusCoverage = struct {
     joined_source_cross_table_source_schema: bool = false,
     read_join_cross_table_source_schema: bool = false,
     read_lateral_cross_table_source_schema: bool = false,
+    read_set_operation_cross_table_source_schema: bool = false,
     merge_cross_table_source_schema: bool = false,
     scalar_membership: bool = false,
     boolean_is_predicate: bool = false,
@@ -5460,6 +5475,10 @@ pub const AppParityCorpusCoverage = struct {
                     (std.mem.startsWith(u8, entry.plan, "read:lateral:") and
                         entry.source_schema_json.len > 0 and
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "balance_records"));
+                self.read_set_operation_cross_table_source_schema_classifier = self.read_set_operation_cross_table_source_schema_classifier or
+                    (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
+                        entry.source_schema_json.len > 0 and
+                        setOperationPlanHasRightTable(entry.plan, "archived_records"));
                 self.read_cte_query_expression = self.read_cte_query_expression or
                     (is_read_query and has_read_query_expression);
                 self.read_cte_aggregate_expression = self.read_cte_aggregate_expression or
@@ -6621,6 +6640,10 @@ pub const AppParityCorpusCoverage = struct {
             (entry.family == .lateral and
                 entry.source_schema_json.len > 0 and
                 sql_adapter.planHasExactStringToken(entry.plan, ":right=", "balance_records"));
+        self.read_set_operation_cross_table_source_schema = self.read_set_operation_cross_table_source_schema or
+            (entry.family == .read and
+                entry.source_schema_json.len > 0 and
+                setOperationPlanHasRightTable(entry.plan, "archived_records"));
         self.merge_cross_table_source_schema = self.merge_cross_table_source_schema or
             (entry.family == .merge_mutation and
                 entry.source_schema_json.len > 0 and

@@ -505,7 +505,7 @@ pub fn lowerReadPlanAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredReadPlan {
-    return try lowerReadPlanWithSchemasAlloc(alloc, sql, schema, schema, params);
+    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params);
 }
 
 pub fn lowerReadPlanWithSchemasAlloc(
@@ -515,9 +515,20 @@ pub fn lowerReadPlanWithSchemasAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredReadPlan {
-    var saw_invalid_catalog = false;
+    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params);
+}
 
-    if (lowerLateralPlanWithSchemasAlloc(alloc, sql, schema, source_schema, params)) |lowered| {
+fn lowerReadPlanWithOptionalSourceSchemaAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredReadPlan {
+    var saw_invalid_catalog = false;
+    const joined_source_schema = source_schema orelse schema;
+
+    if (lowerLateralPlanWithSchemasAlloc(alloc, sql, schema, joined_source_schema, params)) |lowered| {
         return .{ .lateral = lowered };
     } else |err| switch (err) {
         error.UnsupportedSqlShape => {},
@@ -541,7 +552,7 @@ pub fn lowerReadPlanWithSchemasAlloc(
         else => return err,
     }
 
-    if (lowerJoinWithSchemasAlloc(alloc, sql, schema, source_schema, params)) |lowered| {
+    if (lowerJoinWithSchemasAlloc(alloc, sql, schema, joined_source_schema, params)) |lowered| {
         return .{ .join = lowered };
     } else |err| switch (err) {
         error.UnsupportedSqlShape => {},
@@ -556,7 +567,7 @@ pub fn lowerReadPlanWithSchemasAlloc(
         else => return err,
     }
 
-    if (lowerSetOperationPlanAlloc(alloc, sql, schema, params)) |lowered| {
+    if (lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params)) |lowered| {
         return .{ .set_operation = lowered };
     } else |err| switch (err) {
         error.UnsupportedSqlShape => if (saw_invalid_catalog) return error.InvalidSqlCatalog else return error.UnsupportedSqlShape,
@@ -571,7 +582,30 @@ pub fn lowerSetOperationPlanAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params);
+}
+
+pub fn lowerSetOperationPlanWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params);
+}
+
+fn lowerSetOperationPlanWithOptionalSourceSchemaAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredSetOperationPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema) |joined_source_schema| {
+        if (joined_source_schema.storage_mode != .relational or joined_source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    }
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
 
@@ -579,6 +613,7 @@ pub fn lowerSetOperationPlanAlloc(
         .alloc = alloc,
         .tokens = tokens.items,
         .schema = schema,
+        .joined_source_schema = source_schema,
         .params = params,
     };
     return try parser.parseSetOperationPlan();
@@ -7546,18 +7581,26 @@ const Parser = struct {
     fn parseSetOperationPlan(self: *@This()) !LoweredSetOperationPlan {
         if (self.peekKeyword("with")) return error.UnsupportedSqlShape;
 
+        const right_schema = self.joined_source_schema orelse self.schema;
         var left = try self.parseSelectWithSetBoundary(true);
         errdefer left.deinit(self.alloc);
+        const left_columns = try self.setOperationOutputColumnsAlloc(left);
+        defer freeDdlRelationalColumns(self.alloc, left_columns);
         if (self.atEnd()) return error.UnsupportedSqlShape;
 
         const op = try self.parseSelectSetOperation();
+        const previous_schema = self.schema;
+        self.schema = right_schema;
+        defer self.schema = previous_schema;
         var right = try self.parseSelectWithSetResultTailBoundary();
         errdefer right.deinit(self.alloc);
+        const right_columns = try self.setOperationOutputColumnsAlloc(right);
+        defer freeDdlRelationalColumns(self.alloc, right_columns);
 
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
-        if (!std.mem.eql(u8, left.table_name, right.table_name)) return error.UnsupportedSqlShape;
-        if (!simpleSelectProjectionsEqual(left.query, right.query, left.select_outputs, right.select_outputs)) return error.UnsupportedSqlShape;
+        if (!std.mem.eql(u8, left.table_name, right.table_name) and self.joined_source_schema == null) return error.UnsupportedSqlShape;
+        if (!setOperationColumnsCompatible(left_columns, right_columns)) return error.UnsupportedSqlShape;
 
         const left_table_name = left.table_name;
         left.table_name = "";
@@ -7585,6 +7628,20 @@ const Parser = struct {
             .left = left_plan,
             .right = right_plan,
         };
+    }
+
+    fn setOperationOutputColumnsAlloc(self: *@This(), lowered: LoweredSelect) ![]runtime_schema.RelationalColumn {
+        const select = SelectList{
+            .fields = lowered.query.select,
+            .json_extract = lowered.query.json_extract,
+            .array_length = lowered.query.array_length,
+            .coalesce = lowered.query.coalesce,
+            .field_aliases = lowered.query.field_aliases,
+            .expressions = lowered.query.expressions,
+            .outputs = lowered.select_outputs,
+            .select_all = lowered.query.select_all,
+        };
+        return try self.selectOutputColumnsAlloc(select);
     }
 
     fn parseSelectWithSetBoundary(self: *@This(), allow_boundary: bool) !LoweredSelect {
@@ -41315,6 +41372,19 @@ fn simpleSelectProjectionsEqual(
     if (lhs_outputs.len != rhs_outputs.len) return false;
     for (lhs_outputs, rhs_outputs) |left, right| {
         if (left.kind != right.kind or left.index != right.index) return false;
+    }
+    return true;
+}
+
+fn setOperationColumnsCompatible(
+    lhs: []const runtime_schema.RelationalColumn,
+    rhs: []const runtime_schema.RelationalColumn,
+) bool {
+    if (lhs.len == 0 or lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name)) return false;
+        if (left.field_type != right.field_type) return false;
+        if (left.array_item_type != right.array_item_type) return false;
     }
     return true;
 }

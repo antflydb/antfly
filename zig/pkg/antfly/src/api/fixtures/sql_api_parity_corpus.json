@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "893040218631ab30725b356d63b9d52e900fcecb7180a6d0fd36b022112a5810",
-  "source_entry_count": 984,
-  "entry_count": 984,
+  "source_sha256": "cd11739e03eaa7caca26a03e3d92c9c4750961058c82e07ba9abf504e42f23b4",
+  "source_entry_count": 986,
+  "entry_count": 986,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -5439,6 +5439,25 @@
       "sql": "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'closed'"
     },
     {
+      "name": "read intersect compatible expression projection set operation",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:set_operation:set_operation:op=intersect:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT upper(status) AS status_key FROM usage_records WHERE enabled IS TRUE"
+    },
+    {
+      "name": "read cross table union all compatible set operation",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE"
+    },
+    {
       "name": "read except mixed scalar expression predicate set operation",
       "family": "read",
       "summary": {
@@ -5451,11 +5470,11 @@
       "sql": "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted'"
     },
     {
-      "name": "unsupported read intersect mismatched expression set operation",
+      "name": "unsupported read intersect mismatched type set operation",
       "family": "unsupported_read",
       "plan": "unsupported:read:requires=set_operation_plan",
       "classification_reason": "set_operation_plan",
-      "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT upper(status) AS status_key FROM usage_records WHERE enabled IS TRUE"
+      "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT amount AS status_key FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "unsupported read except cross table set operation",

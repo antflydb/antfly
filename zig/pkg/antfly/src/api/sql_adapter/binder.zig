@@ -323,6 +323,10 @@ fn selectReadTableNamesAlloc(
     const join_index = if (findTopLevelKeyword(tokens[left_index + 1 ..], "join")) |relative|
         left_index + 1 + relative
     else {
+        if (try selectSetOperationSourceTableNameAlloc(alloc, tokens, left_index + 1)) |source| {
+            left_transferred = true;
+            return .{ .left = left, .source = source };
+        }
         left_transferred = true;
         return .{ .left = left };
     };
@@ -340,6 +344,52 @@ fn selectReadTableNamesAlloc(
 
     left_transferred = true;
     return .{ .left = left, .source = source };
+}
+
+fn selectSetOperationSourceTableNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    start_index: usize,
+) !?[]const u8 {
+    var depth: usize = 0;
+    var i = start_index;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .identifier => {
+                if (depth != 0 or !selectSetOperationKeyword(token.text)) continue;
+                var select_index = i + 1;
+                if (std.ascii.eqlIgnoreCase(token.text, "union")) {
+                    _ = consumeKeyword(tokens, &select_index, "all") or consumeKeyword(tokens, &select_index, "distinct");
+                } else {
+                    _ = consumeKeyword(tokens, &select_index, "distinct");
+                }
+                if (select_index >= tokens.len or tokens[select_index].kind != .identifier or
+                    !std.ascii.eqlIgnoreCase(tokens[select_index].text, "select"))
+                {
+                    return error.UnsupportedSqlShape;
+                }
+                const from_relative = findTopLevelKeyword(tokens[select_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
+                var source_index = select_index + 1 + from_relative + 1;
+                _ = consumeKeyword(tokens, &source_index, "only");
+                if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
+                return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn selectSetOperationKeyword(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "union") or
+        std.ascii.eqlIgnoreCase(text, "intersect") or
+        std.ascii.eqlIgnoreCase(text, "except");
 }
 
 fn readSourceTableNamesFromWithAlloc(
