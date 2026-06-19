@@ -2507,7 +2507,11 @@ exposes distance-only growth for coarse block scoring. Directory blocks also
 retain the coarse centroid's metric measure, so non-quantized block scoring can
 use the same precomputed candidate-measure path as posting-centroid scoring
 instead of recomputing block centroid norms/measures on every query. Adaptive
-two-level queries also delay the posting-count-sized
+two-level selections carry the selected block lower bounds into posting scoring,
+so once the current exact posting heap or epsilon window proves later sorted
+blocks cannot contribute, the query stops before per-block posting estimates
+and exact centroid scoring. Adaptive two-level queries also delay the
+posting-count-sized
 distance/error-bound scratch reservation until the selected block set is known
 to full-scan the directory and use the global posting quantized payload; pruned
 block probes stay at block/per-block scratch size. The optimized gate checks the

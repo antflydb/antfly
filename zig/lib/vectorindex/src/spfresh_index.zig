@@ -441,6 +441,17 @@ fn shouldPruneFlatProbeByEpsilon(metric: vec.DistanceMetric, lower_bound: f32, b
     return @abs(lower_bound) > threshold;
 }
 
+fn shouldStopFlatSelectedBlockByEffort(
+    metric: vec.DistanceMetric,
+    lower_bound: f32,
+    best_distance: f32,
+    epsilon: f32,
+    probe_collector: *FlatProbeCollector,
+) bool {
+    if (shouldPruneFlatProbeByEpsilon(metric, lower_bound, best_distance, epsilon)) return true;
+    return probe_collector.wouldRejectLowerBound(lower_bound);
+}
+
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
     return flatProbeLowerBound(lhs) < flatProbeLowerBound(rhs);
 }
@@ -1196,6 +1207,17 @@ pub fn selectFlatRabitqPostings(
         try self.alloc.alloc(usize, selected_block_capacity);
     defer if (!use_selected_block_stack) self.alloc.free(selected_block_storage);
     var selected_blocks: []usize = selected_block_storage[0..0];
+    const track_selected_block_lower_bounds = use_two_level_blocks and block_probe_limit < directory.blocks.len;
+    var selected_block_lower_bounds_stack: [flat_centroid_query_probe_stack_capacity]f32 = undefined;
+    const use_selected_block_lower_bounds_stack = selected_block_capacity <= selected_block_lower_bounds_stack.len;
+    var selected_block_lower_bounds_storage: []f32 = if (!track_selected_block_lower_bounds)
+        &.{}
+    else if (use_selected_block_lower_bounds_stack)
+        selected_block_lower_bounds_stack[0..selected_block_capacity]
+    else
+        try self.alloc.alloc(f32, selected_block_capacity);
+    defer if (track_selected_block_lower_bounds and !use_selected_block_lower_bounds_stack) self.alloc.free(selected_block_lower_bounds_storage);
+    var selected_block_lower_bounds: []f32 = selected_block_lower_bounds_storage[0..0];
     if (use_two_level_blocks) {
         if (block_probe_limit >= directory.blocks.len) {
             for (directory.blocks, 0..) |_, block_index| selected_block_storage[block_index] = block_index;
@@ -1241,8 +1263,10 @@ pub fn selectFlatRabitqPostings(
                 adaptiveFlatCentroidBlockProbeCount(block_probes, block_probe_limit);
             for (block_probes[0..selected_block_count], 0..) |block_probe, i| {
                 selected_block_storage[i] = @intCast(block_probe.posting_id);
+                selected_block_lower_bounds_storage[i] = flatProbeLowerBound(block_probe);
             }
             selected_blocks = selected_block_storage[0..selected_block_count];
+            selected_block_lower_bounds = selected_block_lower_bounds_storage[0..selected_block_count];
         }
         profile.approx_nodes_expanded += @intCast(directory.blocks.len);
         profile.centroid_directory_blocks_scanned += @intCast(directory.blocks.len);
@@ -1348,7 +1372,14 @@ pub fn selectFlatRabitqPostings(
         }
         profile.centroid_directory_posting_centroids_scored += @intCast(scored_candidates);
     } else {
-        for (selected_blocks) |block_index| {
+        for (selected_blocks, 0..) |block_index, selected_block_index| {
+            if (selected_block_lower_bounds.len != 0 and shouldStopFlatSelectedBlockByEffort(
+                self.config.metric,
+                selected_block_lower_bounds[selected_block_index],
+                best_exact_probe_distance,
+                epsilon,
+                &probe_collector,
+            )) break;
             const block = &directory.blocks[block_index];
             const count = block.posting_ids.len;
             if (self.config.use_quantization) {
@@ -2434,6 +2465,17 @@ test "flat probe dynamic pruning follows effort epsilon" {
     try std.testing.expect(!shouldPruneFlatProbeByEpsilon(.l2_squared, 2.1, 0.0, 3.0));
     try std.testing.expect(!shouldPruneFlatProbeByEpsilon(.inner_product, 100.0, 1.0, 0.1));
     try std.testing.expect(!shouldPruneFlatProbeByEpsilon(.cosine, 2.1, std.math.inf(f32), 1.0));
+}
+
+test "selected block effort gate stops on epsilon or full collector bound" {
+    var storage: [2]FlatCentroidProbe = undefined;
+    var collector = FlatProbeCollector.init(&storage);
+    collector.insert(.{ .posting_id = 1, .distance = 1, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 2, .distance = 2, .error_bound = 0 });
+
+    try std.testing.expect(shouldStopFlatSelectedBlockByEffort(.l2_squared, 2.1, 1.0, 1.0, &collector));
+    try std.testing.expect(shouldStopFlatSelectedBlockByEffort(.l2_squared, 2.0, std.math.inf(f32), 1.0, &collector));
+    try std.testing.expect(!shouldStopFlatSelectedBlockByEffort(.l2_squared, 1.5, std.math.inf(f32), 1.0, &collector));
 }
 
 test "flat probe collector rejection is monotonic for sorted lower bounds" {
