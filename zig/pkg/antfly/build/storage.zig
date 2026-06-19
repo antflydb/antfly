@@ -58,6 +58,7 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "swarm_runtime_focused_test", swarm_runtime_focused_test);
     options.addOption(bool, "bench_minimal_deps", false);
     options.addOption([]const u8, "antfly_version", antfly_version);
+    options.addOption([]const u8, "ard_openapi_ard_yaml", readBuildFileAlloc(b, "../specs/openapi/ard/api.yaml"));
     options.addOption([]const u8, "ard_openapi_antfly_yaml", readBuildFileAlloc(b, "../openapi.yaml"));
     options.addOption([]const u8, "ard_openapi_metadata_yaml", readBuildFileAlloc(b, "../specs/openapi/antfly/metadata.yaml"));
     options.addOption([]const u8, "ard_openapi_extensions_yaml", readBuildFileAlloc(b, "../specs/openapi/extensions/api.yaml"));

@@ -20,7 +20,7 @@ Antfly already has most of the native execution surfaces ARD should advertise:
 - A2A: `/a2a`
 - A2A agent card: `/.well-known/agent-card.json`
 - extension lifecycle and package metadata: `/extensions/v1`
-- OpenAPI specs: `/ard/v1/openapi.yaml` and `/ard/v1/openapi/{spec}.yaml`, backed by generated or source specs from `openapi.yaml` and `specs/openapi/**`
+- OpenAPI specs: `/ard/v1/openapi.yaml`, backed by `specs/openapi/ard/api.yaml`, and `/ard/v1/openapi/{spec}.yaml`, backed by generated or source specs from `openapi.yaml` and `specs/openapi/**`
 - agent-like HTTP endpoints: retrieval, query builder, and table APIs
 
 The design goal is to add ARD as a thin, tenant-aware discovery/export layer over these surfaces, not as a new execution runtime.
