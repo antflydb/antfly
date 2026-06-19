@@ -2547,13 +2547,14 @@ fn applyCreateIndexPlanAlloc(
     }
 
     if (plan.method == .gin) {
-        if (plan.unique or plan.columns.len != 1 or plan.include_columns.len != 0 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
+        if (plan.unique or plan.columns.len != 1 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
         const column = relationalColumnForDdl(schema.relational_columns, plan.columns[0]) orelse return error.InvalidSqlCatalog;
         switch (column.field_type) {
             .json => if (plan.opclass == .array_ops) return error.InvalidSqlCatalog,
             .array => if (plan.opclass == .jsonb_path_ops) return error.InvalidSqlCatalog,
             else => return error.InvalidSqlCatalog,
         }
+        try validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
     }
 
     if (plan.unique) {
@@ -2576,8 +2577,9 @@ fn applyCreateIndexPlanAlloc(
 
     const index_generation = stableSecondaryIndexGeneration(plan);
     if (plan.generated_expression) |generated_expression| {
-        if (plan.columns.len != 0 or plan.include_columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+        if (plan.columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
         if (relationalColumnIndex(schema.relational_columns, plan.index_name) != null) return error.InvalidSqlCatalog;
+        try validateCreateIndexIncludeColumns(schema.relational_columns, &.{}, plan.include_columns);
         const column: runtime_schema.RelationalColumn = .{
             .name = plan.index_name,
             .path = plan.index_name,
@@ -2587,6 +2589,7 @@ fn applyCreateIndexPlanAlloc(
             .index_lifecycle = .building,
             .index_generation = index_generation,
             .index_name = plan.index_name,
+            .index_include_columns = plan.include_columns,
             .generated = generated_expression,
             .index_where = plan.where,
             .index_where_expressions = plan.where_expressions,
@@ -4925,7 +4928,6 @@ const Parser = struct {
         var include_columns_owned = false;
         errdefer if (include_columns_owned) freeStringSlice(self.alloc, include_columns);
         if (self.matchKeyword("include")) {
-            if (method == .gin or generated_expression != null) return error.UnsupportedSqlShape;
             include_columns = try self.parseDdlColumnListAlloc();
             include_columns_owned = true;
             try validateSqlIdentifierListsDisjoint(columns.items, include_columns);
@@ -34974,13 +34976,14 @@ fn applyCreateIndexPlanToSchemaJsonValue(
         return error.InvalidSqlCatalog;
     }
     if (plan.method == .gin) {
-        if (plan.unique or plan.columns.len != 1 or plan.include_columns.len != 0 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
+        if (plan.unique or plan.columns.len != 1 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
         const property_type = try schemaJsonPropertyType(schema_parts.properties, plan.columns[0]);
         if (std.mem.eql(u8, property_type, "json")) {
             if (plan.opclass == .array_ops) return error.InvalidSqlCatalog;
         } else if (std.mem.eql(u8, property_type, "array")) {
             if (plan.opclass == .jsonb_path_ops) return error.InvalidSqlCatalog;
         } else return error.InvalidSqlCatalog;
+        try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, plan.columns, plan.include_columns);
     }
     if (plan.unique) {
         try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, plan.columns, plan.include_columns);
@@ -35001,7 +35004,8 @@ fn applyCreateIndexPlanToSchemaJsonValue(
 
     const index_generation = stableSecondaryIndexGeneration(plan);
     if (plan.generated_expression) |generated_expression| {
-        if (plan.columns.len != 0 or plan.include_columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+        if (plan.columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+        try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, &.{}, plan.include_columns);
         try validateGeneratedExpressionForSchemaJsonProperties(schema_parts.properties, plan.index_name, generated_expression);
         const column: runtime_schema.RelationalColumn = .{
             .name = plan.index_name,
@@ -35012,6 +35016,7 @@ fn applyCreateIndexPlanToSchemaJsonValue(
             .index_lifecycle = .building,
             .index_generation = index_generation,
             .index_name = plan.index_name,
+            .index_include_columns = plan.include_columns,
             .generated = generated_expression,
             .index_where = plan.where,
             .index_where_expressions = plan.where_expressions,
@@ -44016,6 +44021,33 @@ test "postgres sql adapter applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("users_lower_email_idx", generated.index_name.?);
     try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated.generated.?.op);
     try std.testing.expectEqualStrings("email", generated.generated.?.field.?);
+
+    var generated_covering_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX users_lower_email_cover_idx ON users (lower(email)) INCLUDE (tenant_id, amount);",
+    );
+    defer generated_covering_index.deinit(alloc);
+    const generated_covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, generated_covering_index);
+    defer runtime_schema.freeSchema(alloc, generated_covering_schema);
+    const generated_covering = relationalColumnForField(generated_covering_schema, "users_lower_email_cover_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generated_covering.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated_covering.generated.?.op);
+    try std.testing.expectEqual(@as(usize, 2), generated_covering.index_include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", generated_covering.index_include_columns[0]);
+    try std.testing.expectEqualStrings("amount", generated_covering.index_include_columns[1]);
+
+    var gin_covering_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX users_metadata_gin_cover_idx ON users USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);",
+    );
+    defer gin_covering_index.deinit(alloc);
+    const gin_covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, gin_covering_index);
+    defer runtime_schema.freeSchema(alloc, gin_covering_schema);
+    const gin_covering = relationalColumnForField(gin_covering_schema, "metadata", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(gin_covering.indexed);
+    try std.testing.expectEqualStrings("users_metadata_gin_cover_idx", gin_covering.index_name.?);
+    try std.testing.expectEqual(@as(usize, 1), gin_covering.index_include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", gin_covering.index_include_columns[0]);
 
     var wrapped_generated_index = try lowerDdlPlanAlloc(
         alloc,

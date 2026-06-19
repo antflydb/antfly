@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "3b42b5d1ef99f964ca05de603b19b1755c78af1fa3e7dbf9f73aa4d22a4d640c",
+  "source_sha256": "adf119c4bc4f712161a43091935c469df726e878dc521353a8907be66edc019b",
   "source_entry_count": 978,
   "entry_count": 978,
   "skipped_entries": [
@@ -7223,10 +7223,15 @@
       "sql": "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));"
     },
     {
-      "name": "unsupported covering generated expression secondary index",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=covering_derived_index_plan",
-      "classification_reason": "covering_derived_index_plan",
+      "name": "schema covering generated expression secondary index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=lower:include=1",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_lower_email_cover_idx ON usage_records (lower(email)) INCLUDE (tenant_id);"
     },
     {
@@ -7279,10 +7284,15 @@
       "sql": "CREATE INDEX usage_records_metadata_gin ON usage_records USING gin (metadata jsonb_path_ops);"
     },
     {
-      "name": "unsupported covering json gin secondary index",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=covering_derived_index_plan",
-      "classification_reason": "covering_derived_index_plan",
+      "name": "schema covering json gin secondary index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=gin:include=1",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_metadata_gin_cover_idx ON usage_records USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);"
     },
     {

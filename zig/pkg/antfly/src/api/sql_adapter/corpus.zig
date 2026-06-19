@@ -4141,8 +4141,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_copy_unsupported_options: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
-    unsupported_ddl_covering_expression_index_plan: bool = false,
-    unsupported_ddl_covering_gin_index_plan: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
     unsupported_ddl_prepare_transaction_plan: bool = false,
@@ -4459,6 +4457,8 @@ pub const AppParityCorpusCoverage = struct {
     ddl_replace_table: bool = false,
     ddl_create_index: bool = false,
     ddl_create_covering_index: bool = false,
+    ddl_create_covering_generated_index: bool = false,
+    ddl_create_covering_gin_index: bool = false,
     ddl_drop_index: bool = false,
     ddl_drop_table: bool = false,
     ddl_drop_table_cascade: bool = false,
@@ -5373,14 +5373,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     std.mem.startsWith(u8, entry.sql, "COPY ") and
                     std.mem.indexOf(u8, entry.sql, "OIDS") != null);
-            self.unsupported_ddl_covering_expression_index_plan = self.unsupported_ddl_covering_expression_index_plan or
-                (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
-                    std.mem.indexOf(u8, entry.sql, "lower(") != null and
-                    std.mem.indexOf(u8, entry.sql, " INCLUDE ") != null);
-            self.unsupported_ddl_covering_gin_index_plan = self.unsupported_ddl_covering_gin_index_plan or
-                (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
-                    std.mem.indexOf(u8, entry.sql, " USING gin ") != null and
-                    std.mem.indexOf(u8, entry.sql, " INCLUDE ") != null);
             self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
                 (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
                     std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
@@ -5848,6 +5840,12 @@ pub const AppParityCorpusCoverage = struct {
                 .create_index => {
                     self.ddl_create_index = true;
                     self.ddl_create_covering_index = self.ddl_create_covering_index or sql_adapter.planHasNonZeroToken(entry.plan, ":include=");
+                    self.ddl_create_covering_generated_index = self.ddl_create_covering_generated_index or
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":generated_expr=") and
+                            sql_adapter.planHasNonZeroToken(entry.plan, ":include=");
+                    self.ddl_create_covering_gin_index = self.ddl_create_covering_gin_index or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":method=", "gin") and
+                            sql_adapter.planHasNonZeroToken(entry.plan, ":include=");
                 },
                 .drop_index => self.ddl_drop_index = true,
                 .drop_table => {
@@ -6756,8 +6754,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_copy_program_endpoint);
         try std.testing.expect(self.unsupported_ddl_copy_wrong_stream_endpoint);
         try std.testing.expect(self.unsupported_ddl_copy_unsupported_options);
-        try std.testing.expect(self.unsupported_ddl_covering_expression_index_plan);
-        try std.testing.expect(self.unsupported_ddl_covering_gin_index_plan);
         try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
@@ -6983,6 +6979,8 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_replace_table);
         try std.testing.expect(self.ddl_create_index);
         try std.testing.expect(self.ddl_create_covering_index);
+        try std.testing.expect(self.ddl_create_covering_generated_index);
+        try std.testing.expect(self.ddl_create_covering_gin_index);
         try std.testing.expect(self.ddl_drop_index);
         try std.testing.expect(self.ddl_drop_table);
         try std.testing.expect(self.ddl_drop_table_cascade);

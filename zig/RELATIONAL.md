@@ -2147,11 +2147,12 @@ over declared relational columns.
 Covering columns do not participate in index identity, uniqueness, ordering, or
 predicate proof. They are durable catalog metadata that survives schema JSON and
 runtime-schema clone/drop/rename paths, and schema validation rejects include
-columns that do not exist or that repeat key columns. GIN and generated
-expression indexes reject `INCLUDE` until those catalog objects have native
-covering-column metadata instead of silently dropping the PostgreSQL semantics;
-the source parity corpus requires both shapes to fail closed with
-`covering_derived_index_plan`.
+columns that do not exist, that repeat key columns for ordinary column indexes,
+or that are JSON/array payload columns. Ordinary btree secondary indexes,
+generated-expression secondary indexes, and JSON/array GIN secondary indexes all
+preserve `INCLUDE (...)` payload columns as `x-antfly-index-include`, so
+PostgreSQL covering-index syntax is not accepted unless the catalog can retain
+the covering-column metadata exactly.
 
 Unique expression constraints store the expression key directly on the unique
 constraint, evaluate the key from the committed row, and maintain the
