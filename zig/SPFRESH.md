@@ -143,12 +143,13 @@ Current status:
   selected segment slice. Planned selected compaction takes a sorted-id merge
   path over the sorted manifest instead of probing each manifest entry through a
   linear selected-id scan, and segment-id validation returns that sortedness
-  result while skipping the quadratic duplicate scan for ascending plan output.
-  Segment garbage and temporary-file cleanup now track live canonical basenames
-  and delete through the opened postings directory, and manifest temp matching
-  compares entry names against the configured manifest basename in place,
-  avoiding per-file path allocation while scanning maintenance directories.
-  Lazy segment base-data batch reads also use
+  result while skipping the quadratic duplicate scan for ascending plan output;
+  small unsorted selected-compaction inputs sort a stack copy and take the same
+  merge path. Segment garbage and temporary-file cleanup now track live
+  canonical basenames and delete through the opened postings directory, and
+  manifest temp matching compares entry names against the configured manifest
+  basename in place, avoiding per-file path allocation while scanning
+  maintenance directories. Lazy segment base-data batch reads also use
   stack-backed newest-segment tracking for small unsorted manifests, so
   recovery/fallback snapshots do not allocate an extra segment-id array just to
   resolve winners.

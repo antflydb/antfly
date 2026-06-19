@@ -46,6 +46,7 @@ const base_data_batch_best_segment_stack_capacity: usize = 512;
 const base_data_batch_unresolved_stack_capacity: usize = 512;
 const base_data_batch_point_read_stack_capacity: usize = 512;
 const selected_compaction_segment_stack_capacity: usize = 64;
+const selected_compaction_segment_id_stack_capacity: usize = 64;
 const writer_value_offsets_stack_capacity: usize = 512;
 const stack_index_max_bytes: usize = 64 * 1024;
 const stack_base_value_range_max_bytes: usize = 64 * 1024;
@@ -1987,14 +1988,25 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
         if (!use_selected_stack) alloc.free(selected);
     }
 
-    if (segment_ids_strictly_ascending) {
+    var sorted_segment_ids_stack: [selected_compaction_segment_id_stack_capacity]u64 = undefined;
+    var selected_segment_ids: []const u64 = segment_ids;
+    var use_sorted_segment_ids = segment_ids_strictly_ascending;
+    if (!segment_ids_strictly_ascending and segment_ids.len <= sorted_segment_ids_stack.len) {
+        const sorted_segment_ids = sorted_segment_ids_stack[0..segment_ids.len];
+        @memcpy(sorted_segment_ids, segment_ids);
+        std.mem.sort(u64, sorted_segment_ids, {}, std.sort.asc(u64));
+        selected_segment_ids = sorted_segment_ids;
+        use_sorted_segment_ids = true;
+    }
+
+    if (use_sorted_segment_ids) {
         var segment_id_index: usize = 0;
         for (manifest.segments) |entry| {
-            while (segment_id_index < segment_ids.len and segment_ids[segment_id_index] < entry.meta.segment_id) {
+            while (segment_id_index < selected_segment_ids.len and selected_segment_ids[segment_id_index] < entry.meta.segment_id) {
                 segment_id_index += 1;
             }
-            if (segment_id_index >= segment_ids.len) break;
-            if (segment_ids[segment_id_index] != entry.meta.segment_id) continue;
+            if (segment_id_index >= selected_segment_ids.len) break;
+            if (selected_segment_ids[segment_id_index] != entry.meta.segment_id) continue;
             selected[selected_count] = try loadSelectedSegmentBlobAlloc(alloc, io, dir, entry, options.max_segment_bytes);
             selected_count += 1;
             segment_id_index += 1;
