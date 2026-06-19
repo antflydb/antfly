@@ -1071,9 +1071,9 @@ fn buildFlatCentroidDirectoryFromNodes(self: anytype, txn: anytype, root_node: u
     defer deinitFlatCentroidEntries(self.alloc, &entries);
     var pending = std.ArrayListUnmanaged(u64).empty;
     defer pending.deinit(self.alloc);
-    const pending_capacity: usize = @intCast(@min(node_count, @as(u64, std.math.maxInt(usize))));
+    const pending_capacity: usize = @max(1, @as(usize, @intCast(@min(node_count, @as(u64, std.math.maxInt(usize))))));
     try pending.ensureTotalCapacity(self.alloc, pending_capacity);
-    try pending.append(self.alloc, root_node);
+    pending.appendAssumeCapacity(root_node);
 
     var cursor: usize = 0;
     while (cursor < pending.items.len) : (cursor += 1) {
@@ -1084,7 +1084,11 @@ fn buildFlatCentroidDirectoryFromNodes(self: anytype, txn: anytype, root_node: u
         };
         defer node.deinit(self.alloc);
         if (!node.is_leaf) {
-            for (node.children) |child_id| try pending.append(self.alloc, child_id);
+            if (node.children.len <= pending.capacity - pending.items.len) {
+                pending.appendSliceAssumeCapacity(node.children);
+            } else {
+                try pending.appendSlice(self.alloc, node.children);
+            }
             continue;
         }
         if (node.members.len == 0 or node.centroid.len != dims) continue;

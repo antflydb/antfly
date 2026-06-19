@@ -952,8 +952,9 @@ implementations cleanly:
    block quantization now reads block centroids through a source view instead
    of copying them into a temporary dense centroid array.
    Packed-node fallback directory rebuilds also pre-size the pending node
-   traversal queue from the published node count, avoiding geometric growth
-   churn while scanning the HBC tree.
+   traversal queue from the published node count and append through the
+   assume-capacity path in the normal bounded case, avoiding geometric growth
+   churn and repeated append checks while scanning the HBC tree.
    Directory block construction also reuses one zero-centroid quantization
    vector across all blocks in a rebuild instead of allocating/clearing it per
    block.
