@@ -3,6 +3,7 @@ from enum import Enum
 
 class ChatToolName(str, Enum):
     ADD_FILTER = "add_filter"
+    AGGREGATE = "aggregate"
     ASK_CLARIFICATION = "ask_clarification"
     FETCH = "fetch"
     FULL_TEXT_SEARCH = "full_text_search"

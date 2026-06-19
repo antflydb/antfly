@@ -55,6 +55,12 @@ pub const AntflyClient = struct {
         self.inner.deinit();
     }
 
+    pub fn setBaseUrl(self: *AntflyClient, base_url: []const u8) !void {
+        const url = try normalizeBaseUrl(self.allocator, base_url);
+        self.allocator.free(self.inner.base_url);
+        self.inner.base_url = url;
+    }
+
     // --- Auth ---
 
     pub fn setBearer(self: *AntflyClient, token: []const u8) !void {

@@ -999,6 +999,10 @@ fn metalExecutorReuseProbeEnabled() bool {
     return envFlagEnabled("TERMITE_METAL_EXECUTOR_REUSE_PROBE");
 }
 
+fn gemmaPrefillPrewarmDisabled() bool {
+    return envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM");
+}
+
 fn printLiveWholeModelExecutorDetails(runtime_opt: ?*const graph_mod.model_runtime.ModelRuntime) void {
     if (runtime_opt) |runtime_model| {
         runtime_model.printDebugTiming();
@@ -1109,12 +1113,37 @@ fn tryRunLiveWholeModelExecutorGenerate(
     if (opts.print_timing and model.session.backend().usesGpuHostedSession()) {
         runtime_model.resetDebugTimingStats();
     }
-    const runtime_caps = runtime_model.capabilities();
     const created_runtime_at = std.Io.Timestamp.now(io, .awake);
 
     const prompt_ids = try allocator.alloc(i64, prompt_tokens);
     defer allocator.free(prompt_ids);
     for (prompt_token_ids, 0..) |token_id, idx| prompt_ids[idx] = token_id;
+    if (prompt_ids.len == 0) return error.EmptyPrompt;
+
+    var warmed_runtime_at = created_runtime_at;
+    var runtime_prewarm_ms: u64 = 0;
+    if (build_options.enable_metal and
+        gpt_config.family == .gemma and
+        model.session.backend().usesGpuHostedSession() and
+        !gemmaPrefillPrewarmDisabled())
+    {
+        const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
+        const prewarm_ok = runtime_model.prepare(allocator, .{
+            .kv_tokens_hint = prompt_ids.len,
+        }) catch |err| blk: {
+            std.log.warn("Gemma4 Metal runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
+            break :blk false;
+        };
+        warmed_runtime_at = std.Io.Timestamp.now(io, .awake);
+        runtime_prewarm_ms = durationMillis(prewarm_started_at, warmed_runtime_at);
+        if (!prewarm_ok) {
+            std.log.warn("Gemma4 Metal runtime prewarm declined for {s}", .{opts.model_dir});
+        }
+        if (opts.print_timing) {
+            runtime_model.resetDebugTimingStats();
+        }
+    }
+    const runtime_caps = runtime_model.capabilities();
 
     var all_token_ids = std.ArrayListUnmanaged(i64).empty;
     defer all_token_ids.deinit(allocator);
@@ -1139,8 +1168,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
     var output = blk: {
-        if (prompt_ids.len == 0) return error.EmptyPrompt;
-
         var processed: usize = 0;
         var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
         errdefer if (output_accum) |*owned| owned.deinit(allocator);
@@ -1247,12 +1274,13 @@ fn tryRunLiveWholeModelExecutorGenerate(
     }
     if (opts.print_timing) {
         print(
-            "timing_ms: load_model={d} prompt_prep={d} scheduler=0 backend_setup={d} decode_setup=0 generate={d} total={d}\n",
+            "timing_ms: load_model={d} prompt_prep={d} scheduler=0 backend_setup={d} runtime_prewarm={d} decode_setup=0 generate={d} total={d}\n",
             .{
                 durationMillis(started_at, loaded_model_at),
                 durationMillis(loaded_model_at, encoded_prompt_at),
                 durationMillis(encoded_prompt_at, created_runtime_at),
-                durationMillis(created_runtime_at, finished_generate_at),
+                runtime_prewarm_ms,
+                durationMillis(warmed_runtime_at, finished_generate_at),
                 durationMillis(started_at, finished_generate_at),
             },
         );

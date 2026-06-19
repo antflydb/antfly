@@ -33,6 +33,8 @@ const db_mod = @import("../storage/db/mod.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
+const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
+const ha_standby_mod = @import("../storage/ha/standby.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
@@ -721,6 +723,25 @@ pub const GroupVisibleRootGenerationSource = struct {
     /// not the storage engine's physical per-write generation.
     pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
         return self.visible_root_generation_for_group(self.ptr, group_id);
+    }
+};
+
+pub const HAReadGate = struct {
+    standby: *const ha_standby_mod.Standby,
+
+    pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
+        const decision = try ha_read_gate_mod.evaluateStandby(self.standby, .{
+            .consistency = switch (consistency) {
+                .stale => .stale_ok,
+                .leader_lease, .read_index => .primary,
+            },
+        });
+        switch (decision.action) {
+            .serve_standby => {},
+            .wait_for_apply => return error.HAReadWaitForApply,
+            .wait_for_metadata => return error.HAReadWaitForMetadata,
+            .route_to_primary => return error.HAReadRequiresPrimary,
+        }
     }
 };
 
@@ -2323,6 +2344,7 @@ pub const ProvisionedTableReadSource = struct {
     prepare_for_read: ?ReadPreparation = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     primary_lookup_db: ?PrimaryLookupDbSource = null,
+    ha_read_gate: ?HAReadGate = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -2377,6 +2399,18 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.group_visible_root_generation = generation_source;
         return self;
+    }
+
+    pub fn withHAReadGate(
+        self: *ProvisionedTableReadSource,
+        gate: ?HAReadGate,
+    ) *ProvisionedTableReadSource {
+        self.ha_read_gate = gate;
+        return self;
+    }
+
+    fn ensureHAReadAllowed(self: *ProvisionedTableReadSource, consistency: raft_mod.ReadConsistency) !void {
+        if (self.ha_read_gate) |gate| try gate.check(consistency);
     }
 
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
@@ -2445,6 +2479,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
@@ -2459,6 +2494,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
@@ -2472,6 +2508,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
@@ -2487,6 +2524,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, from_key, to_key);
         defer alloc.free(group_ids);
@@ -2519,6 +2557,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
@@ -2586,6 +2625,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
@@ -2612,6 +2652,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
@@ -2626,6 +2667,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
@@ -2639,6 +2681,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
     }
@@ -2653,6 +2696,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         return try preflightHostedLocal(
             self.cache,
             self.replica_root_dir,
@@ -2680,6 +2724,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
     }
@@ -2693,6 +2738,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const start_ns = platform_time.monotonicNs();
         const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
@@ -2719,6 +2765,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         return try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
     }
@@ -2754,6 +2801,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphExpandResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
         var initialized: usize = 0;
         errdefer {
@@ -2795,6 +2843,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
         return try executeProvisionedGraphHydrate(ptr, alloc, group_id, table_name, req, consistency);
     }
@@ -2808,6 +2857,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         return try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
     }
 
@@ -14069,6 +14119,69 @@ test "provisioned table read source routes lookup and scan across ranges" {
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqualStrings("alpha", rows[0].title);
     try std.testing.expectEqualStrings("zeta", rows[1].title);
+}
+
+test "provisioned standby read gate permits stale reads and routes non-stale reads to primary" {
+    const alloc = std.testing.allocator;
+    const root = ".zig-cache/tmp/table-reads-ha-read-gate";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), root);
+
+    const receive_path_raw = try std.fmt.allocPrint(alloc, "{s}/received.wal", .{root});
+    defer alloc.free(receive_path_raw);
+    const receive_path = try alloc.dupeZ(u8, receive_path_raw);
+    defer alloc.free(receive_path);
+    const progress_path_raw = try std.fmt.allocPrint(alloc, "{s}/progress.wal", .{root});
+    defer alloc.free(progress_path_raw);
+    const progress_path = try alloc.dupeZ(u8, progress_path_raw);
+    defer alloc.free(progress_path);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableReadSource.init("/tmp/unused-antfly-ha-read-gate", NoCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    _ = source.withHAReadGate(.{ .standby = &standby });
+
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index),
+    );
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        source.source().lookup(alloc, "docs", "doc:a", .{}, .leader_lease),
+    );
+    try std.testing.expectError(
+        error.UnexpectedCatalogCall,
+        source.source().lookup(alloc, "docs", "doc:a", .{}, .stale),
+    );
 }
 
 test "fanout planner uses io cap and request shape" {

@@ -14899,6 +14899,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .head_dim = head_dim,
                 .attention_kv_format = layer_attention_kv_format,
                 .attention_storage = if (attention.kv_storage != null) .paged else .dense,
+                .activation_dtype = .f16,
                 .intermediate_size = layer.intermediate_size,
                 .ple_hidden_size = request.ple_hidden_size,
             }) catch {};
@@ -16794,6 +16795,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn resetDebugTimingStatsOp(ctx: *anyopaque) void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         self.timing_stats = .{};
+        self.provider_impl.raw_quant_runtime_private_prepare_nanos = 0;
+        self.provider_impl.raw_quant_runtime_mapped_prepare_nanos = 0;
+        self.provider_impl.raw_quant_runtime_mapped_attempts = 0;
+        self.provider_impl.raw_quant_runtime_mapped_fallbacks = 0;
+        self.provider_impl.raw_quant_runtime_mapped_failures = 0;
         metal_tensor_mod.resetMemoryStats();
     }
 

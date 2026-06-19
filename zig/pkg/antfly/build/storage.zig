@@ -14,6 +14,8 @@
 
 const std = @import("std");
 
+const max_openapi_spec_bytes = 2 * 1024 * 1024;
+
 pub const LmdbBackend = enum {
     c,
     zig,
@@ -56,7 +58,19 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "swarm_runtime_focused_test", swarm_runtime_focused_test);
     options.addOption(bool, "bench_minimal_deps", false);
     options.addOption([]const u8, "antfly_version", antfly_version);
+    options.addOption([]const u8, "ard_openapi_ard_yaml", readBuildFileAlloc(b, "../specs/openapi/ard/api.yaml"));
+    options.addOption([]const u8, "ard_openapi_antfly_yaml", readBuildFileAlloc(b, "../openapi.yaml"));
+    options.addOption([]const u8, "ard_openapi_metadata_yaml", readBuildFileAlloc(b, "../specs/openapi/antfly/metadata.yaml"));
+    options.addOption([]const u8, "ard_openapi_extensions_yaml", readBuildFileAlloc(b, "../specs/openapi/extensions/api.yaml"));
+    options.addOption([]const u8, "ard_openapi_auth_yaml", readBuildFileAlloc(b, "../specs/openapi/auth/api.yaml"));
+    options.addOption([]const u8, "ard_openapi_inference_config_yaml", readBuildFileAlloc(b, "../specs/openapi/inference/config.yaml"));
     return options;
+}
+
+fn readBuildFileAlloc(b: *std.Build, path: []const u8) []const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(max_openapi_spec_bytes)) catch |err| {
+        std.debug.panic("failed to read build input {s}: {}", .{ path, err });
+    };
 }
 
 pub fn makeLmdbEngineModule(

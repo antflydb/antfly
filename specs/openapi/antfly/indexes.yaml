@@ -128,6 +128,11 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Serialized chunker configuration for chunk enrichments."
+        full_text_index:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: "When true on a chunk enrichment, route generated chunk text into the table's default full-text index."
         content_type:
           x-go-type-skip-optional-pointer: true
           type: string

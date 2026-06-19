@@ -453,6 +453,74 @@ test "late interaction maxsim is insensitive to padded tail" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), score, 1e-5);
 }
 
+test "reranking score extraction handles single-logit classifier output" {
+    const allocator = std.testing.allocator;
+    var pipeline: RerankingPipeline = undefined;
+    pipeline.allocator = allocator;
+
+    const shape = [_]i64{ 2, 1 };
+    const logits = [_]f32{ 0.0, 2.0 };
+    var output = try Tensor.initFloat32(allocator, "logits", &shape, &logits);
+    defer output.deinit();
+
+    const scores = try pipeline.extractScores(&output, 2);
+    defer allocator.free(scores);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), scores[0], 1e-6);
+    try std.testing.expectApproxEqAbs(sigmoid(2.0), scores[1], 1e-6);
+}
+
+test "reranking returns an empty score list for empty documents" {
+    const allocator = std.testing.allocator;
+    var pipeline: RerankingPipeline = undefined;
+    pipeline.allocator = allocator;
+    pipeline.config = .{};
+
+    const scores = try pipeline.rerank("what is cuda", &.{});
+    defer allocator.free(scores);
+    try std.testing.expectEqual(@as(usize, 0), scores.len);
+}
+
+test "reranking score extraction handles two-label classifier output" {
+    const allocator = std.testing.allocator;
+    var pipeline: RerankingPipeline = undefined;
+    pipeline.allocator = allocator;
+
+    const shape = [_]i64{ 2, 2 };
+    const logits = [_]f32{
+        3.0,  1.0,
+        -1.0, 2.0,
+    };
+    var output = try Tensor.initFloat32(allocator, "logits", &shape, &logits);
+    defer output.deinit();
+
+    const scores = try pipeline.extractScores(&output, 2);
+    defer allocator.free(scores);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.11920292), scores[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.95257413), scores[1], 1e-6);
+}
+
+test "reranking score extraction handles legacy cls-sequence output" {
+    const allocator = std.testing.allocator;
+    var pipeline: RerankingPipeline = undefined;
+    pipeline.allocator = allocator;
+
+    const shape = [_]i64{ 2, 3, 1 };
+    const logits = [_]f32{
+        1.0,  99.0, 99.0,
+        -2.0, 99.0, 99.0,
+    };
+    var output = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, &logits);
+    defer output.deinit();
+
+    const scores = try pipeline.extractScores(&output, 2);
+    defer allocator.free(scores);
+
+    try std.testing.expectApproxEqAbs(sigmoid(1.0), scores[0], 1e-6);
+    try std.testing.expectApproxEqAbs(sigmoid(-2.0), scores[1], 1e-6);
+}
+
 fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }

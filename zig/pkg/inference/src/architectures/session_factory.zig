@@ -64,7 +64,31 @@ const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
 
-const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {
+    pub const CudaCompute = void;
+    pub const DeviceBuffer = void;
+    pub const GraphCaptureFrame = void;
+    pub const GraphDeviceTensor = void;
+    pub const GraphFallbackReason = enum {
+        none,
+        unavailable,
+        capture_failed,
+        capture_needs_warmup,
+        unsupported_host_transfer,
+        upload_mismatch,
+        driver_error,
+    };
+    pub const GraphUploadSlot = void;
+    pub const HostBuffer = void;
+};
+const cuda_graph_mod = if (build_options.enable_cuda) @import("../ops/cuda/graph.zig") else struct {
+    pub const CapturedGraph = void;
+};
+const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
+    clipclap,
+    deberta_reranker,
+    gliner2,
+};
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const GpuHostedCompute = void;
 const gpu_hosted_mod = struct {
@@ -139,6 +163,19 @@ fn gpuHostedQuantExecutionMode(direct_quant_enabled: bool) GpuHostedQuantExecuti
         return .device_native;
     }
     return .device_native;
+}
+
+fn parseMetalGemmaKvDTypeOverride(value: []const u8) ?runtime.kv.pool.KvDType {
+    if (std.ascii.eqlIgnoreCase(value, "f16")) return .f16;
+    if (std.ascii.eqlIgnoreCase(value, "f32")) return .f32;
+    return null;
+}
+
+fn metalGemmaKvDTypeOverride() ?runtime.kv.pool.KvDType {
+    const value = platform.env.getenv("TERMITE_METAL_GEMMA_KV_DTYPE") orelse
+        platform.env.getenv("ANTFLY_INFERENCE_METAL_GEMMA_KV_DTYPE") orelse
+        return null;
+    return parseMetalGemmaKvDTypeOverride(value);
 }
 
 fn gpuHostedEagerDenseMaxBytes() u64 {
@@ -322,7 +359,7 @@ fn sessionTaskForModelType(model_type: manifest_mod.ModelType, override: ?TaskOv
         };
     }
     return switch (model_type) {
-        .classifier => .classifier,
+        .classifier, .reranker => .classifier,
         .recognizer => .recognizer,
         else => .generic,
     };
@@ -941,10 +978,11 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     defer native_session.close();
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
-    if (!cudaSupportsArch(native_impl.arch_config)) return error.UnsupportedCudaArchitecture;
+    const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
 
     var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
     errdefer cuda_compute.deinit();
+    try cuda_compute.requireProfile(cuda_profile);
     var it = native_impl.backend_data.native.resident_weights.iterator();
     while (it.next()) |entry| {
         const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
@@ -966,12 +1004,31 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 }
 
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
+    return cudaProfileForArch(arch_config) != null;
+}
+
+fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
     return switch (arch_config) {
-        .deberta, .gliner, .clip, .clap => true,
-        else => false,
+        .clip, .clap => .clipclap,
+        .deberta => .deberta_reranker,
+        .gliner => .gliner2,
+        else => null,
     };
 }
 
+test "cuda support gate admits only supported encoder architectures" {
+    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }));
+    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
+    try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }));
+    if (comptime build_options.enable_cuda) {
+        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
+    }
+}
 fn eagerLoadResidentsFromStore(
     allocator: std.mem.Allocator,
     resident_weights: anytype,
@@ -3417,8 +3474,10 @@ test "makeBertConfig carries num_labels from manifest" {
 
 test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.classifier, null));
+    try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.reranker, null));
     try std.testing.expectEqual(@as(SessionTask, .recognizer), sessionTaskForModelType(.recognizer, null));
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.embedder, null));
+    try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
 test "detectArchitecture recognizes generic deberta classifier configs" {
@@ -3929,8 +3988,96 @@ const PjrtData = struct {
         if (build_options.enable_pjrt) null else {},
 };
 
+const CudaDebertaGraphKey = struct {
+    batch: usize,
+    seq_len: usize,
+    num_labels: usize,
+
+    fn eql(a: CudaDebertaGraphKey, b: CudaDebertaGraphKey) bool {
+        return a.batch == b.batch and a.seq_len == b.seq_len and a.num_labels == b.num_labels;
+    }
+};
+
+const CudaDebertaGraphBucket = if (build_options.enable_cuda) struct {
+    key: CudaDebertaGraphKey,
+    graph: cuda_graph_mod.CapturedGraph,
+    uploads: std.ArrayListUnmanaged(cuda_compute_mod.GraphUploadSlot) = .empty,
+    keepalive: std.ArrayListUnmanaged(cuda_compute_mod.DeviceBuffer) = .empty,
+    output: cuda_compute_mod.GraphDeviceTensor,
+    output_host: cuda_compute_mod.HostBuffer,
+    attention_mask_f32: []f32,
+    last_used: u64 = 0,
+
+    fn deinit(self: *CudaDebertaGraphBucket, allocator: std.mem.Allocator, compute: *cuda_compute_mod.CudaCompute) void {
+        self.graph.deinit(&compute.ctx);
+        for (self.uploads.items) |*slot| slot.deinit(&compute.ctx);
+        self.uploads.deinit(allocator);
+        for (self.keepalive.items) |*buffer| buffer.free(&compute.ctx);
+        self.keepalive.deinit(allocator);
+        self.output_host.free(&compute.ctx);
+        allocator.free(self.attention_mask_f32);
+        self.* = undefined;
+    }
+
+    fn outputF32(self: *CudaDebertaGraphBucket) []f32 {
+        const bytes = self.output_host.bytes();
+        const aligned: []align(@alignOf(f32)) u8 = @alignCast(bytes);
+        return std.mem.bytesAsSlice(f32, aligned);
+    }
+
+    fn ownedBytes(self: *const CudaDebertaGraphBucket) usize {
+        var total = self.output_host.len + self.attention_mask_f32.len * @sizeOf(f32);
+        for (self.uploads.items) |slot| total += slot.ownedBytes();
+        for (self.keepalive.items) |buffer| total += buffer.len;
+        return total;
+    }
+
+    fn dynamicCopyBytes(self: *const CudaDebertaGraphBucket) usize {
+        var total = self.output_host.len;
+        for (self.uploads.items) |slot| {
+            if (slot.isDynamic()) total += slot.bytes;
+        }
+        return total;
+    }
+} else struct {};
+
+const CudaDebertaGraphCache = if (build_options.enable_cuda) struct {
+    buckets: std.ArrayListUnmanaged(CudaDebertaGraphBucket) = .empty,
+    tick: u64 = 0,
+
+    fn deinit(self: *CudaDebertaGraphCache, allocator: std.mem.Allocator, compute: *cuda_compute_mod.CudaCompute) void {
+        for (self.buckets.items) |*bucket| bucket.deinit(allocator, compute);
+        self.buckets.deinit(allocator);
+    }
+
+    fn find(self: *CudaDebertaGraphCache, key: CudaDebertaGraphKey) ?*CudaDebertaGraphBucket {
+        for (self.buckets.items) |*bucket| {
+            if (CudaDebertaGraphKey.eql(bucket.key, key)) return bucket;
+        }
+        return null;
+    }
+
+    fn nextTick(self: *CudaDebertaGraphCache) u64 {
+        self.tick +%= 1;
+        return self.tick;
+    }
+} else struct {};
+
+pub const CudaDebertaGraphRuntimeStats = struct {
+    captures: u64 = 0,
+    replays: u64 = 0,
+    fallbacks: u64 = 0,
+    capture_failures: u64 = 0,
+    buckets: usize = 0,
+    graph_owned_bytes: usize = 0,
+    dynamic_copy_bytes: u64 = 0,
+    last_fallback_reason: []const u8 = "none",
+};
+
 const CudaData = struct {
     compute: if (build_options.enable_cuda) cuda_compute_mod.CudaCompute else void,
+    deberta_graphs: if (build_options.enable_cuda) CudaDebertaGraphCache else void =
+        if (build_options.enable_cuda) .{} else {},
 };
 
 const BackendData = union {
@@ -4122,17 +4269,34 @@ pub fn getWeightExportSource(session: Session) ?export_source_mod.Source {
     };
 }
 
-pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
+pub fn recommendedKvDTypeForGptConfig(config: gpt_mod.Config, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
         .cuda => .f16,
-        .metal => blk: {
-            if (getGptConfig(session)) |cfg| {
-                if (cfg.family == .gemma) break :blk .f32;
-            }
-            break :blk .f16;
-        },
+        .metal => if (config.family == .gemma) metalGemmaKvDTypeOverride() orelse .f16 else .f16,
     };
+}
+
+pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
+    if (getGptConfig(session)) |cfg| return recommendedKvDTypeForGptConfig(cfg, backend_kind);
+    return switch (backend_kind) {
+        .native => .f32,
+        .cuda, .metal => .f16,
+    };
+}
+
+test "parseMetalGemmaKvDTypeOverride only accepts staged Gemma Metal dtypes" {
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, parseMetalGemmaKvDTypeOverride("f16").?);
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, parseMetalGemmaKvDTypeOverride("F32").?);
+    try std.testing.expect(parseMetalGemmaKvDTypeOverride("int8") == null);
+}
+
+test "recommendedKvDTypeForGptConfig keeps backend defaults without a session" {
+    const gemma = gpt_mod.Config{ .family = .gemma };
+    const llama = gpt_mod.Config{ .family = .llama };
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .native));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(gemma, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(llama, .metal));
 }
 
 pub fn getClipConfig(session: Session) ?clip_mod.Config {
@@ -4214,6 +4378,29 @@ pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {
     };
 }
 
+pub fn getCudaDebertaGraphRuntimeStats(session: Session) ?CudaDebertaGraphRuntimeStats {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda) return null;
+
+    const compute_stats = self.backend_data.cuda.compute.graphStats();
+    var graph_owned_bytes: usize = 0;
+    for (self.backend_data.cuda.deberta_graphs.buckets.items) |*bucket| {
+        graph_owned_bytes += bucket.ownedBytes();
+    }
+    return .{
+        .captures = compute_stats.captures,
+        .replays = compute_stats.replays,
+        .fallbacks = compute_stats.fallbacks,
+        .capture_failures = compute_stats.capture_failures,
+        .buckets = self.backend_data.cuda.deberta_graphs.buckets.items.len,
+        .graph_owned_bytes = graph_owned_bytes,
+        .dynamic_copy_bytes = compute_stats.dynamic_copy_bytes,
+        .last_fallback_reason = @tagName(compute_stats.last_fallback_reason),
+    };
+}
+
 pub fn widenBudgetLimitsForSession(
     session: Session,
     limits: runtime.tier.memory.Limits,
@@ -4269,6 +4456,251 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
         .onnx => {},
         .wasm => {},
     }
+}
+
+fn cudaDebertaGraphsEnabled() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    return platform.env.getenvBool("ANTFLY_CUDA_ENABLE_DEBERTA_GRAPHS");
+}
+
+fn cudaDebertaGraphsRequired() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    return platform.env.getenvBool("ANTFLY_CUDA_REQUIRE_DEBERTA_GRAPHS");
+}
+
+fn cudaDebertaGraphMaxBuckets() usize {
+    return 4;
+}
+
+fn fillDebertaAttentionMaskF32(out: []f32, attention_mask: []const i64, batch: usize, seq_len: usize, hidden_size: usize) !void {
+    const token_count = try std.math.mul(usize, batch, seq_len);
+    if (attention_mask.len < token_count) return error.InvalidInputShape;
+    const expected = try std.math.mul(usize, token_count, hidden_size);
+    if (out.len != expected) return error.InvalidInputShape;
+    for (0..token_count) |i| {
+        const value: f32 = @floatFromInt(attention_mask[i]);
+        @memset(out[i * hidden_size ..][0..hidden_size], value);
+    }
+}
+
+fn cudaDebertaGraphEvictIfNeeded(data: *CudaData, allocator: std.mem.Allocator) void {
+    if (comptime !build_options.enable_cuda) return;
+    const max_buckets = cudaDebertaGraphMaxBuckets();
+    if (data.deberta_graphs.buckets.items.len < max_buckets) return;
+
+    var oldest_index: usize = 0;
+    var oldest_tick: u64 = std.math.maxInt(u64);
+    for (data.deberta_graphs.buckets.items, 0..) |bucket, i| {
+        if (bucket.last_used < oldest_tick) {
+            oldest_tick = bucket.last_used;
+            oldest_index = i;
+        }
+    }
+
+    var evicted = data.deberta_graphs.buckets.swapRemove(oldest_index);
+    evicted.deinit(allocator, &data.compute);
+}
+
+fn runCudaDebertaClassifierCt(
+    compute: *cuda_compute_mod.CudaCompute,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+) !ops.CT {
+    var cb = compute.computeBackend();
+    const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+    errdefer cb.free(hidden);
+    const logits = try runDebertaSequenceClassifierLogitsCt(&cb, allocator, cfg, hidden, batch, seq_len);
+    cb.free(hidden);
+    return logits;
+}
+
+fn buildCudaDebertaGraphBucket(
+    data: *CudaData,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    key: CudaDebertaGraphKey,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+) !CudaDebertaGraphBucket {
+    if (comptime !build_options.enable_cuda) unreachable;
+    var compute = &data.compute;
+    const hidden_size: usize = @intCast(cfg.hidden_size);
+    const token_count = try std.math.mul(usize, key.batch, key.seq_len);
+    const mask_f32_len = try std.math.mul(usize, token_count, hidden_size);
+    const output_count = try std.math.mul(usize, key.batch, key.num_labels);
+    var output_host = try cuda_compute_mod.HostBuffer.alloc(&compute.ctx, output_count * @sizeOf(f32));
+    var output_host_owned = true;
+    errdefer if (output_host_owned) output_host.free(&compute.ctx);
+    const attention_mask_f32 = try allocator.alloc(f32, mask_f32_len);
+    var attention_mask_f32_owned = true;
+    errdefer if (attention_mask_f32_owned) allocator.free(attention_mask_f32);
+
+    var bucket = CudaDebertaGraphBucket{
+        .key = key,
+        .graph = .{},
+        .output = .{ .buffer = .{}, .elem_count = 0 },
+        .output_host = output_host,
+        .attention_mask_f32 = attention_mask_f32,
+    };
+    output_host_owned = false;
+    attention_mask_f32_owned = false;
+    errdefer bucket.deinit(allocator, compute);
+
+    try fillDebertaAttentionMaskF32(bucket.attention_mask_f32, attention_mask, key.batch, key.seq_len, hidden_size);
+
+    var record_frame = cuda_compute_mod.GraphCaptureFrame{
+        .mode = .record,
+        .slots = &bucket.uploads,
+        .input_ids = input_ids,
+        .attention_mask = attention_mask,
+        .attention_mask_f32_len = bucket.attention_mask_f32.len,
+    };
+    compute.beginGraphFrame(&record_frame);
+    var record_frame_open = true;
+    errdefer if (record_frame_open) compute.endGraphFrame();
+    {
+        const logits = try runCudaDebertaClassifierCt(compute, allocator, cfg, input_ids, attention_mask, key.batch, key.seq_len);
+        var cb = compute.computeBackend();
+        cb.free(logits);
+    }
+    compute.endGraphFrame();
+    record_frame_open = false;
+    try compute.ctx.synchronize();
+
+    try compute.refreshGraphDynamicUploads(bucket.uploads.items, input_ids, attention_mask, bucket.attention_mask_f32);
+    try compute.ctx.synchronize();
+
+    var used_buffers: std.ArrayListUnmanaged(cuda_compute_mod.DeviceBuffer) = .empty;
+    defer used_buffers.deinit(allocator);
+
+    try compute.beginCudaGraphCapture();
+    var capture_open = true;
+    errdefer if (capture_open) {
+        compute.endGraphFrame();
+        if (compute.endCudaGraphCapture()) |captured| {
+            var graph = captured;
+            graph.deinit(&compute.ctx);
+        } else |_| {}
+    };
+
+    var capture_frame = cuda_compute_mod.GraphCaptureFrame{
+        .mode = .capture,
+        .slots = &bucket.uploads,
+        .input_ids = input_ids,
+        .attention_mask = attention_mask,
+        .attention_mask_f32_len = bucket.attention_mask_f32.len,
+        .used_buffers = &used_buffers,
+    };
+    compute.beginGraphFrame(&capture_frame);
+    var capture_frame_open = true;
+    errdefer if (capture_frame_open) compute.endGraphFrame();
+    {
+        const logits = try runCudaDebertaClassifierCt(compute, allocator, cfg, input_ids, attention_mask, key.batch, key.seq_len);
+        bucket.output = try compute.graphDeviceTensor(logits);
+        try compute.copyGraphDeviceTensorToHostBufferAsync(bucket.output, bucket.output_host);
+        var cb = compute.computeBackend();
+        cb.free(logits);
+    }
+    compute.endGraphFrame();
+    capture_frame_open = false;
+    bucket.graph = try compute.endCudaGraphCapture();
+    capture_open = false;
+
+    try compute.retainGraphTempBuffers(used_buffers.items, &bucket.keepalive);
+    compute.noteGraphCapture();
+    return bucket;
+}
+
+fn getCudaDebertaGraphBucket(
+    data: *CudaData,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    key: CudaDebertaGraphKey,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+) !*CudaDebertaGraphBucket {
+    if (comptime !build_options.enable_cuda) unreachable;
+    if (data.deberta_graphs.find(key)) |bucket| return bucket;
+    cudaDebertaGraphEvictIfNeeded(data, allocator);
+    var bucket = try buildCudaDebertaGraphBucket(data, allocator, cfg, key, input_ids, attention_mask);
+    errdefer bucket.deinit(allocator, &data.compute);
+    try data.deberta_graphs.buckets.append(allocator, bucket);
+    return &data.deberta_graphs.buckets.items[data.deberta_graphs.buckets.items.len - 1];
+}
+
+fn cudaGraphFallbackReasonFromError(err: anyerror) cuda_compute_mod.GraphFallbackReason {
+    return switch (err) {
+        error.CudaGraphUnavailable => .unavailable,
+        error.CudaGraphCaptureFailed => .capture_failed,
+        error.CudaGraphCaptureNeedsWarmup => .capture_needs_warmup,
+        error.CudaGraphUnsupportedHostTransfer => .unsupported_host_transfer,
+        error.CudaGraphUploadMismatch => .upload_mismatch,
+        error.CudaDriverError => .driver_error,
+        else => .none,
+    };
+}
+
+fn tryRunCudaDebertaClassifierGraph(
+    self: *ArchSession,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+) !?[]Tensor {
+    if (comptime !build_options.enable_cuda) return null;
+    if (self.backend_type != .cuda) return null;
+    const require_graph = cudaDebertaGraphsRequired();
+    if (!cudaDebertaGraphsEnabled() and !require_graph) return null;
+    if (batch == 0 or seq_len == 0 or cfg.num_labels == 0) return null;
+
+    var data = &self.backend_data.cuda;
+    var compute = &data.compute;
+    if (!compute.cudaGraphAvailable()) {
+        compute.noteGraphFallback(.unavailable);
+        if (require_graph) return error.CudaGraphUnavailable;
+        return null;
+    }
+
+    const key = CudaDebertaGraphKey{
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_labels = @intCast(cfg.num_labels),
+    };
+    const bucket = getCudaDebertaGraphBucket(data, allocator, cfg, key, input_ids, attention_mask) catch |err| {
+        compute.noteGraphCaptureFailure();
+        compute.noteGraphFallback(cudaGraphFallbackReasonFromError(err));
+        switch (err) {
+            error.CudaGraphUnavailable,
+            error.CudaGraphCaptureFailed,
+            error.CudaGraphCaptureNeedsWarmup,
+            error.CudaGraphUnsupportedHostTransfer,
+            error.CudaGraphUploadMismatch,
+            error.CudaDriverError,
+            => if (require_graph) return err else return null,
+            else => return err,
+        }
+    };
+
+    try fillDebertaAttentionMaskF32(bucket.attention_mask_f32, attention_mask, batch, seq_len, @intCast(cfg.hidden_size));
+    try compute.refreshGraphDynamicUploads(bucket.uploads.items, input_ids, attention_mask, bucket.attention_mask_f32);
+    try compute.launchCudaGraph(&bucket.graph);
+    try compute.ctx.synchronize();
+    compute.noteGraphReplay(bucket.dynamicCopyBytes());
+    bucket.last_used = data.deberta_graphs.nextTick();
+
+    const logits_shape = [_]i64{ @intCast(batch), @intCast(cfg.num_labels) };
+    var output_tensor = try Tensor.initFloat32(allocator, "logits", &logits_shape, bucket.outputF32());
+    errdefer output_tensor.deinit();
+
+    const result = try allocator.alloc(Tensor, 1);
+    result[0] = output_tensor;
+    return result;
 }
 
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
@@ -4405,11 +4837,16 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
             const attention_mask = inputs[1].asInt64();
-            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
-            defer allocator.free(hidden);
 
             if (self.task == .classifier) {
-                const logits = try runDebertaSequenceClassifier(&cb, allocator, cfg, hidden, batch, seq_len);
+                if (try tryRunCudaDebertaClassifierGraph(self, allocator, cfg, input_ids, attention_mask, batch, seq_len)) |graph_result| {
+                    return graph_result;
+                }
+
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+                defer cb.free(hidden_ct);
+
+                const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
                 defer allocator.free(logits);
 
                 const logits_shape = [_]i64{ @intCast(batch), @intCast(cfg.num_labels) };
@@ -4420,6 +4857,10 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 result[0] = output_tensor;
                 return result;
             }
+
+            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            defer allocator.free(hidden);
+
             if (self.task == .recognizer) {
                 const logits = try runTokenClassifier(&cb, allocator, hidden, batch, seq_len, cfg.hidden_size, cfg.num_labels);
                 defer allocator.free(logits);
@@ -4938,6 +5379,107 @@ fn runDebertaSequenceClassifier(
     return runLinearHead(allocator, cb, pooled, batch, H, cfg.num_labels, "classifier.weight", "classifier.bias");
 }
 
+fn runDebertaSequenceClassifierCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    hidden: ops.CT,
+    batch: usize,
+    seq_len: usize,
+) ![]f32 {
+    const logits = try runDebertaSequenceClassifierLogitsCt(cb, allocator, cfg, hidden, batch, seq_len);
+    defer cb.free(logits);
+    return try cb.toFloat32(logits, allocator);
+}
+
+fn runDebertaSequenceClassifierLogitsCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    hidden: ops.CT,
+    batch: usize,
+    seq_len: usize,
+) !ops.CT {
+    const H: usize = @intCast(cfg.hidden_size);
+    const cls_embeddings = try extractClsEmbeddingsCt(cb, allocator, hidden, batch, seq_len, H);
+    defer cb.free(cls_embeddings);
+
+    const pooled = try maybeApplyPoolerCt(cb, allocator, cls_embeddings, batch, H, "pooler.dense.weight", "pooler.dense.bias");
+    defer cb.free(pooled);
+
+    return try runLinearHeadCt(cb, pooled, batch, H, cfg.num_labels, "classifier.weight", "classifier.bias");
+}
+
+fn extractClsEmbeddingsCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    hidden: ops.CT,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+) !ops.CT {
+    const row_ids = try allocator.alloc(u32, batch);
+    defer allocator.free(row_ids);
+    for (0..batch) |b| row_ids[b] = @intCast(b * seq_len);
+
+    if (try cb.takeRows(hidden, row_ids, batch, hidden_size)) |cls| {
+        return cls;
+    }
+
+    const hidden_f32 = try cb.toFloat32(hidden, allocator);
+    defer allocator.free(hidden_f32);
+    const cls_f32 = try extractClsEmbeddings(allocator, hidden_f32, batch, seq_len, hidden_size);
+    defer allocator.free(cls_f32);
+    const shape = [_]i32{ @intCast(batch), @intCast(hidden_size) };
+    return try cb.fromFloat32Shape(cls_f32, &shape);
+}
+
+fn maybeApplyPoolerCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cls_embeddings: ops.CT,
+    batch: usize,
+    hidden_size: usize,
+    weight_name: []const u8,
+    bias_name: []const u8,
+) !ops.CT {
+    const pool_w = cb.getWeight(weight_name) catch |err| switch (err) {
+        error.WeightNotFound => {
+            const shape = [_]i32{ @intCast(batch), @intCast(hidden_size) };
+            if (try cb.cloneTensorShape(cls_embeddings, &shape)) |clone| return clone;
+            const cls_f32 = try cb.toFloat32(cls_embeddings, allocator);
+            defer allocator.free(cls_f32);
+            return try cb.fromFloat32Shape(cls_f32, &shape);
+        },
+        else => return err,
+    };
+    defer cb.free(pool_w);
+    const pool_b = try cb.getWeight(bias_name);
+    defer cb.free(pool_b);
+
+    const pooled_ct = try cb.linear(cls_embeddings, pool_w, pool_b, batch, hidden_size, hidden_size);
+    defer cb.free(pooled_ct);
+
+    return try cb.tanh_act(pooled_ct);
+}
+
+fn runLinearHeadCt(
+    cb: *const ops.ComputeBackend,
+    input: ops.CT,
+    batch: usize,
+    input_dim: usize,
+    output_dim_u32: u32,
+    weight_name: []const u8,
+    bias_name: []const u8,
+) !ops.CT {
+    const output_dim: usize = @intCast(output_dim_u32);
+    const weight = try cb.getWeight(weight_name);
+    defer cb.free(weight);
+    const bias = try cb.getWeight(bias_name);
+    defer cb.free(bias);
+    return try cb.linear(input, weight, bias, batch, input_dim, output_dim);
+}
+
 fn runTokenClassifier(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -5237,6 +5779,7 @@ fn archClose(ptr: *anyopaque) void {
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {
+                self.backend_data.cuda.deberta_graphs.deinit(self.allocator, &self.backend_data.cuda.compute);
                 self.backend_data.cuda.compute.deinit();
             }
         },

@@ -17,6 +17,11 @@ limitations under the License.
 package cli
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -65,5 +70,68 @@ func TestResolveTokenPrefersFlag(t *testing.T) {
 
 	if got := resolveToken(cmd); got != "flag-token" {
 		t.Fatalf("resolveToken = %q", got)
+	}
+}
+
+func TestBackupListJSONWritesStdout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/db/v1/backups" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("location"); got != "s3://bucket/backups" {
+			t.Fatalf("location query = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"backups":[{"backup_id":"daily-20260618","timestamp":"2026-06-18T18:00:00Z","tables":["_backup_verify"],"antfly_version":"v0.2.0"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClient(server.URL, "", server.Client())
+	if err != nil {
+		t.Fatalf("NewAntflyClient: %v", err)
+	}
+	oldClient := antflyClient
+	antflyClient = client
+	defer func() { antflyClient = oldClient }()
+
+	cmd := newBackupCmd()
+	cmd.PreRunE = nil
+	cmd.SetArgs([]string{"--list", "--location", "s3://bucket/backups", "-o", "json"})
+
+	oldStdout := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = writePipe
+	defer func() { os.Stdout = oldStdout }()
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("backup --list -o json: %v", err)
+	}
+	if err := writePipe.Close(); err != nil {
+		t.Fatalf("close stdout pipe: %v", err)
+	}
+
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(readPipe); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if !strings.Contains(out.String(), `"backup_id": "daily-20260618"`) {
+		t.Fatalf("stdout did not contain backup JSON: %s", out.String())
+	}
+}
+
+func TestBackupListRejectsJSONL(t *testing.T) {
+	cmd := newBackupCmd()
+	cmd.PreRunE = nil
+	cmd.SetArgs([]string{"--list", "--location", "s3://bucket/backups", "-o", "jsonl"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("backup --list -o jsonl succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "supports output formats table and json") {
+		t.Fatalf("backup --list -o jsonl error = %q", err)
 	}
 }

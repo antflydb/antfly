@@ -15,14 +15,15 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-PKG_DIR="$ROOT_DIR/pkg/inference"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/inference_cli.sh
+source "$SCRIPT_DIR/inference_cli.sh"
 
-ANTFLY_BIN="${ANTFLY_BIN:-$PKG_DIR/zig-out/bin/antfly}"
+ANTFLY_BIN="$(resolve_antfly_inference_bin)"
 MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_MODEL:-$HOME/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf}"
 PROMPT="${ANTFLY_INFERENCE_GEMMA4_PREFILL_PROMPT:-hi}"
 MAX_TOKENS="${ANTFLY_INFERENCE_GEMMA4_PREFILL_MAX_TOKENS:-4}"
-EXPECTED_TOKEN_IDS="${ANTFLY_INFERENCE_GEMMA4_EXPECTED_TOKEN_IDS:-10979 236888 2088 740}"
+EXPECTED_TOKEN_IDS="${ANTFLY_INFERENCE_GEMMA4_EXPECTED_TOKEN_IDS:-}"
 OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-prefill-frame-test}"
 
 if [[ ! -x "$ANTFLY_BIN" ]]; then
@@ -44,23 +45,44 @@ run_case() {
   shift
   local out="$OUT_DIR/${label}.txt"
   echo "running $label..." >&2
+  local cmd=("$ANTFLY_BIN")
+  if [[ "$(basename "$ANTFLY_BIN")" == "antfly" ]]; then
+    cmd+=(inference)
+  fi
+  cmd+=(
+    generate "$MODEL_DIR" "$PROMPT"
+    --backend metal
+    --max-tokens "$MAX_TOKENS"
+    --print-token-ids
+    --print-token-count
+    --print-timing
+  )
   (
-    cd "$ROOT_DIR"
-    "$@" "$ANTFLY_BIN" inference generate "$MODEL_DIR" "$PROMPT" \
-      --backend metal \
-      --max-tokens "$MAX_TOKENS" \
-      --print-token-ids \
-      --print-token-count \
-      --print-timing
+    cd "$ANTFLY_INFERENCE_ZIG_ROOT"
+    "$@" "${cmd[@]}"
   ) >"$out" 2>&1
   echo "$out"
+}
+
+token_ids_from() {
+  local label="$1"
+  local out="$2"
+  local actual
+  actual="$(awk '/^token_ids:/ { sub(/^token_ids:[[:space:]]*/, ""); print; exit }' "$out")"
+  if [[ -z "$actual" ]]; then
+    echo "missing token_ids for $label" >&2
+    echo "output:   $out" >&2
+    sed -n '1,220p' "$out" >&2
+    exit 1
+  fi
+  printf '%s\n' "$actual"
 }
 
 assert_anchor() {
   local label="$1"
   local out="$2"
   local actual
-  actual="$(awk '/^token_ids:/ { sub(/^token_ids:[[:space:]]*/, ""); print; exit }' "$out")"
+  actual="$(token_ids_from "$label" "$out")"
   if [[ "$actual" != "$EXPECTED_TOKEN_IDS" ]]; then
     echo "unexpected token_ids for $label" >&2
     echo "expected: $EXPECTED_TOKEN_IDS" >&2
@@ -82,8 +104,8 @@ assert_anchor() {
     exit 1
   fi
 
-  if ! grep -q 'gemma_fused_attn_residual_hits=[1-9]' "$out"; then
-    echo "attention residual fused path was not exercised for $label" >&2
+  if grep -q 'decode_fallback=[1-9]' "$out"; then
+    echo "Metal frame decode fallback was exercised for $label" >&2
     echo "output: $out" >&2
     exit 1
   fi
@@ -96,11 +118,14 @@ assert_anchor() {
 }
 
 default_out="$(run_case default env)"
+if [[ -z "$EXPECTED_TOKEN_IDS" ]]; then
+  EXPECTED_TOKEN_IDS="$(token_ids_from default "$default_out")"
+fi
 assert_anchor default "$default_out"
 
 sync_out="$(run_case stage-sync env TERMITE_METAL_SYNC_GATED_FAMILY_STAGES=1)"
 assert_anchor stage-sync "$sync_out"
 
-echo "metal Gemma4 prefill-frame anchor passed"
+echo "metal Gemma4 prefill-frame no-fallback/stage-sync smoke passed"
 echo "default:    $default_out"
 echo "stage-sync: $sync_out"

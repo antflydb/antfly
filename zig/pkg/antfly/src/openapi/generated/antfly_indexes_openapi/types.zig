@@ -606,6 +606,8 @@ pub const EnrichmentConfig = struct {
     chunk_overlap: ?i64 = null,
     /// Serialized chunker configuration for chunk enrichments.
     chunker_json: ?[]const u8 = null,
+    /// When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
+    full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
     /// Serialized asset producer configuration.

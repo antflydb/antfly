@@ -1,6 +1,7 @@
 FROM ubuntu:24.04
 
 ARG ZIG_VERSION=0.16.0
+ARG WASMTIME_VERSION=v45.0.2
 ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -8,6 +9,9 @@ ENV PATH="/opt/zig:${PATH}"
 ENV UV_CACHE_DIR=/tmp/antfly-ci-uv-cache
 ENV HF_HOME=/tmp/antfly-ci-hf
 ENV TERMITE_HOME=/tmp/antfly-ci-termite
+ENV ANTFLY_WASMTIME_LIB=/opt/wasmtime/lib/libwasmtime.so
+ENV LD_LIBRARY_PATH=/opt/wasmtime/lib
+ENV ANTFLY_EXTENSION_PACKAGE_STORE=/tmp/antflydb/extensions
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -31,6 +35,18 @@ RUN case "${TARGETARCH}" in \
     tar -xJf /tmp/zig.tar.xz -C /opt && \
     mv "/opt/zig-${zig_arch}-linux-${ZIG_VERSION}" /opt/zig && \
     rm /tmp/zig.tar.xz
+
+RUN case "${TARGETARCH}" in \
+      amd64) wasmtime_arch="x86_64" ;; \
+      arm64) wasmtime_arch="aarch64" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    archive="wasmtime-${WASMTIME_VERSION}-${wasmtime_arch}-linux-c-api.tar.xz" && \
+    curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${archive}" -o "/tmp/${archive}" && \
+    mkdir -p /opt/wasmtime && \
+    tar -xJf "/tmp/${archive}" -C /opt/wasmtime --strip-components=1 && \
+    rm "/tmp/${archive}" && \
+    test -f /opt/wasmtime/lib/libwasmtime.so
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 

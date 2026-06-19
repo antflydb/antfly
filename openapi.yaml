@@ -3846,6 +3846,22 @@ paths:
           schema:
             type: string
           example: title,author,metadata.tags
+        - name: consistency
+          in: query
+          required: false
+          description: >
+            Read consistency for the lookup. The default `read_index` routes to
+
+            the primary for linearizable reads. `stale` allows a hot standby to
+
+            serve the lookup at its safe-read LSN.
+          schema:
+            type: string
+            enum:
+              - read_index
+              - leader_lease
+              - stale
+            default: read_index
       responses:
         '200':
           description: Record found
@@ -3977,6 +3993,92 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DocumentArtifactTableReprocessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Stable generated artifact name.
+        schema:
+          type: string
+    put:
+      summary: Register or replace an artifact enrichment
+      description: >
+        Registers a table-level generated artifact definition. Reusing the same
+
+        artifact name replaces the existing mapping. Chunk enrichments may set
+
+        `full_text_index: true` to map generated chunk text into the table's
+
+        default full-text index.
+      tags:
+        - index_management
+      operationId: putArtifactEnrichment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrichmentConfig'
+      responses:
+        '201':
+          description: Artifact enrichment registered
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Delete an artifact enrichment
+      description: >
+        Removes the table-level generated artifact definition. Local table
+
+        reconciliation drops no-longer-desired enrichment registrations when it
+
+        is safe to do so.
+      tags:
+        - index_management
+      operationId: deleteArtifactEnrichment
+      responses:
+        '201':
+          description: Artifact enrichment deleted
+          content:
+            application/json:
+              schema:
+                type: object
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -8449,6 +8551,11 @@ components:
           properties:
             storage_status:
               $ref: '#/components/schemas/StorageStatus'
+            artifact_enrichments:
+              type: array
+              description: Table-level generated artifact enrichments registered outside a specific index.
+              items:
+                $ref: '#/components/schemas/EnrichmentConfig'
     TransformOpType:
       type: string
       enum:
@@ -14014,6 +14121,12 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Serialized chunker configuration for chunk enrichments.
+        full_text_index:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: When true on a chunk enrichment, route generated chunk text into the table's default
+            full-text index.
         content_type:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -15000,6 +15113,8 @@ components:
         - tree_search: Execute tree search with beam search navigation
 
         - graph_search: Execute graph traversal search
+
+        - aggregate: Execute aggregations against an index
       enum:
         - add_filter
         - ask_clarification
@@ -15010,6 +15125,7 @@ components:
         - full_text_search
         - tree_search
         - graph_search
+        - aggregate
     WebSearchProvider:
       type: string
       enum:
@@ -18727,6 +18843,8 @@ components:
         - enrichment
         - resolver
         - mcp_tool
+        - skill
+        - agent
         - query_function
         - api_endpoint
         - a2a_agent

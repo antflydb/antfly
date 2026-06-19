@@ -3112,15 +3112,68 @@ pub const IndexManager = struct {
         defer internal.deinit(self.alloc);
 
         try validateEnrichmentConfig(self, internal);
-        if (self.getEnrichment(internal.kind, internal.name) != null) return error.EnrichmentAlreadyExists;
+        if (self.getEnrichmentByName(internal.name) != null) return error.EnrichmentAlreadyExists;
 
         const enrichment_checkpoint = self.enrichments.items.len;
         errdefer self.truncateEnrichments(enrichment_checkpoint);
 
         try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal));
+        try self.validateEnrichmentCatalogGraph();
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         try self.persistEnrichmentCatalog(store);
         self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
+    }
+
+    pub const EnrichmentUpsertResult = enum {
+        added,
+        updated,
+        unchanged,
+    };
+
+    pub fn upsertEnrichment(self: *IndexManager, store: anytype, cfg: types.EnrichmentConfig) !EnrichmentUpsertResult {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var internal = try enrichmentFromPublic(self.alloc, cfg);
+        defer internal.deinit(self.alloc);
+
+        try validateEnrichmentConfig(self, internal);
+
+        for (self.enrichments.items) |*entry| {
+            if (!std.mem.eql(u8, entry.name, internal.name)) continue;
+            if (internalEnrichmentConfigsEqual(entry.*, internal)) return .unchanged;
+
+            var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
+            var previous = entry.*;
+            entry.* = replacement;
+            self.validateEnrichmentCatalogGraph() catch |err| {
+                entry.* = previous;
+                replacement.deinit(self.alloc);
+                return err;
+            };
+            const has_generated_enrichment_targets = self.computeGeneratedEnrichmentTargetCache() catch |err| {
+                entry.* = previous;
+                replacement.deinit(self.alloc);
+                return err;
+            };
+            self.persistEnrichmentCatalog(store) catch |err| {
+                entry.* = previous;
+                replacement.deinit(self.alloc);
+                return err;
+            };
+            previous.deinit(self.alloc);
+            self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
+            return .updated;
+        }
+
+        const enrichment_checkpoint = self.enrichments.items.len;
+        errdefer self.truncateEnrichments(enrichment_checkpoint);
+
+        try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal));
+        try self.validateEnrichmentCatalogGraph();
+        const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
+        try self.persistEnrichmentCatalog(store);
+        self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
+        return .added;
     }
 
     pub fn removeEnrichment(self: *IndexManager, store: anytype, kind: types.EnrichmentKind, name: []const u8) !bool {
@@ -3358,7 +3411,7 @@ pub const IndexManager = struct {
 
             const index_path = try self.indexPath(name);
             defer self.alloc.free(index_path);
-            var artifact_refs = try self.artifactRefsFromConfig(cfg);
+            var artifact_refs = self.bestEffortArtifactRefsFromConfig(cfg);
             defer artifact_refs.deinit(self.alloc);
             const cleanup_artifacts = cfg.kind == .dense_vector or cfg.kind == .sparse_vector;
             const owned_chunk_name = if (cleanup_artifacts) blk: {
@@ -3643,6 +3696,13 @@ pub const IndexManager = struct {
         return self.getEnrichmentExcluding(kind, name, null);
     }
 
+    fn getEnrichmentByName(self: *const IndexManager, name: []const u8) ?*const enrichment_catalog.EnrichmentConfig {
+        for (self.enrichments.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+
     fn getEnrichmentExcluding(
         self: *const IndexManager,
         kind: enrichment_catalog.EnrichmentType,
@@ -3726,6 +3786,7 @@ pub const IndexManager = struct {
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .full_text_index = chunk_cfg.full_text_index,
                     });
                 }
                 if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
@@ -3741,6 +3802,7 @@ pub const IndexManager = struct {
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .full_text_index = chunk_cfg.full_text_index,
                     });
                 }
             } else if (entry.embedding_name) |embedding_name| {
@@ -3760,6 +3822,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                     if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
@@ -3775,6 +3838,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                 } else {
@@ -3816,6 +3880,7 @@ pub const IndexManager = struct {
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .full_text_index = chunk_cfg.full_text_index,
                     });
                 }
                 try requests.append(alloc, .{
@@ -3829,6 +3894,7 @@ pub const IndexManager = struct {
                     .chunk_size = chunk_cfg.chunk_size,
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                    .full_text_index = chunk_cfg.full_text_index,
                 });
             } else if (entry.embedding_name) |embedding_name| {
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
@@ -3847,6 +3913,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                     if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
@@ -3861,6 +3928,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         });
                     }
                 } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
@@ -4476,11 +4544,29 @@ pub const IndexManager = struct {
         }
     }
 
+    fn bestEffortArtifactRefsFromConfig(self: *IndexManager, cfg: types.IndexConfig) ArtifactRefs {
+        return self.artifactRefsFromConfig(cfg) catch |err| {
+            std.log.warn("status-only index artifact refs unavailable name={s} kind={s} err={s}", .{
+                cfg.name,
+                @tagName(cfg.kind),
+                @errorName(err),
+            });
+            return .{};
+        };
+    }
+
     fn chunkArtifactsReferencedElsewhereIncludingStatusOnly(self: *IndexManager, exclude_index_name: []const u8, chunk_name: []const u8) !bool {
         if (self.chunkArtifactsReferencedElsewhere(exclude_index_name, chunk_name)) return true;
         for (self.status_only_index_configs) |cfg| {
             if (std.mem.eql(u8, cfg.name, exclude_index_name)) continue;
-            var refs = try self.artifactRefsFromConfig(cfg);
+            var refs = self.artifactRefsFromConfig(cfg) catch |err| {
+                std.log.warn("status-only chunk artifact reference check skipped name={s} kind={s} err={s}", .{
+                    cfg.name,
+                    @tagName(cfg.kind),
+                    @errorName(err),
+                });
+                return true;
+            };
             defer refs.deinit(self.alloc);
             if (refs.chunk_name) |configured| {
                 if (std.mem.eql(u8, configured, chunk_name)) return true;
@@ -4493,7 +4579,14 @@ pub const IndexManager = struct {
         if (self.embeddingArtifactsReferencedElsewhere(exclude_index_name, embedding_name)) return true;
         for (self.status_only_index_configs) |cfg| {
             if (std.mem.eql(u8, cfg.name, exclude_index_name)) continue;
-            var refs = try self.artifactRefsFromConfig(cfg);
+            var refs = self.artifactRefsFromConfig(cfg) catch |err| {
+                std.log.warn("status-only embedding artifact reference check skipped name={s} kind={s} err={s}", .{
+                    cfg.name,
+                    @tagName(cfg.kind),
+                    @errorName(err),
+                });
+                return true;
+            };
             defer refs.deinit(self.alloc);
             if (refs.embedding_name) |configured| {
                 if (std.mem.eql(u8, configured, embedding_name)) return true;
@@ -4697,7 +4790,9 @@ pub const IndexManager = struct {
         if (resolved.chunk_name != null) return true;
 
         for (self.enrichments.items) |cfg| {
-            if (cfg.kind != .chunk or cfg.chunker_json.len == 0) continue;
+            if (cfg.kind != .chunk) continue;
+            if (cfg.full_text_index) return true;
+            if (cfg.chunker_json.len == 0) continue;
             if (try chunking_types.parseHasFullTextIndexFromSlice(alloc, cfg.chunker_json)) return true;
         }
         return false;
@@ -6752,6 +6847,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
                     changed = (try self.ensureEmbeddingEnrichment(.{
@@ -6779,6 +6875,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
                 }
@@ -6812,7 +6909,8 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.chunk_size != cfg.chunk_size or
                 existing.chunk_overlap != cfg.chunk_overlap or
-                !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json))
+                !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json) or
+                existing.full_text_index != cfg.full_text_index)
             {
                 return error.ConflictingEnrichmentConfig;
             }
@@ -6873,6 +6971,48 @@ pub const IndexManager = struct {
         }
     }
 
+    fn validateEnrichmentCatalogGraph(self: *const IndexManager) !void {
+        for (self.enrichments.items, 0..) |cfg, i| {
+            for (self.enrichments.items[0..i]) |prior| {
+                if (std.mem.eql(u8, prior.name, cfg.name)) return error.ConflictingEnrichmentConfig;
+            }
+            try validateEnrichmentConfig(self, cfg);
+        }
+        try self.validateIndexEnrichmentReferences();
+    }
+
+    fn validateIndexEnrichmentReferences(self: *const IndexManager) !void {
+        for (self.text_indexes.items) |entry| {
+            if (entry.chunk_name) |chunk_name| {
+                if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
+            }
+        }
+        for (self.dense_indexes.items) |entry| {
+            if (entry.chunk_name) |chunk_name| {
+                if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
+            }
+            if (entry.embedding_name) |embedding_name| {
+                if (!entry.external and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
+            }
+        }
+        for (self.sparse_indexes.items) |entry| {
+            if (entry.chunk_name) |chunk_name| {
+                if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
+            }
+        }
+        for (self.graph_indexes.items) |entry| {
+            var graph_cfg = try parseGraphConfig(self.alloc, entry.config.config_json);
+            defer graph_cfg.deinit(self.alloc);
+            if (graph_cfg.artifact_source) |source| {
+                if (self.getEnrichment(.asset, source.artifact_name) == null and
+                    self.getEnrichment(.chunk, source.artifact_name) == null)
+                {
+                    return error.InvalidEnrichmentConfig;
+                }
+            }
+        }
+    }
+
     fn enrichmentInUse(self: *const IndexManager, kind: enrichment_catalog.EnrichmentType, name: []const u8) bool {
         switch (kind) {
             .chunk => {
@@ -6910,6 +7050,9 @@ pub const IndexManager = struct {
                     if (entry.artifact_source) |source| {
                         if (std.mem.eql(u8, source.artifact_name, name)) return true;
                     }
+                }
+                for (self.enrichments.items) |entry| {
+                    if (entry.kind == .chunk and std.mem.eql(u8, entry.source_artifact_name, name)) return true;
                 }
             },
         }
@@ -12045,6 +12188,7 @@ const GeneratorConfig = struct {
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []u8 = &.{},
+    full_text_index: bool = false,
 
     fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
         alloc.free(self.source_field);
@@ -12185,9 +12329,25 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
+}
+
+fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) bool {
+    return a.kind == b.kind and
+        std.mem.eql(u8, a.name, b.name) and
+        std.mem.eql(u8, a.source_field, b.source_field) and
+        std.mem.eql(u8, a.source_template, b.source_template) and
+        std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
+        a.expected_dims == b.expected_dims and
+        a.chunk_size == b.chunk_size and
+        a.chunk_overlap == b.chunk_overlap and
+        std.mem.eql(u8, a.chunker_json, b.chunker_json) and
+        a.full_text_index == b.full_text_index and
+        std.mem.eql(u8, a.content_type, b.content_type) and
+        std.mem.eql(u8, a.producer_json, b.producer_json);
 }
 
 fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types.EnrichmentKind {
@@ -12209,6 +12369,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
@@ -16950,6 +17111,36 @@ test "remove status-only dense config drops owned generated artifacts" {
     const stored_doc = try store.get(alloc, doc_internal_key);
     defer alloc.free(stored_doc);
     try std.testing.expectEqualStrings("{\"body\":\"alpha concept overview\"}", stored_doc);
+}
+
+test "remove status-only malformed dense config drops catalog entry" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "status-only-malformed-remove");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const cfg: types.IndexConfig = .{
+        .name = "bad_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":",
+    };
+    try manager.ensureConfiguredIndexDir(cfg);
+    try manager.recordFailedIndexLoad(cfg, error.InvalidIndexConfig);
+
+    try std.testing.expect(manager.get("bad_dense") != null);
+    try std.testing.expect(manager.loadFailure("bad_dense") != null);
+
+    try std.testing.expect(try manager.remove(&store, "bad_dense"));
+    try std.testing.expect(manager.get("bad_dense") == null);
+    try std.testing.expect(manager.loadFailure("bad_dense") == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.status_only_index_configs.len);
 }
 
 test "dense artifact preload session reuses cached raw values across calls" {

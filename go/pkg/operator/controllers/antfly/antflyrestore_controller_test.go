@@ -48,13 +48,12 @@ func TestBuildRestoreJob_SwarmStillUsesPublicAPIService(t *testing.T) {
 		t.Fatalf("expected restore job to invoke zig antfly directly, got command: %#v", container.Command)
 	}
 
-	if len(args) < 3 {
-		t.Fatalf("expected restore args to include URL, got: %#v", args)
+	for _, arg := range args {
+		if arg == "--url" {
+			t.Fatalf("expected restore job to use ANTFLY_URL instead of --url, got args: %#v", args)
+		}
 	}
-	if args[1] != "--url" {
-		t.Fatalf("expected second restore arg to be --url, got: %q", args[1])
-	}
-	if args[2] != "http://swarm-cluster-public-api.default.svc.cluster.local" {
-		t.Fatalf("expected restore URL to continue using public-api service in swarm mode, got: %q", args[2])
+	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://swarm-cluster-public-api.default.svc.cluster.local" {
+		t.Fatalf("expected restore URL to continue using public-api service in swarm mode, got: %q", got)
 	}
 }

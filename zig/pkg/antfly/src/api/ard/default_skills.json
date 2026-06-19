@@ -1,0 +1,71 @@
+[
+  {
+    "slug": "antfly-query-builder",
+    "identifier_suffix": "skill:antfly-query-builder",
+    "url": "/ard/v1/skills/antfly-query-builder",
+    "display_name": "Antfly Query Builder",
+    "description": "Translate user intent into Antfly table queries and query-builder requests.",
+    "metadata": "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:read\"}",
+    "tags": ["skill", "workflow"],
+    "capabilities": ["query-builder", "table-query", "schema-aware-search"],
+    "representative_queries": [
+      "turn this question into an Antfly query",
+      "build a query for relevant customer support tickets",
+      "ask a clarifying question before querying the table"
+    ],
+    "body": "# Antfly Query Builder\n\nUse this skill when an agent needs to translate user intent into Antfly table queries or query-builder API requests.\n\nPrefer `/api/v1/tables/{table}/query-builder` when the user intent is underspecified and `/api/v1/tables/{table}/query` when the caller already has a concrete Antfly query.\n\nKeep table and field selection scoped to resources visible to the authenticated tenant identity.\n",
+    "required_permission": "table_read"
+  },
+  {
+    "slug": "antfly-retrieval",
+    "identifier_suffix": "skill:antfly-retrieval",
+    "url": "/ard/v1/skills/antfly-retrieval",
+    "display_name": "Antfly Retrieval",
+    "description": "Retrieve, rank, and synthesize context from Antfly tables.",
+    "metadata": "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:read\"}",
+    "tags": ["skill", "workflow"],
+    "capabilities": ["retrieval", "hybrid-search", "context-synthesis"],
+    "representative_queries": [
+      "retrieve context for this incident",
+      "find the most relevant documents in this table",
+      "summarize results from Antfly retrieval"
+    ],
+    "body": "# Antfly Retrieval\n\nUse this skill when an agent needs tenant-scoped context retrieval from Antfly tables.\n\nUse `/api/v1/tables/{table}/retrieval-agent` for end-to-end retrieval and synthesis. Use `/api/v1/tables/{table}/query` for direct search when the caller already knows the query shape.\n\nDo not infer access to tables or rows that are not visible through the caller's Antfly identity.\n",
+    "required_permission": "table_read"
+  },
+  {
+    "slug": "antfly-schema-design",
+    "identifier_suffix": "skill:antfly-schema-design",
+    "url": "/ard/v1/skills/antfly-schema-design",
+    "display_name": "Antfly Schema Design",
+    "description": "Design Antfly tables, schemas, indexes, enrichments, and query processors.",
+    "metadata": "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:admin\"}",
+    "tags": ["skill", "workflow"],
+    "capabilities": ["schema-design", "index-design", "table-management"],
+    "representative_queries": [
+      "design a schema for these documents",
+      "choose indexes for semantic and keyword search",
+      "configure enrichments for this table"
+    ],
+    "body": "# Antfly Schema Design\n\nUse this skill when an agent needs to create or evolve Antfly table contracts.\n\nUse the table lifecycle APIs for creation and updates, and prefer generated OpenAPI schemas as the source of request shape.\n\nValidate that requested indexes and enrichments are available in the deployment before recommending them.\n",
+    "required_permission": "table_admin"
+  },
+  {
+    "slug": "antfly-extension-management",
+    "identifier_suffix": "skill:antfly-extension-management",
+    "url": "/ard/v1/skills/antfly-extension-management",
+    "display_name": "Antfly Extension Management",
+    "description": "Install, configure, enable, disable, and inspect Antfly extensions.",
+    "metadata": "{\"scope\":\"tenant\",\"requiredPermissions\":\"admin\"}",
+    "tags": ["skill", "workflow"],
+    "capabilities": ["extension-install", "extension-config", "extension-lifecycle"],
+    "representative_queries": [
+      "install this Antfly extension",
+      "show visible MCP tools for an extension",
+      "configure an extension for a tenant table"
+    ],
+    "body": "# Antfly Extension Management\n\nUse this skill when an agent needs to inspect or manage Antfly extensions.\n\nUse `/extensions/v1` for package and lifecycle operations. Use `/mcp/v1/extensions/{extension}` only after the extension is installed, enabled, and visible to the tenant identity.\n\nNever expose extension tools through ARD that the same identity cannot list through MCP.\n",
+    "admin_only": true,
+    "required_permission": "admin"
+  }
+]

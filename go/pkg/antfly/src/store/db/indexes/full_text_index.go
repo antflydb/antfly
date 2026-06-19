@@ -283,20 +283,21 @@ func NewBleveIndexV2(
 	_ *pebbleutils.Cache,
 ) (Index, error) {
 	// Validate config against schema
+	var c FullTextIndexConfig
+	if config != nil {
+		var err error
+		if c, err = config.AsFullTextIndexConfig(); err != nil {
+			return nil, fmt.Errorf("parsing config: %w", err)
+		}
+	}
 	writer, err := zstd.NewWriter(nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating zstd writer: %w", err)
 	}
 	reader, err := zstd.NewReader(nil)
 	if err != nil {
+		_ = writer.Close()
 		return nil, fmt.Errorf("creating zstd reader: %w", err)
-	}
-
-	var c FullTextIndexConfig
-	if config != nil {
-		if c, err = config.AsFullTextIndexConfig(); err != nil {
-			return nil, fmt.Errorf("parsing config: %w", err)
-		}
 	}
 	indexPath := filepath.Join(dir, name)
 	bi := &BleveIndexV2{
@@ -723,13 +724,15 @@ func (bi *BleveIndexV2) Close() error {
 	if bi.egCancel != nil {
 		bi.egCancel()
 	}
-	if err := bi.walBuf.Close(); err != nil {
-		bi.logger.Warn(
-			"Closing walBuf",
-			zap.String("name", bi.name),
-			zap.String("indexPath", bi.indexPath),
-			zap.Error(err),
-		)
+	if bi.walBuf != nil {
+		if err := bi.walBuf.Close(); err != nil {
+			bi.logger.Warn(
+				"Closing walBuf",
+				zap.String("name", bi.name),
+				zap.String("indexPath", bi.indexPath),
+				zap.Error(err),
+			)
+		}
 	}
 	if bi.bidx != nil {
 		if err := bi.bidx.Close(); err != nil {
@@ -743,15 +746,22 @@ func (bi *BleveIndexV2) Close() error {
 	}
 	if bi.eg != nil {
 		if err := bi.eg.Wait(); err != nil {
-			bi.zstdReader.Close()
 			if errors.Is(err, context.Canceled) || errors.Is(err, inflight.ErrBufferClosed) ||
 				errors.Is(err, bleve.ErrorIndexClosed) {
-				return nil // Normal shutdown
+				// Normal shutdown
+			} else {
+				return fmt.Errorf("waiting for background tasks to finish: %w", err)
 			}
-			return fmt.Errorf("waiting for background tasks to finish: %w", err)
 		}
 	}
-	bi.zstdReader.Close()
+	if bi.zstdReader != nil {
+		bi.zstdReader.Close()
+	}
+	if bi.zstdWriter != nil {
+		if err := bi.zstdWriter.Close(); err != nil {
+			return fmt.Errorf("closing zstd writer: %w", err)
+		}
+	}
 	return nil
 }
 

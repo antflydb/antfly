@@ -268,3 +268,5 @@ export { embedderProviders, generatorProviders } from "./types.js";
 // Default export for convenience
 import { Client } from "./sdk.js";
 export default Client;
+
+export * from "./models.js";

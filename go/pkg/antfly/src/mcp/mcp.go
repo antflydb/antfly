@@ -54,14 +54,16 @@ type IndexInfo struct {
 
 // QueryRequest holds query parameters passed from MCP tools.
 type QueryRequest struct {
-	TableName      string
-	FullTextSearch string
-	SemanticSearch string
-	Fields         []string
-	Limit          int
-	OrderBy        []indexes.SortField
-	Indexes        []string
-	FilterPrefix   string
+	TableName           string
+	RawQueryRequest     map[string]any
+	FullTextSearch      any
+	FullTextSearchField string
+	SemanticSearch      string
+	Fields              []string
+	Limit               int
+	OrderBy             []indexes.SortField
+	Indexes             []string
+	FilterPrefix        string
 }
 
 // QueryResult holds query results returned to MCP tools.
@@ -109,14 +111,17 @@ type DropIndexArgs struct {
 
 // QueryArgs defines the query tool parameters.
 type QueryArgs struct {
-	TableName      string              `json:"tableName"                mcp:"name of the table to query"`
-	FullTextSearch string              `json:"fullTextSearch,omitempty" mcp:"full text search query using bleve query string syntax"`
-	Fields         []string            `json:"fields,omitempty"         mcp:"fields to return"`
-	Limit          int                 `json:"limit,omitempty"          mcp:"maximum number of results (default: 10)"`
-	OrderBy        []indexes.SortField `json:"orderBy,omitempty"        mcp:"sort fields with direction (desc: true for descending)"`
-	SemanticSearch string              `json:"semanticSearch,omitempty" mcp:"semantic search query"`
-	Indexes        []string            `json:"indexes,omitempty"        mcp:"index names to use for semantic search"`
-	FilterPrefix   string              `json:"filterPrefix,omitempty"   mcp:"filter results by document id/key prefix"`
+	TableName           string              `json:"tableName"                     mcp:"name of the table to query"`
+	QueryRequest        map[string]any      `json:"queryRequest,omitempty"        mcp:"raw Antfly QueryRequest body for POST /tables/{tableName}/query; mutually exclusive with query shorthand arguments"`
+	FullTextSearch      any                 `json:"fullTextSearch,omitempty"      mcp:"full text search query string shorthand, or the generic full_text_search query object accepted by the REST API"`
+	FullTextSearchRaw   map[string]any      `json:"full_text_search,omitempty"    mcp:"generic REST-shaped full_text_search query object"`
+	FullTextSearchField string              `json:"fullTextSearchField,omitempty" mcp:"field to search when fullTextSearch is a string shorthand, for example content"`
+	Fields              []string            `json:"fields,omitempty"              mcp:"fields to return"`
+	Limit               int                 `json:"limit,omitempty"               mcp:"maximum number of results (default: 10)"`
+	OrderBy             []indexes.SortField `json:"orderBy,omitempty"             mcp:"sort fields with direction (desc: true for descending)"`
+	SemanticSearch      string              `json:"semanticSearch,omitempty"      mcp:"semantic search query"`
+	Indexes             []string            `json:"indexes,omitempty"             mcp:"index names to use for semantic search"`
+	FilterPrefix        string              `json:"filterPrefix,omitempty"        mcp:"filter results by document id/key prefix"`
 }
 
 // BackupArgs defines the backup tool parameters.
@@ -153,6 +158,75 @@ type ListTablesResult struct {
 // ListIndexesResult wraps the list of indexes in a struct for MCP output schema compatibility.
 type ListIndexesResult struct {
 	Indexes []IndexInfo `json:"indexes"`
+}
+
+// QueryRequestDescription returns compact schema guidance for the raw queryRequest argument.
+func QueryRequestDescription() map[string]any {
+	return map[string]any{
+		"openapi_schema":   "specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest",
+		"query_ast_schema": "specs/openapi/antfly/query.yaml#/components/schemas/Query",
+		"mcp_usage": map[string]any{
+			"tool":                   "query",
+			"path_table_argument":    "tableName",
+			"raw_body_argument":      "queryRequest",
+			"raw_mode_exclusive":     true,
+			"rejects_query_table":    true,
+			"shorthand_arguments":    []string{"fullTextSearch", "fullTextSearchField", "semanticSearch", "fields", "limit", "orderBy", "indexes", "filterPrefix"},
+			"forwarded_request_path": "POST /tables/{tableName}/query",
+		},
+		"top_level_fields": []string{
+			"query", "full_text_search", "semantic_search", "embedding_template", "indexes",
+			"filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings",
+			"search_effort", "fields", "limit", "offset", "order_by", "search_after",
+			"search_before", "distance_under", "distance_over", "merge_config", "count",
+			"profile", "reranker", "analyses", "graph_searches", "expand_strategy",
+			"document_renderer", "pruner", "join", "foreign_sources",
+		},
+		"examples": map[string]any{
+			"fielded_full_text": map[string]any{
+				"full_text_search": map[string]any{"match": "hello", "field": "body"},
+				"fields":           []string{"title", "body"},
+				"limit":            5,
+			},
+			"hybrid": map[string]any{
+				"full_text_search": map[string]any{"match": "raft", "field": "body"},
+				"semantic_search":  "raft snapshot architecture",
+				"indexes":          []string{"body_embedding"},
+				"merge_config":     map[string]any{"strategy": "rrf"},
+				"fields":           []string{"title", "body"},
+				"limit":            20,
+				"profile":          true,
+			},
+		},
+	}
+}
+
+// MCPCapabilitiesDescription returns compact capability discovery metadata.
+func MCPCapabilitiesDescription() map[string]any {
+	return map[string]any{
+		"protocol":         "mcp",
+		"protocol_version": "2025-06-18",
+		"transport":        "streamable_http",
+		"sessions": map[string]any{
+			"initialize_returns_session_id":  true,
+			"delete_closes_session":          true,
+			"last_event_id_cursor_supported": true,
+			"historical_replay":              false,
+		},
+		"query_builder": "Use the A2A query-builder skill for agentic natural-language query planning. MCP stays focused on deterministic database tools and raw QueryRequest execution.",
+		"tools": map[string]any{
+			"deterministic":   []string{"list_tables", "list_indexes", "query", "describe_query_request"},
+			"write":           []string{"create_table", "drop_table", "create_index", "drop_index", "batch", "backup", "restore"},
+			"schema_helpers":  []string{"describe_query_request", "describe_mcp_capabilities"},
+			"zig_extra_tools": []string{"describe_table", "describe_indexes", "get_document", "sample_documents"},
+		},
+		"query": map[string]any{
+			"raw_query_request":          true,
+			"raw_query_request_argument": "queryRequest",
+			"shorthand_arguments":        []string{"fullTextSearch", "fullTextSearchField", "semanticSearch", "fields", "limit", "orderBy", "indexes", "filterPrefix"},
+			"raw_mode_exclusive":         true,
+		},
+	}
 }
 
 // AntflyMCPServer wraps an AntflyHandler for MCP operations.
@@ -354,22 +428,61 @@ func (s *AntflyMCPServer) Query(
 ) (*mcp.CallToolResult, map[string]any, error) {
 	var res mcp.CallToolResult
 
-	limit := args.Limit
-	if limit == 0 {
-		limit = 10 // default
+	if args.QueryRequest != nil {
+		if _, ok := args.QueryRequest["table"]; ok {
+			res.Content = []mcp.Content{
+				&mcp.TextContent{Text: "queryRequest.table is not allowed; pass the table as tableName"},
+			}
+			return &res, nil, nil
+		}
+		if queryRequestHasShorthandArgs(args) {
+			res.Content = []mcp.Content{
+				&mcp.TextContent{Text: "queryRequest cannot be combined with query shorthand arguments"},
+			}
+			return &res, nil, nil
+		}
+		qr := QueryRequest{
+			TableName:       args.TableName,
+			RawQueryRequest: args.QueryRequest,
+		}
+		return s.runQuery(ctx, qr)
 	}
 
 	qr := QueryRequest{
-		TableName:      args.TableName,
-		FullTextSearch: args.FullTextSearch,
-		SemanticSearch: args.SemanticSearch,
-		Fields:         args.Fields,
-		Limit:          limit,
-		OrderBy:        args.OrderBy,
-		Indexes:        args.Indexes,
-		FilterPrefix:   args.FilterPrefix,
+		TableName:           args.TableName,
+		FullTextSearch:      args.FullTextSearch,
+		FullTextSearchField: args.FullTextSearchField,
+		SemanticSearch:      args.SemanticSearch,
+		Fields:              args.Fields,
+		Limit:               args.Limit,
+		OrderBy:             args.OrderBy,
+		Indexes:             args.Indexes,
+		FilterPrefix:        args.FilterPrefix,
+	}
+	if qr.Limit == 0 {
+		qr.Limit = 10 // default
+	}
+	if args.FullTextSearchRaw != nil {
+		qr.FullTextSearch = args.FullTextSearchRaw
 	}
 
+	return s.runQuery(ctx, qr)
+}
+
+func queryRequestHasShorthandArgs(args QueryArgs) bool {
+	return args.FullTextSearch != nil ||
+		args.FullTextSearchRaw != nil ||
+		args.FullTextSearchField != "" ||
+		args.SemanticSearch != "" ||
+		len(args.Fields) != 0 ||
+		args.Limit != 0 ||
+		len(args.OrderBy) != 0 ||
+		len(args.Indexes) != 0 ||
+		args.FilterPrefix != ""
+}
+
+func (s *AntflyMCPServer) runQuery(ctx context.Context, qr QueryRequest) (*mcp.CallToolResult, map[string]any, error) {
+	var res mcp.CallToolResult
 	result, err := s.handler.Query(ctx, qr)
 	if err != nil {
 		res.Content = []mcp.Content{
@@ -384,6 +497,32 @@ func (s *AntflyMCPServer) Query(
 		},
 	}
 	return &res, result.Structured, nil
+}
+
+// DescribeQueryRequest returns compact guidance for query.queryRequest.
+func (s *AntflyMCPServer) DescribeQueryRequest(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	args struct{},
+) (*mcp.CallToolResult, map[string]any, error) {
+	var res mcp.CallToolResult
+	res.Content = []mcp.Content{
+		&mcp.TextContent{Text: "Antfly QueryRequest schema summary for query.queryRequest"},
+	}
+	return &res, QueryRequestDescription(), nil
+}
+
+// DescribeMCPCapabilities returns compact capability discovery metadata.
+func (s *AntflyMCPServer) DescribeMCPCapabilities(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	args struct{},
+) (*mcp.CallToolResult, map[string]any, error) {
+	var res mcp.CallToolResult
+	res.Content = []mcp.Content{
+		&mcp.TextContent{Text: "Antfly MCP capabilities"},
+	}
+	return &res, MCPCapabilitiesDescription(), nil
 }
 
 // Backup creates a backup of a table
@@ -532,6 +671,14 @@ func NewMCPServer(handler AntflyHandler) *mcp.Server {
 		Name:        "query",
 		Description: "Query data from a table with full-text and semantic search",
 	}, s.Query)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "describe_query_request",
+		Description: "Return compact guidance for the raw Antfly QueryRequest accepted by query.queryRequest",
+	}, s.DescribeQueryRequest)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "describe_mcp_capabilities",
+		Description: "Describe Antfly MCP capabilities, deterministic tools, and A2A query-builder handoff guidance",
+	}, s.DescribeMCPCapabilities)
 
 	// Backup and restore
 	mcp.AddTool(server, &mcp.Tool{

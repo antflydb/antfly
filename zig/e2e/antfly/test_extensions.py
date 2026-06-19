@@ -298,6 +298,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     object_kinds = {(obj["object_kind"], obj["object_name"]) for obj in objects}
     assert ("data_shape", "memory_record") in object_kinds
     assert ("generated_artifact", "memory_embedding") in object_kinds
+    assert ("skill", "memory") in object_kinds
     assert ("mcp_tool", "store_memory") in object_kinds
     assert ("mcp_tool", "search_memories") in object_kinds
     assert ("mcp_tool", "list_memories") in object_kinds

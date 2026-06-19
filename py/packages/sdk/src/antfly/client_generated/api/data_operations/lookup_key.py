@@ -7,6 +7,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
+from ...models.lookup_key_consistency import LookupKeyConsistency
 from ...models.lookup_key_response_200 import LookupKeyResponse200
 from ...types import UNSET, Response, Unset
 
@@ -16,11 +17,18 @@ def _get_kwargs(
     key: str,
     *,
     fields: str | Unset = UNSET,
+    consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
     params["fields"] = fields
+
+    json_consistency: str | Unset = UNSET
+    if not isinstance(consistency, Unset):
+        json_consistency = consistency.value
+
+    params["consistency"] = json_consistency
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -82,6 +90,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Response[Error | LookupKeyResponse200]:
     """Retrieve a document by key
 
@@ -89,6 +98,7 @@ def sync_detailed(
         table_name (str):
         key (str):
         fields (str | Unset):
+        consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -102,6 +112,7 @@ def sync_detailed(
         table_name=table_name,
         key=key,
         fields=fields,
+        consistency=consistency,
     )
 
     response = client.get_httpx_client().request(
@@ -117,6 +128,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Error | LookupKeyResponse200 | None:
     """Retrieve a document by key
 
@@ -124,6 +136,7 @@ def sync(
         table_name (str):
         key (str):
         fields (str | Unset):
+        consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -138,6 +151,7 @@ def sync(
         key=key,
         client=client,
         fields=fields,
+        consistency=consistency,
     ).parsed
 
 
@@ -147,6 +161,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Response[Error | LookupKeyResponse200]:
     """Retrieve a document by key
 
@@ -154,6 +169,7 @@ async def asyncio_detailed(
         table_name (str):
         key (str):
         fields (str | Unset):
+        consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -167,6 +183,7 @@ async def asyncio_detailed(
         table_name=table_name,
         key=key,
         fields=fields,
+        consistency=consistency,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -180,6 +197,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
+    consistency: LookupKeyConsistency | Unset = LookupKeyConsistency.READ_INDEX,
 ) -> Error | LookupKeyResponse200 | None:
     """Retrieve a document by key
 
@@ -187,6 +205,7 @@ async def asyncio(
         table_name (str):
         key (str):
         fields (str | Unset):
+        consistency (LookupKeyConsistency | Unset):  Default: LookupKeyConsistency.READ_INDEX.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -202,5 +221,6 @@ async def asyncio(
             key=key,
             client=client,
             fields=fields,
+            consistency=consistency,
         )
     ).parsed

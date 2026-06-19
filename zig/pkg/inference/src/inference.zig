@@ -57,6 +57,7 @@ pub const native_export_safetensors = @import("native_export_safetensors.zig");
 pub const native_run_artifact = @import("native_run_artifact.zig");
 pub const native_embed = @import("native_embed.zig");
 pub const native_classify = @import("native_classify.zig");
+pub const native_rerank = @import("native_rerank.zig");
 pub const native_transcribe = @import("native_transcribe.zig");
 pub const native_read = @import("native_read.zig");
 pub const scraping = @import("antfly_scraping");
@@ -114,6 +115,7 @@ test {
     _ = native_run_artifact;
     _ = native_embed;
     _ = native_classify;
+    _ = native_rerank;
     _ = native_transcribe;
     _ = native_read;
     _ = native_recognize;

@@ -180,7 +180,6 @@ func (r *AntflyRestoreReconciler) buildRestoreJob(restore *antflyv1.AntflyRestor
 	// Build CLI arguments
 	args := []string{
 		"restore",
-		"--url", clusterURL,
 		"--backup-id", restore.Spec.Source.BackupID,
 		"--location", restore.Spec.Source.Location,
 	}
@@ -259,6 +258,12 @@ func (r *AntflyRestoreReconciler) buildRestoreJob(restore *antflyv1.AntflyRestor
 							Command: []string{"/antfly"},
 							Args:    args,
 							EnvFrom: envFrom,
+							Env: []corev1.EnvVar{
+								{
+									Name:  "ANTFLY_URL",
+									Value: clusterURL,
+								},
+							},
 						},
 					},
 				},

@@ -46,6 +46,7 @@ pub const GeneratedEnrichmentRequest = struct {
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
+    full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
 };
@@ -90,6 +91,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .chunk_size = request.chunk_size,
         .chunk_overlap = request.chunk_overlap,
         .chunker_json = if (request.chunker_json.len > 0) try alloc.dupe(u8, request.chunker_json) else "",
+        .full_text_index = request.full_text_index,
         .content_type = if (request.content_type.len > 0) try alloc.dupe(u8, request.content_type) else "",
         .producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "",
     };

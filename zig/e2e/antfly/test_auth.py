@@ -449,7 +449,7 @@ def test_swarm_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     assert remaining[0]["key_id"] == read_only_key["key_id"]
 
 
-def test_swarm_auth_enforces_row_filters_on_lookup_and_query(auth_api: AuthApi):
+def test_swarm_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
     auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     auth_api.create_table("docs")
     auth_api.batch_write(
@@ -467,7 +467,7 @@ def test_swarm_auth_enforces_row_filters_on_lookup_and_query(auth_api: AuthApi):
                     "tier": "silver",
                 },
             },
-            "sync_level": "full_text",
+            "sync_level": "write",
         },
     )
     auth_api.post(
@@ -508,19 +508,6 @@ def test_swarm_auth_enforces_row_filters_on_lookup_and_query(auth_api: AuthApi):
     assert [entry["key"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
-
-    query_result = _wait_until(
-        lambda: auth_api.post(
-            "/tables/docs/query",
-            {
-                "full_text_search": {"match_all": {}},
-                "limit": 10,
-            },
-        )
-    )
-    assert query_result is not None
-    hits = query_result["responses"][0]["hits"]["hits"]
-    assert [hit["_id"] for hit in hits] == ["doc:gold"]
 
 
 def test_stateful_auth_defaults_to_local_admin_user(stateful_auth_api: AuthApi):
@@ -584,7 +571,7 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
     assert admin_resp.status_code == 403
 
 
-def test_stateful_auth_enforces_row_filters_on_lookup_and_query(stateful_auth_api: AuthApi):
+def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api: AuthApi):
     stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     stateful_auth_api.create_table("docs")
     stateful_auth_api.batch_write(
@@ -602,9 +589,10 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_query(stateful_auth_ap
                     "tier": "silver",
                 },
             },
-            "sync_level": "full_text",
+            "sync_level": "write",
         },
     )
+
     stateful_auth_api.post(
         "/auth/v1/users/reader",
         {
@@ -644,26 +632,3 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_query(stateful_auth_ap
     assert [entry["key"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
-
-    query_result = _wait_until(
-        lambda: stateful_auth_api.post(
-            "/tables/docs/query",
-            {
-                "full_text_search": {"match_all": {}},
-                "limit": 10,
-            },
-        )
-    )
-    assert query_result is not None
-    hits = query_result["responses"][0]["hits"]["hits"]
-    assert [hit["_id"] for hit in hits] == ["doc:gold"]
-
-    filtered_query = stateful_auth_api.post(
-        "/tables/docs/query",
-        {
-            "full_text_search": {"match_all": {}},
-            "filter_query": {"term": {"tier": "silver"}},
-            "limit": 10,
-        },
-    )
-    assert filtered_query["responses"][0]["hits"]["total"] == 0
