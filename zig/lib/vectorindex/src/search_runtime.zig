@@ -164,7 +164,7 @@ pub const SearchScratch = struct {
     query_storage: []u64,
     vector_ids: []u64,
     metadata: []?[]const u8,
-    flags: []bool,
+    rerank_flags: []bool,
     positions: []usize,
     lookups: []RerankLookup,
     key_views: [][]const u8,
@@ -233,7 +233,7 @@ pub const SearchScratch = struct {
             .query_storage = &.{},
             .vector_ids = &.{},
             .metadata = &.{},
-            .flags = &.{},
+            .rerank_flags = &.{},
             .positions = &.{},
             .lookups = &.{},
             .key_views = &.{},
@@ -305,7 +305,6 @@ pub const SearchScratch = struct {
             .positions = self.positions,
             .vector_ids = self.vector_ids,
             .metadata = self.metadata,
-            .flags = self.flags,
             .lookups = self.lookups,
             .key_views = self.key_views,
             .values = self.values,
@@ -317,7 +316,6 @@ pub const SearchScratch = struct {
         self.positions = views.positions;
         self.vector_ids = views.vector_ids;
         self.metadata = views.metadata;
-        self.flags = views.flags;
         self.lookups = views.lookups;
         self.key_views = views.key_views;
         self.values = views.values;
@@ -341,6 +339,13 @@ pub const SearchScratch = struct {
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         try self.ensureVectorFetchCapacity(alloc, needed);
+    }
+
+    pub fn ensureRerankFlagCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        if (self.rerank_flags.len < needed) {
+            self.rerank_flags = try alloc.realloc(self.rerank_flags, nextScratchCapacity(self.rerank_flags.len, needed));
+            self.noteScratchAllocation(byteLen(self.rerank_flags));
+        }
     }
 
     pub fn ensureMemberIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -671,11 +676,13 @@ pub const SearchScratch = struct {
         self.positions = &.{};
         self.vector_ids = &.{};
         self.metadata = &.{};
-        self.flags = &.{};
         self.lookups = &.{};
         self.key_views = &.{};
         self.values = &.{};
         self.vector_views = &.{};
+        if (self.bytes() <= max_retained_bytes) return trimmed;
+        alloc.free(self.rerank_flags);
+        self.rerank_flags = &.{};
         if (self.bytes() <= max_retained_bytes) return trimmed;
         alloc.free(self.distance_storage);
         self.distance_storage = &.{};
@@ -704,6 +711,7 @@ pub const SearchScratch = struct {
             byteLen(self.vector_batch) +
             byteLen(self.member_ids) +
             byteLen(self.query_storage) +
+            byteLen(self.rerank_flags) +
             byteLen(self.distance_storage) +
             byteLen(self.posting_delta_records) +
             posting_delta_tail_cache_bytes +
@@ -721,6 +729,7 @@ pub const SearchScratch = struct {
         alloc.free(self.vector_batch);
         alloc.free(self.member_ids);
         alloc.free(self.query_storage);
+        alloc.free(self.rerank_flags);
         alloc.free(self.distance_storage);
         for (self.posting_member_cache.items) |entry| alloc.free(entry.members);
         self.posting_member_cache.deinit(alloc);
@@ -739,7 +748,6 @@ const QueryStorageViews = struct {
     positions: []usize,
     vector_ids: []u64,
     metadata: []?[]const u8,
-    flags: []bool,
     lookups: []RerankLookup,
     key_views: [][]const u8,
     values: []?[]const u8,
@@ -785,7 +793,6 @@ fn queryStorageByteLen(capacity: usize) usize {
     addQueryStorageSlice(usize, &offset, capacity);
     addQueryStorageSlice(u64, &offset, capacity);
     addQueryStorageSlice(?[]const u8, &offset, capacity);
-    addQueryStorageSlice(bool, &offset, capacity);
     addQueryStorageSlice(RerankLookup, &offset, capacity);
     addQueryStorageSlice([]const u8, &offset, capacity);
     addQueryStorageSlice(?[]const u8, &offset, capacity);
@@ -821,7 +828,6 @@ fn carveQueryStorage(storage: []u64, capacity: usize) QueryStorageViews {
         .positions = carveQueryStorageSlice(usize, bytes, &offset, capacity),
         .vector_ids = carveQueryStorageSlice(u64, bytes, &offset, capacity),
         .metadata = carveQueryStorageSlice(?[]const u8, bytes, &offset, capacity),
-        .flags = carveQueryStorageSlice(bool, bytes, &offset, capacity),
         .lookups = carveQueryStorageSlice(RerankLookup, bytes, &offset, capacity),
         .key_views = carveQueryStorageSlice([]const u8, bytes, &offset, capacity),
         .values = carveQueryStorageSlice(?[]const u8, bytes, &offset, capacity),
@@ -862,7 +868,6 @@ fn copyQueryStorageViews(dst: QueryStorageViews, src: QueryStorageViews) void {
     copySlicePrefix(usize, dst.positions, src.positions);
     copySlicePrefix(u64, dst.vector_ids, src.vector_ids);
     copySlicePrefix(?[]const u8, dst.metadata, src.metadata);
-    copySlicePrefix(bool, dst.flags, src.flags);
     copySlicePrefix(RerankLookup, dst.lookups, src.lookups);
     copySlicePrefix([]const u8, dst.key_views, src.key_views);
     copySlicePrefix(?[]const u8, dst.values, src.values);
@@ -1032,12 +1037,13 @@ test "SearchScratch trims cold slabs and regrows on demand" {
 
     try scratch.ensureVectorFetchCapacity(alloc, 5);
     try scratch.ensureRerankCapacity(alloc, 5);
+    try scratch.ensureRerankFlagCapacity(alloc, 5);
     try scratch.ensureMemberIdCapacity(alloc, 5);
     try std.testing.expect(scratch.query_storage.len > 0);
     try std.testing.expect(scratch.distance_storage.len > 0);
     try std.testing.expect(scratch.vector_batch.len > 0);
     try std.testing.expect(scratch.member_ids.len > 0);
-    try std.testing.expect(scratch.flags.len > 0);
+    try std.testing.expect(scratch.rerank_flags.len > 0);
 
     try std.testing.expect(scratch.trimColdScratchForRetention(alloc, 1));
     try std.testing.expectEqual(@as(usize, 0), scratch.query_storage.len);
@@ -1048,9 +1054,10 @@ test "SearchScratch trims cold slabs and regrows on demand" {
     try std.testing.expectEqual(@as(usize, 0), scratch.error_bounds.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.vector_batch.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.member_ids.len);
-    try std.testing.expectEqual(@as(usize, 0), scratch.flags.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.rerank_flags.len);
 
     try scratch.ensureRerankCapacity(alloc, 5);
+    try scratch.ensureRerankFlagCapacity(alloc, 5);
     try scratch.ensureMemberIdCapacity(alloc, 5);
     try std.testing.expect(scratch.query_storage.len > 0);
     try std.testing.expect(scratch.positions.len >= 5);
@@ -1060,7 +1067,22 @@ test "SearchScratch trims cold slabs and regrows on demand" {
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expect(scratch.vector_batch.len >= 20);
     try std.testing.expect(scratch.member_ids.len >= 5);
-    try std.testing.expect(scratch.flags.len >= 5);
+    try std.testing.expect(scratch.rerank_flags.len >= 5);
+}
+
+test "SearchScratch grows rerank flags without query lookup slab" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureRerankFlagCapacity(alloc, 5);
+
+    try std.testing.expect(scratch.rerank_flags.len >= 5);
+    try std.testing.expectEqual(@as(usize, 0), scratch.query_storage.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.positions.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_batch.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.distance_storage.len);
 }
 
 test "SearchScratch caches multiple posting delta tails in a compact ring" {

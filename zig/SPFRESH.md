@@ -196,10 +196,11 @@ Current status:
   empty and grow on first metadata/rerank/scoring use instead of being
   allocated for the initial candidate ceiling. The grouped query/distance slabs
   now grow geometrically instead of resizing exactly to each transient
-  candidate count. Rerank preparation grows query-result flags for the full
-  approximate window, but delays distance/error-bound and vector-batch growth
-  until the selected rerank count is known, so boundary rerank does not size
-  vector fetch scratch to candidates it will never exact-score. Small
+  candidate count. Rerank preparation now grows a compact flag buffer for the
+  full approximate window, but delays query lookup, distance/error-bound, and
+  vector-batch growth until the selected rerank count is known, so boundary
+  rerank does not size vector fetch scratch to candidates it will never
+  exact-score. Small
   transformed-vector matrix loads now use stack-backed lookup, vector-view, and
   batch-vector scratch before falling back to heap allocation. Rerank position
   selection also skips the vector-id sort when the selected positions are
@@ -918,11 +919,13 @@ implementations cleanly:
 3. Continue compacting query scratch into slabs.
 
    `SearchScratch` now groups the fixed query result arrays that grow together
-   into slabs: positions, vector ids, metadata, rerank flags, lookups, key
-   views, values, and vector views share `query_storage`, while distances and
-   error bounds share `distance_storage`. The remaining separate hot buffers
-   are for distinct lifetime/shape classes such as vector batches, member ids,
-   posting overlay summaries, and posting caches. Small transformed-vector
+   into slabs: positions, vector ids, metadata, lookups, key views, values, and
+   vector views share `query_storage`, while distances and error bounds share
+   `distance_storage`. Rerank flags now use a separate compact buffer because
+   they grow to the full approximate candidate window before the selected
+   rerank count is known. The remaining separate hot buffers are for distinct
+   lifetime/shape classes such as vector batches, member ids, posting overlay
+   summaries, and posting caches. Small transformed-vector
    matrix loads, external batch metadata scratch, and small metadata batch
    lookups now use stack-backed scratch before falling back to heap allocation.
    Bulk-split external-vector matrix cache misses also keep the common

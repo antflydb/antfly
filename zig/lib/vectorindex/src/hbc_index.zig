@@ -3309,12 +3309,12 @@ pub fn rerankResults(
     defer profile.rerank_ns += elapsed_fn_u64(start);
     const ranked_items = approx_results.items.items;
     const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
-    try scratch.ensureQueryCapacity(self.alloc, ranked_items.len);
+    try scratch.ensureRerankFlagCapacity(self.alloc, ranked_items.len);
 
     const prepare_start = now_fn_u64();
     search_mod.sortApproxResultsByDistance(ranked_items);
 
-    const rerank_selection = selectRerankCandidatesInto(scratch.flags[0..ranked_items.len], ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
+    const rerank_selection = selectRerankCandidatesInto(scratch.rerank_flags[0..ranked_items.len], ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
 
     profile.approx_candidate_count = ranked_items.len;
     profile.top_k_count = rerank_selection.top_k_count;
@@ -3342,6 +3342,7 @@ pub fn rerankResults(
 
     const rerank_count = rerank_selection.rerank_candidate_count;
     if (rerank_count > 0) {
+        try scratch.ensureQueryCapacity(self.alloc, rerank_count);
         try scratch.ensureDistanceOnlyCapacity(self.alloc, rerank_count);
         try scratch.ensureVectorBatchCapacity(self.alloc, rerank_count);
 
