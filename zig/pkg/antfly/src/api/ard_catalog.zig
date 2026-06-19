@@ -706,7 +706,7 @@ fn collectExtensionFacets(
                 defer alloc.free(package_capabilities);
                 if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
-                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, package_capabilities, text, filter, options.publisher_domain))
+                    extensionPackageEntryMatches(package.*, package_capabilities, text, filter, options.publisher_domain))
                 {
                     matched.* += 1;
                     try addDynamicFacets(alloc, facets, options.publisher_domain, "application/antfly-extension-package+json", &.{ "extension", "package" }, package_capabilities);
@@ -718,14 +718,14 @@ fn collectExtensionFacets(
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp or has_visible_skill) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
-            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
+            installedExtensionEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
         {
             matched.* += 1;
             try addDynamicFacets(alloc, facets, options.publisher_domain, "application/antfly-installed-extension+json", &.{ "extension", "installed" }, installed_capabilities);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
-                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, installed_capabilities, text, filter, options.publisher_domain))
+                extensionMcpEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
             {
                 matched.* += 1;
                 try addDynamicFacets(alloc, facets, options.publisher_domain, "application/mcp-server+json", &.{ "mcp", "extension" }, installed_capabilities);
@@ -852,7 +852,7 @@ fn writeExtensionEntries(
                 defer alloc.free(package_capabilities);
                 if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
-                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, package_capabilities, text, filter, options.publisher_domain))
+                    extensionPackageEntryMatches(package.*, package_capabilities, text, filter, options.publisher_domain))
                 {
                     try writeExtensionPackageEntry(writer, options.publisher_domain, first, package.*);
                 }
@@ -863,13 +863,13 @@ fn writeExtensionEntries(
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp or has_visible_skill) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
-            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
+            installedExtensionEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
         {
             try writeInstalledExtensionEntry(writer, options.publisher_domain, first, installed);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
-                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, installed_capabilities, text, filter, options.publisher_domain))
+                extensionMcpEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
             {
                 try writeExtensionMcpEntry(writer, options.publisher_domain, first, installed);
             }
@@ -899,7 +899,7 @@ fn writeMatchedExtensionEntries(
                 defer alloc.free(package_capabilities);
                 if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
-                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, package_capabilities, text, filter, options.publisher_domain))
+                    extensionPackageEntryMatches(package.*, package_capabilities, text, filter, options.publisher_domain))
                 {
                     try writeSearchExtensionPackageEntry(writer, options.publisher_domain, first, package.*, matched, text);
                 }
@@ -910,13 +910,13 @@ fn writeMatchedExtensionEntries(
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp or has_visible_skill) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
-            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
+            installedExtensionEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
         {
             try writeSearchInstalledExtensionEntry(writer, options.publisher_domain, first, installed, matched, text);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
-                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, installed_capabilities, text, filter, options.publisher_domain))
+                extensionMcpEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
             {
                 try writeSearchExtensionMcpEntry(writer, options.publisher_domain, first, installed, matched, text);
             }
@@ -1984,6 +1984,100 @@ fn freeParsedCapabilityValues(alloc: std.mem.Allocator, capabilities: []const ex
     }
 }
 
+fn extensionPackageEntryMatches(
+    package: extension_domain.PackageManifest,
+    capabilities: []const []const u8,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    publisher_domain: []const u8,
+) bool {
+    return dynamicEntryMatches(
+        package.name,
+        "application/antfly-extension-package+json",
+        if (package.description.len > 0) package.description else "extension package",
+        &.{ "extension", "package" },
+        capabilities,
+        text,
+        filter,
+        publisher_domain,
+        struct {
+            fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
+                const item: *const extension_domain.PackageManifest = @ptrCast(@alignCast(ctx));
+                if (std.mem.eql(u8, key, "digest")) return jsonValueMatchesString(value, item.digest);
+                if (std.mem.eql(u8, key, "kind")) return jsonValueMatchesString(value, @tagName(item.kind));
+                if (std.mem.eql(u8, key, "trusted")) return jsonValueMatchesBool(value, item.trusted);
+                if (std.mem.eql(u8, key, "artifactCount")) return jsonValueMatchesInteger(value, @intCast(item.artifacts.len));
+                if (std.mem.eql(u8, key, "capabilitiesRequestedCount")) return jsonValueMatchesInteger(value, @intCast(item.capabilities_requested.len));
+                return false;
+            }
+        }.matches,
+        &package,
+    );
+}
+
+fn installedExtensionEntryMatches(
+    installed: extension_domain.InstalledExtension,
+    capabilities: []const []const u8,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    publisher_domain: []const u8,
+) bool {
+    return dynamicEntryMatches(
+        installed.name,
+        "application/antfly-installed-extension+json",
+        "extension",
+        &.{ "extension", "installed" },
+        capabilities,
+        text,
+        filter,
+        publisher_domain,
+        struct {
+            fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
+                const item: *const extension_domain.InstalledExtension = @ptrCast(@alignCast(ctx));
+                if (std.mem.eql(u8, key, "digest")) return jsonValueMatchesString(value, item.package_digest);
+                if (std.mem.eql(u8, key, "packageName")) return jsonValueMatchesString(value, item.package_name);
+                if (std.mem.eql(u8, key, "packageVersion")) return jsonValueMatchesString(value, item.package_version);
+                if (std.mem.eql(u8, key, "endpoint")) return jsonValueMatchesFmt(value, "/extensions/v1/installed/{s}", .{item.name});
+                if (std.mem.eql(u8, key, "status")) return jsonValueMatchesString(value, @tagName(item.status));
+                if (std.mem.eql(u8, key, "scope")) return extensionScopeMatchesFilter(item.scope, value);
+                if (std.mem.eql(u8, key, "scopeKind")) return jsonValueMatchesString(value, @tagName(item.scope.kind));
+                if (std.mem.eql(u8, key, "scopeTableName")) return item.scope.kind == .table and jsonValueMatchesString(value, item.scope.table_name);
+                if (std.mem.eql(u8, key, "grantedCapabilitiesCount")) return jsonValueMatchesInteger(value, @intCast(item.granted_capabilities.len));
+                return false;
+            }
+        }.matches,
+        &installed,
+    );
+}
+
+fn extensionMcpEntryMatches(
+    installed: extension_domain.InstalledExtension,
+    capabilities: []const []const u8,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    publisher_domain: []const u8,
+) bool {
+    return dynamicEntryMatches(
+        installed.name,
+        "application/mcp-server+json",
+        "mcp extension",
+        &.{ "mcp", "extension" },
+        capabilities,
+        text,
+        filter,
+        publisher_domain,
+        struct {
+            fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
+                const item: *const extension_domain.InstalledExtension = @ptrCast(@alignCast(ctx));
+                if (std.mem.eql(u8, key, "endpoint")) return jsonValueMatchesFmt(value, "/mcp/v1/extensions/{s}", .{item.name});
+                if (std.mem.eql(u8, key, "extension")) return jsonValueMatchesString(value, item.name);
+                return false;
+            }
+        }.matches,
+        &installed,
+    );
+}
+
 fn dynamicEntryMatches(
     name: []const u8,
     media_type: []const u8,
@@ -1993,6 +2087,8 @@ fn dynamicEntryMatches(
     text: ?[]const u8,
     filter: ?std.json.Value,
     publisher_domain: []const u8,
+    metadataMatches: *const fn (*const anyopaque, []const u8, std.json.Value) bool,
+    metadata_context: *const anyopaque,
 ) bool {
     if (text) |query| {
         if (std.mem.trim(u8, query, " \t\r\n").len > 0 and
@@ -2015,6 +2111,8 @@ fn dynamicEntryMatches(
                 if (!jsonValueMatchesAnyString(value, capabilities)) return false;
             } else if (std.mem.eql(u8, key, "publisher") or std.mem.eql(u8, key, "publisherId")) {
                 if (!jsonValueMatchesString(value, publisher_domain)) return false;
+            } else if (std.mem.startsWith(u8, key, "metadata.")) {
+                if (!metadataMatches(metadata_context, key["metadata.".len..], value)) return false;
             } else {
                 return false;
             }
@@ -2172,6 +2270,48 @@ fn jsonValueMatchesString(value: std.json.Value, expected: []const u8) bool {
     };
 }
 
+fn jsonValueMatchesFmt(value: std.json.Value, comptime fmt: []const u8, args: anytype) bool {
+    var buf: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(&buf, fmt, args) catch return false;
+    return jsonValueMatchesString(value, expected);
+}
+
+fn jsonValueMatchesBool(value: std.json.Value, expected: bool) bool {
+    return switch (value) {
+        .bool => |actual| actual == expected,
+        .string => |actual| std.mem.eql(u8, actual, if (expected) "true" else "false"),
+        .array => |array| blk: {
+            for (array.items) |item| {
+                if (jsonValueMatchesBool(item, expected)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn jsonValueMatchesInteger(value: std.json.Value, expected: i64) bool {
+    return switch (value) {
+        .integer => |actual| actual == expected,
+        .string => |actual| blk: {
+            const parsed = std.fmt.parseInt(i64, actual, 10) catch break :blk false;
+            break :blk parsed == expected;
+        },
+        .array => |array| blk: {
+            for (array.items) |item| {
+                if (jsonValueMatchesInteger(item, expected)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn extensionScopeMatchesFilter(scope: extension_domain.ExtensionScope, value: std.json.Value) bool {
+    if (scope.kind != .table) return jsonValueMatchesString(value, @tagName(scope.kind));
+    return jsonValueMatchesFmt(value, "table:{s}", .{scope.table_name});
+}
+
 fn jsonValueMatchesAnyString(value: std.json.Value, expected_values: []const []const u8) bool {
     for (expected_values) |expected| {
         if (jsonValueMatchesString(value, expected)) return true;
@@ -2298,6 +2438,85 @@ test "ARD extension package entries use trust provenance for artifact digests" {
     try expectMetadataValuesAreScalars(installed_entry.object.get("metadata").?);
     try std.testing.expectEqualStrings("table:docs", installed_entry.object.get("metadata").?.object.get("scope").?.string);
     try std.testing.expect(installed_entry.object.get("trustManifest") != null);
+}
+
+test "ARD search supports extension metadata filters" {
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "docsaf",
+        .version = "1.0.0",
+        .digest = "sha256:docs",
+        .trusted = true,
+        .capabilities_requested = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .artifacts = &.{
+            .{ .kind = .manifest, .path = "extension.json", .digest = "sha256:docs-manifest" },
+            .{ .kind = .wasm, .path = "docsaf.wasm", .digest = "sha256:docs-wasm" },
+        },
+        .install = .{ .scopes_supported = &.{.table} },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "docsaf",
+        .package_name = "docsaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:docs",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .granted_capabilities = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "docsaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .mcp_tool,
+        .object_name = "search_docs",
+        .table_name = "docs",
+        .owner_metadata_json = "{\"description\":\"Search docs\",\"input_schema\":{\"type\":\"object\"}}",
+    }};
+    const ctx: ExtensionCatalogContext = .{
+        .extension_packages = &packages,
+        .installed_extensions = &installed,
+        .extension_members = &members,
+    };
+
+    const package_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/antfly-extension-package+json\"],\"metadata.trusted\":[true],\"metadata.artifactCount\":[2],\"metadata.digest\":[\"sha256:docs\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(package_body);
+    var package_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, package_body, .{});
+    defer package_parsed.deinit();
+    const package_results = package_parsed.value.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), package_results.len);
+    try std.testing.expect(std.mem.indexOf(u8, package_results[0].object.get("identifier").?.string, ":extension-package:docsaf:1.0.0") != null);
+
+    const installed_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/antfly-installed-extension+json\"],\"metadata.scope\":[\"table:docs\"],\"metadata.scopeKind\":[\"table\"],\"metadata.status\":[\"ready\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(installed_body);
+    var installed_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, installed_body, .{});
+    defer installed_parsed.deinit();
+    const installed_results = installed_parsed.value.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), installed_results.len);
+    try std.testing.expect(std.mem.indexOf(u8, installed_results[0].object.get("identifier").?.string, ":extension:docsaf:installed") != null);
+
+    const mcp_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/mcp-server+json\"],\"metadata.extension\":[\"docsaf\"],\"metadata.endpoint\":[\"/mcp/v1/extensions/docsaf\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(mcp_body);
+    var mcp_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, mcp_body, .{});
+    defer mcp_parsed.deinit();
+    const mcp_results = mcp_parsed.value.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), mcp_results.len);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_results[0].object.get("identifier").?.string, ":extension:docsaf:mcp") != null);
 }
 
 test "ARD profile filter keeps only profile-compatible skills" {
