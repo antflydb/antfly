@@ -4980,15 +4980,17 @@ setting names, scoped/reset forms, and expression values under
 to typed bulk import/export intent that captures table identity, selected
 columns, stream endpoint, direction, format, CSV header intent, import-freeze
 intent, delimiter byte, quote byte, escape byte, and null-marker string, then
-fails closed when applied to table schema or runtime storage. The production
-shape should stream rows through typed schema validation, defaults, generated
-columns, checks, unique/FK participants, row-policy/authorization checks, 2PC
-staging, retryable range routing, and deterministic error reporting for
-imports, and through typed snapshot/range-read plans for exports. PostgreSQL
-`COPY` syntax can become an adapter frontend for those contracts, but it must not bypass
+fails closed when applied to table schema or runtime storage. Stream encoding
+names are captured as typed bulk-I/O metadata so import/export validation can
+normalize or transcode before row decoding. The production shape should stream
+rows through typed schema validation, defaults, generated columns, checks,
+unique/FK participants, row-policy/authorization checks, 2PC staging, retryable
+range routing, and deterministic error reporting for imports, and through typed
+snapshot/range-read plans for exports. PostgreSQL `COPY` syntax can become an
+adapter frontend for those contracts, but it must not bypass
 row-batch, mutation-source, or routed read semantics. Until server-file,
-`PROGRAM`, alternate stream endpoints, and richer COPY options such as encoding
-controls have
+`PROGRAM`, alternate stream endpoints, and richer COPY options such as
+force-quote/force-null column policies have
 native bulk-I/O endpoint and validation contracts, the source parity corpus
 requires them to fail closed under `bulk_io_plan`.
 
