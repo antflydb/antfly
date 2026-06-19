@@ -1981,20 +1981,24 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
         alloc.free(selected);
     }
 
-    for (manifest.segments) |entry| {
-        if (!segmentIdIn(entry.meta.segment_id, segment_ids)) continue;
-        if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
-
-        const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
-        var data_owned = true;
-        errdefer if (data_owned) alloc.free(data);
-        try validateSegmentDataMatchesMeta(data, entry.meta);
-        selected[selected_count] = .{
-            .meta = entry.meta,
-            .data = data,
-        };
-        selected_count += 1;
-        data_owned = false;
+    if (isStrictlyAscendingU64(segment_ids)) {
+        var segment_id_index: usize = 0;
+        for (manifest.segments) |entry| {
+            while (segment_id_index < segment_ids.len and segment_ids[segment_id_index] < entry.meta.segment_id) {
+                segment_id_index += 1;
+            }
+            if (segment_id_index >= segment_ids.len) break;
+            if (segment_ids[segment_id_index] != entry.meta.segment_id) continue;
+            selected[selected_count] = try loadSelectedSegmentBlobAlloc(alloc, io, dir, entry, options.max_segment_bytes);
+            selected_count += 1;
+            segment_id_index += 1;
+        }
+    } else {
+        for (manifest.segments) |entry| {
+            if (!segmentIdIn(entry.meta.segment_id, segment_ids)) continue;
+            selected[selected_count] = try loadSelectedSegmentBlobAlloc(alloc, io, dir, entry, options.max_segment_bytes);
+            selected_count += 1;
+        }
     }
     if (selected_count != segment_ids.len) return error.PostingSegmentManifestReplacementMissingSegment;
 
@@ -2022,6 +2026,17 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
             .segment_bytes = written.meta.byte_len,
             .manifest_bytes = replacement.encoded.len,
         },
+    };
+}
+
+fn loadSelectedSegmentBlobAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: OwnedManifestEntry, max_segment_bytes: usize) !SegmentBlob {
+    if (entry.meta.byte_len > max_segment_bytes) return error.PostingSegmentTooLarge;
+    const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
+    errdefer alloc.free(data);
+    try validateSegmentDataMatchesMeta(data, entry.meta);
+    return .{
+        .meta = entry.meta,
+        .data = data,
     };
 }
 
@@ -5141,6 +5156,15 @@ fn segmentIdIn(segment_id: u64, segment_ids: []const u64) bool {
     return false;
 }
 
+fn isStrictlyAscendingU64(values: []const u64) bool {
+    if (values.len < 2) return true;
+    var index: usize = 1;
+    while (index < values.len) : (index += 1) {
+        if (values[index - 1] >= values[index]) return false;
+    }
+    return true;
+}
+
 fn rejectDuplicateSegmentIds(segment_ids: []const u64) !void {
     if (segment_ids.len < 2) return;
     var i: usize = 1;
@@ -6882,6 +6906,10 @@ pub fn testDirectoryCompactionCanReplaceSelectedSegments() !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    try std.testing.expect(isStrictlyAscendingU64(&.{ 1, 2, 3 }));
+    try std.testing.expect(!isStrictlyAscendingU64(&.{ 2, 1, 3 }));
+    try std.testing.expect(!isStrictlyAscendingU64(&.{ 1, 1, 2 }));
+
     var writer_1 = Writer.init(alloc);
     defer writer_1.deinit();
     try writer_1.appendPostingBase(.{
@@ -6915,7 +6943,7 @@ pub fn testDirectoryCompactionCanReplaceSelectedSegments() !void {
     try std.testing.expectError(error.DuplicatePostingSegmentId, compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{ committed_1.entry.meta.segment_id, committed_1.entry.meta.segment_id }, .{}));
     try std.testing.expectError(error.PostingSegmentManifestReplacementMissingSegment, compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{99}, .{}));
 
-    var compacted = try compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{ committed_1.entry.meta.segment_id, committed_2.entry.meta.segment_id }, .{});
+    var compacted = try compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{ committed_2.entry.meta.segment_id, committed_1.entry.meta.segment_id }, .{});
     defer compacted.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 4), compacted.entry.meta.segment_id);
     try std.testing.expectEqual(@as(usize, 2), compacted.stats.manifest.removed_segments);

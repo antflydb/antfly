@@ -139,11 +139,13 @@ Current status:
   compaction now uses a replace-all manifest helper instead of allocating a
   remove-id array for every input segment, and selected compaction frees loaded
   segment buffers directly from its selected segment slice instead of allocating
-  a parallel owner array. Segment garbage and temporary-file cleanup now track
-  live canonical basenames and delete through the opened postings directory, and
-  manifest temp matching compares entry names against the configured manifest
-  basename in place, avoiding per-file path allocation while scanning
-  maintenance directories. Lazy segment base-data batch reads also use
+  a parallel owner array. Planned selected compaction also takes a sorted-id
+  merge path over the sorted manifest instead of probing each manifest entry
+  through a linear selected-id scan. Segment garbage and temporary-file cleanup
+  now track live canonical basenames and delete through the opened postings
+  directory, and manifest temp matching compares entry names against the
+  configured manifest basename in place, avoiding per-file path allocation while
+  scanning maintenance directories. Lazy segment base-data batch reads also use
   stack-backed newest-segment tracking for small unsorted manifests, so
   recovery/fallback snapshots do not allocate an extra segment-id array just to
   resolve winners.
