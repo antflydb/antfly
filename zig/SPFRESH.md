@@ -133,7 +133,8 @@ Current status:
   same exact-size/assume-capacity path for segment metadata entries. Directory
   compaction planning also pre-reserves its selected segment-id list from the
   manifest length and configured segment cap, avoiding growth churn while
-  choosing bounded compaction inputs, and manifest encode, replacement,
+  choosing bounded compaction inputs, and appends those planned ids through the
+  assume-capacity path. Manifest encode, replacement,
   summary, and planning can consume owned decoded manifest entries directly
   instead of allocating temporary borrowed-entry views. Whole-directory segment
   compaction now uses a replace-all manifest helper instead of allocating a

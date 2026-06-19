@@ -1702,7 +1702,7 @@ fn planDirectoryCompactionEntriesAlloc(alloc: Allocator, next_segment_id: u64, e
             stats.stopped_on_byte_limit = true;
             break;
         }
-        try selected_ids.append(alloc, entry.meta.segment_id);
+        selected_ids.appendAssumeCapacity(entry.meta.segment_id);
         selected_bytes = next_bytes;
         selected_entries += entry.meta.entry_count;
     }
