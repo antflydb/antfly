@@ -2208,6 +2208,10 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
     records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
     stats: *posting.PostingDeltaTailStats,
 ) !void {
+    if (min_generation) |generation| {
+        if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, generation)) return;
+    }
+
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
@@ -2239,6 +2243,8 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
     scratch: anytype,
     stats: *posting.PostingDeltaTailStats,
 ) !void {
+    if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, base_generation)) return;
+
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
@@ -2260,6 +2266,8 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
 }
 
 pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
+    if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, base_generation)) return .{};
+
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
@@ -6961,7 +6969,7 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
         .meta = committed_2.entry.meta,
         .path = committed_2.entry.path,
     }, 7, 2, &filtered_delta_scratch, &filtered_direct_stats);
-    try std.testing.expectEqual(@as(usize, 2), filtered_direct_stats.records);
+    try std.testing.expectEqual(@as(usize, 0), filtered_direct_stats.records);
     try std.testing.expectEqual(@as(usize, 0), filtered_direct_stats.records_after_generation);
     try std.testing.expectEqual(@as(usize, 0), filtered_delta_scratch.deltaRecordCount());
     try std.testing.expectEqual(@as(usize, 0), filtered_delta_scratch.delta_records.len);
@@ -7003,6 +7011,27 @@ pub fn testReadSegmentDeltaRecordsSkipsStaleSegmentByMetadata() !void {
     defer alloc.free(stale_records);
     try std.testing.expectEqual(@as(usize, 0), stale_records.len);
     try std.testing.expectError(error.CorruptedPostingSegment, readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 0));
+
+    var stale_records_with_stats = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+    defer stale_records_with_stats.deinit(alloc);
+    var stale_stats = posting.PostingDeltaTailStats{};
+    try readSegmentDeltaRecordsWithStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 1, &stale_records_with_stats, &stale_stats);
+    try std.testing.expectEqual(@as(usize, 0), stale_records_with_stats.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stale_stats.records);
+    try std.testing.expectError(error.CorruptedPostingSegment, readSegmentDeltaRecordsWithStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 0, &stale_records_with_stats, &stale_stats));
+
+    var stale_scratch = posting.PostingStore.FoldScratch{};
+    defer stale_scratch.deinit(alloc);
+    var stale_scratch_stats = posting.PostingDeltaTailStats{};
+    try readSegmentDeltaRecordsIntoScratchWithStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 1, &stale_scratch, &stale_scratch_stats);
+    try std.testing.expectEqual(@as(usize, 0), stale_scratch.deltaRecordCount());
+    try std.testing.expectEqual(@as(usize, 0), stale_scratch_stats.records);
+    try std.testing.expectError(error.CorruptedPostingSegment, readSegmentDeltaRecordsIntoScratchWithStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 0, &stale_scratch, &stale_scratch_stats));
+
+    const stats = try readSegmentDeltaTailStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 1);
+    try std.testing.expectEqual(@as(usize, 0), stats.records);
+    try std.testing.expectEqual(@as(usize, 0), stats.records_after_generation);
+    try std.testing.expectError(error.CorruptedPostingSegment, readSegmentDeltaTailStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 0));
 }
 
 test "posting segment filtered delta scratch grows by live records only" {
