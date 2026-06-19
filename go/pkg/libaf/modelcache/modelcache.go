@@ -450,9 +450,9 @@ func selectModelFiles(entries []hfTreeEntry, format, variant string) []hfTreeEnt
 		return nil
 	}
 	out := make([]hfTreeEntry, 0, len(support)+len(artifacts)+len(onnxData))
-	out = append(out, support...)
 	out = append(out, artifacts...)
 	out = append(out, onnxData...)
+	out = append(out, support...)
 	return out
 }
 

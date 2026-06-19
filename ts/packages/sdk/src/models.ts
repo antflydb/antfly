@@ -329,7 +329,7 @@ function selectModelFiles(entries: HuggingFaceTreeEntry[], format: string, varia
     }
   }
   if (artifacts.length === 0) return [];
-  return [...support, ...artifacts, ...onnxData];
+  return [...artifacts, ...onnxData, ...support];
 }
 
 async function downloadFile(

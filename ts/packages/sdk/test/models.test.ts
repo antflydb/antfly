@@ -131,6 +131,31 @@ describe("model helpers", () => {
     await expect(stat(join(root, "antflydb", "clipclap", "model_manifest.json"))).rejects.toThrow();
   });
 
+  it("does not write support files before artifacts succeed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
+    const fetchMock = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/api/models/antflydb/clipclap/tree/main?recursive=1")) {
+        return Response.json([
+          { path: "config.json", type: "file", size: 2 },
+          { path: "clipclap-Q4_K.gguf", type: "file", size: 4 },
+        ]);
+      }
+      if (url.endsWith("/antflydb/clipclap/resolve/main/config.json")) return new Response("{}");
+      return new Response("missing", { status: 404 });
+    };
+
+    await expect(
+      pullHuggingFaceModel("antflydb/clipclap:gguf:Q4_K", {
+        modelsDir: root,
+        huggingFaceBaseUrl: "https://hf.test",
+        fetch: fetchMock as typeof fetch,
+      })
+    ).rejects.toThrow(/downloading clipclap-Q4_K.gguf failed/);
+    await expect(stat(join(root, "antflydb", "clipclap", "config.json"))).rejects.toThrow();
+    await expect(stat(join(root, "antflydb", "clipclap", "model_manifest.json"))).rejects.toThrow();
+  });
+
   it("reports resume progress and resolved source for bare model refs", async () => {
     const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
     const dir = join(root, "antflydb", "clipclap");
