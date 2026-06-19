@@ -36,6 +36,7 @@ const flat_centroid_search_probe_stack_capacity = 512;
 const flat_centroid_posting_prefetch_stack_capacity = 512;
 const exact_leaf_fetch_member_stack_capacity = 256;
 const bulk_parent_child_ids_stack_capacity = 256;
+const rerank_flag_stack_capacity = 512;
 
 fn debugHitFromApprox(item: search_results.ApproxSearchResult) search_types.DebugHit {
     return .{
@@ -3390,12 +3391,18 @@ pub fn rerankResults(
     defer profile.rerank_ns += elapsed_fn_u64(start);
     const ranked_items = approx_results.items.items;
     const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
-    try scratch.ensureRerankFlagCapacity(self.alloc, ranked_items.len);
+    var rerank_flags_stack: [rerank_flag_stack_capacity]bool = undefined;
+    const rerank_flags = if (ranked_items.len <= rerank_flags_stack.len)
+        rerank_flags_stack[0..ranked_items.len]
+    else blk: {
+        try scratch.ensureRerankFlagCapacity(self.alloc, ranked_items.len);
+        break :blk scratch.rerank_flags[0..ranked_items.len];
+    };
 
     const prepare_start = now_fn_u64();
     search_mod.sortApproxResultsByDistance(ranked_items);
 
-    const rerank_selection = selectRerankCandidatesInto(scratch.rerank_flags[0..ranked_items.len], ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
+    const rerank_selection = selectRerankCandidatesInto(rerank_flags, ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
 
     profile.approx_candidate_count = ranked_items.len;
     profile.top_k_count = rerank_selection.top_k_count;

@@ -994,8 +994,10 @@ implementations cleanly:
    fallback leaves also collect vector-cache misses on stack scratch before
    falling back to retained member-id scratch, and their external batch scoring
    path uses stack metadata/lookup scratch for common miss counts before
-   growing the retained query slab. Posting-delta tail cache entries slab their
-   sequence/id/op arrays and discard oversized opportunistic prefetch entries
+   growing the retained query slab. Small rerank windows now keep boundary
+   rerank flags on stack instead of growing retained search scratch.
+   Posting-delta tail cache entries slab their sequence/id/op arrays and
+   discard oversized opportunistic prefetch entries
    instead of retaining large decoded tails in query scratch; prefetch also
    checks value record counts before record decode so oversized tails are
    skipped without building throwaway decoded arrays, and once a prefetched
