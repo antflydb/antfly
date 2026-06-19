@@ -10672,6 +10672,9 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "name: orderBy") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "enum: [none, referrals, auto]") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "Search requires query.text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "AntflyAuthorization:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "X-Antfly-Trusted-Principal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "MethodNotAllowed:") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "RegistryRoot") != null);
 
     var openapi_wrong_method = try server.handle(.{

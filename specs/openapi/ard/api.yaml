@@ -3,10 +3,17 @@ info:
   title: Antfly ARD Discovery API
   version: 1.0.0
   description: Tenant-scoped Agentic Resource Discovery catalog and registry API.
+security:
+  - AntflyAuthorization: []
+  - TrustedPrincipal: []
 paths:
   /.well-known/ai-catalog.json:
     get:
       summary: Fetch the ARD ai-catalog manifest
+      security:
+        - {}
+        - AntflyAuthorization: []
+        - TrustedPrincipal: []
       parameters:
         - $ref: '#/components/parameters/profile'
         - $ref: '#/components/parameters/types'
@@ -14,6 +21,8 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/Catalog'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1:
     get:
       summary: Fetch the Antfly ARD registry root
@@ -24,6 +33,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RegistryRoot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/catalog:
     get:
       summary: Fetch the authenticated tenant ARD catalog
@@ -34,12 +47,20 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/Catalog'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/openapi.yaml:
     get:
       summary: Fetch the ARD discovery OpenAPI document
       responses:
         '200':
           description: This OpenAPI document.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/openapi/{spec}.yaml:
     get:
       summary: Fetch an Antfly API OpenAPI document advertised by ARD
@@ -53,8 +74,14 @@ paths:
       responses:
         '200':
           description: OpenAPI YAML document.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
-          description: The spec is admin-only for this identity.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/search:
     post:
       summary: Search the authenticated tenant ARD catalog
@@ -71,8 +98,12 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/SearchResults'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '400':
           description: Invalid ARD search request. Search requires non-empty query.text.
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/explore:
     post:
       summary: Explore the authenticated tenant ARD catalog
@@ -89,6 +120,12 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/ExploreFacets'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          description: Invalid ARD explore request.
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/agents:
     get:
       summary: List visible agent-like ARD resources
@@ -111,8 +148,12 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/Agents'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '400':
           description: Invalid ARD agents request.
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/skills/{skill}:
     get:
       summary: Fetch a tenant-scoped Antfly skill artifact
@@ -128,6 +169,12 @@ paths:
       responses:
         '200':
           description: Skill markdown.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/skills/extensions/{extension}/{skill}:
     get:
       summary: Fetch an extension-owned skill artifact
@@ -148,8 +195,12 @@ paths:
       responses:
         '200':
           description: Skill markdown.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
-          description: The extension skill is not visible to this identity.
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/resources/mcp/default:
     get:
       summary: Fetch the aggregate MCP resource descriptor
@@ -160,6 +211,12 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/McpDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/resources/mcp/extensions/{extension}:
     get:
       summary: Fetch an extension MCP resource descriptor
@@ -175,8 +232,12 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/McpDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
-          description: The extension MCP descriptor is not visible to this identity.
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/resources/mcp/profiles/{profile}:
     get:
       summary: Fetch a profile-scoped MCP resource descriptor
@@ -192,8 +253,12 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/McpDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
-          description: The profile has no visible tools for this identity.
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /ard/v1/resources/agents/extensions/{extension}/{agent}:
     get:
       summary: Fetch an extension agent resource descriptor
@@ -214,8 +279,12 @@ paths:
       responses:
         '200':
           $ref: '#/components/responses/AgentDescriptor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
-          description: The extension agent descriptor is not visible to this identity.
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
   /agents/v1/extensions/{extension}/{agent}/runs:
     post:
       summary: Start an extension agent run
@@ -223,6 +292,12 @@ paths:
         - $ref: '#/components/parameters/extension'
         - $ref: '#/components/parameters/agent'
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '501':
           description: The extension agent runtime is not enabled yet.
   /agents/v1/extensions/{extension}/{agent}/runs/{run_id}:
@@ -233,6 +308,12 @@ paths:
         - $ref: '#/components/parameters/agent'
         - $ref: '#/components/parameters/run_id'
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '501':
           description: The extension agent runtime is not enabled yet.
   /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/events:
@@ -243,6 +324,12 @@ paths:
         - $ref: '#/components/parameters/agent'
         - $ref: '#/components/parameters/run_id'
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '501':
           description: The extension agent runtime is not enabled yet.
   /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/cancel:
@@ -253,9 +340,26 @@ paths:
         - $ref: '#/components/parameters/agent'
         - $ref: '#/components/parameters/run_id'
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '501':
           description: The extension agent runtime is not enabled yet.
 components:
+  securitySchemes:
+    AntflyAuthorization:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Antfly HTTP authorization header, such as Basic credentials or an API key accepted by the deployment.
+    TrustedPrincipal:
+      type: apiKey
+      in: header
+      name: X-Antfly-Trusted-Principal
+      description: Signed trusted-principal token issued by an upstream identity layer.
   parameters:
     extension:
       name: extension
@@ -344,7 +448,36 @@ components:
           schema:
             type: object
             additionalProperties: true
+    Unauthorized:
+      description: Missing or invalid Antfly identity.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The authenticated identity cannot access this ARD resource.
+      content:
+        text/plain:
+          schema:
+            type: string
+    NotFound:
+      description: The resource is missing or not visible to this identity.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MethodNotAllowed:
+      description: Method not allowed for this ARD route.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
   schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
     Catalog:
       type: object
       required: [host, entries]
