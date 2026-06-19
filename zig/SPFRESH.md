@@ -1128,7 +1128,9 @@ implementations cleanly:
     delta records directly into retained scratch; folds collect tail stats in
     that same pass. Pending and committed segment delta entries now use their min
     sequence to select all-record stats/replay/latest-op paths when the whole
-    value is newer than the base generation. This removes the duplicate
+    value is newer than the base generation, and record-only segment delta loads
+    skip segment bytes entirely when manifest max-sequence metadata proves the
+    requested base generation already covers every delta in that segment. This removes the duplicate
     stats-then-replay scans, delta-location lists, and owned delta slices that
     existed before. Segment delta-tail stats also read a posting's contiguous
     delta-value range once per segment instead of issuing one range read per

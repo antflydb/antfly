@@ -2167,6 +2167,12 @@ pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entr
 }
 
 pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+    if (min_generation) |generation| {
+        if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, generation)) {
+            return try alloc.alloc(posting.PostingDeltaRecord, 0);
+        }
+    }
+
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
@@ -4197,6 +4203,10 @@ fn deltaValueFromEntryRange(range: DeltaValueRange, found: IndexEntry) ![]const 
     const value = range.data[relative_offset..relative_end];
     try found.location().verifyValue(value);
     return value;
+}
+
+fn segmentDeltaTailFullyAtOrBeforeGeneration(meta: SegmentMeta, generation: u64) bool {
+    return meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(meta.max_delta_sequence) <= generation;
 }
 
 fn latestDeltaValueRecordAfterGenerationForMember(
@@ -6986,6 +6996,35 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
     try std.testing.expectEqualSlices(posting.VectorId, materialized, scratch.member_ids[0..sorted_scratch_count]);
 }
 
+pub fn testReadSegmentDeltaRecordsSkipsStaleSegmentByMetadata() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stale_sequence = (@as(u64, 1) << 32) | 1;
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = stale_sequence, .op = .insert, .vector_id = 40 },
+    });
+    defer alloc.free(delta);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendDelta(7, stale_sequence, delta);
+    var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
+    defer committed.deinit(alloc);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed.entry.path,
+        .data = "not a segment",
+    });
+
+    const entry = ManifestEntry{ .meta = committed.entry.meta, .path = committed.entry.path };
+    const stale_records = try readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 1);
+    defer alloc.free(stale_records);
+    try std.testing.expectEqual(@as(usize, 0), stale_records.len);
+    try std.testing.expectError(error.CorruptedPostingSegment, readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 0));
+}
+
 test "posting segment filtered delta scratch grows by live records only" {
     const alloc = std.testing.allocator;
     const records = [_]posting.PostingDeltaRecord{
@@ -7857,6 +7896,10 @@ test "posting segment lazy directory store reads only candidate segments" {
 
 test "posting segment lazy directory store loads delta tail" {
     try testLazyDirectoryStoreLoadsDeltaTail();
+}
+
+test "posting segment delta record reads skip stale segment by metadata" {
+    try testReadSegmentDeltaRecordsSkipsStaleSegmentByMetadata();
 }
 
 test "posting segment lazy materialization sizes member scratch by live deltas" {

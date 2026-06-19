@@ -319,6 +319,10 @@ test "posting segment lazy directory store loads delta tail" {
     try posting_segment.testLazyDirectoryStoreLoadsDeltaTail();
 }
 
+test "posting segment delta record reads skip stale segment by metadata" {
+    try posting_segment.testReadSegmentDeltaRecordsSkipsStaleSegmentByMetadata();
+}
+
 test "posting segment typed base delta facade round trips through directory store" {
     try posting_segment.testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore();
 }
