@@ -11912,6 +11912,11 @@ components:
             - max
             - avg
             - array_agg
+            - string_agg
+            - percentile_cont
+            - percentile_disc
+            - bool_or
+            - bool_and
         field:
           type: string
           minLength: 1
@@ -11923,6 +11928,24 @@ components:
           type: integer
           format: int64
           minimum: 1
+        percentile:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Fraction for percentile_cont and percentile_disc aggregate specs.
+        percentile_max_items:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Maximum bounded per-group sample count for percentile_cont and percentile_disc.
+        percentile_order:
+          type: string
+          enum:
+            - asc
+            - desc
+          default: asc
+          description: Ordered-set sample direction for percentile_cont and percentile_disc.
         array_max_items:
           type: integer
           format: int64
@@ -11931,6 +11954,9 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RowsQueryOrder'
+        delimiter:
+          type: string
+          description: Delimiter for string_agg aggregate specs.
         filter:
           $ref: '#/components/schemas/RowsWhere'
         filter_array_any:

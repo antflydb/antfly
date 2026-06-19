@@ -32,6 +32,7 @@
     "aggregate_offset",
     "aggregate_order_using_operator",
     "aggregate_percentile_cont",
+    "aggregate_percentile_desc",
     "aggregate_percentile_disc",
     "aggregate_regexp_numeric_expression",
     "aggregate_regexp_text_expression",

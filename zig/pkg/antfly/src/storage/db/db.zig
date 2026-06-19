@@ -22800,7 +22800,12 @@ pub const DB = struct {
                 if (metric.percentile_samples.items.len == 0) return try writer.writeAll("null");
                 const percentile = spec.percentile orelse return error.InvalidQueryRequest;
                 if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.InvalidQueryRequest;
-                std.sort.pdq(f64, metric.percentile_samples.items, {}, relationalRowsAggregateF64LessThan);
+                std.sort.pdq(
+                    f64,
+                    metric.percentile_samples.items,
+                    spec.percentile_order,
+                    relationalRowsAggregateF64OrderedBefore,
+                );
                 const value = switch (spec.op) {
                     .percentile_cont => relationalRowsPercentileCont(metric.percentile_samples.items, percentile),
                     .percentile_disc => relationalRowsPercentileDisc(metric.percentile_samples.items, percentile),
@@ -22866,8 +22871,15 @@ pub const DB = struct {
         return lhs.ordinal < rhs.ordinal;
     }
 
-    fn relationalRowsAggregateF64LessThan(_: void, lhs: f64, rhs: f64) bool {
-        return lhs < rhs;
+    fn relationalRowsAggregateF64OrderedBefore(
+        direction: types.RelationalRowsQueryOrderDirection,
+        lhs: f64,
+        rhs: f64,
+    ) bool {
+        return switch (direction) {
+            .asc => lhs < rhs,
+            .desc => lhs > rhs,
+        };
     }
 
     fn relationalRowsPercentileCont(samples: []const f64, percentile: f64) f64 {
@@ -90868,6 +90880,8 @@ test "relational rows aggregate supports bounded percentile continuous metrics" 
         .{ .name = "median_total", .op = .percentile_cont, .expression = .{ .kind = .add, .operands = amount_bonus_operands[0..] }, .percentile = 0.5, .percentile_max_items = 8 },
         .{ .name = "p75_disc_amount", .op = .percentile_disc, .field = "amount", .percentile = 0.75, .percentile_max_items = 8 },
         .{ .name = "p50_disc_total", .op = .percentile_disc, .expression = .{ .kind = .add, .operands = amount_bonus_operands[0..] }, .percentile = 0.5, .percentile_max_items = 8 },
+        .{ .name = "p25_amount_desc", .op = .percentile_cont, .field = "amount", .percentile = 0.25, .percentile_order = .desc, .percentile_max_items = 8 },
+        .{ .name = "p75_disc_amount_desc", .op = .percentile_disc, .field = "amount", .percentile = 0.75, .percentile_order = .desc, .percentile_max_items = 8 },
     };
     const order_by = [_]types.RelationalRowsQueryOrder{.{
         .field = "customer",
@@ -90882,8 +90896,8 @@ test "relational rows aggregate supports bounded percentile continuous metrics" 
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"median_amount\":20,\"p25_amount\":15,\"median_total\":22,\"p75_disc_amount\":40,\"p50_disc_total\":22}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"median_amount\":10,\"p25_amount\":8.5,\"median_total\":12,\"p75_disc_amount\":13,\"p50_disc_total\":8}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"median_amount\":20,\"p25_amount\":15,\"median_total\":22,\"p75_disc_amount\":40,\"p50_disc_total\":22,\"p25_amount_desc\":30,\"p75_disc_amount_desc\":10}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"median_amount\":10,\"p25_amount\":8.5,\"median_total\":12,\"p75_disc_amount\":13,\"p50_disc_total\":8,\"p25_amount_desc\":11.5,\"p75_disc_amount_desc\":7}", result.rows[1]);
 
     const capped_aggregations = [_]types.RelationalRowsAggregateSpec{.{
         .name = "median_amount",

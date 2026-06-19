@@ -4924,7 +4924,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
         defer if (combined_deleted_refs.len > 0) alloc.free(combined_deleted_refs);
 
         if (self.iceberg_delete_plan) |delete_plan| {
-            iceberg_deleted_refs = try serverless_query.readLakeIcebergPositionDeleteRowRefsAlloc(alloc, .{
+            iceberg_deleted_refs = try serverless_query.readLakeIcebergDeleteRowRefsAlloc(alloc, .{
                 .reader = self.object_reader.parquetReader(),
                 .client = self.object_reader.client,
                 .cache = self.cache,

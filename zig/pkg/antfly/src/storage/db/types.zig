@@ -1910,6 +1910,7 @@ pub const RelationalRowsAggregateSpec = struct {
     distinct_max_items: u32 = default_relational_rows_aggregate_distinct_max_items,
     percentile: ?f64 = null,
     percentile_max_items: u32 = 0,
+    percentile_order: RelationalRowsQueryOrderDirection = .asc,
     array_max_items: u32 = 0,
     array_order_by: []const RelationalRowsQueryOrder = &.{},
     string_delimiter: ?[]const u8 = null,

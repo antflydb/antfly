@@ -7815,8 +7815,16 @@ pub const RowsAggregateSpec = struct {
     expr: ?RowsExpression = null,
     distinct: ?bool = null,
     distinct_max_items: ?i64 = null,
+    /// Fraction for percentile_cont and percentile_disc aggregate specs.
+    percentile: ?f64 = null,
+    /// Maximum bounded per-group sample count for percentile_cont and percentile_disc.
+    percentile_max_items: ?i64 = null,
+    /// Ordered-set sample direction for percentile_cont and percentile_disc.
+    percentile_order: ?[]const u8 = null,
     array_max_items: ?i64 = null,
     array_order_by: ?[]const RowsQueryOrder = null,
+    /// Delimiter for string_agg aggregate specs.
+    delimiter: ?[]const u8 = null,
     filter: ?RowsWhere = null,
     /// Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`.
     filter_array_any: ?[]const RowsWhereAtom = null,
