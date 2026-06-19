@@ -6495,7 +6495,8 @@ validation work use the same design shape: catalog mutation emits typed work,
 metadata owns the durable job, workers claim work through first-class
 begin/finish/invalidate metadata transitions with retry after expired leases,
 and table-schema compare-and-swap promotion rejects matching-generation
-rewrite jobs until every one is complete.
+rewrite jobs until every one is complete, then consumes those completed job
+records atomically with the promoted table image.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from

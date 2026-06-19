@@ -3042,13 +3042,16 @@ pub const RaftApplyStore = struct {
         });
     }
 
-    fn requireSchemaRewriteJobsCompleteForTableGenerationTxn(
+    fn collectCompletedSchemaRewriteJobIdsForTableGenerationTxn(
         self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         table_id: u64,
         schema_generation: u64,
-    ) !void {
+    ) ![]u64 {
+        var job_ids = std.ArrayListUnmanaged(u64).empty;
+        errdefer job_ids.deinit(alloc);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try schemaRewriteJobPrefixForGroup(&prefix_buf, group_id);
         var cur = try txn.openCursor();
@@ -3061,7 +3064,9 @@ pub const RaftApplyStore = struct {
             if (record.table_id != table_id) continue;
             if (record.schema_generation != schema_generation) continue;
             if (!metadata_table_manager.schemaRewriteJobComplete(record)) return error.SchemaRewriteJobsIncomplete;
+            try job_ids.append(alloc, record.job_id);
         }
+        return try job_ids.toOwnedSlice(alloc);
     }
 
     fn applySecondaryIndexReadyPromotionTxn(
@@ -3116,16 +3121,19 @@ pub const RaftApplyStore = struct {
 
         if (!std.mem.eql(u8, current.name, request.promoted_table.name)) return error.InvalidTableSchemaCompareAndSwapRequest;
         if (!std.mem.eql(u8, current.schema_json, request.expected_schema_json)) return;
-        try self.requireSchemaRewriteJobsCompleteForTableGenerationTxn(
+        const completed_rewrite_job_ids = try self.collectCompletedSchemaRewriteJobIdsForTableGenerationTxn(
+            self.alloc,
             txn,
             group_id,
             request.table_id,
             metadata_table_manager.schemaRewriteGenerationForSchemaJson(request.expected_schema_json),
         );
+        defer if (completed_rewrite_job_ids.len > 0) self.alloc.free(completed_rewrite_job_ids);
 
         const value = try encodeTableRecord(self.alloc, request.promoted_table);
         defer self.alloc.free(value);
         try txn.put(key, value);
+        for (completed_rewrite_job_ids) |job_id| try self.deleteSchemaRewriteJobTxn(txn, group_id, job_id);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{
             .kind = .table,
@@ -7874,6 +7882,9 @@ test "metadata raft apply store gates table schema compare and swap on rewrite j
     defer ready_store.freeTables(std.testing.allocator, tables);
     try std.testing.expectEqual(@as(usize, 1), tables.len);
     try std.testing.expectEqualStrings(promoted_schema, tables[0].schema_json);
+    const jobs = try ready_store.listSchemaRewriteJobs(std.testing.allocator, 61);
+    defer ready_store.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 0), jobs.len);
 }
 
 test "metadata raft apply store rejects reserved data group ids in transition records" {
