@@ -617,6 +617,7 @@ fn deinitFlatCentroidEntries(alloc: std.mem.Allocator, entries: *std.ArrayListUn
         if (entry.sort_key_storage.len != 0) alloc.free(entry.sort_key_storage);
     }
     entries.deinit(alloc);
+    entries.* = .empty;
 }
 
 fn flatCentroidEntryLess(ctx: FlatCentroidEntrySortContext, lhs: FlatCentroidEntry, rhs: FlatCentroidEntry) bool {
@@ -691,7 +692,8 @@ fn appendFlatCentroidBlocksFromEntries(
     dims: usize,
     block_size: usize,
 ) !usize {
-    if (entries.items.len == 0) return 0;
+    const posting_count = entries.items.len;
+    if (posting_count == 0) return 0;
     if (self.config.centroid_directory_mode == .two_level_rabitq and entries.items.len > block_size and dims > 0) {
         const sorted_by_hilbert = try populateFlatCentroidHilbertSortKeys(self, entries.items, dims);
         const sort_dim = if (sorted_by_hilbert) 0 else chooseFlatCentroidSortDimension(entries.items, dims);
@@ -739,7 +741,8 @@ fn appendFlatCentroidBlocksFromEntries(
     if (block_count > 0) {
         try appendFlatCentroidBlock(self, blocks, posting_ids[0..block_count], parents[0..block_count], levels[0..block_count], states[0..block_count], radii[0..block_count], centroids[0 .. block_count * dims], dims, posting_offset);
     }
-    return entries.items.len;
+    deinitFlatCentroidEntries(self.alloc, entries);
+    return posting_count;
 }
 
 fn finalizeFlatCentroidDirectory(
