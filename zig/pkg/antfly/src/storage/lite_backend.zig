@@ -33,6 +33,10 @@ pub const OpenOptions = struct {
     read_only: bool = false,
 };
 
+pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
+    return try lsm_backend.AfliteContainerStorage.checkFile(allocator, path);
+}
+
 pub const Handle = struct {
     allocator: Allocator,
     engine: EngineKind,

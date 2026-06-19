@@ -27,42 +27,34 @@ const query_api = antfly.public_api.query;
 const portable_backup = antfly.portable_backup;
 
 const LiteDb = struct {
-    allocator: Allocator,
-    storage: *antfly.lsm_backend.AfliteContainerStorage,
+    backend: antfly.lite_backend.Handle,
     db: db_mod.DB,
 
     fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !LiteDb {
-        var storage = try allocator.create(antfly.lsm_backend.AfliteContainerStorage);
-        errdefer allocator.destroy(storage);
-
-        storage.* = try antfly.lsm_backend.AfliteContainerStorage.openWithOptions(allocator, path, .{
+        var backend = try antfly.lite_backend.Handle.open(allocator, path, .{
             .read_only = openModeRequiresReadOnlyBackends(open_mode),
         });
-        errdefer storage.deinit();
+        errdefer backend.deinit();
 
         var opts = db_mod.OpenOptions{
             .open_mode = open_mode,
             .external_derived_checkpoints = false,
         };
-        pinLiteStorage(&opts, storage.storage());
+        backend.configureDbOpenOptions(&opts);
 
         const db = db_mod.DB.open(allocator, path, opts) catch |err| {
-            storage.deinit();
-            allocator.destroy(storage);
             return err;
         };
 
         return .{
-            .allocator = allocator,
-            .storage = storage,
+            .backend = backend,
             .db = db,
         };
     }
 
     fn close(self: *LiteDb) void {
         self.db.close();
-        self.storage.deinit();
-        self.allocator.destroy(self.storage);
+        self.backend.deinit();
         self.* = undefined;
     }
 };
@@ -517,7 +509,7 @@ fn check(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    const report = try antfly.lsm_backend.AfliteContainerStorage.checkFile(allocator, path);
+    const report = try antfly.lite_backend.checkFile(allocator, path);
     const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
@@ -531,18 +523,10 @@ fn vacuum(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
 
-    const report = try lite.storage.vacuum();
+    const report = try lite.backend.vacuum();
     const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
-}
-
-fn pinLiteStorage(opts: *db_mod.OpenOptions, storage: antfly.lsm_backend.Storage) void {
-    opts.storage = storage;
-    opts.index_backends.text_lsm_storage = storage;
-    opts.index_backends.dense_lsm_storage = storage;
-    opts.index_backends.sparse_lsm_storage = storage;
-    opts.index_backends.graph_lsm_storage = storage;
 }
 
 fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
