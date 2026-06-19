@@ -2124,7 +2124,7 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    self.cfg.ard_base_url,
+                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
@@ -10619,6 +10619,13 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
 
+    var skill_filtered_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default?types=application/ai-skill+md",
+    });
+    defer skill_filtered_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), skill_filtered_mcp_resource.status);
+
     var registry_root = try server.handle(.{
         .method = .GET,
         .uri = routes.Routes.ard_v1,
@@ -11146,6 +11153,14 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_memories\"") == null);
 
+    var skill_filtered_extension_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/docsaf?include=skills",
+        .headers = &trusted_principal_headers,
+    });
+    defer skill_filtered_extension_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), skill_filtered_extension_mcp_resource.status);
+
     var hidden_extension_mcp_resource = try server.handle(.{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/memoryaf",
@@ -11258,6 +11273,14 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_memories\"") == null);
+
+    var skill_filtered_profile_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/profiles/copilot?types=application/ai-skill+md",
+        .headers = &trusted_principal_headers,
+    });
+    defer skill_filtered_profile_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), skill_filtered_profile_resource.status);
 
     const no_permission_payload = try std.fmt.allocPrint(
         std.testing.allocator,

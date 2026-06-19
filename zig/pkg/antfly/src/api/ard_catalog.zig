@@ -403,10 +403,11 @@ pub fn extensionSkillMarkdownAlloc(alloc: std.mem.Allocator, options: CatalogOpt
     return null;
 }
 
-pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, base_url: ?[]const u8, extension_context: ?ExtensionCatalogContext) !?[]u8 {
+pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, options: CatalogOptions, extension_context: ?ExtensionCatalogContext) !?[]u8 {
     if (std.mem.eql(u8, name, "profiles/copilot")) {
         if (!(try copilotMcpProfileVisible(alloc, extension_context))) return null;
-        return try copilotMcpProfileDescriptorJsonAlloc(alloc, base_url, extension_context);
+        if (!catalogOptionsAllowStaticEntry(options, copilot_mcp_profile_entry)) return null;
+        return try copilotMcpProfileDescriptorJsonAlloc(alloc, options.base_url, extension_context);
     }
     if (std.mem.startsWith(u8, name, "extensions/")) {
         const extension_name = name["extensions/".len..];
@@ -415,13 +416,15 @@ pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, base_u
         for (ctx.installed_extensions) |installed| {
             if (!std.mem.eql(u8, installed.name, extension_name)) continue;
             if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) return null;
-            return try extensionMcpDescriptorJsonAlloc(alloc, installed, base_url, ctx);
+            if (!catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" })) return null;
+            return try extensionMcpDescriptorJsonAlloc(alloc, installed, options.base_url, ctx);
         }
         return null;
     }
     if (!std.mem.eql(u8, name, "default")) return null;
     if (!(try aggregateMcpVisible(alloc, extension_context))) return null;
-    return try aggregateMcpDescriptorJsonAlloc(alloc, base_url, extension_context);
+    if (!catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry)) return null;
+    return try aggregateMcpDescriptorJsonAlloc(alloc, options.base_url, extension_context);
 }
 
 const SearchRequest = struct {
@@ -2487,19 +2490,19 @@ test "ARD MCP descriptors resolve endpoints against configured base url" {
         .extension_members = &members,
     };
 
-    const aggregate = (try mcpDescriptorJsonAlloc(std.testing.allocator, "default", "https://tenant.example.com/", ctx)).?;
+    const aggregate = (try mcpDescriptorJsonAlloc(std.testing.allocator, "default", .{ .base_url = "https://tenant.example.com/" }, ctx)).?;
     defer std.testing.allocator.free(aggregate);
     try std.testing.expect(std.mem.indexOf(u8, aggregate, "\"endpoint\":\"https://tenant.example.com/mcp/v1\"") != null);
 
-    const extension = (try mcpDescriptorJsonAlloc(std.testing.allocator, "extensions/docsaf", "https://tenant.example.com/", ctx)).?;
+    const extension = (try mcpDescriptorJsonAlloc(std.testing.allocator, "extensions/docsaf", .{ .base_url = "https://tenant.example.com/" }, ctx)).?;
     defer std.testing.allocator.free(extension);
     try std.testing.expect(std.mem.indexOf(u8, extension, "\"endpoint\":\"https://tenant.example.com/mcp/v1/extensions/docsaf\"") != null);
 
-    const profile = (try mcpDescriptorJsonAlloc(std.testing.allocator, "profiles/copilot", "https://tenant.example.com/", ctx)).?;
+    const profile = (try mcpDescriptorJsonAlloc(std.testing.allocator, "profiles/copilot", .{ .base_url = "https://tenant.example.com/" }, ctx)).?;
     defer std.testing.allocator.free(profile);
     try std.testing.expect(std.mem.indexOf(u8, profile, "\"endpoint\":\"https://tenant.example.com/mcp/v1/extensions/profiles/copilot\"") != null);
 
-    const local = (try mcpDescriptorJsonAlloc(std.testing.allocator, "default", null, ctx)).?;
+    const local = (try mcpDescriptorJsonAlloc(std.testing.allocator, "default", .{}, ctx)).?;
     defer std.testing.allocator.free(local);
     try std.testing.expect(std.mem.indexOf(u8, local, "\"endpoint\":\"/mcp/v1\"") != null);
 }
