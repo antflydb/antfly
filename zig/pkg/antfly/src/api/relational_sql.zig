@@ -12670,6 +12670,7 @@ const Parser = struct {
             std.ascii.eqlIgnoreCase(name, "max") or
             std.ascii.eqlIgnoreCase(name, "avg") or
             std.ascii.eqlIgnoreCase(name, "percentile_cont") or
+            std.ascii.eqlIgnoreCase(name, "percentile_disc") or
             std.ascii.eqlIgnoreCase(name, "array_agg") or
             std.ascii.eqlIgnoreCase(name, "string_agg") or
             std.ascii.eqlIgnoreCase(name, "bool_or") or
@@ -12696,7 +12697,7 @@ const Parser = struct {
             freeOrderBy(self.alloc, array_order_by.items);
             array_order_by.deinit(self.alloc);
         }
-        if (op == .percentile_cont) {
+        if (isSqlPercentileAggregateOp(op)) {
             if (distinct) return error.UnsupportedSqlShape;
             percentile = try self.parseAggregatePercentileValue();
             try self.expect(.rparen);
@@ -12750,7 +12751,7 @@ const Parser = struct {
                     switch (op) {
                         .count, .array_agg => {},
                         .string_agg => if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog,
-                        .sum, .avg, .percentile_cont => if (column.field_type != .numeric) return error.InvalidSqlCatalog,
+                        .sum, .avg, .percentile_cont, .percentile_disc => if (column.field_type != .numeric) return error.InvalidSqlCatalog,
                         .min, .max => if (!sqlAggregateMinMaxTypeAllowed(column.field_type)) return error.InvalidSqlCatalog,
                         .bool_or, .bool_and => if (column.field_type != .boolean) return error.InvalidSqlCatalog,
                     }
@@ -12769,7 +12770,7 @@ const Parser = struct {
             try self.expectKeyword("by");
             try self.parseOrderBy(&array_order_by);
         }
-        if (op != .percentile_cont) try self.expect(.rparen);
+        if (!isSqlPercentileAggregateOp(op)) try self.expect(.rparen);
         const filter = try self.parseAggregateFilterAlloc();
         var filter_transferred = false;
         errdefer if (!filter_transferred) {
@@ -12816,7 +12817,7 @@ const Parser = struct {
             .distinct = distinct,
             .distinct_max_items = if (distinct) db_mod.types.default_relational_rows_aggregate_distinct_max_items else 0,
             .percentile = percentile,
-            .percentile_max_items = if (op == .percentile_cont) db_mod.types.default_relational_rows_percentile_max_items else 0,
+            .percentile_max_items = if (isSqlPercentileAggregateOp(op)) db_mod.types.default_relational_rows_percentile_max_items else 0,
             .array_max_items = if (op == .array_agg or op == .string_agg) default_array_agg_max_items else 0,
             .array_order_by = try array_order_by.toOwnedSlice(self.alloc),
             .string_delimiter = string_delimiter,
@@ -13022,7 +13023,7 @@ const Parser = struct {
         switch (op) {
             .count, .array_agg => {},
             .string_agg => try self.validateTextRowExpression(expression),
-            .sum, .avg, .percentile_cont => try self.validateNumericRowExpression(expression),
+            .sum, .avg, .percentile_cont, .percentile_disc => try self.validateNumericRowExpression(expression),
             .min, .max => try self.validateAggregateMinMaxRowExpression(expression),
             .bool_or, .bool_and => try self.validateBooleanRowExpression(expression),
         }
@@ -26672,7 +26673,7 @@ const Parser = struct {
         return switch (aggregation.op) {
             .array_agg => .array,
             .string_agg => .keyword,
-            .count, .sum, .avg, .percentile_cont => .numeric,
+            .count, .sum, .avg, .percentile_cont, .percentile_disc => .numeric,
             .min, .max => try self.aggregateInputType(aggregation),
             .bool_or, .bool_and => .boolean,
         };
@@ -33976,6 +33977,7 @@ fn aggregateOpForName(name: []const u8) ?db_mod.types.RelationalRowsAggregateOp 
     if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
     if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
     if (std.ascii.eqlIgnoreCase(name, "percentile_cont")) return .percentile_cont;
+    if (std.ascii.eqlIgnoreCase(name, "percentile_disc")) return .percentile_disc;
     if (std.ascii.eqlIgnoreCase(name, "array_agg")) return .array_agg;
     if (std.ascii.eqlIgnoreCase(name, "string_agg")) return .string_agg;
     if (std.ascii.eqlIgnoreCase(name, "bool_or")) return .bool_or;
@@ -33991,11 +33993,16 @@ fn aggregateOpName(op: db_mod.types.RelationalRowsAggregateOp) []const u8 {
         .max => "max",
         .avg => "avg",
         .percentile_cont => "percentile_cont",
+        .percentile_disc => "percentile_disc",
         .array_agg => "array_agg",
         .string_agg => "string_agg",
         .bool_or => "bool_or",
         .bool_and => "bool_and",
     };
+}
+
+fn isSqlPercentileAggregateOp(op: db_mod.types.RelationalRowsAggregateOp) bool {
+    return op == .percentile_cont or op == .percentile_disc;
 }
 
 fn sqlJsonNumberAsF64(value: std.json.Value) ?f64 {
@@ -50159,7 +50166,7 @@ test "postgres sql adapter lowers exact percentile continuous aggregates" {
 
     var lowered = try lowerAggregateAlloc(
         alloc,
-        "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount, percentile_cont(0.9) WITHIN GROUP (ORDER BY amount - discount) AS p90_net FROM usage_records GROUP BY customer",
+        "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount, percentile_cont(0.9) WITHIN GROUP (ORDER BY amount - discount) AS p90_net, percentile_disc(0.75) WITHIN GROUP (ORDER BY amount) AS p75_amount FROM usage_records GROUP BY customer",
         schema,
         &.{},
     );
@@ -50167,7 +50174,7 @@ test "postgres sql adapter lowers exact percentile continuous aggregates" {
 
     try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.group_by.len);
     try std.testing.expectEqualStrings("customer", lowered.aggregate.group_by[0]);
-    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 3), lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, lowered.aggregate.aggregations[0].op);
     try std.testing.expectEqualStrings("median_amount", lowered.aggregate.aggregations[0].name);
     try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[0].field.?);
@@ -50177,16 +50184,14 @@ test "postgres sql adapter lowers exact percentile continuous aggregates" {
     try std.testing.expectEqualStrings("p90_net", lowered.aggregate.aggregations[1].name);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.aggregate.aggregations[1].expression.?.kind);
     try std.testing.expectEqual(@as(f64, 0.9), lowered.aggregate.aggregations[1].percentile.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_disc, lowered.aggregate.aggregations[2].op);
+    try std.testing.expectEqualStrings("p75_amount", lowered.aggregate.aggregations[2].name);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[2].field.?);
+    try std.testing.expectEqual(@as(f64, 0.75), lowered.aggregate.aggregations[2].percentile.?);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
         alloc,
         "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC) AS bad FROM usage_records",
-        schema,
-        &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
-        alloc,
-        "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY amount) AS bad FROM usage_records",
         schema,
         &.{},
     ));
