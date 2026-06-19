@@ -27,11 +27,11 @@ const query_api = antfly.public_api.query;
 const portable_backup = antfly.portable_backup;
 
 const LiteDb = struct {
-    backend: antfly.lite_backend.Handle,
+    backend: antfly.lite.backend.Handle,
     db: db_mod.DB,
 
     fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !LiteDb {
-        var backend = try antfly.lite_backend.Handle.open(allocator, path, .{
+        var backend = try antfly.lite.backend.Handle.open(allocator, path, .{
             .read_only = openModeRequiresReadOnlyBackends(open_mode),
         });
         errdefer backend.deinit();
@@ -509,7 +509,7 @@ fn check(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    const report = try antfly.lite_backend.checkFile(allocator, path);
+    const report = try antfly.lite.backend.checkFile(allocator, path);
     const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);

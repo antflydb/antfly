@@ -13,11 +13,12 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("db/db.zig");
-const lsm_backend = @import("lsm_backend/mod.zig");
+const db_mod = @import("../db/db.zig");
+const lsm_backend = @import("../lsm_backend/mod.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const native = @import("native.zig");
 pub const CheckReport = lsm_backend.AfliteContainerStorage.CheckReport;
 pub const VacuumReport = lsm_backend.AfliteContainerStorage.VacuumReport;
 

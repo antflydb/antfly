@@ -30,7 +30,7 @@ const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
 const schema_mod = antfly.schema;
-const lite_backend = antfly.lite_backend;
+const lite_backend = antfly.lite.backend;
 const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
 

@@ -29,8 +29,8 @@ const IndexBackendOptions = @TypeOf((db_mod.OpenOptions{}).index_backends);
 pub const types = support.db_types;
 pub const RemoteTemplateRenderConfig = template_remote_host.RenderConfig;
 pub const RemoteTemplateRenderer = template_remote_host.HostRenderer;
-pub const LiteCheckReport = support.lite_backend.CheckReport;
-pub const LiteVacuumReport = support.lite_backend.VacuumReport;
+pub const LiteCheckReport = support.lite.backend.CheckReport;
+pub const LiteVacuumReport = support.lite.backend.VacuumReport;
 
 pub const OpenOptions = struct {
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -66,7 +66,7 @@ pub const DB = struct {
     allocator: Allocator,
     inner: db_mod.DB,
     profile: Profile,
-    owned_lite_backend: ?support.lite_backend.Handle = null,
+    owned_lite_backend: ?support.lite.backend.Handle = null,
 
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return try openWithProfile(alloc, path, opts, .native);
@@ -93,7 +93,7 @@ pub const DB = struct {
     }
 
     pub fn openLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
-        var lite_backend = try support.lite_backend.Handle.open(alloc, path, .{
+        var lite_backend = try support.lite.backend.Handle.open(alloc, path, .{
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
         });
         errdefer lite_backend.deinit();
