@@ -215,6 +215,145 @@ pub fn removeEnrichmentFromTableIndexesJson(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn collectArtifactEnrichmentsFromTableIndexesJson(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+) ![]db_mod.types.EnrichmentConfig {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
+    defer parsed.deinit();
+
+    var out = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
+    errdefer {
+        for (out.items) |*cfg| cfg.deinit(alloc);
+        out.deinit(alloc);
+    }
+    try collectArtifactEnrichmentsFromValue(alloc, parsed.value, &out);
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn validateArtifactEnrichmentsForTableIndexesJson(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+) !void {
+    const enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try validateArtifactEnrichmentConfigs(enrichments);
+}
+
+pub fn validateArtifactEnrichmentConfigs(configs: []const db_mod.types.EnrichmentConfig) !void {
+    for (configs, 0..) |cfg, i| {
+        try validateArtifactEnrichmentConfigShape(cfg);
+        for (configs[0..i]) |prior| {
+            if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
+            if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
+        }
+        if (cfg.full_text_index and cfg.kind != .chunk) return error.InvalidEnrichmentConfig;
+        switch (cfg.kind) {
+            .chunk => {
+                if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .asset, cfg.source_artifact_name) == null) {
+                    return error.InvalidEnrichmentConfig;
+                }
+            },
+            .embedding => {
+                if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .chunk, cfg.source_artifact_name) == null) {
+                    return error.InvalidEnrichmentConfig;
+                }
+            },
+            .asset => {},
+        }
+    }
+}
+
+pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentConfig) void {
+    std.mem.sort(db_mod.types.EnrichmentConfig, configs, {}, artifactEnrichmentLessThan);
+}
+
+fn collectArtifactEnrichmentsFromValue(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("enrichments")) |enrichments| {
+                if (enrichments == .array) {
+                    for (enrichments.array.items) |item| {
+                        if (item != .object) continue;
+                        const parsed = try std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
+                            .allocate = .alloc_always,
+                            .ignore_unknown_fields = true,
+                        });
+                        defer parsed.deinit();
+                        var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
+                        errdefer owned.deinit(alloc);
+                        try out.append(alloc, owned);
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                try collectArtifactEnrichmentsFromValue(alloc, entry.value_ptr.*, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectArtifactEnrichmentsFromValue(alloc, item, out);
+        },
+        else => {},
+    }
+}
+
+fn validateArtifactEnrichmentConfigShape(cfg: db_mod.types.EnrichmentConfig) !void {
+    if (cfg.name.len == 0 or (cfg.field.len == 0 and cfg.template.len == 0)) return error.InvalidEnrichmentConfig;
+    switch (cfg.kind) {
+        .chunk => {
+            if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;
+        },
+        .embedding, .asset => {},
+    }
+}
+
+fn findArtifactEnrichmentConfig(
+    configs: []const db_mod.types.EnrichmentConfig,
+    kind: db_mod.types.EnrichmentKind,
+    name: []const u8,
+) ?db_mod.types.EnrichmentConfig {
+    for (configs) |cfg| {
+        if (cfg.kind == kind and std.mem.eql(u8, cfg.name, name)) return cfg;
+    }
+    return null;
+}
+
+fn artifactEnrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.EnrichmentConfig) bool {
+    return a.kind == b.kind and
+        std.mem.eql(u8, a.name, b.name) and
+        std.mem.eql(u8, a.field, b.field) and
+        std.mem.eql(u8, a.template, b.template) and
+        std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
+        a.expected_dims == b.expected_dims and
+        a.chunk_size == b.chunk_size and
+        a.chunk_overlap == b.chunk_overlap and
+        std.mem.eql(u8, a.chunker_json, b.chunker_json) and
+        a.full_text_index == b.full_text_index and
+        std.mem.eql(u8, a.content_type, b.content_type) and
+        std.mem.eql(u8, a.producer_json, b.producer_json);
+}
+
+fn artifactEnrichmentLessThan(_: void, lhs: db_mod.types.EnrichmentConfig, rhs: db_mod.types.EnrichmentConfig) bool {
+    const lhs_rank = artifactEnrichmentKindRank(lhs.kind);
+    const rhs_rank = artifactEnrichmentKindRank(rhs.kind);
+    if (lhs_rank != rhs_rank) return lhs_rank < rhs_rank;
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+fn artifactEnrichmentKindRank(kind: db_mod.types.EnrichmentKind) u8 {
+    return switch (kind) {
+        .asset => 0,
+        .chunk => 1,
+        .embedding => 2,
+    };
+}
+
 pub fn encodeIndexList(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -237,6 +376,7 @@ pub fn encodeIndexList(
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses);
@@ -320,6 +460,7 @@ pub fn encodeIndexConfigMap(
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -429,6 +570,10 @@ const ApiIndexType = enum {
 
 fn indexesJsonSource(indexes_json: []const u8) []const u8 {
     return if (indexes_json.len > 0) indexes_json else tables_api.default_indexes_json;
+}
+
+fn isReservedIndexMetadataEntry(name: []const u8) bool {
+    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
 
 fn expectedTableGroupIds(
@@ -2193,6 +2338,37 @@ test "index metadata helpers add replace and remove enrichments" {
     defer std.testing.allocator.free(removed);
     try std.testing.expect(std.mem.indexOf(u8, removed, "\"memory_embed\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, removed, "\"default\"") != null);
+}
+
+test "index metadata validates artifact enrichment graph" {
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(
+            std.testing.allocator,
+            "{\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"chunk_size\":512}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(
+            std.testing.allocator,
+            "{\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512}]}",
+        ),
+    );
+    try validateArtifactEnrichmentsForTableIndexesJson(
+        std.testing.allocator,
+        "{\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512},{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\"}]}",
+    );
+}
+
+test "index metadata rejects artifact enrichment deletion with dependents" {
+    const indexes_json = "{\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512}]}";
+    const removed = (try removeEnrichmentFromTableIndexesJson(std.testing.allocator, indexes_json, "units")).?;
+    defer std.testing.allocator.free(removed);
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, removed),
+    );
 }
 
 test "index encoders expose local shard runtime status" {

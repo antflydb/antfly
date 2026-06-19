@@ -5988,6 +5988,8 @@ const RemoteMetadataSource = struct {
                 .update_schema = remoteUpdateSchema,
                 .create_index = remoteCreateIndex,
                 .drop_index = remoteDropIndex,
+                .put_artifact_enrichment = remotePutArtifactEnrichment,
+                .delete_artifact_enrichment = remoteDeleteArtifactEnrichment,
                 .wait_table_lifecycle = remoteWaitTableLifecycle,
                 .wait_table_projection = remoteWaitTableProjection,
                 .install_extension = remoteInstallExtension,
@@ -6165,6 +6167,26 @@ const RemoteMetadataSource = struct {
                 try client.dropIndex(base_uri, ctx.table_name, ctx.index_name);
             }
         }.call, .{ .table_name = table_name, .index_name = index_name });
+        self.invalidateCache();
+    }
+
+    fn remotePutArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.putArtifactEnrichment(base_uri, ctx.table_name, ctx.artifact_name, ctx.enrichment_json);
+            }
+        }.call, .{ .table_name = table_name, .artifact_name = artifact_name, .enrichment_json = enrichment_json });
+        self.invalidateCache();
+    }
+
+    fn remoteDeleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.deleteArtifactEnrichment(base_uri, ctx.table_name, ctx.artifact_name);
+            }
+        }.call, .{ .table_name = table_name, .artifact_name = artifact_name });
         self.invalidateCache();
     }
 

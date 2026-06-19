@@ -4510,6 +4510,8 @@ pub const EnrichmentConfig = struct {
     chunk_overlap: ?i64 = null,
     /// Serialized chunker configuration for chunk enrichments.
     chunker_json: ?[]const u8 = null,
+    /// When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
+    full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
     /// Serialized asset producer configuration.
@@ -6614,6 +6616,8 @@ pub const TableStatus = struct {
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
     storage_status: StorageStatus,
+    /// Table-level generated artifact enrichments registered outside a specific index.
+    artifact_enrichments: ?[]const EnrichmentConfig = null,
 };
 
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.

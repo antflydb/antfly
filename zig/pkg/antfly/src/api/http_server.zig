@@ -355,6 +355,8 @@ pub const StatusSource = struct {
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
+        put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
+        delete_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) anyerror!void = null,
         wait_table_lifecycle: ?*const fn (ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) anyerror!void = null,
         wait_table_projection: ?*const fn (ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) anyerror!void = null,
         run_round: ?*const fn (ptr: *anyopaque) anyerror!void = null,
@@ -418,6 +420,16 @@ pub const StatusSource = struct {
     pub fn dropIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_index orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn putArtifactEnrichment(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+        const fn_ptr = self.vtable.put_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
+    }
+
+    pub fn deleteArtifactEnrichment(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+        const fn_ptr = self.vtable.delete_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
     }
 
     pub fn waitTableLifecycle(self: StatusSource, table_name: []const u8, expected: TableVisibility) !bool {
@@ -542,6 +554,14 @@ pub const StatusSource = struct {
                 return try dropIndexOnService(cast(ptr), alloc, table_name, index_name);
             }
 
+            fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void {
+                return try putArtifactEnrichmentOnService(cast(ptr), alloc, table_name, artifact_name, enrichment_json);
+            }
+
+            fn deleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) anyerror!void {
+                return try deleteArtifactEnrichmentOnService(cast(ptr), alloc, table_name, artifact_name);
+            }
+
             fn waitTableLifecycle(ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) anyerror!void {
                 return try cast(ptr).waitForTableLifecycle(table_name, switch (expected) {
                     .present => .present,
@@ -618,6 +638,8 @@ pub const StatusSource = struct {
             .update_schema = Gen.updateSchema,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
+            .put_artifact_enrichment = Gen.putArtifactEnrichment,
+            .delete_artifact_enrichment = Gen.deleteArtifactEnrichment,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
             .wait_table_projection = Gen.waitTableProjection,
             .run_round = Gen.runRound,
@@ -756,6 +778,35 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
 
     const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(indexes_json);
+    var updated_record = table.*;
+    updated_record.indexes_json = indexes_json;
+    try svc.upsertTable(updated_record);
+    try svc.runRound();
+}
+
+fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsEnrichment(&snapshot, table_name, artifact_name)) return error.ExtensionOwnedObject;
+
+    var updated_record = table.*;
+    updated_record.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
+    defer alloc.free(updated_record.indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
+    try svc.upsertTable(updated_record);
+    try svc.runRound();
+}
+
+fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsEnrichment(&snapshot, table_name, artifact_name)) return error.ExtensionOwnedObject;
+
+    const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
+    defer alloc.free(indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.upsertTable(updated_record);
@@ -3615,6 +3666,9 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .PUT) {
+            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicPutArtifactEnrichment(artifact_route.table_name, artifact_route.artifact_name, req.body);
+            }
             if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
                 const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid schema update request");
@@ -3683,6 +3737,9 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .DELETE) {
+            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDeleteArtifactEnrichment(artifact_route.table_name, artifact_route.artifact_name);
+            }
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
                 return try self.handlePublicTableDeleteIndex(table_index.table_name, table_index.index_name);
             }
@@ -3745,10 +3802,9 @@ pub const ApiHttpServer = struct {
                         (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(arena_impl.allocator(), &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
                     return try jsonResponse(self.alloc, response);
                 }
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
-                return try jsonResponse(self.alloc, response);
+                const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
+                defer self.alloc.free(body);
+                return try jsonBodyResponseWithStatus(self.alloc, 200, body);
             }
         }
         if (req.method == .DELETE) {
@@ -5019,6 +5075,8 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
+                .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
                 .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
                 .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
                 .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
@@ -5851,6 +5909,77 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn executePublicPutArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const table_before = (self.loadOwnedTableRecord(table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        defer metadata_table_manager.freeTable(alloc, table_before);
+        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
+            return error.InvalidEnrichmentRequest;
+        };
+        defer alloc.free(enrichment_json);
+
+        const expected_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+        defer alloc.free(expected_indexes_json);
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+
+        self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
+            error.TableNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
+            error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => {
+                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                return error.InternalFailure;
+            },
+        };
+        self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
+            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+            return error.InternalFailure;
+        };
+    }
+
+    fn executePublicDeleteArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteDeleteArtifactEnrichmentError!void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const table_before = (self.loadOwnedTableRecord(table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        defer metadata_table_manager.freeTable(alloc, table_before);
+        const expected_indexes_json = (indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table_before.indexes_json, artifact_name) catch return error.InternalFailure) orelse {
+            return error.NotFound;
+        };
+        defer alloc.free(expected_indexes_json);
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+
+        self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
+            error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
+            error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+        self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch {
+            return error.InternalFailure;
+        };
+    }
+
     fn executePublicDocumentArtifactManifest(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6353,6 +6482,38 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicTableDeleteIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8) !http_common.HttpResponse {
         var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            201 => blk: {
+                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_impl.deinit();
+                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
+                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
+            },
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicPutArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        var resp = try public_table_http.handlePutArtifactEnrichment(self.alloc, table_name, artifact_name, body, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            201 => blk: {
+                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_impl.deinit();
+                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
+                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
+            },
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicDeleteArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        var resp = try public_table_http.handleDeleteArtifactEnrichment(self.alloc, table_name, artifact_name, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -6929,6 +7090,8 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
         error.InvalidExtensionEnrichment,
+        error.InvalidEnrichmentConfig,
+        error.ConflictingEnrichmentConfig,
         error.InvalidExtensionLifecycleRequest,
         error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
@@ -7139,6 +7302,16 @@ fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: [
     return false;
 }
 
+fn extensionOwnsEnrichment(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, enrichment_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionEnrichmentMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, enrichment_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
     for (snapshot.extension_members) |member| {
         if (member.object_kind != .table_schema) continue;
@@ -7233,6 +7406,7 @@ fn planExtensionStorageMemberDeltaAlloc(
         }
 
         if (!changed) continue;
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, owned_indexes_json.?);
         var updated_record = try metadata_table_manager.cloneTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, updated_record);
         alloc.free(@constCast(updated_record.indexes_json));
@@ -7528,6 +7702,14 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .permission_type = switch (method) {
             .POST => .admin,
             .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactEnrichment(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .PUT, .DELETE => .admin,
+            .GET, .POST => return null,
         },
     };
     if (routes.Routes.matchTablePath(path)) |table_path| {
@@ -9517,6 +9699,52 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual_embed\"") != null);
     try std.testing.expectEqual(@as(usize, 1), service.installed_removes);
     try std.testing.expectEqual(@as(usize, 2), service.member_removes);
+}
+
+test "extension lifecycle storage delta validates artifact enrichment dependencies" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"document_units_v1\",\"chunk_size\":512}]}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const source_only = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "docaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .enrichment,
+        .object_name = "document_units_v1",
+        .table_name = "docs",
+    }};
+
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        planExtensionStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, source_only[0..], &.{}),
+    );
+
+    const source_and_dependent = [_]extension_domain.ExtensionMember{
+        source_only[0],
+        .{
+            .extension_name = "docaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .enrichment,
+            .object_name = "document_chunks_v1",
+            .table_name = "docs",
+        },
+    };
+    const updates = try planExtensionStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, source_and_dependent[0..], &.{});
+    defer freeExtensionLifecycleTables(std.testing.allocator, updates);
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_units_v1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_chunks_v1") == null);
 }
 
 test "direct index deletion rejects extension-owned indexes" {

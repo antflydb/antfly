@@ -295,6 +295,7 @@ fn planStorageMemberDeltaAlloc(
         }
 
         if (!changed) continue;
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, owned_indexes_json.?);
         var updated_record = try metadata_table_manager.cloneTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, updated_record);
         alloc.free(@constCast(updated_record.indexes_json));
@@ -485,4 +486,74 @@ fn installedExists(installed_extensions: []const extension_domain.InstalledExten
         if (std.mem.eql(u8, installed.name, name)) return true;
     }
     return false;
+}
+
+test "extension lifecycle rejects removing referenced artifact enrichment" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"document_units_v1\",\"chunk_size\":512}]}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const old_members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "docaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .enrichment,
+        .object_name = "document_units_v1",
+        .table_name = "docs",
+    }};
+
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        planStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, old_members[0..], &.{}),
+    );
+}
+
+test "extension lifecycle allows cascading artifact enrichment removal in one delta" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"document_units_v1\",\"chunk_size\":512}]}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const old_members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "docaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .enrichment,
+            .object_name = "document_units_v1",
+            .table_name = "docs",
+        },
+        .{
+            .extension_name = "docaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .enrichment,
+            .object_name = "document_chunks_v1",
+            .table_name = "docs",
+        },
+    };
+
+    const updates = try planStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, old_members[0..], &.{});
+    defer freeLifecycleTables(std.testing.allocator, updates);
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_units_v1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_chunks_v1") == null);
 }

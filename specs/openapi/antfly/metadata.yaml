@@ -3295,6 +3295,11 @@ components:
           properties:
             storage_status:
               $ref: "#/components/schemas/StorageStatus"
+            artifact_enrichments:
+              type: array
+              description: Table-level generated artifact enrichments registered outside a specific index.
+              items:
+                $ref: "indexes.yaml#/components/schemas/EnrichmentConfig"
     TransformOpType:
       type: string
       enum:
@@ -8077,6 +8082,79 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DocumentArtifactTableReprocessResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/artifacts/{artifactName}/enrichment:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Stable generated artifact name.
+        schema:
+          type: string
+    put:
+      summary: Register or replace an artifact enrichment
+      description: |
+        Registers a table-level generated artifact definition. Reusing the same
+        artifact name replaces the existing mapping. Chunk enrichments may set
+        `full_text_index: true` to map generated chunk text into the table's
+        default full-text index.
+      tags:
+        - index_management
+      operationId: putArtifactEnrichment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/EnrichmentConfig"
+      responses:
+        "201":
+          description: Artifact enrichment registered
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Delete an artifact enrichment
+      description: |
+        Removes the table-level generated artifact definition. Local table
+        reconciliation drops no-longer-desired enrichment registrations when it
+        is safe to do so.
+      tags:
+        - index_management
+      operationId: deleteArtifactEnrichment
+      responses:
+        "201":
+          description: Artifact enrichment deleted
+          content:
+            application/json:
+              schema:
+                type: object
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":

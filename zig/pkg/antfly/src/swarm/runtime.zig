@@ -208,6 +208,8 @@ const LocalSwarmMetadata = struct {
                 .update_schema = updateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
+                .put_artifact_enrichment = putArtifactEnrichment,
+                .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .wait_table_lifecycle = waitTableLifecycle,
                 .wait_table_projection = waitTableProjection,
                 .run_round = runRound,
@@ -420,6 +422,35 @@ const LocalSwarmMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const indexes_json = (try antfly.public_api.indexes.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        var updated = table.*;
+        updated.indexes_json = indexes_json;
+        try self.manager.upsertTable(updated);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
+        var updated = table.*;
+        updated.indexes_json = try antfly.public_api.indexes.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
+        defer alloc.free(updated.indexes_json);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try self.manager.upsertTable(updated);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn deleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
+        const indexes_json = (try antfly.public_api.indexes.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
+        defer alloc.free(indexes_json);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try self.manager.upsertTable(updated);
