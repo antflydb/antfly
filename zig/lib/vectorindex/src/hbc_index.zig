@@ -2566,6 +2566,12 @@ fn prefetchFlatProbePostingMembers(
     profile.posting_overlay_ns += elapsed_fn_u64(prefetch_start);
 }
 
+fn resolveFlatCentroidProbeLimit(configured_probe_count: usize, search_width: u32) usize {
+    const dynamic_limit = @max(@as(usize, @intCast(search_width)), @as(usize, 1));
+    if (configured_probe_count == 0) return dynamic_limit;
+    return @min(configured_probe_count, dynamic_limit);
+}
+
 pub fn search(self: anytype, query: []const f32, k: usize, now_fn_u64: fn () u64, elapsed_fn_u64: fn (u64) u64) !search_results.SearchResults {
     const profiled = try searchProfiledRequest(self, .{ .query = query, .k = k }, now_fn_u64, elapsed_fn_u64);
     return profiled.results;
@@ -2659,11 +2665,7 @@ pub fn searchProfiledRequest(
     profile.setup_ns += elapsed_fn_u64(setup_start);
 
     if (self.config.centroid_directory_mode != .hbc and self.config.use_quantization) {
-        const configured_probe_count = if (self.config.flat_centroid_probe_count != 0)
-            self.config.flat_centroid_probe_count
-        else
-            @as(usize, @intCast(search_width));
-        const probe_limit = @max(configured_probe_count, @as(usize, 1));
+        const probe_limit = resolveFlatCentroidProbeLimit(self.config.flat_centroid_probe_count, search_width);
         var probes_stack: [flat_centroid_search_probe_stack_capacity]spfresh_index.FlatCentroidProbe = undefined;
         const use_probes_stack = probe_limit <= probes_stack.len;
         var probes = if (use_probes_stack)
@@ -4322,6 +4324,13 @@ test "boundary rerank threshold ambiguity selects retained approximate set" {
     const boundary = try selectRerankCandidates(std.testing.allocator, ranked_items[0..], req.k, req, .boundary);
     defer std.testing.allocator.free(boundary.flags);
     for (boundary.flags) |selected| try std.testing.expect(selected);
+}
+
+test "flat centroid probe limit follows dynamic search width under configured cap" {
+    try std.testing.expectEqual(@as(usize, 64), resolveFlatCentroidProbeLimit(0, 64));
+    try std.testing.expectEqual(@as(usize, 1), resolveFlatCentroidProbeLimit(0, 0));
+    try std.testing.expectEqual(@as(usize, 16), resolveFlatCentroidProbeLimit(256, 16));
+    try std.testing.expectEqual(@as(usize, 256), resolveFlatCentroidProbeLimit(256, 4096));
 }
 
 test "estimate quantized distances rejects stale quantized count" {
