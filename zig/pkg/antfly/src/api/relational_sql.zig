@@ -3605,10 +3605,12 @@ const Parser = struct {
         const endpoint = syntax.endpoint;
         const format = syntax.format;
         const header = syntax.header;
+        const delimiter = syntax.delimiter;
         syntax.table_name = "";
         syntax.columns = &.{};
         syntax.endpoint = "";
         syntax.format = null;
+        syntax.delimiter = null;
         return .{
             .direction = bulkIoDirectionFromSyntax(syntax.direction),
             .table_name = table_name,
@@ -3616,6 +3618,7 @@ const Parser = struct {
             .endpoint = endpoint,
             .format = format,
             .header = header,
+            .delimiter = delimiter,
         };
     }
 
@@ -45174,27 +45177,29 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("STDIN", copy_from_plan.endpoint);
     try std.testing.expectEqualStrings("csv", copy_from_plan.format.?);
     try std.testing.expect(!copy_from_plan.header);
+    try std.testing.expect(copy_from_plan.delimiter == null);
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false", copy_from_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default", copy_from_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
-    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);");
+    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',');");
     defer copy_from_header.deinit(alloc);
     const copy_from_header_plan = switch (copy_from_header) {
         .bulk_io => |plan| plan,
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(copy_from_header_plan.header);
+    try std.testing.expectEqualStrings(",", copy_from_header_plan.delimiter.?);
     const copy_from_header_fingerprint = try ddlFingerprintAlloc(alloc, copy_from_header);
     defer alloc.free(copy_from_header_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true", copy_from_header_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c", copy_from_header_fingerprint);
 
     var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv);");
     defer copy_to.deinit(alloc);
     const copy_to_fingerprint = try ddlFingerprintAlloc(alloc, copy_to);
     defer alloc.free(copy_to_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false", copy_to_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default", copy_to_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
@@ -56605,18 +56610,22 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 .{ revoke.object_kind, revoke.object_name, revoke.principal_name, revoke.privileges.len },
             ),
         },
-        .bulk_io => |plan| if (plan.format) |format|
-            try std.fmt.allocPrint(
-                alloc,
-                "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}",
-                .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header },
-            )
-        else
-            try std.fmt.allocPrint(
-                alloc,
-                "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}",
-                .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header },
-            ),
+        .bulk_io => |plan| blk: {
+            const delimiter_hex = try bulkIoDelimiterHexAlloc(alloc, plan.delimiter);
+            defer alloc.free(delimiter_hex);
+            break :blk if (plan.format) |format|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:delimiter_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, delimiter_hex },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:delimiter_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, delimiter_hex },
+                );
+        },
         .table_partition_catalog => |plan| switch (plan) {
             .create_partitioned => |create| try std.fmt.allocPrint(
                 alloc,
@@ -57205,6 +57214,12 @@ fn bulkIoDirectionName(direction: BulkIoDirection) []const u8 {
         .from => "from",
         .to => "to",
     };
+}
+
+fn bulkIoDelimiterHexAlloc(alloc: std.mem.Allocator, delimiter: ?[]const u8) ![]const u8 {
+    const value = delimiter orelse return try alloc.dupe(u8, "default");
+    if (value.len != 1) return error.UnsupportedSqlShape;
+    return try std.fmt.allocPrint(alloc, "{x:0>2}", .{value[0]});
 }
 
 fn tablePartitionMethodName(method: TablePartitionMethod) []const u8 {

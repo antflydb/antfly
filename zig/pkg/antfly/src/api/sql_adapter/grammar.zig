@@ -980,12 +980,14 @@ pub const BulkIoSyntax = struct {
     endpoint: []const u8,
     format: ?[]const u8 = null,
     header: bool = false,
+    delimiter: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.table_name));
         freeStringSlice(alloc, self.columns);
         alloc.free(@constCast(self.endpoint));
         if (self.format) |format| alloc.free(@constCast(format));
+        if (self.delimiter) |delimiter| alloc.free(@constCast(delimiter));
         self.* = undefined;
     }
 };
@@ -4861,8 +4863,11 @@ pub fn parseBulkIoTailAlloc(
 
     var format: ?[]const u8 = null;
     var header = false;
+    var delimiter: ?[]const u8 = null;
     var format_transferred = false;
+    var delimiter_transferred = false;
     errdefer if (!format_transferred) if (format) |value| alloc.free(@constCast(value));
+    errdefer if (!delimiter_transferred) if (delimiter) |value| alloc.free(@constCast(value));
     if (cursor.matchKeyword("with")) {
         try cursor.expectToken(.lparen);
         while (true) {
@@ -4876,6 +4881,14 @@ pub fn parseBulkIoTailAlloc(
                 } else if (std.ascii.eqlIgnoreCase(value.text, "false")) {
                     header = false;
                 } else return error.UnsupportedSqlShape;
+            } else if (cursor.matchKeyword("delimiter")) {
+                if (delimiter != null) return error.UnsupportedSqlShape;
+                const value = try parseSqlStringLiteralValueAlloc(alloc, cursor);
+                if (value.len != 1) {
+                    alloc.free(value);
+                    return error.UnsupportedSqlShape;
+                }
+                delimiter = value;
             } else return error.UnsupportedSqlShape;
             if (cursor.matchToken(.comma) != null) continue;
             break;
@@ -4887,6 +4900,7 @@ pub fn parseBulkIoTailAlloc(
     table_transferred = true;
     endpoint_transferred = true;
     format_transferred = true;
+    delimiter_transferred = true;
     return .{
         .direction = direction,
         .table_name = table_name,
@@ -4894,6 +4908,7 @@ pub fn parseBulkIoTailAlloc(
         .endpoint = endpoint,
         .format = format,
         .header = header,
+        .delimiter = delimiter,
     };
 }
 
@@ -8566,7 +8581,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
     try std.testing.expect(!copy_from.header);
 
-    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FORMAT csv);");
+    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FORMAT csv, DELIMITER ',');");
     defer lexer.freeTokens(alloc, &copy_header_tokens);
     var copy_header_pos: usize = 0;
     var copy_header = try parseBulkIoTailAlloc(alloc, copy_header_tokens.items, &copy_header_pos);
@@ -8575,6 +8590,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqual(BulkIoDirectionSyntax.from, copy_header.direction);
     try std.testing.expectEqualStrings("csv", copy_header.format.?);
     try std.testing.expect(copy_header.header);
+    try std.testing.expectEqualStrings(",", copy_header.delimiter.?);
 
     var copy_to_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records TO STDOUT;");
     defer lexer.freeTokens(alloc, &copy_to_tokens);
@@ -8589,7 +8605,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expect(copy_to.format == null);
     try std.testing.expect(!copy_to.header);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (DELIMITER ',');");
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (QUOTE '\"');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

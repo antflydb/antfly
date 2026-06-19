@@ -1665,12 +1665,14 @@ pub const BulkIoPlan = struct {
     endpoint: []const u8,
     format: ?[]const u8 = null,
     header: bool = false,
+    delimiter: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         freeStringSlice(alloc, self.columns);
         alloc.free(self.endpoint);
         if (self.format) |format| alloc.free(format);
+        if (self.delimiter) |delimiter| alloc.free(delimiter);
         self.* = undefined;
     }
 };

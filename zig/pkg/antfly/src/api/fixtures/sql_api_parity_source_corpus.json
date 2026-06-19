@@ -4153,19 +4153,19 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false",
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
     },
     {
-      "name": "copy from header bulk import ddl",
+      "name": "copy from header delimiter bulk import ddl",
       "family": "ddl",
       "summary": {
         "ddl_tag": "copy_from",
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true)"
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',')"
     },
     {
       "name": "copy to bulk export ddl",
@@ -4175,7 +4175,7 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false",
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv)"
     },
     {
@@ -4200,11 +4200,11 @@
       "sql": "COPY usage_records (id, status) TO STDIN"
     },
     {
-      "name": "unsupported copy delimiter option",
+      "name": "unsupported copy quote option",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=bulk_io_plan",
       "classification_reason": "bulk_io_plan",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (DELIMITER ',')"
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (QUOTE '\"')"
     },
     {
       "name": "create function catalog ddl",
