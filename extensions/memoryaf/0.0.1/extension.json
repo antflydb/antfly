@@ -92,6 +92,12 @@
         "config_json": "{\"displayName\":\"MemoryAF Memory\",\"description\":\"Store, list, and search durable MemoryAF memories through visible extension tools.\",\"profile\":\"copilot\",\"tags\":[\"memoryaf\",\"memory\"],\"capabilities\":[\"memory-store\",\"memory-search\",\"extension-tools\"],\"representativeQueries\":[\"remember this for later\",\"search my saved memories\",\"list memoryaf MCP tools\"],\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}],\"body\":\"# MemoryAF Memory\\n\\nUse this skill when an agent needs to store, list, or search memories through a visible MemoryAF extension.\\n\\nUse `/mcp/v1/extensions/memoryaf` or `/mcp/v1/extensions/profiles/copilot` only when the same Antfly identity can discover the MemoryAF MCP tools.\\n\\nDo not infer access to memories or memory tools that are not visible through the caller's Antfly identity.\\n\"}"
       },
       {
+        "kind": "agent",
+        "name": "research",
+        "shape": "search_memories_request",
+        "config_json": "{\"displayName\":\"MemoryAF Research Agent\",\"description\":\"Plan and answer with visible MemoryAF memories.\",\"profile\":\"copilot\",\"protocols\":[\"agents-api\",\"mcp-tool\",\"stream\"],\"tags\":[\"memoryaf\",\"memory\",\"research\"],\"capabilities\":[\"memory-search\",\"memory-research\",\"extension-agent\"],\"representativeQueries\":[\"research from my saved memories\",\"summarize relevant memories\"],\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}],\"handler\":\"wasm:memoryaf_wasm/research\",\"stream_handler\":\"wasm:memoryaf_wasm/research_stream\"}"
+      },
+      {
         "kind": "mcp_tool",
         "name": "store_memory",
         "shape": "store_memory_request",

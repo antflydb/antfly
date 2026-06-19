@@ -121,6 +121,7 @@ pub const ExtensionObjectKind = enum {
     resolver,
     mcp_tool,
     skill,
+    agent,
     query_function,
     api_endpoint,
     a2a_agent,
@@ -146,6 +147,7 @@ pub fn objectKindV1(kind: ExtensionObjectKind) bool {
         .resolver,
         .mcp_tool,
         .skill,
+        .agent,
         => true,
         else => false,
     };
@@ -1755,6 +1757,12 @@ test "extension package manifest validates data shape, mcp, and skill objects" {
         \\        "kind": "skill",
         \\        "name": "memory",
         \\        "config_json": "{\"displayName\":\"Memoryaf\",\"description\":\"Use Memoryaf for long-term memory.\",\"profile\":\"copilot\",\"capabilities\":[\"memory-search\"],\"body\":\"# Memoryaf\\n\\nUse this skill when long-term memory is installed and visible.\"}"
+        \\      },
+        \\      {
+        \\        "kind": "agent",
+        \\        "name": "research",
+        \\        "shape": "recall_request",
+        \\        "config_json": "{\"displayName\":\"Memoryaf Research\",\"description\":\"Research visible long-term memories.\",\"profile\":\"copilot\",\"protocols\":[\"agents-api\",\"stream\"],\"capabilities\":[\"memory-search\"],\"handler\":\"wasm:memoryaf/research\"}"
         \\      }
         \\    ],
         \\    "runtimes": [
@@ -1772,7 +1780,7 @@ test "extension package manifest validates data shape, mcp, and skill objects" {
 
     try std.testing.expectEqualStrings("memoryaf", parsed.value.name);
     try std.testing.expect(parsed.value.install.supportsScope(.table));
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.install.objects.len);
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.install.objects.len);
     try std.testing.expect(objectKindV1(parsed.value.install.objects[1].kind));
 
     var plan = try planManifestOnlyInstallAlloc(
@@ -1790,7 +1798,7 @@ test "extension package manifest validates data shape, mcp, and skill objects" {
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("memoryaf", plan.installed.name);
     try std.testing.expectEqualStrings("sha256:abc", plan.installed.package_digest);
-    try std.testing.expectEqual(@as(usize, 6), plan.members.len);
+    try std.testing.expectEqual(@as(usize, 7), plan.members.len);
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
     try std.testing.expectEqual(DataShapeKind.document, plan.members[0].shape_kind.?);
     try std.testing.expectEqualStrings("{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}", plan.members[0].owner_metadata_json);
@@ -1811,6 +1819,11 @@ test "extension package manifest validates data shape, mcp, and skill objects" {
     try std.testing.expectEqualStrings("memories", plan.members[5].table_name);
     try std.testing.expect(std.mem.indexOf(u8, plan.members[5].owner_metadata_json, "\"displayName\":\"Memoryaf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.members[5].owner_metadata_json, "\"profile\":\"copilot\"") != null);
+    try std.testing.expectEqual(.agent, plan.members[6].object_kind);
+    try std.testing.expectEqualStrings("research", plan.members[6].object_name);
+    try std.testing.expectEqualStrings("recall_request", plan.members[6].shape_name);
+    try std.testing.expectEqualStrings("memories", plan.members[6].table_name);
+    try std.testing.expect(std.mem.indexOf(u8, plan.members[6].owner_metadata_json, "\"protocols\":[\"agents-api\",\"stream\"]") != null);
 }
 
 test "extension catalog resolves unversioned installs to deterministic latest package" {

@@ -36,6 +36,7 @@ pub const Routes = struct {
     pub const mcp_v1_extensions = "/mcp/v1/extensions";
     pub const mcp_v1_extensions_prefix = "/mcp/v1/extensions/";
     pub const mcp_v1_extension_profiles_prefix = "/mcp/v1/extensions/profiles/";
+    pub const agents_v1_extensions_prefix = "/agents/v1/extensions/";
     pub const a2a = "/a2a";
     pub const ai_catalog = "/.well-known/ai-catalog.json";
     pub const ard_v1 = "/ard/v1";

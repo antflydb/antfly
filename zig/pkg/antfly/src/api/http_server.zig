@@ -285,8 +285,87 @@ const root_openapi_yaml =
     \\          $ref: '#/components/responses/McpDescriptor'
     \\        '404':
     \\          description: The profile has no visible tools for this identity.
+    \\  /ard/v1/resources/agents/extensions/{extension}/{agent}:
+    \\    get:
+    \\      summary: Fetch an extension agent resource descriptor
+    \\      parameters:
+    \\        - name: extension
+    \\          in: path
+    \\          required: true
+    \\          schema:
+    \\            type: string
+    \\        - name: agent
+    \\          in: path
+    \\          required: true
+    \\          schema:
+    \\            type: string
+    \\        - $ref: '#/components/parameters/profile'
+    \\        - $ref: '#/components/parameters/types'
+    \\        - $ref: '#/components/parameters/include'
+    \\      responses:
+    \\        '200':
+    \\          $ref: '#/components/responses/AgentDescriptor'
+    \\        '404':
+    \\          description: The extension agent descriptor is not visible to this identity.
+    \\  /agents/v1/extensions/{extension}/{agent}/runs:
+    \\    post:
+    \\      summary: Start an extension agent run
+    \\      parameters:
+    \\        - $ref: '#/components/parameters/extension'
+    \\        - $ref: '#/components/parameters/agent'
+    \\      responses:
+    \\        '501':
+    \\          description: The extension agent runtime is not enabled yet.
+    \\  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}:
+    \\    get:
+    \\      summary: Fetch extension agent run status
+    \\      parameters:
+    \\        - $ref: '#/components/parameters/extension'
+    \\        - $ref: '#/components/parameters/agent'
+    \\        - $ref: '#/components/parameters/run_id'
+    \\      responses:
+    \\        '501':
+    \\          description: The extension agent runtime is not enabled yet.
+    \\  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/events:
+    \\    get:
+    \\      summary: Stream extension agent run events
+    \\      parameters:
+    \\        - $ref: '#/components/parameters/extension'
+    \\        - $ref: '#/components/parameters/agent'
+    \\        - $ref: '#/components/parameters/run_id'
+    \\      responses:
+    \\        '501':
+    \\          description: The extension agent runtime is not enabled yet.
+    \\  /agents/v1/extensions/{extension}/{agent}/runs/{run_id}/cancel:
+    \\    post:
+    \\      summary: Cancel an extension agent run
+    \\      parameters:
+    \\        - $ref: '#/components/parameters/extension'
+    \\        - $ref: '#/components/parameters/agent'
+    \\        - $ref: '#/components/parameters/run_id'
+    \\      responses:
+    \\        '501':
+    \\          description: The extension agent runtime is not enabled yet.
     \\components:
     \\  parameters:
+    \\    extension:
+    \\      name: extension
+    \\      in: path
+    \\      required: true
+    \\      schema:
+    \\        type: string
+    \\    agent:
+    \\      name: agent
+    \\      in: path
+    \\      required: true
+    \\      schema:
+    \\        type: string
+    \\    run_id:
+    \\      name: run_id
+    \\      in: path
+    \\      required: true
+    \\      schema:
+    \\        type: string
     \\    profile:
     \\      name: profile
     \\      in: query
@@ -302,7 +381,7 @@ const root_openapi_yaml =
     \\    include:
     \\      name: include
     \\      in: query
-    \\      description: Comma-separated resource classes such as mcp, a2a, openapi, skills, extensions, registry, catalog.
+    \\      description: Comma-separated resource classes such as mcp, agents, a2a, openapi, skills, extensions, registry, catalog.
     \\      schema:
     \\        type: string
     \\    pageSize:
@@ -344,6 +423,13 @@ const root_openapi_yaml =
     \\            $ref: '#/components/schemas/Agents'
     \\    McpDescriptor:
     \\      description: MCP server descriptor.
+    \\      content:
+    \\        application/json:
+    \\          schema:
+    \\            type: object
+    \\            additionalProperties: true
+    \\    AgentDescriptor:
+    \\      description: Extension agent descriptor.
     \\      content:
     \\        application/json:
     \\          schema:
@@ -2346,6 +2432,7 @@ pub const ApiHttpServer = struct {
             };
         }
         if (try self.dispatchArdRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
+        if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchExtensionRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
@@ -2500,6 +2587,18 @@ pub const ApiHttpServer = struct {
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
                 return try self.ardCatalogResponse(200, body, false);
             }
+            if (std.mem.startsWith(u8, rest, "agents/")) {
+                const name = rest["agents/".len..];
+                var snapshot_opt = if (std.mem.startsWith(u8, name, "extensions/")) try self.source.adminSnapshot() else null;
+                defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+                const body = (try ard_catalog.agentDescriptorJsonAlloc(
+                    self.alloc,
+                    name,
+                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                    if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
+                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try self.ardCatalogResponse(200, body, false);
+            }
             return try jsonErrorResponse(self.alloc, 404, "not found");
         }
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1)) {
@@ -2507,6 +2606,60 @@ pub const ApiHttpServer = struct {
             return try self.ardCatalogResponse(200, try self.ardRegistryRootJsonAlloc(), false);
         }
         return null;
+    }
+
+    fn dispatchExtensionAgentRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        const parsed = parseExtensionAgentRunRoute(uri_parts.path) orelse return null;
+        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAlloc(parsed.extension_name, parsed.agent_name, uri_parts.query, authenticated_identity)) orelse
+            return try jsonErrorResponse(self.alloc, 404, "not found");
+        self.alloc.free(descriptor);
+
+        if (std.mem.eql(u8, parsed.tail, "runs")) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, null);
+            return try self.bodyResponseOwned(501, "application/json", body, false);
+        }
+        if (!std.mem.startsWith(u8, parsed.tail, "runs/")) return try jsonErrorResponse(self.alloc, 404, "not found");
+        const run_tail = parsed.tail["runs/".len..];
+        if (run_tail.len == 0) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (std.mem.endsWith(u8, run_tail, "/events")) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const run_id = run_tail[0 .. run_tail.len - "/events".len];
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            const body = try extensionAgentUnsupportedRuntimeEventAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
+            defer self.alloc.free(body);
+            return try eventStreamResponse(self.alloc, 501, body);
+        }
+        if (std.mem.endsWith(u8, run_tail, "/cancel")) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const run_id = run_tail[0 .. run_tail.len - "/cancel".len];
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
+            return try self.bodyResponseOwned(501, "application/json", body, false);
+        }
+        if (std.mem.indexOfScalar(u8, run_tail, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_tail);
+        return try self.bodyResponseOwned(501, "application/json", body, false);
+    }
+
+    fn visibleExtensionAgentDescriptorJsonAlloc(
+        self: *ApiHttpServer,
+        extension_name: []const u8,
+        agent_name: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !?[]u8 {
+        const route = try std.fmt.allocPrint(self.alloc, "extensions/{s}/{s}", .{ extension_name, agent_name });
+        defer self.alloc.free(route);
+        var snapshot_opt = try self.source.adminSnapshot();
+        defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        return try ard_catalog.agentDescriptorJsonAlloc(
+            self.alloc,
+            route,
+            self.ardCatalogOptions(.tenant, query, authenticated_identity),
+            self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+        );
     }
 
     fn ardRegistryRootJsonAlloc(self: *ApiHttpServer) ![]u8 {
@@ -8532,6 +8685,60 @@ fn jsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8)
     };
 }
 
+const ExtensionAgentRunRoute = struct {
+    extension_name: []const u8,
+    agent_name: []const u8,
+    tail: []const u8,
+};
+
+fn parseExtensionAgentRunRoute(path: []const u8) ?ExtensionAgentRunRoute {
+    if (!std.mem.startsWith(u8, path, routes.Routes.agents_v1_extensions_prefix)) return null;
+    const rest = path[routes.Routes.agents_v1_extensions_prefix.len..];
+    const extension_slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const extension_name = rest[0..extension_slash];
+    const agent_rest = rest[extension_slash + 1 ..];
+    const agent_slash = std.mem.indexOfScalar(u8, agent_rest, '/') orelse return null;
+    const agent_name = agent_rest[0..agent_slash];
+    const tail = agent_rest[agent_slash + 1 ..];
+    if (extension_name.len == 0 or agent_name.len == 0 or tail.len == 0) return null;
+    return .{ .extension_name = extension_name, .agent_name = agent_name, .tail = tail };
+}
+
+fn extensionAgentUnsupportedRuntimeJsonAlloc(
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    agent_name: []const u8,
+    run_id: ?[]const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("{\"error\":\"extension agent runtime not implemented\",\"status\":\"unsupported_runtime\",\"extension\":");
+    try std.json.Stringify.value(extension_name, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"agent\":");
+    try std.json.Stringify.value(agent_name, .{}, &writer.writer);
+    if (run_id) |id| {
+        try writer.writer.writeAll(",\"runId\":");
+        try std.json.Stringify.value(id, .{}, &writer.writer);
+    }
+    const descriptor_path = try std.fmt.allocPrint(alloc, "/ard/v1/resources/agents/extensions/{s}/{s}", .{ extension_name, agent_name });
+    defer alloc.free(descriptor_path);
+    try writer.writer.writeAll(",\"descriptor\":");
+    try std.json.Stringify.value(descriptor_path, .{}, &writer.writer);
+    try writer.writer.writeByte('}');
+    return try writer.toOwnedSlice();
+}
+
+fn extensionAgentUnsupportedRuntimeEventAlloc(
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    agent_name: []const u8,
+    run_id: []const u8,
+) ![]u8 {
+    const data = try extensionAgentUnsupportedRuntimeJsonAlloc(alloc, extension_name, agent_name, run_id);
+    defer alloc.free(data);
+    return try std.fmt.allocPrint(alloc, "event: error\ndata: {s}\n\n", .{data});
+}
+
 pub fn makeSecretEntry(listed: common_secrets.ListedSecret) metadata_openapi.SecretEntry {
     return .{
         .key = listed.key,
@@ -10941,6 +11148,9 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/default:") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/extensions/{extension}:") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/profiles/{profile}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/agents/extensions/{extension}/{agent}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/agents/v1/extensions/{extension}/{agent}/runs:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/agents/v1/extensions/{extension}/{agent}/runs/{run_id}/events:") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "$ref: '#/components/parameters/profile'") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "name: orderBy") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "enum: [none, referrals, auto]") != null);
@@ -11369,7 +11579,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 2, .projected_extension_members = 3 };
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 2, .projected_extension_members = 6 };
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -11432,6 +11642,14 @@ test "api http server filters extension mcp tools by trusted principal table per
                     .{
                         .extension_name = "docsaf",
                         .scope = .{ .kind = .table, .table_name = "docs" },
+                        .object_kind = .agent,
+                        .object_name = "research",
+                        .table_name = "docs",
+                        .owner_metadata_json = "{\"displayName\":\"DocsAF Research Agent\",\"description\":\"Research visible docs.\",\"profile\":\"copilot\",\"protocols\":[\"agents-api\",\"stream\"],\"tags\":[\"docsaf\",\"research\"],\"capabilities\":[\"docs-search\",\"docs-research\"],\"representativeQueries\":[\"research docs\"],\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"docsaf\"}],\"handler\":\"wasm:docsaf/research\",\"stream_handler\":\"wasm:docsaf/research_stream\"}",
+                    },
+                    .{
+                        .extension_name = "docsaf",
+                        .scope = .{ .kind = .table, .table_name = "docs" },
                         .object_kind = .mcp_tool,
                         .object_name = "search_docs",
                         .table_name = "docs",
@@ -11444,6 +11662,14 @@ test "api http server filters extension mcp tools by trusted principal table per
                         .object_name = "store_doc",
                         .table_name = "docs",
                         .owner_metadata_json = "{\"description\":\"Store docs\",\"input_schema\":{\"type\":\"object\"},\"required_capabilities\":[{\"name\":\"db:write\",\"scope\":\"docsaf\"}]}",
+                    },
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .agent,
+                        .object_name = "research",
+                        .table_name = "memories",
+                        .owner_metadata_json = "{\"displayName\":\"MemoryAF Research Agent\",\"description\":\"Research visible memories.\",\"profile\":\"copilot\",\"protocols\":[\"agents-api\",\"stream\"],\"tags\":[\"memoryaf\",\"research\"],\"capabilities\":[\"memory-search\",\"memory-research\"],\"representativeQueries\":[\"research memories\"],\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}],\"handler\":\"wasm:memoryaf/research\",\"stream_handler\":\"wasm:memoryaf/research_stream\"}",
                     },
                     .{
                         .extension_name = "memoryaf",
@@ -11540,7 +11766,10 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:package:memoryaf:1.0.0") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "/ard/v1/resources/agents/extensions/docsaf/research") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") != null);
 
@@ -11563,6 +11792,75 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_memories\"") == null);
+
+    var ard_extension_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/docsaf/research",
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_extension_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_extension_agent_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"runEndpoint\":\"/agents/v1/extensions/docsaf/research/runs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"profile\":\"copilot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"streamHandler\":\"wasm:docsaf/research_stream\"") != null);
+
+    var mcp_filtered_extension_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/docsaf/research?include=mcp",
+        .headers = &trusted_principal_headers,
+    });
+    defer mcp_filtered_extension_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), mcp_filtered_extension_agent_resource.status);
+
+    var hidden_extension_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_extension_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_resource.status);
+
+    var extension_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?include=agents",
+        .headers = &trusted_principal_headers,
+    });
+    defer extension_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), extension_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "\"type\":\"application/antfly-agent+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
+
+    var extension_agent_run = try server.handle(.{
+        .method = .POST,
+        .uri = "/agents/v1/extensions/docsaf/research/runs",
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"input\":{\"query\":\"docs\"}}",
+    });
+    defer extension_agent_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 501), extension_agent_run.status);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"status\":\"unsupported_runtime\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"descriptor\":\"/ard/v1/resources/agents/extensions/docsaf/research\"") != null);
+
+    var extension_agent_events = try server.handle(.{
+        .method = .GET,
+        .uri = "/agents/v1/extensions/docsaf/research/runs/run-1/events",
+        .headers = &trusted_principal_headers,
+    });
+    defer extension_agent_events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 501), extension_agent_events.status);
+    try std.testing.expectEqualStrings("text/event-stream", extension_agent_events.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "event: error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "\"runId\":\"run-1\"") != null);
+
+    var hidden_extension_agent_run = try server.handle(.{
+        .method = .POST,
+        .uri = "/agents/v1/extensions/memoryaf/research/runs",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_extension_agent_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_run.status);
 
     var skill_filtered_extension_mcp_resource = try server.handle(.{
         .method = .GET,
@@ -11614,7 +11912,9 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer memory_catalog_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), memory_catalog_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/resources/agents/extensions/memoryaf/research") != null);
 
     var memory_skill = try server.handle(.{
         .method = .GET,
@@ -11660,6 +11960,25 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer memory_skill_search.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), memory_skill_search.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_skill_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
+
+    var memory_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
+        .headers = &memory_headers,
+    });
+    defer memory_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_agent_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_agent_resource.body, "\"runEndpoint\":\"/agents/v1/extensions/memoryaf/research/runs\"") != null);
+
+    var memory_agent_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &memory_headers,
+        .body = "{\"query\":{\"text\":\"memoryaf\",\"filter\":{\"type\":[\"application/antfly-agent+json\"]}}}",
+    });
+    defer memory_agent_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_agent_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_agent_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") != null);
 
     var ard_filtered_catalog_resp = try server.handle(.{
         .method = .GET,
@@ -11760,6 +12079,17 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), ard_search_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+
+    var ard_agent_search_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &trusted_principal_headers,
+        .body = "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/antfly-agent+json\"]}}}",
+    });
+    defer ard_agent_search_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_agent_search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_agent_search_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_agent_search_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
 }
 
 test "api http server authenticates trusted principal" {
