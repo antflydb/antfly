@@ -855,6 +855,9 @@ implementations cleanly:
    Routing scratch now slabs child ids, distances, error bounds, and
    competitive candidate storage behind one backing allocation while preserving
    retained-scratch byte accounting.
+   RaBitQ estimate scratch now slabs query-diff and four query-code buffers
+   behind one backing allocation, so retained query/routing scratch no longer
+   pins five small allocations per estimator.
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed

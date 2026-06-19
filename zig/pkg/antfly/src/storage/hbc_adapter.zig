@@ -1516,12 +1516,7 @@ pub const HBCIndex = struct {
         }
 
         fn bytes(self: *const @This()) u64 {
-            return @as(u64, @intCast(self.estimate.query_diff.len * @sizeOf(f32))) +
-                @as(u64, @intCast(self.estimate.q1.len * @sizeOf(u64))) +
-                @as(u64, @intCast(self.estimate.q2.len * @sizeOf(u64))) +
-                @as(u64, @intCast(self.estimate.q3.len * @sizeOf(u64))) +
-                @as(u64, @intCast(self.estimate.q4.len * @sizeOf(u64))) +
-                @as(u64, @intCast(self.routing_storage.len * @sizeOf(u64)));
+            return self.estimate.bytes() + @as(u64, @intCast(self.routing_storage.len * @sizeOf(u64)));
         }
 
         fn routingStorageWordLen(capacity: usize) usize {

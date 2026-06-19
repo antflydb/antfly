@@ -73,40 +73,85 @@ pub const RaBitQuantizer = struct {
     }
 
     pub const EstimateScratch = struct {
+        storage: []u64,
         query_diff: []f32,
         q1: []u64,
         q2: []u64,
         q3: []u64,
         q4: []u64,
 
+        const Views = struct {
+            query_diff: []f32,
+            q1: []u64,
+            q2: []u64,
+            q3: []u64,
+            q4: []u64,
+        };
+
         pub fn init(alloc: Allocator, dims: usize) !EstimateScratch {
             const width = rabitq.codeWidth(dims);
-            const query_diff = try alloc.alloc(f32, dims);
-            errdefer alloc.free(query_diff);
-            const q1 = try alloc.alloc(u64, width);
-            errdefer alloc.free(q1);
-            const q2 = try alloc.alloc(u64, width);
-            errdefer alloc.free(q2);
-            const q3 = try alloc.alloc(u64, width);
-            errdefer alloc.free(q3);
-            const q4 = try alloc.alloc(u64, width);
-            errdefer alloc.free(q4);
+            const storage = try alloc.alloc(u64, storageWordLen(dims, width));
+            const views = carveStorage(storage, dims, width);
             return .{
-                .query_diff = query_diff,
-                .q1 = q1,
-                .q2 = q2,
-                .q3 = q3,
-                .q4 = q4,
+                .storage = storage,
+                .query_diff = views.query_diff,
+                .q1 = views.q1,
+                .q2 = views.q2,
+                .q3 = views.q3,
+                .q4 = views.q4,
             };
         }
 
         pub fn deinit(self: *EstimateScratch, alloc: Allocator) void {
-            alloc.free(self.query_diff);
-            alloc.free(self.q1);
-            alloc.free(self.q2);
-            alloc.free(self.q3);
-            alloc.free(self.q4);
+            alloc.free(self.storage);
             self.* = undefined;
+        }
+
+        pub fn bytes(self: *const EstimateScratch) u64 {
+            return @intCast(self.storage.len * @sizeOf(u64));
+        }
+
+        fn storageWordLen(dims: usize, width: usize) usize {
+            const byte_count = storageByteLen(dims, width);
+            return std.math.divCeil(usize, byte_count, @sizeOf(u64)) catch unreachable;
+        }
+
+        fn storageByteLen(dims: usize, width: usize) usize {
+            var offset: usize = 0;
+            addStorageSlice(f32, &offset, dims);
+            addStorageSlice(u64, &offset, width);
+            addStorageSlice(u64, &offset, width);
+            addStorageSlice(u64, &offset, width);
+            addStorageSlice(u64, &offset, width);
+            return std.mem.alignForward(usize, offset, @alignOf(u64));
+        }
+
+        fn addStorageSlice(comptime T: type, offset: *usize, len: usize) void {
+            comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
+            offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+            offset.* += len * @sizeOf(T);
+        }
+
+        fn carveStorage(storage: []u64, dims: usize, width: usize) Views {
+            const raw_bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
+            var offset: usize = 0;
+            return .{
+                .query_diff = carveStorageSlice(f32, raw_bytes, &offset, dims),
+                .q1 = carveStorageSlice(u64, raw_bytes, &offset, width),
+                .q2 = carveStorageSlice(u64, raw_bytes, &offset, width),
+                .q3 = carveStorageSlice(u64, raw_bytes, &offset, width),
+                .q4 = carveStorageSlice(u64, raw_bytes, &offset, width),
+            };
+        }
+
+        fn carveStorageSlice(comptime T: type, raw_bytes: []align(@alignOf(u64)) u8, offset: *usize, len: usize) []T {
+            comptime std.debug.assert(@alignOf(T) <= @alignOf(u64));
+            offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+            const byte_len = len * @sizeOf(T);
+            const aligned: []align(@alignOf(T)) u8 = @alignCast(raw_bytes[offset.* .. offset.* + byte_len]);
+            const out = std.mem.bytesAsSlice(T, aligned);
+            offset.* += byte_len;
+            return out;
         }
     };
 

@@ -1204,11 +1204,7 @@ test "SearchScratch skips entries above per posting member cache cap" {
 }
 
 fn estimateScratchBytes(scratch: *const quantizer.RaBitQuantizer.EstimateScratch) u64 {
-    return byteLen(scratch.query_diff) +
-        byteLen(scratch.q1) +
-        byteLen(scratch.q2) +
-        byteLen(scratch.q3) +
-        byteLen(scratch.q4);
+    return scratch.bytes();
 }
 
 pub fn requestHasExtraFilters(
