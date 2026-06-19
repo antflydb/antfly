@@ -34,7 +34,6 @@ pub const SqlAdapterClassificationReason = enum {
     role_setting_plan,
     routine_body_plan,
     routine_option_plan,
-    row_security_policy_plan,
     row_rewrite_expression_plan,
     row_lock_mode_plan,
     schema_namespace,
@@ -80,7 +79,6 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.role_setting_plan, classificationReasonFromToken("role_setting_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.routine_body_plan, classificationReasonFromToken("routine_body_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.routine_option_plan, classificationReasonFromToken("routine_option_plan").?);
-    try std.testing.expectEqual(SqlAdapterClassificationReason.row_security_policy_plan, classificationReasonFromToken("row_security_policy_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_lock_mode_plan, classificationReasonFromToken("row_lock_mode_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_rewrite_expression_plan, classificationReasonFromToken("row_rewrite_expression_plan").?);
     try std.testing.expectEqualStrings("multi_table_generation_barrier", classificationReasonToken(.multi_table_generation_barrier));

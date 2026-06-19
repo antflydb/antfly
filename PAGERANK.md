@@ -5001,20 +5001,23 @@ than PR unit coverage:
   count, so final-row release evidence proves bounded diagnostics
   were retained and shaped correctly, not only that the underlying storage
   record counts stayed bounded. The summary row also aggregates operational
-  scheduler-state proof: total pre-drain queued builds, total fresh-terminal
-  pending work plus its active-build/page, failed-page, paused-metric, and
-  truncation components, fresh terminal status page and truncation counts, total
-  active builds, active pages, active failed-page, paused-metric, and truncation
-  components, active status pages, active page-probe claim and reclaim counts,
+  scheduler-state proof: total pre-drain queued builds, min observed pre-drain
+  scheduler scans, min observed queued builds, total fresh-terminal pending work
+  plus its active-build/page, failed-page, paused-metric, and truncation
+  components, fresh terminal status page and truncation counts, total active
+  builds, active pages plus min/max observed per-family active page bounds,
+  active failed-page, paused-metric, and truncation components, active status
+  pages, active page-probe claim and reclaim counts,
   active leased pages, active detailed pages, active cursor-bearing pages,
   active progress-bearing pages, active status truncation count, the observed active-progress range, total failed-terminal pending work plus its active-build/page,
   failed-page, paused-metric, and truncation components, and failed terminal
   status page and truncation counts. Those
   totals are verified against the families that actually ran, so release
   tooling can prove from the final row that every family started as exactly one
-  queued build, every active rebuild exercised a claim plus post-expiry reclaim
-  of a durable build page, active rebuilds exposed bounded leased page detail
-  with finite progress in `[0, 1]`, and fresh and failed terminal states left
+  queued build, every family had nonzero scheduler scan and active page
+  evidence, every active rebuild exercised a claim plus post-expiry reclaim of a
+  durable build page, active rebuilds exposed bounded leased page detail with
+  finite in-flight progress, and fresh and failed terminal states left
   no scheduler-visible work, paused metrics, truncated page summaries, or active
   page payloads. The summary row
   also aggregates the public read-surface proof:

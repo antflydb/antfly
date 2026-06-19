@@ -4548,18 +4548,17 @@ subtransaction model.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
-exact-value `SET [LOCAL|SESSION]` forms for inert client presentation settings,
-`SET LOCAL search_path TO public`, and `RESET` for the same inert setting
-allowlist. Catalog-affecting
-`SET search_path`, `RESET search_path`, `SHOW search_path`, and `DISCARD ALL`
-now lower to typed session catalog plans instead of adapter no-ops. Applying
-those plans mutates an explicit SQL catalog session used by table/schema
-resolution. `SET [SESSION] search_path` preserves the ordered namespace list in
-the typed plan, and the source parity corpus pins both public-only and
-multi-namespace session search paths so schema-resolution metadata cannot
-collapse back into an adapter-only no-op. `SET LOCAL search_path` with any
-non-public namespace fails closed until Antfly has transaction-local session
-state. Role/session
+exact-value `SET [LOCAL|SESSION]` forms for inert client presentation settings
+and `RESET` for the same inert setting allowlist. Catalog-affecting
+`SET search_path`, `SET LOCAL search_path`, `RESET search_path`,
+`SHOW search_path`, and `DISCARD ALL` now lower to typed session catalog plans
+instead of adapter no-ops. Applying those plans mutates an explicit SQL catalog
+session used by table/schema resolution. `SET [SESSION] search_path` preserves
+the ordered namespace list in the typed plan; `SET LOCAL search_path` preserves
+the same ordered namespace list plus transaction-local intent on the owned
+session state. The source parity corpus pins public-only, multi-namespace, and
+transaction-local search paths so schema-resolution metadata cannot collapse
+back into an adapter-only no-op. Role/session
 authorization changes, arbitrary settings, timeout settings, default storage
 settings, unsupported values for otherwise inert settings, `SHOW ALL`, and
 partial `DISCARD` variants still fail closed. The allowlist lives in
@@ -4933,7 +4932,8 @@ hidden in the adapter. `CREATE POLICY` tails parse in
 syntax into typed row-security catalog plans. Public API execution maps each
 supported policy to a hidden native row-filter policy subject, converts
 `current_setting('app.<key>')` to `{"$auth":"settings.app.<key>"}`, stores
-literal equality as a native `term` row filter, applies role targets during
+literal equality as a native `term` row filter, lowers supported `AND` chains
+over those atoms to native row-filter `conjuncts`, applies role targets during
 effective-policy resolution, and merges enabled-table filters into every
 matching user's effective row filters before row-query, aggregate, join,
 lateral, window, and document query execution. Those setting references are
@@ -4944,10 +4944,10 @@ ENABLE ROW LEVEL SECURITY` marks that table as RLS-enabled in the native auth
 policy store. `ALTER POLICY ... USING (...)` replaces the hidden policy
 subject's native row-filter metadata and fails if the policy does not already
 exist. `DROP POLICY` removes the hidden policy subject for that table, while
-`DROP POLICY IF EXISTS` is an idempotent no-op. Compound policy expressions
-still fail closed until they have durable native policy state,
-request-context bindings, and planner/executor validation; the source parity
-corpus pins that shape under the stable `row_security_policy_plan` reason.
+`DROP POLICY IF EXISTS` is an idempotent no-op. Policy syntax outside the
+current native `term`/`conjuncts` row-filter subset still fails closed until it
+has durable native policy state, request-context bindings, and
+planner/executor validation.
 `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` clears the native table enable bit
 idempotently; stored policies remain catalog metadata but stop contributing
 effective row filters until the table is enabled again. Storage must not

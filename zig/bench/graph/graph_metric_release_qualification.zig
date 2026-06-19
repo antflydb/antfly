@@ -416,7 +416,9 @@ const ReleaseSummary = struct {
     total_paired_failure_recent_failures: usize = 0,
     total_paired_failure_expected_error_records: usize = 0,
     total_paired_failure_failed_events: usize = 0,
+    min_observed_pre_drain_metrics_scanned: usize = 0,
     total_pre_drain_metrics_scanned: usize = 0,
+    min_observed_pre_drain_queued_builds: usize = 0,
     total_pre_drain_queued_builds: usize = 0,
     total_pre_drain_paused_metrics: usize = 0,
     total_fresh_terminal_pending_work: usize = 0,
@@ -428,6 +430,8 @@ const ReleaseSummary = struct {
     total_fresh_status_pages: usize = 0,
     total_fresh_status_pages_truncated: usize = 0,
     total_active_work_active_builds: usize = 0,
+    min_observed_active_work_active_pages: usize = 0,
+    max_observed_active_work_active_pages: usize = 0,
     total_active_work_active_pages: usize = 0,
     total_active_work_failed_pages: usize = 0,
     total_active_work_paused_metrics: usize = 0,
@@ -655,7 +659,15 @@ const ReleaseSummary = struct {
         self.total_paired_failure_recent_failures += result.paired_failure_recent_failures;
         self.total_paired_failure_expected_error_records += result.paired_failure_expected_error_records;
         self.total_paired_failure_failed_events += result.paired_failure_failed_events;
+        self.min_observed_pre_drain_metrics_scanned = if (first)
+            result.pre_drain_metrics_scanned
+        else
+            @min(self.min_observed_pre_drain_metrics_scanned, result.pre_drain_metrics_scanned);
         self.total_pre_drain_metrics_scanned += result.pre_drain_metrics_scanned;
+        self.min_observed_pre_drain_queued_builds = if (first)
+            result.pre_drain_queued_builds
+        else
+            @min(self.min_observed_pre_drain_queued_builds, result.pre_drain_queued_builds);
         self.total_pre_drain_queued_builds += result.pre_drain_queued_builds;
         self.total_pre_drain_paused_metrics += result.pre_drain_paused_metrics;
         self.total_fresh_terminal_pending_work += result.fresh_pending_work;
@@ -667,6 +679,11 @@ const ReleaseSummary = struct {
         self.total_fresh_status_pages += result.fresh_status_pages;
         self.total_fresh_status_pages_truncated += @intFromBool(result.fresh_status_pages_truncated);
         self.total_active_work_active_builds += result.active_work_active_builds;
+        self.min_observed_active_work_active_pages = if (first)
+            result.active_work_active_pages
+        else
+            @min(self.min_observed_active_work_active_pages, result.active_work_active_pages);
+        self.max_observed_active_work_active_pages = @max(self.max_observed_active_work_active_pages, result.active_work_active_pages);
         self.total_active_work_active_pages += result.active_work_active_pages;
         self.total_active_work_failed_pages += result.active_work_failed_pages;
         self.total_active_work_paused_metrics += result.active_work_paused_metrics;
@@ -2362,7 +2379,10 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
     {
         return error.GraphMetricReleaseQualificationFailureDiagnosticsMismatch;
     }
-    if (summary.total_pre_drain_queued_builds != summary.families_run or
+    if (summary.min_observed_pre_drain_metrics_scanned == 0 or
+        summary.max_observed_pre_drain_metrics_scanned < summary.min_observed_pre_drain_metrics_scanned or
+        summary.min_observed_pre_drain_queued_builds == 0 or
+        summary.total_pre_drain_queued_builds != summary.families_run or
         summary.total_pre_drain_paused_metrics != 0 or
         summary.total_fresh_terminal_pending_work != 0 or
         summary.total_fresh_active_builds != 0 or
@@ -2373,6 +2393,8 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
         summary.total_fresh_status_pages != 0 or
         summary.total_fresh_status_pages_truncated != 0 or
         summary.total_active_work_active_builds != summary.families_run or
+        summary.min_observed_active_work_active_pages == 0 or
+        summary.max_observed_active_work_active_pages < summary.min_observed_active_work_active_pages or
         summary.total_active_work_active_pages < summary.families_run or
         summary.total_active_work_failed_pages != 0 or
         summary.total_active_work_paused_metrics != 0 or
@@ -7638,6 +7660,9 @@ fn observedPromotionOperationsFloor(cfg: Config, summary: ReleaseSummary) bool {
         summary.families_run != 0 and
         summary.total_active_page_probe_claimed == summary.families_run and
         summary.total_active_page_probe_reclaimed == summary.families_run and
+        summary.min_observed_pre_drain_metrics_scanned != 0 and
+        summary.min_observed_pre_drain_queued_builds != 0 and
+        summary.total_pre_drain_queued_builds == summary.families_run and
         summary.total_active_status_pages != 0 and
         summary.total_active_status_leased_pages == summary.total_active_status_pages and
         summary.total_active_status_detailed_pages == summary.total_active_status_pages and
@@ -7648,6 +7673,8 @@ fn observedPromotionOperationsFloor(cfg: Config, summary: ReleaseSummary) bool {
         summary.max_observed_active_status_pages <= cfg.max_status_pages and
         summary.max_observed_active_status_pages >= summary.min_observed_active_status_pages and
         summary.total_active_work_active_builds == summary.families_run and
+        summary.min_observed_active_work_active_pages != 0 and
+        summary.max_observed_active_work_active_pages >= summary.min_observed_active_work_active_pages and
         summary.total_active_work_active_pages != 0 and
         summary.total_active_work_failed_pages == 0 and
         summary.total_active_work_paused_metrics == 0 and
@@ -8000,8 +8027,8 @@ fn emitReleaseSummary(out: anytype, cfg: Config, summary: ReleaseSummary) !void 
         .{ cfg.max_page_claims, summary.max_observed_page_claims, cfg.max_cleanup_ticks, summary.max_observed_cleanup_ticks, cfg.max_rounds_executed, summary.max_observed_rounds_executed, cfg.max_failure_retry_count, summary.max_observed_failure_retry_count, cfg.max_worker_steps, summary.max_observed_worker_steps, cfg.max_coordinator_steps, summary.max_observed_coordinator_steps, cfg.min_families_run, cfg.min_split_worker_identities_with_progress, cfg.min_split_worker_identities_with_page_progress },
     );
     try out.print(
-        ",\"max_allowed_pre_drain_metrics_scanned\":{d},\"total_pre_drain_metrics_scanned\":{d},\"max_observed_pre_drain_metrics_scanned\":{d},\"total_pre_drain_queued_builds\":{d},\"total_pre_drain_paused_metrics\":{d},\"total_fresh_terminal_pending_work\":{d},\"total_fresh_active_builds\":{d},\"total_fresh_active_pages\":{d},\"total_fresh_failed_pages\":{d},\"total_fresh_paused_metrics\":{d},\"total_fresh_truncated_pages\":{d},\"total_fresh_status_pages\":{d},\"total_fresh_status_pages_truncated\":{d},\"total_active_work_active_builds\":{d},\"total_active_work_active_pages\":{d},\"total_active_work_failed_pages\":{d},\"total_active_work_paused_metrics\":{d},\"total_active_work_truncated_pages\":{d}",
-        .{ max_allowed_pre_drain_metrics_scanned, summary.total_pre_drain_metrics_scanned, summary.max_observed_pre_drain_metrics_scanned, summary.total_pre_drain_queued_builds, summary.total_pre_drain_paused_metrics, summary.total_fresh_terminal_pending_work, summary.total_fresh_active_builds, summary.total_fresh_active_pages, summary.total_fresh_failed_pages, summary.total_fresh_paused_metrics, summary.total_fresh_truncated_pages, summary.total_fresh_status_pages, summary.total_fresh_status_pages_truncated, summary.total_active_work_active_builds, summary.total_active_work_active_pages, summary.total_active_work_failed_pages, summary.total_active_work_paused_metrics, summary.total_active_work_truncated_pages },
+        ",\"max_allowed_pre_drain_metrics_scanned\":{d},\"total_pre_drain_metrics_scanned\":{d},\"min_observed_pre_drain_metrics_scanned\":{d},\"max_observed_pre_drain_metrics_scanned\":{d},\"total_pre_drain_queued_builds\":{d},\"min_observed_pre_drain_queued_builds\":{d},\"total_pre_drain_paused_metrics\":{d},\"total_fresh_terminal_pending_work\":{d},\"total_fresh_active_builds\":{d},\"total_fresh_active_pages\":{d},\"total_fresh_failed_pages\":{d},\"total_fresh_paused_metrics\":{d},\"total_fresh_truncated_pages\":{d},\"total_fresh_status_pages\":{d},\"total_fresh_status_pages_truncated\":{d},\"total_active_work_active_builds\":{d},\"total_active_work_active_pages\":{d},\"min_observed_active_work_active_pages\":{d},\"max_observed_active_work_active_pages\":{d},\"total_active_work_failed_pages\":{d},\"total_active_work_paused_metrics\":{d},\"total_active_work_truncated_pages\":{d}",
+        .{ max_allowed_pre_drain_metrics_scanned, summary.total_pre_drain_metrics_scanned, summary.min_observed_pre_drain_metrics_scanned, summary.max_observed_pre_drain_metrics_scanned, summary.total_pre_drain_queued_builds, summary.min_observed_pre_drain_queued_builds, summary.total_pre_drain_paused_metrics, summary.total_fresh_terminal_pending_work, summary.total_fresh_active_builds, summary.total_fresh_active_pages, summary.total_fresh_failed_pages, summary.total_fresh_paused_metrics, summary.total_fresh_truncated_pages, summary.total_fresh_status_pages, summary.total_fresh_status_pages_truncated, summary.total_active_work_active_builds, summary.total_active_work_active_pages, summary.min_observed_active_work_active_pages, summary.max_observed_active_work_active_pages, summary.total_active_work_failed_pages, summary.total_active_work_paused_metrics, summary.total_active_work_truncated_pages },
     );
     try out.print(
         ",\"total_active_page_probe_claimed\":{d},\"total_active_page_probe_reclaimed\":{d},\"total_active_status_pages\":{d},\"total_active_status_leased_pages\":{d},\"total_active_status_detailed_pages\":{d},\"total_active_status_cursor_pages\":{d},\"total_active_status_progress_pages\":{d},\"total_active_status_pages_truncated\":{d},\"min_observed_active_status_pages\":{d},\"max_observed_active_status_pages\":{d},\"min_active_status_progress\":{d:.12},\"max_active_status_progress\":{d:.12},\"total_failed_terminal_pending_work\":{d},\"total_failed_active_builds\":{d},\"total_failed_active_pages\":{d},\"total_failed_failed_pages\":{d},\"total_failed_paused_metrics\":{d},\"total_failed_truncated_pages\":{d},\"total_failed_status_pages\":{d},\"total_failed_status_pages_truncated\":{d}",
