@@ -948,6 +948,7 @@ pub const LazyDirectorySnapshot = struct {
             var has_candidate = false;
             if (sorted_by_segment_id) {
                 if (unresolved_positions.len == 0) break;
+                if (posting_ids_ascending and !sortedPostingPositionWindowMayOverlapSegment(posting_ids, unresolved_positions, entry.meta)) continue;
                 for (unresolved_positions) |i| {
                     if (!entry.meta.mayContainPosting(posting_ids[i])) continue;
                     has_candidate = true;
@@ -2321,6 +2322,14 @@ fn appendBasePointReadsForSortedPositions(
     }
 
     return count;
+}
+
+fn sortedPostingPositionWindowMayOverlapSegment(posting_ids: []const PostingId, positions: []const usize, meta: SegmentMeta) bool {
+    if (positions.len == 0 or meta.entry_count == 0) return false;
+    const first_position = positions[0];
+    const last_position = positions[positions.len - 1];
+    if (first_position >= posting_ids.len or last_position >= posting_ids.len) return false;
+    return posting_ids[last_position] >= meta.min_posting_id and posting_ids[first_position] <= meta.max_posting_id;
 }
 
 pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId) !?posting.PostingBaseHeader {
@@ -5883,6 +5892,39 @@ pub fn testAppendBasePointReadsForSortedPositionsMergesIndexScan() !void {
     try std.testing.expectEqual(@as(PostingId, 5), reads[3].found.posting_id);
 }
 
+pub fn testSortedPostingPositionWindowMayOverlapSegment() !void {
+    const posting_ids = [_]PostingId{ 10, 20, 30, 40, 50 };
+    const positions = [_]usize{ 1, 2, 3 };
+    const meta = SegmentMeta{
+        .segment_id = 1,
+        .min_posting_id = 25,
+        .max_posting_id = 35,
+        .byte_len = 1,
+        .entry_count = 1,
+        .index_offset = 0,
+    };
+
+    try std.testing.expect(sortedPostingPositionWindowMayOverlapSegment(&posting_ids, &positions, meta));
+    try std.testing.expect(!sortedPostingPositionWindowMayOverlapSegment(&posting_ids, &positions, .{
+        .segment_id = 1,
+        .min_posting_id = 41,
+        .max_posting_id = 45,
+        .byte_len = 1,
+        .entry_count = 1,
+        .index_offset = 0,
+    }));
+    try std.testing.expect(!sortedPostingPositionWindowMayOverlapSegment(&posting_ids, &positions, .{
+        .segment_id = 1,
+        .min_posting_id = 1,
+        .max_posting_id = 19,
+        .byte_len = 1,
+        .entry_count = 1,
+        .index_offset = 0,
+    }));
+    try std.testing.expect(!sortedPostingPositionWindowMayOverlapSegment(&posting_ids, &.{}, meta));
+    try std.testing.expect(!sortedPostingPositionWindowMayOverlapSegment(&posting_ids, &.{99}, meta));
+}
+
 pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
     const candidates = [_]DeltaCandidate{
         .{ .posting_id = 7, .segment_id = 1, .record = .{ .sequence = 10, .op = .insert, .vector_id = 100 } },
@@ -8695,6 +8737,10 @@ test "posting segment skips sorting ordered batch point reads" {
 
 test "posting segment batch base reads merge sorted index scan" {
     try testAppendBasePointReadsForSortedPositionsMergesIndexScan();
+}
+
+test "posting segment sorted batch windows skip disjoint segments" {
+    try testSortedPostingPositionWindowMayOverlapSegment();
 }
 
 test "posting segment retained delta candidate count deduplicates sequences" {
