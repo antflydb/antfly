@@ -11,8 +11,8 @@ require (
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/ajroetker/pdf v0.0.1-antfly001
 	github.com/ajroetker/pdf/render v0.0.1-antfly003
-	github.com/antflydb/antfly/go/pkg/libaf v0.0.0-20260618230658-669d9326222a
-	github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260618231419-a80808b982ff
+	github.com/antflydb/antfly/go/pkg/libaf v0.0.0-20260618235145-cc1bb5d3adfe
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260618235334-3649fb0c83bb
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/gocolly/colly/v2 v2.3.0
