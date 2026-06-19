@@ -1001,7 +1001,10 @@ implementations cleanly:
    materialization scans. Mixed-generation delta-tail replay now grows buffered
    delta-record scratch geometrically per live record instead of reserving the
    rest of the encoded tail after the first live record, keeping retained
-   scratch proportional to records that can affect the current base.
+   scratch proportional to records that can affect the current base. The
+   small-tail linear materializer also appends base members and live
+   insert/replace records through the assume-capacity path after reserving the
+   exact upper bound.
 
    Expected win: fold decisions, backlog stats, and membership checks can avoid
    decoding or allocating full member arrays.

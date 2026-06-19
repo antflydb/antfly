@@ -2249,7 +2249,7 @@ pub const PostingFormat = struct {
         else
             liveDeltaRecordCount(records);
         try members.ensureTotalCapacity(alloc, base_members.len + live_count);
-        try members.appendSlice(alloc, base_members);
+        members.appendSliceAssumeCapacity(base_members);
         for (records) |record| {
             if (maybe_base_generation) |base_generation| {
                 if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
@@ -2257,7 +2257,7 @@ pub const PostingFormat = struct {
             switch (record.op) {
                 .insert, .replace => {
                     removeMemberFromList(&members, record.vector_id);
-                    try members.append(alloc, record.vector_id);
+                    members.appendAssumeCapacity(record.vector_id);
                 },
                 .tombstone => removeMemberFromList(&members, record.vector_id),
             }
