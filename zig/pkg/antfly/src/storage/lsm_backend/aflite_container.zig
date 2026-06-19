@@ -44,9 +44,15 @@ const RecordKind = enum(u8) {
 };
 
 pub const ContainerStorage = struct {
+    pub const Options = struct {
+        read_only: bool = false,
+    };
+
     allocator: Allocator,
     io_impl: std.Io.Threaded,
     path: []u8,
+    lock_file: ?std.Io.File = null,
+    read_only: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     files: std.StringHashMapUnmanaged([]u8) = .empty,
 
@@ -66,22 +72,36 @@ pub const ContainerStorage = struct {
     };
 
     pub fn open(allocator: Allocator, path: []const u8) !ContainerStorage {
+        return try openWithOptions(allocator, path, .{});
+    }
+
+    pub fn openReadOnly(allocator: Allocator, path: []const u8) !ContainerStorage {
+        return try openWithOptions(allocator, path, .{ .read_only = true });
+    }
+
+    pub fn openWithOptions(allocator: Allocator, path: []const u8, options: Options) !ContainerStorage {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         errdefer io_impl.deinit();
 
         const owned_path = try allocator.dupe(u8, path);
-        errdefer allocator.free(owned_path);
+        var owned_path_transferred = false;
+        errdefer if (!owned_path_transferred) allocator.free(owned_path);
 
-        try ensureParentDir(io_impl.io(), owned_path);
+        if (!options.read_only) {
+            try ensureParentDir(io_impl.io(), owned_path);
+        }
 
         var self = ContainerStorage{
             .allocator = allocator,
             .io_impl = io_impl,
             .path = owned_path,
+            .read_only = options.read_only,
         };
+        owned_path_transferred = true;
         errdefer self.deinit();
 
-        try self.loadOrCreate();
+        self.lock_file = try openLockFile(self.io_impl.io(), self.path, options.read_only);
+        try self.loadOrCreate(!options.read_only);
         return self;
     }
 
@@ -92,6 +112,10 @@ pub const ContainerStorage = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.files.deinit(self.allocator);
+        if (self.lock_file) |file| {
+            file.unlock(self.io_impl.io());
+            file.close(self.io_impl.io());
+        }
         self.allocator.free(self.path);
         self.io_impl.deinit();
         self.* = undefined;
@@ -104,7 +128,7 @@ pub const ContainerStorage = struct {
         };
     }
 
-    fn loadOrCreate(self: *ContainerStorage) !void {
+    fn loadOrCreate(self: *ContainerStorage, create_if_missing: bool) !void {
         const raw = std.Io.Dir.cwd().readFileAlloc(
             self.io_impl.io(),
             self.path,
@@ -112,6 +136,7 @@ pub const ContainerStorage = struct {
             .limited(std.math.maxInt(usize)),
         ) catch |err| switch (err) {
             error.FileNotFound => {
+                if (!create_if_missing) return error.FileNotFound;
                 try writeFile(self.io_impl.io(), self.path, file_magic);
                 return;
             },
@@ -119,6 +144,10 @@ pub const ContainerStorage = struct {
         };
         defer self.allocator.free(raw);
 
+        if (raw.len == 0 and create_if_missing) {
+            try writeFile(self.io_impl.io(), self.path, file_magic);
+            return;
+        }
         if (raw.len < file_magic.len or !std.mem.eql(u8, raw[0..file_magic.len], file_magic)) {
             return error.InvalidAfliteContainer;
         }
@@ -281,6 +310,10 @@ pub const ContainerStorage = struct {
 
 fn createDirPath(_: *anyopaque, _: []const u8) !void {}
 
+fn ensureWritable(self: *ContainerStorage) !void {
+    if (self.read_only) return error.ReadOnly;
+}
+
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
@@ -325,6 +358,7 @@ fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !v
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
+    try ensureWritable(self);
     try self.putDurable(path, contents);
 }
 
@@ -333,6 +367,7 @@ fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, s
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
+    try ensureWritable(self);
 
     if (self.files.get(path)) |old| {
         const joined = try self.allocator.alloc(u8, old.len + contents.len);
@@ -347,6 +382,7 @@ fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, s
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
+    try ensureWritable(self);
     return try ContainerAtomicWriteSink.create(allocator, self, path);
 }
 
@@ -354,6 +390,7 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
+    try ensureWritable(self);
     try self.renameDurable(old_path, new_path);
 }
 
@@ -361,6 +398,7 @@ fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
+    try ensureWritable(self);
     try self.deleteDurable(path);
 }
 
@@ -368,6 +406,7 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
+    try ensureWritable(self);
     try self.deleteTreeDurable(path);
 }
 
@@ -442,6 +481,7 @@ const ContainerAtomicWriteSink = struct {
 
         const locked = lockAtomic(&self.storage.mutex);
         defer if (locked) self.storage.mutex.unlock();
+        try ensureWritable(self.storage);
         try self.storage.putDurable(self.path, self.out.items);
     }
 
@@ -467,6 +507,66 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
     if (parent.len == 0) return;
     try fs_paths.createDirPathPortable(io, parent);
+}
+
+fn openLockFile(io: std.Io, path: []const u8, read_only: bool) !?std.Io.File {
+    return openLockedFile(io, path, read_only) catch |err| switch (err) {
+        error.FileLocksUnsupported => {
+            try prepareUnlockedFile(io, path, read_only);
+            return null;
+        },
+        else => return err,
+    };
+}
+
+fn openLockedFile(io: std.Io, path: []const u8, read_only: bool) !std.Io.File {
+    const lock: std.Io.File.Lock = if (read_only) .shared else .exclusive;
+    if (read_only) {
+        var file = try openFilePortable(io, path, .{
+            .mode = .read_only,
+            .lock = lock,
+            .lock_nonblocking = true,
+        });
+        errdefer file.close(io);
+        return file;
+    }
+
+    var file = try fs_paths.createFilePortable(io, path, .{
+        .read = true,
+        .truncate = false,
+        .lock = lock,
+        .lock_nonblocking = true,
+    });
+    errdefer file.close(io);
+    return file;
+}
+
+fn prepareUnlockedFile(io: std.Io, path: []const u8, read_only: bool) !void {
+    if (read_only) {
+        var file = try openFilePortable(io, path, .{ .mode = .read_only });
+        defer file.close(io);
+        return;
+    }
+
+    var file = try fs_paths.createFilePortable(io, path, .{
+        .read = true,
+        .truncate = false,
+    });
+    defer file.close(io);
+}
+
+fn openFilePortable(io: std.Io, path: []const u8, flags: std.Io.Dir.OpenFileOptions) !std.Io.File {
+    const base_name = std.fs.path.basename(path);
+    if (!std.fs.path.isAbsolute(path)) {
+        if (std.fs.path.dirname(path)) |parent_path| {
+            var parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
+            defer parent.close(io);
+            return try parent.openFile(io, base_name, flags);
+        }
+        return try std.Io.Dir.cwd().openFile(io, base_name, flags);
+    }
+
+    return try std.Io.Dir.openFileAbsolute(io, path, flags);
 }
 
 fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
@@ -584,4 +684,34 @@ test "aflite container storage ignores truncated tail record on reopen" {
     const got = try reopened.storage().readFileAlloc(alloc, "/good", 64);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("value", got);
+}
+
+test "aflite container read-only open requires existing file and rejects writes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "readonly.aflite");
+    defer alloc.free(path);
+
+    try std.testing.expectError(error.FileNotFound, ContainerStorage.openReadOnly(alloc, path));
+
+    {
+        var container = try ContainerStorage.open(alloc, path);
+        defer container.deinit();
+        try container.storage().writeFileAbsolute("/doc", "value");
+    }
+
+    var readonly = try ContainerStorage.openReadOnly(alloc, path);
+    defer readonly.deinit();
+    const storage = readonly.storage();
+
+    const got = try storage.readFileAlloc(alloc, "/doc", 64);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("value", got);
+    try std.testing.expectError(error.ReadOnly, storage.writeFileAbsolute("/doc", "new"));
+    try std.testing.expectError(error.ReadOnly, storage.appendFileAbsolute(alloc, "/doc", "!", true));
+    try std.testing.expectError(error.ReadOnly, storage.renameAbsolute("/doc", "/other"));
+    try std.testing.expectError(error.ReadOnly, storage.deleteFileAbsolute("/doc"));
+    try std.testing.expectError(error.ReadOnly, storage.deleteTree("/"));
+    try std.testing.expectError(error.ReadOnly, storage.beginAtomicWrite(alloc, "/atomic"));
 }

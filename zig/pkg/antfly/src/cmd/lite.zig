@@ -29,14 +29,18 @@ const LiteDb = struct {
     storage: *antfly.lsm_backend.AfliteContainerStorage,
     db: db_mod.DB,
 
-    fn open(allocator: Allocator, path: []const u8) !LiteDb {
+    fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !LiteDb {
         var storage = try allocator.create(antfly.lsm_backend.AfliteContainerStorage);
         errdefer allocator.destroy(storage);
 
-        storage.* = try antfly.lsm_backend.AfliteContainerStorage.open(allocator, path);
+        storage.* = try antfly.lsm_backend.AfliteContainerStorage.openWithOptions(allocator, path, .{
+            .read_only = openModeRequiresReadOnlyBackends(open_mode),
+        });
         errdefer storage.deinit();
 
-        var opts = db_mod.OpenOptions{};
+        var opts = db_mod.OpenOptions{
+            .open_mode = open_mode,
+        };
         pinLiteStorage(&opts, storage.storage());
 
         const db = db_mod.DB.open(allocator, path, opts) catch |err| {
@@ -126,7 +130,7 @@ fn initLite(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) 
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
 
-    var lite = try LiteDb.open(allocator, path);
+    var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
 
     cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
@@ -138,7 +142,7 @@ fn status(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
 
-    var lite = try LiteDb.open(allocator, path);
+    var lite = try LiteDb.open(allocator, path, .status_only);
     defer lite.close();
 
     const stats_value = try lite.db.stats(allocator);
@@ -156,7 +160,7 @@ fn batch(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path);
+    var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
 
     const json = try batchJson(allocator, &lite.db, body);
@@ -189,7 +193,7 @@ fn lookup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
         try allocator.dupe(u8, "");
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path);
+    var lite = try LiteDb.open(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try lookupJson(allocator, &lite.db, resolved_key, body);
@@ -205,7 +209,7 @@ fn scan(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !voi
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path);
+    var lite = try LiteDb.open(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try scanJson(allocator, &lite.db, body);
@@ -221,7 +225,7 @@ fn query(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path);
+    var lite = try LiteDb.open(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try searchJson(allocator, &lite.db, body);
@@ -233,7 +237,7 @@ fn runUntilIdle(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
 
-    var lite = try LiteDb.open(allocator, path);
+    var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.maintenanceDriver().runUntilIdle();
@@ -248,6 +252,10 @@ fn pinLiteStorage(opts: *db_mod.OpenOptions, storage: antfly.lsm_backend.Storage
     opts.index_backends.dense_lsm_storage = storage;
     opts.index_backends.sparse_lsm_storage = storage;
     opts.index_backends.graph_lsm_storage = storage;
+}
+
+fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
+    return open_mode == .query_readonly or open_mode == .status_only;
 }
 
 fn batchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {

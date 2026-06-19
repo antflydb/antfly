@@ -31,6 +31,7 @@ pub const RemoteTemplateRenderConfig = template_remote_host.RenderConfig;
 pub const RemoteTemplateRenderer = template_remote_host.HostRenderer;
 
 pub const OpenOptions = struct {
+    open_mode: db_mod.OpenOptions.OpenMode = .writer,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: db_mod.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -93,7 +94,9 @@ pub const DB = struct {
         var lite_storage = try alloc.create(support.lsm_backend.AfliteContainerStorage);
         errdefer alloc.destroy(lite_storage);
 
-        lite_storage.* = try support.lsm_backend.AfliteContainerStorage.open(alloc, path);
+        lite_storage.* = try support.lsm_backend.AfliteContainerStorage.openWithOptions(alloc, path, .{
+            .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
+        });
         errdefer lite_storage.deinit();
 
         var lite_opts = opts;
@@ -235,6 +238,7 @@ pub fn renderRemoteTemplateText(
 
 fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
     var resolved: db_mod.OpenOptions = .{
+        .open_mode = opts.open_mode,
         .map_size = opts.map_size,
         .no_sync = opts.no_sync,
         .primary_backend = opts.primary_backend,
@@ -248,6 +252,10 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         resolved.transaction_recovery = .{ .enabled = false };
     }
     return resolved;
+}
+
+fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
+    return open_mode == .query_readonly or open_mode == .status_only;
 }
 
 fn pinLiteStorage(opts: *OpenOptions, storage: support.lsm_storage.Storage) void {
@@ -319,4 +327,47 @@ test "embedded db openLiteHosted exposes manual maintenance capabilities" {
     try std.testing.expect(!caps.background_enrichment_runtime);
     try std.testing.expect(!caps.ttl_cleanup_runtime);
     try std.testing.expect(!caps.transaction_recovery_runtime);
+}
+
+test "embedded db openLite query_readonly rejects writes" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite-readonly.aflite");
+    defer alloc.free(path);
+
+    {
+        var db = try DB.openLite(alloc, path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:readonly",
+                .value = "{\"title\":\"readonly visible\"}",
+            }},
+            .sync_level = .write,
+        });
+    }
+
+    var readonly = try DB.openLite(alloc, path, .{
+        .open_mode = .query_readonly,
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer readonly.close();
+
+    var result = (try readonly.lookup(alloc, "doc:readonly", .{})) orelse return error.MissingLiteDocument;
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"readonly visible\"") != null);
+
+    try std.testing.expectError(error.ReadOnly, readonly.batch(.{
+        .writes = &.{.{
+            .key = "doc:denied",
+            .value = "{}",
+        }},
+        .sync_level = .write,
+    }));
 }
