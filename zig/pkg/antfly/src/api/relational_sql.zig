@@ -3523,9 +3523,11 @@ const Parser = struct {
         const language = syntax.language;
         const volatility = syntax.volatility;
         const security = syntax.security;
+        const cost = syntax.cost;
         syntax.routine_name = "";
         syntax.returns_type = null;
         syntax.language = null;
+        syntax.cost = null;
         return .{
             .kind = routineKindFromSyntax(syntax.kind),
             .routine_name = routine_name,
@@ -3535,6 +3537,7 @@ const Parser = struct {
             .language = language,
             .volatility = volatility,
             .security = security,
+            .cost = cost,
         };
     }
 
@@ -45188,8 +45191,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=secure_audit:args=0:replace=false:returns=trigger:language=plpgsql:security=definer", security_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, security_function));
 
+    var cost_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION costed_audit() RETURNS trigger LANGUAGE plpgsql COST 10;");
+    defer cost_function.deinit(alloc);
+    const cost_function_plan = switch (cost_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("10", cost_function_plan.cost.?);
+    const cost_function_fingerprint = try ddlFingerprintAlloc(alloc, cost_function);
+    defer alloc.free(cost_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=costed_audit:args=0:replace=false:returns=trigger:language=plpgsql:cost=10", cost_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, cost_function));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql COST 10;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -57590,6 +57608,15 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             alloc,
             "{s}:security={s}",
             .{ base, routineSecurityName(security) },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.cost) |cost| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:cost={s}",
+            .{ base, cost },
         );
         alloc.free(base);
         base = next;

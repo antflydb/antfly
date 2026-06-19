@@ -202,6 +202,7 @@
     "ddl_fetch_cursor_last",
     "ddl_fetch_cursor_prior",
     "ddl_fetch_cursor_relative",
+    "ddl_function_cost",
     "ddl_function_create",
     "ddl_function_drop",
     "ddl_function_drop_cascade",

@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "8dff82bc5c7596d837d3b3a6d3fcdbd0a3138c2f9bf6953f7c5cef1e9d1a91a7",
-  "source_entry_count": 968,
-  "entry_count": 968,
+  "source_sha256": "6bc05024ccf65b0f9bc2dcd0588c91c15e67a99825203c2cdf4f6cdb30c0186c",
+  "source_entry_count": 969,
+  "entry_count": 969,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3880,6 +3880,17 @@
       "sql": "CREATE FUNCTION secure_audit() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER"
     },
     {
+      "name": "create costed function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "costed_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=costed_audit:args=0:replace=false:returns=trigger:language=plpgsql:cost=10",
+      "sql": "CREATE FUNCTION costed_audit() RETURNS trigger LANGUAGE plpgsql COST 10"
+    },
+    {
       "name": "unsupported create function body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
@@ -3891,7 +3902,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql COST 10"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE"
     },
     {
       "name": "drop function catalog ddl",

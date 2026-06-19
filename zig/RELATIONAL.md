@@ -5013,9 +5013,9 @@ parity corpus requires them to fail closed under `bulk_io_plan`.
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,
 language, optional volatility (`IMMUTABLE`, `STABLE`, or `VOLATILE`), optional
-security mode (`SECURITY INVOKER` or `SECURITY DEFINER`), and drop dependency
-metadata such as `CASCADE`, then fails closed when applied to table schema or
-runtime storage. Routine lifecycle tails parse in
+security mode (`SECURITY INVOKER` or `SECURITY DEFINER`), optional planner
+`COST`, and drop dependency metadata such as `CASCADE`, then fails closed when
+applied to table schema or runtime storage. Routine lifecycle tails parse in
 `api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper
