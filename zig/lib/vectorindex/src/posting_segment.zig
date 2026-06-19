@@ -729,9 +729,10 @@ pub const Catalog = struct {
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
             var reader = try Reader.init(segment.data);
+            try deltas.ensureUnusedCapacity(alloc, try reader.deltaCount(posting_id));
             var iter = reader.deltas(posting_id);
             while (try iter.next()) |delta| {
-                try deltas.append(alloc, delta);
+                deltas.appendAssumeCapacity(delta);
             }
         }
         sortDeltaValuesIfNeeded(deltas.items);
@@ -745,9 +746,10 @@ pub const Catalog = struct {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
             if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= base_generation) continue;
             var reader = try Reader.init(segment.data);
+            try deltas.ensureUnusedCapacity(alloc, try reader.deltaCount(posting_id));
             var iter = reader.deltas(posting_id);
             while (try iter.next()) |delta| {
-                try deltas.append(alloc, delta);
+                deltas.appendAssumeCapacity(delta);
             }
         }
         sortDeltaValuesIfNeeded(deltas.items);
@@ -3699,6 +3701,11 @@ pub const Reader = struct {
         };
     }
 
+    pub fn deltaCount(self: Reader, posting_id: PostingId) !usize {
+        const range = (try deltaIndexRange(self.data[self.index_offset .. self.index_offset + self.entry_count * index_entry_size], self.entry_count, posting_id)) orelse return 0;
+        return range.past_index - range.first_index;
+    }
+
     pub fn entries(self: Reader) EntryIterator {
         return .{
             .reader = self,
@@ -5381,6 +5388,9 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     const reader_2 = try Reader.init(segment_2);
     const meta_1 = try reader_1.metadata(1);
     const meta_2 = try reader_2.metadata(2);
+    try std.testing.expectEqual(@as(usize, 1), try reader_1.deltaCount(7));
+    try std.testing.expectEqual(@as(usize, 1), try reader_2.deltaCount(7));
+    try std.testing.expectEqual(@as(usize, 0), try reader_1.deltaCount(8));
     try std.testing.expect(meta_1.mayContainPosting(7));
     try std.testing.expectEqual(@as(usize, 2), meta_1.entry_count);
     try std.testing.expectEqual(delta_10_sequence, meta_1.min_delta_sequence);
