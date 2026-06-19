@@ -5019,7 +5019,8 @@ language, optional volatility (`IMMUTABLE`, `STABLE`, or `VOLATILE`), optional
 security mode (`SECURITY INVOKER` or `SECURITY DEFINER`), optional planner
 `COST`, optional parallel-safety metadata (`PARALLEL SAFE`, `PARALLEL
 RESTRICTED`, or `PARALLEL UNSAFE`), optional `LEAKPROOF` metadata, optional
-planner support-function identity (`SUPPORT function_name`), and drop dependency
+planner support-function identity (`SUPPORT function_name`), optional transform
+type metadata (`TRANSFORM FOR TYPE type_name[, ...]`), and drop dependency
 metadata such as `CASCADE`, then fails closed when applied to table schema or
 runtime storage. Routine lifecycle tails parse in
 `api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax

@@ -414,6 +414,7 @@ pub const CreateRoutineSyntax = struct {
     parallel_safety: ?ddl_plan.RoutineParallelSafety = null,
     leakproof: bool = false,
     support_function: ?[]const u8 = null,
+    transform_types: []const []const u8 = &.{},
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -421,6 +422,7 @@ pub const CreateRoutineSyntax = struct {
         if (self.returns_type) |returns_type| alloc.free(@constCast(returns_type));
         if (self.language) |language| alloc.free(@constCast(language));
         if (self.support_function) |support_function| alloc.free(@constCast(support_function));
+        freeStringSlice(alloc, self.transform_types);
         if (self.cost) |cost| alloc.free(@constCast(cost));
         self.* = undefined;
     }
@@ -2544,6 +2546,9 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     var leakproof = false;
     var support_function: ?[]const u8 = null;
     errdefer if (support_function) |value| alloc.free(@constCast(value));
+    var transform_types: []const []const u8 = &.{};
+    var transform_types_transferred = true;
+    errdefer if (!transform_types_transferred) freeStringSlice(alloc, transform_types);
     var cost: ?[]const u8 = null;
     errdefer if (cost) |value| alloc.free(@constCast(value));
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
@@ -2606,6 +2611,14 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             support_function = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
             continue;
         }
+        if (cursor.matchKeyword("transform")) {
+            if (transform_types.len != 0) return error.UnsupportedSqlShape;
+            try cursor.expectKeyword("for");
+            try cursor.expectKeyword("type");
+            transform_types = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
+            transform_types_transferred = false;
+            continue;
+        }
         if (cursor.matchKeyword("cost")) {
             if (cost != null) return error.UnsupportedSqlShape;
             const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
@@ -2619,6 +2632,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     if (kind == .function and returns_type == null) return error.UnsupportedSqlShape;
     try parseAdapterNoopStatementEnd(cursor);
     routine_transferred = true;
+    transform_types_transferred = true;
     const out = CreateRoutineSyntax{
         .kind = kind,
         .routine_name = routine_name,
@@ -2630,6 +2644,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .parallel_safety = parallel_safety,
         .leakproof = leakproof,
         .support_function = support_function,
+        .transform_types = transform_types,
         .cost = cost,
     };
     returns_type = null;
@@ -7125,6 +7140,17 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(RoutineKindSyntax.function, support_function.kind);
     try std.testing.expectEqualStrings("audit_support", support_function.support_function.?);
 
+    var transform_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql TRANSFORM FOR TYPE jsonb, public.hstore;");
+    defer lexer.freeTokens(alloc, &transform_function_tokens);
+    var transform_function_pos: usize = 0;
+    var transform_function = try parseCreateRoutineCatalogTailAlloc(alloc, transform_function_tokens.items, &transform_function_pos);
+    defer transform_function.deinit(alloc);
+    try std.testing.expectEqual(transform_function_tokens.items.len, transform_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, transform_function.kind);
+    try std.testing.expectEqual(@as(usize, 2), transform_function.transform_types.len);
+    try std.testing.expectEqualStrings("jsonb", transform_function.transform_types[0]);
+    try std.testing.expectEqualStrings("hstore", transform_function.transform_types[1]);
+
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);
     var create_procedure_pos: usize = 0;
@@ -7178,7 +7204,7 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(security_tokens.items.len, security_pos);
     try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, security.security.?);
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql TRANSFORM FOR TYPE jsonb;");
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SET search_path TO public;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));

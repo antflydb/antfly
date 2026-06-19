@@ -723,6 +723,7 @@ pub const CreateRoutinePlan = struct {
     parallel_safety: ?RoutineParallelSafety = null,
     leakproof: bool = false,
     support_function: ?[]const u8 = null,
+    transform_types: []const []const u8 = &.{},
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -730,6 +731,7 @@ pub const CreateRoutinePlan = struct {
         if (self.returns_type) |returns_type| alloc.free(returns_type);
         if (self.language) |language| alloc.free(language);
         if (self.support_function) |support_function| alloc.free(support_function);
+        freeStringSlice(alloc, self.transform_types);
         if (self.cost) |cost| alloc.free(cost);
         self.* = undefined;
     }

@@ -3527,11 +3527,13 @@ const Parser = struct {
         const parallel_safety = syntax.parallel_safety;
         const leakproof = syntax.leakproof;
         const support_function = syntax.support_function;
+        const transform_types = syntax.transform_types;
         const cost = syntax.cost;
         syntax.routine_name = "";
         syntax.returns_type = null;
         syntax.language = null;
         syntax.support_function = null;
+        syntax.transform_types = &.{};
         syntax.cost = null;
         return .{
             .kind = routineKindFromSyntax(syntax.kind),
@@ -3545,6 +3547,7 @@ const Parser = struct {
             .parallel_safety = parallel_safety,
             .leakproof = leakproof,
             .support_function = support_function,
+            .transform_types = transform_types,
             .cost = cost,
         };
     }
@@ -45261,8 +45264,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=support_audit:args=0:replace=false:returns=trigger:language=plpgsql:support=audit_support", support_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, support_function));
 
+    var transform_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION transform_audit() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore;");
+    defer transform_function.deinit(alloc);
+    const transform_function_plan = switch (transform_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), transform_function_plan.transform_types.len);
+    try std.testing.expectEqualStrings("jsonb", transform_function_plan.transform_types[0]);
+    try std.testing.expectEqualStrings("hstore", transform_function_plan.transform_types[1]);
+    const transform_function_fingerprint = try ddlFingerprintAlloc(alloc, transform_function);
+    defer alloc.free(transform_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=transform_audit:args=0:replace=false:returns=trigger:language=plpgsql:transforms=2:transform=jsonb:transform=hstore", transform_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, transform_function));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SET search_path TO public;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -57721,6 +57741,25 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             .{ base, support_function },
         );
         alloc.free(base);
+        base = next;
+    }
+    if (create.transform_types.len != 0) {
+        var next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:transforms={d}",
+            .{ base, create.transform_types.len },
+        );
+        alloc.free(base);
+        errdefer alloc.free(next);
+        for (create.transform_types) |transform_type| {
+            const appended = try std.fmt.allocPrint(
+                alloc,
+                "{s}:transform={s}",
+                .{ next, transform_type },
+            );
+            alloc.free(next);
+            next = appended;
+        }
         base = next;
     }
     if (create.cost) |cost| {
