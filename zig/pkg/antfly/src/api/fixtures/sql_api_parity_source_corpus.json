@@ -5330,6 +5330,93 @@
         "CREATE TABLE prices (sku text NOT NULL, source_id text, valid_from numeric NOT NULL, valid_to numeric NOT NULL, status text, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS))"
       ],
       "sql": "MERGE INTO prices AS target USING prices AS source ON target.sku = source.source_id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.sku, target.status"
+    },
+    {
+      "name": "fixed interval query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [
+        {
+          "integer": 1700000000000000000
+        }
+      ],
+      "sql": "SELECT created_at + INTERVAL '1 hour 30 minutes' AS expires_at FROM usage_records WHERE created_at + INTERVAL '1 hour' > $1 ORDER BY created_at - INTERVAL '7 days' ASC LIMIT 5"
+    },
+    {
+      "name": "calendar interval query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 0
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "SELECT created_at + INTERVAL '1 month' AS next_cycle FROM usage_records WHERE id = $1"
+    },
+    {
+      "name": "mixed calendar fixed interval query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 0
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "SELECT created_at + INTERVAL '1 month 1 day' AS next_cycle_plus_day FROM usage_records WHERE id = $1"
+    },
+    {
+      "name": "primary key rewrite point update lowers to identity rewrite",
+      "family": "update",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 0
+      },
+      "plan": "update:table=usage_records:transforms=0:ops=0:returning_rows=0:returning_expr=0:identity_rewrites=1",
+      "sql": "UPDATE usage_records SET id = 'u2' WHERE id = 'u1'"
+    },
+    {
+      "name": "primary key rewrite mutation source",
+      "family": "update_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "operations": 1,
+        "returning": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=1:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET id = 'u2' WHERE status = 'queued' FOR UPDATE RETURNING id"
+    },
+    {
+      "name": "primary key rewrite joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "source_assignments": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=1:ops=0:returning=1:returning_expr=0:returning_all=0:rewrite=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"source_pk\":{\"type\":\"keyword\"},\"id\":{\"type\":\"keyword\"}},\"required\":[\"source_pk\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"source_pk\"]}}",
+      "sql": "UPDATE usage_records SET id = source.id FROM source_records AS source WHERE usage_records.id = source.source_pk FOR UPDATE RETURNING id"
     }
   ]
 }
