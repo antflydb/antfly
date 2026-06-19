@@ -855,6 +855,134 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    derive_from_schema: ?bool = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.external) |value| {
+            try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.embedding_name) |value| {
+            try jw.objectField("embedding_name");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.distance_metric) |value| {
+            try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_document) |value| {
+            try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.derive_from_schema) |value| {
+            try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A step in a graph pattern query

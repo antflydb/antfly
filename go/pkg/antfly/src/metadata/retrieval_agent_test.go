@@ -15,13 +15,16 @@
 package metadata
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/websearch"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/go/pkg/generating"
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -247,6 +250,98 @@ func TestBuildEffectiveRetrievalQueryIncludesDecisions(t *testing.T) {
 	assert.Contains(t, query, "Resolved user decisions:")
 	assert.Contains(t, query, "oauth_version: OAuth 2.0")
 	assert.Contains(t, query, "confirm_scope: approved")
+}
+
+func TestEffectiveRetrievalToolsConfigIntersectsGlobalAndRetrievalTools(t *testing.T) {
+	global := []ai.ChatToolName{ai.ToolNameSemanticSearch, ai.ToolNameFullTextSearch}
+	retrieval := []ai.ChatToolName{ai.ToolNameSemanticSearch}
+	req := &RetrievalAgentRequest{
+		Tools: ai.ChatToolsConfig{EnabledTools: &global},
+	}
+	req.Steps.Retrieval.Tools.EnabledTools = &retrieval
+
+	config, err := effectiveRetrievalToolsConfig(req)
+
+	require.NoError(t, err)
+	assert.True(t, config.IsToolEnabled(ai.ToolNameSemanticSearch))
+	assert.False(t, config.IsToolEnabled(ai.ToolNameFullTextSearch))
+}
+
+func TestEffectiveRetrievalToolsConfigKeepsEmptyIntersectionDisabled(t *testing.T) {
+	global := []ai.ChatToolName{ai.ToolNameFullTextSearch}
+	retrieval := []ai.ChatToolName{ai.ToolNameSemanticSearch}
+	req := &RetrievalAgentRequest{
+		Tools: ai.ChatToolsConfig{EnabledTools: &global},
+	}
+	req.Steps.Retrieval.Tools.EnabledTools = &retrieval
+
+	config, err := effectiveRetrievalToolsConfig(req)
+
+	require.NoError(t, err)
+	assert.False(t, config.IsToolEnabled(ai.ToolNameSemanticSearch))
+	assert.False(t, config.IsToolEnabled(ai.ToolNameFullTextSearch))
+	assert.False(t, config.IsToolEnabled(ai.ToolNameFilter))
+}
+
+func TestRetrievalQueryAllowedByTools(t *testing.T) {
+	fullTextOnly := []ai.ChatToolName{ai.ToolNameFullTextSearch}
+	config := ai.ChatToolsConfig{EnabledTools: &fullTextOnly}
+
+	assert.True(t, retrievalQueryAllowedByTools(RetrievalQueryRequest{
+		FullTextSearch: json.RawMessage(`{"query":"body:raft"}`),
+	}, config))
+	assert.False(t, retrievalQueryAllowedByTools(RetrievalQueryRequest{
+		SemanticSearch: "raft consensus",
+	}, config))
+}
+
+func TestRetrievalQueryAllowedByToolsRequiresEveryQueryCapability(t *testing.T) {
+	semanticOnly := []ai.ChatToolName{ai.ToolNameSemanticSearch}
+	config := ai.ChatToolsConfig{EnabledTools: &semanticOnly}
+
+	assert.False(t, retrievalQueryAllowedByTools(RetrievalQueryRequest{
+		SemanticSearch: "raft consensus",
+		FilterQuery:    json.RawMessage(`{"query":"status:published"}`),
+	}, config))
+	assert.False(t, retrievalQueryAllowedByTools(RetrievalQueryRequest{
+		SemanticSearch: "raft consensus",
+		GraphSearches: map[string]indexes.GraphQuery{
+			"related": {},
+		},
+	}, config))
+
+	withFilterAndGraph := []ai.ChatToolName{
+		ai.ToolNameSemanticSearch,
+		ai.ToolNameFilter,
+		ai.ToolNameGraphSearch,
+	}
+	config.EnabledTools = &withFilterAndGraph
+	assert.True(t, retrievalQueryAllowedByTools(RetrievalQueryRequest{
+		SemanticSearch: "raft consensus",
+		FilterQuery:    json.RawMessage(`{"query":"status:published"}`),
+		GraphSearches: map[string]indexes.GraphQuery{
+			"related": {},
+		},
+	}, config))
+}
+
+func TestExecutePipelineRejectsDisabledRetrievalTool(t *testing.T) {
+	fullTextOnly := []ai.ChatToolName{ai.ToolNameFullTextSearch}
+	req := &RetrievalAgentRequest{
+		Query: "find raft",
+		Tools: ai.ChatToolsConfig{EnabledTools: &fullTextOnly},
+		Queries: []RetrievalQueryRequest{{
+			Table:          "docs",
+			SemanticSearch: "raft consensus",
+			Indexes:        []string{"semantic_idx"},
+		}},
+	}
+
+	result, err := (&TableApi{}).ExecutePipeline(context.Background(), req, nil, nil)
+
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), `retrieval query strategy "semantic" uses disabled tool(s): semantic_search`)
 }
 
 func TestApplyPendingClarificationPopulatesSharedQuestions(t *testing.T) {

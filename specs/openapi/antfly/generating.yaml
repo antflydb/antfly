@@ -298,8 +298,7 @@ components:
         Available tool names for the chat and retrieval agents.
         - add_filter: Add search filters (field constraints)
         - ask_clarification: Ask user for clarification
-        - search: Execute semantic searches (legacy, use semantic_search for retrieval)
-        - websearch: Search the web (requires websearch_connection or websearch_config)
+        - web_search: Search the web (requires web_search_connection or web_search_config)
         - fetch: Fetch URL content (subject to security controls)
         - semantic_search: Execute semantic/vector search against an index
         - full_text_search: Execute full-text BM25 search against an index
@@ -309,8 +308,7 @@ components:
       enum:
         - add_filter
         - ask_clarification
-        - search
-        - websearch
+        - web_search
         - fetch
         - semantic_search
         - full_text_search
@@ -323,7 +321,9 @@ components:
       description: |
         Configuration for chat agent tools.
 
-        If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search.
+        If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
+        available for the request. Explicit retrieval policies should use semantic_search
+        for vector retrieval.
 
         For models that don't support native tool calling (e.g., Ollama),
         a prompt-based fallback is used with structured output parsing.
@@ -333,16 +333,17 @@ components:
           items:
             $ref: "#/components/schemas/ChatToolName"
           description: |
-            List of tools to enable. If empty, defaults to filter, clarification, and search.
-          example: ["add_filter", "search", "websearch"]
-        websearch_config:
+            List of tools to enable. If empty, retrieval agents default to all retrieval
+            tools available for the request.
+          example: ["add_filter", "semantic_search", "web_search"]
+        web_search_config:
           $ref: "websearch.yaml#/components/schemas/WebSearchConfig"
           description: |
-            Inline web search provider configuration. Prefer websearch_connection for
+            Inline web search provider configuration. Prefer web_search_connection for
             configured production agents; inline config remains useful for CLI/dev
             requests. See specs/openapi/antfly/websearch.yaml for provider-specific
             options.
-        websearch_connection:
+        web_search_connection:
           type: string
           description: |
             Name of a configured connections.<id> resource with kind web_search.

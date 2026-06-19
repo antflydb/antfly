@@ -2649,12 +2649,11 @@ pub const AlgebraicIndexStats = struct {
     active_progress_target_rows: ?i64 = null,
 };
 
-/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_connection or websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
+/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
 pub const ChatToolName = enum {
     add_filter,
     ask_clarification,
-    search,
-    websearch,
+    web_search,
     fetch,
     semantic_search,
     full_text_search,
@@ -2666,8 +2665,7 @@ pub const ChatToolName = enum {
         const s = switch (self) {
             .add_filter => "add_filter",
             .ask_clarification => "ask_clarification",
-            .search => "search",
-            .websearch => "websearch",
+            .web_search => "web_search",
             .fetch => "fetch",
             .semantic_search => "semantic_search",
             .full_text_search => "full_text_search",
@@ -2686,8 +2684,7 @@ pub const ChatToolName = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "add_filter", .add_filter },
             .{ "ask_clarification", .ask_clarification },
-            .{ "search", .search },
-            .{ "websearch", .websearch },
+            .{ "web_search", .web_search },
             .{ "fetch", .fetch },
             .{ "semantic_search", .semantic_search },
             .{ "full_text_search", .full_text_search },
@@ -5684,14 +5681,14 @@ pub const VertexSearchConfig = struct {
     service: ?[]const u8 = null,
 };
 
-/// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
+/// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
 pub const ChatToolsConfig = struct {
-    /// List of tools to enable. If empty, defaults to filter, clarification, and search.
+    /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
     enabled_tools: ?[]const ChatToolName = null,
-    /// Inline web search provider configuration. Prefer websearch_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
-    websearch_config: ?WebSearchConfig = null,
+    /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
+    web_search_config: ?WebSearchConfig = null,
     /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
-    websearch_connection: ?[]const u8 = null,
+    web_search_connection: ?[]const u8 = null,
     /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
     fetch_config: ?FetchConfig = null,
     /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
@@ -6136,6 +6133,12 @@ pub const TableSchema = struct {
     dynamic_templates: ?[]const DynamicTemplate = null,
 };
 
+/// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
+pub const RetrievalStepConfig = struct {
+    /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
+    tools: ?ChatToolsConfig = null,
+};
+
 /// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
 pub const ChatMessageContent = std.json.Value;
 
@@ -6243,22 +6246,6 @@ pub const TransactionCommitRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
-/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
-pub const RetrievalAgentSteps = struct {
-    /// Tool configuration for the retrieval agent. Controls which tools are available and their settings. If not specified, tools are automatically determined from the table's available indexes.
-    tools: ?ChatToolsConfig = null,
-    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?ClassificationStepConfig = null,
-    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?FollowupStepConfig = null,
-    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?ConfidenceStepConfig = null,
-    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
-    eval: ?EvalConfig = null,
-};
-
 /// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
 pub const AnswerAgentSteps = struct {
     /// Configuration for query classification and transformation.
@@ -6308,6 +6295,22 @@ pub const EmbeddingsIndexConfig = struct {
 pub const TableMigration = struct {
     state: []const u8,
     read_schema: TableSchema,
+};
+
+/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
+pub const RetrievalAgentSteps = struct {
+    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
+    classification: ?ClassificationStepConfig = null,
+    /// Configuration for retrieval tool execution. Retrieval-step tools narrow the top-level tools policy when both are provided.
+    retrieval: ?RetrievalStepConfig = null,
+    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
+    generation: ?GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
+    followup: ?FollowupStepConfig = null,
+    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
+    confidence: ?ConfidenceStepConfig = null,
+    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
+    eval: ?EvalConfig = null,
 };
 
 /// OpenAI-compatible message in a generation/chat conversation.
@@ -6379,6 +6382,134 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    derive_from_schema: ?bool = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.external) |value| {
+            try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.embedding_name) |value| {
+            try jw.objectField("embedding_name");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.distance_metric) |value| {
+            try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_document) |value| {
+            try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.derive_from_schema) |value| {
+            try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result from the retrieval agent
@@ -6780,7 +6911,9 @@ pub const RetrievalAgentRequest = struct {
     generator: ?GeneratorConfig = null,
     /// Chain of generators
     chain: ?[]const ChainLink = null,
-    /// Tool and step configuration
+    /// Default tool policy for this agent run. Step-specific tool policies narrow this default for their step; retrieval currently uses steps.retrieval.tools.
+    tools: ?ChatToolsConfig = null,
+    /// Step configuration
     steps: ?RetrievalAgentSteps = null,
     /// Handlebars template for rendering documents in the generation prompt. Default uses TOON format for token efficiency. Requires steps.generation to be set.
     document_renderer: ?[]const u8 = null,

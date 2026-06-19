@@ -335,7 +335,7 @@ case "step_completed":
 - Wire `onStepStarted` to show "in progress" indicators per step during streaming
 - Wire `onStepCompleted` to accumulate `reasoningChain` incrementally during streaming
 - Extract `reasoning_chain` and `tool_calls_made` from `onRetrievalAgentResult` (line 178) as fallback for non-streaming
-- Pass `config.tools` into the `steps.tools` field of the request (line 134)
+- Pass `config.tools` into the top-level `tools` field of the request (line 134)
 
 ---
 

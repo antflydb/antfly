@@ -38,6 +38,63 @@ const RetrievalQueryRequest = metadata_openapi.RetrievalQueryRequest;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
 const TreeSearchConfig = metadata_openapi.TreeSearchConfig;
 
+const ToolPolicy = struct {
+    global_tools: ?generating_api_openapi.ChatToolsConfig = null,
+    retrieval_tools: ?generating_api_openapi.ChatToolsConfig = null,
+
+    fn globalEnabledTools(self: ToolPolicy) ?[]const generating_api_openapi.ChatToolName {
+        const tools = self.global_tools orelse return null;
+        const enabled = tools.enabled_tools orelse return null;
+        if (enabled.len == 0) return null;
+        return enabled;
+    }
+
+    fn retrievalEnabledTools(self: ToolPolicy) ?[]const generating_api_openapi.ChatToolName {
+        const tools = self.retrieval_tools orelse return null;
+        const enabled = tools.enabled_tools orelse return null;
+        if (enabled.len == 0) return null;
+        return enabled;
+    }
+
+    fn hasTool(list: []const generating_api_openapi.ChatToolName, tool: generating_api_openapi.ChatToolName) bool {
+        for (list) |candidate| {
+            if (candidate == tool) return true;
+        }
+        return false;
+    }
+
+    fn isEnabled(self: ToolPolicy, tool: generating_api_openapi.ChatToolName) bool {
+        if (self.globalEnabledTools()) |enabled| {
+            if (!hasTool(enabled, tool)) return false;
+        }
+        if (self.retrievalEnabledTools()) |enabled| {
+            if (!hasTool(enabled, tool)) return false;
+        }
+        return true;
+    }
+
+    fn allowsClarification(self: ToolPolicy) bool {
+        return self.isEnabled(.ask_clarification);
+    }
+
+    fn maxToolIterations(self: ToolPolicy) ?i64 {
+        if (self.retrieval_tools) |tools| {
+            if (tools.max_tool_iterations) |value| return value;
+        }
+        const tools = self.global_tools orelse return null;
+        return tools.max_tool_iterations;
+    }
+
+    fn explicitToolCount(self: ToolPolicy) ?usize {
+        var count: usize = 0;
+        inline for (.{ .add_filter, .ask_clarification, .semantic_search, .full_text_search, .tree_search, .graph_search }) |tool| {
+            if (self.isEnabled(tool)) count += 1;
+        }
+        if (self.globalEnabledTools() == null and self.retrievalEnabledTools() == null) return null;
+        return count;
+    }
+};
+
 pub const EncodedResponse = struct {
     content_type: []const u8,
     body: []u8,
@@ -59,7 +116,7 @@ pub const EventSink = struct {
 };
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{});
+    return try std.json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
 }
 
 fn parseQueryRequestBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(QueryRequest) {
@@ -117,6 +174,13 @@ fn countSseEvents(events: []const TestSseEvent, name: []const u8) usize {
 fn firstSseEventData(events: []const TestSseEvent, name: []const u8) ?[]const u8 {
     for (events) |event| {
         if (std.mem.eql(u8, event.event, name)) return event.data;
+    }
+    return null;
+}
+
+fn findStepByName(steps: []const AgentStep, name: []const u8) ?AgentStep {
+    for (steps) |step| {
+        if (std.mem.eql(u8, step.name, name)) return step;
     }
     return null;
 }
@@ -292,7 +356,11 @@ const LiveEmitter = struct {
                 .details = step.details,
             });
         } else if (std.mem.eql(u8, step.name, "agentic")) {
-            try self.emitValue("tool_mode", .{ .mode = "structured_output" });
+            if (toolCountFromStepDetails(step.details)) |tools_count| {
+                try self.emitValue("tool_mode", .{ .mode = "structured_output", .tools_count = tools_count });
+            } else {
+                try self.emitValue("tool_mode", .{ .mode = "structured_output" });
+            }
             try self.emitTextChunks("reasoning", step.action);
         } else if (step.kind == .tool_call) {
             try self.emitValue("step_progress", .{
@@ -442,7 +510,8 @@ fn executeInternal(
 
     const format: ResponseFormat = if (request.stream orelse false) .sse else .json;
     var live = LiveEmitter{ .sink = event_sink, .alloc = alloc };
-    const max_internal_iterations: i64 = request.max_internal_iterations orelse 0;
+    const tool_policy = try parseToolPolicy(request);
+    const max_internal_iterations = try effectiveMaxInternalIterations(request, tool_policy);
     if (max_internal_iterations < 0) return error.InvalidRetrievalAgentRequest;
     const agentic_mode = max_internal_iterations > 0;
     if (request.accumulated_filters != null) return error.UnsupportedRetrievalAgentRequest;
@@ -451,6 +520,7 @@ fn executeInternal(
     if (retrieval_queries.len == 0) return error.InvalidRetrievalAgentRequest;
     if (request.query.len == 0) return error.InvalidRetrievalAgentRequest;
     if (raw_queries.len != retrieval_queries.len) return error.InvalidRetrievalAgentRequest;
+    try validateRetrievalQueriesAllowedByTools(retrieval_queries, tool_policy, agentic_mode);
 
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
@@ -486,7 +556,7 @@ fn executeInternal(
         null;
     if (classification_result) |classification| try live.emitClassification(classification);
     var selection = if (agentic_mode)
-        try selectAgenticQueries(arena, request, retrieval_queries, clarification_state)
+        try selectAgenticQueries(arena, request, retrieval_queries, clarification_state, tool_policy)
     else
         null;
     const allow_probe_selection = if (request.require_decision_after) |limit|
@@ -600,6 +670,7 @@ fn executeInternal(
             .name = "agentic",
             .action = "executed retrieval tools in bounded agentic mode",
             .status = .success,
+            .details = try buildToolModeStepDetails(arena, tool_policy),
         });
     }
 
@@ -637,12 +708,19 @@ fn executeInternal(
     var planned_query_indices = std.ArrayListUnmanaged(usize).empty;
     defer planned_query_indices.deinit(arena);
     if (selected_query_indices) |selected| {
-        try planned_query_indices.appendSlice(arena, selected);
+        for (selected) |retrieval_query_index| {
+            if (toolPolicyAllowsRetrievalQuery(tool_policy, retrieval_queries[retrieval_query_index])) {
+                try planned_query_indices.append(arena, retrieval_query_index);
+            }
+        }
     } else {
-        for (retrieval_queries, 0..) |_, retrieval_query_index| {
-            try planned_query_indices.append(arena, retrieval_query_index);
+        for (retrieval_queries, 0..) |retrieval_query, retrieval_query_index| {
+            if (toolPolicyAllowsRetrievalQuery(tool_policy, retrieval_query)) {
+                try planned_query_indices.append(arena, retrieval_query_index);
+            }
         }
     }
+    if (planned_query_indices.items.len == 0) return error.UnsupportedRetrievalAgentRequest;
 
     var previous_query_hits: []const QueryHit = &.{};
 
@@ -2001,10 +2079,6 @@ fn parseGenerationConfig(
         if (request.chain != null) return error.UnsupportedRetrievalAgentRequest;
         return null;
     };
-    if (steps.tools != null) {
-        return error.UnsupportedRetrievalAgentRequest;
-    }
-
     const public_generation = steps.generation orelse {
         if (request.chain != null) return error.UnsupportedRetrievalAgentRequest;
         return null;
@@ -2020,6 +2094,119 @@ fn parseGenerationConfig(
         .chain = chain,
         .system_prompt = generation.system_prompt,
         .generation_context = generation.generation_context,
+    };
+}
+
+fn parseToolPolicy(request: RetrievalAgentRequest) !ToolPolicy {
+    const retrieval_tools = if (request.steps) |steps|
+        if (steps.retrieval) |retrieval| retrieval.tools else null
+    else
+        null;
+    if (request.tools) |tools| try validateToolsConfig(tools);
+    if (retrieval_tools) |tools| try validateToolsConfig(tools);
+    return .{
+        .global_tools = request.tools,
+        .retrieval_tools = retrieval_tools,
+    };
+}
+
+fn validateToolsConfig(tools: generating_api_openapi.ChatToolsConfig) !void {
+    if (tools.max_tool_iterations) |max_tool_iterations| {
+        if (max_tool_iterations < 1 or max_tool_iterations > 20) return error.InvalidRetrievalAgentRequest;
+    }
+}
+
+fn effectiveMaxInternalIterations(request: RetrievalAgentRequest, tool_policy: ToolPolicy) !i64 {
+    const requested = request.max_internal_iterations orelse 0;
+    if (requested < 0) return error.InvalidRetrievalAgentRequest;
+    const tool_max = tool_policy.maxToolIterations() orelse return requested;
+    if (tool_max < 0) return error.InvalidRetrievalAgentRequest;
+    if (requested == 0) return 0;
+    return @min(requested, tool_max);
+}
+
+fn validateRetrievalQueriesAllowedByTools(
+    retrieval_queries: []const RetrievalQueryRequest,
+    tool_policy: ToolPolicy,
+    agentic_mode: bool,
+) !void {
+    var allowed_count: usize = 0;
+    for (retrieval_queries) |retrieval_query| {
+        if (toolPolicyAllowsRetrievalQuery(tool_policy, retrieval_query)) {
+            allowed_count += 1;
+        } else if (!agentic_mode) {
+            return error.UnsupportedRetrievalAgentRequest;
+        }
+    }
+    if (agentic_mode and allowed_count == 0) return error.UnsupportedRetrievalAgentRequest;
+}
+
+fn toolPolicyAllowsRetrievalQuery(
+    tool_policy: ToolPolicy,
+    retrieval_query: RetrievalQueryRequest,
+) bool {
+    var required_tools = requiredRetrievalTools(retrieval_query);
+    for (required_tools.items()) |tool| {
+        if (!tool_policy.isEnabled(tool)) return false;
+    }
+    return true;
+}
+
+fn requiredRetrievalTools(retrieval_query: RetrievalQueryRequest) RequiredRetrievalTools {
+    var required = RequiredRetrievalTools{};
+    if (retrieval_query.semantic_search != null or retrieval_query.embeddings != null) required.add(.semantic_search);
+    if (retrieval_query.full_text_search != null) required.add(.full_text_search);
+    if (hasMetadataRetrievalFields(retrieval_query)) required.add(.add_filter);
+    if (retrieval_query.tree_search != null) required.add(.tree_search);
+    if (retrieval_query.graph_searches != null) required.add(.graph_search);
+    if (required.len == 0) required.add(.add_filter);
+    return required;
+}
+
+const RequiredRetrievalTools = struct {
+    buf: [5]generating_api_openapi.ChatToolName = undefined,
+    len: usize = 0,
+
+    fn add(self: *@This(), tool: generating_api_openapi.ChatToolName) void {
+        for (self.buf[0..self.len]) |existing| {
+            if (existing == tool) return;
+        }
+        self.buf[self.len] = tool;
+        self.len += 1;
+    }
+
+    fn items(self: *@This()) []const generating_api_openapi.ChatToolName {
+        return self.buf[0..self.len];
+    }
+};
+
+fn hasMetadataRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
+    return retrieval_query.query != null or
+        retrieval_query.filter_prefix != null or
+        retrieval_query.filter_query != null or
+        retrieval_query.exclusion_query != null or
+        retrieval_query.aggregations != null or
+        retrieval_query.order_by != null or
+        (retrieval_query.count orelse false);
+}
+
+fn buildToolModeStepDetails(
+    alloc: std.mem.Allocator,
+    tool_policy: ToolPolicy,
+) !?std.json.Value {
+    const count = tool_policy.explicitToolCount() orelse return null;
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "tools_count", .{ .integer = @intCast(count) });
+    return .{ .object = obj };
+}
+
+fn toolCountFromStepDetails(details: ?std.json.Value) ?i64 {
+    const value = details orelse return null;
+    if (value != .object) return null;
+    const tools_count = value.object.get("tools_count") orelse return null;
+    return switch (tools_count) {
+        .integer => |count| count,
+        else => null,
     };
 }
 
@@ -3667,21 +3854,24 @@ fn selectAgenticQueries(
     request: RetrievalAgentRequest,
     retrieval_queries: []const RetrievalQueryRequest,
     clarification_state: ClarificationState,
+    tool_policy: ToolPolicy,
 ) !?AgenticSelection {
     if (retrieval_queries.len == 0) return null;
+    const allowed_query_indices = try collectAllowedRetrievalQueryIndices(alloc, retrieval_queries, tool_policy);
+    if (allowed_query_indices.len == 0) return error.UnsupportedRetrievalAgentRequest;
     if (retrieval_queries.len == 1) {
         return .{
             .indices = try alloc.dupe(usize, &[_]usize{0}),
             .source = .single_query,
-            .candidate_scores = try buildAgenticCandidateScores(alloc, request.query, retrieval_queries, preferredAgenticQueryStrategy(request)),
+            .candidate_scores = try buildAgenticCandidateScores(alloc, request.query, retrieval_queries, preferredAgenticQueryStrategy(request), allowed_query_indices),
         };
     }
 
     const preferred_strategy = preferredAgenticQueryStrategy(request);
-    const candidate_scores = try buildAgenticCandidateScores(alloc, request.query, retrieval_queries, preferred_strategy);
+    const candidate_scores = try buildAgenticCandidateScores(alloc, request.query, retrieval_queries, preferred_strategy, allowed_query_indices);
     if (preferred_strategy == .decompose) {
         return .{
-            .indices = try allQueryIndices(alloc, retrieval_queries.len),
+            .indices = try alloc.dupe(usize, allowed_query_indices),
             .source = .decompose,
             .candidate_scores = candidate_scores,
         };
@@ -3689,7 +3879,7 @@ fn selectAgenticQueries(
 
     if (decisionApproved(clarification_state.decisions, "broaden_search")) {
         return .{
-            .indices = try allQueryIndices(alloc, retrieval_queries.len),
+            .indices = try alloc.dupe(usize, allowed_query_indices),
             .source = .broaden_decision,
             .candidate_scores = candidate_scores,
         };
@@ -3697,6 +3887,7 @@ fn selectAgenticQueries(
 
     const decision_index = try resolveAgenticDecisionSelection(request.decisions orelse &.{}, retrieval_queries.len);
     if (decision_index) |value| {
+        if (!containsIndex(allowed_query_indices, value)) return error.UnsupportedRetrievalAgentRequest;
         return .{
             .indices = try alloc.dupe(usize, &[_]usize{value}),
             .source = .user_decision,
@@ -3707,7 +3898,8 @@ fn selectAgenticQueries(
     var best_index: usize = 0;
     var best_score: i32 = std.math.minInt(i32);
     var second_best_score: i32 = std.math.minInt(i32);
-    for (retrieval_queries, 0..) |retrieval_query, i| {
+    for (allowed_query_indices) |i| {
+        const retrieval_query = retrieval_queries[i];
         const score = scoreAgenticQueryCandidate(request.query, retrieval_query, preferred_strategy);
         if (score > best_score) {
             second_best_score = best_score;
@@ -3718,24 +3910,20 @@ fn selectAgenticQueries(
         }
     }
 
-    const ambiguous = retrieval_queries.len > 1 and (best_score - second_best_score) <= 10;
+    const ambiguous = allowed_query_indices.len > 1 and (best_score - second_best_score) <= 10;
     const must_decide_now = if (request.require_decision_after) |limit|
         limit <= 0
     else
         false;
     const decision_count: i64 = if (request.decisions) |decisions| @intCast(decisions.len) else 0;
-    const can_clarify = (request.interactive orelse true) and ((request.max_user_clarifications orelse 1) - decision_count > 0);
+    const can_clarify = allowed_query_indices.len > 1 and tool_policy.allowsClarification() and (request.interactive orelse true) and ((request.max_user_clarifications orelse 1) - decision_count > 0);
     if (ambiguous or must_decide_now) {
         if (can_clarify) {
             return .{
-                .question = try buildAgenticSelectionQuestion(alloc, request.query, retrieval_queries),
+                .question = try buildAgenticSelectionQuestionForIndices(alloc, request.query, retrieval_queries, allowed_query_indices),
                 .candidate_scores = candidate_scores,
             };
         }
-        return .{
-            .incomplete_reason = "clarification_required",
-            .candidate_scores = candidate_scores,
-        };
     }
 
     return .{
@@ -3769,7 +3957,10 @@ fn maybeProbeAgenticSelection(
         };
     }
 
-    for (probe_indices) |candidate_index| {
+    for (probe_indices) |candidate_pos| {
+        if (candidate_pos >= scores.len) continue;
+        const candidate_index = scores[candidate_pos].index;
+        if (candidate_index >= retrieval_queries.len) continue;
         const retrieval_query = retrieval_queries[candidate_index];
         if (!isProbeableRetrievalQuery(retrieval_query)) continue;
         const query_json = try encodeQueryValueForRetrievalQuery(
@@ -3806,12 +3997,12 @@ fn maybeProbeAgenticSelection(
         else
             extractHits(parsed_query.value);
 
-        scores[candidate_index].probe_hits = @intCast(query_hits.len);
+        scores[candidate_pos].probe_hits = @intCast(query_hits.len);
         if (query_hits.len > 0) {
             const probe_context = buildContextText(arena, query_hits[0..@min(query_hits.len, 3)]) catch "";
-            scores[candidate_index].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
+            scores[candidate_pos].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
         }
-        scores[candidate_index].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
+        scores[candidate_pos].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
     }
 
     const winner = selectProbeWinner(scores, probe_indices) orelse return .{
@@ -3823,7 +4014,7 @@ fn maybeProbeAgenticSelection(
     };
 
     return .{
-        .indices = try arena.dupe(usize, &[_]usize{winner}),
+        .indices = try arena.dupe(usize, &[_]usize{scores[winner].index}),
         .source = .probe,
         .candidate_scores = scores,
     };
@@ -3919,7 +4110,10 @@ fn probeAgenticFallbackCandidates(
     const probe_indices = try topRemainingProbeCandidateIndices(arena, scores, retrieval_queries, attempted_query_indices);
     if (probe_indices.len == 0) return scores;
 
-    for (probe_indices) |candidate_index| {
+    for (probe_indices) |candidate_pos| {
+        if (candidate_pos >= scores.len) continue;
+        const candidate_index = scores[candidate_pos].index;
+        if (candidate_index >= retrieval_queries.len) continue;
         const retrieval_query = retrieval_queries[candidate_index];
         if (!isProbeableRetrievalQuery(retrieval_query)) continue;
         const query_json = try encodeQueryValueForRetrievalQuery(
@@ -3956,12 +4150,12 @@ fn probeAgenticFallbackCandidates(
         else
             extractHits(parsed_query.value);
 
-        scores[candidate_index].probe_hits = @intCast(query_hits.len);
+        scores[candidate_pos].probe_hits = @intCast(query_hits.len);
         if (query_hits.len > 0) {
             const probe_context = buildContextText(arena, query_hits[0..@min(query_hits.len, 3)]) catch "";
-            scores[candidate_index].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
+            scores[candidate_pos].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
         }
-        scores[candidate_index].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
+        scores[candidate_pos].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
     }
 
     return scores;
@@ -3971,15 +4165,16 @@ fn selectNextAgenticFallbackIndex(
     candidate_scores: []const AgenticCandidateScore,
     attempted_query_indices: []const bool,
 ) ?usize {
-    var best_index: ?usize = null;
-    for (candidate_scores) |candidate| {
+    var best_pos: ?usize = null;
+    for (candidate_scores, 0..) |candidate, pos| {
         if (candidate.index >= attempted_query_indices.len) continue;
         if (attempted_query_indices[candidate.index]) continue;
-        if (best_index == null or compareAgenticCandidatePriority(candidate, candidate_scores[best_index.?]) > 0) {
-            best_index = candidate.index;
+        if (best_pos == null or compareAgenticCandidatePriority(candidate, candidate_scores[best_pos.?]) > 0) {
+            best_pos = pos;
         }
     }
-    return best_index;
+    const pos = best_pos orelse return null;
+    return candidate_scores[pos].index;
 }
 
 fn hasUnattemptedAgenticCandidate(
@@ -4381,7 +4576,8 @@ fn topProbeCandidateIndices(
     var second_index: ?usize = null;
 
     for (candidate_scores, 0..) |candidate, i| {
-        if (!isProbeableRetrievalQuery(retrieval_queries[i])) continue;
+        if (candidate.index >= retrieval_queries.len) continue;
+        if (!isProbeableRetrievalQuery(retrieval_queries[candidate.index])) continue;
         if (best_index == null or candidate.score > candidate_scores[best_index.?].score) {
             second_index = best_index;
             best_index = i;
@@ -4407,7 +4603,8 @@ fn topRemainingProbeCandidateIndices(
     for (candidate_scores, 0..) |candidate, i| {
         if (candidate.index >= attempted_query_indices.len) continue;
         if (attempted_query_indices[candidate.index]) continue;
-        if (!isProbeableRetrievalQuery(retrieval_queries[i])) continue;
+        if (candidate.index >= retrieval_queries.len) continue;
+        if (!isProbeableRetrievalQuery(retrieval_queries[candidate.index])) continue;
         if (best_index == null or candidate.score > candidate_scores[best_index.?].score) {
             second_index = best_index;
             best_index = i;
@@ -4552,9 +4749,11 @@ fn buildAgenticCandidateScores(
     query: []const u8,
     retrieval_queries: []const RetrievalQueryRequest,
     preferred_strategy: generating_api_openapi.QueryStrategy,
+    allowed_query_indices: []const usize,
 ) ![]const AgenticCandidateScore {
-    const out = try alloc.alloc(AgenticCandidateScore, retrieval_queries.len);
-    for (retrieval_queries, out, 0..) |retrieval_query, *slot, i| {
+    const out = try alloc.alloc(AgenticCandidateScore, allowed_query_indices.len);
+    for (allowed_query_indices, out) |i, *slot| {
+        const retrieval_query = retrieval_queries[i];
         slot.* = .{
             .index = i,
             .strategy = detectStrategy(retrieval_query),
@@ -4562,6 +4761,21 @@ fn buildAgenticCandidateScores(
         };
     }
     return out;
+}
+
+fn collectAllowedRetrievalQueryIndices(
+    alloc: std.mem.Allocator,
+    retrieval_queries: []const RetrievalQueryRequest,
+    tool_policy: ToolPolicy,
+) ![]const usize {
+    var out = std.ArrayListUnmanaged(usize).empty;
+    errdefer out.deinit(alloc);
+    for (retrieval_queries, 0..) |retrieval_query, i| {
+        if (toolPolicyAllowsRetrievalQuery(tool_policy, retrieval_query)) {
+            try out.append(alloc, i);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn resolveAgenticDecisionSelection(
@@ -4946,9 +5160,16 @@ fn encodeSse(
                 }
             }
         } else if (std.mem.eql(u8, step.name, "agentic")) {
-            try appendSseEventValue(alloc, &out, "tool_mode", .{
-                .mode = "structured_output",
-            });
+            if (toolCountFromStepDetails(step.details)) |tools_count| {
+                try appendSseEventValue(alloc, &out, "tool_mode", .{
+                    .mode = "structured_output",
+                    .tools_count = tools_count,
+                });
+            } else {
+                try appendSseEventValue(alloc, &out, "tool_mode", .{
+                    .mode = "structured_output",
+                });
+            }
             try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
         } else if (step.kind == .tool_call) {
             if (step.details) |details| {
@@ -5723,6 +5944,69 @@ fn detectStrategy(retrieval_query: RetrievalQueryRequest) RetrievalStrategy {
     return .metadata;
 }
 
+const ValidationOnlyRunner = struct {
+    fn iface() QueryRunner {
+        return .{
+            .ptr = undefined,
+            .vtable = &.{ .run_query = runQuery },
+        };
+    }
+
+    fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+        return .{
+            .json = try alloc.dupe(u8,
+                \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+            ),
+        };
+    }
+};
+
+test "retrieval agent rejects removed search tool name" {
+    const body =
+        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, body),
+    );
+}
+
+test "retrieval agent requires every tool used by a combined retrieval query" {
+    const semantic_graph_body =
+        \\{"query":"find related alpha docs","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{"related":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}},"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, semantic_graph_body),
+    );
+
+    const tree_seed_body =
+        \\{"query":"find alpha branch","stream":false,"tools":{"enabled_tools":["tree_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"tree_search":{"index":"doc_hierarchy","max_depth":3},"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, tree_seed_body),
+    );
+}
+
+test "retrieval agent rejects out of range max tool iterations" {
+    const zero_body =
+        \\{"query":"find alpha","stream":false,"max_internal_iterations":3,"tools":{"enabled_tools":["semantic_search"],"max_tool_iterations":0},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, zero_body),
+    );
+
+    const too_large_body =
+        \\{"query":"find alpha","stream":false,"max_internal_iterations":3,"tools":{"enabled_tools":["semantic_search"],"max_tool_iterations":21},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, too_large_body),
+    );
+}
+
 test "retrieval agent executes explicit query pipeline" {
     const FakeRunner = struct {
         fn iface() QueryRunner {
@@ -5741,7 +6025,7 @@ test "retrieval agent executes explicit query pipeline" {
             try std.testing.expectEqualStrings("alpha concept", parsed_query.value.semantic_search.?);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"fields":{"title":"alpha"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"fields":{"title":"alpha"}}]}}]}
                 ),
             };
         }
@@ -5780,7 +6064,7 @@ test "retrieval agent supports inline tree search" {
             try std.testing.expectEqualStrings("$tree_search", tree_query.start_nodes.?.result_ref.?);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
                 ),
             };
         }
@@ -5819,7 +6103,7 @@ test "retrieval agent supports pipeline tree search from previous hits" {
                 try std.testing.expectEqualStrings("alpha concept", parsed_query.value.semantic_search.?);
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"title":"alpha"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"title":"alpha"}}]}}]}
                     ),
                 };
             }
@@ -5827,7 +6111,7 @@ test "retrieval agent supports pipeline tree search from previous hits" {
             try std.testing.expectEqualStrings("doc:a", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
                 ),
             };
         }
@@ -5877,14 +6161,14 @@ test "retrieval agent supports roots tree search" {
                         if (keys.len == 1 and std.mem.eql(u8, keys[0], "doc:root")) {
                             return .{
                                 .json = try alloc.dupe(u8,
-                                    \\{"responses":[{"graph_results":{"incoming":{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}}}]}
+                                    \\{"responses":[{"status":200,"took":1,"graph_results":{"incoming":{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}}}]}
                                 ),
                             };
                         }
                     }
                     return .{
                         .json = try alloc.dupe(u8,
-                            \\{"responses":[{"graph_results":{"incoming":{"type":"neighbors","nodes":[{"key":"doc:root","depth":1,"document":{"title":"root"}}],"paths":[],"total":1,"took":1}}}]}
+                            \\{"responses":[{"status":200,"took":1,"graph_results":{"incoming":{"type":"neighbors","nodes":[{"key":"doc:root","depth":1,"document":{"title":"root"}}],"paths":[],"total":1,"took":1}}}]}
                         ),
                     };
                 }
@@ -5893,7 +6177,7 @@ test "retrieval agent supports roots tree search" {
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"total":1,"took":1}}}]}
                 ),
             };
         }
@@ -6376,7 +6660,7 @@ test "extract tree hits prefers strongest branches and ancestor ordering" {
     const alloc = std.testing.allocator;
 
     const response_json =
-        \\{"responses":[{"graph_results":{"tree_search":{"type":"traverse","nodes":[
+        \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[
         \\{"key":"doc:b","depth":1,"document":{"title":"branch b"}},
         \\{"key":"doc:a","depth":1,"document":{"title":"branch a"}},
         \\{"key":"doc:a:leaf","depth":2,"document":{"title":"branch a leaf"}}
@@ -6755,7 +7039,7 @@ test "retrieval agent supports bounded agentic mode" {
             }
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -6803,7 +7087,7 @@ test "retrieval agent agentic streaming emits tool mode" {
             }
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -6844,6 +7128,87 @@ test "retrieval agent agentic streaming emits tool mode" {
     try std.testing.expect(runner.call_count == 2);
 }
 
+test "retrieval agent agentic mode accepts explicit tools config" {
+    const FakeRunner = struct {
+        call_count: usize = 0,
+
+        fn ifaceWithState(self: *@This()) QueryRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            try std.testing.expect(std.mem.indexOf(u8, query_json, "semantic_search") != null);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const body =
+        \\{"query":"How does Raft work?","stream":true,"max_internal_iterations":3,"tools":{"enabled_tools":["add_filter","ask_clarification","semantic_search","full_text_search"],"max_tool_iterations":5},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    var runner = FakeRunner{};
+    const encoded = try execute(std.testing.allocator, runner.ifaceWithState(), null, body);
+    defer std.testing.allocator.free(encoded.body);
+    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
+    defer std.testing.allocator.free(events);
+
+    try std.testing.expectEqualStrings("text/event-stream", encoded.content_type);
+    var parsed_tool_mode = try parseJsonBody(TestToolModeEvent, std.testing.allocator, firstSseEventData(events, "tool_mode").?);
+    defer parsed_tool_mode.deinit();
+    try std.testing.expectEqualStrings("structured_output", parsed_tool_mode.value.mode);
+    try std.testing.expectEqual(@as(usize, 4), parsed_tool_mode.value.tools_count.?);
+    try std.testing.expect(runner.call_count > 0);
+}
+
+test "retrieval agent agentic mode ignores disabled retrieval tools" {
+    const FakeRunner = struct {
+        call_count: usize = 0,
+
+        fn ifaceWithState(self: *@This()) QueryRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            var parsed_query = try parseQueryRequestBody(alloc, query_json);
+            defer parsed_query.deinit();
+            try std.testing.expect(parsed_query.value.semantic_search == null);
+            try std.testing.expect(parsed_query.value.full_text_search != null);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:bm25","_score":1.0,"_source":{"content":"raft body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const body =
+        \\{"query":"How does Raft work?","stream":false,"interactive":false,"max_internal_iterations":3,"steps":{"retrieval":{"tools":{"enabled_tools":["full_text_search"]}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5},{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5}]}
+    ;
+    var runner = FakeRunner{};
+    const encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
+    try std.testing.expectEqual(RetrievalStrategy.bm25, parsed.value.strategy_used.?);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.tool_calls_made.?);
+    try std.testing.expectEqual(@as(usize, 1), runner.call_count);
+}
+
 test "retrieval agent streaming emits go-shaped tree search progress" {
     const FakeRunner = struct {
         fn iface() QueryRunner {
@@ -6856,14 +7221,14 @@ test "retrieval agent streaming emits go-shaped tree search progress" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"total":1,"took":1}}}]}
                 ),
             };
         }
     };
 
     const body =
-        \\{"query":"summarize the architecture tree","stream":true,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2,"beam_width":2},"limit":5}]}
+        \\{"query":"summarize the architecture tree","stream":true,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"doc:root","max_depth":2,"beam_width":2},"limit":5}]}
     ;
     const encoded = try execute(std.testing.allocator, FakeRunner.iface(), null, body);
     defer std.testing.allocator.free(encoded.body);
@@ -6905,7 +7270,7 @@ test "retrieval agent agentic mode selects one best query" {
             try expectFullTextQueryValue(parsed_query.value.full_text_search.?, "body:raft");
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"raft consensus in antfly"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"raft consensus in antfly"}}]}}]}
                 ),
             };
         }
@@ -6924,8 +7289,8 @@ test "retrieval agent agentic mode selects one best query" {
     try std.testing.expectEqual(@as(i64, 1), parsed.value.tool_calls_made.?);
     try std.testing.expectEqual(RetrievalStrategy.bm25, parsed.value.strategy_used.?);
     try std.testing.expect(parsed.value.classification != null);
-    try std.testing.expectEqualStrings("select_strategy", parsed.value.steps.?[1].name);
-    const selection_details = parsed.value.steps.?[1].details.?;
+    const selection_step = findStepByName(parsed.value.steps.?, "select_strategy") orelse return error.TestUnexpectedResult;
+    const selection_details = selection_step.details.?;
     try std.testing.expect(std.mem.eql(u8, selection_details.object.get("selection_source").?.string, "heuristic"));
     try std.testing.expect(selection_details.object.get("candidate_scores").?.array.items.len == 2);
 }
@@ -6950,20 +7315,20 @@ test "retrieval agent agentic mode can resolve ambiguity by probing candidates" 
                 if (self.call_count == 1) {
                     return .{
                         .json = try alloc.dupe(u8,
-                            \\{"responses":[{"hits":{"hits":[]}}]}
+                            \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
                         ),
                     };
                 }
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic","_score":0.5,"_source":{"body":"semantic fallback"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":0.5,"_source":{"body":"semantic fallback"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.full_text_search != null and parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:hybrid","_score":1.0,"_source":{"body":"hybrid winner"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:hybrid","_score":1.0,"_source":{"body":"hybrid winner"}}]}}]}
                     ),
                 };
             }
@@ -6983,7 +7348,8 @@ test "retrieval agent agentic mode can resolve ambiguity by probing candidates" 
 
     try std.testing.expectEqual(@as(usize, 3), runner.call_count);
     try std.testing.expectEqual(RetrievalStrategy.hybrid, parsed.value.strategy_used.?);
-    const selection_details = parsed.value.steps.?[1].details.?;
+    const selection_step = findStepByName(parsed.value.steps.?, "select_strategy") orelse return error.TestUnexpectedResult;
+    const selection_details = selection_step.details.?;
     try std.testing.expect(std.mem.eql(u8, selection_details.object.get("selection_source").?.string, "probe"));
     const candidate_scores = selection_details.object.get("candidate_scores").?.array.items;
     try std.testing.expect(candidate_scores.len == 2);
@@ -7018,14 +7384,14 @@ test "retrieval agent agentic mode evaluates misses and falls back to the next q
             if (parsed_query.value.full_text_search != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
                     ),
                 };
             }
             if (parsed_query.value.filter_query != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"fallback winner","status":"active"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"fallback winner","status":"active"}}]}}]}
                     ),
                 };
             }
@@ -7093,14 +7459,14 @@ test "retrieval agent agentic mode evaluates weak lexical hits and falls back to
                 }
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.2,"_source":{"title":"raft","body":"raft"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.2,"_source":{"title":"raft","body":"raft"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"title":"Raft Consensus","body":"raft consensus architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"title":"Raft Consensus","body":"raft consensus architecture overview"}}]}}]}
                     ),
                 };
             }
@@ -7172,14 +7538,14 @@ test "retrieval agent agentic mode evaluates weak multi-hit lexical results and 
                 }
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.4,"_source":{"title":"raft","body":"raft"}},{"_id":"doc:other","_score":0.3,"_source":{"title":"other","body":"raft note"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.4,"_source":{"title":"raft","body":"raft"}},{"_id":"doc:other","_score":0.3,"_source":{"title":"other","body":"raft note"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"title":"Raft Consensus","body":"raft consensus architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"title":"Raft Consensus","body":"raft consensus architecture overview"}}]}}]}
                     ),
                 };
             }
@@ -7252,21 +7618,21 @@ test "retrieval agent asks for clarification after ambiguous post-refinement fal
                 }
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.2,"_source":{"title":"raft","body":"raft"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.2,"_source":{"title":"raft","body":"raft"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.full_text_search != null and parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:hybrid","_score":0.9,"_source":{"title":"Raft Overview","body":"raft consensus architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:hybrid","_score":0.9,"_source":{"title":"Raft Overview","body":"raft consensus architecture overview"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic","_score":0.9,"_source":{"title":"Raft Overview","body":"raft consensus architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":0.9,"_source":{"title":"Raft Overview","body":"raft consensus architecture overview"}}]}}]}
                     ),
                 };
             }
@@ -7339,14 +7705,14 @@ test "retrieval agent agentic mode refines partial semantic results before switc
                     try std.testing.expectEqualStrings("antfly Explain the architecture of Antfly in detail", semantic_search);
                     return .{
                         .json = try alloc.dupe(u8,
-                            \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
+                            \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
                         ),
                     };
                 }
                 try std.testing.expectEqualStrings("Explain the architecture of Antfly in detail", semantic_search);
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"body":"Explain the architecture of Antfly in detail with cluster topology, storage roles, and retrieval planning."}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"body":"Explain the architecture of Antfly in detail with cluster topology, storage roles, and retrieval planning."}}]}}]}
                     ),
                 };
             }
@@ -7415,21 +7781,21 @@ test "retrieval agent can clarify after ambiguous partial semantic refinement" {
                 }
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.full_text_search != null and parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:hybrid","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:hybrid","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic_fallback","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic_fallback","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
                     ),
                 };
             }
@@ -7494,21 +7860,21 @@ test "retrieval agent can keep refined partial semantic result when fallback is 
             if (parsed_query.value.semantic_search != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic","_score":0.92,"_source":{"body":"Explain the architecture of Antfly in detail with storage roles and retrieval planning."}},{"_id":"doc:semantic-2","_score":0.80,"_source":{"body":"Antfly architecture overview with cluster storage routing details."}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":0.92,"_source":{"body":"Explain the architecture of Antfly in detail with storage roles and retrieval planning."}},{"_id":"doc:semantic-2","_score":0.80,"_source":{"body":"Antfly architecture overview with cluster storage routing details."}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.full_text_search != null and parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:hybrid","_score":0.55,"_source":{"body":"architecture notes"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:hybrid","_score":0.55,"_source":{"body":"architecture notes"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:fallback","_score":0.54,"_source":{"body":"architecture summary"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:fallback","_score":0.54,"_source":{"body":"architecture summary"}}]}}]}
                     ),
                 };
             }
@@ -7564,14 +7930,14 @@ test "retrieval agent agentic mode uses multiple tools for decompose queries" {
                 try std.testing.expect(parsed_query.value.full_text_search != null);
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"raft consensus"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"raft consensus"}}]}}]}
                     ),
                 };
             }
             try std.testing.expect(parsed_query.value.filter_query != null);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:b","_score":1.0,"_source":{"status":"active"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:b","_score":1.0,"_source":{"status":"active"}}]}}]}
                 ),
             };
         }
@@ -7616,7 +7982,7 @@ test "retrieval agent refines decompose queries before execution" {
             }
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"match"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"match"}}]}}]}
                 ),
             };
         }
@@ -7647,7 +8013,7 @@ test "retrieval agent refines step-back semantic queries before execution" {
             try std.testing.expectEqualStrings("Background context and core Antfly concepts needed for: How does retrieval work?", parsed_query.value.semantic_search.?);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"match"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"match"}}]}}]}
                 ),
             };
         }
@@ -7747,7 +8113,7 @@ test "retrieval agent can continue from a decision" {
             try std.testing.expect(parsed_query.value.filter_query == null);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"raft consensus in antfly"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"raft consensus in antfly"}}]}}]}
                 ),
             };
         }
@@ -7831,7 +8197,7 @@ test "retrieval agent can broaden after user approval" {
             try std.testing.expect(parsed_query.value.filter_query != null);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"status":"active"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"status":"active"}}]}}]}
                 ),
             };
         }
@@ -7864,7 +8230,7 @@ test "retrieval agent supports generation step in phase 2" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -7881,7 +8247,7 @@ test "retrieval agent supports generation step in phase 2" {
         fn executeChain(_: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
-            try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:a") != null);
+            try std.testing.expect(std.mem.indexOf(u8, messages[1].content.?.text, "doc:a") != null);
             return .{
                 .content = try alloc.dupe(u8, "Generated answer citing doc:a"),
                 .allocator = alloc,
@@ -7914,7 +8280,7 @@ test "retrieval agent event sink receives live milestones" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -7970,7 +8336,7 @@ test "retrieval agent supports classification confidence and followup" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -8019,7 +8385,7 @@ test "retrieval agent supports inline eval" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"raft consensus leader follower log replication"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"raft consensus leader follower log replication"}}]}}]}
                 ),
             };
         }
@@ -8064,7 +8430,7 @@ test "retrieval agent classification can decompose multi-part queries" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -8096,7 +8462,7 @@ test "retrieval agent supports fixed-body sse streaming" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -8154,7 +8520,7 @@ test "retrieval agent sse emits followup events" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
                 ),
             };
         }
@@ -8197,7 +8563,7 @@ test "retrieval agent sse emits eval events" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"raft consensus leader follower"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"raft consensus leader follower"}}]}}]}
                 ),
             };
         }
@@ -8289,13 +8655,13 @@ test "retrieval agent sse emits decomposition progress" {
             if (self.call_count == 1) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"raft consensus"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"raft consensus"}}]}}]}
                     ),
                 };
             }
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:b","_score":1.0,"_source":{"status":"active"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:b","_score":1.0,"_source":{"status":"active"}}]}}]}
                 ),
             };
         }
@@ -8345,13 +8711,13 @@ test "retrieval agent sse emits probe progress for ambiguous agentic selection" 
             if (parsed_query.value.semantic_search != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
                     ),
                 };
             }
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:hybrid","_score":1.0,"_source":{"body":"hybrid winner"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:hybrid","_score":1.0,"_source":{"body":"hybrid winner"}}]}}]}
                 ),
             };
         }
@@ -8400,13 +8766,13 @@ test "retrieval agent sse emits evaluation progress for fallback planning" {
             if (parsed_query.value.full_text_search != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
                     ),
                 };
             }
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"fallback winner","status":"active"}}]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"fallback winner","status":"active"}}]}}]}
                 ),
             };
         }
@@ -8455,13 +8821,13 @@ test "retrieval agent sse emits evaluation refinement progress" {
                 if (self.call_count == 1) {
                     return .{
                         .json = try alloc.dupe(u8,
-                            \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
+                            \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
                         ),
                     };
                 }
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"body":"Explain the architecture of Antfly in detail with cluster topology, storage roles, and retrieval planning."}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"body":"Explain the architecture of Antfly in detail with cluster topology, storage roles, and retrieval planning."}}]}}]}
                     ),
                 };
             }
@@ -8512,27 +8878,27 @@ test "retrieval agent sse emits fallback consensus ambiguity progress" {
                 if (self.call_count == 1) {
                     return .{
                         .json = try alloc.dupe(u8,
-                            \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
+                            \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
                         ),
                     };
                 }
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:thin","_score":0.71,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.61,"_source":{"body":"overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.71,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.61,"_source":{"body":"overview"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.full_text_search != null and parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:hybrid","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:hybrid","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
                     ),
                 };
             }
             if (parsed_query.value.embeddings != null) {
                 return .{
                     .json = try alloc.dupe(u8,
-                        \\{"responses":[{"hits":{"hits":[{"_id":"doc:semantic_fallback","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
+                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic_fallback","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
                     ),
                 };
             }

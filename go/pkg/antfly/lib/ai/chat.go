@@ -36,8 +36,7 @@ const (
 
 	ToolNameFilter        = ChatToolNameAddFilter
 	ToolNameClarification = ChatToolNameAskClarification
-	ToolNameSearch        = ChatToolNameSearch
-	ToolNameWebSearch     = ChatToolNameWebsearch
+	ToolNameWebSearch     = ChatToolNameWebSearch
 	ToolNameFetch         = ChatToolNameFetch
 
 	// Retrieval-specific tool names
@@ -84,17 +83,6 @@ var (
 		"required": []string{"question"},
 	}
 
-	searchSchema = map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"query": map[string]any{
-				"type":        "string",
-				"description": "The semantic search query to execute",
-			},
-		},
-		"required": []string{"query"},
-	}
-
 	websearchSchema = map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -134,13 +122,12 @@ var (
 const (
 	filterDescription        = "Add a filter to narrow search results. Use this when the user wants to filter by specific field values like date ranges, categories, status, or other attributes."
 	clarificationDescription = "Ask the user a clarifying question before searching. Use this when the query is ambiguous, missing important details, or could be interpreted multiple ways."
-	searchDescription        = "Execute a semantic search query. Use this to find relevant documents based on the user's request or to explore related topics."
 	websearchDescription     = "Search the web for external information. Use this when the internal documents don't have the answer, or when the user explicitly asks for current/external information. Returns search results with titles, snippets, and URLs."
 	fetchDescription         = "Fetch and extract content from a URL. Supports web pages (extracts readable text), PDFs (extracts text), and plain text files. Use this to get detailed content from a specific URL, such as from web search results."
 )
 
 // defaultChatTools are the tools enabled when EnabledTools is nil/empty.
-var defaultChatTools = []ChatToolName{ToolNameFilter, ToolNameClarification, ToolNameSearch}
+var defaultChatTools = []ChatToolName{ToolNameFilter, ToolNameClarification}
 
 // indexTools are auto-enabled when EnabledTools is nil/empty.
 var indexTools = []ChatToolName{ToolNameSemanticSearch, ToolNameFullTextSearch, ToolNameTreeSearch, ToolNameGraphSearch}
@@ -169,22 +156,6 @@ func groupIndexesByType(indexes []IndexInfo) (embeddings, fullText, graph []Inde
 		}
 	}
 	return
-}
-
-// configWithoutSearch returns a copy of config with ToolNameSearch removed from EnabledTools.
-// Used by retrieval tools which replace the generic "search" with specific search tools.
-func configWithoutSearch(config ChatToolsConfig) ChatToolsConfig {
-	if config.EnabledTools == nil || !slices.Contains(*config.EnabledTools, ToolNameSearch) {
-		return config
-	}
-	filtered := make([]ChatToolName, 0, len(*config.EnabledTools)-1)
-	for _, t := range *config.EnabledTools {
-		if t != ToolNameSearch {
-			filtered = append(filtered, t)
-		}
-	}
-	config.EnabledTools = &filtered
-	return config
 }
 
 // indexNames extracts index names from a slice of IndexInfo.
@@ -641,9 +612,6 @@ func ChatToolDefinitions(config ChatToolsConfig) []ai.ToolDefinition {
 	if config.IsToolEnabled(ToolNameClarification) {
 		tools = append(tools, ai.ToolDefinition{Name: string(ToolNameClarification), Description: clarificationDescription, InputSchema: clarificationSchema})
 	}
-	if config.IsToolEnabled(ToolNameSearch) {
-		tools = append(tools, ai.ToolDefinition{Name: string(ToolNameSearch), Description: searchDescription, InputSchema: searchSchema})
-	}
 	if config.IsToolEnabled(ToolNameWebSearch) {
 		tools = append(tools, ai.ToolDefinition{Name: string(ToolNameWebSearch), Description: websearchDescription, InputSchema: websearchSchema})
 	}
@@ -711,45 +679,23 @@ func ParseStructuredOutput(text string) ([]ParsedToolAction, string, error) {
 		}
 	}
 
-	// Parse <search> tags
-	searchStart := strings.Index(text, "<search>")
-	for searchStart != -1 {
-		searchEnd := strings.Index(text[searchStart:], "</search>")
-		if searchEnd == -1 {
-			break
-		}
-		searchEnd += searchStart + len("</search>")
-
-		searchContent := text[searchStart+len("<search>") : searchEnd-len("</search>")]
-		action, err := parseSearchContent(searchContent)
-		if err == nil {
-			actions = append(actions, action)
-		}
-
-		remainingText = strings.Replace(remainingText, text[searchStart:searchEnd], "", 1)
-		searchStart = strings.Index(text[searchEnd:], "<search>")
-		if searchStart != -1 {
-			searchStart += searchEnd
-		}
-	}
-
-	// Parse <websearch> tags
-	wsStart := strings.Index(text, "<websearch>")
+	// Parse <web_search> tags
+	wsStart := strings.Index(text, "<web_search>")
 	for wsStart != -1 {
-		wsEnd := strings.Index(text[wsStart:], "</websearch>")
+		wsEnd := strings.Index(text[wsStart:], "</web_search>")
 		if wsEnd == -1 {
 			break
 		}
-		wsEnd += wsStart + len("</websearch>")
+		wsEnd += wsStart + len("</web_search>")
 
-		wsContent := text[wsStart+len("<websearch>") : wsEnd-len("</websearch>")]
+		wsContent := text[wsStart+len("<web_search>") : wsEnd-len("</web_search>")]
 		action, err := parseWebsearchContent(wsContent)
 		if err == nil {
 			actions = append(actions, action)
 		}
 
 		remainingText = strings.Replace(remainingText, text[wsStart:wsEnd], "", 1)
-		wsStart = strings.Index(text[wsEnd:], "<websearch>")
+		wsStart = strings.Index(text[wsEnd:], "<web_search>")
 		if wsStart != -1 {
 			wsStart += wsEnd
 		}
@@ -845,27 +791,6 @@ func parseClarificationContent(content string) (ParsedToolAction, error) {
 
 	return ParsedToolAction{
 		ToolName:  ToolNameClarification,
-		Arguments: args,
-	}, nil
-}
-
-func parseSearchContent(content string) (ParsedToolAction, error) {
-	lines := strings.Split(strings.TrimSpace(content), "\n")
-	args := make(map[string]any)
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if after, ok := strings.CutPrefix(line, "query:"); ok {
-			args["query"] = strings.TrimSpace(after)
-		}
-	}
-
-	if args["query"] == nil {
-		return ParsedToolAction{}, fmt.Errorf("missing required query field")
-	}
-
-	return ParsedToolAction{
-		ToolName:  ToolNameSearch,
 		Arguments: args,
 	}, nil
 }
@@ -1171,8 +1096,6 @@ type ToolExecutionResult struct {
 
 // ToolExecutor defines the interface for executing tools
 type ToolExecutor interface {
-	// ExecuteSearch runs a semantic search query
-	ExecuteSearch(ctx context.Context, query string, filters []FilterSpec) ([]map[string]any, error)
 	// ExecuteWebSearch runs a web search
 	ExecuteWebSearch(ctx context.Context, query string, numResults int) ([]map[string]any, error)
 	// ExecuteFetch fetches content from a URL
@@ -1307,29 +1230,6 @@ func CreateNativeTools(g *genkit.Genkit, config ChatToolsConfig, executor ToolEx
 		tools = append(tools, clarificationTool)
 	}
 
-	// Search tool - executes additional searches
-	if config.IsToolEnabled(ToolNameSearch) && executor != nil {
-		searchTool := ai.NewTool[any, []map[string]any](
-			string(ToolNameSearch),
-			searchDescription,
-			func(ctx *ai.ToolContext, input any) ([]map[string]any, error) {
-				inputMap, ok := input.(map[string]any)
-				if !ok {
-					return nil, fmt.Errorf("invalid search input type")
-				}
-
-				query, _ := inputMap["query"].(string)
-				if query == "" {
-					return nil, fmt.Errorf("query is required")
-				}
-
-				return executor.ExecuteSearch(ctx.Context, query, nil)
-			},
-			ai.WithInputSchema(searchSchema),
-		)
-		tools = append(tools, searchTool)
-	}
-
 	// Web search tool
 	if config.IsToolEnabled(ToolNameWebSearch) && executor != nil {
 		websearchTool := ai.NewTool[any, []map[string]any](
@@ -1338,7 +1238,7 @@ func CreateNativeTools(g *genkit.Genkit, config ChatToolsConfig, executor ToolEx
 			func(ctx *ai.ToolContext, input any) ([]map[string]any, error) {
 				inputMap, ok := input.(map[string]any)
 				if !ok {
-					return nil, fmt.Errorf("invalid websearch input type")
+					return nil, fmt.Errorf("invalid web_search input type")
 				}
 
 				query, _ := inputMap["query"].(string)
@@ -1386,11 +1286,10 @@ func CreateNativeTools(g *genkit.Genkit, config ChatToolsConfig, executor ToolEx
 
 // CreateRetrievalTools creates genkit Tool instances for the retrieval agent based on the
 // table's available indexes. Tools are dynamically created from the index configuration.
-// Chat tools (filter, clarification, websearch, fetch) are also included if enabled.
+// Chat tools (filter, clarification, web_search, fetch) are also included if enabled.
 func CreateRetrievalTools(g *genkit.Genkit, config ChatToolsConfig, executor RetrievalToolExecutor, availableIndexes []IndexInfo) []ai.Tool {
-	// Start with the base chat tools (filter, clarification, websearch, fetch)
-	// but exclude "search" since retrieval uses specific search tools instead
-	tools := CreateNativeTools(g, configWithoutSearch(config), executor)
+	// Start with the base chat tools (filter, clarification, web_search, fetch).
+	tools := CreateNativeTools(g, config, executor)
 
 	// Build index-name-to-table lookup and group indexes by type (single pass)
 	indexTable := make(map[string]string, len(availableIndexes))
@@ -1572,8 +1471,7 @@ func CreateRetrievalTools(g *genkit.Genkit, config ChatToolsConfig, executor Ret
 // RetrievalToolDefinitions returns tool definitions for the retrieval agent
 // (used for structured output fallback with non-native tool providers)
 func RetrievalToolDefinitions(config ChatToolsConfig, availableIndexes []IndexInfo) []ai.ToolDefinition {
-	// Start with base chat tool definitions (minus "search" which is replaced by specific search tools)
-	tools := ChatToolDefinitions(configWithoutSearch(config))
+	tools := ChatToolDefinitions(config)
 
 	aknnIndexes, fullTextIndexes, graphIndexes := groupIndexesByType(availableIndexes)
 
