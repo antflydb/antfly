@@ -27,6 +27,8 @@ const vec = @import("vector.zig");
 const proto = @import("proto.zig");
 const go_rand = @import("go_rand.zig");
 
+const source_quantize_temp_diff_stack_capacity = 4096;
+
 /// RaBitQuantizer quantizes vectors into 1 bit per dimension.
 ///
 /// Thread-safe: can be cached and reused across threads.
@@ -215,8 +217,13 @@ pub const RaBitQuantizer = struct {
             centroid_dot_products = try self.alloc.alloc(f32, count);
         }
 
-        const temp_diff = try self.alloc.alloc(f32, self.dims);
-        defer self.alloc.free(temp_diff);
+        var temp_diff_stack: [source_quantize_temp_diff_stack_capacity]f32 = undefined;
+        const use_temp_diff_stack = self.dims <= temp_diff_stack.len;
+        const temp_diff = if (use_temp_diff_stack)
+            temp_diff_stack[0..self.dims]
+        else
+            try self.alloc.alloc(f32, self.dims);
+        defer if (!use_temp_diff_stack) self.alloc.free(temp_diff);
 
         for (0..count) |i| {
             const v = source.vectorAt(i);
