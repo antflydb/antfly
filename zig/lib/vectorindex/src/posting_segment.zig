@@ -1023,7 +1023,11 @@ pub const LazyDirectorySnapshot = struct {
         scratch: anytype,
     ) !posting.PostingDeltaTailStats {
         var stats = posting.PostingDeltaTailStats{};
-        for (self.manifest.segments) |entry| {
+        const start_index = if (self.manifest.segments_sorted_by_segment_id and min_segment_id != 0)
+            lowerBoundOwnedManifestSegmentId(self.manifest.segments, min_segment_id)
+        else
+            0;
+        for (self.manifest.segments[start_index..]) |entry| {
             if (entry.meta.segment_id < min_segment_id) continue;
             if (!entry.meta.mayContainPosting(posting_id)) continue;
             if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
@@ -4534,6 +4538,20 @@ fn sortManifestEntriesIfNeeded(entries: []ManifestEntry) void {
     }
 }
 
+fn lowerBoundOwnedManifestSegmentId(entries: []const OwnedManifestEntry, min_segment_id: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (entries[mid].meta.segment_id < min_segment_id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 fn segmentBlobsSortedBySegmentId(segments: []const SegmentBlob) bool {
     var index: usize = 1;
     while (index < segments.len) : (index += 1) {
@@ -7391,6 +7409,20 @@ test "posting segment manifest codec rejects invalid data" {
 
 test "posting segment manifest replacement encodes compaction commit" {
     try testManifestReplacementEncodesCompactionCommit();
+}
+
+test "posting segment manifest segment id lower bound" {
+    const entries = [_]OwnedManifestEntry{
+        .{ .meta = .{ .segment_id = 2 }, .path = &.{} },
+        .{ .meta = .{ .segment_id = 4 }, .path = &.{} },
+        .{ .meta = .{ .segment_id = 9 }, .path = &.{} },
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), lowerBoundOwnedManifestSegmentId(&entries, 0));
+    try std.testing.expectEqual(@as(usize, 0), lowerBoundOwnedManifestSegmentId(&entries, 2));
+    try std.testing.expectEqual(@as(usize, 1), lowerBoundOwnedManifestSegmentId(&entries, 3));
+    try std.testing.expectEqual(@as(usize, 2), lowerBoundOwnedManifestSegmentId(&entries, 9));
+    try std.testing.expectEqual(@as(usize, 3), lowerBoundOwnedManifestSegmentId(&entries, 10));
 }
 
 test "posting segment directory compaction planner selects within budgets" {
