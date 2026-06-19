@@ -6121,81 +6121,6 @@
       "sql": "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records"
     },
     {
-      "name": "create view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_view",
-        "table_name": "usage_records_v",
-        "select": 1
-      },
-      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=false:if_not_exists=false",
-      "sql": "CREATE VIEW usage_records_v AS SELECT id FROM usage_records"
-    },
-    {
-      "name": "create view column list catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_view",
-        "table_name": "usage_records_v",
-        "select": 1
-      },
-      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=false:if_not_exists=false",
-      "sql": "CREATE VIEW usage_records_v(record_id) AS SELECT id FROM usage_records"
-    },
-    {
-      "name": "create view select alias catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_view",
-        "table_name": "usage_records_v",
-        "select": 1
-      },
-      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=false:if_not_exists=false",
-      "sql": "CREATE VIEW usage_records_v AS SELECT id AS record_id FROM usage_records"
-    },
-    {
-      "name": "create or replace view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_view",
-        "table_name": "usage_records_v",
-        "select": 1
-      },
-      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=true:if_not_exists=false",
-      "sql": "CREATE OR REPLACE VIEW usage_records_v AS SELECT id FROM usage_records"
-    },
-    {
-      "name": "create or replace view if not exists catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_view",
-        "table_name": "usage_records_v",
-        "select": 1
-      },
-      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=true:if_not_exists=true",
-      "sql": "CREATE OR REPLACE VIEW IF NOT EXISTS usage_records_v AS SELECT id FROM usage_records"
-    },
-    {
-      "name": "rename view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "rename_view",
-        "table_name": "usage_records_v"
-      },
-      "plan": "ddl:rename_view:view=usage_records_v:new=usage_records_visible_v",
-      "sql": "ALTER VIEW usage_records_v RENAME TO usage_records_visible_v"
-    },
-    {
-      "name": "drop view catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "drop_view",
-        "table_name": "usage_records_v"
-      },
-      "plan": "ddl:drop_view:view=usage_records_v:if_exists=false",
-      "sql": "DROP VIEW usage_records_v"
-    },
-    {
       "name": "point update joined source routes to claimed joined mutation source",
       "family": "update_joined_source",
       "summary": {
@@ -10781,6 +10706,81 @@
       },
       "plan": "ddl:detach_table_partition:parent=usage_events:partition=usage_events_2026",
       "sql": "ALTER TABLE usage_events DETACH PARTITION usage_events_2026"
+    },
+    {
+      "name": "create view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_view",
+        "table_name": "usage_records_v",
+        "select": 1
+      },
+      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=false:if_not_exists=false",
+      "sql": "CREATE VIEW usage_records_v AS SELECT id FROM usage_records"
+    },
+    {
+      "name": "create view column list catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_view",
+        "table_name": "usage_records_v",
+        "select": 1
+      },
+      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=false:if_not_exists=false",
+      "sql": "CREATE VIEW usage_records_v(record_id) AS SELECT id FROM usage_records"
+    },
+    {
+      "name": "create view select alias catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_view",
+        "table_name": "usage_records_v",
+        "select": 1
+      },
+      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=false:if_not_exists=false",
+      "sql": "CREATE VIEW usage_records_v AS SELECT id AS record_id FROM usage_records"
+    },
+    {
+      "name": "create or replace view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_view",
+        "table_name": "usage_records_v",
+        "select": 1
+      },
+      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=true:if_not_exists=false",
+      "sql": "CREATE OR REPLACE VIEW usage_records_v AS SELECT id FROM usage_records"
+    },
+    {
+      "name": "create or replace view if not exists catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_view",
+        "table_name": "usage_records_v",
+        "select": 1
+      },
+      "plan": "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=true:if_not_exists=true",
+      "sql": "CREATE OR REPLACE VIEW IF NOT EXISTS usage_records_v AS SELECT id FROM usage_records"
+    },
+    {
+      "name": "rename view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "rename_view",
+        "table_name": "usage_records_v"
+      },
+      "plan": "ddl:rename_view:view=usage_records_v:new=usage_records_visible_v",
+      "sql": "ALTER VIEW usage_records_v RENAME TO usage_records_visible_v"
+    },
+    {
+      "name": "drop view catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_view",
+        "table_name": "usage_records_v"
+      },
+      "plan": "ddl:drop_view:view=usage_records_v:if_exists=false",
+      "sql": "DROP VIEW usage_records_v"
     }
   ]
 }
