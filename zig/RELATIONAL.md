@@ -1221,8 +1221,9 @@ prefix grammar for `[CONSTRAINT name] PRIMARY KEY`, `UNIQUE`, `CHECK`, and
 `REFERENCES`, and DDL constraint suffix grammar for `NOT VALID`,
 `NULLS [NOT] DISTINCT`, immediate `NOT DEFERRABLE` timing, constraint
 column lists, `INCLUDE (...)`, temporal `WITHOUT OVERLAPS` column lists, and
-foreign-key column lists plus option tails for `ON DELETE`, `ON UPDATE`, and
-deferrability, DDL `COLLATE` clauses, DDL type-name/modifier grammar, and
+foreign-key column lists plus option tails for `MATCH SIMPLE`, `MATCH FULL`,
+`ON DELETE`, `ON UPDATE`, and deferrability, DDL `COLLATE` clauses, DDL
+type-name/modifier grammar, and
 `CURRENT_TIMESTAMP(p)` precision grammar, `PERIOD FOR name (start, end)`
 constraint grammar, and stored generated-column value grammar for
 `ALWAYS AS (...) STORED` over the deterministic row-expression subset used by

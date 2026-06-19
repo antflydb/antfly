@@ -54701,6 +54701,49 @@ fn createTablePlanUpdatePolicyColumnCount(plan: CreateTablePlan) usize {
     return count;
 }
 
+const ForeignKeyOptionFingerprintCounts = struct {
+    deferrable: usize = 0,
+    deferred: usize = 0,
+    match_full: usize = 0,
+    match_partial: usize = 0,
+};
+
+fn countForeignKeyOptionFingerprints(foreign_keys: []const runtime_schema.ForeignKey) ForeignKeyOptionFingerprintCounts {
+    var counts: ForeignKeyOptionFingerprintCounts = .{};
+    for (foreign_keys) |foreign_key| {
+        if (foreign_key.deferrable) counts.deferrable += 1;
+        if (foreign_key.timing == .deferred) counts.deferred += 1;
+        switch (foreign_key.match) {
+            .simple => {},
+            .full => counts.match_full += 1,
+            .partial => counts.match_partial += 1,
+        }
+    }
+    return counts;
+}
+
+fn addForeignKeyOptionFingerprintCounts(
+    counts: *ForeignKeyOptionFingerprintCounts,
+    foreign_keys: []const runtime_schema.ForeignKey,
+) void {
+    const next = countForeignKeyOptionFingerprints(foreign_keys);
+    counts.deferrable += next.deferrable;
+    counts.deferred += next.deferred;
+    counts.match_full += next.match_full;
+    counts.match_partial += next.match_partial;
+}
+
+fn appendForeignKeyOptionFingerprintsAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    counts: ForeignKeyOptionFingerprintCounts,
+) ![]u8 {
+    var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, "fk_deferrable", counts.deferrable);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_deferred", counts.deferred);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_match_full", counts.match_full);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_match_partial", counts.match_partial);
+}
+
 const AlterTablePlanFingerprintCounts = struct {
     add_column: usize = 0,
     add_column_if_not_exists: usize = 0,
@@ -54729,6 +54772,7 @@ const AlterTablePlanFingerprintCounts = struct {
     add_foreign_key: usize = 0,
     add_check: usize = 0,
     validate_constraint: usize = 0,
+    foreign_key_options: ForeignKeyOptionFingerprintCounts = .{},
 };
 
 fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerprintCounts {
@@ -54743,6 +54787,7 @@ fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerpri
             counts.add_column_unique += add.unique_constraints.len;
             counts.add_column_fk += add.foreign_keys.len;
             counts.add_column_check += add.checks.len;
+            addForeignKeyOptionFingerprintCounts(&counts.foreign_key_options, add.foreign_keys);
         },
         .add_period => counts.add_period += 1,
         .add_primary_key => counts.add_primary_key += 1,
@@ -54776,7 +54821,10 @@ fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerpri
         },
         .alter_column_type => counts.alter_type += 1,
         .add_unique_constraint => counts.add_unique += 1,
-        .add_foreign_key => counts.add_foreign_key += 1,
+        .add_foreign_key => |foreign_key| {
+            counts.add_foreign_key += 1;
+            addForeignKeyOptionFingerprintCounts(&counts.foreign_key_options, &.{foreign_key});
+        },
         .add_check => counts.add_check += 1,
         .validate_constraint => counts.validate_constraint += 1,
     };
@@ -55430,6 +55478,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "defaults", createTablePlanDefaultColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "generated", createTablePlanGeneratedColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_update", createTablePlanUpdatePolicyColumnCount(plan));
+            fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, countForeignKeyOptionFingerprints(plan.foreign_keys));
             break :blk fingerprint;
         },
         .table_clone => |plan| try std.fmt.allocPrint(
@@ -55497,19 +55546,22 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     .{ drop.view_name, drop.if_exists },
                 ),
         },
-        .relation_lifetime => |plan| try std.fmt.allocPrint(
-            alloc,
-            "ddl:relation_lifetime:kind={s}:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}",
-            .{
-                relationLifetimeKindName(plan.kind),
-                plan.create_table.table_name,
-                plan.create_table.columns.len,
-                plan.create_table.unique_constraints.len,
-                plan.create_table.foreign_keys.len,
-                plan.create_table.checks.len,
-                plan.create_table.if_not_exists,
-            },
-        ),
+        .relation_lifetime => |plan| blk: {
+            const base = try std.fmt.allocPrint(
+                alloc,
+                "ddl:relation_lifetime:kind={s}:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}",
+                .{
+                    relationLifetimeKindName(plan.kind),
+                    plan.create_table.table_name,
+                    plan.create_table.columns.len,
+                    plan.create_table.unique_constraints.len,
+                    plan.create_table.foreign_keys.len,
+                    plan.create_table.checks.len,
+                    plan.create_table.if_not_exists,
+                },
+            );
+            break :blk try appendForeignKeyOptionFingerprintsAlloc(alloc, base, countForeignKeyOptionFingerprints(plan.create_table.foreign_keys));
+        },
         .enum_type_catalog => |plan| switch (plan) {
             .create => |create| try std.fmt.allocPrint(
                 alloc,
@@ -56153,6 +56205,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_fk", counts.add_foreign_key);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_check", counts.add_check);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "validate", counts.validate_constraint);
+            fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, counts.foreign_key_options);
             break :blk fingerprint;
         },
         .create_update_policy => |plan| try std.fmt.allocPrint(

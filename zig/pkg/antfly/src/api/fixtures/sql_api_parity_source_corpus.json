@@ -7044,7 +7044,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1:fk_deferrable=1:fk_deferred=1:fk_match_full=1",
       "apply_setup_sql": [
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text, region text);"
       ],
