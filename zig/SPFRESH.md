@@ -266,7 +266,10 @@ Current status:
   no-op replacement. Segment writer flushes and lazy segment batch point reads
   now skip their ordering sort when buffered records are already in segment key
   order, while still sorting unordered batches before duplicate-key validation
-  or range coalescing. Pending segment delta micro-batches now count
+  or range coalescing. Newest-first centroid-directory scans also resolve
+  superseded ranges from the verified index before opening the segment again
+  for value reads, so fully covered older centroid segments do not pay a cold
+  value-reader open. Pending segment delta micro-batches now count
   their exact encoded value bytes while still buffered as records, so
   `max_pending_value_bytes` bounds delta batches as well as point values and
   pending-tail stats expose the same encoded-byte total to fold policy.

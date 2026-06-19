@@ -4003,6 +4003,8 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
     defer index_data.deinit(alloc);
 
+    var range = (try nextCentroidDirectoryReadRange(index_data.data, entry.meta, 0, entry.meta.segment_id, candidates, skip_superseded_candidates)) orelse return;
+
     const file = try dir.openFile(io, entry.path, .{});
     defer file.close(io);
 
@@ -4011,20 +4013,7 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
     var heap_values = std.ArrayListUnmanaged(u8).empty;
     defer heap_values.deinit(alloc);
 
-    var index: usize = 0;
-    while (index < entry.meta.entry_count) {
-        const found = try indexEntryFromBytes(index_data.data[index * index_entry_size ..][0..index_entry_size]);
-        if (found.kind != .centroid_directory) {
-            index += 1;
-            continue;
-        }
-
-        const range = try centroidDirectoryIndexRange(index_data.data, entry.meta, index);
-        if (skip_superseded_candidates and try centroidDirectoryRangeFullyCoveredByCandidates(index_data.data, range, entry.meta.segment_id, candidates)) {
-            index = range.past_index;
-            continue;
-        }
-
+    while (true) {
         const range_len = range.end - range.offset;
         const bytes = if (range_len <= stack_values.len) blk: {
             break :blk stack_values[0..range_len];
@@ -4038,7 +4027,7 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
             else => return err,
         };
 
-        var record_index = index;
+        var record_index = range.first_index;
         while (record_index < range.past_index) : (record_index += 1) {
             const record_entry = try indexEntryFromBytes(index_data.data[record_index * index_entry_size ..][0..index_entry_size]);
             if (record_entry.kind != .centroid_directory) continue;
@@ -4048,8 +4037,34 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
             try putCentroidRecordCandidate(alloc, candidates, entry.meta.segment_id, &record);
         }
 
-        index = range.past_index;
+        range = (try nextCentroidDirectoryReadRange(index_data.data, entry.meta, range.past_index, entry.meta.segment_id, candidates, skip_superseded_candidates)) orelse break;
     }
+}
+
+fn nextCentroidDirectoryReadRange(
+    index_data: []const u8,
+    meta: SegmentMeta,
+    start_index: usize,
+    segment_id: u64,
+    candidates: *const std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+    skip_superseded_candidates: bool,
+) !?ValueIndexRange {
+    var index = start_index;
+    while (index < meta.entry_count) {
+        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+        if (found.kind != .centroid_directory) {
+            index += 1;
+            continue;
+        }
+
+        const range = try centroidDirectoryIndexRange(index_data, meta, index);
+        if (skip_superseded_candidates and try centroidDirectoryRangeFullyCoveredByCandidates(index_data, range, segment_id, candidates)) {
+            index = range.past_index;
+            continue;
+        }
+        return range;
+    }
+    return null;
 }
 
 fn centroidDirectoryRangeFullyCoveredByCandidates(
@@ -7349,6 +7364,48 @@ pub fn testLazyCentroidRecordLoadSkipsSupersededSegments() !void {
     try std.testing.expectEqual(@as(u64, 4), records[0].mutation_version);
 }
 
+pub fn testCentroidCandidateScanSkipsFullyCoveredRangeBeforeValueRead() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .mutation_version = 4,
+        .payload_version = 5,
+        .flags = 0,
+        .parent = 2,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 2.0,
+        .centroid = &.{ 3.0, 4.0 },
+    });
+    defer alloc.free(centroid);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendCentroidDirectory(7, centroid);
+    var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
+    defer committed.deinit(alloc);
+
+    var candidates = std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate).empty;
+    defer {
+        deinitCentroidRecordCandidates(alloc, &candidates);
+        candidates.deinit(alloc);
+    }
+    var record = try posting.CentroidDirectoryFormat.decode(alloc, centroid);
+    try putCentroidRecordCandidate(alloc, &candidates, committed.entry.meta.segment_id, &record);
+
+    const entry = ManifestEntry{ .meta = committed.entry.meta, .path = committed.entry.path };
+    var stack_index: [stack_index_max_bytes]u8 = undefined;
+    const index_data = try readSegmentIndexWithScratchAlloc(alloc, std.testing.io, tmp.dir, entry, &stack_index);
+    defer index_data.deinit(alloc);
+
+    try std.testing.expect(try nextCentroidDirectoryReadRange(index_data.data, entry.meta, 0, entry.meta.segment_id, &candidates, true) == null);
+    try std.testing.expect(try nextCentroidDirectoryReadRange(index_data.data, entry.meta, 0, entry.meta.segment_id, &candidates, false) != null);
+}
+
 pub fn testLazyDirectoryStoreBulkLoadsCentroidsWithPartialReads() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8228,6 +8285,10 @@ test "posting segment lazy directory store uses newest point records by segment 
 
 test "posting segment lazy centroid record load skips superseded segments" {
     try testLazyCentroidRecordLoadSkipsSupersededSegments();
+}
+
+test "posting segment centroid scan skips fully covered range before value read" {
+    try testCentroidCandidateScanSkipsFullyCoveredRangeBeforeValueRead();
 }
 
 test "posting segment lazy directory store bulk loads centroids with partial reads" {
