@@ -861,6 +861,9 @@ implementations cleanly:
    Local HBC cache clock metadata now slabs key/ref arrays behind one backing
    allocation per cache kind, reducing retained allocation count without
    changing eviction behavior.
+   Flat/two-level centroid-directory blocks now slab posting metadata arrays
+   and f32 centroid/radius/measure arrays into two backing allocations per
+   block, reducing retained directory allocation count as posting count grows.
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed
