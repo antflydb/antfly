@@ -3036,6 +3036,7 @@ fn addChildCandidatesFromIds(
     defer profile.child_expand_ns += elapsed_fn_u64(start);
     const child_count = child_ids.len;
     if (self.config.use_quantization) {
+        try scratch.ensureDistanceOnlyCapacity(self.alloc, child_count);
         if (try loadQuantizedReadHandleProfiled(self, txn, node_id, uses_nonquantized_payload, child_count, .internal, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
             defer {
                 var handle = quantized_handle;

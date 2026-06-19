@@ -223,8 +223,6 @@ pub const SearchScratch = struct {
         const query_storage = try allocateQueryStorage(alloc, max_candidates);
         errdefer alloc.free(query_storage);
         const query_views = carveQueryStorage(query_storage, max_candidates);
-        const distance_storage = try alloc.alloc(f32, 2 * max_candidates);
-        errdefer alloc.free(distance_storage);
         return .{
             .dims = dims,
             .estimate = estimate,
@@ -243,9 +241,9 @@ pub const SearchScratch = struct {
             .key_views = query_views.key_views,
             .values = query_views.values,
             .vector_views = query_views.vector_views,
-            .distance_storage = distance_storage,
-            .distances = distance_storage[0..max_candidates],
-            .error_bounds = distance_storage[max_candidates .. 2 * max_candidates],
+            .distance_storage = &.{},
+            .distances = &.{},
+            .error_bounds = &.{},
             .max_posting_member_cache_bytes = max_posting_member_cache_bytes,
             .max_posting_member_cache_entry_bytes = effectivePostingMemberCacheEntryBytes(
                 max_posting_member_cache_bytes,
@@ -254,11 +252,9 @@ pub const SearchScratch = struct {
             .scratch_allocation_count = initialScratchAllocationCount(.{
                 vector_storage,
                 query_storage,
-                distance_storage,
             }),
             .scratch_allocation_bytes = byteLen(vector_storage) +
-                byteLen(query_storage) +
-                byteLen(distance_storage),
+                byteLen(query_storage),
         };
     }
 
@@ -944,6 +940,9 @@ test "SearchScratch grows distance-only capacity without query slab" {
     var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
     defer scratch.deinit(alloc);
 
+    try std.testing.expectEqual(@as(usize, 0), scratch.distance_storage.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.distances.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.error_bounds.len);
     const positions_len = scratch.positions.len;
     const vector_ids_len = scratch.vector_ids.len;
 
