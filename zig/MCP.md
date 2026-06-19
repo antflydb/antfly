@@ -69,12 +69,16 @@ The Go implementation uses mature protocol SDKs:
   - `create_table`
   - `drop_table`
   - `list_tables`
+  - `describe_table`
   - `create_index`
   - `drop_index`
   - `list_indexes`
+  - `describe_indexes`
   - `get_document`
+  - `sample_documents`
   - `query`
   - `describe_query_request`
+  - `describe_mcp_capabilities`
   - `backup`
   - `restore`
   - `batch`
@@ -83,6 +87,11 @@ The Go implementation uses mature protocol SDKs:
   - `retrieval`
 
 ## MCP Query Request Design
+
+MCP is the deterministic database control and retrieval surface. It should expose exact table/index/document/query
+operations, schema/capability discovery, and raw request pass-through. It should not duplicate the agentic query
+planner. Natural-language query planning belongs in the A2A `query-builder` skill, which can inspect context, propose a
+query plan, and then call MCP `query` with either shorthand args or a raw `queryRequest`.
 
 The MCP `query` tool has two modes:
 
@@ -130,6 +139,23 @@ structured summary with examples and pointers to:
 - `specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest`
 - `specs/openapi/antfly/query.yaml#/components/schemas/Query`
 
+## MCP Introspection Tools
+
+The MCP tool surface includes deterministic helpers so clients can discover table shape and build precise requests
+without needing to scrape broad list responses:
+
+- `describe_table` calls the existing table status route for one table, including schema, indexes, ranges, and storage
+  status when available.
+- `describe_indexes` calls the existing table index listing route for one table. It is intentionally an alias-shaped
+  companion to `list_indexes` for clients that distinguish list and describe workflows.
+- `sample_documents` calls the existing lookup/scan route with bounded `limit` and optional `from`, `to`,
+  `inclusiveFrom`, and `fields` arguments. It is for schema/content inspection, not agentic retrieval planning.
+- `describe_mcp_capabilities` returns MCP transport/session capabilities, deterministic tool categories, raw
+  `queryRequest` support, shorthand query args, and the A2A `query-builder` handoff guidance.
+
+These tools route through the same HTTP handlers as REST calls where possible. That keeps auth, permission checks,
+validation, and error behavior aligned with the product API.
+
 ## Verification
 
 - `zig build lib-mcp-test`
@@ -137,6 +163,8 @@ structured summary with examples and pointers to:
 - `zig build raft-transport-test`
 - `zig build lib-api-auth-test`
 - `zig build public-api-parity-test -- --test-filter "retrieval agent event sink receives live milestones" "api http server serves retrieval agent event stream"`
+- `zig build root-test -- --test-filter "api http server serves fielded full-text search through mcp tools"`
+- `go test ./src/mcp ./src/metadata`
 
 The API auth test bucket includes an HTTP-level coverage test for MCP initialize, the A2A well-known agent card, and
 the A2A card JSON-RPC method. It also covers MCP session response headers, MCP GET event-stream endpoint framing, A2A
@@ -175,7 +203,7 @@ The next durability improvements should be:
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
 2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
 3. Add durable task store plumbing if A2A task state needs to survive process restart.
-4. Broaden adapter failure mapping and tool schema stability tests.
+4. Broaden adapter failure mapping, tool schema stability tests, and cross-language MCP parity tests.
 5. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to
    expand.
 

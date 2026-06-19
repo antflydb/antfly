@@ -11765,11 +11765,13 @@ test "api http server serves fielded full-text search through mcp tools" {
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
 
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                 },
             };
         }
@@ -11777,6 +11779,31 @@ test "api http server serves fielded full-text search through mcp tools" {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 77,
+                    .name = "docs",
+                    .schema_json = "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\",\"field\":\"body\"}}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 77,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
     var source = FakeSource{};
@@ -11805,11 +11832,65 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_query_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_table\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_indexes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"sample_documents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_mcp_capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"queryRequest\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Raw Antfly QueryRequest body") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
+
+    var describe_table_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_table\",\"arguments\":{\"tableName\":\"docs\"}}}",
+    });
+    defer describe_table_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_table_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"name\":\"docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"full_text_index_v0\"") != null);
+
+    var describe_indexes_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_indexes\",\"arguments\":{\"tableName\":\"docs\"}}}",
+    });
+    defer describe_indexes_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_indexes_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"full_text_index_v0\"") != null);
+
+    var sample_documents_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"fields\":[\"title\",\"body\"],\"limit\":1,\"inclusiveFrom\":true}}}",
+    });
+    defer sample_documents_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), sample_documents_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"hello\"") != null);
+
+    var describe_capabilities_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_mcp_capabilities\",\"arguments\":{}}}",
+    });
+    defer describe_capabilities_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_capabilities_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "query-builder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"raw_query_request\":true") != null);
 
     var wrong_field_resp = try server.handle(.{
         .method = .POST,

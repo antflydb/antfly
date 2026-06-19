@@ -27,12 +27,16 @@ const McpToolKind = enum {
     create_table,
     drop_table,
     list_tables,
+    describe_table,
     create_index,
     drop_index,
     list_indexes,
+    describe_indexes,
     get_document,
+    sample_documents,
     query,
     describe_query_request,
+    describe_mcp_capabilities,
     backup,
     restore,
     batch,
@@ -48,6 +52,7 @@ const McpToolSpec = struct {
 const McpToolFieldType = enum {
     string,
     integer,
+    boolean,
     array,
     object,
 };
@@ -74,6 +79,10 @@ const query_request_description_json =
     \\{"openapi_schema":"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest","query_ast_schema":"specs/openapi/antfly/query.yaml#/components/schemas/Query","mcp_usage":{"tool":"query","path_table_argument":"tableName","raw_body_argument":"queryRequest","rules":["queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.","queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.","queryRequest.table is rejected because tableName selects the table-scoped route.","Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema."]},"top_level_fields":["query","full_text_search","semantic_search","embedding_template","indexes","filter_prefix","filter_query","exclusion_query","aggregations","embeddings","search_effort","fields","limit","offset","order_by","search_after","search_before","distance_under","distance_over","merge_config","count","profile","reranker","analyses","graph_searches","expand_strategy","document_renderer","pruner","join","foreign_sources"],"examples":{"fielded_full_text":{"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5},"hybrid":{"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},"filtered":{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10}}}
 ;
 
+const mcp_capabilities_description_json =
+    \\{"protocol":"mcp","protocol_version":"2025-06-18","transport":"streamable_http","endpoint":"/mcp/v1","sessions":{"initialize_returns_session_id":true,"delete_closes_session":true,"last_event_id_cursor_supported":true,"historical_replay":false},"query_builder":"Use the A2A query-builder skill for agentic natural-language query planning. MCP stays focused on deterministic database tools and raw QueryRequest execution.","tools":{"deterministic":["list_tables","describe_table","list_indexes","describe_indexes","get_document","sample_documents","query","describe_query_request"],"write":["create_table","drop_table","create_index","drop_index","batch","backup","restore"],"schema_helpers":["describe_query_request","describe_mcp_capabilities"]},"query":{"raw_query_request":true,"raw_query_request_argument":"queryRequest","shorthand_arguments":["fullTextSearch","fullTextSearchField","semanticSearch","fields","limit","orderBy","indexes","filterPrefix"],"raw_mode_exclusive":true}}
+;
+
 const mcp_tool_specs = [_]McpToolSpec{
     .{
         .kind = .create_table,
@@ -93,6 +102,12 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables" },
+    .{
+        .kind = .describe_table,
+        .name = "describe_table",
+        .description = "Describe an Antfly table, including schema, indexes, ranges, and storage status when available",
+        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+    },
     .{
         .kind = .create_index,
         .name = "create_index",
@@ -123,12 +138,31 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
+        .kind = .describe_indexes,
+        .name = "describe_indexes",
+        .description = "Describe indexes for an Antfly table",
+        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+    },
+    .{
         .kind = .get_document,
         .name = "get_document",
         .description = "Get an Antfly document by key",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "key", .schema_type = .string, .required = true },
+            .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
+        },
+    },
+    .{
+        .kind = .sample_documents,
+        .name = "sample_documents",
+        .description = "Return a bounded NDJSON sample from a table using the table lookup/scan route",
+        .fields = &.{
+            .{ .name = "tableName", .schema_type = .string, .required = true },
+            .{ .name = "limit", .schema_type = .integer, .default_json = "5" },
+            .{ .name = "from", .schema_type = .string },
+            .{ .name = "to", .schema_type = .string },
+            .{ .name = "inclusiveFrom", .schema_type = .boolean, .description = "Set to true to include the from key." },
             .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
         },
     },
@@ -154,6 +188,11 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .describe_query_request,
         .name = "describe_query_request",
         .description = "Return compact guidance for the raw Antfly QueryRequest accepted by query.queryRequest",
+    },
+    .{
+        .kind = .describe_mcp_capabilities,
+        .name = "describe_mcp_capabilities",
+        .description = "Describe Antfly MCP capabilities, deterministic tools, and A2A query-builder handoff guidance",
     },
     .{
         .kind = .backup,
@@ -256,12 +295,16 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
                 .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
+                .describe_table => try ctx.tableRoute(alloc, args, .GET, "tableName", null, ""),
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
                 .list_indexes => try ctx.listIndexes(alloc, args),
+                .describe_indexes => try ctx.listIndexes(alloc, args),
                 .get_document => try ctx.getDocument(alloc, args),
+                .sample_documents => try ctx.sampleDocuments(alloc, args),
                 .query => try ctx.query(alloc, args),
                 .describe_query_request => try ctx.describeQueryRequest(alloc),
+                .describe_mcp_capabilities => try ctx.describeMcpCapabilities(alloc),
                 .backup => try ctx.backupRestore(alloc, args, "backup"),
                 .restore => try ctx.backupRestore(alloc, args, "restore"),
                 .batch => try ctx.batch(alloc, args),
@@ -338,6 +381,18 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             return try ctx.simpleRoute(alloc, .GET, try uri.toOwnedSlice(alloc), "");
         }
 
+        fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 5 });
+            if (jsonStringArg(args, "from")) |from| if (from.len != 0) try body.put(alloc, "from", .{ .string = from });
+            if (jsonStringArg(args, "to")) |to| if (to.len != 0) try body.put(alloc, "to", .{ .string = to });
+            if (jsonBoolArg(args, "inclusiveFrom")) |inclusive| try body.put(alloc, "inclusive_from", .{ .bool = inclusive });
+            if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/lookup", .{ routes.Routes.tables, table_name });
+            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+        }
+
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
@@ -372,6 +427,14 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, query_request_description_json, .{});
             return .{
                 .text = try alloc.dupe(u8, "Antfly QueryRequest schema summary for query.queryRequest"),
+                .structured = structured,
+            };
+        }
+
+        fn describeMcpCapabilities(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
+            const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, mcp_capabilities_description_json, .{});
+            return .{
+                .text = try alloc.dupe(u8, "Antfly MCP capabilities"),
                 .structured = structured,
             };
         }
@@ -546,9 +609,9 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
     return switch (kind) {
-        .describe_query_request => true,
+        .describe_query_request, .describe_mcp_capabilities => true,
         .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
-        .query, .get_document, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
+        .query, .describe_table, .describe_indexes, .get_document, .sample_documents, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
         .batch => identityHasAnyPermission(identity.permissions, .table, .write),
         .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
     };
@@ -1355,6 +1418,15 @@ fn jsonIntObjectField(object: anytype, key: []const u8) ?i64 {
     return switch (value) {
         .integer => |n| n,
         .float => |n| @intFromFloat(n),
+        else => null,
+    };
+}
+
+fn jsonBoolArg(value: std.json.Value, key: []const u8) ?bool {
+    if (value != .object) return null;
+    const raw = value.object.get(key) orelse return null;
+    return switch (raw) {
+        .bool => |flag| flag,
         else => null,
     };
 }
