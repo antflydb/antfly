@@ -804,10 +804,11 @@ pub fn parseCoverageRequirementsRootAlloc(
 
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(alloc);
-    for (required) |name| {
+    for (required, 0..) |name, i| {
         if (name.len == 0 or seen.contains(name) or !appParityCoverageRequirementKnown(name)) {
             return error.TestUnexpectedResult;
         }
+        if (i > 0 and !std.mem.lessThan(u8, required[i - 1], name)) return error.TestUnexpectedResult;
         try seen.put(alloc, name, {});
     }
 
@@ -3750,6 +3751,16 @@ test "sql adapter corpus parses data-driven coverage requirements" {
     var parsed_invalid = try std.json.parseFromSlice(std.json.Value, alloc, invalid_json, .{});
     defer parsed_invalid.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRequirementsRootAlloc(alloc, parsed_invalid.value));
+
+    const unsorted_json =
+        \\{
+        \\  "coverage_format": 1,
+        \\  "required": ["query", "aggregate"]
+        \\}
+    ;
+    var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
+    defer parsed_unsorted.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRequirementsRootAlloc(alloc, parsed_unsorted.value));
 }
 
 test "sql adapter corpus validates fixture mutation and aggregate summaries" {
