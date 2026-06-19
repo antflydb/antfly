@@ -2770,12 +2770,13 @@ pub const IndexManager = struct {
         defer internal.deinit(self.alloc);
 
         try validateEnrichmentConfig(self, internal);
-        if (self.getEnrichment(internal.kind, internal.name) != null) return error.EnrichmentAlreadyExists;
+        if (self.getEnrichmentByName(internal.name) != null) return error.EnrichmentAlreadyExists;
 
         const enrichment_checkpoint = self.enrichments.items.len;
         errdefer self.truncateEnrichments(enrichment_checkpoint);
 
         try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal));
+        try self.validateEnrichmentCatalogGraph();
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         try self.persistEnrichmentCatalog(store);
         self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -2800,9 +2801,13 @@ pub const IndexManager = struct {
             if (internalEnrichmentConfigsEqual(entry.*, internal)) return .unchanged;
 
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
-            errdefer replacement.deinit(self.alloc);
             var previous = entry.*;
             entry.* = replacement;
+            self.validateEnrichmentCatalogGraph() catch |err| {
+                entry.* = previous;
+                replacement.deinit(self.alloc);
+                return err;
+            };
             const has_generated_enrichment_targets = self.computeGeneratedEnrichmentTargetCache() catch |err| {
                 entry.* = previous;
                 replacement.deinit(self.alloc);
@@ -2822,6 +2827,7 @@ pub const IndexManager = struct {
         errdefer self.truncateEnrichments(enrichment_checkpoint);
 
         try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal));
+        try self.validateEnrichmentCatalogGraph();
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         try self.persistEnrichmentCatalog(store);
         self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -3346,6 +3352,13 @@ pub const IndexManager = struct {
 
     pub fn getEnrichment(self: *const IndexManager, kind: enrichment_catalog.EnrichmentType, name: []const u8) ?*const enrichment_catalog.EnrichmentConfig {
         return self.getEnrichmentExcluding(kind, name, null);
+    }
+
+    fn getEnrichmentByName(self: *const IndexManager, name: []const u8) ?*const enrichment_catalog.EnrichmentConfig {
+        for (self.enrichments.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
     }
 
     fn getEnrichmentExcluding(
@@ -6582,6 +6595,48 @@ pub const IndexManager = struct {
                 }
             },
             .asset => {},
+        }
+    }
+
+    fn validateEnrichmentCatalogGraph(self: *const IndexManager) !void {
+        for (self.enrichments.items, 0..) |cfg, i| {
+            for (self.enrichments.items[0..i]) |prior| {
+                if (std.mem.eql(u8, prior.name, cfg.name)) return error.ConflictingEnrichmentConfig;
+            }
+            try validateEnrichmentConfig(self, cfg);
+        }
+        try self.validateIndexEnrichmentReferences();
+    }
+
+    fn validateIndexEnrichmentReferences(self: *const IndexManager) !void {
+        for (self.text_indexes.items) |entry| {
+            if (entry.chunk_name) |chunk_name| {
+                if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
+            }
+        }
+        for (self.dense_indexes.items) |entry| {
+            if (entry.chunk_name) |chunk_name| {
+                if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
+            }
+            if (entry.embedding_name) |embedding_name| {
+                if (!entry.external and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
+            }
+        }
+        for (self.sparse_indexes.items) |entry| {
+            if (entry.chunk_name) |chunk_name| {
+                if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
+            }
+        }
+        for (self.graph_indexes.items) |entry| {
+            var graph_cfg = try parseGraphConfig(self.alloc, entry.config.config_json);
+            defer graph_cfg.deinit(self.alloc);
+            if (graph_cfg.artifact_source) |source| {
+                if (self.getEnrichment(.asset, source.artifact_name) == null and
+                    self.getEnrichment(.chunk, source.artifact_name) == null)
+                {
+                    return error.InvalidEnrichmentConfig;
+                }
+            }
         }
     }
 

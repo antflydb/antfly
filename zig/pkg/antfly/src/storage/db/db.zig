@@ -35737,6 +35737,160 @@ test "db deleteEnrichment rejects asset referenced by chunk enrichment" {
     try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "document_units_v1"));
 }
 
+test "db upsertEnrichment rejects replacing referenced asset with chunk" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .source_artifact_name = "document_units_v1",
+        .field = "text",
+        .chunk_size = 512,
+    });
+
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .chunk,
+        .source_artifact_name = "document_units_v1",
+        .field = "text",
+        .chunk_size = 512,
+    }));
+
+    var asset = (try db.getEnrichment(alloc, .asset, "document_units_v1")).?;
+    defer asset.deinit(alloc);
+    try std.testing.expectEqual(types.EnrichmentKind.asset, asset.kind);
+}
+
+test "db upsertEnrichment rejects replacing referenced chunk with asset" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 512,
+    });
+    try db.addEnrichment(.{
+        .name = "document_dense_v1",
+        .kind = .embedding,
+        .source_artifact_name = "document_chunks_v1",
+        .field = "text",
+        .expected_dims = 3,
+    });
+
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    }));
+
+    var chunk = (try db.getEnrichment(alloc, .chunk, "document_chunks_v1")).?;
+    defer chunk.deinit(alloc);
+    try std.testing.expectEqual(types.EnrichmentKind.chunk, chunk.kind);
+}
+
+test "db upsertEnrichment rejects replacing indexed chunk with asset" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 512,
+    });
+    try db.addIndex(.{
+        .name = "body_text",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    });
+
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    }));
+
+    var chunk = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")).?;
+    defer chunk.deinit(alloc);
+    try std.testing.expectEqual(types.EnrichmentKind.chunk, chunk.kind);
+}
+
+test "db addEnrichment rejects duplicate names across enrichment kinds" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_artifact_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    });
+    try std.testing.expectError(error.EnrichmentAlreadyExists, db.addEnrichment(.{
+        .name = "document_artifact_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 512,
+    }));
+}
+
+test "db addEnrichment allows unrelated definitions after field sparse index" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+    });
+}
+
 test "db dense index can reference existing whole-doc embedding enrichment" {
     const alloc = std.testing.allocator;
 
