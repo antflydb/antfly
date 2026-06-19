@@ -18,6 +18,11 @@ const driver_mod = @import("driver.zig");
 const CudaDriver = driver_mod.CudaDriver;
 const CUcontext = driver_mod.CUcontext;
 const CUdevice = driver_mod.CUdevice;
+const CUgraph = driver_mod.CUgraph;
+const CUgraphExec = driver_mod.CUgraphExec;
+const CUgraphExecUpdateResult = driver_mod.CUgraphExecUpdateResult;
+const CUgraphNode = driver_mod.CUgraphNode;
+const CUevent = driver_mod.CUevent;
 const CUstream = driver_mod.CUstream;
 
 pub const DeviceInfo = struct {
@@ -34,42 +39,68 @@ pub const DeviceInfo = struct {
     }
 };
 
+pub const RuntimeStats = struct {
+    kernel_launches: usize = 0,
+    stream_syncs: usize = 0,
+};
+
+pub const ProfileEventPair = struct {
+    start: CUevent = null,
+    end: CUevent = null,
+};
+
+pub const GraphExecUpdateOutcome = struct {
+    cuda_result: driver_mod.CUresult,
+    update_result: CUgraphExecUpdateResult = driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR,
+    error_node: CUgraphNode = null,
+
+    pub fn success(self: GraphExecUpdateOutcome) bool {
+        return self.cuda_result == driver_mod.CUDA_SUCCESS and
+            self.update_result == driver_mod.CU_GRAPH_EXEC_UPDATE_SUCCESS;
+    }
+};
+
 pub const CudaContext = struct {
     driver: CudaDriver,
     device: CUdevice,
     ctx: CUcontext,
     stream: CUstream,
     info: DeviceInfo,
+    stats: RuntimeStats = .{},
+    debug_graph_capture_active: bool = false,
+    debug_graph_capture_id: usize = 0,
+    debug_graph_capture_param_trace_count: usize = 0,
+    debug_graph_capture_tensor_trace_count: usize = 0,
 
     pub fn initDefault() driver_mod.Error!CudaContext {
         var driver = try CudaDriver.open();
         errdefer driver.deinit();
 
-        try driver.check(driver.fns.cuInit(0));
+        checkStep(&driver, "cuInit", driver.fns.cuInit(0)) catch |err| return err;
 
         var info = DeviceInfo{};
-        try driver.check(driver.fns.cuDriverGetVersion(&info.driver_version));
-        try driver.check(driver.fns.cuDeviceGetCount(&info.device_count));
+        checkStep(&driver, "cuDriverGetVersion", driver.fns.cuDriverGetVersion(&info.driver_version)) catch |err| return err;
+        checkStep(&driver, "cuDeviceGetCount", driver.fns.cuDeviceGetCount(&info.device_count)) catch |err| return err;
         if (info.device_count <= 0) return error.NoCudaDevices;
 
         var device: CUdevice = 0;
-        try driver.check(driver.fns.cuDeviceGet(&device, 0));
+        checkStep(&driver, "cuDeviceGet", driver.fns.cuDeviceGet(&device, 0)) catch |err| return err;
         info.selected_device = device;
 
         var name_buf: [256]u8 = .{0} ** 256;
-        try driver.check(driver.fns.cuDeviceGetName(&name_buf, name_buf.len, device));
+        checkStep(&driver, "cuDeviceGetName", driver.fns.cuDeviceGetName(&name_buf, name_buf.len, device)) catch |err| return err;
         info.name = name_buf;
         info.name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
 
-        try driver.check(driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device));
+        checkStep(&driver, "cuDeviceComputeCapability", driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device)) catch |err| return err;
 
         var ctx: CUcontext = null;
-        try driver.check(driver.fns.cuDevicePrimaryCtxRetain(&ctx, device));
+        checkStep(&driver, "cuDevicePrimaryCtxRetain", driver.fns.cuDevicePrimaryCtxRetain(&ctx, device)) catch |err| return err;
         errdefer _ = driver.fns.cuDevicePrimaryCtxRelease(device);
-        try driver.check(driver.fns.cuCtxSetCurrent(ctx));
+        checkStep(&driver, "cuCtxSetCurrent", driver.fns.cuCtxSetCurrent(ctx)) catch |err| return err;
 
         var stream: CUstream = null;
-        try driver.check(driver.fns.cuStreamCreate(&stream, 0));
+        checkStep(&driver, "cuStreamCreate", driver.fns.cuStreamCreate(&stream, 0)) catch |err| return err;
         errdefer _ = driver.fns.cuStreamDestroy(stream);
 
         return .{
@@ -105,8 +136,131 @@ pub const CudaContext = struct {
     pub fn synchronize(self: *CudaContext) driver_mod.Error!void {
         try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuStreamSynchronize(self.stream));
+        self.stats.stream_syncs += 1;
+    }
+
+    pub fn createStreamEvent(self: *CudaContext) driver_mod.Error!CUevent {
+        try self.makeCurrent();
+        var event: CUevent = null;
+        try self.driver.check(self.driver.fns.cuEventCreate(&event, driver_mod.CU_EVENT_DISABLE_TIMING));
+        if (event == null) return error.InvalidCudaState;
+        return event;
+    }
+
+    pub fn recordEvent(self: *CudaContext, event: CUevent) driver_mod.Error!void {
+        if (event == null) return error.InvalidCudaState;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuEventRecord(event, self.stream));
+    }
+
+    pub fn waitEvent(self: *CudaContext, event: CUevent) driver_mod.Error!void {
+        if (event == null) return error.InvalidCudaState;
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuStreamWaitEvent(self.stream, event, 0));
+    }
+
+    pub fn beginStreamCapture(self: *CudaContext, mode: driver_mod.CUstreamCaptureMode) driver_mod.Error!void {
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuStreamBeginCapture(self.stream, mode));
+        self.debug_graph_capture_active = true;
+        self.debug_graph_capture_id += 1;
+        self.debug_graph_capture_param_trace_count = 0;
+        self.debug_graph_capture_tensor_trace_count = 0;
+    }
+
+    pub fn endStreamCapture(self: *CudaContext) driver_mod.Error!CUgraph {
+        try self.makeCurrent();
+        var graph: CUgraph = null;
+        self.driver.check(self.driver.fns.cuStreamEndCapture(self.stream, &graph)) catch |err| {
+            self.debug_graph_capture_active = false;
+            return err;
+        };
+        self.debug_graph_capture_active = false;
+        if (graph == null) return error.InvalidCudaState;
+        return graph;
+    }
+
+    pub fn instantiateGraph(self: *CudaContext, graph: CUgraph) driver_mod.Error!CUgraphExec {
+        try self.makeCurrent();
+        var exec: CUgraphExec = null;
+        try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, null, null, 0));
+        if (exec == null) return error.InvalidCudaState;
+        return exec;
+    }
+
+    pub fn updateGraphExec(self: *CudaContext, exec: CUgraphExec, graph: CUgraph) driver_mod.Error!GraphExecUpdateOutcome {
+        const update_fn = self.driver.fns.cuGraphExecUpdate orelse return error.CudaSymbolMissing;
+        try self.makeCurrent();
+        var outcome = GraphExecUpdateOutcome{ .cuda_result = driver_mod.CUDA_SUCCESS };
+        outcome.cuda_result = update_fn(exec, graph, &outcome.error_node, &outcome.update_result);
+        return outcome;
+    }
+
+    pub fn launchGraph(self: *CudaContext, exec: CUgraphExec) driver_mod.Error!void {
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuGraphLaunch(exec, self.stream));
+        self.noteKernelLaunch();
+    }
+
+    pub fn beginProfileEventPair(self: *CudaContext) driver_mod.Error!ProfileEventPair {
+        try self.makeCurrent();
+        var pair = ProfileEventPair{};
+        errdefer self.destroyProfileEventPair(pair);
+        try self.driver.check(self.driver.fns.cuEventCreate(&pair.start, driver_mod.CU_EVENT_DEFAULT));
+        try self.driver.check(self.driver.fns.cuEventCreate(&pair.end, driver_mod.CU_EVENT_DEFAULT));
+        try self.driver.check(self.driver.fns.cuEventRecord(pair.start, self.stream));
+        return pair;
+    }
+
+    pub fn endProfileEventPairUs(self: *CudaContext, pair: ProfileEventPair) driver_mod.Error!u64 {
+        defer self.destroyProfileEventPair(pair);
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuEventRecord(pair.end, self.stream));
+        try self.driver.check(self.driver.fns.cuEventSynchronize(pair.end));
+        var elapsed_ms: f32 = 0;
+        try self.driver.check(self.driver.fns.cuEventElapsedTime(&elapsed_ms, pair.start, pair.end));
+        if (elapsed_ms <= 0) return 0;
+        return @intFromFloat(@as(f64, elapsed_ms) * 1000.0);
+    }
+
+    pub fn destroyGraphExec(self: *CudaContext, exec: CUgraphExec) void {
+        if (exec == null) return;
+        self.makeCurrent() catch {};
+        _ = self.driver.fns.cuGraphExecDestroy(exec);
+    }
+
+    pub fn destroyGraph(self: *CudaContext, graph: CUgraph) void {
+        if (graph == null) return;
+        self.makeCurrent() catch {};
+        _ = self.driver.fns.cuGraphDestroy(graph);
+    }
+
+    fn destroyProfileEventPair(self: *CudaContext, pair: ProfileEventPair) void {
+        if (pair.start != null) {
+            _ = self.driver.fns.cuEventDestroy(pair.start);
+        }
+        if (pair.end != null) {
+            _ = self.driver.fns.cuEventDestroy(pair.end);
+        }
+    }
+
+    pub fn destroyEvent(self: *CudaContext, event: CUevent) void {
+        if (event == null) return;
+        self.makeCurrent() catch {};
+        _ = self.driver.fns.cuEventDestroy(event);
+    }
+
+    pub fn noteKernelLaunch(self: *CudaContext) void {
+        self.stats.kernel_launches += 1;
     }
 };
+
+fn checkStep(driver: *const CudaDriver, step: []const u8, result: driver_mod.CUresult) driver_mod.Error!void {
+    if (result != driver_mod.CUDA_SUCCESS) {
+        std.log.err("CUDA context init failed at {s}: {s} ({s})", .{ step, driver.errorName(result), driver.errorString(result) });
+        return error.CudaDriverError;
+    }
+}
 
 pub fn probeDefault() driver_mod.Error!DeviceInfo {
     var ctx = try CudaContext.initDefault();

@@ -3419,6 +3419,7 @@ fn isQLinearAttentionPathNode(node: *const ml.graph.Node) bool {
         .mul,
         .fused_rms_norm,
         .fused_elem_multiply,
+        .fused_add_mul_scalar,
         .fused_rope,
         .fused_to_float32,
         .fused_from_float32,
@@ -4327,6 +4328,7 @@ fn classifyGemmaRuntimeResidencyNode(graph: *const Graph, node_id: NodeId) ?Gemm
         .fused_softmax => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .softmax else null,
         .add, .fused_elem_add => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .residual_add else null,
         .mul, .fused_elem_multiply => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .elementwise_mul else null,
+        .fused_add_mul_scalar => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .elementwise_mul else null,
         else => return null,
     }
 }
@@ -4650,6 +4652,7 @@ fn tryExecuteMetalCommand(
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
         .fused_elem_add, .add => try executeRuntimeAdd(cb, values, inputs, n.output_shape),
         .fused_elem_multiply, .mul => try executeRuntimeBinary(cb, values, inputs, .multiply),
+        .fused_add_mul_scalar => try executeRuntimeAddMulScalar(cb, values, inputs),
         .sub => try executeRuntimeBinary(cb, values, inputs, .subtract),
         .div => try executeRuntimeBinary(cb, values, inputs, .divide),
         .less_than => try executeRuntimeBinary(cb, values, inputs, .less_than),
@@ -5060,6 +5063,22 @@ fn executeRuntimeBinary(
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+fn executeRuntimeAddMulScalar(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+) !?CT {
+    const lhs = valueFor(values, inputs[0]) orelse return null;
+    const rhs = valueFor(values, inputs[1]) orelse return null;
+    const scalar = valueFor(values, inputs[2]) orelse return null;
+    if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
+    const sum = try cb.add(lhs, rhs);
+    errdefer cb.free(sum);
+    const scaled = try cb.multiply(sum, scalar);
+    cb.free(sum);
+    return scaled;
 }
 
 fn executeRuntimeWhereSelect(

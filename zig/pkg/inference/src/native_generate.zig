@@ -26,11 +26,14 @@ const graph_mod = @import("graph/root.zig");
 const onnx_decoder_only_vlm = @import("pipelines/onnx_decoder_only_vlm.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const manifest_mod = @import("models/manifest.zig");
+const gpt_mod = @import("models/gpt.zig");
 const runtime = @import("runtime/root.zig");
 const c_file = @import("util/c_file.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
+const compat = @import("io/compat.zig");
+const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
@@ -71,6 +74,8 @@ const Options = struct {
     prefill_chunk_size: usize = 0,
     draft_model: ?[]const u8 = null,
     speculative_k: u32 = 4,
+    speculation_policy: generation.SpeculationPolicy = .auto,
+    speculation_calibration: generation.SpeculationCalibration = .none,
     no_chat_template: bool = false,
     print_finish_reason: bool = false,
     print_token_count: bool = false,
@@ -79,6 +84,9 @@ const Options = struct {
     print_prompt: bool = false,
     print_chat_template_status: bool = false,
     print_timing: bool = false,
+    debug_mtp: bool = false,
+    debug_gemma4_target: bool = false,
+    disable_gemma_embedding_scale: bool = false,
     host_budget_mb: usize = 0,
     backend_budget_mb: usize = 0,
     combined_budget_mb: usize = 0,
@@ -91,12 +99,14 @@ const Options = struct {
     mode: ?ExecutionMode = null,
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
+    json_timing_path: ?[]const u8 = null,
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
+    const effective_draft_model = if (opts.speculation_policy == .off) null else opts.draft_model;
     try native_backend_choice.validate(opts.backend);
-    if (opts.draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
+    if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
@@ -169,8 +179,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .top_k = opts.top_k,
         .repetition_penalty = opts.repetition_penalty,
         .prefill_chunk_size = opts.prefill_chunk_size,
-        .draft_model = opts.draft_model,
+        .draft_model = effective_draft_model,
         .speculative_k = opts.speculative_k,
+        .speculation_requested = opts.draft_model != null,
+        .speculation_policy = opts.speculation_policy,
+        .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
     };
 
@@ -190,7 +203,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const route_onnx_whole_model_graph = opts.backend == .onnx and opts.compiled_target == .whole_model;
 
     const allow_direct_onnx = opts.backend == .auto or opts.backend == .onnx;
-    if (allow_direct_onnx and opts.draft_model == null and build_options.enable_onnx and
+    if (allow_direct_onnx and effective_draft_model == null and build_options.enable_onnx and
         !route_onnx_whole_model_graph and
         !c_file.fileExistsInDir(allocator, opts.model_dir, "genai_config.json") and
         onnx_decoder_only_vlm.isSupportedModelDir(allocator, opts.model_dir))
@@ -234,7 +247,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             print("\n", .{});
         }
 
-        if (artifact_backend != null and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+        if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
             if (try tryRunArtifactForPromptShape(
                 allocator,
                 io,
@@ -290,7 +303,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
-    if (artifact_backend != null and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
         defer artifact_arena.deinit();
         const artifact_allocator = artifact_arena.allocator();
@@ -324,14 +337,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
 
+    generation.gemma4_mtp_debug_override = opts.debug_mtp;
+    try warmInitCudaBeforeLargeModelScan(opts.backend);
     const model = try model_manager.loadFromDir(opts.model_dir);
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
-    const gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
+    var gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
+    if (opts.disable_gemma_embedding_scale and gpt_config.family == .gemma) {
+        gpt_config.disable_token_embedding_scale = true;
+    }
     const tokenizer = model.getTokenizer();
-    if (opts.draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
+    if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
     }
-    const draft_model = if (opts.draft_model) |draft_model_dir| blk: {
+    const draft_model = if (effective_draft_model) |draft_model_dir| blk: {
         const loaded = try model_manager.loadFromDir(draft_model_dir);
         const draft_cfg = session_factory.getGptConfig(loaded.session) orelse return error.InvalidDraftModelForGeneration;
         try validateDraftTokenizerCompatibility(tokenizer, loaded.getTokenizer(), gpt_config, draft_cfg);
@@ -363,7 +381,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const prompt_tokens = countPromptTokens(prompt_encoded.attention_mask) +
         opts.image_count * (@as(usize, gpt_config.mm_tokens_per_image) + 1);
 
-    if (artifact_backend != null and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
             allocator,
             io,
@@ -419,7 +437,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         graph_mode and
         explicit_partition_backend == .metal and
         compiled_attachment_target == .whole_model and
-        opts.draft_model == null and
+        effective_draft_model == null and
         opts.image_count == 0 and
         opts.audio_count == 0 and
         graph_mod.metal_executor.supportsSession(model.session))
@@ -535,6 +553,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer cb.deinit();
+    if (opts.debug_gemma4_target) {
+        try printGemma4TargetDebug(&cb, tokenizer, model.manifest, gpt_config, prompt_encoded.ids[0..prompt_tokens]);
+    }
     var draft_cb: ?ops.ComputeBackend = if (draft_model) |loaded|
         session_factory.getComputeBackendWithBudget(loaded.session, allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
@@ -564,8 +585,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .head_dim = gpt_config.maxHeadDim(),
         .sliding_window_size = sliding_window_size,
     });
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = backend_kind,
+        .dtype = kv_dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+        .num_kv_heads = gpt_config.maxKvHeads(),
+        .head_dim = gpt_config.maxHeadDim(),
+        .sliding_window_size = sliding_window_size,
+    });
+    defer kv_storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&kv_storage);
 
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
+    decode_state.kv_storage = &kv_storage;
     const created_decode_state_at = std.Io.Timestamp.now(io, .awake);
     defer decode_state.deinit();
     var draft_kv_manager: ?runtime.kv.manager.KvManager = null;
@@ -643,16 +676,49 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     if (build_options.enable_metal and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
         debug_timing.resetLiveGpuTimingStats(&cb);
+        generation.resetDecoderRuntimeDebugStats();
     }
     gpt_arch.resetDebugTimingStats();
 
+    const cuda_stats_before_generate = if (comptime build_options.enable_cuda)
+        session_factory.getCudaRuntimeStats(model.session)
+    else
+        null;
+    const draft_cuda_stats_before_generate = if (comptime build_options.enable_cuda)
+        if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
+    else
+        null;
     var result = pipeline.generate(&messages, config) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
+        } else if (err == error.AudioInputTooLong) {
+            print("error: {s}\n", .{generation.userFacingErrorMessage(err)});
         }
         return err;
     };
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
+        session_factory.getCudaRuntimeStats(model.session)
+    else
+        null;
+    const draft_cuda_stats_after_generate = if (comptime build_options.enable_cuda)
+        if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
+    else
+        null;
+    const cuda_generate_stats = if (comptime build_options.enable_cuda)
+        if (cuda_stats_after_generate) |after|
+            if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+        else
+            null
+    else
+        null;
+    const draft_cuda_generate_stats = if (comptime build_options.enable_cuda)
+        if (draft_cuda_stats_after_generate) |after|
+            if (draft_cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+        else
+            null
+    else
+        null;
     defer result.deinit();
 
     print("{s}\n", .{result.text});
@@ -691,6 +757,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(started_at, finished_generate_at),
             },
         );
+        const decode_ms = if (result.timing_ms) |timing| timing.decode else durationMillis(created_decode_state_at, finished_generate_at);
+        print("decode_tok_per_s={d:.3}\n", .{tokensPerSecond(result.tokens_used, decode_ms)});
         if (build_options.enable_metal and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
             printGpuHostedTimingDetails(&cb);
         }
@@ -960,7 +1028,568 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 gpt_stats.gated_block_qkv_successes,
             },
         );
+        if (comptime build_options.enable_cuda) {
+            if (cuda_stats_after_generate) |cuda_stats| {
+                print(
+                    "cuda_runtime_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} eval_syncs={d} alloc_calls={d} free_calls={d} temp_hits={d} temp_misses={d} temp_releases={d} temp_evictions={d} temp_cached_mb={d} deferred_free_queued={d} deferred_free_drains={d} deferred_free_forced_drains={d} deferred_free_pending_mb={d} deferred_free_reclaimed_mb={d}\n",
+                    .{
+                        cuda_stats.kernel_launches,
+                        cuda_stats.stream_syncs,
+                        cuda_stats.upload_syncs,
+                        cuda_stats.download_syncs,
+                        cuda_stats.eval_syncs,
+                        cuda_stats.device_alloc_calls,
+                        cuda_stats.device_free_calls,
+                        cuda_stats.temp_buffer_hits,
+                        cuda_stats.temp_buffer_misses,
+                        cuda_stats.temp_buffer_releases,
+                        cuda_stats.temp_buffer_evictions,
+                        cuda_stats.temp_buffer_cached_bytes / (1024 * 1024),
+                        cuda_stats.deferred_free_queued,
+                        cuda_stats.deferred_free_drains,
+                        cuda_stats.deferred_free_forced_drains,
+                        cuda_stats.deferred_free_pending_bytes / (1024 * 1024),
+                        cuda_stats.deferred_free_reclaimed_bytes / (1024 * 1024),
+                    },
+                );
+                print(
+                    "cuda_runtime_rates: launches_per_token={d:.3} syncs_per_token={d:.3}\n",
+                    .{
+                        perToken(cuda_stats.kernel_launches, result.tokens_used),
+                        perToken(cuda_stats.stream_syncs, result.tokens_used),
+                    },
+                );
+                if (cuda_generate_stats) |generate_stats| {
+                    print(
+                        "cuda_generate_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} eval_syncs={d} alloc_calls={d} free_calls={d} temp_hits={d} temp_misses={d} temp_releases={d} temp_evictions={d} h2d={d} d2h={d} to_f32_calls={d} to_f32_bytes={d} argmax={d} norm={d} elementwise={d} scalar={d} qkv={d} linear={d} attention={d} deferred_free_queued={d} deferred_free_drains={d} deferred_free_forced_drains={d}\n",
+                        .{
+                            generate_stats.kernel_launches,
+                            generate_stats.stream_syncs,
+                            generate_stats.upload_syncs,
+                            generate_stats.download_syncs,
+                            generate_stats.eval_syncs,
+                            generate_stats.device_alloc_calls,
+                            generate_stats.device_free_calls,
+                            generate_stats.temp_buffer_hits,
+                            generate_stats.temp_buffer_misses,
+                            generate_stats.temp_buffer_releases,
+                            generate_stats.temp_buffer_evictions,
+                            generate_stats.h2d_bytes,
+                            generate_stats.d2h_bytes,
+                            generate_stats.to_float32_calls,
+                            generate_stats.to_float32_bytes,
+                            generate_stats.launch_argmax,
+                            generate_stats.launch_norm,
+                            generate_stats.launch_elementwise,
+                            generate_stats.launch_scalar,
+                            generate_stats.launch_linear_qkv,
+                            generate_stats.launch_linear,
+                            generate_stats.launch_attention,
+                            generate_stats.deferred_free_queued,
+                            generate_stats.deferred_free_drains,
+                            generate_stats.deferred_free_forced_drains,
+                        },
+                    );
+                    print(
+                        "cuda_generate_cross_backend_copy: copies={d} bytes={d} event_records={d} event_waits={d} sync_fallbacks={d}\n",
+                        .{
+                            generate_stats.cross_backend_copies,
+                            generate_stats.cross_backend_copy_bytes,
+                            generate_stats.cross_backend_event_records,
+                            generate_stats.cross_backend_event_waits,
+                            generate_stats.cross_backend_sync_fallbacks,
+                        },
+                    );
+                    print(
+                        "cuda_generate_norm_launch_breakdown: layer={d} add_layer={d} rms={d} rms_add={d} rms_add_mul_scalar={d} rms_add_output_scale={d} rms_bare={d} head_rope={d}\n",
+                        .{
+                            generate_stats.launch_norm_layer,
+                            generate_stats.launch_norm_add_layer,
+                            generate_stats.launch_norm_rms,
+                            generate_stats.launch_norm_rms_add,
+                            generate_stats.launch_norm_rms_add_mul_scalar,
+                            generate_stats.launch_norm_rms_add_output_scale,
+                            generate_stats.launch_norm_rms_bare,
+                            generate_stats.launch_norm_head_rope,
+                        },
+                    );
+                    print(
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_scalar={d}\n",
+                        .{
+                            generate_stats.launch_attention_gqa_decode,
+                            generate_stats.launch_attention_gqa_scalar,
+                        },
+                    );
+                    print(
+                        "cuda_generate_rates: launches_per_token={d:.3} syncs_per_token={d:.3}\n",
+                        .{
+                            perToken(generate_stats.kernel_launches, result.tokens_used),
+                            perToken(generate_stats.stream_syncs, result.tokens_used),
+                        },
+                    );
+                    print(
+                        "cuda_generate_graph_capture_counts: begins={d} replays={d} discards={d} instantiates={d} update_successes={d} update_failures={d} update_unavailable={d} scalar_updates={d} persistent_replays={d} capacity_skips={d}\n",
+                        .{
+                            generate_stats.cuda_graph_capture_begins,
+                            generate_stats.cuda_graph_capture_replays,
+                            generate_stats.cuda_graph_capture_discards,
+                            generate_stats.cuda_graph_capture_instantiates,
+                            generate_stats.cuda_graph_capture_update_successes,
+                            generate_stats.cuda_graph_capture_update_failures,
+                            generate_stats.cuda_graph_capture_update_unavailable,
+                            generate_stats.cuda_graph_capture_scalar_updates,
+                            generate_stats.cuda_graph_capture_persistent_replays,
+                            generate_stats.cuda_graph_capture_capacity_skips,
+                        },
+                    );
+                    print(
+                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                        .{
+                            generate_stats.lm_head_argmax_fused_q8,
+                            generate_stats.lm_head_argmax_fused_q4,
+                            generate_stats.lm_head_argmax_fallbacks,
+                        },
+                    );
+                    print(
+                        "cuda_generate_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
+                        .{
+                            generate_stats.activation_multiply_fused,
+                            generate_stats.add_mul_scalar_fused,
+                            generate_stats.rms_norm_add_fused,
+                            generate_stats.rms_norm_add_output_scale_fused,
+                            generate_stats.rms_norm_add_output_scale_fallbacks,
+                            generate_stats.gated_down_fused_q8,
+                            generate_stats.gated_down_fused_q4,
+                            generate_stats.gated_down_fallbacks,
+                        },
+                    );
+                    print(
+                        "cuda_generate_decoder_runtime_counts: linear_prepares={d} linear_prepare_misses={d} rms_prepares={d} rms_prepare_misses={d} linear_apply_hits={d} linear_apply_misses={d} linear_pair_apply_hits={d} linear_qkv_apply_hits={d} rms_apply_hits={d} rms_apply_misses={d} attention_residual_attempts={d} attention_residual_hits={d} attention_residual_misses={d} gated_ffn_attempts={d} gated_ffn_hits={d} gated_ffn_misses={d} pinned_eviction_skips={d}\n",
+                        .{
+                            generate_stats.decoder_runtime_linear_slot_prepares,
+                            generate_stats.decoder_runtime_linear_slot_prepare_misses,
+                            generate_stats.decoder_runtime_rms_norm_slot_prepares,
+                            generate_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                            generate_stats.decoder_runtime_linear_apply_hits,
+                            generate_stats.decoder_runtime_linear_apply_misses,
+                            generate_stats.decoder_runtime_linear_pair_apply_hits,
+                            generate_stats.decoder_runtime_linear_qkv_apply_hits,
+                            generate_stats.decoder_runtime_rms_norm_apply_hits,
+                            generate_stats.decoder_runtime_rms_norm_apply_misses,
+                            generate_stats.decoder_runtime_attention_residual_attempts,
+                            generate_stats.decoder_runtime_attention_residual_hits,
+                            generate_stats.decoder_runtime_attention_residual_misses,
+                            generate_stats.decoder_runtime_gated_ffn_attempts,
+                            generate_stats.decoder_runtime_gated_ffn_hits,
+                            generate_stats.decoder_runtime_gated_ffn_misses,
+                            generate_stats.decoder_runtime_pinned_eviction_skips,
+                        },
+                    );
+                    print(
+                        "cuda_decode_profile_us: events={d} qkv={d} gqa_attention={d} attention_output={d} attention_norm_residual={d} ffn_gate_up={d} ffn_gated_down={d} ffn_post_norm={d} lm_head_argmax={d} graph_replay={d}\n",
+                        .{
+                            generate_stats.decode_profile_events,
+                            generate_stats.decode_profile_qkv_us,
+                            generate_stats.decode_profile_gqa_attention_us,
+                            generate_stats.decode_profile_attention_output_us,
+                            generate_stats.decode_profile_attention_norm_residual_us,
+                            generate_stats.decode_profile_ffn_gate_up_us,
+                            generate_stats.decode_profile_ffn_gated_down_us,
+                            generate_stats.decode_profile_ffn_post_norm_us,
+                            generate_stats.decode_profile_lm_head_argmax_us,
+                            generate_stats.decode_profile_graph_replay_us,
+                        },
+                    );
+                }
+                print(
+                    "cuda_eval_breakdown: requests={d} skipped_eager={d} forced_syncs={d}\n",
+                    .{
+                        cuda_stats.eval_requests,
+                        cuda_stats.eval_skipped_eager,
+                        cuda_stats.eval_forced_syncs,
+                    },
+                );
+                print(
+                    "cuda_runtime_bytes: h2d={d} d2h={d} d2d={d} resident_weights={d} device_allocated={d}\n",
+                    .{
+                        cuda_stats.h2d_bytes,
+                        cuda_stats.d2h_bytes,
+                        cuda_stats.d2d_bytes,
+                        cuda_stats.resident_weight_bytes,
+                        cuda_stats.device_allocated_bytes,
+                    },
+                );
+                print(
+                    "cuda_cross_backend_copy: copies={d} bytes={d} event_records={d} event_waits={d} sync_fallbacks={d}\n",
+                    .{
+                        cuda_stats.cross_backend_copies,
+                        cuda_stats.cross_backend_copy_bytes,
+                        cuda_stats.cross_backend_event_records,
+                        cuda_stats.cross_backend_event_waits,
+                        cuda_stats.cross_backend_sync_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_lazy_profile: prefetch_enqueues={d} prefetch_duplicates={d} prefetch_missing={d} prefetch_cancelled_for_demand={d} drain_calls={d} demand_loads={d} host_prefetch_hits={d} host_load_ms={d} page_touch_ms={d} upload_ms={d} uploaded_mb={d}\n",
+                    .{
+                        cuda_stats.lazy_prefetch_enqueues,
+                        cuda_stats.lazy_prefetch_duplicates,
+                        cuda_stats.lazy_prefetch_missing,
+                        cuda_stats.lazy_prefetch_cancelled_for_demand,
+                        cuda_stats.lazy_prefetch_drain_calls,
+                        cuda_stats.lazy_demand_loads,
+                        cuda_stats.lazy_host_prefetch_hits,
+                        cuda_stats.lazy_host_load_ns / 1_000_000,
+                        cuda_stats.lazy_host_page_touch_ns / 1_000_000,
+                        cuda_stats.lazy_upload_ns / 1_000_000,
+                        cuda_stats.lazy_uploaded_bytes / (1024 * 1024),
+                    },
+                );
+                print(
+                    "cuda_ffn_stream_profile: requests={d} hits={d} misses={d} fallbacks={d} evictions={d} read_ms={d} h2d_ms={d} read_mb={d} uploaded_mb={d} resident_mb={d} fadvise_calls={d}\n",
+                    .{
+                        cuda_stats.ffn_stream_requests,
+                        cuda_stats.ffn_stream_hits,
+                        cuda_stats.ffn_stream_misses,
+                        cuda_stats.ffn_stream_fallbacks,
+                        cuda_stats.ffn_stream_evictions,
+                        cuda_stats.ffn_stream_read_ns / 1_000_000,
+                        cuda_stats.ffn_stream_h2d_ns / 1_000_000,
+                        cuda_stats.ffn_stream_read_bytes / (1024 * 1024),
+                        cuda_stats.ffn_stream_uploaded_bytes / (1024 * 1024),
+                        cuda_stats.ffn_stream_resident_bytes / (1024 * 1024),
+                        cuda_stats.ffn_stream_fadvise_calls,
+                    },
+                );
+                print(
+                    "cuda_dense_stream_profile: requests={d} hits={d} misses={d} fallbacks={d} evictions={d} read_ms={d} h2d_ms={d} read_mb={d} uploaded_mb={d} resident_mb={d} fadvise_calls={d} attention_loads={d} mlp_loads={d}\n",
+                    .{
+                        cuda_stats.dense_stream_requests,
+                        cuda_stats.dense_stream_hits,
+                        cuda_stats.dense_stream_misses,
+                        cuda_stats.dense_stream_fallbacks,
+                        cuda_stats.dense_stream_evictions,
+                        cuda_stats.dense_stream_read_ns / 1_000_000,
+                        cuda_stats.dense_stream_h2d_ns / 1_000_000,
+                        cuda_stats.dense_stream_read_bytes / (1024 * 1024),
+                        cuda_stats.dense_stream_uploaded_bytes / (1024 * 1024),
+                        cuda_stats.dense_stream_resident_bytes / (1024 * 1024),
+                        cuda_stats.dense_stream_fadvise_calls,
+                        cuda_stats.dense_stream_attention_loads,
+                        cuda_stats.dense_stream_mlp_loads,
+                    },
+                );
+                print(
+                    "cuda_dense_prefetch_profile: enqueues={d} duplicates={d} ready_hits={d} inflight_steals={d} sync_reads={d} evictions={d} failures={d} host_read_ms={d} demand_wait_ms={d} upload_ms={d} resident_mb={d} read_mb={d}\n",
+                    .{
+                        cuda_stats.dense_prefetch_enqueues,
+                        cuda_stats.dense_prefetch_duplicates,
+                        cuda_stats.dense_prefetch_ready_hits,
+                        cuda_stats.dense_prefetch_inflight_steals,
+                        cuda_stats.dense_prefetch_sync_reads,
+                        cuda_stats.dense_prefetch_evictions,
+                        cuda_stats.dense_prefetch_failures,
+                        cuda_stats.dense_prefetch_host_read_ns / 1_000_000,
+                        cuda_stats.dense_prefetch_demand_wait_ns / 1_000_000,
+                        cuda_stats.dense_prefetch_upload_ns / 1_000_000,
+                        cuda_stats.dense_prefetch_resident_bytes / (1024 * 1024),
+                        cuda_stats.dense_prefetch_read_bytes / (1024 * 1024),
+                    },
+                );
+                const attributed_launches =
+                    cuda_stats.launch_embedding +
+                    cuda_stats.launch_linear +
+                    cuda_stats.launch_linear_qkv +
+                    cuda_stats.launch_norm +
+                    cuda_stats.launch_rope +
+                    cuda_stats.launch_attention +
+                    cuda_stats.launch_elementwise +
+                    cuda_stats.launch_scalar +
+                    cuda_stats.launch_argmax +
+                    cuda_stats.launch_other;
+                const unattributed_launches = if (cuda_stats.kernel_launches >= attributed_launches)
+                    cuda_stats.kernel_launches - attributed_launches
+                else
+                    0;
+                print(
+                    "cuda_launch_breakdown: embedding={d} linear={d} qkv={d} norm={d} rope={d} attention={d} elementwise={d} scalar={d} argmax={d} other={d} unattributed={d}\n",
+                    .{
+                        cuda_stats.launch_embedding,
+                        cuda_stats.launch_linear,
+                        cuda_stats.launch_linear_qkv,
+                        cuda_stats.launch_norm,
+                        cuda_stats.launch_rope,
+                        cuda_stats.launch_attention,
+                        cuda_stats.launch_elementwise,
+                        cuda_stats.launch_scalar,
+                        cuda_stats.launch_argmax,
+                        cuda_stats.launch_other,
+                        unattributed_launches,
+                    },
+                );
+                print(
+                    "cuda_norm_launch_breakdown: layer={d} add_layer={d} rms={d} rms_add={d} rms_add_mul_scalar={d} rms_add_output_scale={d} rms_bare={d} head_rope={d}\n",
+                    .{
+                        cuda_stats.launch_norm_layer,
+                        cuda_stats.launch_norm_add_layer,
+                        cuda_stats.launch_norm_rms,
+                        cuda_stats.launch_norm_rms_add,
+                        cuda_stats.launch_norm_rms_add_mul_scalar,
+                        cuda_stats.launch_norm_rms_add_output_scale,
+                        cuda_stats.launch_norm_rms_bare,
+                        cuda_stats.launch_norm_head_rope,
+                    },
+                );
+                print(
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_scalar={d}\n",
+                    .{
+                        cuda_stats.launch_attention_gqa_decode,
+                        cuda_stats.launch_attention_gqa_scalar,
+                    },
+                );
+                print(
+                    "cuda_scalar_launch_breakdown: multiply_immediate={d} add_immediate={d} device_broadcast={d}\n",
+                    .{
+                        cuda_stats.launch_scalar_multiply_immediate,
+                        cuda_stats.launch_scalar_add_immediate,
+                        cuda_stats.launch_scalar_device_broadcast,
+                    },
+                );
+                print(
+                    "cuda_transfer_breakdown: from_f32_calls={d} from_f32_bytes={d} to_f32_calls={d} to_f32_bytes={d} upload_owned_calls={d} upload_owned_bytes={d} download_alloc_calls={d} download_alloc_bytes={d}\n",
+                    .{
+                        cuda_stats.from_float32_calls,
+                        cuda_stats.from_float32_bytes,
+                        cuda_stats.to_float32_calls,
+                        cuda_stats.to_float32_bytes,
+                        cuda_stats.upload_owned_host_calls,
+                        cuda_stats.upload_owned_host_bytes,
+                        cuda_stats.download_alloc_calls,
+                        cuda_stats.download_alloc_bytes,
+                    },
+                );
+                print(
+                    "cuda_transfer_buckets: upload_le16={d} upload_le1k={d} upload_le8k={d} upload_le32k={d} upload_le256k={d} upload_gt256k={d} download_le16={d} download_le1k={d} download_le8k={d} download_le32k={d} download_le256k={d} download_gt256k={d}\n",
+                    .{
+                        cuda_stats.upload_bucket_le_16,
+                        cuda_stats.upload_bucket_le_1k,
+                        cuda_stats.upload_bucket_le_8k,
+                        cuda_stats.upload_bucket_le_32k,
+                        cuda_stats.upload_bucket_le_256k,
+                        cuda_stats.upload_bucket_gt_256k,
+                        cuda_stats.download_bucket_le_16,
+                        cuda_stats.download_bucket_le_1k,
+                        cuda_stats.download_bucket_le_8k,
+                        cuda_stats.download_bucket_le_32k,
+                        cuda_stats.download_bucket_le_256k,
+                        cuda_stats.download_bucket_gt_256k,
+                    },
+                );
+                print(
+                    "cuda_device_op_counts: add_scalar={d} rms_norm_bare={d}\n",
+                    .{
+                        cuda_stats.add_scalar_calls,
+                        cuda_stats.rms_norm_bare_calls,
+                    },
+                );
+                print("cuda_upload_top_sizes:", .{});
+                for (cuda_stats.upload_top_sizes, cuda_stats.upload_top_counts) |size, count| {
+                    if (size != 0 and count != 0) print(" {d}x{d}", .{ count, size });
+                }
+                print("\n", .{});
+                print("cuda_download_top_sizes:", .{});
+                for (cuda_stats.download_top_sizes, cuda_stats.download_top_counts) |size, count| {
+                    if (size != 0 and count != 0) print(" {d}x{d}", .{ count, size });
+                }
+                print("\n", .{});
+                print(
+                    "cuda_fallback_counts: host_attention={d} rope={d} rope_per_item={d} gqa_dense={d} paged_attention={d}\n",
+                    .{
+                        cuda_stats.host_attention_fallbacks,
+                        cuda_stats.rope_host_fallbacks,
+                        cuda_stats.rope_per_item_host_fallbacks,
+                        cuda_stats.gqa_dense_host_fallbacks,
+                        cuda_stats.paged_attention_host_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_qkv_counts: fused_q8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
+                    .{
+                        cuda_stats.qkv_fused_q8,
+                        cuda_stats.qkv_fused_q4,
+                        cuda_stats.qkv_fused_q4_q4_f32,
+                        cuda_stats.qkv_fused_f32,
+                        cuda_stats.qkv_fallback_unsupported,
+                        cuda_stats.qkv_kernel_unavailable,
+                    },
+                );
+                print(
+                    "cuda_linear_pair_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                    .{
+                        cuda_stats.linear_pair_fused_q8,
+                        cuda_stats.linear_pair_fused_q4,
+                        cuda_stats.linear_pair_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                    .{
+                        cuda_stats.lm_head_argmax_fused_q8,
+                        cuda_stats.lm_head_argmax_fused_q4,
+                        cuda_stats.lm_head_argmax_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
+                    .{
+                        cuda_stats.activation_multiply_fused,
+                        cuda_stats.add_mul_scalar_fused,
+                        cuda_stats.rms_norm_add_fused,
+                        cuda_stats.rms_norm_add_output_scale_fused,
+                        cuda_stats.rms_norm_add_output_scale_fallbacks,
+                        cuda_stats.gated_down_fused_q8,
+                        cuda_stats.gated_down_fused_q4,
+                        cuda_stats.gated_down_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_decoder_runtime_counts: linear_prepares={d} linear_prepare_misses={d} rms_prepares={d} rms_prepare_misses={d} linear_apply_hits={d} linear_apply_misses={d} linear_pair_apply_hits={d} linear_qkv_apply_hits={d} rms_apply_hits={d} rms_apply_misses={d} attention_residual_attempts={d} attention_residual_hits={d} attention_residual_misses={d} gated_ffn_attempts={d} gated_ffn_hits={d} gated_ffn_misses={d} pinned_eviction_skips={d}\n",
+                    .{
+                        cuda_stats.decoder_runtime_linear_slot_prepares,
+                        cuda_stats.decoder_runtime_linear_slot_prepare_misses,
+                        cuda_stats.decoder_runtime_rms_norm_slot_prepares,
+                        cuda_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                        cuda_stats.decoder_runtime_linear_apply_hits,
+                        cuda_stats.decoder_runtime_linear_apply_misses,
+                        cuda_stats.decoder_runtime_linear_pair_apply_hits,
+                        cuda_stats.decoder_runtime_linear_qkv_apply_hits,
+                        cuda_stats.decoder_runtime_rms_norm_apply_hits,
+                        cuda_stats.decoder_runtime_rms_norm_apply_misses,
+                        cuda_stats.decoder_runtime_attention_residual_attempts,
+                        cuda_stats.decoder_runtime_attention_residual_hits,
+                        cuda_stats.decoder_runtime_attention_residual_misses,
+                        cuda_stats.decoder_runtime_gated_ffn_attempts,
+                        cuda_stats.decoder_runtime_gated_ffn_hits,
+                        cuda_stats.decoder_runtime_gated_ffn_misses,
+                        cuda_stats.decoder_runtime_pinned_eviction_skips,
+                    },
+                );
+                print(
+                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_fallbacks={d} scalar_linear={d} scalar_qkv={d}\n",
+                    .{
+                        cuda_stats.bf16_cublaslt_linear_calls,
+                        cuda_stats.bf16_cublaslt_qkv_calls,
+                        cuda_stats.bf16_cublaslt_activation_staging_calls,
+                        cuda_stats.bf16_cublaslt_fallbacks,
+                        cuda_stats.bf16_scalar_linear_calls,
+                        cuda_stats.bf16_scalar_qkv_calls,
+                    },
+                );
+                print(
+                    "cuda_q4k_fast_counts: decode_hits={d} decode_fallbacks={d}\n",
+                    .{
+                        cuda_stats.q4k_decode_fast_hits,
+                        cuda_stats.q4k_decode_fast_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_head_norm_rope_counts: fused_hits={d} fused_fallbacks={d}\n",
+                    .{
+                        cuda_stats.head_norm_rope_fused_hits,
+                        cuda_stats.head_norm_rope_fused_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_mtp_counts: masked_argmax_hits={d} masked_argmax_fallbacks={d} verify_device_hits={d} verify_device_fallbacks={d} verify_result_downloads={d} verify_choice_downloads={d}\n",
+                    .{
+                        cuda_stats.mtp_masked_argmax_hits,
+                        cuda_stats.mtp_masked_argmax_fallbacks,
+                        cuda_stats.mtp_verify_commit_device_hits,
+                        cuda_stats.mtp_verify_commit_device_fallbacks,
+                        cuda_stats.mtp_verify_commit_result_downloads,
+                        cuda_stats.mtp_verify_commit_choice_downloads,
+                    },
+                );
+                print(
+                    "cuda_device_kv_counts: attempts={d} successes={d} writes={d} reads={d} fail_batch={d} fail_no_cache={d} fail_no_storage={d} fail_no_hook={d} fail_write={d} fail_read={d} fail_shape={d}\n",
+                    .{
+                        cuda_stats.device_kv_attempts,
+                        cuda_stats.device_kv_successes,
+                        cuda_stats.device_kv_writes,
+                        cuda_stats.device_kv_reads,
+                        cuda_stats.device_kv_fail_batch,
+                        cuda_stats.device_kv_fail_no_cache,
+                        cuda_stats.device_kv_fail_no_storage,
+                        cuda_stats.device_kv_fail_no_hook,
+                        cuda_stats.device_kv_fail_write,
+                        cuda_stats.device_kv_fail_read,
+                        cuda_stats.device_kv_fail_shape,
+                    },
+                );
+            }
+            if (draft_model) |loaded_draft| {
+                if (session_factory.getCudaRuntimeStats(loaded_draft.session)) |draft_cuda_stats| {
+                    print(
+                        "draft_cuda_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} linear={d} argmax={d} h2d={d} d2h={d} cross_backend_copies={d} cross_backend_bytes={d} cross_backend_event_records={d} cross_backend_event_waits={d} cross_backend_sync_fallbacks={d} mtp_masked_argmax_hits={d} mtp_masked_argmax_fallbacks={d} device_kv_attempts={d} device_kv_successes={d} device_kv_reads={d} device_kv_writes={d} device_kv_fail_read={d} device_kv_fail_shape={d}\n",
+                        .{
+                            draft_cuda_stats.kernel_launches,
+                            draft_cuda_stats.stream_syncs,
+                            draft_cuda_stats.upload_syncs,
+                            draft_cuda_stats.download_syncs,
+                            draft_cuda_stats.launch_linear,
+                            draft_cuda_stats.launch_argmax,
+                            draft_cuda_stats.h2d_bytes,
+                            draft_cuda_stats.d2h_bytes,
+                            draft_cuda_stats.cross_backend_copies,
+                            draft_cuda_stats.cross_backend_copy_bytes,
+                            draft_cuda_stats.cross_backend_event_records,
+                            draft_cuda_stats.cross_backend_event_waits,
+                            draft_cuda_stats.cross_backend_sync_fallbacks,
+                            draft_cuda_stats.mtp_masked_argmax_hits,
+                            draft_cuda_stats.mtp_masked_argmax_fallbacks,
+                            draft_cuda_stats.device_kv_attempts,
+                            draft_cuda_stats.device_kv_successes,
+                            draft_cuda_stats.device_kv_reads,
+                            draft_cuda_stats.device_kv_writes,
+                            draft_cuda_stats.device_kv_fail_read,
+                            draft_cuda_stats.device_kv_fail_shape,
+                        },
+                    );
+                }
+            }
+        }
     }
+    if (opts.json_timing_path) |path| {
+        try writeJsonTiming(
+            allocator,
+            io,
+            path,
+            opts.model_dir,
+            @tagName(model.session.backend()),
+            &result,
+            durationMillis(started_at, loaded_model_at),
+            durationMillis(loaded_model_at, encoded_prompt_at),
+            durationMillis(encoded_prompt_at, acquired_scheduler_at),
+            durationMillis(acquired_scheduler_at, created_backend_at),
+            durationMillis(created_backend_at, created_decode_state_at),
+            durationMillis(created_decode_state_at, finished_generate_at),
+            durationMillis(started_at, finished_generate_at),
+            cuda_stats_after_generate,
+            cuda_generate_stats,
+            draft_cuda_stats_after_generate,
+            draft_cuda_generate_stats,
+        );
+    }
+}
+
+fn warmInitCudaBeforeLargeModelScan(backend: BackendChoice) !void {
+    if (backend != .cuda) return;
+    if (!build_options.enable_cuda) return;
+    var ctx = cuda_context.CudaContext.initDefault() catch |err| {
+        std.log.err("CUDA warm init before model load failed: {s}", .{@errorName(err)});
+        return;
+    };
+    ctx.deinit();
 }
 
 fn nanosToMillis(nanos: i128) u64 {
@@ -969,6 +1598,1032 @@ fn nanosToMillis(nanos: i128) u64 {
 
 fn durationMillis(from: std.Io.Timestamp, to: std.Io.Timestamp) u64 {
     return nanosToMillis(std.Io.Timestamp.durationTo(from, to).nanoseconds);
+}
+
+fn tokensPerSecond(tokens: usize, millis: u64) f64 {
+    if (tokens == 0 or millis == 0) return 0.0;
+    return @as(f64, @floatFromInt(tokens)) * 1000.0 / @as(f64, @floatFromInt(millis));
+}
+
+fn perToken(count: usize, tokens: usize) f64 {
+    if (tokens == 0) return 0.0;
+    return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(tokens));
+}
+
+fn cudaStatsDelta(after: session_factory.CudaRuntimeStats, before: session_factory.CudaRuntimeStats) session_factory.CudaRuntimeStats {
+    if (comptime !build_options.enable_cuda) return;
+    var delta = after;
+    inline for (std.meta.fields(session_factory.CudaRuntimeStats)) |field| {
+        switch (@typeInfo(field.type)) {
+            .int => @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name),
+            else => {},
+        }
+    }
+    return delta;
+}
+
+fn appendFmt(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const chunk = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(chunk);
+    try out.appendSlice(allocator, chunk);
+}
+
+fn cudaStatsCompactJson(
+    allocator: std.mem.Allocator,
+    stats_opt: ?session_factory.CudaRuntimeStats,
+    tokens: usize,
+) ![]u8 {
+    const stats = stats_opt orelse return allocator.dupe(u8, "null");
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(
+        allocator,
+        &out,
+        \\{{
+        \\"kernel_launches":{d},
+        \\"launches_per_token":{d:.6},
+        \\"stream_syncs":{d},
+        \\"syncs_per_token":{d:.6},
+        \\"upload_syncs":{d},
+        \\"download_syncs":{d},
+        \\"eval_syncs":{d},
+        \\"h2d_bytes":{d},
+        \\"d2h_bytes":{d},
+        \\"d2d_bytes":{d},
+        \\"cross_backend_copies":{d},
+        \\"cross_backend_copy_bytes":{d},
+        \\"cross_backend_event_records":{d},
+        \\"cross_backend_event_waits":{d},
+        \\"cross_backend_sync_fallbacks":{d},
+        \\
+    ,
+        .{
+            stats.kernel_launches,
+            perToken(stats.kernel_launches, tokens),
+            stats.stream_syncs,
+            perToken(stats.stream_syncs, tokens),
+            stats.upload_syncs,
+            stats.download_syncs,
+            stats.eval_syncs,
+            stats.h2d_bytes,
+            stats.d2h_bytes,
+            stats.d2d_bytes,
+            stats.cross_backend_copies,
+            stats.cross_backend_copy_bytes,
+            stats.cross_backend_event_records,
+            stats.cross_backend_event_waits,
+            stats.cross_backend_sync_fallbacks,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\"launch_linear":{d},
+        \\"launch_linear_qkv":{d},
+        \\"launch_norm":{d},
+        \\"launch_attention":{d},
+        \\"launch_elementwise":{d},
+        \\"launch_scalar":{d},
+        \\"launch_argmax":{d},
+        \\"decoder_runtime_linear_apply_hits":{d},
+        \\"decoder_runtime_linear_pair_apply_hits":{d},
+        \\"decoder_runtime_linear_qkv_apply_hits":{d},
+        \\"decoder_runtime_rms_norm_apply_hits":{d},
+        \\"decoder_runtime_attention_residual_hits":{d},
+        \\"decoder_runtime_gated_ffn_hits":{d},
+        \\
+    ,
+        .{
+            stats.launch_linear,
+            stats.launch_linear_qkv,
+            stats.launch_norm,
+            stats.launch_attention,
+            stats.launch_elementwise,
+            stats.launch_scalar,
+            stats.launch_argmax,
+            stats.decoder_runtime_linear_apply_hits,
+            stats.decoder_runtime_linear_pair_apply_hits,
+            stats.decoder_runtime_linear_qkv_apply_hits,
+            stats.decoder_runtime_rms_norm_apply_hits,
+            stats.decoder_runtime_attention_residual_hits,
+            stats.decoder_runtime_gated_ffn_hits,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\"decode_profile_events":{d},
+        \\"decode_profile_qkv_us":{d},
+        \\"decode_profile_gqa_attention_us":{d},
+        \\"decode_profile_attention_output_us":{d},
+        \\"decode_profile_attention_norm_residual_us":{d},
+        \\"decode_profile_ffn_gate_up_us":{d},
+        \\"decode_profile_ffn_gated_down_us":{d},
+        \\"decode_profile_ffn_post_norm_us":{d},
+        \\"decode_profile_lm_head_argmax_us":{d},
+        \\"decode_profile_graph_replay_us":{d},
+        \\"lm_head_argmax_fused_q8":{d},
+        \\"lm_head_argmax_fused_q4":{d},
+        \\"lm_head_argmax_fallbacks":{d},
+        \\"mtp_masked_argmax_hits":{d},
+        \\"mtp_masked_argmax_fallbacks":{d},
+        \\"mtp_verify_commit_device_hits":{d},
+        \\"mtp_verify_commit_device_fallbacks":{d},
+        \\"mtp_verify_commit_result_downloads":{d},
+        \\"mtp_verify_commit_choice_downloads":{d},
+        \\"device_kv_attempts":{d},
+        \\"device_kv_successes":{d},
+        \\"device_kv_reads":{d},
+        \\"device_kv_writes":{d},
+        \\"device_kv_fail_read":{d},
+        \\"device_kv_fail_shape":{d}
+        \\}}
+    ,
+        .{
+            stats.decode_profile_events,
+            stats.decode_profile_qkv_us,
+            stats.decode_profile_gqa_attention_us,
+            stats.decode_profile_attention_output_us,
+            stats.decode_profile_attention_norm_residual_us,
+            stats.decode_profile_ffn_gate_up_us,
+            stats.decode_profile_ffn_gated_down_us,
+            stats.decode_profile_ffn_post_norm_us,
+            stats.decode_profile_lm_head_argmax_us,
+            stats.decode_profile_graph_replay_us,
+            stats.lm_head_argmax_fused_q8,
+            stats.lm_head_argmax_fused_q4,
+            stats.lm_head_argmax_fallbacks,
+            stats.mtp_masked_argmax_hits,
+            stats.mtp_masked_argmax_fallbacks,
+            stats.mtp_verify_commit_device_hits,
+            stats.mtp_verify_commit_device_fallbacks,
+            stats.mtp_verify_commit_result_downloads,
+            stats.mtp_verify_commit_choice_downloads,
+            stats.device_kv_attempts,
+            stats.device_kv_successes,
+            stats.device_kv_reads,
+            stats.device_kv_writes,
+            stats.device_kv_fail_read,
+            stats.device_kv_fail_shape,
+        },
+    );
+    return try out.toOwnedSlice(allocator);
+}
+
+fn writeJsonTiming(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    model_dir: []const u8,
+    backend_name: []const u8,
+    result: *const generation.GenerationResult,
+    load_model_ms: u64,
+    prompt_prep_ms: u64,
+    scheduler_ms: u64,
+    backend_setup_ms: u64,
+    decode_setup_ms: u64,
+    generate_ms: u64,
+    total_ms: u64,
+    cuda_stats_opt: ?session_factory.CudaRuntimeStats,
+    cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
+    draft_cuda_stats_opt: ?session_factory.CudaRuntimeStats,
+    draft_cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
+) !void {
+    const inner_timing = result.timing_ms orelse generation.GenerationTimingMs{};
+    const decode_ms = if (inner_timing.decode != 0) inner_timing.decode else generate_ms;
+    const speculative_json = if (result.speculative) |stats| blk: {
+        const quality = stats.mtp_quality;
+        const profile = stats.mtp_profile;
+        var profile_out = std.ArrayListUnmanaged(u8).empty;
+        errdefer profile_out.deinit(allocator);
+        try appendFmt(
+            allocator,
+            &profile_out,
+            \\{{
+            \\"enabled":{},
+            \\"sync_enabled":{},
+            \\"draft_steps":{d},
+            \\"resident_draft_steps":{d},
+            \\"host_draft_steps":{d},
+            \\"target_verify_calls":{d},
+            \\"target_verify_rows":{d},
+            \\"target_verify_argmax_calls":{d},
+            \\"target_verify_argmax_rows":{d},
+            \\"target_verify_argmax_batched_calls":{d},
+            \\"target_verify_argmax_syncs":{d},
+            \\"dedicated_runtime_hits":{d},
+            \\"dedicated_runtime_fallbacks":{d},
+            \\"device_verify_commit_hits":{d},
+            \\"device_verify_commit_fallbacks":{d},
+            \\"device_verify_commit_result_downloads":{d},
+            \\"target_choice_downloads":{d},
+            \\
+        ,
+            .{
+                profile.enabled,
+                profile.sync_enabled,
+                profile.draft_steps,
+                profile.resident_draft_steps,
+                profile.host_draft_steps,
+                profile.target_verify_calls,
+                profile.target_verify_rows,
+                profile.target_verify_argmax_calls,
+                profile.target_verify_argmax_rows,
+                profile.target_verify_argmax_batched_calls,
+                profile.target_verify_argmax_syncs,
+                profile.dedicated_runtime_hits,
+                profile.dedicated_runtime_fallbacks,
+                profile.device_verify_commit_hits,
+                profile.device_verify_commit_fallbacks,
+                profile.device_verify_commit_result_downloads,
+                profile.target_choice_downloads,
+            },
+        );
+        try appendFmt(
+            allocator,
+            &profile_out,
+            \\"commit_forwards_required":{d},
+            \\"commit_forwards_avoided":{d},
+            \\"accepted_hidden_reuse_rows":{d},
+            \\"activation_copies":{d},
+            \\"materializations":{d},
+            \\"materialization_hidden_only_hits":{d},
+            \\"materialization_hidden_only_fallbacks":{d},
+            \\"correction_materializations":{d},
+            \\"bonus_materializations":{d},
+            \\"bonus_skips":{d},
+            \\"fallback_calls":{d},
+            \\"draft_token_ns":{d},
+            \\"target_verify_ns":{d},
+            \\"activation_copy_ns":{d},
+            \\"materialization_ns":{d},
+            \\"fallback_ns":{d}
+            \\}}
+        ,
+            .{
+                profile.commit_forwards_required,
+                profile.commit_forwards_avoided,
+                profile.accepted_hidden_reuse_rows,
+                profile.activation_copies,
+                profile.materializations,
+                profile.materialization_hidden_only_hits,
+                profile.materialization_hidden_only_fallbacks,
+                profile.correction_materializations,
+                profile.bonus_materializations,
+                profile.bonus_skips,
+                profile.fallback_calls,
+                profile.draft_token_ns,
+                profile.target_verify_ns,
+                profile.activation_copy_ns,
+                profile.materialization_ns,
+                profile.fallback_ns,
+            },
+        );
+        const profile_json = try profile_out.toOwnedSlice(allocator);
+        defer allocator.free(profile_json);
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            \\{{
+            \\"speculation_policy":"{s}",
+            \\"speculation_calibration":"{s}",
+            \\"speculation_policy_decision":"{s}",
+            \\"rounds":{d},
+            \\"drafted":{d},
+            \\"matched":{d},
+            \\"rejected":{d},
+            \\"accepted":{d},
+            \\"corrections":{d},
+            \\"bonus":{d},
+            \\"adaptive_fallbacks":{d},
+            \\"mtp_enabled":{},
+            \\"mtp_graph_replay":"{s}",
+            \\"mtp_acceptance_permille":{d},
+            \\"mtp_acceptance_gate_fallbacks":{d},
+            \\"mtp_profile":{s},
+            \\"mtp_quality":{{
+            \\"mismatches":{d},
+            \\"mismatches_with_assistant_logits":{d},
+            \\"target_in_assistant_top2":{d},
+            \\"target_in_assistant_top4":{d},
+            \\"target_in_assistant_top8":{d},
+            \\"draft_in_target_top2":{d},
+            \\"format_or_control_misses":{d},
+            \\"near_tie_misses":{d},
+            \\"confident_misses":{d},
+            \\"avg_assistant_target_margin":{d:.6}
+            \\}}
+            \\}}
+        ,
+            .{
+                stats.speculation_policy.name(),
+                stats.speculation_calibration.name(),
+                stats.speculation_policy_decision.name(),
+                stats.rounds,
+                stats.drafted_tokens,
+                stats.matched_draft_tokens,
+                stats.rejectedDraftTokens(),
+                stats.accepted_tokens,
+                stats.correction_tokens,
+                stats.bonus_tokens,
+                stats.adaptive_fallbacks,
+                stats.mtp_enabled,
+                stats.mtp_graph_replay_status,
+                stats.acceptancePermille(),
+                stats.mtp_acceptance_gate_fallbacks,
+                profile_json,
+                quality.mismatches,
+                quality.mismatches_with_assistant_logits,
+                quality.target_in_assistant_top2,
+                quality.target_in_assistant_top4,
+                quality.target_in_assistant_top8,
+                quality.draft_in_target_top2,
+                quality.format_or_control_misses,
+                quality.near_tie_misses,
+                quality.confident_misses,
+                quality.averageAssistantTargetMargin(),
+            },
+        );
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(speculative_json);
+    const cuda_json = if (comptime build_options.enable_cuda) blk: {
+        if (cuda_stats_opt) |cuda_stats| {
+            var cuda_out = std.ArrayListUnmanaged(u8).empty;
+            errdefer cuda_out.deinit(allocator);
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\{{
+                \\"kernel_launches":{d},
+                \\"launches_per_token":{d:.6},
+                \\"stream_syncs":{d},
+                \\"syncs_per_token":{d:.6},
+                \\"upload_syncs":{d},
+                \\"download_syncs":{d},
+                \\"eval_syncs":{d},
+                \\"h2d_bytes":{d},
+                \\"d2h_bytes":{d},
+                \\"d2d_bytes":{d},
+                \\"cross_backend_copies":{d},
+                \\"cross_backend_copy_bytes":{d},
+                \\"cross_backend_event_records":{d},
+                \\"cross_backend_event_waits":{d},
+                \\"cross_backend_sync_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.kernel_launches,
+                    perToken(cuda_stats.kernel_launches, result.tokens_used),
+                    cuda_stats.stream_syncs,
+                    perToken(cuda_stats.stream_syncs, result.tokens_used),
+                    cuda_stats.upload_syncs,
+                    cuda_stats.download_syncs,
+                    cuda_stats.eval_syncs,
+                    cuda_stats.h2d_bytes,
+                    cuda_stats.d2h_bytes,
+                    cuda_stats.d2d_bytes,
+                    cuda_stats.cross_backend_copies,
+                    cuda_stats.cross_backend_copy_bytes,
+                    cuda_stats.cross_backend_event_records,
+                    cuda_stats.cross_backend_event_waits,
+                    cuda_stats.cross_backend_sync_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"temp_buffer_hits":{d},
+                \\"temp_buffer_misses":{d},
+                \\"temp_buffer_releases":{d},
+                \\"temp_buffer_evictions":{d},
+                \\"temp_buffer_cached_bytes":{d},
+                \\"deferred_free_queued":{d},
+                \\"deferred_free_drains":{d},
+                \\"deferred_free_forced_drains":{d},
+                \\"deferred_free_pending_bytes":{d},
+                \\"deferred_free_reclaimed_bytes":{d},
+                \\"graph_capture_begins":{d},
+                \\"graph_capture_replays":{d},
+                \\"graph_capture_discards":{d},
+                \\"graph_capture_instantiates":{d},
+                \\"graph_capture_update_successes":{d},
+                \\"graph_capture_update_failures":{d},
+                \\"graph_capture_update_unavailable":{d},
+                \\"graph_capture_scalar_updates":{d},
+                \\"graph_capture_persistent_replays":{d},
+                \\"graph_capture_capacity_skips":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.temp_buffer_hits,
+                    cuda_stats.temp_buffer_misses,
+                    cuda_stats.temp_buffer_releases,
+                    cuda_stats.temp_buffer_evictions,
+                    cuda_stats.temp_buffer_cached_bytes,
+                    cuda_stats.deferred_free_queued,
+                    cuda_stats.deferred_free_drains,
+                    cuda_stats.deferred_free_forced_drains,
+                    cuda_stats.deferred_free_pending_bytes,
+                    cuda_stats.deferred_free_reclaimed_bytes,
+                    cuda_stats.cuda_graph_capture_begins,
+                    cuda_stats.cuda_graph_capture_replays,
+                    cuda_stats.cuda_graph_capture_discards,
+                    cuda_stats.cuda_graph_capture_instantiates,
+                    cuda_stats.cuda_graph_capture_update_successes,
+                    cuda_stats.cuda_graph_capture_update_failures,
+                    cuda_stats.cuda_graph_capture_update_unavailable,
+                    cuda_stats.cuda_graph_capture_scalar_updates,
+                    cuda_stats.cuda_graph_capture_persistent_replays,
+                    cuda_stats.cuda_graph_capture_capacity_skips,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"launch_embedding":{d},
+                \\"launch_linear":{d},
+                \\"launch_linear_qkv":{d},
+                \\"launch_norm":{d},
+                \\"launch_rope":{d},
+                \\"launch_attention":{d},
+                \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_scalar":{d},
+                \\"launch_elementwise":{d},
+                \\"launch_scalar":{d},
+                \\"launch_argmax":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_embedding,
+                    cuda_stats.launch_linear,
+                    cuda_stats.launch_linear_qkv,
+                    cuda_stats.launch_norm,
+                    cuda_stats.launch_rope,
+                    cuda_stats.launch_attention,
+                    cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_scalar,
+                    cuda_stats.launch_elementwise,
+                    cuda_stats.launch_scalar,
+                    cuda_stats.launch_argmax,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"activation_multiply_fused":{d},
+                \\"add_mul_scalar_fused":{d},
+                \\"rms_norm_add_output_scale_fused":{d},
+                \\"rms_norm_add_output_scale_fallbacks":{d},
+                \\"gated_down_fused_q8":{d},
+                \\"gated_down_fused_q4":{d},
+                \\"gated_down_fallbacks":{d},
+                \\"qkv_fused_q8":{d},
+                \\"qkv_fused_q4":{d},
+                \\"qkv_fused_q4_q4_f32":{d},
+                \\"qkv_fused_f32":{d},
+                \\"qkv_fallback_unsupported":{d},
+                \\"qkv_kernel_unavailable":{d},
+                \\"linear_pair_fused_q8":{d},
+                \\"linear_pair_fused_q4":{d},
+                \\"linear_pair_fallbacks":{d},
+                \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fallbacks":{d},
+                \\"q4k_decode_fast_hits":{d},
+                \\"q4k_decode_fast_fallbacks":{d},
+                \\"bf16_cublaslt_linear_calls":{d},
+                \\"bf16_cublaslt_qkv_calls":{d},
+                \\"bf16_cublaslt_activation_staging_calls":{d},
+                \\"bf16_cublaslt_fallbacks":{d},
+                \\"bf16_scalar_linear_calls":{d},
+                \\"bf16_scalar_qkv_calls":{d},
+                \\"mtp_verify_commit_device_hits":{d},
+                \\"mtp_verify_commit_device_fallbacks":{d},
+                \\"mtp_verify_commit_result_downloads":{d},
+                \\"mtp_verify_commit_choice_downloads":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.activation_multiply_fused,
+                    cuda_stats.add_mul_scalar_fused,
+                    cuda_stats.rms_norm_add_output_scale_fused,
+                    cuda_stats.rms_norm_add_output_scale_fallbacks,
+                    cuda_stats.gated_down_fused_q8,
+                    cuda_stats.gated_down_fused_q4,
+                    cuda_stats.gated_down_fallbacks,
+                    cuda_stats.qkv_fused_q8,
+                    cuda_stats.qkv_fused_q4,
+                    cuda_stats.qkv_fused_q4_q4_f32,
+                    cuda_stats.qkv_fused_f32,
+                    cuda_stats.qkv_fallback_unsupported,
+                    cuda_stats.qkv_kernel_unavailable,
+                    cuda_stats.linear_pair_fused_q8,
+                    cuda_stats.linear_pair_fused_q4,
+                    cuda_stats.linear_pair_fallbacks,
+                    cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fallbacks,
+                    cuda_stats.q4k_decode_fast_hits,
+                    cuda_stats.q4k_decode_fast_fallbacks,
+                    cuda_stats.bf16_cublaslt_linear_calls,
+                    cuda_stats.bf16_cublaslt_qkv_calls,
+                    cuda_stats.bf16_cublaslt_activation_staging_calls,
+                    cuda_stats.bf16_cublaslt_fallbacks,
+                    cuda_stats.bf16_scalar_linear_calls,
+                    cuda_stats.bf16_scalar_qkv_calls,
+                    cuda_stats.mtp_verify_commit_device_hits,
+                    cuda_stats.mtp_verify_commit_device_fallbacks,
+                    cuda_stats.mtp_verify_commit_result_downloads,
+                    cuda_stats.mtp_verify_commit_choice_downloads,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"decoder_runtime_linear_slot_prepares":{d},
+                \\"decoder_runtime_linear_slot_prepare_misses":{d},
+                \\"decoder_runtime_rms_norm_slot_prepares":{d},
+                \\"decoder_runtime_rms_norm_slot_prepare_misses":{d},
+                \\"decoder_runtime_linear_apply_hits":{d},
+                \\"decoder_runtime_linear_apply_misses":{d},
+                \\"decoder_runtime_linear_pair_apply_hits":{d},
+                \\"decoder_runtime_linear_qkv_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_misses":{d},
+                \\"decoder_runtime_attention_residual_attempts":{d},
+                \\"decoder_runtime_attention_residual_hits":{d},
+                \\"decoder_runtime_attention_residual_misses":{d},
+                \\"decoder_runtime_gated_ffn_attempts":{d},
+                \\"decoder_runtime_gated_ffn_hits":{d},
+                \\"decoder_runtime_gated_ffn_misses":{d},
+                \\"decoder_runtime_pinned_eviction_skips":{d},
+                \\"decode_profile_events":{d},
+                \\"decode_profile_qkv_us":{d},
+                \\"decode_profile_gqa_attention_us":{d},
+                \\"decode_profile_attention_output_us":{d},
+                \\"decode_profile_attention_norm_residual_us":{d},
+                \\"decode_profile_ffn_gate_up_us":{d},
+                \\"decode_profile_ffn_gated_down_us":{d},
+                \\"decode_profile_ffn_post_norm_us":{d},
+                \\"decode_profile_lm_head_argmax_us":{d},
+                \\"decode_profile_graph_replay_us":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.decoder_runtime_linear_slot_prepares,
+                    cuda_stats.decoder_runtime_linear_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepares,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_linear_apply_hits,
+                    cuda_stats.decoder_runtime_linear_apply_misses,
+                    cuda_stats.decoder_runtime_linear_pair_apply_hits,
+                    cuda_stats.decoder_runtime_linear_qkv_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_misses,
+                    cuda_stats.decoder_runtime_attention_residual_attempts,
+                    cuda_stats.decoder_runtime_attention_residual_hits,
+                    cuda_stats.decoder_runtime_attention_residual_misses,
+                    cuda_stats.decoder_runtime_gated_ffn_attempts,
+                    cuda_stats.decoder_runtime_gated_ffn_hits,
+                    cuda_stats.decoder_runtime_gated_ffn_misses,
+                    cuda_stats.decoder_runtime_pinned_eviction_skips,
+                    cuda_stats.decode_profile_events,
+                    cuda_stats.decode_profile_qkv_us,
+                    cuda_stats.decode_profile_gqa_attention_us,
+                    cuda_stats.decode_profile_attention_output_us,
+                    cuda_stats.decode_profile_attention_norm_residual_us,
+                    cuda_stats.decode_profile_ffn_gate_up_us,
+                    cuda_stats.decode_profile_ffn_gated_down_us,
+                    cuda_stats.decode_profile_ffn_post_norm_us,
+                    cuda_stats.decode_profile_lm_head_argmax_us,
+                    cuda_stats.decode_profile_graph_replay_us,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"launch_norm_layer":{d},
+                \\"launch_norm_add_layer":{d},
+                \\"launch_norm_rms":{d},
+                \\"launch_norm_rms_add":{d},
+                \\"launch_norm_rms_add_mul_scalar":{d},
+                \\"launch_norm_rms_add_output_scale":{d},
+                \\"launch_norm_rms_bare":{d},
+                \\"launch_norm_head_rope":{d},
+                \\"rms_norm_add_fused":{d},
+                \\"rms_norm_add_output_scale_fused":{d},
+                \\"rms_norm_add_output_scale_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_norm_layer,
+                    cuda_stats.launch_norm_add_layer,
+                    cuda_stats.launch_norm_rms,
+                    cuda_stats.launch_norm_rms_add,
+                    cuda_stats.launch_norm_rms_add_mul_scalar,
+                    cuda_stats.launch_norm_rms_add_output_scale,
+                    cuda_stats.launch_norm_rms_bare,
+                    cuda_stats.launch_norm_head_rope,
+                    cuda_stats.rms_norm_add_fused,
+                    cuda_stats.rms_norm_add_output_scale_fused,
+                    cuda_stats.rms_norm_add_output_scale_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"dense_stream_requests":{d},
+                \\"dense_stream_hits":{d},
+                \\"dense_stream_misses":{d},
+                \\"dense_stream_fallbacks":{d},
+                \\"dense_stream_evictions":{d},
+                \\"dense_stream_read_ms":{d},
+                \\"dense_stream_h2d_ms":{d},
+                \\"dense_stream_read_bytes":{d},
+                \\"dense_stream_uploaded_bytes":{d},
+                \\"dense_stream_resident_bytes":{d},
+                \\"dense_prefetch_enqueues":{d},
+                \\"dense_prefetch_ready_hits":{d},
+                \\"dense_prefetch_inflight_steals":{d},
+                \\"dense_prefetch_sync_reads":{d},
+                \\"dense_prefetch_host_read_ms":{d},
+                \\"dense_prefetch_upload_ms":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.dense_stream_requests,
+                    cuda_stats.dense_stream_hits,
+                    cuda_stats.dense_stream_misses,
+                    cuda_stats.dense_stream_fallbacks,
+                    cuda_stats.dense_stream_evictions,
+                    cuda_stats.dense_stream_read_ns / std.time.ns_per_ms,
+                    cuda_stats.dense_stream_h2d_ns / std.time.ns_per_ms,
+                    cuda_stats.dense_stream_read_bytes,
+                    cuda_stats.dense_stream_uploaded_bytes,
+                    cuda_stats.dense_stream_resident_bytes,
+                    cuda_stats.dense_prefetch_enqueues,
+                    cuda_stats.dense_prefetch_ready_hits,
+                    cuda_stats.dense_prefetch_inflight_steals,
+                    cuda_stats.dense_prefetch_sync_reads,
+                    cuda_stats.dense_prefetch_host_read_ns / std.time.ns_per_ms,
+                    cuda_stats.dense_prefetch_upload_ns / std.time.ns_per_ms,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"device_kv_attempts":{d},
+                \\"device_kv_successes":{d},
+                \\"device_kv_writes":{d},
+                \\"device_kv_reads":{d},
+                \\"device_kv_fail_batch":{d},
+                \\"device_kv_fail_no_cache":{d},
+                \\"device_kv_fail_no_storage":{d},
+                \\"device_kv_fail_no_hook":{d},
+                \\"device_kv_fail_write":{d},
+                \\"device_kv_fail_read":{d},
+                \\"device_kv_fail_shape":{d}
+                \\}}
+                \\
+            ,
+                .{
+                    cuda_stats.device_kv_attempts,
+                    cuda_stats.device_kv_successes,
+                    cuda_stats.device_kv_writes,
+                    cuda_stats.device_kv_reads,
+                    cuda_stats.device_kv_fail_batch,
+                    cuda_stats.device_kv_fail_no_cache,
+                    cuda_stats.device_kv_fail_no_storage,
+                    cuda_stats.device_kv_fail_no_hook,
+                    cuda_stats.device_kv_fail_write,
+                    cuda_stats.device_kv_fail_read,
+                    cuda_stats.device_kv_fail_shape,
+                },
+            );
+            break :blk try cuda_out.toOwnedSlice(allocator);
+        }
+        break :blk try allocator.dupe(u8, "null");
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_json);
+
+    const cuda_generate_json = if (comptime build_options.enable_cuda) blk: {
+        if (cuda_generate_stats_opt) |cuda_stats| {
+            var cuda_generate_out = std.ArrayListUnmanaged(u8).empty;
+            errdefer cuda_generate_out.deinit(allocator);
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\{{
+                \\"kernel_launches":{d},
+                \\"launches_per_token":{d:.6},
+                \\"stream_syncs":{d},
+                \\"syncs_per_token":{d:.6},
+                \\"upload_syncs":{d},
+                \\"download_syncs":{d},
+                \\"eval_syncs":{d},
+                \\"device_alloc_calls":{d},
+                \\"device_free_calls":{d},
+                \\"temp_buffer_hits":{d},
+                \\"temp_buffer_misses":{d},
+                \\"temp_buffer_releases":{d},
+                \\"temp_buffer_evictions":{d},
+                \\"h2d_bytes":{d},
+                \\"d2h_bytes":{d},
+                \\"d2d_bytes":{d},
+                \\"cross_backend_copies":{d},
+                \\"cross_backend_copy_bytes":{d},
+                \\"cross_backend_event_records":{d},
+                \\"cross_backend_event_waits":{d},
+                \\"cross_backend_sync_fallbacks":{d},
+                \\"to_float32_calls":{d},
+                \\"to_float32_bytes":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.kernel_launches,
+                    perToken(cuda_stats.kernel_launches, result.tokens_used),
+                    cuda_stats.stream_syncs,
+                    perToken(cuda_stats.stream_syncs, result.tokens_used),
+                    cuda_stats.upload_syncs,
+                    cuda_stats.download_syncs,
+                    cuda_stats.eval_syncs,
+                    cuda_stats.device_alloc_calls,
+                    cuda_stats.device_free_calls,
+                    cuda_stats.temp_buffer_hits,
+                    cuda_stats.temp_buffer_misses,
+                    cuda_stats.temp_buffer_releases,
+                    cuda_stats.temp_buffer_evictions,
+                    cuda_stats.h2d_bytes,
+                    cuda_stats.d2h_bytes,
+                    cuda_stats.d2d_bytes,
+                    cuda_stats.cross_backend_copies,
+                    cuda_stats.cross_backend_copy_bytes,
+                    cuda_stats.cross_backend_event_records,
+                    cuda_stats.cross_backend_event_waits,
+                    cuda_stats.cross_backend_sync_fallbacks,
+                    cuda_stats.to_float32_calls,
+                    cuda_stats.to_float32_bytes,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"graph_capture_begins":{d},
+                \\"graph_capture_replays":{d},
+                \\"graph_capture_discards":{d},
+                \\"graph_capture_instantiates":{d},
+                \\"graph_capture_update_successes":{d},
+                \\"graph_capture_update_failures":{d},
+                \\"graph_capture_update_unavailable":{d},
+                \\"graph_capture_scalar_updates":{d},
+                \\"graph_capture_persistent_replays":{d},
+                \\"graph_capture_capacity_skips":{d},
+                \\"launch_linear":{d},
+                \\"launch_linear_qkv":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.cuda_graph_capture_begins,
+                    cuda_stats.cuda_graph_capture_replays,
+                    cuda_stats.cuda_graph_capture_discards,
+                    cuda_stats.cuda_graph_capture_instantiates,
+                    cuda_stats.cuda_graph_capture_update_successes,
+                    cuda_stats.cuda_graph_capture_update_failures,
+                    cuda_stats.cuda_graph_capture_update_unavailable,
+                    cuda_stats.cuda_graph_capture_scalar_updates,
+                    cuda_stats.cuda_graph_capture_persistent_replays,
+                    cuda_stats.cuda_graph_capture_capacity_skips,
+                    cuda_stats.launch_linear,
+                    cuda_stats.launch_linear_qkv,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"decoder_runtime_linear_slot_prepares":{d},
+                \\"decoder_runtime_linear_slot_prepare_misses":{d},
+                \\"decoder_runtime_rms_norm_slot_prepares":{d},
+                \\"decoder_runtime_rms_norm_slot_prepare_misses":{d},
+                \\"decoder_runtime_linear_apply_hits":{d},
+                \\"decoder_runtime_linear_apply_misses":{d},
+                \\"decoder_runtime_linear_pair_apply_hits":{d},
+                \\"decoder_runtime_linear_qkv_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_misses":{d},
+                \\"decoder_runtime_attention_residual_attempts":{d},
+                \\"decoder_runtime_attention_residual_hits":{d},
+                \\"decoder_runtime_attention_residual_misses":{d},
+                \\"decoder_runtime_gated_ffn_attempts":{d},
+                \\"decoder_runtime_gated_ffn_hits":{d},
+                \\"decoder_runtime_gated_ffn_misses":{d},
+                \\"decoder_runtime_pinned_eviction_skips":{d},
+                \\"decode_profile_events":{d},
+                \\"decode_profile_qkv_us":{d},
+                \\"decode_profile_gqa_attention_us":{d},
+                \\"decode_profile_attention_output_us":{d},
+                \\"decode_profile_attention_norm_residual_us":{d},
+                \\"decode_profile_ffn_gate_up_us":{d},
+                \\"decode_profile_ffn_gated_down_us":{d},
+                \\"decode_profile_ffn_post_norm_us":{d},
+                \\"decode_profile_lm_head_argmax_us":{d},
+                \\"decode_profile_graph_replay_us":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.decoder_runtime_linear_slot_prepares,
+                    cuda_stats.decoder_runtime_linear_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepares,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_linear_apply_hits,
+                    cuda_stats.decoder_runtime_linear_apply_misses,
+                    cuda_stats.decoder_runtime_linear_pair_apply_hits,
+                    cuda_stats.decoder_runtime_linear_qkv_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_misses,
+                    cuda_stats.decoder_runtime_attention_residual_attempts,
+                    cuda_stats.decoder_runtime_attention_residual_hits,
+                    cuda_stats.decoder_runtime_attention_residual_misses,
+                    cuda_stats.decoder_runtime_gated_ffn_attempts,
+                    cuda_stats.decoder_runtime_gated_ffn_hits,
+                    cuda_stats.decoder_runtime_gated_ffn_misses,
+                    cuda_stats.decoder_runtime_pinned_eviction_skips,
+                    cuda_stats.decode_profile_events,
+                    cuda_stats.decode_profile_qkv_us,
+                    cuda_stats.decode_profile_gqa_attention_us,
+                    cuda_stats.decode_profile_attention_output_us,
+                    cuda_stats.decode_profile_attention_norm_residual_us,
+                    cuda_stats.decode_profile_ffn_gate_up_us,
+                    cuda_stats.decode_profile_ffn_gated_down_us,
+                    cuda_stats.decode_profile_ffn_post_norm_us,
+                    cuda_stats.decode_profile_lm_head_argmax_us,
+                    cuda_stats.decode_profile_graph_replay_us,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"launch_norm":{d},
+                \\"launch_norm_layer":{d},
+                \\"launch_norm_add_layer":{d},
+                \\"launch_norm_rms":{d},
+                \\"launch_norm_rms_add":{d},
+                \\"launch_norm_rms_add_mul_scalar":{d},
+                \\"launch_norm_rms_add_output_scale":{d},
+                \\"launch_norm_rms_bare":{d},
+                \\"launch_norm_head_rope":{d},
+                \\"launch_attention":{d},
+                \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_scalar":{d},
+                \\"launch_elementwise":{d},
+                \\"launch_scalar":{d},
+                \\"launch_argmax":{d},
+                \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fallbacks":{d},
+                \\"mtp_verify_commit_device_hits":{d},
+                \\"mtp_verify_commit_device_fallbacks":{d},
+                \\"mtp_verify_commit_result_downloads":{d},
+                \\"mtp_verify_commit_choice_downloads":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_norm,
+                    cuda_stats.launch_norm_layer,
+                    cuda_stats.launch_norm_add_layer,
+                    cuda_stats.launch_norm_rms,
+                    cuda_stats.launch_norm_rms_add,
+                    cuda_stats.launch_norm_rms_add_mul_scalar,
+                    cuda_stats.launch_norm_rms_add_output_scale,
+                    cuda_stats.launch_norm_rms_bare,
+                    cuda_stats.launch_norm_head_rope,
+                    cuda_stats.launch_attention,
+                    cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_scalar,
+                    cuda_stats.launch_elementwise,
+                    cuda_stats.launch_scalar,
+                    cuda_stats.launch_argmax,
+                    cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fallbacks,
+                    cuda_stats.mtp_verify_commit_device_hits,
+                    cuda_stats.mtp_verify_commit_device_fallbacks,
+                    cuda_stats.mtp_verify_commit_result_downloads,
+                    cuda_stats.mtp_verify_commit_choice_downloads,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"activation_multiply_fused":{d},
+                \\"add_mul_scalar_fused":{d},
+                \\"rms_norm_add_fused":{d},
+                \\"rms_norm_add_output_scale_fused":{d},
+                \\"rms_norm_add_output_scale_fallbacks":{d},
+                \\"gated_down_fused_q8":{d},
+                \\"gated_down_fused_q4":{d},
+                \\"gated_down_fallbacks":{d},
+                \\"deferred_free_queued":{d},
+                \\"deferred_free_drains":{d},
+                \\"deferred_free_forced_drains":{d},
+                \\"deferred_free_reclaimed_bytes":{d}
+                \\}}
+            ,
+                .{
+                    cuda_stats.activation_multiply_fused,
+                    cuda_stats.add_mul_scalar_fused,
+                    cuda_stats.rms_norm_add_fused,
+                    cuda_stats.rms_norm_add_output_scale_fused,
+                    cuda_stats.rms_norm_add_output_scale_fallbacks,
+                    cuda_stats.gated_down_fused_q8,
+                    cuda_stats.gated_down_fused_q4,
+                    cuda_stats.gated_down_fallbacks,
+                    cuda_stats.deferred_free_queued,
+                    cuda_stats.deferred_free_drains,
+                    cuda_stats.deferred_free_forced_drains,
+                    cuda_stats.deferred_free_reclaimed_bytes,
+                },
+            );
+            break :blk try cuda_generate_out.toOwnedSlice(allocator);
+        }
+        break :blk try allocator.dupe(u8, "null");
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_generate_json);
+
+    const draft_cuda_json = if (comptime build_options.enable_cuda)
+        try cudaStatsCompactJson(allocator, draft_cuda_stats_opt, result.tokens_used)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(draft_cuda_json);
+
+    const draft_cuda_generate_json = if (comptime build_options.enable_cuda)
+        try cudaStatsCompactJson(allocator, draft_cuda_generate_stats_opt, result.tokens_used)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(draft_cuda_generate_json);
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"model_dir":{f},
+        \\"backend":{f},
+        \\"tokens":{d},
+        \\"finish_reason":{f},
+        \\"decode_tok_per_s":{d:.6},
+        \\"timing_ms":{{
+        \\"load_model":{d},
+        \\"prompt_prep":{d},
+        \\"scheduler":{d},
+        \\"backend_setup":{d},
+        \\"decode_setup":{d},
+        \\"generate":{d},
+        \\"total":{d},
+        \\"prompt_format_inner":{d},
+        \\"tokenize_inner":{d},
+        \\"runtime_prepare_inner":{d},
+        \\"prefill_inner":{d},
+        \\"decode_inner":{d},
+        \\"total_inner":{d}
+        \\}},
+        \\"speculative":{s},
+        \\"cuda":{s},
+        \\"cuda_generate":{s},
+        \\"draft_cuda":{s},
+        \\"draft_cuda_generate":{s}
+        \\}}
+        \\
+    ,
+        .{
+            std.json.fmt(model_dir, .{}),
+            std.json.fmt(backend_name, .{}),
+            result.tokens_used,
+            std.json.fmt(result.finish_reason, .{}),
+            tokensPerSecond(result.tokens_used, decode_ms),
+            load_model_ms,
+            prompt_prep_ms,
+            scheduler_ms,
+            backend_setup_ms,
+            decode_setup_ms,
+            generate_ms,
+            total_ms,
+            inner_timing.prompt_format,
+            inner_timing.tokenize,
+            inner_timing.runtime_prepare,
+            inner_timing.prefill,
+            inner_timing.decode,
+            inner_timing.total,
+            speculative_json,
+            cuda_json,
+            cuda_generate_json,
+            draft_cuda_json,
+            draft_cuda_generate_json,
+        },
+    );
+    defer allocator.free(json);
+    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
@@ -1091,7 +2746,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
 ) !bool {
     if (!liveWholeModelExecutorRequested(opts)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
-    if (opts.draft_model != null) return false;
+    if (config.draft_model != null) return false;
     if (opts.image_count > 0 or opts.audio_count > 0) return false;
 
     gpt_arch.resetDebugTimingStats();
@@ -1656,7 +3311,19 @@ fn runOnnxWholeModelGraphGenerate(
         .head_dim = gpt_config.maxHeadDim(),
         .sliding_window_size = sliding_window_size,
     });
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = backend_kind,
+        .dtype = kv_dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+        .num_kv_heads = gpt_config.maxKvHeads(),
+        .head_dim = gpt_config.maxHeadDim(),
+        .sliding_window_size = sliding_window_size,
+    });
+    defer kv_storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&kv_storage);
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
+    decode_state.kv_storage = &kv_storage;
     const created_decode_state_at = std.Io.Timestamp.now(io, .awake);
     defer decode_state.deinit();
 
@@ -1804,6 +3471,14 @@ fn validateDraftTokenizerCompatibility(
     target_cfg: @import("models/gpt.zig").Config,
     draft_cfg: @import("models/gpt.zig").Config,
 ) !void {
+    if (draft_cfg.gemma4_mtp_assistant) {
+        if (draft_tokenizer.vocabSize() != target_tokenizer.vocabSize() or
+            draft_cfg.vocab_size != target_cfg.vocab_size)
+        {
+            return error.IncompatibleDraftTokenizer;
+        }
+        return;
+    }
     const target_special = target_tokenizer.specialTokens();
     const draft_special = draft_tokenizer.specialTokens();
     if (draft_tokenizer.vocabSize() != target_tokenizer.vocabSize() or
@@ -1884,6 +3559,14 @@ fn parseArgs(args: []const []const u8) !Options {
             if (i >= args.len) return error.MissingSpeculativeK;
             opts.speculative_k = try std.fmt.parseInt(u32, args[i], 10);
             if (opts.speculative_k == 0) return error.InvalidSpeculativeK;
+        } else if (std.mem.eql(u8, arg, "--speculation-policy")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            opts.speculation_policy = generation.parseSpeculationPolicy(args[i]) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--speculation-calibration")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            opts.speculation_calibration = generation.parseSpeculationCalibration(args[i]) orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--image")) {
             i += 1;
             if (i >= args.len) return error.MissingImagePath;
@@ -1912,6 +3595,16 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.print_chat_template_status = true;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--json-timing")) {
+            i += 1;
+            if (i >= args.len) return error.MissingJsonTimingPath;
+            opts.json_timing_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--debug-mtp")) {
+            opts.debug_mtp = true;
+        } else if (std.mem.eql(u8, arg, "--debug-gemma4-target")) {
+            opts.debug_gemma4_target = true;
+        } else if (std.mem.eql(u8, arg, "--disable-gemma-embedding-scale")) {
+            opts.disable_gemma_embedding_scale = true;
         } else if (std.mem.eql(u8, arg, "--raw-prompt")) {
             opts.raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--no-bos")) {
@@ -1985,8 +3678,11 @@ fn printBudgetExceeded(
 fn printSpeculativeStats(result: *const generation.GenerationResult) void {
     const stats = result.speculative orelse return;
     print(
-        "speculative: rounds={d} drafted={d} matched={d} rejected={d} accepted={d} corrections={d} bonus={d}\n",
+        "speculative: policy={s} calibration={s} decision={s} rounds={d} drafted={d} matched={d} rejected={d} accepted={d} corrections={d} bonus={d} adaptive_fallbacks={d} mtp_enabled={} mtp_graph_replay={s} mtp_acceptance_permille={d} mtp_acceptance_gate_fallbacks={d}",
         .{
+            stats.speculation_policy.name(),
+            stats.speculation_calibration.name(),
+            stats.speculation_policy_decision.name(),
             stats.rounds,
             stats.drafted_tokens,
             stats.matched_draft_tokens,
@@ -1994,8 +3690,193 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
             stats.accepted_tokens,
             stats.correction_tokens,
             stats.bonus_tokens,
+            stats.adaptive_fallbacks,
+            stats.mtp_enabled,
+            stats.mtp_graph_replay_status,
+            stats.acceptancePermille(),
+            stats.mtp_acceptance_gate_fallbacks,
         },
     );
+    if (stats.mtp_disabled_reason) |reason| {
+        print(" mtp_disabled_reason={s}", .{reason});
+    }
+    print("\n", .{});
+    const profile = stats.mtp_profile;
+    if (profile.enabled) {
+        print(
+            "mtp_profile: sync={} draft_steps={d} resident_draft_steps={d} host_draft_steps={d} target_verify_calls={d} target_verify_rows={d} target_verify_argmax_calls={d} target_verify_argmax_rows={d} target_verify_argmax_batched_calls={d} target_verify_argmax_syncs={d} dedicated_runtime_hits={d} dedicated_runtime_fallbacks={d} device_verify_commit_hits={d} device_verify_commit_fallbacks={d} device_verify_commit_result_downloads={d} target_choice_downloads={d} commit_forwards_required={d} commit_forwards_avoided={d} accepted_hidden_reuse_rows={d} activation_copies={d} materializations={d} hidden_only_materializations={d} hidden_only_fallbacks={d} correction_materializations={d} bonus_materializations={d} bonus_skips={d} fallback_calls={d} draft_ms={d} verify_ms={d} activation_copy_ms={d} materialization_ms={d} fallback_ms={d}\n",
+            .{
+                profile.sync_enabled,
+                profile.draft_steps,
+                profile.resident_draft_steps,
+                profile.host_draft_steps,
+                profile.target_verify_calls,
+                profile.target_verify_rows,
+                profile.target_verify_argmax_calls,
+                profile.target_verify_argmax_rows,
+                profile.target_verify_argmax_batched_calls,
+                profile.target_verify_argmax_syncs,
+                profile.dedicated_runtime_hits,
+                profile.dedicated_runtime_fallbacks,
+                profile.device_verify_commit_hits,
+                profile.device_verify_commit_fallbacks,
+                profile.device_verify_commit_result_downloads,
+                profile.target_choice_downloads,
+                profile.commit_forwards_required,
+                profile.commit_forwards_avoided,
+                profile.accepted_hidden_reuse_rows,
+                profile.activation_copies,
+                profile.materializations,
+                profile.materialization_hidden_only_hits,
+                profile.materialization_hidden_only_fallbacks,
+                profile.correction_materializations,
+                profile.bonus_materializations,
+                profile.bonus_skips,
+                profile.fallback_calls,
+                profile.draft_token_ns / std.time.ns_per_ms,
+                profile.target_verify_ns / std.time.ns_per_ms,
+                profile.activation_copy_ns / std.time.ns_per_ms,
+                profile.materialization_ns / std.time.ns_per_ms,
+                profile.fallback_ns / std.time.ns_per_ms,
+            },
+        );
+    }
+    const quality = stats.mtp_quality;
+    if (stats.mtp_enabled and quality.mismatches > 0) {
+        print(
+            "mtp_quality: mismatches={d} with_assistant_logits={d} target_in_assistant_top2={d} target_in_assistant_top4={d} target_in_assistant_top8={d} draft_in_target_top2={d} format_or_control_misses={d} near_tie_misses={d} confident_misses={d} avg_assistant_target_margin={d:.6}\n",
+            .{
+                quality.mismatches,
+                quality.mismatches_with_assistant_logits,
+                quality.target_in_assistant_top2,
+                quality.target_in_assistant_top4,
+                quality.target_in_assistant_top8,
+                quality.draft_in_target_top2,
+                quality.format_or_control_misses,
+                quality.near_tie_misses,
+                quality.confident_misses,
+                quality.averageAssistantTargetMargin(),
+            },
+        );
+    }
+}
+
+fn printGemma4TargetDebug(
+    cb: *const ops.ComputeBackend,
+    tokenizer: tokenizer_mod.Tokenizer,
+    manifest: manifest_mod.ModelManifest,
+    cfg: gpt_mod.Config,
+    prompt_ids: []const i32,
+) !void {
+    const special = tokenizer.specialTokens();
+    print(
+        "gemma4_target_debug: family={s} hidden={d} layers={d} heads={d} kv_heads={d} global_kv_heads={d} head_dim={d} global_head_dim={d} sliding_window={d} sliding_pattern={d} kv_shared_layers={d} ple_hidden={d} attention_k_eq_v={} rope_theta={d:.6} rope_local_theta={d:.6} rope_partial_factor={d:.6} rope_dim_override={d} final_logit_softcap={d:.6} embedding_scale={d:.6} weight_tying={} norm_offset={d:.6}\n",
+        .{
+            @tagName(cfg.family),
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.num_global_key_value_heads,
+            cfg.attention_head_dim,
+            cfg.global_head_dim,
+            cfg.sliding_window,
+            cfg.sliding_window_pattern,
+            cfg.num_kv_shared_layers,
+            cfg.ple_hidden_size,
+            cfg.attention_k_eq_v,
+            cfg.rope_theta,
+            cfg.rope_local_theta,
+            cfg.rope_partial_factor,
+            cfg.rope_dim_override,
+            cfg.final_logit_softcapping,
+            cfg.tokenEmbeddingScale(),
+            cfg.weight_tying,
+            cfg.norm_weight_offset,
+        },
+    );
+    print(
+        "gemma4_tokenizer_debug: vocab={d} bos={d} eos={d} pad={d} unk={d} manifest_bos={s} manifest_eos={s} manifest_pad={s} add_bos={} add_eos={}\n",
+        .{
+            tokenizer.vocabSize(),
+            special.cls_id,
+            special.sep_id,
+            special.pad_id,
+            special.unk_id,
+            manifest.bos_token,
+            manifest.eos_token,
+            manifest.pad_token,
+            manifest.add_bos_token,
+            manifest.add_eos_token,
+        },
+    );
+    print("gemma4_prompt_debug: tokens={d} ids", .{prompt_ids.len});
+    for (prompt_ids[0..@min(prompt_ids.len, 48)]) |id| print(" {d}", .{id});
+    if (prompt_ids.len > 48) print(" ...", .{});
+    print("\n", .{});
+
+    print(
+        "gemma4_weight_debug: raw_token_embd={} model_token_embd={} raw_output={} lm_head={} raw_output_norm={} model_norm={}\n",
+        .{
+            try backendHasWeight(cb, "token_embd.weight"),
+            try backendHasWeight(cb, "model.embed_tokens.weight"),
+            try backendHasWeight(cb, "output.weight"),
+            try backendHasWeight(cb, "lm_head.weight"),
+            try backendHasWeight(cb, "output_norm.weight"),
+            try backendHasWeight(cb, "model.norm.weight"),
+        },
+    );
+    try printDebugWeightSample(cb, cfg, "model.norm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.input_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.post_attention_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.pre_feedforward_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.post_feedforward_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.self_attn.q_norm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.self_attn.k_norm.weight");
+
+    const layer_samples = [_]usize{ 0, 1, 4, 5, 6, 47 };
+    for (layer_samples) |layer| {
+        if (layer >= cfg.num_hidden_layers) continue;
+        print(
+            "gemma4_layer_debug: layer={d} sliding={} shared_tail={} donor={?} kv_heads={d} head_dim={d} rope_dim={d} rope_freq_dim={d} omits_v={}\n",
+            .{
+                layer,
+                cfg.layerUsesSlidingAttention(layer),
+                cfg.layerSharesKv(layer),
+                cfg.kvDonorLayerIndex(layer),
+                cfg.effectiveKVHeadsForLayer(layer),
+                cfg.effectiveHeadDimForLayer(layer),
+                cfg.layerRopeDim(layer),
+                cfg.layerRopeFrequencyDim(layer),
+                cfg.layerOmitsVProj(layer),
+            },
+        );
+    }
+}
+
+fn backendHasWeight(cb: *const ops.ComputeBackend, name: []const u8) !bool {
+    const weight = cb.getWeight(name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return false,
+        else => return err,
+    };
+    cb.free(weight);
+    return true;
+}
+
+fn printDebugWeightSample(cb: *const ops.ComputeBackend, cfg: gpt_mod.Config, name: []const u8) !void {
+    const weight = gpt_arch.getModelWeight(cb, cfg, name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => {
+            print("gemma4_weight_sample: {s} missing\n", .{name});
+            return;
+        },
+        else => return err,
+    };
+    defer cb.free(weight);
+    const values = try cb.toFloat32(weight, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(values);
+    print("gemma4_weight_sample: {s} len={d} first", .{ name, values.len });
+    for (values[0..@min(values.len, 8)]) |value| print(" {d:.6}", .{value});
+    print("\n", .{});
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
@@ -2008,7 +3889,7 @@ fn preflightModelLoadBudget(
     opts: Options,
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
-    const weight_bytes = estimateModelArtifactBytes(allocator, manifest) catch 0;
+    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
     if (weight_bytes == 0) return;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
@@ -2016,11 +3897,7 @@ fn preflightModelLoadBudget(
         .backend => .gpu,
         .disk => return,
     });
-    const predicted_backend_type: backends.BackendType = switch (reservation_tier) {
-        .host => .native,
-        .backend => .metal,
-        .disk => unreachable,
-    };
+    const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
     limits = try session_factory.widenBudgetLimitsForModelPath(
         allocator,
         opts.model_dir,
@@ -2065,6 +3942,16 @@ fn predictedWeightTier(
     }
 }
 
+fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.ResidencyTier) backends.BackendType {
+    if (tier != .backend) return .native;
+    return switch (choice) {
+        .metal => .metal,
+        .cuda => .cuda,
+        .auto => .metal,
+        .onnx, .native, .xla, .webgpu => .native,
+    };
+}
+
 fn shouldPreferNativeAheadOfMetal(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
@@ -2082,6 +3969,25 @@ fn estimateModelArtifactBytes(
     return 0;
 }
 
+fn estimatePreflightWeightBytes(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    opts: Options,
+) !usize {
+    const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
+    if (opts.backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
+
+    const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
+    defer allocator.free(config_bytes);
+    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return artifact_bytes;
+    if (cfg.family != .gemma) return artifact_bytes;
+
+    const embed_elements = std.math.mul(usize, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size)) catch return artifact_bytes;
+    const embed_bytes = std.math.mul(usize, embed_elements, @sizeOf(f32)) catch return artifact_bytes;
+    const overhead_bytes: usize = 512 * 1024 * 1024;
+    return @min(artifact_bytes, embed_bytes + overhead_bytes);
+}
+
 fn metalEagerDenseMaxBytes() u64 {
     const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
@@ -2089,9 +3995,10 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
+        \\  speculation-calibration defaults to none; Gemma4 MTP auto mode requires probe or positive to run the drafter.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
         \\  artifact-dir overrides that lookup root.
         \\  whole-model compiled generate prefers package manifests before raw sidecar scanning.

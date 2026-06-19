@@ -156,6 +156,9 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
     var self_pair_rewrites = try fuseAlgebraicSelfPairs(allocator, &work, reachable_anchor);
     num_rewrites += self_pair_rewrites.num_rewrites;
 
+    var add_mul_scalar_rewrites = try fuseAddMulScalar(allocator, &work, reachable_anchor);
+    num_rewrites += add_mul_scalar_rewrites.num_rewrites;
+
     var pair_rewrites = try fuseLinearPairs(allocator, &work);
     num_rewrites += pair_rewrites.num_rewrites;
 
@@ -201,6 +204,7 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
         &linear_bias_rewrites.redirects,
         &matmul_no_bias_rewrites.redirects,
         &rope_rewrites.redirects,
+        &add_mul_scalar_rewrites.redirects,
         &pair_rewrites.redirects,
         &sdpa_rewrites.redirects,
     };
@@ -217,6 +221,7 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
     linear_bias_rewrites.redirects.deinit(allocator);
     matmul_no_bias_rewrites.redirects.deinit(allocator);
     rope_rewrites.redirects.deinit(allocator);
+    add_mul_scalar_rewrites.redirects.deinit(allocator);
     hoist_rewrites.redirects.deinit(allocator);
     chain_reshape_rewrites.redirects.deinit(allocator);
     chain_broadcast_rewrites.redirects.deinit(allocator);
@@ -478,6 +483,95 @@ const PairFusionResult = struct {
     redirects: std.ArrayListUnmanaged(Redirect),
     num_rewrites: u32,
 };
+
+fn fuseAddMulScalar(allocator: std.mem.Allocator, work: *Graph, reachable: []const bool) !PairFusionResult {
+    var redirects = std.ArrayListUnmanaged(Redirect).empty;
+    errdefer redirects.deinit(allocator);
+    var num_rewrites: u32 = 0;
+
+    const count = work.nodeCount();
+    const consumer_counts = try computeInputConsumerCounts(allocator, work);
+    defer allocator.free(consumer_counts);
+
+    for (0..count) |i| {
+        if (i >= reachable.len or !reachable[i]) continue;
+        const mul_id: NodeId = @intCast(i);
+        const n = work.node(mul_id);
+        if (!isMulLike(n.op)) continue;
+
+        const lhs = n.inputs[0];
+        const rhs = n.inputs[1];
+        if (lhs == null_node or rhs == null_node) continue;
+
+        const matched = matchAddMulScalar(work, lhs, rhs, consumer_counts) orelse
+            matchAddMulScalar(work, rhs, lhs, consumer_counts) orelse
+            continue;
+
+        const fused_id = try work.addNode(.{
+            .op = .{ .fused_add_mul_scalar = {} },
+            .output_shape = n.output_shape,
+            .inputs = .{ matched.add_lhs, matched.add_rhs, matched.scalar, null_node },
+            .num_inputs = 3,
+        });
+        try redirects.append(allocator, .{ .from = mul_id, .to = fused_id });
+        num_rewrites += 1;
+    }
+
+    return .{ .redirects = redirects, .num_rewrites = num_rewrites };
+}
+
+fn matchAddMulScalar(
+    graph: *const Graph,
+    add_id: NodeId,
+    scalar_id: NodeId,
+    consumer_counts: []const u32,
+) ?struct { add_lhs: NodeId, add_rhs: NodeId, scalar: NodeId } {
+    if (add_id == null_node or scalar_id == null_node) return null;
+    if (add_id >= graph.nodeCount() or scalar_id >= graph.nodeCount()) return null;
+    if (add_id >= consumer_counts.len or consumer_counts[@intCast(add_id)] != 1) return null;
+
+    const add_node = graph.node(add_id);
+    if (!isAddLike(add_node.op)) return null;
+    if (add_node.inputs[0] == null_node or add_node.inputs[1] == null_node) return null;
+    if (!shapesEqual(add_node.output_shape, graph.node(add_node.inputs[0]).output_shape)) return null;
+    if (!shapesEqual(add_node.output_shape, graph.node(add_node.inputs[1]).output_shape)) return null;
+
+    const scalar_shape = graph.node(scalar_id).output_shape;
+    if (add_node.output_shape.dtype != .f32 or scalar_shape.dtype != .f32) return null;
+    if (!isScalarLikeShape(scalar_shape)) return null;
+    return .{ .add_lhs = add_node.inputs[0], .add_rhs = add_node.inputs[1], .scalar = scalar_id };
+}
+
+fn isAddLike(op: OpCode) bool {
+    return switch (op) {
+        .add, .fused_elem_add => true,
+        else => false,
+    };
+}
+
+fn isMulLike(op: OpCode) bool {
+    return switch (op) {
+        .mul, .fused_elem_multiply => true,
+        else => false,
+    };
+}
+
+fn isScalarLikeShape(shape: Shape) bool {
+    return (shape.numElements() orelse return false) == 1;
+}
+
+fn computeInputConsumerCounts(allocator: std.mem.Allocator, graph: *const Graph) ![]u32 {
+    const count = graph.nodeCount();
+    const counts = try allocator.alloc(u32, count);
+    @memset(counts, 0);
+    for (0..count) |i| {
+        const n = graph.node(@intCast(i));
+        for (n.getInputs()) |input| {
+            if (input != null_node and input < count) counts[@intCast(input)] += 1;
+        }
+    }
+    return counts;
+}
 
 /// Detect groups of fused_linear_no_bias nodes sharing the same input
 /// (and same `rows`, `in_dim`) and fuse them.
@@ -3411,6 +3505,49 @@ test "fuse preserves already-optimal graph" {
 
     try std.testing.expectEqual(@as(u32, 0), result.num_rewrites);
     try std.testing.expectEqual(g.nodeCount(), result.graph.nodeCount());
+}
+
+test "fuse detects add multiplied by scalar" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const y = try b.parameter("y", Shape.init(.f32, &.{ 2, 4 }));
+    const scale = try b.scalarConst(.f32, 0.5);
+    const sum = try b.add(x, y);
+    const out = try b.mul(sum, scale);
+    try g.markOutput(out);
+
+    var result = try fuse(allocator, &g);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.num_rewrites);
+    const out_id = result.graph.outputs.items[0];
+    try std.testing.expectEqual(@as(usize, 3), result.graph.node(out_id).num_inputs);
+    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = {} }, result.graph.node(out_id).op);
+}
+
+test "fuse skips add multiplied by non-scalar tensor" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const y = try b.parameter("y", Shape.init(.f32, &.{ 2, 4 }));
+    const scale = try b.parameter("scale", Shape.init(.f32, &.{ 2, 4 }));
+    const sum = try b.add(x, y);
+    const out = try b.mul(sum, scale);
+    try g.markOutput(out);
+
+    var result = try fuse(allocator, &g);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.num_rewrites);
+    const out_id = result.graph.outputs.items[0];
+    try std.testing.expectEqualDeep(OpCode{ .mul = {} }, result.graph.node(out_id).op);
 }
 
 test "fuse preserves fused ops" {

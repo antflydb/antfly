@@ -1,0 +1,3 @@
+# Gemma4 CUDA generated-output replay smoke prompts.
+Name two uses for a compass.
+Rewrite this in uppercase: cuda kernels are fast

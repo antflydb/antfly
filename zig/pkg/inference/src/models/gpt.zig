@@ -90,6 +90,8 @@ pub const DeepseekV4MlpKind = enum {
 };
 
 pub const deepseek_v4_max_layers = 256;
+pub const max_extra_eos_token_ids = 16;
+pub const max_suppress_token_ids = 64;
 
 pub const Config = struct {
     family: ModelFamily = .gpt2,
@@ -162,6 +164,7 @@ pub const Config = struct {
     mtp_use_ordered_embeddings: bool = false,
     mtp_kv_sliding_donor_layer: u32 = std.math.maxInt(u32),
     mtp_kv_full_donor_layer: u32 = std.math.maxInt(u32),
+    mtp_kv_donor_base_layer: u32 = std.math.maxInt(u32),
 
     // Architecture choices
     norm_type: NormType = .layer_norm,
@@ -172,6 +175,10 @@ pub const Config = struct {
     // Token IDs
     bos_token_id: i32 = -1,
     eos_token_id: i32 = -1,
+    extra_eos_token_ids_len: u8 = 0,
+    extra_eos_token_ids: [max_extra_eos_token_ids]i32 = [_]i32{-1} ** max_extra_eos_token_ids,
+    suppress_token_ids_len: u8 = 0,
+    suppress_token_ids: [max_suppress_token_ids]i32 = [_]i32{-1} ** max_suppress_token_ids,
     pad_token_id: i32 = -1,
     image_token_index: i32 = -1,
     boi_token_index: i32 = -1,
@@ -217,6 +224,8 @@ pub const Config = struct {
     // Optional model-specific decode semantics.
     norm_weight_offset: f32 = 0.0,
     final_logit_softcapping: f32 = 0.0,
+    attention_k_eq_v: bool = false,
+    disable_token_embedding_scale: bool = false,
 
     // Weight tying: when true, lm_head reuses embedding weights (no separate lm_head.weight tensor).
     weight_tying: bool = false,
@@ -268,6 +277,7 @@ pub const Config = struct {
     }
 
     pub fn tokenEmbeddingScale(self: Config) f32 {
+        if (self.disable_token_embedding_scale) return 1.0;
         return switch (self.family) {
             .gemma => @sqrt(@as(f32, @floatFromInt(self.hidden_size))),
             else => 1.0,
@@ -371,6 +381,9 @@ pub const Config = struct {
     pub fn kvDonorLayerIndex(self: Config, layer_index: usize) ?usize {
         if (self.gemma4_mtp_assistant) {
             const unset = std.math.maxInt(u32);
+            if (self.mtp_kv_donor_base_layer != unset) {
+                return self.mtp_kv_donor_base_layer + layer_index;
+            }
             if (self.mtp_kv_sliding_donor_layer == unset or self.mtp_kv_full_donor_layer == unset) return layer_index;
             return if (self.layerUsesSlidingAttention(layer_index))
                 self.mtp_kv_sliding_donor_layer
@@ -394,6 +407,7 @@ pub const Config = struct {
 
     /// Gemma 4 full-attention layers may omit v_proj (V = K).
     pub fn layerOmitsVProj(self: Config, layer_index: usize) bool {
+        if (!self.attention_k_eq_v) return false;
         if (self.global_head_dim == 0) return false;
         if (!self.usesGemmaSlidingAttention()) return false;
         return !self.layerUsesSlidingAttention(layer_index);
@@ -435,6 +449,18 @@ pub const Config = struct {
         const global_dim: usize = if (self.global_head_dim > 0) self.global_head_dim else self.headDim();
         const global_width = global_kv_heads * global_dim;
         return @max(sliding_width, global_width);
+    }
+
+    pub fn isEosToken(self: Config, token_id: usize) bool {
+        if (self.eos_token_id >= 0 and token_id == @as(usize, @intCast(self.eos_token_id))) return true;
+        for (self.extra_eos_token_ids[0..self.extra_eos_token_ids_len]) |eos| {
+            if (eos >= 0 and token_id == @as(usize, @intCast(eos))) return true;
+        }
+        return false;
+    }
+
+    pub fn suppressTokenIds(self: Config) []const i32 {
+        return self.suppress_token_ids[0..self.suppress_token_ids_len];
     }
 
     pub fn deepseekV4CompressRateForLayer(self: Config, layer_index: usize) u32 {
@@ -534,14 +560,14 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     // Detect family from model_type
     if (model_obj.get("model_type")) |v| {
         if (v == .string) {
-            config.gemma4_mtp_assistant = std.mem.eql(u8, v.string, "gemma4_assistant");
+            config.gemma4_mtp_assistant = isGemma4AssistantModelType(v.string);
             config.family = detectFamily(v.string);
             applyFamilyDefaults(&config);
             if (isGemma4ModelType(v.string)) config.norm_weight_offset = 0.0;
         }
     } else if (obj.get("model_type")) |v| {
         if (v == .string) {
-            config.gemma4_mtp_assistant = std.mem.eql(u8, v.string, "gemma4_assistant");
+            config.gemma4_mtp_assistant = isGemma4AssistantModelType(v.string);
             config.family = detectFamily(v.string);
             applyFamilyDefaults(&config);
             if (isGemma4ModelType(v.string)) config.norm_weight_offset = 0.0;
@@ -797,6 +823,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("num_global_key_value_heads")) |v| if (jsonU32(v)) |val| {
         config.num_global_key_value_heads = val;
     };
+    if (text_obj.get("attention_k_eq_v")) |v| if (jsonBool(v)) |val| {
+        config.attention_k_eq_v = val;
+    };
     if (config.family == .gemma and config.num_kv_shared_layers > 0 and config.shared_layer_intermediate_size == 0) {
         config.shared_layer_intermediate_size = config.intermediate_size * 2;
     }
@@ -814,6 +843,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("eos_token_id")) |v| if (jsonI32(v)) |val| {
         config.eos_token_id = val;
     };
+    if (obj.get("eos_token_id")) |v| parseEosTokenIds(&config, v);
     if (text_obj.get("pad_token_id")) |v| if (jsonI32(v)) |val| {
         config.pad_token_id = val;
     };
@@ -1040,12 +1070,24 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     return config;
 }
 
+pub fn applyGenerationConfigJson(allocator: std.mem.Allocator, config: *Config, json_bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    if (obj.get("eos_token_id")) |value| parseEosTokenIds(config, value);
+    if (obj.get("suppress_tokens")) |value| parseSuppressTokenIds(config, value);
+}
+
 pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     const arch = view.getString("general.architecture") orelse return null;
     if (!isGenerativeModel(arch)) return null;
 
     var config = Config{
         .family = detectFamily(arch),
+        .gemma4_mtp_assistant = std.mem.eql(u8, arch, "gemma4_assistant") or
+            std.mem.eql(u8, arch, "gemma4_unified_assistant") or
+            std.mem.eql(u8, arch, "gemma4-assistant"),
     };
     applyFamilyDefaults(&config);
     if (config.family == .gemma) {
@@ -1111,25 +1153,47 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     if (metaF32(view, &key_buf, arch, "rope.freq_base_swa")) |value| config.rope_local_theta = value;
 
-    // Gemma 4: partial rotary for full attention layers.
-    // rope.dimension_count gives the number of dims to rotate for full-attn layers.
-    // Derive partial_rotary_factor from it: factor = rope_dim / head_dim.
-    if (metaU32(view, &key_buf, arch, "rope.dimension_count")) |rope_dim| {
-        if (config.global_head_dim > 0 and rope_dim < config.global_head_dim) {
-            config.rope_partial_factor = @as(f32, @floatFromInt(rope_dim)) / @as(f32, @floatFromInt(config.global_head_dim));
-        } else if (config.attention_head_dim > 0 and rope_dim < config.attention_head_dim) {
-            config.rope_partial_factor = @as(f32, @floatFromInt(rope_dim)) / @as(f32, @floatFromInt(config.attention_head_dim));
-        }
-    }
-
-    // Gemma 4: shared KV cache and per-layer GQA.
+    // Gemma 4: shared KV cache and per-layer GQA. Apply explicit global head
+    // metadata before deriving rope_partial_factor from rope.dimension_count.
     if (metaU32(view, &key_buf, arch, "attention.kv_shared_layer_count")) |value| config.num_kv_shared_layers = value;
     if (metaU32(view, &key_buf, arch, "attention.shared_kv_layers")) |value| config.num_kv_shared_layers = value;
     if (metaU32(view, &key_buf, arch, "attention.global_head_dim")) |value| config.global_head_dim = value;
     if (metaU32(view, &key_buf, arch, "attention.global_head_count_kv")) |value| config.num_global_key_value_heads = value;
 
+    // Gemma 4: partial rotary for full attention layers.
+    // rope.dimension_count gives the number of dims to rotate for full-attn layers.
+    // Derive partial_rotary_factor from it: factor = rope_dim / head_dim.
+    var derived_rope_partial_from_dim = false;
+    if (metaU32(view, &key_buf, arch, "rope.dimension_count")) |rope_dim| {
+        if (config.global_head_dim > 0 and rope_dim < config.global_head_dim) {
+            config.rope_partial_factor = @as(f32, @floatFromInt(rope_dim)) / @as(f32, @floatFromInt(config.global_head_dim));
+            derived_rope_partial_from_dim = true;
+        } else if (config.attention_head_dim > 0 and rope_dim < config.attention_head_dim) {
+            config.rope_partial_factor = @as(f32, @floatFromInt(rope_dim)) / @as(f32, @floatFromInt(config.attention_head_dim));
+            derived_rope_partial_from_dim = true;
+        }
+    }
+    if (!derived_rope_partial_from_dim and
+        isGemma4ModelType(arch) and
+        config.global_head_dim > config.attention_head_dim and
+        config.attention_head_dim > 0 and
+        config.sliding_window > 0)
+    {
+        config.rope_partial_factor = 0.25;
+    }
+
     // Gemma 4: Per-Layer Embeddings (PLE).
     if (metaU32(view, &key_buf, arch, "embedding_length_per_layer_input")) |value| config.ple_hidden_size = value;
+    if (config.gemma4_mtp_assistant) {
+        if (metaU32(view, &key_buf, arch, "n_embd_backbone")) |value| config.mtp_backbone_hidden_size = value;
+        if (metaU32(view, &key_buf, arch, "backbone_hidden_size")) |value| config.mtp_backbone_hidden_size = value;
+        if (metaU32(view, &key_buf, arch, "embedding_length_out")) |value| config.mtp_backbone_hidden_size = value;
+        if (metaU32(view, &key_buf, arch, "n_centroids")) |value| config.mtp_num_centroids = value;
+        if (metaU32(view, &key_buf, arch, "num_centroids")) |value| config.mtp_num_centroids = value;
+        if (metaU32(view, &key_buf, arch, "centroid_top_k")) |value| config.mtp_centroid_intermediate_top_k = value;
+        if (metaU32(view, &key_buf, arch, "centroid_intermediate_top_k")) |value| config.mtp_centroid_intermediate_top_k = value;
+        if (metaBool(view, &key_buf, arch, "use_ordered_embeddings")) |value| config.mtp_use_ordered_embeddings = value;
+    }
 
     // Gemma 4: sliding_window_pattern may be a per-layer bool array.
     if (metaSlidingPatternFromBoolArray(view, &key_buf, arch, "attention.sliding_window_pattern")) |value| config.sliding_window_pattern = value;
@@ -1157,6 +1221,11 @@ fn metaU32(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []c
 fn metaF32(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []const u8) ?f32 {
     const key = std.fmt.bufPrint(buf, "{s}.{s}", .{ arch, suffix }) catch return null;
     return view.getF32(key);
+}
+
+fn metaBool(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []const u8) ?bool {
+    const key = std.fmt.bufPrint(buf, "{s}.{s}", .{ arch, suffix }) catch return null;
+    return view.getBool(key);
 }
 
 /// Read element at index from an i32/u32 metadata array.
@@ -1255,6 +1324,7 @@ fn detectFamily(model_type: []const u8) ModelFamily {
         .{ "gemma4_unified_text", ModelFamily.gemma },
         .{ "gemma4_assistant", ModelFamily.gemma },
         .{ "gemma4_unified_assistant", ModelFamily.gemma },
+        .{ "gemma4-assistant", ModelFamily.gemma },
         .{ "bitnet", ModelFamily.bitnet },
         .{ "bitnet-b1.58", ModelFamily.bitnet },
         .{ "falcon", ModelFamily.falcon },
@@ -1272,8 +1342,13 @@ fn isGemma4ModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "gemma4_text") or
         std.mem.eql(u8, model_type, "gemma4_unified") or
         std.mem.eql(u8, model_type, "gemma4_unified_text") or
-        std.mem.eql(u8, model_type, "gemma4_assistant") or
-        std.mem.eql(u8, model_type, "gemma4_unified_assistant");
+        isGemma4AssistantModelType(model_type);
+}
+
+fn isGemma4AssistantModelType(model_type: []const u8) bool {
+    return std.mem.eql(u8, model_type, "gemma4_assistant") or
+        std.mem.eql(u8, model_type, "gemma4_unified_assistant") or
+        std.mem.eql(u8, model_type, "gemma4-assistant");
 }
 
 fn applyFamilyDefaults(config: *Config) void {
@@ -1447,6 +1522,53 @@ fn jsonI32(val: std.json.Value) ?i32 {
         .integer => |i| @intCast(i),
         else => null,
     };
+}
+
+fn parseEosTokenIds(config: *Config, value: std.json.Value) void {
+    if (jsonI32(value)) |token_id| {
+        addEosTokenId(config, token_id);
+        return;
+    }
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        if (jsonI32(item)) |token_id| addEosTokenId(config, token_id);
+    }
+}
+
+fn addEosTokenId(config: *Config, token_id: i32) void {
+    if (token_id < 0) return;
+    if (config.eos_token_id < 0) {
+        config.eos_token_id = token_id;
+        return;
+    }
+    if (config.eos_token_id == token_id) return;
+    for (config.extra_eos_token_ids[0..config.extra_eos_token_ids_len]) |existing| {
+        if (existing == token_id) return;
+    }
+    if (config.extra_eos_token_ids_len >= max_extra_eos_token_ids) return;
+    config.extra_eos_token_ids[config.extra_eos_token_ids_len] = token_id;
+    config.extra_eos_token_ids_len += 1;
+}
+
+fn parseSuppressTokenIds(config: *Config, value: std.json.Value) void {
+    if (jsonI32(value)) |token_id| {
+        addSuppressTokenId(config, token_id);
+        return;
+    }
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        if (jsonI32(item)) |token_id| addSuppressTokenId(config, token_id);
+    }
+}
+
+fn addSuppressTokenId(config: *Config, token_id: i32) void {
+    if (token_id < 0) return;
+    for (config.suppress_token_ids[0..config.suppress_token_ids_len]) |existing| {
+        if (existing == token_id) return;
+    }
+    if (config.suppress_token_ids_len >= max_suppress_token_ids) return;
+    config.suppress_token_ids[config.suppress_token_ids_len] = token_id;
+    config.suppress_token_ids_len += 1;
 }
 
 fn jsonBool(val: std.json.Value) ?bool {
@@ -1950,7 +2072,7 @@ test "parse gguf metadata for llama config" {
     try data.appendSlice(allocator, "GGUF");
     try appendLe(u32, allocator, &data, 3);
     try appendLe(u64, allocator, &data, 0);
-    try appendLe(u64, allocator, &data, 8);
+    try appendLe(u64, allocator, &data, 10);
 
     try appendMetadataString(allocator, &data, "general.architecture", "llama");
     try appendMetadataU32(allocator, &data, "llama.embedding_length", 4096);
@@ -2174,6 +2296,9 @@ test "parse gemma4 12b unified config aliases" {
         \\  "boi_token_id": 255999,
         \\  "eoi_token_id": 258882,
         \\  "text_config": {
+        \\    "bos_token_id": 2,
+        \\    "eos_token_id": 1,
+        \\    "pad_token_id": 0,
         \\    "model_type": "gemma4_unified_text",
         \\    "hidden_size": 3840,
         \\    "num_hidden_layers": 48,
@@ -2182,12 +2307,15 @@ test "parse gemma4 12b unified config aliases" {
         \\    "num_global_key_value_heads": 1,
         \\    "head_dim": 256,
         \\    "global_head_dim": 512,
+        \\    "attention_k_eq_v": true,
         \\    "intermediate_size": 15360,
         \\    "max_position_embeddings": 262144,
         \\    "sliding_window": 1024,
         \\    "tie_word_embeddings": true,
         \\    "vocab_size": 262144,
         \\    "hidden_activation": "gelu_pytorch_tanh",
+        \\    "rms_norm_eps": 1e-6,
+        \\    "final_logit_softcapping": 30.0,
         \\    "layer_types": [
         \\      "sliding_attention", "sliding_attention", "sliding_attention",
         \\      "sliding_attention", "sliding_attention", "full_attention"
@@ -2210,6 +2338,9 @@ test "parse gemma4 12b unified config aliases" {
     try std.testing.expectEqual(@as(i32, 258880), config.image_token_index);
     try std.testing.expectEqual(@as(i32, 255999), config.boi_token_index);
     try std.testing.expectEqual(@as(i32, 258882), config.eoi_token_index);
+    try std.testing.expectEqual(@as(i32, 2), config.bos_token_id);
+    try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
+    try std.testing.expectEqual(@as(i32, 0), config.pad_token_id);
     try std.testing.expectEqual(@as(u32, 3840), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 16), config.num_attention_heads);
@@ -2225,12 +2356,99 @@ test "parse gemma4 12b unified config aliases" {
     try std.testing.expectEqual(@as(f32, 0.25), config.rope_partial_factor);
     try std.testing.expectEqual(@as(f32, 1000000.0), config.rope_theta);
     try std.testing.expectEqual(@as(f32, 10000.0), config.rope_local_theta);
+    try std.testing.expectEqual(ActivationType.gelu_new, config.activation);
+    try std.testing.expectEqual(@as(f32, 1e-6), config.norm_eps);
+    try std.testing.expectEqual(@as(f32, 30.0), config.final_logit_softcapping);
     try std.testing.expectEqual(@as(u32, 8), config.effectiveKVHeadsForLayer(0));
     try std.testing.expectEqual(@as(u32, 1), config.effectiveKVHeadsForLayer(5));
     try std.testing.expectEqual(@as(u32, 256), config.effectiveHeadDimForLayer(0));
     try std.testing.expectEqual(@as(u32, 512), config.effectiveHeadDimForLayer(5));
+    try std.testing.expect(config.attention_k_eq_v);
+    try std.testing.expect(config.layerOmitsVProj(5));
     try std.testing.expectEqual(@as(u32, 512), config.maxHeadDim());
     try std.testing.expect(config.weight_tying);
+}
+
+test "parse gemma4 12b unified assistant config as mtp draft" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "architectures": ["Gemma4UnifiedAssistantForCausalLM"],
+        \\  "backbone_hidden_size": 3840,
+        \\  "centroid_intermediate_top_k": 32,
+        \\  "model_type": "gemma4_unified_assistant",
+        \\  "num_centroids": 2048,
+        \\  "use_ordered_embeddings": false,
+        \\  "text_config": {
+        \\    "attention_k_eq_v": true,
+        \\    "bos_token_id": 2,
+        \\    "eos_token_id": 1,
+        \\    "global_head_dim": 512,
+        \\    "head_dim": 256,
+        \\    "hidden_activation": "gelu_pytorch_tanh",
+        \\    "hidden_size": 1024,
+        \\    "intermediate_size": 8192,
+        \\    "layer_types": [
+        \\      "sliding_attention",
+        \\      "sliding_attention",
+        \\      "sliding_attention",
+        \\      "full_attention"
+        \\    ],
+        \\    "max_position_embeddings": 262144,
+        \\    "model_type": "gemma4_unified_text",
+        \\    "num_attention_heads": 16,
+        \\    "num_global_key_value_heads": 1,
+        \\    "num_hidden_layers": 4,
+        \\    "num_key_value_heads": 8,
+        \\    "num_kv_shared_layers": 4,
+        \\    "pad_token_id": 0,
+        \\    "rms_norm_eps": 1e-6,
+        \\    "sliding_window": 1024,
+        \\    "tie_word_embeddings": true,
+        \\    "vocab_size": 262144
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(config.gemma4_mtp_assistant);
+    try std.testing.expectEqual(@as(u32, 3840), config.mtp_backbone_hidden_size);
+    try std.testing.expectEqual(@as(u32, 2048), config.mtp_num_centroids);
+    try std.testing.expectEqual(@as(u32, 32), config.mtp_centroid_intermediate_top_k);
+    try std.testing.expect(!config.mtp_use_ordered_embeddings);
+    try std.testing.expectEqual(@as(u32, 1024), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 4), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 4), config.num_kv_shared_layers);
+    try std.testing.expect(config.layerSharesKv(0));
+    try std.testing.expect(config.layerOmitsVProj(3));
+    try std.testing.expect(config.attention_k_eq_v);
+}
+
+test "parse gemma4 multi eos and generation suppress tokens" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "gemma4_unified",
+        \\  "eos_token_id": [1, 106],
+        \\  "text_config": {
+        \\    "model_type": "gemma4_unified_text",
+        \\    "eos_token_id": 1
+        \\  }
+        \\}
+    ;
+    var config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
+    try std.testing.expect(config.isEosToken(1));
+    try std.testing.expect(config.isEosToken(106));
+    try std.testing.expect(!config.isEosToken(50));
+
+    try applyGenerationConfigJson(allocator, &config,
+        \\{"eos_token_id":[1,106,50],"suppress_tokens":[258883,258882,258883]}
+    );
+    try std.testing.expect(config.isEosToken(50));
+    try std.testing.expectEqual(@as(usize, 2), config.suppressTokenIds().len);
+    try std.testing.expectEqual(@as(i32, 258883), config.suppressTokenIds()[0]);
+    try std.testing.expectEqual(@as(i32, 258882), config.suppressTokenIds()[1]);
 }
 
 test "parse gemma4 moe fields from text_config" {
@@ -2330,7 +2548,7 @@ test "parse gguf gemma4 per-layer head_count_kv array" {
     try data.appendSlice(allocator, "GGUF");
     try appendLe(u32, allocator, &data, 3);
     try appendLe(u64, allocator, &data, 0);
-    try appendLe(u64, allocator, &data, 8);
+    try appendLe(u64, allocator, &data, 10);
 
     try appendMetadataString(allocator, &data, "general.architecture", "gemma4");
     try appendMetadataU32(allocator, &data, "gemma4.embedding_length", 2816);
@@ -2341,6 +2559,8 @@ test "parse gguf gemma4 per-layer head_count_kv array" {
     try appendMetadataU32(allocator, &data, "gemma4.attention.sliding_window", 1024);
     try appendMetadataBoolArray(allocator, &data, "gemma4.attention.sliding_window_pattern", &.{ true, true, true, true, true, false });
     try appendMetadataU32(allocator, &data, "gemma4.attention.key_length_swa", 256);
+    try appendMetadataU32(allocator, &data, "gemma4.attention.global_head_dim", 512);
+    try appendMetadataU32(allocator, &data, "gemma4.rope.dimension_count", 128);
 
     var parsed = try @import("../gguf/format.zig").parse(allocator, data.items);
     defer parsed.deinit(allocator);
@@ -2353,6 +2573,9 @@ test "parse gguf gemma4 per-layer head_count_kv array" {
     try std.testing.expectEqual(@as(u32, 2), config.num_global_key_value_heads);
     // sliding_window_pattern derived correctly
     try std.testing.expectEqual(@as(u32, 6), config.sliding_window_pattern);
+    try std.testing.expectEqual(@as(u32, 512), config.global_head_dim);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), config.rope_partial_factor, 0.000001);
+    try std.testing.expectEqual(@as(u32, 128), config.layerRopeDim(5));
 }
 
 test "parse gemma4 e2b config with layer_types and shared kv" {
@@ -2367,6 +2590,7 @@ test "parse gemma4 e2b config with layer_types and shared kv" {
         \\    "num_key_value_heads": 1,
         \\    "head_dim": 256,
         \\    "global_head_dim": 512,
+        \\    "attention_k_eq_v": false,
         \\    "intermediate_size": 6144,
         \\    "sliding_window": 512,
         \\    "num_kv_shared_layers": 20,
@@ -2409,6 +2633,8 @@ test "parse gemma4 e2b config with layer_types and shared kv" {
     try std.testing.expectEqual(@as(u32, 512), config.effectiveHeadDimForLayer(4)); // global (pattern=5)
     try std.testing.expectEqual(@as(u32, 1), config.effectiveKVHeadsForLayer(0));
     try std.testing.expectEqual(@as(u32, 1), config.effectiveKVHeadsForLayer(4));
+    try std.testing.expect(!config.attention_k_eq_v);
+    try std.testing.expect(!config.layerOmitsVProj(4));
 
     // Pool sizing: max across sliding (1*256=256) and global (1*512=512).
     try std.testing.expectEqual(@as(u32, 1), config.maxKvHeads());
@@ -2425,7 +2651,7 @@ test "parse gguf metadata for gemma4 shared kv config" {
     try appendLe(u32, allocator, &data, 3);
     try appendLe(u64, allocator, &data, 0);
     // Use actual Gemma 4 GGUF key names as exported by Unsloth/llama.cpp.
-    try appendLe(u64, allocator, &data, 15);
+    try appendLe(u64, allocator, &data, 17);
 
     try appendMetadataString(allocator, &data, "general.architecture", "gemma4");
     try appendMetadataU32(allocator, &data, "gemma4.embedding_length", 1536);
@@ -2441,6 +2667,8 @@ test "parse gguf metadata for gemma4 shared kv config" {
     try appendMetadataF32(allocator, &data, "gemma4.attention.layer_norm_rms_epsilon", 0.000001);
     try appendMetadataF32(allocator, &data, "gemma4.rope.freq_base", 1000000.0);
     try appendMetadataF32(allocator, &data, "gemma4.rope.freq_base_swa", 10000.0);
+    try appendMetadataU32(allocator, &data, "gemma4.rope.dimension_count", 512);
+    try appendMetadataU32(allocator, &data, "gemma4.rope.dimension_count_swa", 256);
     // sliding_window_pattern: bool array [true,true,true,true,false,...] → pattern=5
     try appendMetadataBoolArray(allocator, &data, "gemma4.attention.sliding_window_pattern", &.{ true, true, true, true, false });
 
@@ -2457,9 +2685,47 @@ test "parse gguf metadata for gemma4 shared kv config" {
     try std.testing.expectEqual(@as(u32, 5), config.sliding_window_pattern);
     try std.testing.expectEqual(@as(f32, 10000.0), config.rope_local_theta);
     try std.testing.expectEqual(@as(f32, 1000000.0), config.rope_theta);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), config.rope_partial_factor, 0.000001);
     // Per-layer head_dim: sliding=256 (from key_length_swa), global=512 (from key_length).
     try std.testing.expectEqual(@as(u32, 256), config.effectiveHeadDimForLayer(0)); // sliding
     try std.testing.expectEqual(@as(u32, 512), config.effectiveHeadDimForLayer(4)); // global
+    try std.testing.expectEqual(@as(u32, 256), config.layerRopeDim(0)); // sliding rotates full local width
+    try std.testing.expectEqual(@as(u32, 128), config.layerRopeDim(4)); // full attention uses p-RoPE
+}
+
+test "parse gguf metadata for gemma4 assistant mtp fields" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, "GGUF");
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 11);
+
+    try appendMetadataString(allocator, &data, "general.architecture", "gemma4_assistant");
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.embedding_length", 256);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.block_count", 4);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.attention.head_count", 4);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.attention.head_count_kv", 1);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.feed_forward_length", 1024);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.context_length", 131072);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.backbone_hidden_size", 1536);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.num_centroids", 2048);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.centroid_intermediate_top_k", 32);
+    try appendMetadataBool(allocator, &data, "gemma4_assistant.use_ordered_embeddings", true);
+
+    var parsed = try @import("../gguf/format.zig").parse(allocator, data.items);
+    defer parsed.deinit(allocator);
+
+    const view = gguf_metadata.View.init(&parsed);
+    const config = parseGgufMetadata(view).?;
+    try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(config.gemma4_mtp_assistant);
+    try std.testing.expectEqual(@as(u32, 1536), config.mtp_backbone_hidden_size);
+    try std.testing.expectEqual(@as(u32, 2048), config.mtp_num_centroids);
+    try std.testing.expectEqual(@as(u32, 32), config.mtp_centroid_intermediate_top_k);
+    try std.testing.expect(config.mtp_use_ordered_embeddings);
 }
 
 test "gemma family defaults to gelu_new activation" {
@@ -2515,6 +2781,12 @@ fn appendMetadataF32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged
     try appendString(allocator, data, key);
     try appendLe(u32, allocator, data, 6);
     try appendLe(u32, allocator, data, @bitCast(value));
+}
+
+fn appendMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
+    try appendString(allocator, data, key);
+    try appendLe(u32, allocator, data, 7);
+    try data.append(allocator, if (value) @as(u8, 1) else 0);
 }
 
 fn appendMetadataBoolArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const bool) !void {

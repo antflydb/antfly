@@ -206,6 +206,7 @@ pub const TracingCompute = struct {
         .tanh_act = &tanhActOp,
         .concat = &concatOp,
         .add = &addOp,
+        .addMultiplyScalarTensor = &addMultiplyScalarTensorOp,
         .scaledDotProductAttention = &sdpaOp,
         .causalSelfAttention = &causalSelfAttentionOp,
         .crossAttention = &crossAttentionOp,
@@ -466,6 +467,13 @@ pub const TracingCompute = struct {
         var tc = fromCtx(ctx);
         var bld = Builder.init(tc.getGraphMut());
         const id = try bld.elemMultiply(nodeIdFromCT(a), nodeIdFromCT(b));
+        return tc.makeHandle(id);
+    }
+
+    fn addMultiplyScalarTensorOp(ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT {
+        var tc = fromCtx(ctx);
+        var bld = Builder.init(tc.getGraphMut());
+        const id = try bld.addMulScalar(nodeIdFromCT(a), nodeIdFromCT(b), nodeIdFromCT(scalar));
         return tc.makeHandle(id);
     }
 
