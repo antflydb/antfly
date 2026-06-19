@@ -63,6 +63,7 @@ const CliConfig = struct {
     raft_bind_host: ?[]const u8 = null,
     raft_bind_port: ?u16 = null,
     auth_enabled: ?bool = null,
+    ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: ?[]const u8 = null,
     ard_display_name: ?[]const u8 = null,
     ard_public_catalog_enabled: bool = false,
@@ -7803,6 +7804,7 @@ pub fn runFromIterator(
             .auth_enabled = effective_auth_enabled,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
             .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
@@ -7907,6 +7909,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--ard-publisher-domain")) {
             cfg.ard_publisher_domain = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-base-url")) {
+            cfg.ard_base_url = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--ard-display-name")) {
@@ -8227,6 +8233,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --auth <true|false>            Enable auth middleware and local user store
+        \\  --ard-base-url <url>           Absolute public base URL for ARD catalog artifact links
         \\  --ard-publisher-domain <name>  ARD did:web publisher domain (default: antfly.local)
         \\  --ard-display-name <name>      ARD catalog host display name (default: Antfly)
         \\  --ard-public-catalog <bool>    Publish anonymous /.well-known ARD bootstrap when auth is enabled
@@ -8336,6 +8343,8 @@ test "data runtime cli accepts ARD identity flags" {
     const argv = [_][*:0]const u8{
         "--ard-publisher-domain",
         "tenant.example.com",
+        "--ard-base-url",
+        "https://tenant.example.com",
         "--ard-display-name",
         "Tenant Antfly",
         "--ard-public-catalog=true",
@@ -8343,6 +8352,7 @@ test "data runtime cli accepts ARD identity flags" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
     try std.testing.expectEqualStrings("tenant.example.com", cfg.ard_publisher_domain.?);
     try std.testing.expectEqualStrings("Tenant Antfly", cfg.ard_display_name.?);
     try std.testing.expect(cfg.ard_public_catalog_enabled);

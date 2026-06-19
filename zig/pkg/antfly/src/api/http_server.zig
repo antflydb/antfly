@@ -277,6 +277,7 @@ test "public API request body limit matches Go linear merge contract" {
 
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
+    ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
     ard_public_catalog_enabled: bool = false,
@@ -2153,6 +2154,7 @@ pub const ApiHttpServer = struct {
     fn ardCatalogOptions(self: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) ard_catalog.CatalogOptions {
         return .{
             .mode = mode,
+            .base_url = self.cfg.ard_base_url,
             .publisher_domain = if (self.cfg.ard_publisher_domain.len > 0) self.cfg.ard_publisher_domain else "antfly.local",
             .display_name = if (self.cfg.ard_display_name.len > 0) self.cfg.ard_display_name else "Antfly",
             .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),

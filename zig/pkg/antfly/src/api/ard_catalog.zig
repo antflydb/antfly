@@ -23,6 +23,7 @@ pub const CatalogMode = enum {
 
 pub const CatalogOptions = struct {
     mode: CatalogMode = .public_bootstrap,
+    base_url: ?[]const u8 = null,
     publisher_domain: []const u8 = "antfly.local",
     display_name: []const u8 = "Antfly",
     is_admin: bool = false,
@@ -52,23 +53,23 @@ const Entry = struct {
     representative_queries: []const []const u8 = &.{},
     admin_only: bool = false,
 
-    fn write(self: Entry, writer: *std.Io.Writer, publisher_domain: []const u8) !void {
+    fn write(self: Entry, writer: *std.Io.Writer, options: CatalogOptions) !void {
         try writer.writeByte('{');
-        try self.writeFields(writer, publisher_domain);
+        try self.writeFields(writer, options);
         try writer.writeByte('}');
     }
 
-    fn writeSearchResult(self: Entry, writer: *std.Io.Writer, publisher_domain: []const u8, score: u16) !void {
+    fn writeSearchResult(self: Entry, writer: *std.Io.Writer, options: CatalogOptions, score: u16) !void {
         try writer.writeByte('{');
-        try self.writeFields(writer, publisher_domain);
+        try self.writeFields(writer, options);
         try writer.writeAll(",\"score\":");
         try writer.print("{d}", .{score});
         try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
     }
 
-    fn writeFields(self: Entry, writer: *std.Io.Writer, publisher_domain: []const u8) !void {
+    fn writeFields(self: Entry, writer: *std.Io.Writer, options: CatalogOptions) !void {
         try writer.writeAll("\"identifier\":");
-        try writeStringFmt(writer, "urn:ai:{s}:antfly:{s}", .{ publisher_domain, self.identifier_suffix });
+        try writeStringFmt(writer, "urn:ai:{s}:antfly:{s}", .{ options.publisher_domain, self.identifier_suffix });
         try writer.writeAll(",\"displayName\":");
         try std.json.Stringify.value(self.display_name, .{}, writer);
         try writer.writeAll(",\"type\":");
@@ -77,7 +78,7 @@ const Entry = struct {
         try std.json.Stringify.value(self.description, .{}, writer);
         if (self.url) |url| {
             try writer.writeAll(",\"url\":");
-            try std.json.Stringify.value(url, .{}, writer);
+            try writeUrlValue(writer, options.base_url, url);
         } else if (self.data) |data| {
             try writer.writeAll(",\"data\":");
             try writer.writeAll(data);
@@ -779,15 +780,15 @@ fn writeScopedEntries(
     filter: ?std.json.Value,
 ) !void {
     for (static_entries) |entry| {
-        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
+        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options, first, entry);
     }
     if (options.mode == .tenant) {
         for (tenant_entries) |entry| {
-            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options, first, entry);
         }
         for (skills) |skill| {
             const entry = skillEntry(skill);
-            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options, first, entry);
         }
     }
 }
@@ -801,15 +802,15 @@ fn writeMatchedEntries(
     matched: *usize,
 ) !void {
     for (static_entries) |entry| {
-        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
+        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, matched, text);
     }
     if (options.mode == .tenant) {
         for (tenant_entries) |entry| {
-            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, matched, text);
         }
         for (skills) |skill| {
             const entry = skillEntry(skill);
-            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, matched, text);
         }
     }
 }
@@ -817,14 +818,14 @@ fn writeMatchedEntries(
 fn writeAgentEntries(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, count: *usize) !void {
     for (static_entries) |entry| {
         if (isAgentLike(entry) and catalogOptionsAllowStaticEntry(options, entry)) {
-            try writeEntry(writer, options.publisher_domain, first, entry);
+            try writeEntry(writer, options, first, entry);
             count.* += 1;
         }
     }
     if (options.mode == .tenant) {
         for (tenant_entries) |entry| {
             if (isAgentLike(entry) and catalogOptionsAllowStaticEntry(options, entry)) {
-                try writeEntry(writer, options.publisher_domain, first, entry);
+                try writeEntry(writer, options, first, entry);
                 count.* += 1;
             }
         }
@@ -854,7 +855,7 @@ fn writeExtensionEntries(
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
                     extensionPackageEntryMatches(package.*, package_capabilities, text, filter, options.publisher_domain))
                 {
-                    try writeExtensionPackageEntry(writer, options.publisher_domain, first, package.*);
+                    try writeExtensionPackageEntry(writer, options, first, package.*);
                 }
             }
         }
@@ -865,13 +866,13 @@ fn writeExtensionEntries(
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             installedExtensionEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
         {
-            try writeInstalledExtensionEntry(writer, options.publisher_domain, first, installed);
+            try writeInstalledExtensionEntry(writer, options, first, installed);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
                 extensionMcpEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
             {
-                try writeExtensionMcpEntry(writer, options.publisher_domain, first, installed);
+                try writeExtensionMcpEntry(writer, options, first, installed);
             }
         }
     }
@@ -901,7 +902,7 @@ fn writeMatchedExtensionEntries(
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
                     extensionPackageEntryMatches(package.*, package_capabilities, text, filter, options.publisher_domain))
                 {
-                    try writeSearchExtensionPackageEntry(writer, options.publisher_domain, first, package.*, matched, text);
+                    try writeSearchExtensionPackageEntry(writer, options, first, package.*, matched, text);
                 }
             }
         }
@@ -912,13 +913,13 @@ fn writeMatchedExtensionEntries(
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             installedExtensionEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
         {
-            try writeSearchInstalledExtensionEntry(writer, options.publisher_domain, first, installed, matched, text);
+            try writeSearchInstalledExtensionEntry(writer, options, first, installed, matched, text);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
                 extensionMcpEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
             {
-                try writeSearchExtensionMcpEntry(writer, options.publisher_domain, first, installed, matched, text);
+                try writeSearchExtensionMcpEntry(writer, options, first, installed, matched, text);
             }
         }
     }
@@ -935,7 +936,7 @@ fn writeAgentExtensionEntries(
     for (ctx.installed_extensions) |installed| {
         if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) continue;
         if (!catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" })) continue;
-        try writeExtensionMcpEntry(writer, options.publisher_domain, first, installed);
+        try writeExtensionMcpEntry(writer, options, first, installed);
         count.* += 1;
     }
 }
@@ -966,7 +967,7 @@ fn writeAggregateMcpEntry(
 ) !void {
     if (!(try aggregateMcpVisible(alloc, extension_context))) return;
     if (!catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry) or !entryMatches(aggregate_mcp_entry, options.publisher_domain, text, filter)) return;
-    try writeEntry(writer, options.publisher_domain, first, aggregate_mcp_entry);
+    try writeEntry(writer, options, first, aggregate_mcp_entry);
 }
 
 fn writeSearchAggregateMcpEntry(
@@ -981,7 +982,7 @@ fn writeSearchAggregateMcpEntry(
 ) !void {
     if (!(try aggregateMcpVisible(alloc, extension_context))) return;
     if (!catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry) or !entryMatches(aggregate_mcp_entry, options.publisher_domain, text, filter)) return;
-    try writeSearchEntry(writer, options.publisher_domain, first, aggregate_mcp_entry, matched, text);
+    try writeSearchEntry(writer, options, first, aggregate_mcp_entry, matched, text);
 }
 
 fn writeAgentAggregateMcpEntry(
@@ -994,7 +995,7 @@ fn writeAgentAggregateMcpEntry(
 ) !void {
     if (!(try aggregateMcpVisible(alloc, extension_context))) return;
     if (!isAgentLike(aggregate_mcp_entry) or !catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry)) return;
-    try writeEntry(writer, options.publisher_domain, first, aggregate_mcp_entry);
+    try writeEntry(writer, options, first, aggregate_mcp_entry);
     count.* += 1;
 }
 
@@ -1024,7 +1025,7 @@ fn writeCopilotMcpProfileEntry(
 ) !void {
     if (!(try copilotMcpProfileVisible(alloc, extension_context))) return;
     if (!catalogOptionsAllowStaticEntry(options, copilot_mcp_profile_entry) or !entryMatches(copilot_mcp_profile_entry, options.publisher_domain, text, filter)) return;
-    try writeEntry(writer, options.publisher_domain, first, copilot_mcp_profile_entry);
+    try writeEntry(writer, options, first, copilot_mcp_profile_entry);
 }
 
 fn writeSearchCopilotMcpProfileEntry(
@@ -1039,7 +1040,7 @@ fn writeSearchCopilotMcpProfileEntry(
 ) !void {
     if (!(try copilotMcpProfileVisible(alloc, extension_context))) return;
     if (!catalogOptionsAllowStaticEntry(options, copilot_mcp_profile_entry) or !entryMatches(copilot_mcp_profile_entry, options.publisher_domain, text, filter)) return;
-    try writeSearchEntry(writer, options.publisher_domain, first, copilot_mcp_profile_entry, matched, text);
+    try writeSearchEntry(writer, options, first, copilot_mcp_profile_entry, matched, text);
 }
 
 fn writeAgentCopilotMcpProfileEntry(
@@ -1052,46 +1053,46 @@ fn writeAgentCopilotMcpProfileEntry(
 ) !void {
     if (!(try copilotMcpProfileVisible(alloc, extension_context))) return;
     if (!isAgentLike(copilot_mcp_profile_entry) or !catalogOptionsAllowStaticEntry(options, copilot_mcp_profile_entry)) return;
-    try writeEntry(writer, options.publisher_domain, first, copilot_mcp_profile_entry);
+    try writeEntry(writer, options, first, copilot_mcp_profile_entry);
     count.* += 1;
 }
 
-fn writeExtensionPackageEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, package: extension_domain.PackageManifest) !void {
+fn writeExtensionPackageEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, package: extension_domain.PackageManifest) !void {
     if (first.*) {
         first.* = false;
     } else {
         try writer.writeByte(',');
     }
     try writer.writeByte('{');
-    try writeExtensionPackageFields(writer, publisher_domain, package);
+    try writeExtensionPackageFields(writer, options, package);
     try writer.writeByte('}');
 }
 
-fn writeInstalledExtensionEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension) !void {
+fn writeInstalledExtensionEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension) !void {
     if (first.*) {
         first.* = false;
     } else {
         try writer.writeByte(',');
     }
     try writer.writeByte('{');
-    try writeInstalledExtensionFields(writer, publisher_domain, installed);
+    try writeInstalledExtensionFields(writer, options, installed);
     try writer.writeByte('}');
 }
 
-fn writeExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension) !void {
+fn writeExtensionMcpEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension) !void {
     if (first.*) {
         first.* = false;
     } else {
         try writer.writeByte(',');
     }
     try writer.writeByte('{');
-    try writeExtensionMcpFields(writer, publisher_domain, installed);
+    try writeExtensionMcpFields(writer, options, installed);
     try writer.writeByte('}');
 }
 
 fn writeExtensionSkillEntry(
     writer: *std.Io.Writer,
-    publisher_domain: []const u8,
+    options: CatalogOptions,
     first: *bool,
     installed: extension_domain.InstalledExtension,
     member: extension_domain.ExtensionMember,
@@ -1103,11 +1104,11 @@ fn writeExtensionSkillEntry(
         try writer.writeByte(',');
     }
     try writer.writeByte('{');
-    try writeExtensionSkillFields(writer, publisher_domain, installed, member, skill);
+    try writeExtensionSkillFields(writer, options, installed, member, skill);
     try writer.writeByte('}');
 }
 
-fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
+fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
     if (first.*) {
         first.* = false;
     } else {
@@ -1115,13 +1116,13 @@ fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, publisher_domain: 
     }
     matched.* += 1;
     try writer.writeByte('{');
-    try writeInstalledExtensionFields(writer, publisher_domain, installed);
+    try writeInstalledExtensionFields(writer, options, installed);
     try writer.writeAll(",\"score\":");
     try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
 }
 
-fn writeSearchExtensionPackageEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, package: extension_domain.PackageManifest, matched: *usize, text: ?[]const u8) !void {
+fn writeSearchExtensionPackageEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, package: extension_domain.PackageManifest, matched: *usize, text: ?[]const u8) !void {
     if (first.*) {
         first.* = false;
     } else {
@@ -1129,7 +1130,7 @@ fn writeSearchExtensionPackageEntry(writer: *std.Io.Writer, publisher_domain: []
     }
     matched.* += 1;
     try writer.writeByte('{');
-    try writeExtensionPackageFields(writer, publisher_domain, package);
+    try writeExtensionPackageFields(writer, options, package);
     try writer.writeAll(",\"score\":");
     try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
@@ -1137,7 +1138,7 @@ fn writeSearchExtensionPackageEntry(writer: *std.Io.Writer, publisher_domain: []
 
 fn writeSearchExtensionSkillEntry(
     writer: *std.Io.Writer,
-    publisher_domain: []const u8,
+    options: CatalogOptions,
     first: *bool,
     installed: extension_domain.InstalledExtension,
     member: extension_domain.ExtensionMember,
@@ -1152,13 +1153,13 @@ fn writeSearchExtensionSkillEntry(
     }
     matched.* += 1;
     try writer.writeByte('{');
-    try writeExtensionSkillFields(writer, publisher_domain, installed, member, skill);
+    try writeExtensionSkillFields(writer, options, installed, member, skill);
     try writer.writeAll(",\"score\":");
     try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
 }
 
-fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
+fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
     if (first.*) {
         first.* = false;
     } else {
@@ -1166,7 +1167,7 @@ fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []cons
     }
     matched.* += 1;
     try writer.writeByte('{');
-    try writeExtensionMcpFields(writer, publisher_domain, installed);
+    try writeExtensionMcpFields(writer, options, installed);
     try writer.writeAll(",\"score\":");
     try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
@@ -1211,7 +1212,7 @@ fn writeExtensionSkillEntries(
         var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
         defer skill.deinit();
         if (!extensionSkillAllowedAndMatches(options, installed, member, skill, text, filter)) continue;
-        try writeExtensionSkillEntry(writer, options.publisher_domain, first, installed, member, skill);
+        try writeExtensionSkillEntry(writer, options, first, installed, member, skill);
     }
 }
 
@@ -1233,13 +1234,13 @@ fn writeSearchExtensionSkillEntries(
         var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
         defer skill.deinit();
         if (!extensionSkillAllowedAndMatches(options, installed, member, skill, text, filter)) continue;
-        try writeSearchExtensionSkillEntry(writer, options.publisher_domain, first, installed, member, skill, matched, text);
+        try writeSearchExtensionSkillEntry(writer, options, first, installed, member, skill, matched, text);
     }
 }
 
-fn writeExtensionPackageFields(writer: *std.Io.Writer, publisher_domain: []const u8, package: extension_domain.PackageManifest) !void {
+fn writeExtensionPackageFields(writer: *std.Io.Writer, options: CatalogOptions, package: extension_domain.PackageManifest) !void {
     try writer.writeAll("\"identifier\":");
-    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension-package:{s}:{s}", .{ publisher_domain, package.name, package.version });
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension-package:{s}:{s}", .{ options.publisher_domain, package.name, package.version });
     try writer.writeAll(",\"displayName\":");
     try writeStringFmt(writer, "Antfly Extension Package {s} {s}", .{ package.name, package.version });
     try writer.writeAll(",\"type\":\"application/antfly-extension-package+json\",\"description\":");
@@ -1249,7 +1250,7 @@ fn writeExtensionPackageFields(writer: *std.Io.Writer, publisher_domain: []const
         try writeStringFmt(writer, "Antfly extension package {s} version {s}.", .{ package.name, package.version });
     }
     try writer.writeAll(",\"url\":");
-    try writeStringFmt(writer, "/extensions/v1/packages/{s}/versions/{s}", .{ package.name, package.version });
+    try writeUrlFmt(writer, options.base_url, "/extensions/v1/packages/{s}/versions/{s}", .{ package.name, package.version });
     try writer.writeAll(",\"tags\":[\"extension\",\"package\"],\"capabilities\":");
     try writeCapabilitiesFromGrants(writer, package.capabilities_requested);
     try writer.writeAll(",\"metadata\":{\"digest\":");
@@ -1263,7 +1264,7 @@ fn writeExtensionPackageFields(writer: *std.Io.Writer, publisher_domain: []const
     try writer.writeAll(",\"capabilitiesRequestedCount\":");
     try writer.print("{d}", .{package.capabilities_requested.len});
     try writer.writeAll("},\"trustManifest\":");
-    try writePackageTrustManifest(writer, publisher_domain, package);
+    try writePackageTrustManifest(writer, options.publisher_domain, package);
 }
 
 fn writePackageTrustManifest(writer: *std.Io.Writer, publisher_domain: []const u8, package: extension_domain.PackageManifest) !void {
@@ -1287,15 +1288,15 @@ fn writePackageTrustManifest(writer: *std.Io.Writer, publisher_domain: []const u
     try writer.writeAll("]}");
 }
 
-fn writeInstalledExtensionFields(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
+fn writeInstalledExtensionFields(writer: *std.Io.Writer, options: CatalogOptions, installed: extension_domain.InstalledExtension) !void {
     try writer.writeAll("\"identifier\":");
-    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:installed", .{ publisher_domain, installed.name });
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:installed", .{ options.publisher_domain, installed.name });
     try writer.writeAll(",\"displayName\":");
     try writeStringFmt(writer, "Antfly Extension {s}", .{installed.name});
     try writer.writeAll(",\"type\":\"application/antfly-installed-extension+json\",\"description\":");
     try writeStringFmt(writer, "Installed Antfly extension {s}.", .{installed.name});
     try writer.writeAll(",\"url\":");
-    try writeStringFmt(writer, "/extensions/v1/installed/{s}", .{installed.name});
+    try writeUrlFmt(writer, options.base_url, "/extensions/v1/installed/{s}", .{installed.name});
     try writer.writeAll(",\"tags\":[\"extension\",\"installed\"],\"capabilities\":");
     try writeCapabilitiesFromGrants(writer, installed.granted_capabilities);
     try writer.writeAll(",\"metadata\":{\"digest\":");
@@ -1319,7 +1320,7 @@ fn writeInstalledExtensionFields(writer: *std.Io.Writer, publisher_domain: []con
     try writer.writeAll(",\"grantedCapabilitiesCount\":");
     try writer.print("{d}", .{installed.granted_capabilities.len});
     try writer.writeAll("},\"trustManifest\":");
-    try writeInstalledExtensionTrustManifest(writer, publisher_domain, installed);
+    try writeInstalledExtensionTrustManifest(writer, options.publisher_domain, installed);
 }
 
 fn writeInstalledExtensionTrustManifest(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
@@ -1333,15 +1334,15 @@ fn writeInstalledExtensionTrustManifest(writer: *std.Io.Writer, publisher_domain
     try writer.writeAll("}]}");
 }
 
-fn writeExtensionMcpFields(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
+fn writeExtensionMcpFields(writer: *std.Io.Writer, options: CatalogOptions, installed: extension_domain.InstalledExtension) !void {
     try writer.writeAll("\"identifier\":");
-    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:mcp", .{ publisher_domain, installed.name });
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:mcp", .{ options.publisher_domain, installed.name });
     try writer.writeAll(",\"displayName\":");
     try writeStringFmt(writer, "Antfly Extension MCP {s}", .{installed.name});
     try writer.writeAll(",\"type\":\"application/mcp-server+json\",\"description\":");
     try writeStringFmt(writer, "MCP server for visible tools owned by Antfly extension {s}.", .{installed.name});
     try writer.writeAll(",\"url\":");
-    try writeStringFmt(writer, "/ard/v1/resources/mcp/extensions/{s}", .{installed.name});
+    try writeUrlFmt(writer, options.base_url, "/ard/v1/resources/mcp/extensions/{s}", .{installed.name});
     try writer.writeAll(",\"tags\":[\"mcp\",\"extension\"],\"capabilities\":");
     try writeCapabilitiesFromGrants(writer, installed.granted_capabilities);
     try writer.writeAll(",\"metadata\":{\"endpoint\":");
@@ -1353,19 +1354,19 @@ fn writeExtensionMcpFields(writer: *std.Io.Writer, publisher_domain: []const u8,
 
 fn writeExtensionSkillFields(
     writer: *std.Io.Writer,
-    publisher_domain: []const u8,
+    options: CatalogOptions,
     installed: extension_domain.InstalledExtension,
     member: extension_domain.ExtensionMember,
     skill: ParsedExtensionSkill,
 ) !void {
     try writer.writeAll("\"identifier\":");
-    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:skill:{s}", .{ publisher_domain, installed.name, member.object_name });
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:skill:{s}", .{ options.publisher_domain, installed.name, member.object_name });
     try writer.writeAll(",\"displayName\":");
     try std.json.Stringify.value(skill.display_name, .{}, writer);
     try writer.writeAll(",\"type\":\"application/ai-skill+md\",\"description\":");
     try std.json.Stringify.value(skill.description, .{}, writer);
     try writer.writeAll(",\"url\":");
-    try writeStringFmt(writer, "/ard/v1/skills/extensions/{s}/{s}", .{ installed.name, member.object_name });
+    try writeUrlFmt(writer, options.base_url, "/ard/v1/skills/extensions/{s}/{s}", .{ installed.name, member.object_name });
     try writer.writeAll(",\"tags\":");
     try writeStringArray(writer, skill.tags());
     if (skill.capabilities().len > 0) {
@@ -2196,7 +2197,7 @@ fn findSkill(slug: []const u8) ?Skill {
 
 fn writeEntry(
     writer: *std.Io.Writer,
-    publisher_domain: []const u8,
+    options: CatalogOptions,
     first: *bool,
     entry: Entry,
 ) !void {
@@ -2205,12 +2206,12 @@ fn writeEntry(
     } else {
         try writer.writeByte(',');
     }
-    try entry.write(writer, publisher_domain);
+    try entry.write(writer, options);
 }
 
 fn writeSearchEntry(
     writer: *std.Io.Writer,
-    publisher_domain: []const u8,
+    options: CatalogOptions,
     first: *bool,
     entry: Entry,
     matched: *usize,
@@ -2222,7 +2223,7 @@ fn writeSearchEntry(
         try writer.writeByte(',');
     }
     matched.* += 1;
-    try entry.writeSearchResult(writer, publisher_domain, if (text == null or text.?.len == 0) 100 else 90);
+    try entry.writeSearchResult(writer, options, if (text == null or text.?.len == 0) 100 else 90);
 }
 
 fn entryMatches(entry: Entry, publisher_domain: []const u8, text: ?[]const u8, filter: ?std.json.Value) bool {
@@ -2359,10 +2360,28 @@ fn writeStringArray(writer: *std.Io.Writer, values: []const []const u8) !void {
     try writer.writeByte(']');
 }
 
+fn writeUrlValue(writer: *std.Io.Writer, base_url: ?[]const u8, url: []const u8) !void {
+    const base = base_url orelse return try std.json.Stringify.value(url, .{}, writer);
+    if (base.len == 0 or !std.mem.startsWith(u8, url, "/")) return try std.json.Stringify.value(url, .{}, writer);
+    try writeStringFmt(writer, "{s}{s}", .{ trimTrailingSlashes(base), url });
+}
+
+fn writeUrlFmt(writer: *std.Io.Writer, base_url: ?[]const u8, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&buf, fmt, args);
+    try writeUrlValue(writer, base_url, url);
+}
+
 fn writeStringFmt(writer: *std.Io.Writer, comptime fmt: []const u8, args: anytype) !void {
     var buf: [512]u8 = undefined;
     const value = try std.fmt.bufPrint(&buf, fmt, args);
     try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn trimTrailingSlashes(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') end -= 1;
+    return value[0..end];
 }
 
 test "ARD catalog entries contain required value or reference fields" {
@@ -2387,6 +2406,51 @@ test "ARD catalog entries contain required value or reference fields" {
         try std.testing.expect(has_url != has_data);
         if (object.get("metadata")) |metadata| try expectMetadataValuesAreScalars(metadata);
     }
+}
+
+test "ARD catalog resolves artifact urls against configured base url" {
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "docsaf",
+        .version = "1.0.0",
+        .digest = "sha256:docs",
+        .capabilities_requested = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .install = .{ .scopes_supported = &.{.table} },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "docsaf",
+        .package_name = "docsaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:docs",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .granted_capabilities = &.{.{ .name = "db:read", .scope = "docsaf" }},
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "docsaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .mcp_tool,
+        .object_name = "search_docs",
+        .table_name = "docs",
+        .owner_metadata_json = "{\"description\":\"Search docs\",\"input_schema\":{\"type\":\"object\"}}",
+    }};
+    const ctx: ExtensionCatalogContext = .{
+        .extension_packages = &packages,
+        .installed_extensions = &installed,
+        .extension_members = &members,
+    };
+
+    const body = try catalogJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant, .base_url = "https://tenant.example.com/" },
+        ctx,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/ard/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/ard/v1/resources/mcp/default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/extensions/v1/packages/docsaf/versions/1.0.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/extensions/v1/installed/docsaf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/ard/v1/resources/mcp/extensions/docsaf\"") != null);
 }
 
 test "ARD extension package entries use trust provenance for artifact digests" {
