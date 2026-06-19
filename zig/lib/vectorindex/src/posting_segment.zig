@@ -727,8 +727,9 @@ pub const Catalog = struct {
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
             var reader = try Reader.init(segment.data);
-            try deltas.ensureUnusedCapacity(alloc, try reader.deltaCount(posting_id));
-            var iter = reader.deltas(posting_id);
+            const range = try reader.deltasWithCount(posting_id);
+            try deltas.ensureUnusedCapacity(alloc, range.count);
+            var iter = range.iterator;
             while (try iter.next()) |delta| {
                 deltas.appendAssumeCapacity(delta);
             }
@@ -745,8 +746,9 @@ pub const Catalog = struct {
             if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= base_generation) continue;
             var reader = try Reader.init(segment.data);
             const all_segment_records_after_generation = segmentDeltaTailFullyAfterGeneration(segment.meta, base_generation);
-            if (all_segment_records_after_generation) try deltas.ensureUnusedCapacity(alloc, try reader.deltaCount(posting_id));
-            var iter = reader.deltas(posting_id);
+            const range = try reader.deltasWithCount(posting_id);
+            if (all_segment_records_after_generation) try deltas.ensureUnusedCapacity(alloc, range.count);
+            var iter = range.iterator;
             while (try iter.next()) |delta| {
                 if (!all_segment_records_after_generation and posting.PostingFormat.deltaSequenceGeneration(delta.sequence) <= base_generation) continue;
                 if (!all_segment_records_after_generation) try deltas.ensureUnusedCapacity(alloc, 1);
@@ -775,7 +777,9 @@ pub const Catalog = struct {
             }
 
             var reader = try Reader.init(segment.data);
-            var iter = reader.deltas(posting_id);
+            const range = try reader.deltasWithCount(posting_id);
+            if (range.count == 0) continue;
+            var iter = range.iterator;
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
                 if (all_segment_records_after_generation) {
@@ -814,7 +818,9 @@ pub const Catalog = struct {
             }
 
             var reader = try Reader.init(segment.data);
-            var iter = reader.deltas(posting_id);
+            const range = try reader.deltasWithCount(posting_id);
+            if (range.count == 0) continue;
+            var iter = range.iterator;
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
                 if (all_segment_records_after_generation) {
@@ -3869,9 +3875,28 @@ pub const Reader = struct {
         };
     }
 
+    pub fn deltasWithCount(self: Reader, posting_id: PostingId) !DeltaIteratorWithCount {
+        const index_data = self.data[self.index_offset .. self.index_offset + self.entry_count * index_entry_size];
+        const range = (try deltaIndexRange(index_data, self.entry_count, posting_id)) orelse return .{
+            .iterator = .{
+                .reader = self,
+                .posting_id = posting_id,
+                .index = self.entry_count,
+            },
+            .count = 0,
+        };
+        return .{
+            .iterator = .{
+                .reader = self,
+                .posting_id = posting_id,
+                .index = range.first_index,
+            },
+            .count = range.past_index - range.first_index,
+        };
+    }
+
     pub fn deltaCount(self: Reader, posting_id: PostingId) !usize {
-        const range = (try deltaIndexRange(self.data[self.index_offset .. self.index_offset + self.entry_count * index_entry_size], self.entry_count, posting_id)) orelse return 0;
-        return range.past_index - range.first_index;
+        return (try self.deltasWithCount(posting_id)).count;
     }
 
     pub fn entries(self: Reader) EntryIterator {
@@ -3969,6 +3994,11 @@ pub const DeltaIterator = struct {
             .value = try entry.value(self.reader.data),
         };
     }
+};
+
+pub const DeltaIteratorWithCount = struct {
+    iterator: DeltaIterator,
+    count: usize,
 };
 
 pub const EntryIterator = struct {
@@ -5454,6 +5484,13 @@ pub fn testStoresBaseCentroidAndOrderedDeltaValues() !void {
     try std.testing.expectEqual(@as(u64, 5), second.sequence);
     try std.testing.expectEqualSlices(u8, delta_5, second.value);
     try std.testing.expect(try iter.next() == null);
+
+    var counted = try reader.deltasWithCount(7);
+    try std.testing.expectEqual(@as(usize, 2), counted.count);
+    try std.testing.expectEqual(@as(u64, 4), (try counted.iterator.next()).?.sequence);
+    try std.testing.expectEqual(@as(u64, 5), (try counted.iterator.next()).?.sequence);
+    try std.testing.expect(try counted.iterator.next() == null);
+    try std.testing.expectEqual(@as(usize, 0), (try reader.deltasWithCount(8)).count);
 
     var entry_iter = reader.entries();
     const base_entry = (try entry_iter.next()).?;
