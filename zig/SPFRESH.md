@@ -2540,9 +2540,10 @@ two-level selections carry the selected block lower bounds into posting scoring,
 so once the current exact posting heap or epsilon window proves later sorted
 blocks cannot contribute, the query stops before per-block posting estimates
 and exact centroid scoring. Per-block quantized posting candidate collection
-also checks the current final posting heap bound before inserting into the
-temporary candidate heap, so clearly rejected candidates no longer participate
-in candidate sorting. Bounded flat posting and block probe collectors also
+also checks the current final posting heap bound and dynamic epsilon effort
+window before inserting into the temporary candidate heap, so clearly rejected
+candidates no longer participate in candidate sorting. Bounded flat posting
+and block probe collectors also
 build their internal heaps lazily only when an overflow insert or rejection
 check requires it, so exactly-filled candidate buffers can go straight to the
 final sort. Adaptive

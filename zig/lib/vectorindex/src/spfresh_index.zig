@@ -460,6 +460,20 @@ fn shouldSkipFlatPostingCandidateByCollector(
     return probe_collector.wouldRejectLowerBound(distance - error_bound - posting_error_bound);
 }
 
+fn shouldSkipFlatPostingCandidateByEffort(
+    metric: vec.DistanceMetric,
+    distance: f32,
+    error_bound: f32,
+    posting_error_bound: f32,
+    best_distance: f32,
+    epsilon: f32,
+    probe_collector: *FlatProbeCollector,
+) bool {
+    const lower_bound = distance - error_bound - posting_error_bound;
+    if (shouldPruneFlatProbeByEpsilon(metric, lower_bound, best_distance, epsilon)) return true;
+    return probe_collector.wouldRejectLowerBound(lower_bound);
+}
+
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
     return flatProbeLowerBound(lhs) < flatProbeLowerBound(rhs);
 }
@@ -1398,7 +1412,15 @@ pub fn selectFlatRabitqPostings(
                 var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
                 for (block.posting_ids, 0..) |posting_id, i| {
                     const posting_error_bound = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
-                    if (shouldSkipFlatPostingCandidateByCollector(distances[i], error_bounds[i], posting_error_bound, &probe_collector)) continue;
+                    if (shouldSkipFlatPostingCandidateByEffort(
+                        self.config.metric,
+                        distances[i],
+                        error_bounds[i],
+                        posting_error_bound,
+                        best_exact_probe_distance,
+                        epsilon,
+                        &probe_collector,
+                    )) continue;
                     candidate_collector.insert(.{
                         .posting_id = posting_id,
                         .parent = block.parents[i],
@@ -2511,6 +2533,39 @@ test "posting candidate collection skips bounds rejected by final heap" {
 
     try std.testing.expect(shouldSkipFlatPostingCandidateByCollector(4.0, 1.0, 1.0, &collector));
     try std.testing.expect(!shouldSkipFlatPostingCandidateByCollector(3.0, 1.0, 1.0, &collector));
+}
+
+test "posting candidate collection skips bounds outside effort window" {
+    var storage: [2]FlatCentroidProbe = undefined;
+    var collector = FlatProbeCollector.init(&storage);
+
+    try std.testing.expect(shouldSkipFlatPostingCandidateByEffort(
+        .l2_squared,
+        4.1,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        &collector,
+    ));
+    try std.testing.expect(!shouldSkipFlatPostingCandidateByEffort(
+        .l2_squared,
+        4.1,
+        1.0,
+        1.0,
+        1.0,
+        1.2,
+        &collector,
+    ));
+    try std.testing.expect(!shouldSkipFlatPostingCandidateByEffort(
+        .inner_product,
+        100.0,
+        0.0,
+        0.0,
+        1.0,
+        0.1,
+        &collector,
+    ));
 }
 
 test "flat probe collector rejection is monotonic for sorted lower bounds" {
