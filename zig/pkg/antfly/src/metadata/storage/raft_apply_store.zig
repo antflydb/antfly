@@ -3042,6 +3042,28 @@ pub const RaftApplyStore = struct {
         });
     }
 
+    fn requireSchemaRewriteJobsCompleteForTableGenerationTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        schema_generation: u64,
+    ) !void {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try schemaRewriteJobPrefixForGroup(&prefix_buf, group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const record = try decodeSchemaRewriteJobRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+            if (record.table_id != table_id) continue;
+            if (record.schema_generation != schema_generation) continue;
+            if (!metadata_table_manager.schemaRewriteJobComplete(record)) return error.SchemaRewriteJobsIncomplete;
+        }
+    }
+
     fn applySecondaryIndexReadyPromotionTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -3094,6 +3116,12 @@ pub const RaftApplyStore = struct {
 
         if (!std.mem.eql(u8, current.name, request.promoted_table.name)) return error.InvalidTableSchemaCompareAndSwapRequest;
         if (!std.mem.eql(u8, current.schema_json, request.expected_schema_json)) return;
+        try self.requireSchemaRewriteJobsCompleteForTableGenerationTxn(
+            txn,
+            group_id,
+            request.table_id,
+            metadata_table_manager.schemaRewriteGenerationForSchemaJson(request.expected_schema_json),
+        );
 
         const value = try encodeTableRecord(self.alloc, request.promoted_table);
         defer self.alloc.free(value);
@@ -7739,6 +7767,113 @@ test "metadata raft apply store compares and swaps table schema generically" {
     defer store.freeTables(std.testing.allocator, tables);
     try std.testing.expectEqual(@as(usize, 1), tables.len);
     try std.testing.expectEqualStrings(enforced_schema, tables[0].schema_json);
+}
+
+test "metadata raft apply store gates table schema compare and swap on rewrite jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const blocked_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-schema-cas-rewrite-blocked", .{tmp.sub_path});
+    defer std.testing.allocator.free(blocked_root);
+    const ready_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-schema-cas-rewrite-ready", .{tmp.sub_path});
+    defer std.testing.allocator.free(ready_root);
+
+    const rewrite_schema =
+        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string"},"status_norm":{"type":"string"}}}}}}
+    ;
+    const promoted_schema =
+        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string"},"status_norm":{"type":"string"}}}}},"rewrite_generation":"ready"}
+    ;
+    const rewrite_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(rewrite_schema);
+
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 61,
+            .name = "events",
+            .schema_json = rewrite_schema,
+        },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const rewrite_job_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_schema_rewrite_job = .{
+            .job_id = 9101,
+            .table_id = 61,
+            .schema_generation = rewrite_generation,
+            .action = "rewrite",
+            .reason = "row_images",
+            .target_column = "status_norm",
+            .expression = .{
+                .kind = .lower,
+                .operands = &.{.{ .kind = .field, .field = "status" }},
+            },
+        },
+    });
+    defer std.testing.allocator.free(rewrite_job_cmd);
+    const finish_rewrite_job_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9101,
+            .lease_owner = "worker-a",
+            .now_ms = 1000,
+            .lease_expires_at_ms = 2000,
+        },
+    });
+    defer std.testing.allocator.free(finish_rewrite_job_cmd);
+    const ready_rewrite_job_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_schema_rewrite_job = .{
+            .job_id = 9101,
+            .completed_row_count = 42,
+            .progress_row_key = "event:z",
+        },
+    });
+    defer std.testing.allocator.free(ready_rewrite_job_cmd);
+    const promote_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .compare_and_swap_table_schema = .{
+            .table_id = 61,
+            .expected_schema_json = rewrite_schema,
+            .promoted_table = .{
+                .table_id = 61,
+                .name = "events",
+                .schema_json = promoted_schema,
+            },
+        },
+    });
+    defer std.testing.allocator.free(promote_cmd);
+
+    const blocked_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = rewrite_job_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(blocked_entries);
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = blocked_root });
+        defer store.deinit();
+        try std.testing.expectError(error.SchemaRewriteJobsIncomplete, store.snapshotBuilder().applyBatch(.{
+            .group_id = 61,
+            .commit_index = 3,
+            .entries_bytes = blocked_entries,
+        }));
+    }
+
+    const ready_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = rewrite_job_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = finish_rewrite_job_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = ready_rewrite_job_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = promote_cmd },
+    });
+    defer std.testing.allocator.free(ready_entries);
+    var ready_store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = ready_root });
+    defer ready_store.deinit();
+    try ready_store.snapshotBuilder().applyBatch(.{
+        .group_id = 61,
+        .commit_index = 5,
+        .entries_bytes = ready_entries,
+    });
+    const tables = try ready_store.listTables(std.testing.allocator, 61);
+    defer ready_store.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings(promoted_schema, tables[0].schema_json);
 }
 
 test "metadata raft apply store rejects reserved data group ids in transition records" {

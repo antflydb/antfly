@@ -1298,7 +1298,7 @@ fn schemaRewriteJobForAppliedDdlWorkItem(
     hasher.update(&[_]u8{0});
     hasher.update(std.mem.asBytes(&ordinal));
     const job_id = nonZeroId(hasher.final());
-    const schema_generation = nonZeroId(std.hash.Wyhash.hash(0x53434a47, table.schema_json));
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
     return .{
         .job_id = job_id,
         .table_id = table.table_id,

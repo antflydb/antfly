@@ -351,6 +351,11 @@ pub fn schemaRewriteJobComplete(record: SchemaRewriteJobRecord) bool {
     return std.mem.eql(u8, record.state, schema_rewrite_ready);
 }
 
+pub fn schemaRewriteGenerationForSchemaJson(schema_json: []const u8) u64 {
+    const value = std.hash.Wyhash.hash(0x53434a47, schema_json);
+    return if (value == 0) 1 else value;
+}
+
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
 
