@@ -137,12 +137,14 @@ Current status:
   summary, and planning can consume owned decoded manifest entries directly
   instead of allocating temporary borrowed-entry views. Whole-directory segment
   compaction now uses a replace-all manifest helper instead of allocating a
-  remove-id array for every input segment. Segment garbage and temporary-file
-  cleanup now track live canonical basenames and delete through the opened
-  postings directory, and manifest temp matching compares entry names against
-  the configured manifest basename in place, avoiding per-file path allocation
-  while scanning maintenance directories. Lazy segment base-data batch reads
-  also use stack-backed newest-segment tracking for small unsorted manifests, so
+  remove-id array for every input segment, and selected compaction frees loaded
+  segment buffers directly from its selected segment slice instead of allocating
+  a parallel owner array. Segment garbage and temporary-file cleanup now track
+  live canonical basenames and delete through the opened postings directory, and
+  manifest temp matching compares entry names against the configured manifest
+  basename in place, avoiding per-file path allocation while scanning
+  maintenance directories. Lazy segment base-data batch reads also use
+  stack-backed newest-segment tracking for small unsorted manifests, so
   recovery/fallback snapshots do not allocate an extra segment-id array just to
   resolve winners.
   Unsorted materialization and fold fallback paths likewise reserve member

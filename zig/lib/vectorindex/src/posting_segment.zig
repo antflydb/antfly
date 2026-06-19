@@ -1975,29 +1975,26 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
     defer manifest.deinit(alloc);
 
     const selected = try alloc.alloc(SegmentBlob, segment_ids.len);
-    defer alloc.free(selected);
-    const selected_data = try alloc.alloc([]u8, segment_ids.len);
-    var selected_data_count: usize = 0;
+    var selected_count: usize = 0;
     defer {
-        for (selected_data[0..selected_data_count]) |data| alloc.free(data);
-        alloc.free(selected_data);
+        for (selected[0..selected_count]) |segment| alloc.free(segment.data);
+        alloc.free(selected);
     }
 
-    var selected_count: usize = 0;
     for (manifest.segments) |entry| {
         if (!segmentIdIn(entry.meta.segment_id, segment_ids)) continue;
         if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
         const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
-        errdefer alloc.free(data);
+        var data_owned = true;
+        errdefer if (data_owned) alloc.free(data);
         try validateSegmentDataMatchesMeta(data, entry.meta);
-        selected_data[selected_data_count] = data;
-        selected_data_count += 1;
         selected[selected_count] = .{
             .meta = entry.meta,
             .data = data,
         };
         selected_count += 1;
+        data_owned = false;
     }
     if (selected_count != segment_ids.len) return error.PostingSegmentManifestReplacementMissingSegment;
 
