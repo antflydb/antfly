@@ -13172,6 +13172,48 @@ test "api http server serves status" {
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
 }
 
+test "api http server defaults external lake serving cache budget" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var default_server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer default_server.deinit();
+    const default_options = default_server.externalLakeRowsSourceOptions();
+    try std.testing.expectEqual(@as(?usize, default_external_lake_serving_cache_max_bytes), default_options.serving_cache_max_bytes);
+    try std.testing.expect(default_options.persistent_cache_root_dir == null);
+
+    var override_server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .external_lake_serving_cache_max_bytes = 4096,
+            .external_lake_persistent_cache_root_dir = "/tmp/antfly-lake-cache",
+        },
+        source.iface(),
+        null,
+        null,
+    );
+    defer override_server.deinit();
+    const override_options = override_server.externalLakeRowsSourceOptions();
+    try std.testing.expectEqual(@as(?usize, 4096), override_options.serving_cache_max_bytes);
+    try std.testing.expectEqualStrings("/tmp/antfly-lake-cache", override_options.persistent_cache_root_dir.?);
+}
+
 test "api http server serves extension catalog reads" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
