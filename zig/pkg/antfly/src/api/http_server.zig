@@ -11744,6 +11744,115 @@ test "api http server serves document lookup through mcp tool" {
     try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"structuredContent\":{\"title\":\"alpha\"}") != null);
 }
 
+test "api http server serves fielded full-text search through mcp tools" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-mcp-fielded-search";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello\"}" }},
+        .sync_level = .full_index,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    defer server.deinit();
+
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
+
+    var wrong_field_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"full_text_search\":{\"match\":\"hello\",\"field\":\"title\"},\"fields\":[\"title\",\"body\"],\"limit\":5}}}",
+    });
+    defer wrong_field_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), wrong_field_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, wrong_field_resp.body, "\"doc:a\"") == null);
+
+    var query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"fullTextSearch\":\"hello\",\"fullTextSearchField\":\"body\",\"fields\":[\"title\",\"body\"],\"limit\":5}}}",
+    });
+    defer query_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, query_resp.body, "\"doc:a\"") != null);
+
+    var query_object_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"fullTextSearch\":{\"match\":\"hello\",\"field\":\"body\"},\"fields\":[\"title\",\"body\"],\"limit\":5}}}",
+    });
+    defer query_object_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), query_object_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, query_object_resp.body, "\"doc:a\"") != null);
+
+    var query_rest_alias_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"},\"fields\":[\"title\",\"body\"],\"limit\":5}}}",
+    });
+    defer query_rest_alias_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), query_rest_alias_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, query_rest_alias_resp.body, "\"doc:a\"") != null);
+}
+
 test "api http server serves table scan as ndjson" {
     const ScanRow = struct {
         key: []const u8,

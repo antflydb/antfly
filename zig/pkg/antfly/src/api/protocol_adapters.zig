@@ -58,7 +58,12 @@ const McpToolFieldSpec = struct {
     description: ?[]const u8 = null,
     default_json: ?[]const u8 = null,
     items_json: ?[]const u8 = null,
+    schema_json: ?[]const u8 = null,
 };
+
+const full_text_search_schema_json =
+    \\{"oneOf":[{"type":"string"},{"type":"object","additionalProperties":true}],"description":"Full-text query string shorthand, or the generic full_text_search query object accepted by the REST API"}
+;
 
 const mcp_tool_specs = [_]McpToolSpec{
     .{
@@ -124,7 +129,9 @@ const mcp_tool_specs = [_]McpToolSpec{
         .description = "Run an Antfly table query",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "fullTextSearch", .schema_type = .string },
+            .{ .name = "fullTextSearch", .schema_type = .object, .schema_json = full_text_search_schema_json },
+            .{ .name = "full_text_search", .schema_type = .object, .description = "Generic REST-shaped full_text_search query object" },
+            .{ .name = "fullTextSearchField", .schema_type = .string, .description = "Field to search when fullTextSearch is a string shorthand, for example content" },
             .{ .name = "semanticSearch", .schema_type = .string },
             .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
             .{ .name = "limit", .schema_type = .integer, .default_json = "10" },
@@ -325,13 +332,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             var body = std.json.ObjectMap.empty;
-            if (jsonStringArg(args, "fullTextSearch")) |full_text| {
-                if (full_text.len != 0) {
-                    var full_text_obj = std.json.ObjectMap.empty;
-                    try full_text_obj.put(alloc, "query", .{ .string = full_text });
-                    try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
-                }
-            }
+            putFullTextSearchArg(alloc, &body, args) catch return mcpError(alloc, "invalid fullTextSearch");
             if (jsonStringArg(args, "semanticSearch")) |semantic| if (semantic.len != 0) try body.put(alloc, "semantic_search", .{ .string = semantic });
             if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
             if (jsonValueArg(args, "orderBy")) |order_by| try body.put(alloc, "order_by", order_by);
@@ -996,7 +997,12 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     for (spec.fields, 0..) |field, i| {
         if (i != 0) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, field.name);
-        try out.appendSlice(alloc, ":{\"type\":");
+        try out.append(alloc, ':');
+        if (field.schema_json) |schema_json| {
+            try out.appendSlice(alloc, schema_json);
+            continue;
+        }
+        try out.appendSlice(alloc, "{\"type\":");
         try appendJsonString(alloc, &out, @tagName(field.schema_type));
         if (field.items_json) |items_json| {
             try out.appendSlice(alloc, ",\"items\":");
@@ -1322,6 +1328,44 @@ fn jsonIntObjectField(object: anytype, key: []const u8) ?i64 {
 fn jsonValueArg(value: std.json.Value, key: []const u8) ?std.json.Value {
     if (value != .object) return null;
     return value.object.get(key);
+}
+
+fn putFullTextSearch(
+    alloc: std.mem.Allocator,
+    body: *std.json.ObjectMap,
+    match: []const u8,
+    field: ?[]const u8,
+) !void {
+    var full_text_obj = std.json.ObjectMap.empty;
+    if (field) |field_name| {
+        if (field_name.len != 0) {
+            try full_text_obj.put(alloc, "match", .{ .string = match });
+            try full_text_obj.put(alloc, "field", .{ .string = field_name });
+            try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
+            return;
+        }
+    }
+    try full_text_obj.put(alloc, "query", .{ .string = match });
+    try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
+}
+
+fn putFullTextSearchArg(
+    alloc: std.mem.Allocator,
+    body: *std.json.ObjectMap,
+    args: std.json.Value,
+) !void {
+    if (jsonValueArg(args, "full_text_search")) |full_text| {
+        if (full_text != .null) try body.put(alloc, "full_text_search", full_text);
+        return;
+    }
+    if (jsonValueArg(args, "fullTextSearch")) |full_text| {
+        switch (full_text) {
+            .string => |text| if (text.len != 0) try putFullTextSearch(alloc, body, text, jsonStringArg(args, "fullTextSearchField")),
+            .object => try body.put(alloc, "full_text_search", full_text),
+            .null => {},
+            else => return error.InvalidParams,
+        }
+    }
 }
 
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {

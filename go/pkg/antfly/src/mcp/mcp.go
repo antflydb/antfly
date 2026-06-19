@@ -54,14 +54,15 @@ type IndexInfo struct {
 
 // QueryRequest holds query parameters passed from MCP tools.
 type QueryRequest struct {
-	TableName      string
-	FullTextSearch string
-	SemanticSearch string
-	Fields         []string
-	Limit          int
-	OrderBy        []indexes.SortField
-	Indexes        []string
-	FilterPrefix   string
+	TableName           string
+	FullTextSearch      any
+	FullTextSearchField string
+	SemanticSearch      string
+	Fields              []string
+	Limit               int
+	OrderBy             []indexes.SortField
+	Indexes             []string
+	FilterPrefix        string
 }
 
 // QueryResult holds query results returned to MCP tools.
@@ -109,14 +110,16 @@ type DropIndexArgs struct {
 
 // QueryArgs defines the query tool parameters.
 type QueryArgs struct {
-	TableName      string              `json:"tableName"                mcp:"name of the table to query"`
-	FullTextSearch string              `json:"fullTextSearch,omitempty" mcp:"full text search query using bleve query string syntax"`
-	Fields         []string            `json:"fields,omitempty"         mcp:"fields to return"`
-	Limit          int                 `json:"limit,omitempty"          mcp:"maximum number of results (default: 10)"`
-	OrderBy        []indexes.SortField `json:"orderBy,omitempty"        mcp:"sort fields with direction (desc: true for descending)"`
-	SemanticSearch string              `json:"semanticSearch,omitempty" mcp:"semantic search query"`
-	Indexes        []string            `json:"indexes,omitempty"        mcp:"index names to use for semantic search"`
-	FilterPrefix   string              `json:"filterPrefix,omitempty"   mcp:"filter results by document id/key prefix"`
+	TableName           string              `json:"tableName"                     mcp:"name of the table to query"`
+	FullTextSearch      any                 `json:"fullTextSearch,omitempty"      mcp:"full text search query string shorthand, or the generic full_text_search query object accepted by the REST API"`
+	FullTextSearchRaw   map[string]any      `json:"full_text_search,omitempty"    mcp:"generic REST-shaped full_text_search query object"`
+	FullTextSearchField string              `json:"fullTextSearchField,omitempty" mcp:"field to search when fullTextSearch is a string shorthand, for example content"`
+	Fields              []string            `json:"fields,omitempty"              mcp:"fields to return"`
+	Limit               int                 `json:"limit,omitempty"               mcp:"maximum number of results (default: 10)"`
+	OrderBy             []indexes.SortField `json:"orderBy,omitempty"             mcp:"sort fields with direction (desc: true for descending)"`
+	SemanticSearch      string              `json:"semanticSearch,omitempty"      mcp:"semantic search query"`
+	Indexes             []string            `json:"indexes,omitempty"             mcp:"index names to use for semantic search"`
+	FilterPrefix        string              `json:"filterPrefix,omitempty"        mcp:"filter results by document id/key prefix"`
 }
 
 // BackupArgs defines the backup tool parameters.
@@ -360,14 +363,18 @@ func (s *AntflyMCPServer) Query(
 	}
 
 	qr := QueryRequest{
-		TableName:      args.TableName,
-		FullTextSearch: args.FullTextSearch,
-		SemanticSearch: args.SemanticSearch,
-		Fields:         args.Fields,
-		Limit:          limit,
-		OrderBy:        args.OrderBy,
-		Indexes:        args.Indexes,
-		FilterPrefix:   args.FilterPrefix,
+		TableName:           args.TableName,
+		FullTextSearch:      args.FullTextSearch,
+		FullTextSearchField: args.FullTextSearchField,
+		SemanticSearch:      args.SemanticSearch,
+		Fields:              args.Fields,
+		Limit:               limit,
+		OrderBy:             args.OrderBy,
+		Indexes:             args.Indexes,
+		FilterPrefix:        args.FilterPrefix,
+	}
+	if args.FullTextSearchRaw != nil {
+		qr.FullTextSearch = args.FullTextSearchRaw
 	}
 
 	result, err := s.handler.Query(ctx, qr)
