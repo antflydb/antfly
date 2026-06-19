@@ -27,7 +27,7 @@ const vec = @import("vector.zig");
 const proto = @import("proto.zig");
 const go_rand = @import("go_rand.zig");
 
-const source_quantize_temp_diff_stack_capacity = 4096;
+const quantize_temp_diff_stack_capacity = 4096;
 
 /// RaBitQuantizer quantizes vectors into 1 bit per dimension.
 ///
@@ -131,8 +131,14 @@ pub const RaBitQuantizer = struct {
         errdefer self.alloc.free(quantized_dot_products);
 
         // Allocate temp space for normalized vectors.
-        const temp_diffs = try self.alloc.alloc(f32, count * self.dims);
-        defer self.alloc.free(temp_diffs);
+        const temp_diff_count = try std.math.mul(usize, count, self.dims);
+        var temp_diffs_stack: [quantize_temp_diff_stack_capacity]f32 = undefined;
+        const use_temp_diffs_stack = temp_diff_count <= temp_diffs_stack.len;
+        const temp_diffs = if (use_temp_diffs_stack)
+            temp_diffs_stack[0..temp_diff_count]
+        else
+            try self.alloc.alloc(f32, temp_diff_count);
+        defer if (!use_temp_diffs_stack) self.alloc.free(temp_diffs);
 
         // Step 1: Compute differences from centroid and normalize.
         for (0..count) |i| {
@@ -217,7 +223,7 @@ pub const RaBitQuantizer = struct {
             centroid_dot_products = try self.alloc.alloc(f32, count);
         }
 
-        var temp_diff_stack: [source_quantize_temp_diff_stack_capacity]f32 = undefined;
+        var temp_diff_stack: [quantize_temp_diff_stack_capacity]f32 = undefined;
         const use_temp_diff_stack = self.dims <= temp_diff_stack.len;
         const temp_diff = if (use_temp_diff_stack)
             temp_diff_stack[0..self.dims]
@@ -288,8 +294,14 @@ pub const RaBitQuantizer = struct {
         qs.centroid_distances = try resizeSlice(f32, self.alloc, qs.centroid_distances, count);
         qs.quantized_dot_products = try resizeSlice(f32, self.alloc, qs.quantized_dot_products, count);
 
-        const temp_diffs = try self.alloc.alloc(f32, count * self.dims);
-        defer self.alloc.free(temp_diffs);
+        const temp_diff_count = try std.math.mul(usize, count, self.dims);
+        var temp_diffs_stack: [quantize_temp_diff_stack_capacity]f32 = undefined;
+        const use_temp_diffs_stack = temp_diff_count <= temp_diffs_stack.len;
+        const temp_diffs = if (use_temp_diffs_stack)
+            temp_diffs_stack[0..temp_diff_count]
+        else
+            try self.alloc.alloc(f32, temp_diff_count);
+        defer if (!use_temp_diffs_stack) self.alloc.free(temp_diffs);
 
         for (0..count) |i| {
             const v = vectors[i * self.dims ..][0..self.dims];
@@ -352,8 +364,14 @@ pub const RaBitQuantizer = struct {
             }
         }
 
-        const temp_diffs = try self.alloc.alloc(f32, count * self.dims);
-        defer self.alloc.free(temp_diffs);
+        const temp_diff_count = try std.math.mul(usize, count, self.dims);
+        var temp_diffs_stack: [quantize_temp_diff_stack_capacity]f32 = undefined;
+        const use_temp_diffs_stack = temp_diff_count <= temp_diffs_stack.len;
+        const temp_diffs = if (use_temp_diffs_stack)
+            temp_diffs_stack[0..temp_diff_count]
+        else
+            try self.alloc.alloc(f32, temp_diff_count);
+        defer if (!use_temp_diffs_stack) self.alloc.free(temp_diffs);
 
         for (0..count) |i| {
             const v = vectors[i * self.dims ..][0..self.dims];
