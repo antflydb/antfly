@@ -575,6 +575,16 @@
       "sql": "ALTER TYPE usage_status ADD VALUE 'archived'"
     },
     {
+      "name": "add enum type value positioned catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "add_enum_value",
+        "table_name": "usage_status"
+      },
+      "plan": "ddl:add_enum_value:type=usage_status:if_not_exists=true:position=after",
+      "sql": "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done'"
+    },
+    {
       "name": "drop enum type catalog ddl",
       "family": "ddl",
       "summary": {
@@ -583,6 +593,16 @@
       },
       "plan": "ddl:drop_enum_type:type=usage_status:if_exists=false",
       "sql": "DROP TYPE usage_status"
+    },
+    {
+      "name": "drop enum type cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_enum_type",
+        "table_name": "usage_status"
+      },
+      "plan": "ddl:drop_enum_type:type=usage_status:if_exists=true:cascade=true",
+      "sql": "DROP TYPE IF EXISTS usage_status CASCADE"
     },
     {
       "name": "create schema namespace catalog ddl",

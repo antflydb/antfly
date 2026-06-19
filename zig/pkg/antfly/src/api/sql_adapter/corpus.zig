@@ -3873,7 +3873,10 @@ pub const AppParityCorpusCoverage = struct {
     ddl_relation_lifetime_unlogged: bool = false,
     ddl_enum_type_create: bool = false,
     ddl_enum_type_add_value: bool = false,
+    ddl_enum_type_add_value_if_not_exists: bool = false,
+    ddl_enum_type_add_value_position: bool = false,
     ddl_enum_type_drop: bool = false,
+    ddl_enum_type_drop_cascade: bool = false,
     ddl_domain_create: bool = false,
     ddl_domain_alter: bool = false,
     ddl_domain_drop: bool = false,
@@ -5391,8 +5394,16 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_relation_lifetime_unlogged = self.ddl_relation_lifetime_unlogged or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "unlogged");
                 },
                 .create_enum_type => self.ddl_enum_type_create = true,
-                .add_enum_value => self.ddl_enum_type_add_value = true,
-                .drop_enum_type => self.ddl_enum_type_drop = true,
+                .add_enum_value => {
+                    self.ddl_enum_type_add_value = true;
+                    self.ddl_enum_type_add_value_if_not_exists = self.ddl_enum_type_add_value_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
+                    self.ddl_enum_type_add_value_position = self.ddl_enum_type_add_value_position or
+                        sql_adapter.planHasAnyExactStringToken(entry.plan, ":position=", &.{ "before", "after" });
+                },
+                .drop_enum_type => {
+                    self.ddl_enum_type_drop = true;
+                    self.ddl_enum_type_drop_cascade = self.ddl_enum_type_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
                 .create_domain => self.ddl_domain_create = true,
                 .alter_domain => self.ddl_domain_alter = true,
                 .drop_domain => self.ddl_domain_drop = true,
@@ -6203,7 +6214,10 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_relation_lifetime_unlogged);
         try std.testing.expect(self.ddl_enum_type_create);
         try std.testing.expect(self.ddl_enum_type_add_value);
+        try std.testing.expect(self.ddl_enum_type_add_value_if_not_exists);
+        try std.testing.expect(self.ddl_enum_type_add_value_position);
         try std.testing.expect(self.ddl_enum_type_drop);
+        try std.testing.expect(self.ddl_enum_type_drop_cascade);
         try std.testing.expect(self.ddl_domain_create);
         try std.testing.expect(self.ddl_domain_alter);
         try std.testing.expect(self.ddl_domain_drop);

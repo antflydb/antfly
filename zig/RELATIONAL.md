@@ -1214,7 +1214,8 @@ sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`, including idempotent create, `IF EXISTS` alter, owned-by/type
 metadata, and drop dependency metadata,
 enum-type catalog grammar for `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD
-VALUE`, and `DROP TYPE`,
+VALUE`, and `DROP TYPE`, including idempotent positioned enum additions and drop
+dependency metadata,
 domain catalog grammar for `CREATE DOMAIN ... AS`, `ALTER DOMAIN`, and
 `DROP DOMAIN`,
 comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
