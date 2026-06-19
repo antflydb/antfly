@@ -331,6 +331,10 @@ fn rowAggregateValue(
         .sum_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .sum_i64 = value_column.?.values.i64[row_idx] },
         .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
         .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
+        .avg_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .avg_i64 = .{
+            .sum_i64 = value_column.?.values.i64[row_idx],
+            .count = 1,
+        } },
     };
 }
 
@@ -343,6 +347,10 @@ fn combine(
         .sum_i64 => |left| .{ .sum_i64 = left + rhs.sum_i64 },
         .min_i64 => |left| .{ .min_i64 = @min(left, rhs.min_i64) },
         .max_i64 => |left| .{ .max_i64 = @max(left, rhs.max_i64) },
+        .avg_i64 => |left| .{ .avg_i64 = .{
+            .sum_i64 = left.sum_i64 + rhs.avg_i64.sum_i64,
+            .count = left.count + rhs.avg_i64.count,
+        } },
     };
 }
 
@@ -358,10 +366,11 @@ fn initExpressionAccumulator(op: algebraic_segment.AggregateOp) ExpressionAccumu
             .sum_i64 => .{ .sum_i64 = 0 },
             .min_i64 => .{ .min_i64 = 0 },
             .max_i64 => .{ .max_i64 = 0 },
+            .avg_i64 => .{ .avg_i64 = .{ .sum_i64 = 0, .count = 0 } },
         },
         .seen_non_null = switch (op) {
             .count, .sum_i64 => true,
-            .min_i64, .max_i64 => false,
+            .min_i64, .max_i64, .avg_i64 => false,
         },
     };
 }
@@ -385,6 +394,11 @@ fn appendBatchExpressions(
             switch (expression.op) {
                 .count => unreachable,
                 .sum_i64 => accumulator.value.sum_i64 += value,
+                .avg_i64 => {
+                    accumulator.value.avg_i64.sum_i64 += value;
+                    accumulator.value.avg_i64.count += 1;
+                    accumulator.seen_non_null = true;
+                },
                 .min_i64 => {
                     if (!accumulator.seen_non_null or value < accumulator.value.min_i64) {
                         accumulator.value.min_i64 = value;
@@ -460,7 +474,7 @@ fn accumulatorsToExpressionMaterializationAlloc(
     for (options.expressions, accumulators, expressions) |spec, accumulator, *out| {
         switch (spec.op) {
             .count, .sum_i64 => {},
-            .min_i64, .max_i64 => if (!accumulator.seen_non_null) return error.EmptyAlgebraicExpressionFold,
+            .min_i64, .max_i64, .avg_i64 => if (!accumulator.seen_non_null) return error.EmptyAlgebraicExpressionFold,
         }
 
         const name = try alloc.dupe(u8, spec.name);
@@ -919,6 +933,7 @@ test "lake algebraic expression sidecar builder folds external row source batche
         .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
         .{ .name = "amount_min", .value_column = "amount", .op = .min_i64 },
         .{ .name = "amount_max", .value_column = "amount", .op = .max_i64 },
+        .{ .name = "amount_avg", .value_column = "amount", .op = .avg_i64 },
     };
 
     var result = try buildAlgebraicExpressionSidecarFromRowSourceAlloc(alloc, batch_source.rowSource(), binding, .{
@@ -934,11 +949,13 @@ test "lake algebraic expression sidecar builder folds external row source batche
     defer algebraic_segment.freeExpressionMaterialization(alloc, &materialization);
     try std.testing.expectEqual(algebraic_segment.SourceKind.external_iceberg, materialization.source.kind);
     try std.testing.expectEqualStrings("orders", materialization.source.source_id);
-    try std.testing.expectEqual(@as(usize, 4), materialization.expressions.len);
+    try std.testing.expectEqual(@as(usize, 5), materialization.expressions.len);
     try std.testing.expectEqual(@as(u64, 4), materialization.expressions[0].value.count);
     try std.testing.expectEqual(@as(i64, 31), materialization.expressions[1].value.sum_i64);
     try std.testing.expectEqual(@as(i64, 7), materialization.expressions[2].value.min_i64);
     try std.testing.expectEqual(@as(i64, 13), materialization.expressions[3].value.max_i64);
+    try std.testing.expectEqual(@as(i64, 31), materialization.expressions[4].value.avg_i64.sum_i64);
+    try std.testing.expectEqual(@as(u64, 3), materialization.expressions[4].value.avg_i64.count);
 }
 
 test "lake algebraic expression sidecar publisher writes artifact store metadata into declaration" {

@@ -606,6 +606,10 @@ fn rowAggregateValue(
         .sum_i64 => .{ .sum_i64 = if (value_column.?.nulls.isNull(row_idx)) 0 else value_column.?.values.i64[row_idx] },
         .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
         .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
+        .avg_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .avg_i64 = .{
+            .sum_i64 = value_column.?.values.i64[row_idx],
+            .count = 1,
+        } },
     };
 }
 
@@ -618,6 +622,10 @@ fn combine(
         .sum_i64 => |left| .{ .sum_i64 = left + rhs.sum_i64 },
         .min_i64 => |left| .{ .min_i64 = @min(left, rhs.min_i64) },
         .max_i64 => |left| .{ .max_i64 = @max(left, rhs.max_i64) },
+        .avg_i64 => |left| .{ .avg_i64 = .{
+            .sum_i64 = left.sum_i64 + rhs.avg_i64.sum_i64,
+            .count = left.count + rhs.avg_i64.count,
+        } },
     };
 }
 

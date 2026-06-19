@@ -30,6 +30,17 @@ pub const AggregateOp = enum(u8) {
     sum_i64 = 2,
     min_i64 = 3,
     max_i64 = 4,
+    avg_i64 = 5,
+};
+
+pub const AverageI64 = struct {
+    sum_i64: i64,
+    count: u64,
+
+    pub fn value(self: AverageI64) ?f64 {
+        if (self.count == 0) return null;
+        return @as(f64, @floatFromInt(self.sum_i64)) / @as(f64, @floatFromInt(self.count));
+    }
 };
 
 pub const AggregateValue = union(AggregateOp) {
@@ -37,6 +48,7 @@ pub const AggregateValue = union(AggregateOp) {
     sum_i64: i64,
     min_i64: i64,
     max_i64: i64,
+    avg_i64: AverageI64,
 };
 
 pub const SourceRef = struct {

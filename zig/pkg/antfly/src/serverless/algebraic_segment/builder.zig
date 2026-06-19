@@ -206,6 +206,10 @@ fn rowAggregateValue(
         .sum_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .sum_i64 = value_column.?.values.i64[row_idx] },
         .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
         .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
+        .avg_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .avg_i64 = .{
+            .sum_i64 = value_column.?.values.i64[row_idx],
+            .count = 1,
+        } },
     };
 }
 
@@ -252,6 +256,17 @@ fn expressionValue(
             if (!found) return error.EmptyAlgebraicExpressionFold;
             break :blk .{ .max_i64 = best };
         },
+        .avg_i64 => blk: {
+            var total: i64 = 0;
+            var count: u64 = 0;
+            for (0..row_count) |row_idx| {
+                if (value_column.?.nulls.isNull(row_idx)) continue;
+                total += value_column.?.values.i64[row_idx];
+                count += 1;
+            }
+            if (count == 0) return error.EmptyAlgebraicExpressionFold;
+            break :blk .{ .avg_i64 = .{ .sum_i64 = total, .count = count } };
+        },
     };
 }
 
@@ -264,6 +279,10 @@ fn combine(
         .sum_i64 => |left| .{ .sum_i64 = left + rhs.sum_i64 },
         .min_i64 => |left| .{ .min_i64 = @min(left, rhs.min_i64) },
         .max_i64 => |left| .{ .max_i64 = @max(left, rhs.max_i64) },
+        .avg_i64 => |left| .{ .avg_i64 = .{
+            .sum_i64 = left.sum_i64 + rhs.avg_i64.sum_i64,
+            .count = left.count + rhs.avg_i64.count,
+        } },
     };
 }
 
@@ -344,6 +363,44 @@ test "algebraic builder skips null value rows for i64 folds" {
     try std.testing.expectEqual(@as(i64, 9), segment.aggregate.groups[0].value.min_i64);
 }
 
+test "algebraic builder computes avg folds" {
+    const alloc = std.testing.allocator;
+    const row_refs = [_]rowsource.RowRef{
+        .{ .serverless = .{ .fragment_id = "frag-1", .row_ordinal = 0 } },
+        .{ .serverless = .{ .fragment_id = "frag-1", .row_ordinal = 1 } },
+        .{ .serverless = .{ .fragment_id = "frag-1", .row_ordinal = 2 } },
+    };
+    const tenants = [_][]const u8{ "t1", "t1", "t2" };
+    const amounts = [_]i64{ 10, 20, 99 };
+    const amount_nulls = [_]u8{ 0, 0, 1 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
+        .{ .name = "amount", .values = .{ .i64 = &amounts }, .nulls = .{ .bytes = &amount_nulls } },
+    };
+    const batch = rowsource.ColumnBatch{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "manifest-1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    };
+
+    var segment = try buildGroupByAggregateAlloc(alloc, batch, .{
+        .source_kind = .serverless_fragment,
+        .snapshot_id = "manifest-1",
+        .schema_fingerprint = "schema-v1",
+        .source_id = "orders",
+        .group_column = "tenant",
+        .value_column = "amount",
+        .op = .avg_i64,
+    });
+    defer segment.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), segment.aggregate.groups.len);
+    try std.testing.expectEqualStrings("t1", segment.aggregate.groups[0].key);
+    try std.testing.expectEqual(@as(i64, 30), segment.aggregate.groups[0].value.avg_i64.sum_i64);
+    try std.testing.expectEqual(@as(u64, 2), segment.aggregate.groups[0].value.avg_i64.count);
+    try std.testing.expectEqual(@as(f64, 15), segment.aggregate.groups[0].value.avg_i64.value().?);
+}
+
 test "algebraic builder computes expression folds" {
     const alloc = std.testing.allocator;
     const row_refs = [_]rowsource.RowRef{
@@ -364,6 +421,7 @@ test "algebraic builder computes expression folds" {
         .{ .name = "row_count", .op = .count },
         .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
         .{ .name = "amount_max", .value_column = "amount", .op = .max_i64 },
+        .{ .name = "amount_avg", .value_column = "amount", .op = .avg_i64 },
     };
 
     var materialization = try buildExpressionFoldsAlloc(alloc, batch, .{
@@ -375,10 +433,12 @@ test "algebraic builder computes expression folds" {
     });
     defer materialization.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), materialization.expressions.len);
+    try std.testing.expectEqual(@as(usize, 4), materialization.expressions.len);
     try std.testing.expectEqual(@as(u64, 3), materialization.expressions[0].value.count);
     try std.testing.expectEqual(@as(i64, 31), materialization.expressions[1].value.sum_i64);
     try std.testing.expectEqual(@as(i64, 13), materialization.expressions[2].value.max_i64);
+    try std.testing.expectEqual(@as(i64, 31), materialization.expressions[3].value.avg_i64.sum_i64);
+    try std.testing.expectEqual(@as(u64, 3), materialization.expressions[3].value.avg_i64.count);
 
     const encoded = try encodeExpressionFoldsAlloc(alloc, batch, .{
         .source_kind = .external_iceberg,

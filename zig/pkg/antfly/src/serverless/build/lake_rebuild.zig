@@ -1089,6 +1089,7 @@ fn supportedAlgebraicOp(materialization: std.json.Value) ?algebraic_segment.Aggr
     if (std.mem.eql(u8, op, "sum") or std.mem.eql(u8, op, "sum_i64")) return .sum_i64;
     if (std.mem.eql(u8, op, "min") or std.mem.eql(u8, op, "min_i64")) return .min_i64;
     if (std.mem.eql(u8, op, "max") or std.mem.eql(u8, op, "max_i64")) return .max_i64;
+    if (std.mem.eql(u8, op, "avg") or std.mem.eql(u8, op, "avg_i64")) return .avg_i64;
     return null;
 }
 
@@ -1883,7 +1884,7 @@ test "lake rebuild desired artifacts derive supported algebraic materializations
     });
     defer desired.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), desired.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 4), desired.artifacts.len);
     try std.testing.expect(desired.find(default_full_text_index_name) != null);
 
     const grouped = desired.find("alg.count_by_tenant").?;
@@ -1899,11 +1900,18 @@ test "lake rebuild desired artifacts derive supported algebraic materializations
     try std.testing.expectEqualStrings("amount", expression.build_spec.?.algebraic_expression.expressions[0].value_column);
     try std.testing.expectEqual(algebraic_segment.AggregateOp.sum_i64, expression.build_spec.?.algebraic_expression.expressions[0].op);
 
+    const avg_grouped = desired.find("alg.avg_by_tenant").?;
+    try std.testing.expectEqual(BuilderKind.algebraic_group_by, std.meta.activeTag(avg_grouped.build_spec.?));
+    try std.testing.expectEqualStrings("tenant", avg_grouped.build_spec.?.algebraic_group_by.group_column);
+    try std.testing.expectEqualStrings("amount", avg_grouped.build_spec.?.algebraic_group_by.value_column);
+    try std.testing.expectEqual(algebraic_segment.AggregateOp.avg_i64, avg_grouped.build_spec.?.algebraic_group_by.op);
+
     var operations = try planOperationsAlloc(alloc, desired.artifacts, &.{});
     defer operations.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), operations.operations.len);
+    try std.testing.expectEqual(@as(usize, 4), operations.operations.len);
     try std.testing.expectEqual(BuilderKind.algebraic_group_by, operations.find("alg.count_by_tenant").?.builder_kind.?);
     try std.testing.expectEqual(BuilderKind.algebraic_expression, operations.find("alg.sum_amount").?.builder_kind.?);
+    try std.testing.expectEqual(BuilderKind.algebraic_group_by, operations.find("alg.avg_by_tenant").?.builder_kind.?);
 }
 
 test "lake rebuild planner rebuilds stale source snapshots and missing folds" {

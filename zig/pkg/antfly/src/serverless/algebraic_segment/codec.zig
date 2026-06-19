@@ -205,6 +205,10 @@ fn encodeAggregateValue(
     switch (value) {
         .count => |count| try appendU64(alloc, out, count),
         .sum_i64, .min_i64, .max_i64 => |int| try appendI64(alloc, out, int),
+        .avg_i64 => |avg| {
+            try appendI64(alloc, out, avg.sum_i64);
+            try appendU64(alloc, out, avg.count);
+        },
     }
 }
 
@@ -218,6 +222,10 @@ fn decodeAggregateValue(
         .sum_i64 => .{ .sum_i64 = try readI64(bytes, cursor) },
         .min_i64 => .{ .min_i64 = try readI64(bytes, cursor) },
         .max_i64 => .{ .max_i64 = try readI64(bytes, cursor) },
+        .avg_i64 => .{ .avg_i64 = .{
+            .sum_i64 = try readI64(bytes, cursor),
+            .count = try readU64(bytes, cursor),
+        } },
     };
 }
 
@@ -238,6 +246,7 @@ fn decodeAggregateOp(raw: u8) !algebraic_segment.AggregateOp {
         2 => .sum_i64,
         3 => .min_i64,
         4 => .max_i64,
+        5 => .avg_i64,
         else => error.InvalidAlgebraicSegment,
     };
 }
@@ -355,4 +364,38 @@ test "algebraic segment codec round-trips expression folds" {
     try std.testing.expectEqual(@as(usize, 2), decoded.expressions.len);
     try std.testing.expectEqualStrings("amount_max", decoded.expressions[1].name);
     try std.testing.expectEqual(@as(i64, 20), decoded.expressions[1].value.max_i64);
+}
+
+test "algebraic segment codec round-trips avg folds" {
+    const alloc = std.testing.allocator;
+    var segment = algebraic_segment.Segment{
+        .source = .{
+            .kind = .external_iceberg,
+            .snapshot_id = try alloc.dupe(u8, "iceberg-7"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "events"),
+        },
+        .aggregate = .{
+            .group_column = try alloc.dupe(u8, "tenant"),
+            .value_column = try alloc.dupe(u8, "amount"),
+            .op = .avg_i64,
+            .groups = try alloc.alloc(algebraic_segment.GroupFold, 1),
+        },
+    };
+    defer segment.deinit(alloc);
+    segment.aggregate.groups[0] = .{
+        .key = try alloc.dupe(u8, "t1"),
+        .value = .{ .avg_i64 = .{ .sum_i64 = 30, .count = 2 } },
+    };
+
+    const encoded = try encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expectEqual(algebraic_segment.AggregateOp.avg_i64, decoded.aggregate.op);
+    try std.testing.expectEqual(@as(i64, 30), decoded.aggregate.groups[0].value.avg_i64.sum_i64);
+    try std.testing.expectEqual(@as(u64, 2), decoded.aggregate.groups[0].value.avg_i64.count);
+    try std.testing.expectEqual(@as(f64, 15), decoded.aggregate.groups[0].value.avg_i64.value().?);
 }
