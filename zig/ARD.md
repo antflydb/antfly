@@ -104,11 +104,30 @@ Behavior:
 
 This should come after the catalog builder is stable.
 
-### `POST /ard/v1/explore` and `GET /ard/v1/agents`
+### `POST /ard/v1/explore`
 
-Optional later additions if clients need ARD registry parity. These correspond to optional ARD registry operations under the `/ard/v1` base URL. They should reuse the same scoped index and catalog entry serializer.
+Registry exploration endpoint over the same scoped entries. This is the ARD `POST /explore` operation when `/ard/v1` is advertised as the registry base URL.
 
-`POST /ard/v1/explore` may accept a text query, a filter, both, or neither. It is the correct endpoint for deterministic inventory questions such as available media types, publishers, or capabilities.
+Behavior:
+
+- Requires normal Antfly auth when auth is enabled.
+- Accepts the ARD query model: `{ "query": { "text": "...", "filter": { ... } } }`.
+- Accepts a text query, a filter, both, or neither.
+- Returns deterministic facet inventory for questions such as available media types, publishers, tags, or capabilities.
+- Uses the same auth, tenant, profile, media-type, include, and permission scoping as `/ard/v1/catalog`.
+
+### `GET /ard/v1/agents`
+
+Registry agent-list endpoint over the same scoped entries. This is the ARD `GET /agents` operation when `/ard/v1` is advertised as the registry base URL.
+
+Behavior:
+
+- Requires normal Antfly auth when auth is enabled.
+- Returns visible agent-like resources only, currently A2A agent cards and MCP server descriptors.
+- Accepts `filter` as a percent-encoded ARD filter object.
+- Accepts `orderBy` for `identifier`, `displayName`, or `type`, with optional `asc`, `desc`, or a leading `-`.
+- Accepts `pageSize` and `pageToken`, bounded to the same maximum page size as search.
+- Uses the same auth, tenant, profile, media-type, include, and permission scoping as `/ard/v1/catalog`.
 
 ### `GET /ard/v1/skills/{skill}`
 
