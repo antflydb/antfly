@@ -19848,7 +19848,8 @@ test "lowered sql set operation plans route cross table branches through catalog
                 const ndjson =
                     "{\"key\":\"a1\",\"id\":\"a1\",\"status\":\"archived\",\"enabled\":true}\n" ++
                     "{\"key\":\"a2\",\"id\":\"a2\",\"status\":\"archived\",\"enabled\":false}\n" ++
-                    "{\"key\":\"a3\",\"id\":\"a3\",\"status\":\"deleted\",\"enabled\":true}\n";
+                    "{\"key\":\"a3\",\"id\":\"a3\",\"status\":\"deleted\",\"enabled\":true}\n" ++
+                    "{\"key\":\"u2\",\"id\":\"u2\",\"status\":\"deleted\",\"enabled\":false}\n";
                 return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
             }
             return error.TableNotFound;
@@ -19903,6 +19904,42 @@ test "lowered sql set operation plans route cross table branches through catalog
             try std.testing.expectEqualStrings("{\"id\":\"u2\"}", query_result.rows[1]);
             try std.testing.expectEqualStrings("{\"id\":\"a1\"}", query_result.rows[2]);
             try std.testing.expectEqualStrings("{\"id\":\"a3\"}", query_result.rows[3]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_except = try relational_sql_api.lowerReadPlanWithCatalogAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'",
+        usage_schema,
+        &.{},
+        catalog.iface(),
+    );
+    defer lowered_except.deinit(alloc);
+    switch (lowered_except) {
+        .set_operation => |set_operation| try std.testing.expectEqualStrings("except", @tagName(set_operation.operation)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var fake_except = FakeSource{};
+    var except_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake_except.source(),
+        catalog.iface(),
+        "usage_records",
+        usage_schema,
+        lowered_except,
+        .read_index,
+    )).?;
+    defer except_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), fake_except.usage_scans);
+    try std.testing.expectEqual(@as(usize, 1), fake_except.archived_scans);
+    switch (except_result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 1), query_result.total);
+            try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
         },
         else => return error.TestUnexpectedResult,
     }

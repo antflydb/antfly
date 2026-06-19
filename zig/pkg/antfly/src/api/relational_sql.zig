@@ -2195,6 +2195,7 @@ pub fn bulkSqlIoImportRowsBatchFromStdinAlloc(
     if (plan.codec != .csv) return error.UnsupportedSqlShape;
     if (plan.columns.len == 0) return error.UnsupportedSqlShape;
     try validateBulkSqlIoCsvOptions(plan);
+    try validateBulkSqlIoPlanForSchema(alloc, schema, plan);
     if (plan.encoding) |encoding| {
         if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
             return error.UnsupportedSqlShape;
@@ -2248,6 +2249,7 @@ pub fn bulkSqlIoExportRowsCsvToStdoutAlloc(
     if (plan.operation != .export_rows or plan.native_route != .rows_query or plan.stream != .stdout) return error.UnsupportedSqlShape;
     if (plan.codec != .csv) return error.UnsupportedSqlShape;
     try validateBulkSqlIoCsvOptions(plan);
+    try validateBulkSqlIoPlanForSchema(alloc, schema, plan);
     if (plan.encoding) |encoding| {
         if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
             return error.UnsupportedSqlShape;
@@ -2447,6 +2449,89 @@ fn validateBulkSqlIoCsvOptions(plan: BulkSqlIoExecutionPlan) !void {
     const quote = try bulkSqlIoSingleByteOption(plan.quote, '"');
     _ = try bulkSqlIoSingleByteOption(plan.escape, quote);
     if (delimiter == quote) return error.UnsupportedSqlShape;
+}
+
+fn validateBulkSqlIoPlanForSchema(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+) !void {
+    switch (plan.operation) {
+        .import_rows => {
+            if (plan.columns.len == 0) return error.UnsupportedSqlShape;
+            try validateBulkSqlIoColumnListForSchema(alloc, schema, plan.columns, .reject_generated);
+            try validateBulkSqlIoOptionColumns(alloc, schema, plan.columns, plan.force_not_null_columns);
+            try validateBulkSqlIoOptionColumns(alloc, schema, plan.columns, plan.force_null_columns);
+            if (plan.force_quote_all or plan.force_quote_columns.len != 0) return error.UnsupportedSqlShape;
+        },
+        .export_rows => {
+            try validateBulkSqlIoColumnListForSchema(alloc, schema, plan.columns, .allow_generated);
+            try validateBulkSqlIoOptionColumns(alloc, schema, plan.columns, plan.force_quote_columns);
+            if (plan.force_not_null_columns.len != 0 or plan.force_null_columns.len != 0) return error.UnsupportedSqlShape;
+        },
+    }
+    for (plan.where_expressions) |condition| try validateBulkSqlIoExpressionConditionForSchema(schema, condition);
+}
+
+const BulkSqlIoGeneratedColumnPolicy = enum {
+    allow_generated,
+    reject_generated,
+};
+
+fn validateBulkSqlIoColumnListForSchema(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    columns: []const []const u8,
+    generated_policy: BulkSqlIoGeneratedColumnPolicy,
+) !void {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for (columns) |column_name| {
+        if (seen.contains(column_name)) return error.InvalidRowsRequest;
+        const column = bulkSqlIoFindRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
+        if (generated_policy == .reject_generated and column.generated != null) return error.InvalidRowsRequest;
+        try seen.put(alloc, column_name, {});
+    }
+}
+
+fn validateBulkSqlIoOptionColumns(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    copy_columns: []const []const u8,
+    option_columns: []const []const u8,
+) !void {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for (option_columns) |column_name| {
+        if (seen.contains(column_name)) return error.InvalidRowsRequest;
+        _ = bulkSqlIoFindRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
+        if (copy_columns.len != 0 and !bulkSqlIoStringSliceContains(copy_columns, column_name)) return error.InvalidRowsRequest;
+        try seen.put(alloc, column_name, {});
+    }
+}
+
+fn validateBulkSqlIoExpressionConditionForSchema(
+    schema: runtime_schema.TableSchema,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) error{InvalidRowsRequest}!void {
+    try validateBulkSqlIoExpressionForSchema(schema, condition.lhs);
+    for (condition.rhs) |expression| try validateBulkSqlIoExpressionForSchema(schema, expression);
+}
+
+fn validateBulkSqlIoExpressionForSchema(
+    schema: runtime_schema.TableSchema,
+    expression: db_mod.types.RelationalRowsExpression,
+) error{InvalidRowsRequest}!void {
+    if (expression.kind == .field) {
+        if (expression.field_source != .row) return error.InvalidRowsRequest;
+        _ = bulkSqlIoFindRelationalColumn(schema, expression.field) orelse return error.InvalidRowsRequest;
+    }
+    for (expression.operands) |operand| try validateBulkSqlIoExpressionForSchema(schema, operand);
+    for (expression.case_branches) |branch| {
+        try validateBulkSqlIoExpressionConditionForSchema(schema, branch.when);
+        try validateBulkSqlIoExpressionForSchema(schema, branch.then);
+    }
+    for (expression.case_else) |fallback| try validateBulkSqlIoExpressionForSchema(schema, fallback);
 }
 
 fn bulkSqlIoRowJsonFromCsvFieldsAlloc(
@@ -47117,6 +47202,46 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         error.UnsupportedSqlShape,
         bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, invalid_csv_options_import_plan, "u_bad|ready|0\n"),
     );
+    var duplicate_copy_column_import = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, id) FROM STDIN WITH (FORMAT csv);");
+    defer duplicate_copy_column_import.deinit(alloc);
+    const duplicate_copy_column_import_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (duplicate_copy_column_import) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, duplicate_copy_column_import_plan, "u_bad,u_bad_again\n"),
+    );
+    var copy_import_unknown_force_column = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, FORCE_NULL (missing));");
+    defer copy_import_unknown_force_column.deinit(alloc);
+    const copy_import_unknown_force_column_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_unknown_force_column) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_unknown_force_column_plan, "u_bad,ready\n"),
+    );
+    var copy_import_unselected_force_column = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL (amount));");
+    defer copy_import_unselected_force_column.deinit(alloc);
+    const copy_import_unselected_force_column_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_unselected_force_column) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_unselected_force_column_plan, "u_bad,ready\n"),
+    );
+    var copy_import_unknown_where_column = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE missing = 'active';");
+    defer copy_import_unknown_where_column.deinit(alloc);
+    const copy_import_unknown_where_column_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_unknown_where_column) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_unknown_where_column_plan, "u_bad,ready\n"),
+    );
 
     var copy_import_filtered = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount) FROM STDIN WITH (FORMAT csv, DEFAULT 'DEFAULT') WHERE status = 'active';");
     defer copy_import_filtered.deinit(alloc);
@@ -47180,6 +47305,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         bulkSqlIoExportRowsCsvToStdoutAlloc(alloc, copy_runtime_schema, invalid_csv_options_export_plan, .{}),
+    );
+    var copy_to_unknown_force_column = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (missing));");
+    defer copy_to_unknown_force_column.deinit(alloc);
+    const copy_to_unknown_force_column_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_to_unknown_force_column) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoExportRowsCsvToStdoutAlloc(alloc, copy_runtime_schema, copy_to_unknown_force_column_plan, .{}),
+    );
+    var copy_to_unselected_force_column = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (amount));");
+    defer copy_to_unselected_force_column.deinit(alloc);
+    const copy_to_unselected_force_column_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_to_unselected_force_column) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        bulkSqlIoExportRowsCsvToStdoutAlloc(alloc, copy_runtime_schema, copy_to_unselected_force_column_plan, .{}),
     );
 
     var copy_binary = try lowerDdlPlanAlloc(alloc, "COPY usage_records TO STDOUT WITH (FORMAT binary);");
