@@ -27,7 +27,7 @@ const vector_proto = @import("antfly_vector").proto;
 const vector_quantizer = @import("antfly_vector").quantizer;
 const vector_types = @import("antfly_vector").vector;
 
-const ScoredDoc = struct {
+pub const ScoredDoc = struct {
     doc_id: []const u8,
     score: u32,
 };
@@ -339,6 +339,18 @@ fn searchHybridAllocResolved(
 
 fn searchTextSegmentAlloc(alloc: Allocator, text_segment: text_segment_mod.Segment, req: query_request.QueryRequest) ![]ScoredDoc {
     return try searchTextSegmentSpecAlloc(alloc, text_segment, req.text, req.operator, req.offset, req.limit, req.min_score);
+}
+
+pub fn searchTextSegmentDocIdsAlloc(
+    alloc: Allocator,
+    text_segment: text_segment_mod.Segment,
+    text: []const u8,
+    operator: query_request.QueryOperator,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+) ![]ScoredDoc {
+    return try searchTextSegmentSpecAlloc(alloc, text_segment, text, operator, offset, limit, min_score);
 }
 
 fn searchTextSegmentSpecAlloc(
@@ -1390,7 +1402,7 @@ fn clipScoredDocsAlloc(alloc: Allocator, scored: []ScoredDoc, offset: usize, lim
     return out;
 }
 
-fn freeScoredDocs(alloc: Allocator, hits: []ScoredDoc) void {
+pub fn freeScoredDocs(alloc: Allocator, hits: []ScoredDoc) void {
     for (hits) |hit| alloc.free(hit.doc_id);
     alloc.free(hits);
 }
