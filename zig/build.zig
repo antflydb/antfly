@@ -3323,6 +3323,7 @@ pub fn build(b: *std.Build) void {
             "ARD search validates federation and returns referral envelope",
             "ARD explore returns requested facet buckets over scoped entries",
             "ARD catalog resolves artifact urls against configured base url",
+            "ARD catalog hides admin-only built-in skills from non-admin entries",
             "ARD extension package entries use trust provenance for artifact digests",
             "ARD search supports extension metadata filters",
             "ARD profile filter keeps only profile-compatible skills",

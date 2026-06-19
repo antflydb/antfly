@@ -118,6 +118,7 @@ const Skill = struct {
     capabilities: []const []const u8,
     representative_queries: []const []const u8,
     body: []const u8,
+    admin_only: bool = false,
 };
 
 const skills = [_]Skill{
@@ -192,6 +193,7 @@ const skills = [_]Skill{
         .url = "/ard/v1/skills/antfly-extension-management",
         .display_name = "Antfly Extension Management",
         .description = "Install, configure, enable, disable, and inspect Antfly extensions.",
+        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"admin\"}",
         .capabilities = &.{ "extension-install", "extension-config", "extension-lifecycle" },
         .representative_queries = &.{
             "install this Antfly extension",
@@ -208,6 +210,7 @@ const skills = [_]Skill{
         \\Never expose extension tools through ARD that the same identity cannot list through MCP.
         \\
         ,
+        .admin_only = true,
     },
 };
 
@@ -453,8 +456,9 @@ pub fn agentsJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     return try writer.toOwnedSlice();
 }
 
-pub fn skillMarkdownAlloc(alloc: std.mem.Allocator, slug: []const u8) !?[]u8 {
+pub fn skillMarkdownAlloc(alloc: std.mem.Allocator, options: CatalogOptions, slug: []const u8) !?[]u8 {
     const skill = findSkill(slug) orelse return null;
+    if (!catalogOptionsAllowStaticEntry(options, skillEntry(skill))) return null;
     return try alloc.dupe(u8, skill.body);
 }
 
@@ -2185,6 +2189,7 @@ fn skillEntry(skill: Skill) Entry {
         .tags = skill.tags,
         .capabilities = skill.capabilities,
         .representative_queries = skill.representative_queries,
+        .admin_only = skill.admin_only,
     };
 }
 
@@ -2451,6 +2456,23 @@ test "ARD catalog resolves artifact urls against configured base url" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/extensions/v1/packages/docsaf/versions/1.0.0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/extensions/v1/installed/docsaf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://tenant.example.com/ard/v1/resources/mcp/extensions/docsaf\"") != null);
+}
+
+test "ARD catalog hides admin-only built-in skills from non-admin entries" {
+    const non_admin = try catalogJsonAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = false });
+    defer std.testing.allocator.free(non_admin);
+    try std.testing.expect(std.mem.indexOf(u8, non_admin, "Antfly Extension Management") == null);
+
+    const admin = try catalogJsonAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = true });
+    defer std.testing.allocator.free(admin);
+    try std.testing.expect(std.mem.indexOf(u8, admin, "Antfly Extension Management") != null);
+
+    const hidden_skill = try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = false }, "antfly-extension-management");
+    try std.testing.expect(hidden_skill == null);
+
+    const visible_skill = (try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = true }, "antfly-extension-management")).?;
+    defer std.testing.allocator.free(visible_skill);
+    try std.testing.expect(std.mem.indexOf(u8, visible_skill, "# Antfly Extension Management") != null);
 }
 
 test "ARD extension package entries use trust provenance for artifact digests" {
