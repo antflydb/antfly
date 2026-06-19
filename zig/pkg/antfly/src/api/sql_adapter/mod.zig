@@ -367,6 +367,7 @@ pub const LoweredQueryPlan = plan.LoweredQueryPlan;
 pub const LoweredReadPlan = plan.LoweredReadPlan;
 pub const LoweredRelationPopulationPlan = plan.LoweredRelationPopulationPlan;
 pub const LoweredSelect = plan.LoweredSelect;
+pub const LoweredSetOperationPlan = plan.LoweredSetOperationPlan;
 pub const LoweredWindowPlan = plan.LoweredWindowPlan;
 pub const LoweredWritePlan = plan.LoweredWritePlan;
 pub const ReadSourceTableNames = binder.ReadSourceTableNames;

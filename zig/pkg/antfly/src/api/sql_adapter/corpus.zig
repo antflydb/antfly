@@ -2407,7 +2407,10 @@ pub fn corpusFixtureSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
         .query,
         .read,
         .window,
-        => planHasExactUsizeToken(entry.plan, ":select=", expected),
+        => if (entry.family == .read and corpusReadPlanHasPrefix(entry, "read:set_operation:"))
+            planAllUsizeTokensMatch(entry.plan, ":select=", expected)
+        else
+            planHasExactUsizeToken(entry.plan, ":select=", expected),
         .explain => planHasExactUsizeToken(entry.plan, ":select=", expected) or
             planHasExactUsizeToken(entry.plan, ":not_matched_insert=", expected),
         .merge_mutation => planHasExactUsizeToken(entry.plan, ":not_matched_insert=", expected),
@@ -2882,6 +2885,18 @@ pub fn planHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usi
         .value => |value| value == expected,
         .absent, .invalid => false,
     };
+}
+
+pub fn planAllUsizeTokensMatch(plan: []const u8, token: []const u8, expected: usize) bool {
+    var start: usize = 0;
+    var found = false;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        const parsed = parseDelimitedUsizeToken(plan, index + token.len) orelse return false;
+        if (parsed != expected) return false;
+        found = true;
+        start = index + token.len;
+    }
+    return found;
 }
 
 pub fn planUsizeOptionalTokenValue(plan: []const u8, token: []const u8) ?usize {
@@ -4288,12 +4303,10 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_delete_joined_source: bool = false,
     unsupported_merge_mutation: bool = false,
     unsupported_query_recursive_cte_stream_plan: bool = false,
-    unsupported_query_set_operation_plan: bool = false,
     query_calendar_interval_expression: bool = false,
     unsupported_read_recursive_cte_stream_plan: bool = false,
     unsupported_read_duplicate_output_name: bool = false,
     unsupported_read_aggregate_duplicate_output_name: bool = false,
-    unsupported_read_set_operation_union: bool = false,
     unsupported_read_set_operation_intersect: bool = false,
     unsupported_read_set_operation_except: bool = false,
     read_row_lock_nowait: bool = false,
@@ -5457,15 +5470,11 @@ pub const AppParityCorpusCoverage = struct {
         }
         if (entry.family == .unsupported) {
             self.unsupported_query_recursive_cte_stream_plan = self.unsupported_query_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
-            self.unsupported_query_set_operation_plan = self.unsupported_query_set_operation_plan or std.mem.eql(u8, entry.classification_reason, "set_operation_plan");
         } else if (entry.family == .unsupported_read) {
             self.unsupported_read_recursive_cte_stream_plan = self.unsupported_read_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
             self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
             self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
                 std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");
-            self.unsupported_read_set_operation_union = self.unsupported_read_set_operation_union or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
-                    std.mem.indexOf(u8, entry.sql, " UNION ") != null);
             self.unsupported_read_set_operation_intersect = self.unsupported_read_set_operation_intersect or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
                     std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);

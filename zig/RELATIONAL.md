@@ -6494,7 +6494,8 @@ on durable job completion rather than request-local state. Rebuild and
 validation work use the same design shape: catalog mutation emits typed work,
 metadata owns the durable job, workers claim work through first-class
 begin/finish/invalidate metadata transitions with retry after expired leases,
-and table-schema compare-and-swap promotion rejects matching-generation
+finish/invalidate is accepted only from the current lease owner, and
+table-schema compare-and-swap promotion rejects matching-generation
 rewrite jobs until every one is complete, then consumes those completed job
 records atomically with the promoted table image.
 Service-level SQL table-drop records carry the same three typed table work

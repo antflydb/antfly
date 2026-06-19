@@ -23,6 +23,7 @@ const runtime_schema = @import("../../storage/schema.zig");
 pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
 pub const RelationPopulationMode = grammar.RelationPopulationMode;
 pub const SelectOutputRef = ast.SelectOutputRef;
+pub const SelectSetOperation = ast.SelectSetOperation;
 
 pub const LoweredSelect = struct {
     table_name: []const u8,
@@ -55,6 +56,18 @@ pub const LoweredQueryPlan = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.plan.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredSetOperationPlan = struct {
+    operation: SelectSetOperation,
+    left: LoweredQueryPlan,
+    right: LoweredQueryPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.left.deinit(alloc);
+        self.right.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -329,6 +342,7 @@ pub const LoweredLateralPlan = struct {
 
 pub const LoweredReadPlan = union(enum) {
     query: LoweredQueryPlan,
+    set_operation: LoweredSetOperationPlan,
     aggregate: LoweredAggregatePlan,
     join: LoweredJoin,
     lateral: LoweredLateralPlan,
@@ -337,6 +351,7 @@ pub const LoweredReadPlan = union(enum) {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .query => |*query| query.deinit(alloc),
+            .set_operation => |*set_operation| set_operation.deinit(alloc),
             .aggregate => |*aggregate| aggregate.deinit(alloc),
             .join => |*join| join.deinit(alloc),
             .lateral => |*lateral| lateral.deinit(alloc),

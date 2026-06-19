@@ -4752,10 +4752,13 @@
       "sql": "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records"
     },
     {
-      "name": "unsupported set operation query",
-      "family": "unsupported",
-      "plan": "unsupported:query:requires=set_operation_plan",
-      "classification_reason": "set_operation_plan",
+      "name": "read union all boolean set operation",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {
@@ -5368,10 +5371,13 @@
       "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM usage_records WHERE status = 'deleted'"
     },
     {
-      "name": "unsupported read union all set operation",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=set_operation_plan",
-      "classification_reason": "set_operation_plan",
+      "name": "read union all boolean set operation duplicate coverage",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE"
     },
     {

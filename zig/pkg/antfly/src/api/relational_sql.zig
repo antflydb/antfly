@@ -111,6 +111,7 @@ const InsertValueRows = []const []const []const u8;
 
 pub const LoweredSelect = sql_adapter.LoweredSelect;
 pub const LoweredQueryPlan = sql_adapter.LoweredQueryPlan;
+pub const LoweredSetOperationPlan = sql_adapter.LoweredSetOperationPlan;
 pub const LoweredWindowPlan = sql_adapter.LoweredWindowPlan;
 
 pub const LoweredInsert = sql_adapter.LoweredInsert;
@@ -551,9 +552,36 @@ pub fn lowerReadPlanWithSchemasAlloc(
     if (lowerQueryPlanAlloc(alloc, sql, schema, params)) |lowered| {
         return .{ .query = lowered };
     } else |err| switch (err) {
-        error.UnsupportedSqlShape => if (saw_invalid_catalog) return error.InvalidSqlCatalog else return error.UnsupportedSqlShape,
+        error.UnsupportedSqlShape => {},
         else => return err,
     }
+
+    if (lowerSetOperationPlanAlloc(alloc, sql, schema, params)) |lowered| {
+        return .{ .set_operation = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => if (saw_invalid_catalog) return error.InvalidSqlCatalog else return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => return error.InvalidSqlCatalog,
+        else => return err,
+    }
+}
+
+pub fn lowerSetOperationPlanAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredSetOperationPlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    var parser = Parser{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+    };
+    return try parser.parseSetOperationPlan();
 }
 
 pub fn lowerReadPlanWithCatalogAlloc(
@@ -7512,6 +7540,50 @@ const Parser = struct {
                 .ctes = owned_ctes,
                 .query = final.query,
             },
+        };
+    }
+
+    fn parseSetOperationPlan(self: *@This()) !LoweredSetOperationPlan {
+        if (self.peekKeyword("with")) return error.UnsupportedSqlShape;
+
+        var left = try self.parseSelectWithSetBoundary(true);
+        errdefer left.deinit(self.alloc);
+        if (self.atEnd()) return error.UnsupportedSqlShape;
+
+        const op = try self.parseSelectSetOperation();
+        var right = try self.parseSelectWithSetResultTailBoundary();
+        errdefer right.deinit(self.alloc);
+
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        if (!std.mem.eql(u8, left.table_name, right.table_name)) return error.UnsupportedSqlShape;
+        if (!simpleSelectProjectionsEqual(left.query, right.query, left.select_outputs, right.select_outputs)) return error.UnsupportedSqlShape;
+
+        const left_table_name = left.table_name;
+        left.table_name = "";
+        const right_table_name = right.table_name;
+        right.table_name = "";
+        left.clearSelectOutputs(self.alloc);
+        right.clearSelectOutputs(self.alloc);
+
+        var left_plan = LoweredQueryPlan{
+            .table_name = left_table_name,
+            .plan = .{ .query = left.query },
+        };
+        left.query = .{};
+        errdefer left_plan.deinit(self.alloc);
+
+        var right_plan = LoweredQueryPlan{
+            .table_name = right_table_name,
+            .plan = .{ .query = right.query },
+        };
+        right.query = .{};
+        errdefer right_plan.deinit(self.alloc);
+
+        return .{
+            .operation = op,
+            .left = left_plan,
+            .right = right_plan,
         };
     }
 
@@ -61333,6 +61405,10 @@ fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) 
             fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, query.plan.ctes);
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "query");
         },
+        .set_operation => |set_operation| blk: {
+            const fingerprint = try setOperationFingerprintAlloc(alloc, set_operation);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "set_operation");
+        },
         .aggregate => |aggregate| blk: {
             var fingerprint = try aggregatePlanFingerprintAlloc(alloc, aggregate);
             fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", aggregate.plan.aggregate.offset);
@@ -61354,6 +61430,18 @@ fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) 
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "window");
         },
     };
+}
+
+fn setOperationFingerprintAlloc(alloc: std.mem.Allocator, set_operation: LoweredSetOperationPlan) ![]u8 {
+    const left = try queryFingerprintAlloc(alloc, "left", set_operation.left.table_name, set_operation.left.plan.query, set_operation.left.plan.ctes.len);
+    defer alloc.free(left);
+    const right = try queryFingerprintAlloc(alloc, "right", set_operation.right.table_name, set_operation.right.plan.query, set_operation.right.plan.ctes.len);
+    defer alloc.free(right);
+    return try std.fmt.allocPrint(
+        alloc,
+        "set_operation:op={s}:left={s}:right={s}",
+        .{ @tagName(set_operation.operation), left, right },
+    );
 }
 
 fn explainPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredExplainPlan) ![]u8 {
@@ -61482,6 +61570,11 @@ fn expectAppParityReadPlanEntry(
             },
             else => return error.TestUnexpectedResult,
         },
+        .read => {
+            const fingerprint = try readPlanFingerprintAlloc(alloc, lowered);
+            defer alloc.free(fingerprint);
+            try expectAppParityPlan(entry.plan, fingerprint);
+        },
         .aggregate => switch (lowered) {
             .aggregate => |aggregate| {
                 var fingerprint = try aggregatePlanFingerprintAlloc(alloc, aggregate);
@@ -61528,6 +61621,15 @@ fn expectAppParityReadSummary(summary: AppParityPlanSummary, lowered: LoweredRea
             try expectOptionalTableName(summary.table_name, query.table_name);
             try expectOptionalUsize(summary.ctes, query.plan.ctes.len);
             try expectQuerySummary(summary, query.plan.query);
+        },
+        .set_operation => |set_operation| {
+            try expectOptionalTableName(summary.table_name, set_operation.left.table_name);
+            try expectOptionalUsize(summary.ctes, set_operation.left.plan.ctes.len + set_operation.right.plan.ctes.len);
+            try expectOptionalUsize(summary.select, set_operation.left.plan.query.select.len);
+            try expectOptionalUsize(summary.order_by, set_operation.left.plan.query.order_by.len + set_operation.right.plan.query.order_by.len);
+            try expectOptionalU32(summary.limit, set_operation.left.plan.query.limit);
+            if (summary.offset) |expected| try std.testing.expectEqual(expected, set_operation.left.plan.query.offset);
+            if (summary.right_offset) |expected| try std.testing.expectEqual(expected, set_operation.right.plan.query.offset);
         },
         .aggregate => |aggregate| {
             try expectOptionalTableName(summary.table_name, aggregate.table_name);
@@ -61688,6 +61790,7 @@ fn expectAppParityExplainSummary(summary: AppParityPlanSummary, lowered: Lowered
 
 fn appParityPlanFamilyIsSupportedRead(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
+        .read,
         .query,
         .aggregate,
         .join,

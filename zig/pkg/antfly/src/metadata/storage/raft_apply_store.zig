@@ -2938,6 +2938,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         request: metadata_table_manager.SchemaRewriteJobBeginRequest,
     ) !void {
+        if (request.lease_owner.len == 0 or request.lease_expires_at_ms <= request.now_ms) return error.InvalidSchemaRewriteJobLease;
         var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
         defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
         const claimable = std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_declared) or
@@ -2962,6 +2963,7 @@ pub const RaftApplyStore = struct {
         var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
         defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
         if (!std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.SchemaRewriteJobLeaseMismatch;
         try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_ready);
         try replaceOwnedString(self.alloc, &record.lease_owner, "");
         record.lease_expires_at_ms = 0;
@@ -2979,6 +2981,8 @@ pub const RaftApplyStore = struct {
     ) !void {
         var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
         defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.SchemaRewriteJobLeaseMismatch;
         try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_invalid);
         try replaceOwnedString(self.alloc, &record.lease_owner, "");
         record.lease_expires_at_ms = 0;
@@ -3275,10 +3279,12 @@ fn freeSchemaRewriteJobBeginRequest(alloc: std.mem.Allocator, request: metadata_
 }
 
 fn freeSchemaRewriteJobFinishRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SchemaRewriteJobFinishRequest) void {
+    alloc.free(request.lease_owner);
     alloc.free(request.progress_row_key);
 }
 
 fn freeSchemaRewriteJobInvalidateRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) void {
+    alloc.free(request.lease_owner);
     alloc.free(request.last_error);
 }
 
@@ -5373,6 +5379,7 @@ fn appendSchemaRewriteJobFinishRequest(
     request: metadata_table_manager.SchemaRewriteJobFinishRequest,
 ) !void {
     try appendInt(alloc, out, u64, request.job_id);
+    try appendRequiredString(alloc, out, request.lease_owner);
     try appendInt(alloc, out, u64, request.completed_row_count);
     try appendRequiredString(alloc, out, request.progress_row_key);
 }
@@ -5383,6 +5390,7 @@ fn appendSchemaRewriteJobInvalidateRequest(
     request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
 ) !void {
     try appendInt(alloc, out, u64, request.job_id);
+    try appendRequiredString(alloc, out, request.lease_owner);
     try appendRequiredString(alloc, out, request.last_error);
 }
 
@@ -6275,11 +6283,14 @@ fn readSchemaRewriteJobFinishRequest(
     pos: *usize,
 ) !metadata_table_manager.SchemaRewriteJobFinishRequest {
     const job_id = try readInt(encoded, pos, u64);
+    const lease_owner = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(lease_owner);
     const completed_row_count = try readInt(encoded, pos, u64);
     const progress_row_key = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(progress_row_key);
     return .{
         .job_id = job_id,
+        .lease_owner = lease_owner,
         .completed_row_count = completed_row_count,
         .progress_row_key = progress_row_key,
     };
@@ -6291,10 +6302,13 @@ fn readSchemaRewriteJobInvalidateRequest(
     pos: *usize,
 ) !metadata_table_manager.SchemaRewriteJobInvalidateRequest {
     const job_id = try readInt(encoded, pos, u64);
+    const lease_owner = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(lease_owner);
     const last_error = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(last_error);
     return .{
         .job_id = job_id,
+        .lease_owner = lease_owner,
         .last_error = last_error,
     };
 }
@@ -7537,6 +7551,7 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
     const finish_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .finish_schema_rewrite_job = .{
             .job_id = 9101,
+            .lease_owner = "worker-a",
             .completed_row_count = 17,
             .progress_row_key = "order:z",
         },
@@ -7566,9 +7581,19 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         },
     });
     defer std.testing.allocator.free(invalidated_cmd);
+    const begin_invalidated_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9103,
+            .lease_owner = "worker-b",
+            .now_ms = 1000,
+            .lease_expires_at_ms = 2000,
+        },
+    });
+    defer std.testing.allocator.free(begin_invalidated_cmd);
     const invalidate_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .invalidate_schema_rewrite_job = .{
             .job_id = 9103,
+            .lease_owner = "worker-b",
             .last_error = "schema generation moved",
         },
     });
@@ -7582,7 +7607,8 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         .{ .term = 1, .index = 5, .entry_type = .normal, .data = removed_cmd },
         .{ .term = 1, .index = 6, .entry_type = .normal, .data = remove_cmd },
         .{ .term = 1, .index = 7, .entry_type = .normal, .data = invalidated_cmd },
-        .{ .term = 1, .index = 8, .entry_type = .normal, .data = invalidate_cmd },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = begin_invalidated_cmd },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = invalidate_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -7591,7 +7617,7 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 41,
-            .commit_index = 8,
+            .commit_index = 9,
             .entries_bytes = encoded_entries,
         });
     }
@@ -7631,6 +7657,67 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         }
     }
     try std.testing.expect(saw_ready and saw_invalid);
+}
+
+test "metadata raft apply store rejects stale schema rewrite lease owners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-schema-rewrite-stale-lease", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "orders",
+            .schema_json = "{\"type\":\"object\"}",
+        },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_schema_rewrite_job = .{
+            .job_id = 9101,
+            .table_id = 41,
+            .schema_generation = 42,
+            .action = "rewrite",
+            .reason = "row_images",
+        },
+    });
+    defer std.testing.allocator.free(rewrite_cmd);
+    const begin_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9101,
+            .lease_owner = "worker-a",
+            .now_ms = 1000,
+            .lease_expires_at_ms = 2000,
+        },
+    });
+    defer std.testing.allocator.free(begin_cmd);
+    const stale_finish_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_schema_rewrite_job = .{
+            .job_id = 9101,
+            .lease_owner = "worker-b",
+            .completed_row_count = 17,
+            .progress_row_key = "order:z",
+        },
+    });
+    defer std.testing.allocator.free(stale_finish_cmd);
+
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = rewrite_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = begin_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = stale_finish_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expectError(error.SchemaRewriteJobLeaseMismatch, store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 4,
+        .entries_bytes = encoded_entries,
+    }));
 }
 
 test "metadata raft apply store promotes secondary index schema with compare and swap" {
@@ -7829,6 +7916,7 @@ test "metadata raft apply store gates table schema compare and swap on rewrite j
     const ready_rewrite_job_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .finish_schema_rewrite_job = .{
             .job_id = 9101,
+            .lease_owner = "worker-a",
             .completed_row_count = 42,
             .progress_row_key = "event:z",
         },
