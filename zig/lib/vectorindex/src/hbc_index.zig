@@ -34,6 +34,7 @@ const vec = @import("antfly_vector").vector;
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_search_probe_stack_capacity = 512;
 const flat_centroid_posting_prefetch_stack_capacity = 512;
+const exact_leaf_fetch_member_stack_capacity = 256;
 const bulk_parent_child_ids_stack_capacity = 256;
 
 fn debugHitFromApprox(item: search_results.ApproxSearchResult) search_types.DebugHit {
@@ -3200,8 +3201,14 @@ fn scoreLeafMemberIds(
         }
     }
 
-    try scratch.ensureMemberIdCapacity(self.alloc, member_ids.len);
-    const fetch_member_ids = scratch.member_ids[0..member_ids.len];
+    var fetch_member_ids_stack: [exact_leaf_fetch_member_stack_capacity]u64 = undefined;
+    const use_fetch_member_ids_stack = member_ids.len <= fetch_member_ids_stack.len;
+    const fetch_member_ids = if (use_fetch_member_ids_stack)
+        fetch_member_ids_stack[0..member_ids.len]
+    else blk: {
+        try scratch.ensureMemberIdCapacity(self.alloc, member_ids.len);
+        break :blk scratch.member_ids[0..member_ids.len];
+    };
     var fetch_count: usize = 0;
     for (member_ids) |member_id| {
         if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {

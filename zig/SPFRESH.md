@@ -981,8 +981,10 @@ implementations cleanly:
    across posting groups. Fresh quantized leaf scoring now reserves only
    distance/error-bound scratch before exact fallback or payload rebuild needs
    the fixed vector-fetch arrays, and exact fallback sizes those fixed fetch
-   arrays by vector-cache misses instead of total leaf members. Posting-delta
-   tail cache entries slab their
+   arrays by vector-cache misses instead of total leaf members. Common exact
+   fallback leaves also collect vector-cache misses on stack scratch before
+   falling back to retained member-id scratch. Posting-delta tail cache entries
+   slab their
    sequence/id/op arrays and discard oversized opportunistic prefetch entries
    instead of retaining large decoded tails in query scratch; prefetch also
    checks value record counts before record decode so oversized tails are
