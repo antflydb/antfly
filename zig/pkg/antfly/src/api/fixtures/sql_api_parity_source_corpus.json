@@ -3549,6 +3549,34 @@
       "sql": "ALTER ROLE app_writer SET app.tenant_id = 'acme'"
     },
     {
+      "name": "unsupported role runtime setting",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=role_setting_plan",
+      "classification_reason": "role_setting_plan",
+      "sql": "ALTER ROLE app_writer SET statement_timeout = '1ms'"
+    },
+    {
+      "name": "unsupported role scoped setting",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=role_setting_plan",
+      "classification_reason": "role_setting_plan",
+      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme'"
+    },
+    {
+      "name": "unsupported role setting reset",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=role_setting_plan",
+      "classification_reason": "role_setting_plan",
+      "sql": "ALTER ROLE app_writer RESET app.tenant_id"
+    },
+    {
+      "name": "unsupported role setting expression value",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=role_setting_plan",
+      "classification_reason": "role_setting_plan",
+      "sql": "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id')"
+    },
+    {
       "name": "drop role catalog ddl",
       "family": "ddl",
       "summary": {

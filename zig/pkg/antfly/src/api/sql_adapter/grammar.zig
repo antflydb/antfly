@@ -4725,8 +4725,9 @@ pub fn parseAlterRoleCatalogTailAlloc(
     const setting_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var setting_transferred = false;
     errdefer if (!setting_transferred) alloc.free(setting_name);
+    if (!std.mem.startsWith(u8, setting_name, "app.")) return error.UnsupportedSqlShape;
     try cursor.expectToken(.eq);
-    if (cursor.atEnd() or cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
+    if (cursor.atEnd() or cursor.peekKind(.semicolon) or !cursor.peekKind(.string)) return error.UnsupportedSqlShape;
     const setting_value = try alloc.dupe(u8, tokens[pos.*].text);
     var value_transferred = false;
     errdefer if (!value_transferred) alloc.free(setting_value);
@@ -8185,15 +8186,25 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(create_role_tokens.items.len, create_role_pos);
     try std.testing.expectEqualStrings("app_writer", create_role.role_name);
 
-    var alter_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app_tenant = 'acme';");
+    var alter_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app.tenant_id = 'acme';");
     defer lexer.freeTokens(alloc, &alter_role_tokens);
     var alter_role_pos: usize = 0;
     var alter_role = try parseAlterRoleCatalogTailAlloc(alloc, alter_role_tokens.items, &alter_role_pos);
     defer alter_role.deinit(alloc);
     try std.testing.expectEqual(alter_role_tokens.items.len, alter_role_pos);
     try std.testing.expectEqualStrings("app_writer", alter_role.role_name);
-    try std.testing.expectEqualStrings("app_tenant", alter_role.setting_name);
+    try std.testing.expectEqualStrings("app.tenant_id", alter_role.setting_name);
     try std.testing.expectEqualStrings("acme", alter_role.setting_value);
+
+    var unsupported_role_setting_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET statement_timeout = '1ms';");
+    defer lexer.freeTokens(alloc, &unsupported_role_setting_tokens);
+    var unsupported_role_setting_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterRoleCatalogTailAlloc(alloc, unsupported_role_setting_tokens.items, &unsupported_role_setting_pos));
+
+    var unsupported_role_value_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');");
+    defer lexer.freeTokens(alloc, &unsupported_role_value_tokens);
+    var unsupported_role_value_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterRoleCatalogTailAlloc(alloc, unsupported_role_value_tokens.items, &unsupported_role_value_pos));
 
     var drop_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE IF EXISTS app_writer;");
     defer lexer.freeTokens(alloc, &drop_role_tokens);

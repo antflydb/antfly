@@ -4942,7 +4942,9 @@ roles define the same setting with different values, effective-setting
 resolution fails closed; a direct user setting for the same key is an explicit
 override. Unsupported role-setting forms such as reset, database-scoped
 settings, and multi-token expressions still fail closed until they have
-explicit native semantics.
+explicit native semantics; the source parity corpus pins unsupported runtime
+setting names, scoped/reset forms, and expression values under
+`role_setting_plan`.
 
 `COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
 to typed bulk import/export intent that captures table identity, selected
