@@ -22608,8 +22608,7 @@ pub const DB = struct {
                     },
                     .percentile_cont, .percentile_disc => {
                         if (spec.distinct) return error.InvalidQueryRequest;
-                        const percentile = spec.percentile orelse return error.InvalidQueryRequest;
-                        if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.InvalidQueryRequest;
+                        try validateRelationalRowsAggregatePercentiles(spec);
                         if (spec.percentile_max_items == 0) return error.InvalidQueryRequest;
                         const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
                         defer alloc.free(value_json);
@@ -22798,20 +22797,23 @@ pub const DB = struct {
             },
             .percentile_cont, .percentile_disc => {
                 if (metric.percentile_samples.items.len == 0) return try writer.writeAll("null");
-                const percentile = spec.percentile orelse return error.InvalidQueryRequest;
-                if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.InvalidQueryRequest;
+                try validateRelationalRowsAggregatePercentiles(spec);
                 std.sort.pdq(
                     f64,
                     metric.percentile_samples.items,
                     spec.percentile_order,
                     relationalRowsAggregateF64OrderedBefore,
                 );
-                const value = switch (spec.op) {
-                    .percentile_cont => relationalRowsPercentileCont(metric.percentile_samples.items, percentile),
-                    .percentile_disc => relationalRowsPercentileDisc(metric.percentile_samples.items, percentile),
-                    else => unreachable,
-                };
-                try writeRelationalRowsAggregateNumberJson(writer, value);
+                if (spec.percentiles.len > 0) {
+                    try writer.writeByte('[');
+                    for (spec.percentiles, 0..) |percentile, i| {
+                        if (i != 0) try writer.writeByte(',');
+                        try writeRelationalRowsPercentileValueJson(writer, spec.op, metric.percentile_samples.items, percentile);
+                    }
+                    try writer.writeByte(']');
+                } else {
+                    try writeRelationalRowsPercentileValueJson(writer, spec.op, metric.percentile_samples.items, spec.percentile.?);
+                }
             },
             .min => if (metric.min_json) |value|
                 try writer.writeAll(value)
@@ -22900,6 +22902,32 @@ pub const DB = struct {
         const rank: usize = @intFromFloat(raw_rank);
         const index = @min(samples.len - 1, rank - 1);
         return samples[index];
+    }
+
+    fn writeRelationalRowsPercentileValueJson(
+        writer: *std.Io.Writer,
+        op: types.RelationalRowsAggregateOp,
+        samples: []const f64,
+        percentile: f64,
+    ) !void {
+        const value = switch (op) {
+            .percentile_cont => relationalRowsPercentileCont(samples, percentile),
+            .percentile_disc => relationalRowsPercentileDisc(samples, percentile),
+            else => return error.InvalidQueryRequest,
+        };
+        try writeRelationalRowsAggregateNumberJson(writer, value);
+    }
+
+    fn validateRelationalRowsAggregatePercentiles(spec: types.RelationalRowsAggregateSpec) !void {
+        const scalar = spec.percentile != null;
+        const array = spec.percentiles.len > 0;
+        if (scalar == array) return error.InvalidQueryRequest;
+        if (scalar) return try validateRelationalRowsAggregatePercentile(spec.percentile.?);
+        for (spec.percentiles) |percentile| try validateRelationalRowsAggregatePercentile(percentile);
+    }
+
+    fn validateRelationalRowsAggregatePercentile(percentile: f64) !void {
+        if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.InvalidQueryRequest;
     }
 
     fn writeRelationalRowsAggregateNumberJson(writer: *std.Io.Writer, value: f64) !void {
@@ -90873,6 +90901,7 @@ test "relational rows aggregate supports bounded percentile continuous metrics" 
         .{ .kind = .field, .field = "amount" },
         .{ .kind = .field, .field = "bonus" },
     };
+    const percentile_set = [_]f64{ 0.25, 0.5, 0.75 };
     const group_by = [_][]const u8{"customer"};
     const aggregations = [_]types.RelationalRowsAggregateSpec{
         .{ .name = "median_amount", .op = .percentile_cont, .field = "amount", .percentile = 0.5, .percentile_max_items = 8 },
@@ -90882,6 +90911,8 @@ test "relational rows aggregate supports bounded percentile continuous metrics" 
         .{ .name = "p50_disc_total", .op = .percentile_disc, .expression = .{ .kind = .add, .operands = amount_bonus_operands[0..] }, .percentile = 0.5, .percentile_max_items = 8 },
         .{ .name = "p25_amount_desc", .op = .percentile_cont, .field = "amount", .percentile = 0.25, .percentile_order = .desc, .percentile_max_items = 8 },
         .{ .name = "p75_disc_amount_desc", .op = .percentile_disc, .field = "amount", .percentile = 0.75, .percentile_order = .desc, .percentile_max_items = 8 },
+        .{ .name = "amount_percentiles", .op = .percentile_cont, .field = "amount", .percentiles = percentile_set[0..], .percentile_max_items = 8 },
+        .{ .name = "disc_amount_percentiles", .op = .percentile_disc, .field = "amount", .percentiles = percentile_set[0..], .percentile_max_items = 8 },
     };
     const order_by = [_]types.RelationalRowsQueryOrder{.{
         .field = "customer",
@@ -90896,8 +90927,8 @@ test "relational rows aggregate supports bounded percentile continuous metrics" 
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"median_amount\":20,\"p25_amount\":15,\"median_total\":22,\"p75_disc_amount\":40,\"p50_disc_total\":22,\"p25_amount_desc\":30,\"p75_disc_amount_desc\":10}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"median_amount\":10,\"p25_amount\":8.5,\"median_total\":12,\"p75_disc_amount\":13,\"p50_disc_total\":8,\"p25_amount_desc\":11.5,\"p75_disc_amount_desc\":7}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"median_amount\":20,\"p25_amount\":15,\"median_total\":22,\"p75_disc_amount\":40,\"p50_disc_total\":22,\"p25_amount_desc\":30,\"p75_disc_amount_desc\":10,\"amount_percentiles\":[15,20,30],\"disc_amount_percentiles\":[10,20,40]}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"median_amount\":10,\"p25_amount\":8.5,\"median_total\":12,\"p75_disc_amount\":13,\"p50_disc_total\":8,\"p25_amount_desc\":11.5,\"p75_disc_amount_desc\":7,\"amount_percentiles\":[8.5,10,11.5],\"disc_amount_percentiles\":[7,7,13]}", result.rows[1]);
 
     const capped_aggregations = [_]types.RelationalRowsAggregateSpec{.{
         .name = "median_amount",

@@ -541,6 +541,7 @@ from .rows_aggregate_result_set import RowsAggregateResultSet
 from .rows_aggregate_result_set_rows_item import RowsAggregateResultSetRowsItem
 from .rows_aggregate_spec import RowsAggregateSpec
 from .rows_aggregate_spec_op import RowsAggregateSpecOp
+from .rows_aggregate_spec_percentile_order import RowsAggregateSpecPercentileOrder
 from .rows_array_length_projection import RowsArrayLengthProjection
 from .rows_array_update_transform import RowsArrayUpdateTransform
 from .rows_array_update_transform_op import RowsArrayUpdateTransformOp
@@ -1273,6 +1274,7 @@ __all__ = (
     "RowsAggregateResultSetRowsItem",
     "RowsAggregateSpec",
     "RowsAggregateSpecOp",
+    "RowsAggregateSpecPercentileOrder",
     "RowsArrayLengthProjection",
     "RowsArrayUpdateTransform",
     "RowsArrayUpdateTransformOp",

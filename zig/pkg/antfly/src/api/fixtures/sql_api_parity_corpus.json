@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 894,
-  "entry_count": 894,
+  "source_entry_count": 895,
+  "entry_count": 895,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4683,11 +4683,22 @@
       "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
     },
     {
-      "name": "unsupported ordered-set multiple percentile aggregate plan",
+      "name": "unsupported ordered-set mode aggregate plan",
       "family": "unsupported_read",
       "plan": "unsupported:read:requires=ordered_set_aggregate_plan",
       "classification_reason": "ordered_set_aggregate_plan",
-      "sql": "SELECT customer_id, percentile_cont([0.25, 0.75]) WITHIN GROUP (ORDER BY amount) AS amount_percentiles FROM usage_records GROUP BY customer_id"
+      "sql": "SELECT customer_id, mode() WITHIN GROUP (ORDER BY status) AS modal_status FROM usage_records GROUP BY customer_id"
+    },
+    {
+      "name": "ordered-set multi-percentile aggregate",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "group_by": 1,
+        "aggregations": 1
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=0:limit=-1:percentile_array=1",
+      "sql": "SELECT customer_id, percentile_cont(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY amount) AS amount_percentiles FROM usage_records GROUP BY customer_id"
     },
     {
       "name": "ordered-set percentile aggregate with explicit null placement",

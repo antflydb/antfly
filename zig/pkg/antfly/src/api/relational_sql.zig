@@ -12692,6 +12692,9 @@ const Parser = struct {
         var string_delimiter_transferred = false;
         errdefer if (!string_delimiter_transferred) if (string_delimiter) |delimiter| self.alloc.free(delimiter);
         var percentile: ?f64 = null;
+        var percentiles: []const f64 = &.{};
+        var percentiles_transferred = false;
+        errdefer if (!percentiles_transferred and percentiles.len > 0) self.alloc.free(percentiles);
         var percentile_order: db_mod.types.RelationalRowsQueryOrderDirection = .asc;
         var array_order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
@@ -12700,7 +12703,9 @@ const Parser = struct {
         }
         if (isSqlPercentileAggregateOp(op)) {
             if (distinct) return error.UnsupportedSqlShape;
-            percentile = try self.parseAggregatePercentileValue();
+            const percentile_argument = try self.parseAggregatePercentileArgumentAlloc();
+            percentile = percentile_argument.percentile;
+            percentiles = percentile_argument.percentiles;
             try self.expect(.rparen);
             try self.expectKeyword("within");
             try self.expectKeyword("group");
@@ -12809,6 +12814,7 @@ const Parser = struct {
         field_transferred = true;
         expression_transferred = true;
         string_delimiter_transferred = true;
+        percentiles_transferred = true;
         filter_transferred = true;
         name_transferred = true;
         return .{
@@ -12819,6 +12825,7 @@ const Parser = struct {
             .distinct = distinct,
             .distinct_max_items = if (distinct) db_mod.types.default_relational_rows_aggregate_distinct_max_items else 0,
             .percentile = percentile,
+            .percentiles = percentiles,
             .percentile_max_items = if (isSqlPercentileAggregateOp(op)) db_mod.types.default_relational_rows_percentile_max_items else 0,
             .percentile_order = percentile_order,
             .array_max_items = if (op == .array_agg or op == .string_agg) default_array_agg_max_items else 0,
@@ -12849,14 +12856,37 @@ const Parser = struct {
         return try self.alloc.dupe(u8, parsed.value.string);
     }
 
-    fn parseAggregatePercentileValue(self: *@This()) !f64 {
-        const value_json = try self.parseJsonValueAlloc();
+    const AggregatePercentileArgument = struct {
+        percentile: ?f64 = null,
+        percentiles: []const f64 = &.{},
+    };
+
+    fn parseAggregatePercentileArgumentAlloc(self: *@This()) !AggregatePercentileArgument {
+        const value_json = if (self.peekKeyword("array"))
+            try self.parseSqlArrayConstructorJsonAlloc()
+        else
+            try self.parseJsonValueAlloc();
         defer self.alloc.free(value_json);
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
         defer parsed.deinit();
+        if (parsed.value == .array) {
+            if (parsed.value.array.items.len == 0) return error.UnsupportedSqlShape;
+            const percentiles = try self.alloc.alloc(f64, parsed.value.array.items.len);
+            errdefer self.alloc.free(percentiles);
+            for (parsed.value.array.items, 0..) |item, i| {
+                const percentile = sqlJsonNumberAsF64(item) orelse return error.UnsupportedSqlShape;
+                try validateSqlAggregatePercentile(percentile);
+                percentiles[i] = percentile;
+            }
+            return .{ .percentiles = percentiles };
+        }
         const percentile = sqlJsonNumberAsF64(parsed.value) orelse return error.UnsupportedSqlShape;
+        try validateSqlAggregatePercentile(percentile);
+        return .{ .percentile = percentile };
+    }
+
+    fn validateSqlAggregatePercentile(percentile: f64) !void {
         if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.UnsupportedSqlShape;
-        return percentile;
     }
 
     fn peekAggregateExpressionInput(self: *@This()) bool {
@@ -26661,7 +26691,7 @@ const Parser = struct {
                 .name = aggregation.name,
                 .path = aggregation.name,
                 .field_type = try self.aggregateOutputType(aggregation),
-                .array_item_type = if (aggregation.op == .array_agg) .keyword else null,
+                .array_item_type = try self.aggregateOutputArrayItemType(aggregation),
                 .nullable = false,
             };
             initialized += 1;
@@ -26676,10 +26706,20 @@ const Parser = struct {
         return switch (aggregation.op) {
             .array_agg => .array,
             .string_agg => .keyword,
-            .count, .sum, .avg, .percentile_cont, .percentile_disc => .numeric,
+            .percentile_cont, .percentile_disc => if (aggregation.percentiles.len > 0) .array else .numeric,
+            .count, .sum, .avg => .numeric,
             .min, .max => try self.aggregateInputType(aggregation),
             .bool_or, .bool_and => .boolean,
         };
+    }
+
+    fn aggregateOutputArrayItemType(
+        self: *@This(),
+        aggregation: db_mod.types.RelationalRowsAggregateSpec,
+    ) !?runtime_schema.AntflyType {
+        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentiles.len > 0) return .numeric;
+        if (aggregation.op != .array_agg) return null;
+        return try self.aggregateInputType(aggregation);
     }
 
     fn aggregateInputType(
@@ -34066,6 +34106,7 @@ fn aggregateSpecsEquivalent(
     if (lhs.percentile == null or rhs.percentile == null) {
         if (lhs.percentile != null or rhs.percentile != null) return false;
     } else if (lhs.percentile.? != rhs.percentile.?) return false;
+    if (!floatSlicesEqual(lhs.percentiles, rhs.percentiles)) return false;
     if (!optionalStringEqual(lhs.field, rhs.field)) return false;
     if (!optionalStringEqual(lhs.string_delimiter, rhs.string_delimiter)) return false;
     if (!optionalExpressionEqual(lhs.expression, rhs.expression)) return false;
@@ -34089,6 +34130,14 @@ fn aggregateSpecsEquivalent(
 fn optionalStringEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
     return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+fn floatSlicesEqual(lhs: []const f64, rhs: []const f64) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (left != right) return false;
+    }
+    return true;
 }
 
 fn optionalExpressionEqual(lhs: ?db_mod.types.RelationalRowsExpression, rhs: ?db_mod.types.RelationalRowsExpression) bool {
@@ -38373,6 +38422,7 @@ fn freeAggregateSpec(alloc: std.mem.Allocator, spec: db_mod.types.RelationalRows
     alloc.free(spec.name);
     if (spec.field) |field| alloc.free(field);
     if (spec.expression) |expression| freeExpression(alloc, expression);
+    if (spec.percentiles.len > 0) alloc.free(spec.percentiles);
     if (spec.string_delimiter) |delimiter| alloc.free(delimiter);
     freeOrderBy(alloc, spec.array_order_by);
     if (spec.array_order_by.len > 0) alloc.free(spec.array_order_by);
@@ -50213,6 +50263,23 @@ test "postgres sql adapter lowers exact percentile continuous aggregates" {
     try std.testing.expectEqual(@as(f64, 0.5), explicit_nulls.aggregate.aggregations[0].percentile.?);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, explicit_nulls.aggregate.aggregations[0].percentile_order);
 
+    var multi_fraction = try lowerAggregateAlloc(
+        alloc,
+        "SELECT percentile_cont(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY amount) AS amount_percentiles FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer multi_fraction.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), multi_fraction.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, multi_fraction.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("amount_percentiles", multi_fraction.aggregate.aggregations[0].name);
+    try std.testing.expectEqualStrings("amount", multi_fraction.aggregate.aggregations[0].field.?);
+    try std.testing.expect(multi_fraction.aggregate.aggregations[0].percentile == null);
+    try std.testing.expectEqual(@as(usize, 3), multi_fraction.aggregate.aggregations[0].percentiles.len);
+    try std.testing.expectEqual(@as(f64, 0.25), multi_fraction.aggregate.aggregations[0].percentiles[0]);
+    try std.testing.expectEqual(@as(f64, 0.5), multi_fraction.aggregate.aggregations[0].percentiles[1]);
+    try std.testing.expectEqual(@as(f64, 0.75), multi_fraction.aggregate.aggregations[0].percentiles[2]);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
         alloc,
         "SELECT percentile_cont([0.25, 0.75]) WITHIN GROUP (ORDER BY amount) AS bad FROM usage_records",
@@ -55118,6 +55185,14 @@ fn aggregateDescendingPercentileCount(aggregations: []const db_mod.types.Relatio
     return count;
 }
 
+fn aggregatePercentileArrayCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentiles.len > 0) count += 1;
+    }
+    return count;
+}
+
 fn windowValueExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
     var count: usize = 0;
     for (windows) |window| {
@@ -57516,6 +57591,7 @@ fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggregate
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_json", filter_json_access);
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_structured", filter_structured_access);
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_in", source.in_predicates.len);
         return try appendSourceQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, source);
     }
@@ -57544,6 +57620,7 @@ fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggregate
         );
         var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "order_expr", expressionOrderCount(lowered.aggregate.order_by));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
         fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_in", source.in_predicates.len);
         return try appendSourceQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, source);
     }
@@ -57566,6 +57643,7 @@ fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggregate
     );
     var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "order_expr", expressionOrderCount(lowered.aggregate.order_by));
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_in", source.in_predicates.len);
     return try appendSourceQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, source);
 }

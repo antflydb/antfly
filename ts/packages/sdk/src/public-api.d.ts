@@ -5186,15 +5186,35 @@ export interface components {
         RowsAggregateSpec: {
             name: string;
             /** @enum {string} */
-            op: "count" | "sum" | "min" | "max" | "avg" | "array_agg";
+            op: "count" | "sum" | "min" | "max" | "avg" | "array_agg" | "string_agg" | "percentile_cont" | "percentile_disc" | "bool_or" | "bool_and";
             field?: string;
             expr?: components["schemas"]["RowsExpression"];
             distinct?: boolean;
             /** Format: int64 */
             distinct_max_items?: number;
+            /**
+             * Format: double
+             * @description Fraction for percentile_cont and percentile_disc aggregate specs.
+             */
+            percentile?: number;
+            /** @description Fractions for array-valued percentile_cont and percentile_disc aggregate specs. */
+            percentiles?: number[];
+            /**
+             * Format: int64
+             * @description Maximum bounded per-group sample count for percentile_cont and percentile_disc.
+             */
+            percentile_max_items?: number;
+            /**
+             * @description Ordered-set sample direction for percentile_cont and percentile_disc.
+             * @default asc
+             * @enum {string}
+             */
+            percentile_order?: "asc" | "desc";
             /** Format: int64 */
             array_max_items?: number;
             array_order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** @description Delimiter for string_agg aggregate specs. */
+            delimiter?: string;
             filter?: components["schemas"]["RowsWhere"];
             /** @description Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`. */
             filter_array_any?: components["schemas"]["RowsWhereAtom"][];

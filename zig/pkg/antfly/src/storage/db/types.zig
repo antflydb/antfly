@@ -1909,6 +1909,7 @@ pub const RelationalRowsAggregateSpec = struct {
     distinct: bool = false,
     distinct_max_items: u32 = default_relational_rows_aggregate_distinct_max_items,
     percentile: ?f64 = null,
+    percentiles: []const f64 = &.{},
     percentile_max_items: u32 = 0,
     percentile_order: RelationalRowsQueryOrderDirection = .asc,
     array_max_items: u32 = 0,
@@ -1954,6 +1955,7 @@ pub const RelationalRowsAggregateRequest = struct {
         for (self.aggregations) |aggregation| {
             alloc.free(aggregation.name);
             if (aggregation.field) |field| alloc.free(field);
+            if (aggregation.percentiles.len > 0) alloc.free(aggregation.percentiles);
             if (aggregation.string_delimiter) |delimiter| alloc.free(delimiter);
             if (aggregation.expression) |expression| freeRelationalRowsExpression(alloc, expression);
             for (aggregation.array_order_by) |order| {

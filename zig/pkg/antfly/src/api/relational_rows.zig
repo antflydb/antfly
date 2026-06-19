@@ -6027,7 +6027,7 @@ fn parseRowsAggregateSpecAlloc(
     value: std.json.Value,
 ) !db_mod.types.RelationalRowsAggregateSpec {
     if (value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(value.object, &.{ "name", "op", "field", "expr", "distinct", "distinct_max_items", "percentile", "percentile_max_items", "percentile_order", "array_max_items", "array_order_by", "delimiter", "filter", "filter_array_any", "filter_array_contains", "filter_array_eq", "filter_in", "filter_json_contains", "filter_json_path_eq", "filter_json_path_exists", "filter_text_patterns", "filter_expressions", "filter_expression_array_contains", "filter_any", "filter_not" });
+    try requireJsonObjectOnlyKeys(value.object, &.{ "name", "op", "field", "expr", "distinct", "distinct_max_items", "percentile", "percentiles", "percentile_max_items", "percentile_order", "array_max_items", "array_order_by", "delimiter", "filter", "filter_array_any", "filter_array_contains", "filter_array_eq", "filter_in", "filter_json_contains", "filter_json_path_eq", "filter_json_path_exists", "filter_text_patterns", "filter_expressions", "filter_expression_array_contains", "filter_any", "filter_not" });
     const name_value = value.object.get("name") orelse return error.InvalidRowsRequest;
     const op_value = value.object.get("op") orelse return error.InvalidRowsRequest;
     if (name_value != .string or name_value.string.len == 0) return error.InvalidRowsRequest;
@@ -6071,12 +6071,23 @@ fn parseRowsAggregateSpecAlloc(
     };
     if (distinct and distinct_max_items == 0) return error.InvalidRowsRequest;
 
+    var percentiles: []const f64 = &.{};
+    var percentiles_transferred = false;
+    errdefer if (!percentiles_transferred and percentiles.len > 0) alloc.free(percentiles);
     const percentile: ?f64 = if (isRowsPercentileAggregateOp(op)) blk: {
-        const parsed = try parseOptionalF64(value.object.get("percentile")) orelse return error.InvalidRowsRequest;
-        if (!std.math.isFinite(parsed) or parsed < 0 or parsed > 1) return error.InvalidRowsRequest;
+        const percentile_value = value.object.get("percentile");
+        const percentiles_value = value.object.get("percentiles");
+        if (percentile_value != null and percentiles_value != null) return error.InvalidRowsRequest;
+        if (percentiles_value) |raw_percentiles| {
+            percentiles = try parseRowsPercentilesAlloc(alloc, raw_percentiles);
+            break :blk null;
+        }
+        const parsed = try parseOptionalF64(percentile_value) orelse return error.InvalidRowsRequest;
+        try validateRowsPercentile(parsed);
         break :blk parsed;
     } else blk: {
         if (value.object.get("percentile") != null) return error.InvalidRowsRequest;
+        if (value.object.get("percentiles") != null) return error.InvalidRowsRequest;
         break :blk null;
     };
     const percentile_max_items = if (isRowsPercentileAggregateOp(op))
@@ -6170,6 +6181,7 @@ fn parseRowsAggregateSpecAlloc(
     name_transferred = true;
     field_transferred = true;
     expression_transferred = true;
+    percentiles_transferred = true;
     array_order_transferred = true;
     delimiter_transferred = true;
     return .{
@@ -6180,6 +6192,7 @@ fn parseRowsAggregateSpecAlloc(
         .distinct = distinct,
         .distinct_max_items = distinct_max_items,
         .percentile = percentile,
+        .percentiles = percentiles,
         .percentile_max_items = percentile_max_items,
         .percentile_order = percentile_order,
         .array_max_items = array_max_items,
@@ -6226,6 +6239,27 @@ fn parseRowsAggregatePercentileOrder(value: ?std.json.Value) !RowsQueryOrderDire
     if (std.mem.eql(u8, direction_value.string, "asc")) return .asc;
     if (std.mem.eql(u8, direction_value.string, "desc")) return .desc;
     return error.InvalidRowsRequest;
+}
+
+fn parseRowsPercentilesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const f64 {
+    if (value != .array or value.array.items.len == 0) return error.InvalidRowsRequest;
+    const percentiles = try alloc.alloc(f64, value.array.items.len);
+    errdefer alloc.free(percentiles);
+    for (value.array.items, 0..) |item, i| {
+        const parsed = switch (item) {
+            .integer => |number| @as(f64, @floatFromInt(number)),
+            .float => |number| number,
+            .number_string => |number| std.fmt.parseFloat(f64, number) catch return error.InvalidRowsRequest,
+            else => return error.InvalidRowsRequest,
+        };
+        try validateRowsPercentile(parsed);
+        percentiles[i] = parsed;
+    }
+    return percentiles;
+}
+
+fn validateRowsPercentile(value: f64) !void {
+    if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidRowsRequest;
 }
 
 fn validateRowsAggregateFieldInput(
@@ -7428,7 +7462,8 @@ fn rowsAggregateOutputType(
     return switch (aggregation.op) {
         .array_agg => .array,
         .string_agg => .keyword,
-        .count, .sum, .avg, .percentile_cont, .percentile_disc => .numeric,
+        .percentile_cont, .percentile_disc => if (aggregation.percentiles.len > 0) .array else .numeric,
+        .count, .sum, .avg => .numeric,
         .min, .max => try rowsAggregateInputType(alloc, schema, aggregation),
         .bool_or, .bool_and => .boolean,
     };
@@ -7461,6 +7496,7 @@ fn rowsAggregateOutputArrayItemType(
     schema: runtime_schema.TableSchema,
     aggregation: db_mod.types.RelationalRowsAggregateSpec,
 ) !?runtime_schema.AntflyType {
+    if (isRowsPercentileAggregateOp(aggregation.op) and aggregation.percentiles.len > 0) return .numeric;
     if (aggregation.op != .array_agg) return null;
     if (aggregation.field) |field| {
         const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
@@ -15105,6 +15141,7 @@ fn freeRowsAggregateSpecs(alloc: std.mem.Allocator, specs: []const db_mod.types.
 fn freeRowsAggregateSpec(alloc: std.mem.Allocator, spec: db_mod.types.RelationalRowsAggregateSpec) void {
     alloc.free(spec.name);
     if (spec.field) |field| alloc.free(field);
+    if (spec.percentiles.len > 0) alloc.free(spec.percentiles);
     if (spec.string_delimiter) |delimiter| alloc.free(delimiter);
     if (spec.expression) |expression| freeRowsQueryExpression(alloc, expression);
     freeRowsQueryOrder(alloc, spec.array_order_by);
@@ -20502,7 +20539,7 @@ test "relational rows batch returning materializes defaults generated columns an
     );
     defer update_batch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), update_batch.transforms.len);
-    try std.testing.expectEqual(@as(usize, 4), update_batch.transforms[0].operations.len);
+    try std.testing.expectEqual(@as(usize, 5), update_batch.transforms[0].operations.len);
     try std.testing.expectEqualStrings("email", update_batch.transforms[0].operations[0].path);
     try std.testing.expectEqualStrings("\"GRACE@EXAMPLE.TEST\"", update_batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqualStrings("email_key", update_batch.transforms[0].operations[1].path);
@@ -20511,6 +20548,8 @@ test "relational rows batch returning materializes defaults generated columns an
     try std.testing.expectEqualStrings("\"GRACE@EXAMPLE.TEST\"", update_batch.transforms[0].operations[2].value_json.?);
     try std.testing.expectEqualStrings("email_md5_key", update_batch.transforms[0].operations[3].path);
     try std.testing.expectEqualStrings("\"adc0884981e59dd44735764748d12211\"", update_batch.transforms[0].operations[3].value_json.?);
+    try std.testing.expectEqualStrings("status_expr_key", update_batch.transforms[0].operations[4].path);
+    try std.testing.expectEqualStrings("\"active\"", update_batch.transforms[0].operations[4].value_json.?);
     try std.testing.expectEqual(@as(usize, 1), update_batch.predicates.len);
     try std.testing.expectEqual(@as(u64, 9), update_batch.predicates[0].expected_version);
     try std.testing.expectEqual(@as(usize, 1), update_batch.returning_rows.len);
@@ -20528,7 +20567,7 @@ test "relational rows batch returning materializes defaults generated columns an
     try std.testing.expectEqual(@as(usize, 0), rewrite_batch.writes.len);
     try std.testing.expectEqual(@as(usize, 1), rewrite_batch.relational_identity_rewrites.len);
     try std.testing.expect(!std.mem.eql(u8, rewrite_batch.relational_identity_rewrites[0].old_key, rewrite_batch.relational_identity_rewrites[0].new_key));
-    try std.testing.expectEqualStrings("{\"id\":\"u2\",\"email\":\"LINDA@EXAMPLE.TEST\",\"status\":\"active\",\"amount\":1,\"email_key\":\"linda@example.test\",\"email_upper_key\":\"LINDA@EXAMPLE.TEST\",\"email_md5_key\":\"d0b11fc0e81f5560aef7946b6125c660\"}", rewrite_batch.relational_identity_rewrites[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"u2\",\"email\":\"LINDA@EXAMPLE.TEST\",\"status\":\"active\",\"amount\":1,\"email_key\":\"linda@example.test\",\"email_upper_key\":\"LINDA@EXAMPLE.TEST\",\"email_md5_key\":\"d0b11fc0e81f5560aef7946b6125c660\",\"status_expr_key\":\"active\"}", rewrite_batch.relational_identity_rewrites[0].value);
     try std.testing.expectEqual(@as(usize, 2), rewrite_batch.predicates.len);
     try std.testing.expectEqual(@as(u64, 9), rewrite_batch.predicates[0].expected_version);
     try std.testing.expectEqual(@as(u64, 0), rewrite_batch.predicates[1].expected_version);
@@ -22317,11 +22356,11 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
 
     var percentile_request = try parseRowsAggregateRequest(
         std.testing.allocator,
-        "{\"aggregations\":[{\"name\":\"median_amount\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":0.5,\"percentile_max_items\":128},{\"name\":\"p90_net\",\"op\":\"percentile_cont\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]},\"percentile\":0.9,\"percentile_order\":\"desc\"},{\"name\":\"p75_amount\",\"op\":\"percentile_disc\",\"field\":\"amount\",\"percentile\":0.75,\"percentile_max_items\":64,\"percentile_order\":\"asc\"}]}",
+        "{\"aggregations\":[{\"name\":\"median_amount\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":0.5,\"percentile_max_items\":128},{\"name\":\"p90_net\",\"op\":\"percentile_cont\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]},\"percentile\":0.9,\"percentile_order\":\"desc\"},{\"name\":\"p75_amount\",\"op\":\"percentile_disc\",\"field\":\"amount\",\"percentile\":0.75,\"percentile_max_items\":64,\"percentile_order\":\"asc\"},{\"name\":\"amount_percentiles\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentiles\":[0.25,0.5,0.75]}]}",
         schema,
     );
     defer percentile_request.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), percentile_request.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 4), percentile_request.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, percentile_request.aggregations[0].op);
     try std.testing.expectEqualStrings("amount", percentile_request.aggregations[0].field.?);
     try std.testing.expectEqual(@as(f64, 0.5), percentile_request.aggregations[0].percentile.?);
@@ -22335,6 +22374,11 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectEqual(@as(f64, 0.75), percentile_request.aggregations[2].percentile.?);
     try std.testing.expectEqual(@as(u32, 64), percentile_request.aggregations[2].percentile_max_items);
     try std.testing.expectEqual(RowsQueryOrderDirection.asc, percentile_request.aggregations[2].percentile_order);
+    try std.testing.expect(percentile_request.aggregations[3].percentile == null);
+    try std.testing.expectEqual(@as(usize, 3), percentile_request.aggregations[3].percentiles.len);
+    try std.testing.expectEqual(@as(f64, 0.25), percentile_request.aggregations[3].percentiles[0]);
+    try std.testing.expectEqual(@as(f64, 0.5), percentile_request.aggregations[3].percentiles[1]);
+    try std.testing.expectEqual(@as(f64, 0.75), percentile_request.aggregations[3].percentiles[2]);
     const percentile_output_columns = try rowsAggregateOutputColumnsAlloc(
         std.testing.allocator,
         schema,
@@ -22347,6 +22391,8 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expect(findRelationalColumn(percentile_output_columns, "median_amount").?.nullable);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, findRelationalColumn(percentile_output_columns, "p75_amount").?.field_type);
     try std.testing.expect(findRelationalColumn(percentile_output_columns, "p75_amount").?.nullable);
+    try std.testing.expectEqual(runtime_schema.AntflyType.array, findRelationalColumn(percentile_output_columns, "amount_percentiles").?.field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, findRelationalColumn(percentile_output_columns, "amount_percentiles").?.array_item_type.?);
 
     var group_expression_array_request = try parseRowsAggregateRequest(
         std.testing.allocator,
@@ -22415,6 +22461,16 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
         std.testing.allocator,
         "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":1.5}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentiles\":[]}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":0.5,\"percentiles\":[0.25]}]}",
         schema,
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(

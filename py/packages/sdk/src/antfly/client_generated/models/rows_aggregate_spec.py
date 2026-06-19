@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 
 from ..models.rows_aggregate_spec_op import RowsAggregateSpecOp
+from ..models.rows_aggregate_spec_percentile_order import RowsAggregateSpecPercentileOrder
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -42,8 +43,16 @@ class RowsAggregateSpec:
             expressions use the default row source.
         distinct (bool | Unset):
         distinct_max_items (int | Unset):
+        percentile (float | Unset): Fraction for percentile_cont and percentile_disc aggregate specs.
+        percentiles (list[float] | Unset): Fractions for array-valued percentile_cont and percentile_disc aggregate
+            specs.
+        percentile_max_items (int | Unset): Maximum bounded per-group sample count for percentile_cont and
+            percentile_disc.
+        percentile_order (RowsAggregateSpecPercentileOrder | Unset): Ordered-set sample direction for percentile_cont
+            and percentile_disc. Default: RowsAggregateSpecPercentileOrder.ASC.
         array_max_items (int | Unset):
         array_order_by (list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset):
+        delimiter (str | Unset): Delimiter for string_agg aggregate specs.
         filter_ (Any | RowsWhereType0 | Unset): Canonical row predicate tree. A top-level `where` is one predicate
             atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an
             `all` conjunction plus branch groups. Branches may contain scalar,
@@ -81,8 +90,13 @@ class RowsAggregateSpec:
     expr: RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset = UNSET
     distinct: bool | Unset = UNSET
     distinct_max_items: int | Unset = UNSET
+    percentile: float | Unset = UNSET
+    percentiles: list[float] | Unset = UNSET
+    percentile_max_items: int | Unset = UNSET
+    percentile_order: RowsAggregateSpecPercentileOrder | Unset = RowsAggregateSpecPercentileOrder.ASC
     array_max_items: int | Unset = UNSET
     array_order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
+    delimiter: str | Unset = UNSET
     filter_: Any | RowsWhereType0 | Unset = UNSET
     filter_array_any: list[RowsWhereAtom] | Unset = UNSET
     filter_array_contains: list[RowsWhereAtom] | Unset = UNSET
@@ -123,6 +137,18 @@ class RowsAggregateSpec:
 
         distinct_max_items = self.distinct_max_items
 
+        percentile = self.percentile
+
+        percentiles: list[float] | Unset = UNSET
+        if not isinstance(self.percentiles, Unset):
+            percentiles = self.percentiles
+
+        percentile_max_items = self.percentile_max_items
+
+        percentile_order: str | Unset = UNSET
+        if not isinstance(self.percentile_order, Unset):
+            percentile_order = self.percentile_order.value
+
         array_max_items = self.array_max_items
 
         array_order_by: list[dict[str, Any]] | Unset = UNSET
@@ -136,6 +162,8 @@ class RowsAggregateSpec:
                     array_order_by_item = array_order_by_item_data.to_dict()
 
                 array_order_by.append(array_order_by_item)
+
+        delimiter = self.delimiter
 
         filter_: Any | dict[str, Any] | Unset
         if isinstance(self.filter_, Unset):
@@ -245,10 +273,20 @@ class RowsAggregateSpec:
             field_dict["distinct"] = distinct
         if distinct_max_items is not UNSET:
             field_dict["distinct_max_items"] = distinct_max_items
+        if percentile is not UNSET:
+            field_dict["percentile"] = percentile
+        if percentiles is not UNSET:
+            field_dict["percentiles"] = percentiles
+        if percentile_max_items is not UNSET:
+            field_dict["percentile_max_items"] = percentile_max_items
+        if percentile_order is not UNSET:
+            field_dict["percentile_order"] = percentile_order
         if array_max_items is not UNSET:
             field_dict["array_max_items"] = array_max_items
         if array_order_by is not UNSET:
             field_dict["array_order_by"] = array_order_by
+        if delimiter is not UNSET:
+            field_dict["delimiter"] = delimiter
         if filter_ is not UNSET:
             field_dict["filter"] = filter_
         if filter_array_any is not UNSET:
@@ -329,6 +367,19 @@ class RowsAggregateSpec:
 
         distinct_max_items = d.pop("distinct_max_items", UNSET)
 
+        percentile = d.pop("percentile", UNSET)
+
+        percentiles = cast(list[float], d.pop("percentiles", UNSET))
+
+        percentile_max_items = d.pop("percentile_max_items", UNSET)
+
+        _percentile_order = d.pop("percentile_order", UNSET)
+        percentile_order: RowsAggregateSpecPercentileOrder | Unset
+        if isinstance(_percentile_order, Unset):
+            percentile_order = UNSET
+        else:
+            percentile_order = RowsAggregateSpecPercentileOrder(_percentile_order)
+
         array_max_items = d.pop("array_max_items", UNSET)
 
         _array_order_by = d.pop("array_order_by", UNSET)
@@ -355,6 +406,8 @@ class RowsAggregateSpec:
                 array_order_by_item = _parse_array_order_by_item(array_order_by_item_data)
 
                 array_order_by.append(array_order_by_item)
+
+        delimiter = d.pop("delimiter", UNSET)
 
         def _parse_filter_(data: object) -> Any | RowsWhereType0 | Unset:
             if isinstance(data, Unset):
@@ -488,8 +541,13 @@ class RowsAggregateSpec:
             expr=expr,
             distinct=distinct,
             distinct_max_items=distinct_max_items,
+            percentile=percentile,
+            percentiles=percentiles,
+            percentile_max_items=percentile_max_items,
+            percentile_order=percentile_order,
             array_max_items=array_max_items,
             array_order_by=array_order_by,
+            delimiter=delimiter,
             filter_=filter_,
             filter_array_any=filter_array_any,
             filter_array_contains=filter_array_contains,

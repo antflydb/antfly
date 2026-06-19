@@ -3723,6 +3723,8 @@ pub const RowsAggregateSpec = struct {
     distinct_max_items: ?i64 = null,
     /// Fraction for percentile_cont and percentile_disc aggregate specs.
     percentile: ?f64 = null,
+    /// Fractions for array-valued percentile_cont and percentile_disc aggregate specs.
+    percentiles: ?[]const f64 = null,
     /// Maximum bounded per-group sample count for percentile_cont and percentile_disc.
     percentile_max_items: ?i64 = null,
     /// Ordered-set sample direction for percentile_cont and percentile_disc.

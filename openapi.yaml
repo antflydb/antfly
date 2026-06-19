@@ -11934,6 +11934,15 @@ components:
           minimum: 0
           maximum: 1
           description: Fraction for percentile_cont and percentile_disc aggregate specs.
+        percentiles:
+          type: array
+          minItems: 1
+          items:
+            type: number
+            format: double
+            minimum: 0
+            maximum: 1
+          description: Fractions for array-valued percentile_cont and percentile_disc aggregate specs.
         percentile_max_items:
           type: integer
           format: int64
