@@ -2060,7 +2060,7 @@ pub const ApiHttpServer = struct {
                 self.ardCatalogOptions(mode, uri_parts.query, authenticated_identity),
                 extension_context,
             );
-            return try self.ardCatalogResponse(200, body, true);
+            return try self.ardCatalogResponse(200, body, mode == .public_bootstrap);
         }
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
@@ -10426,6 +10426,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     });
     defer authorized_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), authorized_well_known.status);
+    try std.testing.expectEqual(@as(usize, 0), authorized_well_known.headers.len);
     try std.testing.expect(std.mem.indexOf(u8, authorized_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 
     var forbidden_spec = try server.handle(.{
@@ -10539,6 +10540,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     });
     defer public_flag_authenticated_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_flag_authenticated_well_known.status);
+    try std.testing.expectEqual(@as(usize, 0), public_flag_authenticated_well_known.headers.len);
     try std.testing.expect(std.mem.indexOf(u8, public_flag_authenticated_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 }
 
