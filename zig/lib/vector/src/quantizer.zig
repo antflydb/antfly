@@ -192,6 +192,76 @@ pub const RaBitQuantizer = struct {
         };
     }
 
+    pub fn quantizeFromSource(
+        self: *const RaBitQuantizer,
+        centroid: []const f32,
+        source: anytype,
+    ) !proto.RaBitQuantizedVectorSet {
+        const count = source.count();
+        const width = rabitq.codeWidth(self.dims);
+
+        const codes = try self.alloc.alloc(u64, count * width);
+        errdefer self.alloc.free(codes);
+        const code_counts = try self.alloc.alloc(u32, count);
+        errdefer self.alloc.free(code_counts);
+        const centroid_distances = try self.alloc.alloc(f32, count);
+        errdefer self.alloc.free(centroid_distances);
+        const quantized_dot_products = try self.alloc.alloc(f32, count);
+        errdefer self.alloc.free(quantized_dot_products);
+
+        var centroid_dot_products: []f32 = &.{};
+        errdefer if (centroid_dot_products.len != 0) self.alloc.free(centroid_dot_products);
+        if (self.distance_metric != .l2_squared) {
+            centroid_dot_products = try self.alloc.alloc(f32, count);
+        }
+
+        const temp_diff = try self.alloc.alloc(f32, self.dims);
+        defer self.alloc.free(temp_diff);
+
+        for (0..count) |i| {
+            const v = source.vectorAt(i);
+            std.debug.assert(v.len == self.dims);
+
+            vec.subTo(temp_diff, v, centroid);
+            const dist = vec.norm(temp_diff);
+            centroid_distances[i] = dist;
+            if (dist != 0) vec.scale(1.0 / dist, temp_diff);
+
+            rabitq.quantizeVectors(
+                temp_diff,
+                codes[i * width ..][0..width],
+                quantized_dot_products[i..][0..1],
+                code_counts[i..][0..1],
+                self.sqrt_dims_inv,
+                1,
+                self.dims,
+                width,
+            );
+
+            if (self.distance_metric != .l2_squared) {
+                centroid_dot_products[i] = vec.dot(v, centroid);
+            }
+        }
+
+        const centroid_norm: f32 = if (self.distance_metric != .l2_squared) vec.norm(centroid) else 0;
+        const centroid_copy = try self.alloc.dupe(f32, centroid);
+
+        return .{
+            .metric = self.distance_metric,
+            .centroid = centroid_copy,
+            .codes = .{
+                .count = @intCast(count),
+                .width = @intCast(width),
+                .data = codes,
+            },
+            .code_counts = code_counts,
+            .centroid_distances = centroid_distances,
+            .quantized_dot_products = quantized_dot_products,
+            .centroid_dot_products = centroid_dot_products,
+            .centroid_norm = centroid_norm,
+        };
+    }
+
     pub fn quantizeInto(
         self: *const RaBitQuantizer,
         qs: *proto.RaBitQuantizedVectorSet,
@@ -585,6 +655,55 @@ test "RaBitQuantizer distinct vectors" {
     try q.estimateDistances(&qs, vectors[0..64], &distances, &error_bounds);
 
     try std.testing.expect(distances[0] < distances[1]);
+}
+
+test "RaBitQuantizer source quantization matches contiguous vectors" {
+    const alloc = std.testing.allocator;
+
+    var q = try RaBitQuantizer.init(alloc, 2, 42, .cosine);
+    defer q.deinit();
+
+    var centroid = [_]f32{ 1.0, 1.0 };
+    _ = vec.normalize(&centroid);
+    const vectors = [_]f32{
+        1.0,        0.0,
+        0.0,        1.0,
+        0.70710677, 0.70710677,
+    };
+
+    const Source = struct {
+        vectors: []const f32,
+        dims: usize,
+        total_count: usize,
+
+        fn count(self: @This()) usize {
+            return self.total_count;
+        }
+
+        fn vectorAt(self: @This(), index: usize) []const f32 {
+            return self.vectors[index * self.dims ..][0..self.dims];
+        }
+    };
+
+    var contiguous = try q.quantize(&centroid, &vectors, 3);
+    defer contiguous.deinit(alloc);
+    var sourced = try q.quantizeFromSource(&centroid, Source{
+        .vectors = &vectors,
+        .dims = 2,
+        .total_count = 3,
+    });
+    defer sourced.deinit(alloc);
+
+    try std.testing.expectEqual(contiguous.metric, sourced.metric);
+    try std.testing.expectEqualSlices(f32, contiguous.centroid, sourced.centroid);
+    try std.testing.expectEqual(contiguous.codes.count, sourced.codes.count);
+    try std.testing.expectEqual(contiguous.codes.width, sourced.codes.width);
+    try std.testing.expectEqualSlices(u64, contiguous.codes.data, sourced.codes.data);
+    try std.testing.expectEqualSlices(u32, contiguous.code_counts, sourced.code_counts);
+    try std.testing.expectEqualSlices(f32, contiguous.centroid_distances, sourced.centroid_distances);
+    try std.testing.expectEqualSlices(f32, contiguous.quantized_dot_products, sourced.quantized_dot_products);
+    try std.testing.expectEqualSlices(f32, contiguous.centroid_dot_products, sourced.centroid_dot_products);
+    try std.testing.expectEqual(contiguous.centroid_norm, sourced.centroid_norm);
 }
 
 test "RaBitQuantizer centroid query matches inner product centroid distances" {

@@ -84,6 +84,36 @@ pub const FlatCentroidDirectory = struct {
     }
 };
 
+const FlatCentroidBlocksVectorSource = struct {
+    blocks: []const FlatCentroidBlock,
+    dims: usize,
+    total_count: usize,
+
+    pub fn count(self: FlatCentroidBlocksVectorSource) usize {
+        return self.total_count;
+    }
+
+    pub fn vectorAt(self: FlatCentroidBlocksVectorSource, index: usize) []const f32 {
+        var lo: usize = 0;
+        var hi: usize = self.blocks.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const block = &self.blocks[mid];
+            const block_start = block.posting_offset;
+            const block_end = block_start + block.posting_ids.len;
+            if (index < block_start) {
+                hi = mid;
+            } else if (index >= block_end) {
+                lo = mid + 1;
+            } else {
+                const entry_index = index - block_start;
+                return block.centroids[entry_index * self.dims ..][0..self.dims];
+            }
+        }
+        unreachable;
+    }
+};
+
 pub const FlatCentroidProbe = struct {
     posting_id: u64,
     parent: u64 = 0,
@@ -809,13 +839,11 @@ fn finalizeFlatCentroidDirectory(
         errdefer if (coarse_quantized) |*coarse| coarse.deinit(self.alloc);
 
         if (shouldBuildGlobalPostingQuantized(self, owned_blocks.len, posting_count)) {
-            const posting_centroids = try self.alloc.alloc(f32, posting_count * dims);
-            defer self.alloc.free(posting_centroids);
-            for (owned_blocks) |*block| {
-                const start = block.posting_offset * dims;
-                @memcpy(posting_centroids[start..][0..block.centroids.len], block.centroids);
-            }
-            posting_quantized = try self.quantizer.quantize(zero, posting_centroids, posting_count);
+            posting_quantized = try self.quantizer.quantizeFromSource(zero, FlatCentroidBlocksVectorSource{
+                .blocks = owned_blocks,
+                .dims = dims,
+                .total_count = posting_count,
+            });
         }
     }
 
