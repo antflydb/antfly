@@ -2815,6 +2815,10 @@ pub fn appliedPlanIsStructured(plan: []const u8) bool {
         if (!consumeBool(plan, &drop_index)) return false;
         if (!consumeLiteral(plan, &drop_index, ":rewrite=")) return false;
         if (!consumeBool(plan, &drop_index)) return false;
+        if (!consumeLiteral(plan, &drop_index, ":work_items=")) return false;
+        const work_item_count = consumeUsizeValue(plan, &drop_index) orelse return false;
+        if (!consumeLiteral(plan, &drop_index, ":work=")) return false;
+        if (!consumeAppliedWorkItems(plan, &drop_index, work_item_count)) return false;
         return drop_index == plan.len;
     }
 
@@ -2835,6 +2839,10 @@ pub fn appliedPlanIsStructured(plan: []const u8) bool {
     if (!consumeUsize(plan, &index)) return false;
     if (!consumeLiteral(plan, &index, ":update_policy=")) return false;
     if (!consumeUsize(plan, &index)) return false;
+    if (!consumeLiteral(plan, &index, ":work_items=")) return false;
+    const work_item_count = consumeUsizeValue(plan, &index) orelse return false;
+    if (!consumeLiteral(plan, &index, ":work=")) return false;
+    if (!consumeAppliedWorkItems(plan, &index, work_item_count)) return false;
     if (index == plan.len) return true;
     if (!consumeLiteral(plan, &index, ":comments=")) return false;
     if (!consumeUsize(plan, &index)) return false;
@@ -2867,6 +2875,28 @@ fn consumeUsize(text: []const u8, index: *usize) bool {
     const start = index.*;
     while (index.* < text.len and text[index.*] >= '0' and text[index.*] <= '9') : (index.* += 1) {}
     return index.* > start;
+}
+
+fn consumeUsizeValue(text: []const u8, index: *usize) ?usize {
+    const start = index.*;
+    if (!consumeUsize(text, index)) return null;
+    return std.fmt.parseInt(usize, text[start..index.*], 10) catch null;
+}
+
+fn consumeAppliedWorkItems(text: []const u8, index: *usize, expected_count: usize) bool {
+    if (expected_count == 0) return consumeLiteral(text, index, "none");
+
+    var count: usize = 0;
+    while (count < expected_count) : (count += 1) {
+        if (!(consumeLiteral(text, index, "rebuild/table/derived_artifacts") or
+            consumeLiteral(text, index, "validate/table/constraints") or
+            consumeLiteral(text, index, "rewrite/table/row_images")))
+        {
+            return false;
+        }
+        if (count + 1 < expected_count and !consumeLiteral(text, index, ",")) return false;
+    }
+    return true;
 }
 
 pub const SqlParameterScan = union(enum) {
@@ -3528,15 +3558,16 @@ test "sql adapter corpus numeric and bool token matching is exact and unique" {
 }
 
 test "sql adapter corpus plan predicates are exact and structured" {
-    const applied = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=10:unvalidated_fk=1:unvalidated_check=0:update_policy=0";
+    const applied = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=10:unvalidated_fk=1:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts";
     try std.testing.expect(appliedPlanIsStructured(applied));
     try std.testing.expect(appliedPlanHasExactBoolToken(applied, "rebuild=", true));
     try std.testing.expect(appliedPlanHasExactBoolToken(applied, "validation=", false));
     try std.testing.expect(appliedPlanHasExactUsizeToken(applied, "unvalidated_unique=", 10));
     try std.testing.expect(!appliedPlanHasExactUsizeToken(applied, "unvalidated_unique=", 1));
     try std.testing.expect(!appliedPlanHasExactBoolToken("applied:rebuild=true:rewrite=false", "rebuild=", true));
-    try std.testing.expect(appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true"));
-    try std.testing.expect(!appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:extra=1"));
+    try std.testing.expect(appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images"));
+    try std.testing.expect(!appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints"));
+    try std.testing.expect(!appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=0:work=none:extra=1"));
 
     const explain = "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0";
     try std.testing.expect(explainPlanHasKind(explain, "write"));
@@ -6699,7 +6730,7 @@ test "sql adapter corpus owns ddl applied-plan fixture policy" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
-        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
     }));
     try std.testing.expect(!try corpusDdlFixtureRequiresAppliedPlan(.{
         .name = "set search path",

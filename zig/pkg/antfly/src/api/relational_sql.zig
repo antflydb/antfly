@@ -56630,11 +56630,14 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
 }
 
 fn ddlAppliedFingerprintAlloc(alloc: std.mem.Allocator, applied: AppliedDdlSchemaJson) ![]u8 {
-    if (applied.schema_json.len == 0) return try std.fmt.allocPrint(
-        alloc,
-        "applied:drop_table:rebuild={}:validation={}:rewrite={}",
-        .{ applied.requires_rebuild, applied.validation_required, applied.rewrite_required },
-    );
+    if (applied.schema_json.len == 0) {
+        const base = try std.fmt.allocPrint(
+            alloc,
+            "applied:drop_table:rebuild={}:validation={}:rewrite={}",
+            .{ applied.requires_rebuild, applied.validation_required, applied.rewrite_required },
+        );
+        return try appendAppliedDdlWorkItemsFingerprintAlloc(alloc, base, applied.work_items);
+    }
 
     var parsed = try schema_api.parseValidatedTableSchema(alloc, applied.schema_json);
     defer parsed.deinit(alloc);
@@ -56684,7 +56687,73 @@ fn ddlAppliedFingerprintAlloc(alloc: std.mem.Allocator, applied: AppliedDdlSchem
             update_policies,
         },
     );
-    return try appendNonZeroUsizeFingerprintAlloc(alloc, base, "comments", comments);
+    const with_work = try appendAppliedDdlWorkItemsFingerprintAlloc(alloc, base, applied.work_items);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, with_work, "comments", comments);
+}
+
+fn appliedDdlWorkActionName(action: AppliedDdlWorkAction) []const u8 {
+    return switch (action) {
+        .rebuild => "rebuild",
+        .validate => "validate",
+        .rewrite => "rewrite",
+    };
+}
+
+fn appliedDdlWorkSubjectName(subject: AppliedDdlWorkSubject) []const u8 {
+    return switch (subject) {
+        .table => "table",
+    };
+}
+
+fn appliedDdlWorkReasonName(reason: AppliedDdlWorkReason) []const u8 {
+    return switch (reason) {
+        .derived_artifacts => "derived_artifacts",
+        .constraints => "constraints",
+        .row_images => "row_images",
+    };
+}
+
+fn appendAppliedDdlWorkItemsFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    work_items: []const AppliedDdlWorkItem,
+) ![]u8 {
+    errdefer alloc.free(owned_base);
+    if (work_items.len == 0) {
+        const fingerprint = try std.fmt.allocPrint(
+            alloc,
+            "{s}:work_items=0:work=none",
+            .{owned_base},
+        );
+        alloc.free(owned_base);
+        return fingerprint;
+    }
+
+    var work = try alloc.dupe(u8, "");
+    defer alloc.free(work);
+    for (work_items, 0..) |item, i| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}{s}/{s}/{s}",
+            .{
+                work,
+                if (i == 0) "" else ",",
+                appliedDdlWorkActionName(item.action),
+                appliedDdlWorkSubjectName(item.subject),
+                appliedDdlWorkReasonName(item.reason),
+            },
+        );
+        alloc.free(work);
+        work = next;
+    }
+
+    const fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "{s}:work_items={d}:work={s}",
+        .{ owned_base, work_items.len, work },
+    );
+    alloc.free(owned_base);
+    return fingerprint;
 }
 
 fn createTablePlanHasTemporalPrimaryKey(plan: CreateTablePlan) bool {
@@ -59060,7 +59129,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 2 },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false",
-        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -59069,7 +59138,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 2 },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=true:if_not_exists=false",
-        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -59094,7 +59163,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 2, .operations = 3 },
         .plan = "ddl:create_table:table=usage_records:columns=2:unique=1:fk=1:checks=0:if_not_exists=false:pk=1",
-        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -59103,7 +59172,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 2, .operations = 3 },
         .plan = "ddl:create_table:table=usage_records:columns=2:unique=1:fk=1:checks=1:if_not_exists=false:pk=1",
-        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -60061,7 +60130,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
         .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text)"},
-        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -60070,7 +60139,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .query,
         .summary = .{ .table_name = "usage_records" },
         .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
-        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -60454,7 +60523,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
         .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text)"},
-        .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+        .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
     }, &seen, alloc);
 
     try validateAppParityFixtureMetadata(.{
@@ -60463,7 +60532,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .drop_table, .table_name = "usage_records" },
         .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=false",
-        .applied_plan = "applied:drop_table:rebuild=true:validation=true:rewrite=true",
+        .applied_plan = "applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
     }, &seen, alloc);
 
     try validateAppParityFixtureMetadata(.{

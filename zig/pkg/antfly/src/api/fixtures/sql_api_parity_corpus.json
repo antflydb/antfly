@@ -861,7 +861,7 @@
       },
       "plan": "ddl:comment:kind=table:object=usage_records:comment=true",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:comments=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none:comments=1",
       "sql": "COMMENT ON TABLE usage_records IS 'metered usage rows';"
     },
     {
@@ -874,7 +874,7 @@
       },
       "plan": "ddl:comment:kind=column:object=usage_records.status:comment=true",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:comments=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none:comments=1",
       "sql": "COMMENT ON COLUMN usage_records.status IS 'application state';"
     },
     {
@@ -887,7 +887,7 @@
       },
       "plan": "ddl:comment:kind=index:object=usage_records_status_idx:comment=true",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));", "CREATE INDEX usage_records_status_idx ON usage_records (status);"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:comments=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none:comments=1",
       "sql": "COMMENT ON INDEX usage_records_status_idx IS 'status lookup';"
     },
     {
@@ -900,7 +900,7 @@
       },
       "plan": "ddl:comment:kind=constraint:object=usage_records_status_check:table=usage_records:comment=true",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:comments=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none:comments=1",
       "sql": "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';"
     },
     {
@@ -922,7 +922,7 @@
         "table_name": "usage_records"
       },
       "plan": "ddl:drop_table:table=usage_records:if_exists=false",
-      "applied_plan": "applied:drop_table:rebuild=false:validation=false:rewrite=false",
+      "applied_plan": "applied:drop_table:rebuild=false:validation=false:rewrite=false:work_items=0:work=none",
       "sql": "DROP TABLE usage_records;"
     },
     {
@@ -933,7 +933,7 @@
         "table_name": "usage_records"
       },
       "plan": "ddl:drop_table:table=usage_records:if_exists=false:cascade=true",
-      "applied_plan": "applied:drop_table:rebuild=false:validation=false:rewrite=false",
+      "applied_plan": "applied:drop_table:rebuild=false:validation=false:rewrite=false:work_items=0:work=none",
       "sql": "DROP TABLE usage_records CASCADE;"
     },
     {
@@ -944,7 +944,7 @@
         "table_name": "usage_records"
       },
       "plan": "ddl:drop_table:table=usage_records:if_exists=true",
-      "applied_plan": "applied:drop_table:rebuild=false:validation=false:rewrite=false",
+      "applied_plan": "applied:drop_table:rebuild=false:validation=false:rewrite=false:work_items=0:work=none",
       "sql": "DROP TABLE IF EXISTS usage_records;"
     },
     {
@@ -3271,7 +3271,7 @@
         "table_name": "usage_records_copy"
       },
       "plan": "ddl:table_clone:table=usage_records_copy:source=usage_records:if_not_exists=false:columns=true:defaults=true:generated=true:checks=true:constraints=true:indexes=true:periods=true:update_policies=true",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)"
     },
     {
@@ -5996,7 +5996,7 @@
         "operations": 3
       },
       "plan": "ddl:create_table:table=usage_records:columns=7:unique=1:fk=1:checks=1:if_not_exists=true:pk=1:defaults=3:generated=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE IF NOT EXISTS usage_records (\n  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,\n  tenant_id text COLLATE \"C\" NOT NULL,\n  quantity numeric(18, 2) DEFAULT 0::numeric CHECK (quantity >= 0::numeric),\n  metadata jsonb,\n  tags text[],\n  created_at timestamptz DEFAULT now(),\n  tenant_key text GENERATED ALWAYS AS (lower(tenant_id)) STORED,\n  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),\n  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE\n);"
     },
     {
@@ -6008,7 +6008,7 @@
         "select": 8
       },
       "plan": "ddl:create_table:table=generated_expr_records:columns=8:unique=0:fk=0:checks=0:if_not_exists=false:pk=1:generated=3",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE generated_expr_records (\n  id uuid PRIMARY KEY,\n  status text,\n  amount numeric,\n  fee numeric,\n  metadata jsonb,\n  status_slug text GENERATED ALWAYS AS (replace(lower(status), ' ', '-')) STORED,\n  amount_cents numeric GENERATED ALWAYS AS (round((amount + fee) * 100)) STORED,\n  source_key text GENERATED ALWAYS AS (jsonb_extract_path_text(metadata, 'source')) STORED\n);"
     },
     {
@@ -6021,7 +6021,7 @@
         "operations": 3
       },
       "plan": "ddl:create_table:table=inline_constraints:columns=4:unique=1:fk=1:checks=1:if_not_exists=false:pk=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE inline_constraints (\n  id uuid CONSTRAINT inline_constraints_pk PRIMARY KEY,\n  tenant_id text CONSTRAINT inline_constraints_tenant_fkey REFERENCES tenants (id) ON DELETE RESTRICT,\n  email text CONSTRAINT inline_constraints_email_key UNIQUE,\n  amount numeric CONSTRAINT inline_constraints_amount_check CHECK (amount >= 0)\n);"
     },
     {
@@ -6033,7 +6033,7 @@
         "select": 3
       },
       "plan": "ddl:create_table:table=casted_defaults:columns=3:unique=0:fk=0:checks=0:if_not_exists=false:pk=1:defaults=2",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE casted_defaults (\n  id uuid PRIMARY KEY,\n  amount numeric DEFAULT '0'::numeric,\n  enabled boolean DEFAULT 'true'::boolean\n);"
     },
     {
@@ -6045,7 +6045,7 @@
         "select": 3
       },
       "plan": "ddl:create_table:table=usage_stage:columns=3:unique=0:fk=0:checks=0:if_not_exists=false",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);"
     },
     {
@@ -6058,7 +6058,7 @@
       },
       "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:add_pk=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id);"
     },
     {
@@ -6071,7 +6071,7 @@
       },
       "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:add_pk=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY IMMEDIATE;"
     },
     {
@@ -6084,7 +6084,7 @@
       },
       "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:add_pk=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status);"
     },
     {
@@ -6097,7 +6097,7 @@
       },
       "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:drop_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text, PRIMARY KEY (tenant_id, id));"],
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_stage DROP CONSTRAINT usage_stage_pkey;"
     },
     {
@@ -6110,7 +6110,7 @@
       },
       "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:drop_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text, CONSTRAINT usage_stage_identity PRIMARY KEY (tenant_id, id));"],
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_stage DROP CONSTRAINT usage_stage_identity;"
     },
     {
@@ -6126,7 +6126,7 @@
         "temporal_foreign_keys": 0
       },
       "plan": "ddl:create_table:table=account_prices:columns=5:unique=1:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=1:temporal_fk=0:pk=2",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE account_prices (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  price numeric,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT account_prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS)\n);"
     },
     {
@@ -6140,7 +6140,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=4:if_exists=false:add_col=2:add_period=1:add_unique=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records\n  ADD COLUMN valid_from numeric NOT NULL,\n  ADD COLUMN valid_to numeric NOT NULL,\n  ADD PERIOD FOR valid_time (valid_from, valid_to),\n  ADD CONSTRAINT usage_records_tenant_valid_key UNIQUE (tenant_id, valid_time WITHOUT OVERLAPS);"
     },
     {
@@ -6154,7 +6154,7 @@
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:temporal_unique=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, PERIOD FOR valid_time (valid_from, valid_to));"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE UNIQUE INDEX usage_records_tenant_valid_time_key ON usage_records (tenant_id, valid_time WITHOUT OVERLAPS);"
     },
     {
@@ -6170,7 +6170,7 @@
         "temporal_foreign_keys": 0
       },
       "plan": "ddl:create_table:table=products:columns=5:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE products (\n  product_id int NOT NULL,\n  product_name text NOT NULL,\n  price numeric,\n  valid_at daterange NOT NULL,\n  PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS)\n);"
     },
     {
@@ -6186,7 +6186,7 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  amount numeric,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n);"
     },
     {
@@ -6202,7 +6202,7 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments_cascade (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE CASCADE\n);"
     },
     {
@@ -6218,7 +6218,7 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments_set_null_delete (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE SET NULL\n);"
     },
     {
@@ -6234,7 +6234,7 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_set_null:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments_set_null (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON UPDATE SET NULL\n);"
     },
     {
@@ -6260,7 +6260,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:nulls_not_distinct=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT;"
     },
     {
@@ -6272,7 +6272,7 @@
         "select": 1
       },
       "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true:pk=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "CREATE OR REPLACE TABLE usage_records (id uuid PRIMARY KEY);"
     },
     {
@@ -6284,7 +6284,7 @@
         "select": 2
       },
       "plan": "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true:replace=true:pk=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "CREATE OR REPLACE TABLE IF NOT EXISTS usage_records (id uuid PRIMARY KEY, status text);"
     },
     {
@@ -6297,7 +6297,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_status_idx ON usage_records (status) WHERE status = 'pending';"
     },
     {
@@ -6310,7 +6310,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false:include=2",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_status_cover_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE status = 'pending';"
     },
     {
@@ -6322,7 +6322,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:include=2",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE UNIQUE INDEX usage_records_email_cover_key ON usage_records (email) INCLUDE (tenant_id, status);"
     },
     {
@@ -6334,7 +6334,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE UNIQUE INDEX usage_records_email_nulls_distinct_key ON usage_records (email) NULLS DISTINCT;"
     },
     {
@@ -6347,7 +6347,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX CONCURRENTLY usage_records_status_idx ON usage_records (status) WHERE status = 'pending';"
     },
     {
@@ -6360,7 +6360,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX public.usage_records_status_idx ON public.usage_records (status) WHERE status = 'pending';"
     },
     {
@@ -6373,7 +6373,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX public.usage_records_status_idx ON ONLY public.usage_records (status) WHERE status = 'pending';"
     },
     {
@@ -6387,7 +6387,7 @@
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=true",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "CREATE INDEX usage_records_status_idx ON usage_records (status) WHERE status = 'pending';"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status) WHERE status = 'pending';"
     },
     {
@@ -6400,7 +6400,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_negative_amount_idx ON usage_records (status) WHERE amount = -1;"
     },
     {
@@ -6413,7 +6413,7 @@
       },
       "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=concat",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);"],
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_tenant_status_idx ON usage_records (concat(tenant_id, ':', status));"
     },
     {
@@ -6426,7 +6426,7 @@
       },
       "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=concat_ws",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);"],
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_tenant_status_ws_idx ON usage_records (concat_ws(':', tenant_id, status));"
     },
     {
@@ -6438,7 +6438,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=lower",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));"
     },
     {
@@ -6450,7 +6450,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=upper",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_upper_email_idx ON usage_records (upper(email));"
     },
     {
@@ -6462,7 +6462,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=md5",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_md5_email_idx ON usage_records (md5(email));"
     },
     {
@@ -6474,7 +6474,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=gin",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_metadata_gin ON usage_records USING gin (metadata jsonb_path_ops);"
     },
     {
@@ -6486,7 +6486,7 @@
         "select": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=gin",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_tags_gin ON usage_records USING gin (tags array_ops);"
     },
     {
@@ -6499,7 +6499,7 @@
         "select": 2
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=1:unique=true:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE UNIQUE INDEX usage_records_tenant_email_key ON usage_records (tenant_id, lower(email)) WHERE status = 'active';"
     },
     {
@@ -6512,7 +6512,7 @@
         "select": 2
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=1:unique=true:if_not_exists=false",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "CREATE UNIQUE INDEX usage_records_tenant_wrapped_email_key ON usage_records (tenant_id, (lower(email))) WHERE status = 'active';"
     },
     {
@@ -6523,7 +6523,7 @@
       },
       "plan": "ddl:drop_index:index=usage_records_status_idx:if_exists=false",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "CREATE INDEX usage_records_status_idx ON usage_records (status);"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "DROP INDEX usage_records_status_idx;"
     },
     {
@@ -6534,7 +6534,7 @@
       },
       "plan": "ddl:drop_index:index=usage_records_status_idx:if_exists=false",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "CREATE INDEX usage_records_status_idx ON usage_records (status);"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "DROP INDEX CONCURRENTLY usage_records_status_idx;"
     },
     {
@@ -6547,7 +6547,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_fk=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD COLUMN user_id text REFERENCES users(id);"
     },
     {
@@ -6559,7 +6559,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_generated=1",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records ADD COLUMN email_upper_key text GENERATED ALWAYS AS (upper(email)) STORED;"
     },
     {
@@ -6571,7 +6571,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=true:add_col=1",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "ALTER TABLE IF EXISTS usage_records ADD COLUMN optional_status text;"
     },
     {
@@ -6584,7 +6584,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records ADD COLUMN billing_status text DEFAULT 'active' NOT NULL;"
     },
     {
@@ -6596,7 +6596,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);"
     },
     {
@@ -6608,7 +6608,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_nulls_distinct_key UNIQUE NULLS DISTINCT (email) NOT DEFERRABLE INITIALLY IMMEDIATE;"
     },
     {
@@ -6620,7 +6620,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (tenant_id, status);"
     },
     {
@@ -6633,7 +6633,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"
     },
     {
@@ -6646,7 +6646,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;"
     },
     {
@@ -6659,7 +6659,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1:fk_deferrable=1:fk_deferred=1:fk_match_full=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text, region text);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_region_fkey FOREIGN KEY (user_id, region) REFERENCES users(id, region) MATCH FULL DEFERRABLE INITIALLY DEFERRED;"
     },
     {
@@ -6672,7 +6672,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_user_id_fkey;"
     },
     {
@@ -6684,7 +6684,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_check=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;"
     },
     {
@@ -6696,7 +6696,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_check=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown');"
     },
     {
@@ -6709,7 +6709,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_status_known_check;"
     },
     {
@@ -6722,7 +6722,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "ALTER TABLE usage_records DROP CONSTRAINT usage_records_status_known_check;"
     },
     {
@@ -6735,7 +6735,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'pending';"
     },
     {
@@ -6748,7 +6748,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, amount numeric);"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "ALTER TABLE usage_records ALTER COLUMN amount SET DEFAULT '7'::numeric;"
     },
     {
@@ -6761,7 +6761,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT 'pending');"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status DROP DEFAULT;"
     },
     {
@@ -6774,7 +6774,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_not_null=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"],
-      "applied_plan": "applied:rebuild=false:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=validate/table/constraints",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL;"
     },
     {
@@ -6787,7 +6787,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_not_null=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text NOT NULL);"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status DROP NOT NULL;"
     },
     {
@@ -6800,7 +6800,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:rename_col=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, tenant_status_key text GENERATED ALWAYS AS (concat(id, ':', status)) STORED, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records RENAME COLUMN status TO state;"
     },
     {
@@ -6813,7 +6813,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:rename_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_state_check;"
     },
     {
@@ -6826,7 +6826,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records ALTER COLUMN updated_at_ns TYPE timestamptz USING updated_at_ns::timestamptz;"
     },
     {
@@ -6837,7 +6837,7 @@
         "table_name": "usage_records"
       },
       "plan": "ddl:create_update_policy:table=usage_records:column=updated_at_ns",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=1:work_items=0:work=none",
       "sql": "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');"
     },
     {
@@ -6848,7 +6848,7 @@
         "table_name": "usage_records"
       },
       "plan": "ddl:create_update_policy:table=usage_records:column=updated_at_ns",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=1:work_items=0:work=none",
       "sql": "CREATE OR REPLACE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');"
     },
     {
@@ -6861,7 +6861,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_update_policy=1:drop_update_policy_if_exists=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);", "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');"],
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;"
     },
     {
@@ -7027,7 +7027,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_col=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records DROP COLUMN metadata;"
     },
     {
