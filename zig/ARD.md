@@ -281,14 +281,16 @@ Admin-only OpenAPI entries should be hidden from non-admin scoped catalogs and t
 
 Skills should be first-class discovery artifacts, not extension runtimes.
 
-Initial skills:
+Antfly-owned default skills should be packaged as source-controlled ARD skill artifacts, not handwritten Zig entries. The default Antfly distribution can embed a manifest such as `pkg/antfly/src/api/ard/default_skills.json` so a fresh tenant has useful Antfly skills even before installing extensions.
+
+Initial Antfly default skills:
 
 - `antfly-query-builder`: translate user intent into Antfly queries.
 - `antfly-retrieval`: retrieve and synthesize context from Antfly tables.
 - `antfly-schema-design`: design tables, schemas, indexes, enrichments, and query processors.
 - `antfly-extension-management`: install, configure, enable, disable, and inspect extensions.
 
-Extension-owned skills must be declared by extension metadata, not hardcoded into Antfly. An extension can contribute an `ExtensionObjectKind.skill` member whose `owner_metadata_json` describes display text, markdown body, tags, profile, capabilities, representative queries, and required capabilities. Memoryaf, for example, should contribute its memory skill from the Memoryaf package or install metadata.
+Extension-owned skills must be declared by extension metadata, not hardcoded into Antfly. Antfly core should not keep a list of known extension names or built-in extension skills. An extension can contribute an `ExtensionObjectKind.skill` member whose `owner_metadata_json` describes display text, markdown body, tags, profile, capabilities, representative queries, and required capabilities. Memoryaf, for example, should contribute its memory skill from the Memoryaf package or install metadata, not from Antfly's default skill manifest.
 
 Extension-owned skills must be emitted only when the corresponding installed extension skill member is visible to the caller. The skill artifact route must apply the same extension visibility check as the catalog entry.
 

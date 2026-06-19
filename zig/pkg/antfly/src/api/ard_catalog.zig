@@ -117,7 +117,9 @@ const RequiredPermission = enum {
     admin,
 };
 
-const Skill = struct {
+const default_skills_manifest_json = @embedFile("ard/default_skills.json");
+
+const DefaultSkillManifest = struct {
     slug: []const u8,
     url: []const u8,
     display_name: []const u8,
@@ -128,107 +130,7 @@ const Skill = struct {
     representative_queries: []const []const u8,
     body: []const u8,
     admin_only: bool = false,
-    required_permission: RequiredPermission = .none,
-};
-
-const skills = [_]Skill{
-    .{
-        .slug = "antfly-query-builder",
-        .url = "/ard/v1/skills/antfly-query-builder",
-        .display_name = "Antfly Query Builder",
-        .description = "Translate user intent into Antfly table queries and query-builder requests.",
-        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:read\"}",
-        .capabilities = &.{ "query-builder", "table-query", "schema-aware-search" },
-        .representative_queries = &.{
-            "turn this question into an Antfly query",
-            "build a query for relevant customer support tickets",
-            "ask a clarifying question before querying the table",
-        },
-        .body =
-        \\# Antfly Query Builder
-        \\
-        \\Use this skill when an agent needs to translate user intent into Antfly table queries or query-builder API requests.
-        \\
-        \\Prefer `/api/v1/tables/{table}/query-builder` when the user intent is underspecified and `/api/v1/tables/{table}/query` when the caller already has a concrete Antfly query.
-        \\
-        \\Keep table and field selection scoped to resources visible to the authenticated tenant identity.
-        \\
-        ,
-        .required_permission = .table_read,
-    },
-    .{
-        .slug = "antfly-retrieval",
-        .url = "/ard/v1/skills/antfly-retrieval",
-        .display_name = "Antfly Retrieval",
-        .description = "Retrieve, rank, and synthesize context from Antfly tables.",
-        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:read\"}",
-        .capabilities = &.{ "retrieval", "hybrid-search", "context-synthesis" },
-        .representative_queries = &.{
-            "retrieve context for this incident",
-            "find the most relevant documents in this table",
-            "summarize results from Antfly retrieval",
-        },
-        .body =
-        \\# Antfly Retrieval
-        \\
-        \\Use this skill when an agent needs tenant-scoped context retrieval from Antfly tables.
-        \\
-        \\Use `/api/v1/tables/{table}/retrieval-agent` for end-to-end retrieval and synthesis. Use `/api/v1/tables/{table}/query` for direct search when the caller already knows the query shape.
-        \\
-        \\Do not infer access to tables or rows that are not visible through the caller's Antfly identity.
-        \\
-        ,
-        .required_permission = .table_read,
-    },
-    .{
-        .slug = "antfly-schema-design",
-        .url = "/ard/v1/skills/antfly-schema-design",
-        .display_name = "Antfly Schema Design",
-        .description = "Design Antfly tables, schemas, indexes, enrichments, and query processors.",
-        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:admin\"}",
-        .capabilities = &.{ "schema-design", "index-design", "table-management" },
-        .representative_queries = &.{
-            "design a schema for these documents",
-            "choose indexes for semantic and keyword search",
-            "configure enrichments for this table",
-        },
-        .body =
-        \\# Antfly Schema Design
-        \\
-        \\Use this skill when an agent needs to create or evolve Antfly table contracts.
-        \\
-        \\Use the table lifecycle APIs for creation and updates, and prefer generated OpenAPI schemas as the source of request shape.
-        \\
-        \\Validate that requested indexes and enrichments are available in the deployment before recommending them.
-        \\
-        ,
-        .required_permission = .table_admin,
-    },
-    .{
-        .slug = "antfly-extension-management",
-        .url = "/ard/v1/skills/antfly-extension-management",
-        .display_name = "Antfly Extension Management",
-        .description = "Install, configure, enable, disable, and inspect Antfly extensions.",
-        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"admin\"}",
-        .capabilities = &.{ "extension-install", "extension-config", "extension-lifecycle" },
-        .representative_queries = &.{
-            "install this Antfly extension",
-            "show visible MCP tools for an extension",
-            "configure an extension for a tenant table",
-        },
-        .body =
-        \\# Antfly Extension Management
-        \\
-        \\Use this skill when an agent needs to inspect or manage Antfly extensions.
-        \\
-        \\Use `/extensions/v1` for package and lifecycle operations. Use `/mcp/v1/extensions/{extension}` only after the extension is installed, enabled, and visible to the tenant identity.
-        \\
-        \\Never expose extension tools through ARD that the same identity cannot list through MCP.
-        \\
-        ,
-        .admin_only = true,
-        .required_permission = .admin,
-    },
+    required_permission: []const u8 = "none",
 };
 
 const static_entries = [_]Entry{
@@ -369,7 +271,7 @@ pub fn catalogJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: Catalog
 
     try writeCatalogPrefix(&writer.writer, options);
     var first = true;
-    try writeScopedEntries(&writer.writer, options, &first, null, null);
+    try writeScopedEntries(alloc, &writer.writer, options, &first, null, null);
     if (options.mode == .tenant) {
         try writeAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, null, null);
         try writeCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, null, null);
@@ -395,7 +297,7 @@ pub fn searchJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     try writer.writer.writeAll("{\"results\":[");
     var first = true;
     var matched: usize = 0;
-    try writeMatchedEntries(&writer.writer, options, &first, request.text, request.filter, &matched);
+    try writeMatchedEntries(alloc, &writer.writer, options, &first, request.text, request.filter, &matched);
     if (options.mode == .tenant) {
         try writeSearchAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, &matched);
         try writeSearchCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, &matched);
@@ -474,8 +376,11 @@ pub fn agentsJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
 }
 
 pub fn skillMarkdownAlloc(alloc: std.mem.Allocator, options: CatalogOptions, slug: []const u8) !?[]u8 {
-    const skill = findSkill(slug) orelse return null;
-    if (!catalogOptionsAllowStaticEntry(options, skillEntry(skill))) return null;
+    var parsed_skills = try parseDefaultSkills(alloc);
+    defer parsed_skills.deinit();
+    const skill = findDefaultSkill(parsed_skills.value, slug) orelse return null;
+    const entry = try defaultSkillEntry(skill);
+    if (!catalogOptionsAllowStaticEntry(options, entry)) return null;
     return try alloc.dupe(u8, skill.body);
 }
 
@@ -587,10 +492,13 @@ const FacetAccumulator = struct {
                 return;
             }
         }
-        try self.buckets.append(alloc, .{ .value = value, .count = 1 });
+        const owned_value = try alloc.dupe(u8, value);
+        errdefer alloc.free(owned_value);
+        try self.buckets.append(alloc, .{ .value = owned_value, .count = 1 });
     }
 
     fn deinit(self: *FacetAccumulator, alloc: std.mem.Allocator) void {
+        for (self.buckets.items) |bucket| alloc.free(bucket.value);
         self.buckets.deinit(alloc);
     }
 };
@@ -696,8 +604,10 @@ fn collectStaticFacets(
                 try addEntryFacets(alloc, facets, options.publisher_domain, entry);
             }
         }
-        for (skills) |skill| {
-            const entry = skillEntry(skill);
+        var parsed_skills = try parseDefaultSkills(alloc);
+        defer parsed_skills.deinit();
+        for (parsed_skills.value) |skill| {
+            const entry = try defaultSkillEntry(skill);
             if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) {
                 matched.* += 1;
                 try addEntryFacets(alloc, facets, options.publisher_domain, entry);
@@ -794,6 +704,7 @@ fn addDynamicFacets(
 }
 
 fn writeScopedEntries(
+    alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     options: CatalogOptions,
     first: *bool,
@@ -807,14 +718,17 @@ fn writeScopedEntries(
         for (tenant_entries) |entry| {
             if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options, first, entry);
         }
-        for (skills) |skill| {
-            const entry = skillEntry(skill);
+        var parsed_skills = try parseDefaultSkills(alloc);
+        defer parsed_skills.deinit();
+        for (parsed_skills.value) |skill| {
+            const entry = try defaultSkillEntry(skill);
             if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options, first, entry);
         }
     }
 }
 
 fn writeMatchedEntries(
+    alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     options: CatalogOptions,
     first: *bool,
@@ -829,8 +743,10 @@ fn writeMatchedEntries(
         for (tenant_entries) |entry| {
             if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, matched, text);
         }
-        for (skills) |skill| {
-            const entry = skillEntry(skill);
+        var parsed_skills = try parseDefaultSkills(alloc);
+        defer parsed_skills.deinit();
+        for (parsed_skills.value) |skill| {
+            const entry = try defaultSkillEntry(skill);
             if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, matched, text);
         }
     }
@@ -2205,7 +2121,11 @@ fn jsonStringSliceContains(values: []const []const u8, expected: []const u8) boo
     return false;
 }
 
-fn skillEntry(skill: Skill) Entry {
+fn parseDefaultSkills(alloc: std.mem.Allocator) !std.json.Parsed([]DefaultSkillManifest) {
+    return try std.json.parseFromSlice([]DefaultSkillManifest, alloc, default_skills_manifest_json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+}
+
+fn defaultSkillEntry(skill: DefaultSkillManifest) !Entry {
     return .{
         .identifier_suffix = skill.slug,
         .display_name = skill.display_name,
@@ -2217,15 +2137,23 @@ fn skillEntry(skill: Skill) Entry {
         .capabilities = skill.capabilities,
         .representative_queries = skill.representative_queries,
         .admin_only = skill.admin_only,
-        .required_permission = skill.required_permission,
+        .required_permission = try parseRequiredPermission(skill.required_permission),
     };
 }
 
-fn findSkill(slug: []const u8) ?Skill {
+fn findDefaultSkill(skills: []const DefaultSkillManifest, slug: []const u8) ?DefaultSkillManifest {
     for (skills) |skill| {
         if (std.mem.eql(u8, skill.slug, slug)) return skill;
     }
     return null;
+}
+
+fn parseRequiredPermission(value: []const u8) !RequiredPermission {
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "table_read")) return .table_read;
+    if (std.mem.eql(u8, value, "table_admin")) return .table_admin;
+    if (std.mem.eql(u8, value, "admin")) return .admin;
+    return error.InvalidArdDefaultSkillPermission;
 }
 
 fn writeEntry(
