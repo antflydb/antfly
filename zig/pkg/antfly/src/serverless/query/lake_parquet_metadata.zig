@@ -75,7 +75,7 @@ pub fn enrichInventoryFilesWithFootersAlloc(
     footers: []const FileFooter,
 ) !external_source.Inventory {
     try inventory.validate();
-    if (inventory.format != .parquet) return error.InvalidParquetMetadata;
+    if (inventory.format != .parquet and inventory.format != .iceberg) return error.InvalidParquetMetadata;
     if (footers.len == 0) return error.InvalidParquetMetadata;
     for (footers, 0..) |entry, idx| {
         if (entry.file_id.len == 0) return error.InvalidParquetMetadata;
@@ -138,7 +138,7 @@ pub fn enrichInventoryFileWithFooterAlloc(
     footer: ParsedFooter,
 ) !external_source.Inventory {
     try inventory.validate();
-    if (inventory.format != .parquet) return error.InvalidParquetMetadata;
+    if (inventory.format != .parquet and inventory.format != .iceberg) return error.InvalidParquetMetadata;
     if (file_id.len == 0) return error.InvalidParquetMetadata;
     if (footer.row_count == 0) return error.InvalidParquetMetadata;
 

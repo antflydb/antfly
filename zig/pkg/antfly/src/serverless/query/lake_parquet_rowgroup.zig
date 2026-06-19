@@ -1555,7 +1555,7 @@ fn discoverSupportedI64ObjectRangeRowGroupsFromMaybeCachedFootersAlloc(
     footer_probe_bytes: u64,
 ) !DiscoveredObjectRangeRowGroupPlan {
     try raw_inventory.validate();
-    if (raw_inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+    if (raw_inventory.format != .parquet and raw_inventory.format != .iceberg) return error.InvalidParquetRowGroupBatch;
     if (raw_inventory.files.len == 0) return error.InvalidParquetRowGroupBatch;
     if (footer_probe_bytes == 0) return error.InvalidLakeRangeRead;
 
@@ -2646,6 +2646,7 @@ const TestColumnFooter = struct {
     physical_type: i32 = 2,
     encoding: i32 = 0,
     compression_codec: i32 = 0,
+    field_id: ?i32 = null,
 };
 
 fn appendSingleColumnFooterMetadata(
@@ -2670,6 +2671,30 @@ fn appendSingleColumnFooterMetadata(
     return try appendPlainI64FooterMetadata(out, alloc, row_count, &columns);
 }
 
+fn appendSingleColumnFooterMetadataWithFieldId(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    column_id: []const u8,
+    row_count: usize,
+    column_offset: usize,
+    compressed_len: usize,
+    uncompressed_len: usize,
+    encoding: i32,
+    compression_codec: i32,
+    field_id: i32,
+) !void {
+    const columns = [_]TestColumnFooter{.{
+        .column_id = column_id,
+        .column_offset = column_offset,
+        .compressed_len = compressed_len,
+        .uncompressed_len = uncompressed_len,
+        .encoding = encoding,
+        .compression_codec = compression_codec,
+        .field_id = field_id,
+    }};
+    return try appendPlainI64FooterMetadata(out, alloc, row_count, &columns);
+}
+
 fn appendPlainI64FooterMetadata(
     out: *std.ArrayListUnmanaged(u8),
     alloc: Allocator,
@@ -2686,6 +2711,32 @@ fn appendPlainI64FooterMetadata(
     var file_prev: i16 = 0;
     try appendField(out, alloc, &file_prev, 1, .i32);
     try appendI32(out, alloc, 1);
+    if (footerSchemaHasFieldIds(columns)) {
+        try appendField(out, alloc, &file_prev, 2, .list);
+        try appendListHeader(out, alloc, .struct_, columns.len + 1);
+
+        var root_prev: i16 = 0;
+        try appendField(out, alloc, &root_prev, 4, .binary);
+        try appendBinary(out, alloc, "schema");
+        try appendField(out, alloc, &root_prev, 5, .i32);
+        try appendI32(out, alloc, @intCast(columns.len));
+        try appendStop(out, alloc);
+
+        for (columns) |column| {
+            var leaf_prev: i16 = 0;
+            try appendField(out, alloc, &leaf_prev, 1, .i32);
+            try appendI32(out, alloc, column.physical_type);
+            try appendField(out, alloc, &leaf_prev, 3, .i32);
+            try appendI32(out, alloc, 0);
+            try appendField(out, alloc, &leaf_prev, 4, .binary);
+            try appendBinary(out, alloc, column.column_id);
+            if (column.field_id) |field_id| {
+                try appendField(out, alloc, &leaf_prev, 9, .i32);
+                try appendI32(out, alloc, field_id);
+            }
+            try appendStop(out, alloc);
+        }
+    }
     try appendField(out, alloc, &file_prev, 3, .i64);
     try appendI64(out, alloc, @intCast(row_count));
     try appendField(out, alloc, &file_prev, 4, .list);
@@ -2706,6 +2757,13 @@ fn appendPlainI64FooterMetadata(
     try appendStop(out, alloc);
 
     try appendStop(out, alloc);
+}
+
+fn footerSchemaHasFieldIds(columns: []const TestColumnFooter) bool {
+    for (columns) |column| {
+        if (column.field_id != null) return true;
+    }
+    return false;
 }
 
 fn appendColumnFooterMetadata(
@@ -7000,6 +7058,103 @@ test "parquet object range discovery reads footers and builds row group source" 
     const row_ref = result.rows[0].row_ref.external;
     try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
     try std.testing.expectEqual(@as(u64, 1), row_ref.row_ordinal);
+}
+
+test "iceberg object range discovery enriches footer field ids" {
+    const alloc = std.testing.allocator;
+
+    const column_offset: usize = 100;
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try appendPlainI64DataPage(&chunk, alloc, &[_]i64{ 10, 20, 30 });
+
+    var object = std.ArrayListUnmanaged(u8).empty;
+    defer object.deinit(alloc);
+    try object.appendNTimes(alloc, 0, column_offset);
+    try object.appendSlice(alloc, chunk.items);
+    const metadata_start = object.items.len;
+    try appendSingleColumnFooterMetadataWithFieldId(
+        &object,
+        alloc,
+        "amount",
+        3,
+        column_offset,
+        chunk.items.len,
+        chunk.items.len,
+        0,
+        0,
+        7,
+    );
+    const metadata_len = object.items.len - metadata_start;
+    try appendParquetTrailer(&object, alloc, metadata_len);
+
+    const MemoryRangeReader = struct {
+        bucket: []const u8,
+        key: []const u8,
+        body: []const u8,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, self.bucket, bucket)) return error.ObjectNotFound;
+            if (!std.mem.eql(u8, self.key, key)) return error.ObjectNotFound;
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var range_reader = MemoryRangeReader{
+        .bucket = "bucket",
+        .key = "events/part-a.parquet",
+        .body = object.items,
+    };
+
+    var raw = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "iceberg-snapshot:12"),
+        .schema_fingerprint = try alloc.dupe(u8, "iceberg-schema:7"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer raw.deinit(alloc);
+    raw.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .version_id = try alloc.dupe(u8, "iceberg:v1:a"),
+        .byte_len = object.items.len,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+    try raw.validate();
+
+    const projection = [_][]const u8{"amount"};
+    var discovered = try discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+        alloc,
+        range_reader.reader(),
+        raw,
+        &projection,
+        16,
+    );
+    defer discovered.deinit(alloc);
+
+    try std.testing.expectEqual(external_source.Format.iceberg, discovered.inventory.format);
+    try std.testing.expectEqual(@as(u64, 3), discovered.inventory.files[0].row_count);
+    try std.testing.expectEqual(@as(?i32, 7), discovered.inventory.files[0].row_groups[0].column_chunks[0].field_id);
+    try std.testing.expectEqual(@as(usize, 1), discovered.row_group_plan.row_groups.len);
 }
 
 test "parquet test object builder supports multi-column footer discovery" {

@@ -568,13 +568,15 @@ The concrete work left for the data-lake path is therefore:
    top-level `struct`, `list`, or `map` fields, because Antfly's current scan
    contract still resolves Parquet columns by flat names rather than Iceberg
    field IDs. Parquet footer discovery and the external-source inventory codec
-   now preserve optional Parquet schema field IDs on column chunks, and Iceberg
-   object-range planning rejects projected chunks that lack those IDs so
-   name-only Parquet metadata is not treated as schema-evolution-safe. The
-   remaining work is to broaden equality deletes to nested/complex fields,
-   tighten real-provider version/ETag fixtures, and use field IDs for actual
-   rename/reorder/nested read compatibility instead of only enforcing their
-   presence.
+   now preserve optional Parquet schema field IDs on column chunks. Lazy footer
+   discovery/enrichment accepts Iceberg inventories as well as raw Parquet
+   inventories, carries those footer-derived field IDs into the enriched
+   inventory, and Iceberg object-range planning rejects projected chunks that
+   lack those IDs so name-only Parquet metadata is not treated as
+   schema-evolution-safe. The remaining work is to broaden equality deletes to
+   nested/complex fields, tighten real-provider version/ETag fixtures, and use
+   field IDs for actual rename/reorder/nested read compatibility instead of only
+   enforcing their presence.
 5. Complete sidecar builders over real external row refs: full-text, dense
    vector, sparse, graph, algebraic group-by, and algebraic expression-fold
    paths now consume pinned `RowSource` batches and publish declared sidecar
