@@ -442,16 +442,17 @@ materialization policy for streams that intentionally exceed fail-closed caps,
 merge/spill policy, and
 range-movement chaos coverage rather than changing the public contract. Focused routed-read tests cover stale-topology fail-closed
 behavior for remote row-query collection and hosted lateral right-side
-collection. If an authenticated request has an
-effective row filter, supported
-conjunctive filters are pushed into every base row source before projection,
-aggregation, joining, lateral correlation, CTE materialization, or windowing.
-Supported pushdown covers `match_all`, `conjuncts`, `bool.must`,
+collection. If an authenticated request has an effective row filter, supported
+filters are pushed into every base row source before projection, aggregation,
+joining, lateral correlation, CTE materialization, mutation-source staging, or
+windowing. Supported pushdown covers `match_all`, `conjuncts`, `bool.must`,
 `bool.filter`, scalar `term`/`terms`, `array_any`, `json_contains`,
-`numeric_range`, and `date_range` over declared relational columns. Filters
-that require a broader boolean or text-search execution model fail closed for
-these row-plan endpoints so totals and derived rows cannot bypass row-level
-authorization.
+`numeric_range`, and `date_range` over declared relational columns, plus
+`disjuncts` and `bool.should` / `minimum_should_match = 1` branches that lower
+to native `access_or_predicates`. Filters that require nested disjunctions,
+negation, a broader boolean model, or text-search execution still fail closed
+for these row-plan endpoints so totals, staged writes, and derived rows cannot
+bypass row-level authorization.
 
 Row queries also accept `expression_where`, an array of typed expression
 conditions using the same expression AST as projections, ordering, aggregate
@@ -4347,8 +4348,8 @@ Current PR status:
   client inputs, require each public operation endpoint to receive exactly its
   matching top-level envelope field plus optional ordered CTEs, return stable row-result envelopes, reject
   lockable or range-internal sources at the public boundary, push supported
-  conjunctive row filters into every base row source, and fail closed for
-  unsupported row-filter shapes; a source SQL parity
+  conjunctive and disjunctive access row filters into every base row source,
+  and fail closed for unsupported row-filter shapes; a source SQL parity
   corpus test that classifies representative schema,
   migration-equivalence, query, aggregate, join, lateral, window, point DML,
   claimed mutation-source, and unsupported adapter-only shapes through the
@@ -5014,16 +5015,24 @@ accepted, and default replacement is valid only for imports. Import-side
 `COPY FROM ... WHERE` admits a conservative scalar `field <op> literal`
 conjunction subset and stores it as shared `RelationalRowsExpressionCondition`
 metadata, so later row decoding can evaluate filters without carrying SQL text.
-The production shape should stream rows through typed schema validation,
-defaults, generated columns, checks, unique/FK participants,
+`relational_sql.bulkSqlIoExecutionPlanFromDdlPlan` now maps supported stream
+`COPY` plans into an explicit Antfly execution contract: `COPY FROM STDIN`
+requires a write permission on the table, audits as `copy_from`, and routes to
+the row-batch import surface; `COPY TO STDOUT` requires a read permission,
+audits as `copy_to`, and routes to the row-query export surface. The bridge also
+marks both directions as requiring an external SQL protocol stream so the SQL
+text cannot masquerade as payload. The remaining production layer is the
+streaming executor that decodes the supplied STDIN bytes through typed schema
+validation, defaults, generated columns, checks, unique/FK participants,
 row-policy/authorization checks, 2PC staging, retryable range routing, and
-deterministic error reporting for imports, and through typed snapshot/range-read
-plans for exports. PostgreSQL `COPY` syntax can become an adapter frontend for
-those contracts, but it must not bypass row-batch, mutation-source, or routed
-read semantics. Until server-file, `PROGRAM`, alternate stream endpoints,
-legacy OID options, and broader row-filtered `COPY FROM ... WHERE` predicate
-families have native bulk-I/O endpoint and validation contracts, the source
-parity corpus requires them to fail closed under `bulk_io_plan`.
+deterministic error reporting for imports, and encodes query snapshots for
+exports. PostgreSQL `COPY` syntax is therefore an adapter frontend for those
+contracts, but it must not bypass row-batch, mutation-source, or routed read
+semantics. Until server-file, `PROGRAM`, alternate stream endpoints, binary
+format, legacy OID options, and broader row-filtered `COPY FROM ... WHERE`
+predicate families have native bulk-I/O endpoint and validation contracts, the
+source parity corpus requires them to fail closed under `bulk_io_plan` or at the
+execution-bridge boundary.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,

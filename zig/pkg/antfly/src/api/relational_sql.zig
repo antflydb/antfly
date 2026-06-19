@@ -27,6 +27,7 @@ const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("sql_adapter/mod.zig");
 const table_catalog = @import("table_catalog.zig");
+const usermgr = @import("../usermgr/mod.zig");
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const SqlValue = sql_adapter.SqlValue;
@@ -259,6 +260,48 @@ pub const BulkIoPlan = sql_adapter.BulkIoPlan;
 pub const BulkIoDirection = sql_adapter.BulkIoDirection;
 pub const BulkIoOnErrorPolicy = sql_adapter.BulkIoOnErrorPolicy;
 pub const BulkIoLogVerbosity = sql_adapter.BulkIoLogVerbosity;
+pub const BulkSqlIoOperation = enum {
+    import_rows,
+    export_rows,
+};
+
+pub const BulkSqlIoNativeRoute = enum {
+    rows_batch,
+    rows_query,
+};
+
+pub const BulkSqlIoStream = enum {
+    stdin,
+    stdout,
+};
+
+pub const BulkSqlIoCodec = enum {
+    postgres_text,
+    csv,
+};
+
+pub const BulkSqlIoAuditAction = enum {
+    copy_from,
+    copy_to,
+};
+
+pub const BulkSqlIoExecutionPlan = struct {
+    operation: BulkSqlIoOperation,
+    native_route: BulkSqlIoNativeRoute,
+    stream: BulkSqlIoStream,
+    codec: BulkSqlIoCodec,
+    table_name: []const u8,
+    columns: []const []const u8 = &.{},
+    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    required_resource_type: usermgr.ResourceType = .table,
+    required_permission: usermgr.PermissionType,
+    audit_action: BulkSqlIoAuditAction,
+    requires_external_stream: bool = true,
+    freeze: bool = false,
+    on_error: BulkIoOnErrorPolicy = .stop,
+    reject_limit: ?usize = null,
+    log_verbosity: BulkIoLogVerbosity = .default,
+};
 pub const MaterializedViewCatalogPlan = sql_adapter.MaterializedViewCatalogPlan;
 pub const CreateMaterializedViewPlan = sql_adapter.CreateMaterializedViewPlan;
 pub const RefreshMaterializedViewPlan = sql_adapter.RefreshMaterializedViewPlan;
@@ -1907,6 +1950,71 @@ pub fn lowerDdlPlanAlloc(
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
+}
+
+pub fn bulkSqlIoExecutionPlanFromDdlPlan(plan: BulkIoPlan) !BulkSqlIoExecutionPlan {
+    const codec = try bulkSqlIoCodecFromPlan(plan);
+    switch (plan.direction) {
+        .from => {
+            if (!std.ascii.eqlIgnoreCase(plan.endpoint, "STDIN")) return error.UnsupportedSqlShape;
+            return .{
+                .operation = .import_rows,
+                .native_route = .rows_batch,
+                .stream = .stdin,
+                .codec = codec,
+                .table_name = plan.table_name,
+                .columns = plan.columns,
+                .where_expressions = plan.where_expressions,
+                .required_permission = .write,
+                .audit_action = .copy_from,
+                .freeze = plan.freeze,
+                .on_error = plan.on_error,
+                .reject_limit = plan.reject_limit,
+                .log_verbosity = plan.log_verbosity,
+            };
+        },
+        .to => {
+            if (!std.ascii.eqlIgnoreCase(plan.endpoint, "STDOUT")) return error.UnsupportedSqlShape;
+            return .{
+                .operation = .export_rows,
+                .native_route = .rows_query,
+                .stream = .stdout,
+                .codec = codec,
+                .table_name = plan.table_name,
+                .columns = plan.columns,
+                .where_expressions = plan.where_expressions,
+                .required_permission = .read,
+                .audit_action = .copy_to,
+            };
+        },
+    }
+}
+
+fn bulkSqlIoCodecFromPlan(plan: BulkIoPlan) !BulkSqlIoCodec {
+    const format = plan.format orelse return .postgres_text;
+    if (std.ascii.eqlIgnoreCase(format, "csv")) return .csv;
+    if (std.ascii.eqlIgnoreCase(format, "text")) return .postgres_text;
+    return error.UnsupportedSqlShape;
+}
+
+pub fn bulkSqlIoExecutionFingerprintAlloc(alloc: std.mem.Allocator, plan: BulkSqlIoExecutionPlan) ![]const u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "bulk_sql_io:op={s}:native={s}:stream={s}:codec={s}:auth={s}/{s}:audit={s}:table={s}:columns={d}:where_expr={d}:requires_stream={}",
+        .{
+            @tagName(plan.operation),
+            @tagName(plan.native_route),
+            @tagName(plan.stream),
+            @tagName(plan.codec),
+            plan.required_resource_type.slice(),
+            plan.required_permission.slice(),
+            @tagName(plan.audit_action),
+            plan.table_name,
+            plan.columns.len,
+            plan.where_expressions.len,
+            plan.requires_external_stream,
+        },
+    );
 }
 
 pub const OwnedSqlCatalogSession = struct {
@@ -45741,6 +45849,17 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
     try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0", copy_from_fingerprint);
+    const copy_from_execution = try bulkSqlIoExecutionPlanFromDdlPlan(copy_from_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.import_rows, copy_from_execution.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_batch, copy_from_execution.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.stdin, copy_from_execution.stream);
+    try std.testing.expectEqual(BulkSqlIoCodec.csv, copy_from_execution.codec);
+    try std.testing.expectEqual(usermgr.PermissionType.write, copy_from_execution.required_permission);
+    try std.testing.expectEqual(BulkSqlIoAuditAction.copy_from, copy_from_execution.audit_action);
+    try std.testing.expect(copy_from_execution.requires_external_stream);
+    const copy_from_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_from_execution);
+    defer alloc.free(copy_from_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_from_execution_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
     var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');");
@@ -45796,7 +45915,24 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const copy_to_fingerprint = try ddlFingerprintAlloc(alloc, copy_to);
     defer alloc.free(copy_to_fingerprint);
     try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0", copy_to_fingerprint);
+    const copy_to_execution = try bulkSqlIoExecutionPlanFromDdlPlan(copy_to_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.export_rows, copy_to_execution.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_query, copy_to_execution.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.stdout, copy_to_execution.stream);
+    try std.testing.expectEqual(usermgr.PermissionType.read, copy_to_execution.required_permission);
+    try std.testing.expectEqual(BulkSqlIoAuditAction.copy_to, copy_to_execution.audit_action);
+    const copy_to_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_to_execution);
+    defer alloc.free(copy_to_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=csv:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_to_execution_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
+
+    var copy_binary = try lowerDdlPlanAlloc(alloc, "COPY usage_records TO STDOUT WITH (FORMAT binary);");
+    defer copy_binary.deinit(alloc);
+    const copy_binary_plan = switch (copy_binary) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectError(error.UnsupportedSqlShape, bulkSqlIoExecutionPlanFromDdlPlan(copy_binary_plan));
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
     defer create_partitioned_table.deinit(alloc);

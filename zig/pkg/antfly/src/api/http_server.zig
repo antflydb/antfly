@@ -9864,6 +9864,7 @@ pub const ApiHttpServer = struct {
         array_any: []const db_mod.types.RelationalRowsArrayAnyPredicate = &.{},
         in_predicates: []const db_mod.types.RelationalRowsInPredicate = &.{},
         json_contains: []const db_mod.types.RelationalRowsJsonContainsPredicate = &.{},
+        access_or_predicates: []const db_mod.types.RelationalRowsAccessPredicateGroup = &.{},
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             freeRowsAuthPredicates(alloc, self.predicates);
@@ -9883,11 +9884,17 @@ pub const ApiHttpServer = struct {
                 alloc.free(predicate.value_json);
             }
             if (self.json_contains.len > 0) alloc.free(self.json_contains);
+            freeRowsAuthAccessPredicateGroups(alloc, self.access_or_predicates);
+            if (self.access_or_predicates.len > 0) alloc.free(self.access_or_predicates);
             self.* = undefined;
         }
 
         fn empty(self: @This()) bool {
-            return self.predicates.len == 0 and self.array_any.len == 0 and self.in_predicates.len == 0 and self.json_contains.len == 0;
+            return self.predicates.len == 0 and
+                self.array_any.len == 0 and
+                self.in_predicates.len == 0 and
+                self.json_contains.len == 0 and
+                self.access_or_predicates.len == 0;
         }
     };
 
@@ -10053,6 +10060,7 @@ pub const ApiHttpServer = struct {
         array_any: std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate) = .empty,
         in_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate) = .empty,
         json_contains: std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate) = .empty,
+        access_or_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             freeRowsAuthPredicates(alloc, self.predicates.items);
@@ -10072,7 +10080,17 @@ pub const ApiHttpServer = struct {
                 alloc.free(predicate.value_json);
             }
             self.json_contains.deinit(alloc);
+            freeRowsAuthAccessPredicateGroups(alloc, self.access_or_predicates.items);
+            self.access_or_predicates.deinit(alloc);
             self.* = undefined;
+        }
+
+        fn empty(self: @This()) bool {
+            return self.predicates.items.len == 0 and
+                self.array_any.items.len == 0 and
+                self.in_predicates.items.len == 0 and
+                self.json_contains.items.len == 0 and
+                self.access_or_predicates.items.len == 0;
         }
 
         fn toOwnedPlan(self: *@This(), alloc: std.mem.Allocator) !RowsAuthFilterPlan {
@@ -10081,6 +10099,7 @@ pub const ApiHttpServer = struct {
                 .array_any = try self.array_any.toOwnedSlice(alloc),
                 .in_predicates = try self.in_predicates.toOwnedSlice(alloc),
                 .json_contains = try self.json_contains.toOwnedSlice(alloc),
+                .access_or_predicates = try self.access_or_predicates.toOwnedSlice(alloc),
             };
         }
     };
@@ -10090,12 +10109,13 @@ pub const ApiHttpServer = struct {
         schema: runtime_schema_mod.TableSchema,
         value: std.json.Value,
         filter: *RowsAuthFilterBuilder,
-    ) !void {
+    ) anyerror!void {
         if (value != .object) return error.InvalidRowsFilter;
         if (value.object.get("match_all") != null) return;
         if (value.object.get("match_none") != null) return error.UnsupportedRowsFilter;
         if (value.object.get("doc_id") != null) return error.UnsupportedRowsFilter;
-        if (value.object.get("disjuncts") != null) return error.UnsupportedRowsFilter;
+
+        if (value.object.get("disjuncts")) |disjuncts| return try self.appendRowsAuthDisjunctsFilter(schema, disjuncts, filter);
 
         if (value.object.get("conjuncts")) |conjuncts| {
             if (conjuncts != .array) return error.InvalidRowsFilter;
@@ -10104,7 +10124,7 @@ pub const ApiHttpServer = struct {
         }
         if (value.object.get("bool")) |bool_query| {
             if (bool_query != .object) return error.InvalidRowsFilter;
-            if (bool_query.object.get("should") != null or bool_query.object.get("must_not") != null) return error.UnsupportedRowsFilter;
+            if (bool_query.object.get("must_not") != null) return error.UnsupportedRowsFilter;
             var saw_supported = false;
             if (bool_query.object.get("must")) |must| {
                 if (must != .array or must.array.items.len == 0) return error.InvalidRowsFilter;
@@ -10115,6 +10135,11 @@ pub const ApiHttpServer = struct {
                 if (must_filter != .array or must_filter.array.items.len == 0) return error.InvalidRowsFilter;
                 saw_supported = true;
                 for (must_filter.array.items) |item| try self.appendRowsAuthFilterValue(schema, item, filter);
+            }
+            if (bool_query.object.get("should")) |should| {
+                if (!rowsAuthBoolMinimumShouldMatchIsOne(bool_query.object.get("minimum_should_match"))) return error.UnsupportedRowsFilter;
+                saw_supported = true;
+                try self.appendRowsAuthDisjunctsFilter(schema, should, filter);
             }
             if (!saw_supported) return error.InvalidRowsFilter;
             return;
@@ -10136,6 +10161,44 @@ pub const ApiHttpServer = struct {
             return error.UnsupportedRowsFilter;
         }
         return error.InvalidRowsFilter;
+    }
+
+    fn rowsAuthBoolMinimumShouldMatchIsOne(value: ?std.json.Value) bool {
+        const raw = value orelse return true;
+        return switch (raw) {
+            .integer => |number| number == 1,
+            .number_string => |text| std.mem.eql(u8, text, "1"),
+            .string => |text| std.mem.eql(u8, text, "1"),
+            else => false,
+        };
+    }
+
+    fn appendRowsAuthDisjunctsFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        disjuncts: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        if (disjuncts != .array or disjuncts.array.items.len == 0) return error.InvalidRowsFilter;
+        for (disjuncts.array.items) |item| {
+            var branch = RowsAuthFilterBuilder{};
+            defer branch.deinit(self.alloc);
+            try self.appendRowsAuthFilterValue(schema, item, &branch);
+            if (branch.empty() or branch.access_or_predicates.items.len != 0) return error.UnsupportedRowsFilter;
+            try filter.access_or_predicates.append(self.alloc, try rowsAuthAccessPredicateGroupFromBuilder(self.alloc, &branch));
+        }
+    }
+
+    fn rowsAuthAccessPredicateGroupFromBuilder(
+        alloc: std.mem.Allocator,
+        builder: *RowsAuthFilterBuilder,
+    ) !db_mod.types.RelationalRowsAccessPredicateGroup {
+        return .{
+            .predicates = try builder.predicates.toOwnedSlice(alloc),
+            .array_any = try builder.array_any.toOwnedSlice(alloc),
+            .in_predicates = try builder.in_predicates.toOwnedSlice(alloc),
+            .json_contains = try builder.json_contains.toOwnedSlice(alloc),
+        };
     }
 
     fn appendRowsAuthTermFilter(
@@ -10401,6 +10464,7 @@ pub const ApiHttpServer = struct {
         try self.appendRowsAuthArrayAnyToQuery(filter.array_any, query);
         try self.appendRowsAuthInPredicatesToQuery(filter.in_predicates, query);
         try self.appendRowsAuthJsonContainsToQuery(filter.json_contains, query);
+        try self.appendRowsAuthAccessOrPredicatesToQuery(filter.access_or_predicates, query);
     }
 
     fn appendRowsAuthPredicatesToQuery(
@@ -10521,6 +10585,30 @@ pub const ApiHttpServer = struct {
         query.json_contains = combined;
     }
 
+    fn appendRowsAuthAccessOrPredicatesToQuery(
+        self: *ApiHttpServer,
+        groups: []const db_mod.types.RelationalRowsAccessPredicateGroup,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (groups.len == 0) return;
+        const combined = try self.alloc.alloc(db_mod.types.RelationalRowsAccessPredicateGroup, query.access_or_predicates.len + groups.len);
+        var initialized: usize = 0;
+        errdefer {
+            freeRowsAuthAccessPredicateGroups(self.alloc, combined[query.access_or_predicates.len..initialized]);
+            self.alloc.free(combined);
+        }
+        for (query.access_or_predicates) |group| {
+            combined[initialized] = group;
+            initialized += 1;
+        }
+        for (groups) |group| {
+            combined[initialized] = try cloneRowsAuthAccessPredicateGroup(self.alloc, group);
+            initialized += 1;
+        }
+        if (query.access_or_predicates.len > 0) self.alloc.free(@constCast(query.access_or_predicates));
+        query.access_or_predicates = combined;
+    }
+
     fn cloneRowsAuthPredicate(alloc: std.mem.Allocator, predicate: runtime_schema_mod.RelationalCheck) !runtime_schema_mod.RelationalCheck {
         const field = try alloc.dupe(u8, predicate.field);
         errdefer alloc.free(field);
@@ -10534,10 +10622,137 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn cloneRowsAuthArrayAnyPredicate(
+        alloc: std.mem.Allocator,
+        predicate: db_mod.types.RelationalRowsArrayAnyPredicate,
+    ) !db_mod.types.RelationalRowsArrayAnyPredicate {
+        const field = try alloc.dupe(u8, predicate.field);
+        errdefer alloc.free(field);
+        return .{
+            .field = field,
+            .value_json = try alloc.dupe(u8, predicate.value_json),
+        };
+    }
+
+    fn cloneRowsAuthInPredicate(
+        alloc: std.mem.Allocator,
+        predicate: db_mod.types.RelationalRowsInPredicate,
+    ) !db_mod.types.RelationalRowsInPredicate {
+        const field = try alloc.dupe(u8, predicate.field);
+        errdefer alloc.free(field);
+        return .{
+            .field = field,
+            .values_json = try alloc.dupe(u8, predicate.values_json),
+            .negated = predicate.negated,
+        };
+    }
+
+    fn cloneRowsAuthJsonContainsPredicate(
+        alloc: std.mem.Allocator,
+        predicate: db_mod.types.RelationalRowsJsonContainsPredicate,
+    ) !db_mod.types.RelationalRowsJsonContainsPredicate {
+        const field = try alloc.dupe(u8, predicate.field);
+        errdefer alloc.free(field);
+        return .{
+            .field = field,
+            .value_json = try alloc.dupe(u8, predicate.value_json),
+        };
+    }
+
+    fn cloneRowsAuthAccessPredicateGroup(
+        alloc: std.mem.Allocator,
+        group: db_mod.types.RelationalRowsAccessPredicateGroup,
+    ) !db_mod.types.RelationalRowsAccessPredicateGroup {
+        var predicates = try alloc.alloc(runtime_schema_mod.RelationalCheck, group.predicates.len);
+        var predicates_initialized: usize = 0;
+        errdefer {
+            freeRowsAuthPredicates(alloc, predicates[0..predicates_initialized]);
+            if (predicates.len > 0) alloc.free(predicates);
+        }
+        for (group.predicates) |predicate| {
+            predicates[predicates_initialized] = try cloneRowsAuthPredicate(alloc, predicate);
+            predicates_initialized += 1;
+        }
+
+        var array_any = try alloc.alloc(db_mod.types.RelationalRowsArrayAnyPredicate, group.array_any.len);
+        var array_any_initialized: usize = 0;
+        errdefer {
+            freeRowsAuthArrayAnyPredicates(alloc, array_any[0..array_any_initialized]);
+            if (array_any.len > 0) alloc.free(array_any);
+        }
+        for (group.array_any) |predicate| {
+            array_any[array_any_initialized] = try cloneRowsAuthArrayAnyPredicate(alloc, predicate);
+            array_any_initialized += 1;
+        }
+
+        var in_predicates = try alloc.alloc(db_mod.types.RelationalRowsInPredicate, group.in_predicates.len);
+        var in_initialized: usize = 0;
+        errdefer {
+            freeRowsAuthInPredicates(alloc, in_predicates[0..in_initialized]);
+            if (in_predicates.len > 0) alloc.free(in_predicates);
+        }
+        for (group.in_predicates) |predicate| {
+            in_predicates[in_initialized] = try cloneRowsAuthInPredicate(alloc, predicate);
+            in_initialized += 1;
+        }
+
+        var json_contains = try alloc.alloc(db_mod.types.RelationalRowsJsonContainsPredicate, group.json_contains.len);
+        var json_initialized: usize = 0;
+        errdefer {
+            freeRowsAuthJsonContainsPredicates(alloc, json_contains[0..json_initialized]);
+            if (json_contains.len > 0) alloc.free(json_contains);
+        }
+        for (group.json_contains) |predicate| {
+            json_contains[json_initialized] = try cloneRowsAuthJsonContainsPredicate(alloc, predicate);
+            json_initialized += 1;
+        }
+
+        return .{
+            .predicates = predicates,
+            .array_any = array_any,
+            .in_predicates = in_predicates,
+            .json_contains = json_contains,
+        };
+    }
+
     fn freeRowsAuthPredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema_mod.RelationalCheck) void {
         for (predicates) |predicate| {
             alloc.free(predicate.field);
             if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+    }
+
+    fn freeRowsAuthArrayAnyPredicates(alloc: std.mem.Allocator, predicates: []const db_mod.types.RelationalRowsArrayAnyPredicate) void {
+        for (predicates) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+    }
+
+    fn freeRowsAuthInPredicates(alloc: std.mem.Allocator, predicates: []const db_mod.types.RelationalRowsInPredicate) void {
+        for (predicates) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.values_json);
+        }
+    }
+
+    fn freeRowsAuthJsonContainsPredicates(alloc: std.mem.Allocator, predicates: []const db_mod.types.RelationalRowsJsonContainsPredicate) void {
+        for (predicates) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+    }
+
+    fn freeRowsAuthAccessPredicateGroups(alloc: std.mem.Allocator, groups: []const db_mod.types.RelationalRowsAccessPredicateGroup) void {
+        for (groups) |group| {
+            freeRowsAuthPredicates(alloc, group.predicates);
+            if (group.predicates.len > 0) alloc.free(group.predicates);
+            freeRowsAuthArrayAnyPredicates(alloc, group.array_any);
+            if (group.array_any.len > 0) alloc.free(group.array_any);
+            freeRowsAuthInPredicates(alloc, group.in_predicates);
+            if (group.in_predicates.len > 0) alloc.free(group.in_predicates);
+            freeRowsAuthJsonContainsPredicates(alloc, group.json_contains);
+            if (group.json_contains.len > 0) alloc.free(group.json_contains);
         }
     }
 
@@ -19863,21 +20078,37 @@ test "api http server executes public relational row plan endpoints" {
     try std.testing.expectEqual(@as(i64, 2), parsed_filtered_join.value.object.get("total_rows").?.integer);
     try std.testing.expectEqualStrings("t1", parsed_filtered_join.value.object.get("rows").?.array.items[0].object.get("tenant").?.string);
 
-    var unsupported_row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
-    unsupported_row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "records", "{\"disjuncts\":[{\"term\":{\"tenant\":\"t1\"}},{\"term\":{\"tenant\":\"t2\"}}]}");
-    var unsupported_identity = AuthenticatedIdentity{
-        .username = try alloc.dupe(u8, "unsupported_reader"),
-        .row_filter = unsupported_row_filters,
+    var disjunctive_row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    disjunctive_row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "records", "{\"disjuncts\":[{\"term\":{\"tenant\":\"t1\"}},{\"term\":{\"tenant\":\"t2\"}}]}");
+    var disjunctive_identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "disjunctive_reader"),
+        .row_filter = disjunctive_row_filters,
     };
-    defer unsupported_identity.deinit(alloc);
+    defer disjunctive_identity.deinit(alloc);
 
-    var unsupported_resp = try server.handlePublicTableRowsQuery("records", "{\"query\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"}}}", unsupported_identity);
-    defer unsupported_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 403), unsupported_resp.status);
+    var disjunctive_resp = try server.handlePublicTableRowsQuery("records", "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"tenant\",\"id\",\"amount\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}", disjunctive_identity);
+    defer disjunctive_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), disjunctive_resp.status);
+    var parsed_disjunctive_query = try std.json.parseFromSlice(std.json.Value, alloc, disjunctive_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_disjunctive_query.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed_disjunctive_query.value.object.get("total").?.integer);
+    try std.testing.expectEqualStrings("t2", parsed_disjunctive_query.value.object.get("rows").?.array.items[0].object.get("tenant").?.string);
 
-    var unsupported_mutation_resp = try server.handlePublicTableRowsMutationSource("records", "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:test\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"}}", unsupported_identity);
-    defer unsupported_mutation_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 403), unsupported_mutation_resp.status);
+    const disjunctive_mutation_txn_hex = "10112233445566778899aabbccddeeff";
+    const disjunctive_mutation_txn_id = try distributed_txn.parseTxnIdHex(disjunctive_mutation_txn_hex);
+    _ = try db.beginTransactionWithId(disjunctive_mutation_txn_id, 1_002);
+    var disjunctive_mutation_resp = try server.handlePublicTableRowsMutationSource("records", "{\"op\":\"update\",\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"tenant\",\"op\":\"eq\",\"value\":\"t2\"}]},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:or-auth\",\"transaction_id\":\"10112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"tenant\",\"id\",\"status\"]}", disjunctive_identity);
+    defer disjunctive_mutation_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), disjunctive_mutation_resp.status);
+    var parsed_disjunctive_mutation = try std.json.parseFromSlice(std.json.Value, alloc, disjunctive_mutation_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_disjunctive_mutation.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_disjunctive_mutation.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_disjunctive_mutation.value.object.get("staged").?.integer);
+    const disjunctive_returning = parsed_disjunctive_mutation.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("t2", disjunctive_returning.get("tenant").?.string);
+    try std.testing.expectEqualStrings("o9", disjunctive_returning.get("id").?.string);
+    try std.testing.expectEqualStrings("claimed", disjunctive_returning.get("status").?.string);
+    try db.commitTransaction(disjunctive_mutation_txn_id, 1_003);
 }
 
 test "api http server lake text candidate planning rejects ambiguous field sidecars" {
