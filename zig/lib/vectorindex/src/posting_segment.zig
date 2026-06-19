@@ -921,6 +921,7 @@ pub const LazyDirectorySnapshot = struct {
         @memset(out, null);
         errdefer deinitOptionalByteSlices(alloc, out);
         if (posting_ids.len == 0) return out;
+        if ((try segmentKindCapacityHint(self.manifest.segments, .base)).provesEmpty()) return out;
 
         const sorted_by_segment_id = self.manifest.segments_sorted_by_segment_id;
         const posting_ids_ascending = isAscendingU64(posting_ids);
@@ -5109,23 +5110,27 @@ fn addKnownSegmentKindCount(accum: *usize, meta: SegmentMeta, kind: EntryKind) !
     accum.* = std.math.add(usize, accum.*, count) catch return error.PostingSegmentTooLarge;
 }
 
-const CentroidDirectoryCandidateCapacityHint = struct {
+const SegmentKindCapacityHint = struct {
     count: usize = 0,
     all_kind_counts_known: bool = true,
 
-    fn provesEmpty(self: CentroidDirectoryCandidateCapacityHint) bool {
+    fn provesEmpty(self: SegmentKindCapacityHint) bool {
         return self.all_kind_counts_known and self.count == 0;
     }
 };
 
-fn centroidDirectoryCandidateCapacityHint(entries: []const OwnedManifestEntry) !CentroidDirectoryCandidateCapacityHint {
-    var hint = CentroidDirectoryCandidateCapacityHint{};
+fn centroidDirectoryCandidateCapacityHint(entries: []const OwnedManifestEntry) !SegmentKindCapacityHint {
+    return try segmentKindCapacityHint(entries, .centroid_directory);
+}
+
+fn segmentKindCapacityHint(entries: []const OwnedManifestEntry, kind: EntryKind) !SegmentKindCapacityHint {
+    var hint = SegmentKindCapacityHint{};
     for (entries) |entry| {
         if (!entry.meta.hasKnownKindCounts()) {
             hint.all_kind_counts_known = false;
             continue;
         }
-        try addKnownSegmentKindCount(&hint.count, entry.meta, .centroid_directory);
+        try addKnownSegmentKindCount(&hint.count, entry.meta, kind);
     }
     return hint;
 }
@@ -6260,6 +6265,10 @@ pub fn testSegmentKindCapacityHintsUseKnownCounts() !void {
     try std.testing.expectEqual(@as(usize, 0), known_base_only_hint.count);
     try std.testing.expect(known_base_only_hint.all_kind_counts_known);
     try std.testing.expect(known_base_only_hint.provesEmpty());
+    const known_base_hint = try segmentKindCapacityHint(known_base_only_entries[0..], .base);
+    try std.testing.expectEqual(@as(usize, 4), known_base_hint.count);
+    try std.testing.expect(known_base_hint.all_kind_counts_known);
+    try std.testing.expect(!known_base_hint.provesEmpty());
 
     const segments = [_]SegmentBlob{
         .{

@@ -1259,7 +1259,10 @@ implementations cleanly:
     committed segment kind counts are known and prove that no centroid-directory
     records exist, and the runtime batch has no pending centroid records,
     centroid-directory bulk loads now return an empty owned result without
-    allocating a candidate map or scanning segment indexes.
+    allocating a candidate map or scanning segment indexes. Lazy base-data batch
+    reads use the same known-empty proof for base records, returning the
+    null-filled batch result before allocating scan scratch when a manifest is
+    known to contain only other record families.
     Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read
