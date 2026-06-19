@@ -1210,10 +1210,12 @@ implementations cleanly:
     singleton batch groups read directly into the owned output buffer instead
     of staging through temporary range scratch. Sorted posting-id batches also
     resolve base point locations with a linear index merge instead of one
-    binary index lookup per posting. The same newest-first batch scan keeps a
-    compact unresolved-position list, so older segments only check postings
-    still missing from the batch, and its per-segment point-read candidates are
-    stack-backed for common probe windows. Lazy centroid-directory bulk loads
+    binary index lookup per posting, and flat/two-level probe prefetch sorts
+    cache-miss requests by posting id before issuing the segment batch read.
+    The same newest-first batch scan keeps a compact unresolved-position list,
+    so older segments only check postings still missing from the batch, and its
+    per-segment point-read candidates are stack-backed for common probe windows.
+    Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read
     work for superseded directory records. That preserves the format's sequence

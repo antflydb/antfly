@@ -774,6 +774,40 @@ fn sortFixedKeyLookupsIfNeeded(lookups: []FixedKeyLookup) void {
     }
 }
 
+fn postingPrefetchRequestLess(lhs_id: u64, lhs_position: u64, rhs_id: u64, rhs_position: u64) bool {
+    if (lhs_id == rhs_id) return lhs_position < rhs_position;
+    return lhs_id < rhs_id;
+}
+
+fn sortPostingPrefetchRequestsIfNeeded(ids: []u64, positions: []u64) void {
+    std.debug.assert(ids.len == positions.len);
+    if (ids.len < 2) return;
+    var sorted = true;
+    for (ids[1..], 1..) |id, i| {
+        if (!postingPrefetchRequestLess(ids[i - 1], positions[i - 1], id, positions[i])) {
+            sorted = false;
+            break;
+        }
+    }
+    if (sorted) return;
+
+    var gap = ids.len / 2;
+    while (gap != 0) : (gap /= 2) {
+        var i = gap;
+        while (i < ids.len) : (i += 1) {
+            const id = ids[i];
+            const position = positions[i];
+            var j = i;
+            while (j >= gap and postingPrefetchRequestLess(id, position, ids[j - gap], positions[j - gap])) : (j -= gap) {
+                ids[j] = ids[j - gap];
+                positions[j] = positions[j - gap];
+            }
+            ids[j] = id;
+            positions[j] = position;
+        }
+    }
+}
+
 test "fixed key lookup sort skips already sorted keys" {
     var key_1: [10]u8 = undefined;
     var key_2: [10]u8 = undefined;
@@ -801,6 +835,20 @@ test "fixed key lookup sort skips already sorted keys" {
     try std.testing.expectEqual(@as(u64, 1), unsorted[0].vector_id);
     try std.testing.expectEqual(@as(u64, 2), unsorted[1].vector_id);
     try std.testing.expectEqual(@as(u64, 3), unsorted[2].vector_id);
+}
+
+test "posting prefetch request sort keeps probe positions with posting ids" {
+    var sorted_ids = [_]u64{ 1, 3, 3, 5 };
+    var sorted_positions = [_]u64{ 9, 1, 4, 2 };
+    sortPostingPrefetchRequestsIfNeeded(&sorted_ids, &sorted_positions);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 3, 5 }, &sorted_ids);
+    try std.testing.expectEqualSlices(u64, &.{ 9, 1, 4, 2 }, &sorted_positions);
+
+    var ids = [_]u64{ 9, 3, 5, 3, 1 };
+    var positions = [_]u64{ 0, 4, 2, 1, 9 };
+    sortPostingPrefetchRequestsIfNeeded(&ids, &positions);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 3, 5, 9 }, &ids);
+    try std.testing.expectEqualSlices(u64, &.{ 9, 1, 4, 2, 0 }, &positions);
 }
 
 pub fn loadNode(self: anytype, txn: anytype, node_id: u64) !types.Node {
@@ -2578,6 +2626,8 @@ fn prefetchFlatProbePostingMembers(
         prefetch_count += 1;
     }
     if (prefetch_count == 0) return;
+
+    sortPostingPrefetchRequestsIfNeeded(ids[0..prefetch_count], positions[0..prefetch_count]);
 
     const prefetch_start = now_fn_u64();
     const loaded = try self.loadPostingBackendBaseDataBatch(txn, self.alloc, ids[0..prefetch_count]);
