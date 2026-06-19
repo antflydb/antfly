@@ -1665,6 +1665,7 @@ pub const BulkIoPlan = struct {
     endpoint: []const u8,
     format: ?[]const u8 = null,
     header: bool = false,
+    freeze: bool = false,
     delimiter: ?[]const u8 = null,
     quote: ?[]const u8 = null,
     escape: ?[]const u8 = null,

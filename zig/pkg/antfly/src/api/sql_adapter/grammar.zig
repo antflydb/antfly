@@ -980,6 +980,7 @@ pub const BulkIoSyntax = struct {
     endpoint: []const u8,
     format: ?[]const u8 = null,
     header: bool = false,
+    freeze: bool = false,
     delimiter: ?[]const u8 = null,
     quote: ?[]const u8 = null,
     escape: ?[]const u8 = null,
@@ -4869,6 +4870,7 @@ pub fn parseBulkIoTailAlloc(
 
     var format: ?[]const u8 = null;
     var header = false;
+    var freeze = false;
     var delimiter: ?[]const u8 = null;
     var quote: ?[]const u8 = null;
     var escape: ?[]const u8 = null;
@@ -4895,6 +4897,13 @@ pub fn parseBulkIoTailAlloc(
                     header = true;
                 } else if (std.ascii.eqlIgnoreCase(value.text, "false")) {
                     header = false;
+                } else return error.UnsupportedSqlShape;
+            } else if (cursor.matchKeyword("freeze")) {
+                const value = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+                if (std.ascii.eqlIgnoreCase(value.text, "true")) {
+                    freeze = true;
+                } else if (std.ascii.eqlIgnoreCase(value.text, "false")) {
+                    freeze = false;
                 } else return error.UnsupportedSqlShape;
             } else if (cursor.matchKeyword("delimiter")) {
                 if (delimiter != null) return error.UnsupportedSqlShape;
@@ -4929,6 +4938,7 @@ pub fn parseBulkIoTailAlloc(
         }
         try cursor.expectToken(.rparen);
     }
+    if (freeze and direction != .from) return error.UnsupportedSqlShape;
 
     try parseAdapterNoopStatementEnd(cursor);
     table_transferred = true;
@@ -4945,6 +4955,7 @@ pub fn parseBulkIoTailAlloc(
         .endpoint = endpoint,
         .format = format,
         .header = header,
+        .freeze = freeze,
         .delimiter = delimiter,
         .quote = quote,
         .escape = escape,
@@ -8621,7 +8632,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
     try std.testing.expect(!copy_from.header);
 
-    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FORMAT csv, DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '');");
+    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FREEZE true, FORMAT csv, DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '');");
     defer lexer.freeTokens(alloc, &copy_header_tokens);
     var copy_header_pos: usize = 0;
     var copy_header = try parseBulkIoTailAlloc(alloc, copy_header_tokens.items, &copy_header_pos);
@@ -8630,6 +8641,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqual(BulkIoDirectionSyntax.from, copy_header.direction);
     try std.testing.expectEqualStrings("csv", copy_header.format.?);
     try std.testing.expect(copy_header.header);
+    try std.testing.expect(copy_header.freeze);
     try std.testing.expectEqualStrings(",", copy_header.delimiter.?);
     try std.testing.expectEqualStrings("\"", copy_header.quote.?);
     try std.testing.expectEqualStrings("!", copy_header.escape.?);
@@ -8648,10 +8660,15 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expect(copy_to.format == null);
     try std.testing.expect(!copy_to.header);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (FREEZE true);");
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (ENCODING 'UTF8');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+
+    var freeze_to_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDOUT WITH (FREEZE true);");
+    defer lexer.freeTokens(alloc, &freeze_to_tokens);
+    var freeze_to_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, freeze_to_tokens.items, &freeze_to_pos));
 
     var wrong_endpoint_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDIN;");
     defer lexer.freeTokens(alloc, &wrong_endpoint_tokens);

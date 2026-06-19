@@ -131,6 +131,7 @@
     "ddl_constraint_mode_named",
     "ddl_copy_delimiter",
     "ddl_copy_escape",
+    "ddl_copy_freeze",
     "ddl_copy_from",
     "ddl_copy_header",
     "ddl_copy_null_marker",
