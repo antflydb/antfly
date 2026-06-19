@@ -2572,6 +2572,10 @@ fn resolveFlatCentroidProbeLimit(configured_probe_count: usize, search_width: u3
     return @min(configured_probe_count, dynamic_limit);
 }
 
+fn usesFlatCentroidDirectorySearch(config: types.HBCConfig) bool {
+    return config.centroid_directory_mode != .hbc and config.use_quantization;
+}
+
 pub fn search(self: anytype, query: []const f32, k: usize, now_fn_u64: fn () u64, elapsed_fn_u64: fn (u64) u64) !search_results.SearchResults {
     const profiled = try searchProfiledRequest(self, .{ .query = query, .k = k }, now_fn_u64, elapsed_fn_u64);
     return profiled.results;
@@ -2653,18 +2657,13 @@ pub fn searchProfiledRequest(
     const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
     const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
     const candidate_limit: usize = if (should_rerank) req.k * rerank_factor else req.k;
-    const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
     const root_node_id = searchRootNode(self);
-
-    var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
-    defer candidates.deinit(self.alloc);
-    try candidates.ensureTotalCapacity(self.alloc, candidate_capacity);
 
     var approx_results = try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
     errdefer approx_results.deinit();
     profile.setup_ns += elapsed_fn_u64(setup_start);
 
-    if (self.config.centroid_directory_mode != .hbc and self.config.use_quantization) {
+    if (usesFlatCentroidDirectorySearch(self.config)) {
         const probe_limit = resolveFlatCentroidProbeLimit(self.config.flat_centroid_probe_count, search_width);
         var probes_stack: [flat_centroid_search_probe_stack_capacity]spfresh_index.FlatCentroidProbe = undefined;
         const use_probes_stack = probe_limit <= probes_stack.len;
@@ -2751,6 +2750,11 @@ pub fn searchProfiledRequest(
     }
 
     try pinUpperTreeCacheProfiled(self, &txn, &profile, now_fn_u64, elapsed_fn_u64);
+
+    const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
+    var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
+    defer candidates.deinit(self.alloc);
+    try candidates.ensureTotalCapacity(self.alloc, candidate_capacity);
 
     const root_start = now_fn_u64();
     var root_handle = loadNodeReadHandleProfiled(self, &txn, root_node_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
@@ -4331,6 +4335,29 @@ test "flat centroid probe limit follows dynamic search width under configured ca
     try std.testing.expectEqual(@as(usize, 1), resolveFlatCentroidProbeLimit(0, 0));
     try std.testing.expectEqual(@as(usize, 16), resolveFlatCentroidProbeLimit(256, 16));
     try std.testing.expectEqual(@as(usize, 256), resolveFlatCentroidProbeLimit(256, 4096));
+}
+
+test "flat centroid directory search predicate requires non-hbc quantized mode" {
+    try std.testing.expect(!usesFlatCentroidDirectorySearch(.{
+        .dims = 2,
+        .centroid_directory_mode = .hbc,
+        .use_quantization = true,
+    }));
+    try std.testing.expect(!usesFlatCentroidDirectorySearch(.{
+        .dims = 2,
+        .centroid_directory_mode = .two_level_rabitq,
+        .use_quantization = false,
+    }));
+    try std.testing.expect(usesFlatCentroidDirectorySearch(.{
+        .dims = 2,
+        .centroid_directory_mode = .flat_rabitq,
+        .use_quantization = true,
+    }));
+    try std.testing.expect(usesFlatCentroidDirectorySearch(.{
+        .dims = 2,
+        .centroid_directory_mode = .two_level_rabitq,
+        .use_quantization = true,
+    }));
 }
 
 test "estimate quantized distances rejects stale quantized count" {
