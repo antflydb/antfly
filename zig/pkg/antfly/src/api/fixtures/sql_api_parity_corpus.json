@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "9cffb7bdb5c45167a16211277742572d7a1d4ecbf0c81e3893451de6833c9f6b",
-  "source_entry_count": 939,
-  "entry_count": 939,
+  "source_sha256": "d26e5d73bccd273f772616f9c5c905a2bebc8c74ded517100f10b48b136d33c7",
+  "source_entry_count": 943,
+  "entry_count": 943,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -399,6 +399,17 @@
       "sql": "VACUUM usage_records"
     },
     {
+      "name": "vacuum option maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "vacuum_maintenance",
+        "table_name": "usage_records",
+        "operations": 3
+      },
+      "plan": "ddl:maintenance:kind=vacuum:table=usage_records:full=true:freeze=false:verbose=true:analyze=true",
+      "sql": "VACUUM (FULL, VERBOSE, ANALYZE) usage_records"
+    },
+    {
       "name": "analyze maintenance job",
       "family": "ddl",
       "summary": {
@@ -408,6 +419,17 @@
       },
       "plan": "ddl:maintenance:kind=analyze:table=usage_records:verbose=false:columns=0",
       "sql": "ANALYZE usage_records"
+    },
+    {
+      "name": "analyze verbose column maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "analyze_maintenance",
+        "table_name": "usage_records",
+        "operations": 3
+      },
+      "plan": "ddl:maintenance:kind=analyze:table=usage_records:verbose=true:columns=2",
+      "sql": "ANALYZE VERBOSE usage_records (status, amount)"
     },
     {
       "name": "reindex maintenance job",
@@ -421,6 +443,17 @@
       "sql": "REINDEX TABLE usage_records"
     },
     {
+      "name": "reindex concurrently maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "reindex_maintenance",
+        "table_name": "usage_records_status_idx",
+        "operations": 1
+      },
+      "plan": "ddl:maintenance:kind=reindex:target=index:name=usage_records_status_idx:concurrently=true",
+      "sql": "REINDEX INDEX CONCURRENTLY usage_records_status_idx"
+    },
+    {
       "name": "cluster maintenance job",
       "family": "ddl",
       "summary": {
@@ -430,6 +463,17 @@
       },
       "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=false",
       "sql": "CLUSTER usage_records USING usage_records_status_idx"
+    },
+    {
+      "name": "cluster verbose maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "cluster_maintenance",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=true",
+      "sql": "CLUSTER VERBOSE usage_records USING usage_records_status_idx"
     },
     {
       "name": "explicit table lock transaction control plan",

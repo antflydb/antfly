@@ -3977,16 +3977,33 @@ pub const AppParityCorpusCoverage = struct {
     ddl_cast_create_function: bool = false,
     ddl_cast_drop: bool = false,
     ddl_vacuum_maintenance: bool = false,
+    ddl_vacuum_maintenance_options: bool = false,
     ddl_analyze_maintenance: bool = false,
+    ddl_analyze_maintenance_columns: bool = false,
+    ddl_analyze_maintenance_verbose: bool = false,
     ddl_reindex_maintenance: bool = false,
+    ddl_reindex_maintenance_concurrently: bool = false,
+    ddl_reindex_maintenance_index_target: bool = false,
     ddl_cluster_maintenance: bool = false,
+    ddl_cluster_maintenance_index: bool = false,
+    ddl_cluster_maintenance_verbose: bool = false,
     ddl_prepare_statement: bool = false,
+    ddl_prepare_statement_read_subject: bool = false,
+    ddl_prepare_statement_write_subject: bool = false,
+    ddl_prepare_statement_params: bool = false,
     ddl_prepare_cte_write_statement: bool = false,
     ddl_execute_statement: bool = false,
+    ddl_execute_statement_args: bool = false,
     ddl_deallocate_statement: bool = false,
+    ddl_deallocate_statement_all: bool = false,
     ddl_declare_cursor: bool = false,
+    ddl_declare_cursor_binary_hold_scroll: bool = false,
+    ddl_declare_cursor_read_subject: bool = false,
     ddl_fetch_cursor: bool = false,
+    ddl_fetch_cursor_count: bool = false,
+    ddl_fetch_cursor_forward: bool = false,
     ddl_close_cursor: bool = false,
+    ddl_close_cursor_all: bool = false,
     ddl_savepoint_transaction: bool = false,
     ddl_release_savepoint: bool = false,
     ddl_rollback_to_savepoint: bool = false,
@@ -5609,22 +5626,63 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_cast_create_function = self.ddl_cast_create_function or std.mem.indexOf(u8, entry.plan, ":function=") != null;
                 },
                 .drop_cast => self.ddl_cast_drop = true,
-                .vacuum_maintenance => self.ddl_vacuum_maintenance = true,
-                .analyze_maintenance => self.ddl_analyze_maintenance = true,
-                .reindex_maintenance => self.ddl_reindex_maintenance = true,
-                .cluster_maintenance => self.ddl_cluster_maintenance = true,
+                .vacuum_maintenance => {
+                    self.ddl_vacuum_maintenance = true;
+                    self.ddl_vacuum_maintenance_options = self.ddl_vacuum_maintenance_options or
+                        (sql_adapter.planHasExactBoolToken(entry.plan, ":full=", true) and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":verbose=", true));
+                },
+                .analyze_maintenance => {
+                    self.ddl_analyze_maintenance = true;
+                    self.ddl_analyze_maintenance_columns = self.ddl_analyze_maintenance_columns or sql_adapter.planHasNonZeroToken(entry.plan, ":columns=");
+                    self.ddl_analyze_maintenance_verbose = self.ddl_analyze_maintenance_verbose or sql_adapter.planHasExactBoolToken(entry.plan, ":verbose=", true);
+                },
+                .reindex_maintenance => {
+                    self.ddl_reindex_maintenance = true;
+                    self.ddl_reindex_maintenance_concurrently = self.ddl_reindex_maintenance_concurrently or sql_adapter.planHasExactBoolToken(entry.plan, ":concurrently=", true);
+                    self.ddl_reindex_maintenance_index_target = self.ddl_reindex_maintenance_index_target or sql_adapter.planHasExactStringToken(entry.plan, ":target=", "index");
+                },
+                .cluster_maintenance => {
+                    self.ddl_cluster_maintenance = true;
+                    self.ddl_cluster_maintenance_index = self.ddl_cluster_maintenance_index or
+                        !sql_adapter.planHasExactStringToken(entry.plan, ":index=", "");
+                    self.ddl_cluster_maintenance_verbose = self.ddl_cluster_maintenance_verbose or sql_adapter.planHasExactBoolToken(entry.plan, ":verbose=", true);
+                },
                 .prepare_statement => {
                     self.ddl_prepare_statement = true;
+                    self.ddl_prepare_statement_read_subject = self.ddl_prepare_statement_read_subject or sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "read");
+                    self.ddl_prepare_statement_write_subject = self.ddl_prepare_statement_write_subject or sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
+                    self.ddl_prepare_statement_params = self.ddl_prepare_statement_params or sql_adapter.planHasNonZeroToken(entry.plan, ":params=");
                     self.ddl_prepare_cte_write_statement = self.ddl_prepare_cte_write_statement or
                         std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                             std.mem.indexOf(u8, entry.sql, " AS WITH ") != null and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
                 },
-                .execute_statement => self.ddl_execute_statement = true,
-                .deallocate_statement => self.ddl_deallocate_statement = true,
-                .declare_cursor => self.ddl_declare_cursor = true,
-                .fetch_cursor => self.ddl_fetch_cursor = true,
-                .close_cursor => self.ddl_close_cursor = true,
+                .execute_statement => {
+                    self.ddl_execute_statement = true;
+                    self.ddl_execute_statement_args = self.ddl_execute_statement_args or sql_adapter.planHasNonZeroToken(entry.plan, ":args=");
+                },
+                .deallocate_statement => {
+                    self.ddl_deallocate_statement = true;
+                    self.ddl_deallocate_statement_all = self.ddl_deallocate_statement_all or sql_adapter.planHasExactBoolToken(entry.plan, ":all=", true);
+                },
+                .declare_cursor => {
+                    self.ddl_declare_cursor = true;
+                    self.ddl_declare_cursor_binary_hold_scroll = self.ddl_declare_cursor_binary_hold_scroll or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":scroll=", "scroll") and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":binary=", true) and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":hold=", true));
+                    self.ddl_declare_cursor_read_subject = self.ddl_declare_cursor_read_subject or sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "read");
+                },
+                .fetch_cursor => {
+                    self.ddl_fetch_cursor = true;
+                    self.ddl_fetch_cursor_count = self.ddl_fetch_cursor_count or sql_adapter.planHasNonZeroToken(entry.plan, ":count=");
+                    self.ddl_fetch_cursor_forward = self.ddl_fetch_cursor_forward or sql_adapter.planHasExactStringToken(entry.plan, ":direction=", "forward");
+                },
+                .close_cursor => {
+                    self.ddl_close_cursor = true;
+                    self.ddl_close_cursor_all = self.ddl_close_cursor_all or sql_adapter.planHasExactBoolToken(entry.plan, ":all=", true);
+                },
                 .savepoint_transaction => self.ddl_savepoint_transaction = true,
                 .release_savepoint => self.ddl_release_savepoint = true,
                 .rollback_to_savepoint => self.ddl_rollback_to_savepoint = true,
@@ -6435,16 +6493,33 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_cast_create_function);
         try std.testing.expect(self.ddl_cast_drop);
         try std.testing.expect(self.ddl_vacuum_maintenance);
+        try std.testing.expect(self.ddl_vacuum_maintenance_options);
         try std.testing.expect(self.ddl_analyze_maintenance);
+        try std.testing.expect(self.ddl_analyze_maintenance_columns);
+        try std.testing.expect(self.ddl_analyze_maintenance_verbose);
         try std.testing.expect(self.ddl_reindex_maintenance);
+        try std.testing.expect(self.ddl_reindex_maintenance_concurrently);
+        try std.testing.expect(self.ddl_reindex_maintenance_index_target);
         try std.testing.expect(self.ddl_cluster_maintenance);
+        try std.testing.expect(self.ddl_cluster_maintenance_index);
+        try std.testing.expect(self.ddl_cluster_maintenance_verbose);
         try std.testing.expect(self.ddl_prepare_statement);
+        try std.testing.expect(self.ddl_prepare_statement_read_subject);
+        try std.testing.expect(self.ddl_prepare_statement_write_subject);
+        try std.testing.expect(self.ddl_prepare_statement_params);
         try std.testing.expect(self.ddl_prepare_cte_write_statement);
         try std.testing.expect(self.ddl_execute_statement);
+        try std.testing.expect(self.ddl_execute_statement_args);
         try std.testing.expect(self.ddl_deallocate_statement);
+        try std.testing.expect(self.ddl_deallocate_statement_all);
         try std.testing.expect(self.ddl_declare_cursor);
+        try std.testing.expect(self.ddl_declare_cursor_binary_hold_scroll);
+        try std.testing.expect(self.ddl_declare_cursor_read_subject);
         try std.testing.expect(self.ddl_fetch_cursor);
+        try std.testing.expect(self.ddl_fetch_cursor_count);
+        try std.testing.expect(self.ddl_fetch_cursor_forward);
         try std.testing.expect(self.ddl_close_cursor);
+        try std.testing.expect(self.ddl_close_cursor_all);
         try std.testing.expect(self.ddl_savepoint_transaction);
         try std.testing.expect(self.ddl_release_savepoint);
         try std.testing.expect(self.ddl_rollback_to_savepoint);

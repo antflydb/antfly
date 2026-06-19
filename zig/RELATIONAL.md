@@ -1189,11 +1189,12 @@ trigger-policy grammar syntax for
 row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 `FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
 tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
-direction/count tails, transaction-control grammar for `LOCK TABLE`,
+direction/count and `CLOSE ALL` tails, transaction-control grammar for `LOCK TABLE`,
 `SET CONSTRAINTS`, `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN`
 mode clauses plus advisory-lock function-call tails, maintenance-job grammar for
 `VACUUM`, `ANALYZE`, `REINDEX`, and
-`CLUSTER`, notification-channel grammar for `LISTEN`, `NOTIFY`, and
+`CLUSTER`, including vacuum options, analyze columns, reindex concurrency, and
+cluster index/verbose metadata, notification-channel grammar for `LISTEN`, `NOTIFY`, and
 `UNLISTEN`, database/tablespace catalog grammar for `CREATE DATABASE`, `ALTER
 DATABASE ... SET`, `DROP DATABASE`, `CREATE TABLESPACE`, `ALTER TABLESPACE ...
 RENAME TO`, and `DROP TABLESPACE`, including database settings/forced drops and

@@ -393,6 +393,17 @@
       "sql": "VACUUM usage_records"
     },
     {
+      "name": "vacuum option maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "vacuum_maintenance",
+        "table_name": "usage_records",
+        "operations": 3
+      },
+      "plan": "ddl:maintenance:kind=vacuum:table=usage_records:full=true:freeze=false:verbose=true:analyze=true",
+      "sql": "VACUUM (FULL, VERBOSE, ANALYZE) usage_records"
+    },
+    {
       "name": "analyze maintenance job",
       "family": "ddl",
       "summary": {
@@ -402,6 +413,17 @@
       },
       "plan": "ddl:maintenance:kind=analyze:table=usage_records:verbose=false:columns=0",
       "sql": "ANALYZE usage_records"
+    },
+    {
+      "name": "analyze verbose column maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "analyze_maintenance",
+        "table_name": "usage_records",
+        "operations": 3
+      },
+      "plan": "ddl:maintenance:kind=analyze:table=usage_records:verbose=true:columns=2",
+      "sql": "ANALYZE VERBOSE usage_records (status, amount)"
     },
     {
       "name": "reindex maintenance job",
@@ -415,6 +437,17 @@
       "sql": "REINDEX TABLE usage_records"
     },
     {
+      "name": "reindex concurrently maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "reindex_maintenance",
+        "table_name": "usage_records_status_idx",
+        "operations": 1
+      },
+      "plan": "ddl:maintenance:kind=reindex:target=index:name=usage_records_status_idx:concurrently=true",
+      "sql": "REINDEX INDEX CONCURRENTLY usage_records_status_idx"
+    },
+    {
       "name": "cluster maintenance job",
       "family": "ddl",
       "summary": {
@@ -424,6 +457,17 @@
       },
       "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=false",
       "sql": "CLUSTER usage_records USING usage_records_status_idx"
+    },
+    {
+      "name": "cluster verbose maintenance job",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "cluster_maintenance",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=true",
+      "sql": "CLUSTER VERBOSE usage_records USING usage_records_status_idx"
     },
     {
       "name": "explicit table lock transaction control plan",
