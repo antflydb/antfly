@@ -356,6 +356,25 @@ fn effectiveFlatCentroidBlockProbeCount(
     return @min(@max(defaultFlatCentroidBlockProbeCount(block_count, block_size, posting_probe_limit), @as(usize, 1)), block_count);
 }
 
+fn shouldBuildGlobalPostingQuantized(self: anytype, block_count: usize, posting_count: usize) bool {
+    if (!self.config.use_quantization or posting_count == 0) return false;
+    if (block_count <= 1) return true;
+    if (self.config.centroid_directory_mode != .two_level_rabitq) return true;
+
+    const fixed_block_probe_count = self.config.flat_centroid_block_probe_count != 0;
+    const posting_probe_limit = if (self.config.flat_centroid_probe_count != 0)
+        self.config.flat_centroid_probe_count
+    else
+        self.config.search_width;
+    return effectiveFlatCentroidBlockProbeCount(
+        fixed_block_probe_count,
+        self.config.flat_centroid_block_probe_count,
+        block_count,
+        self.config.flat_centroid_block_size,
+        @max(posting_probe_limit, @as(usize, 1)),
+    ) >= block_count;
+}
+
 fn adaptiveFlatCentroidBlockProbeCount(sorted_block_probes: []const FlatCentroidProbe, base_count: usize) usize {
     if (sorted_block_probes.len == 0) return 0;
     var count = @min(@max(base_count, @as(usize, 1)), sorted_block_probes.len);
@@ -689,7 +708,7 @@ fn finalizeFlatCentroidDirectory(
         coarse_quantized = try self.quantizer.quantize(zero, coarse_centroids, owned_blocks.len);
         errdefer if (coarse_quantized) |*coarse| coarse.deinit(self.alloc);
 
-        if (posting_count > 0) {
+        if (shouldBuildGlobalPostingQuantized(self, owned_blocks.len, posting_count)) {
             const posting_centroids = try self.alloc.alloc(f32, posting_count * dims);
             defer self.alloc.free(posting_centroids);
             for (owned_blocks) |*block| {
@@ -2129,6 +2148,32 @@ test "effective centroid block probing full-scans small directories and prunes 1
     try std.testing.expectEqual(@as(usize, 47), block_count);
     try std.testing.expectEqual(@as(usize, 7), defaultFlatCentroidBlockProbeCount(block_count, 128, 32));
     try std.testing.expectEqual(@as(usize, 7), effectiveFlatCentroidBlockProbeCount(false, 0, block_count, 128, 32));
+}
+
+test "global posting quantized payload is only built for deterministic full block scans" {
+    const TestIndex = struct {
+        config: types.HBCConfig = .{
+            .use_quantization = true,
+            .centroid_directory_mode = .two_level_rabitq,
+            .flat_centroid_block_size = 128,
+            .flat_centroid_probe_count = 256,
+            .flat_centroid_block_probe_count = 0,
+            .search_width = 256,
+        },
+    };
+
+    var index = TestIndex{};
+    try std.testing.expect(!shouldBuildGlobalPostingQuantized(&index, 47, 5953));
+
+    index.config.flat_centroid_block_probe_count = 94;
+    try std.testing.expect(shouldBuildGlobalPostingQuantized(&index, 47, 5953));
+
+    index.config.flat_centroid_block_probe_count = 0;
+    index.config.centroid_directory_mode = .flat_rabitq;
+    try std.testing.expect(shouldBuildGlobalPostingQuantized(&index, 47, 5953));
+
+    index.config.use_quantization = false;
+    try std.testing.expect(!shouldBuildGlobalPostingQuantized(&index, 47, 5953));
 }
 
 test "flat centroid block ordering uses widest centroid dimension" {
