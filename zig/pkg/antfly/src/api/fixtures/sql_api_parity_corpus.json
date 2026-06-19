@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "e6749aaa84f07e494370a467f2535770253a8ce9af02e147a9fe1a36f0f6098a",
-  "source_entry_count": 957,
-  "entry_count": 957,
+  "source_sha256": "1d14ce2fb66840bf88d4b3a5d9317c1f7c04e25222f7dd13eb6049de7e4f131b",
+  "source_entry_count": 958,
+  "entry_count": 958,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -213,6 +213,15 @@
       },
       "plan": "ddl:session:set_search_path:namespaces=1:local=false",
       "sql": "SET search_path TO public;"
+    },
+    {
+      "name": "tenant search path session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_search_path"
+      },
+      "plan": "ddl:session:set_search_path:namespaces=2:local=false",
+      "sql": "SET SESSION search_path TO tenant_schema, public;"
     },
     {
       "name": "adapter-only local public search path session syntax",

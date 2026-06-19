@@ -547,6 +547,7 @@
     "session_discard",
     "session_reset_search_path",
     "session_set_search_path",
+    "session_set_search_path_multi_namespace",
     "session_show_search_path",
     "set_operation_expression_numeric_range_disjoint",
     "set_operation_fetch_tail",

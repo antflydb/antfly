@@ -209,6 +209,15 @@
       "sql": "SET search_path TO public;"
     },
     {
+      "name": "tenant search path session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_search_path"
+      },
+      "plan": "ddl:session:set_search_path:namespaces=2:local=false",
+      "sql": "SET SESSION search_path TO tenant_schema, public;"
+    },
+    {
       "name": "adapter-only local public search path session syntax",
       "family": "adapter_noop_ddl",
       "plan": "adapter_noop:ddl:reason=session_setting",

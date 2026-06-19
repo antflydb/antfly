@@ -4542,8 +4542,12 @@ allowlist. Catalog-affecting
 `SET search_path`, `RESET search_path`, `SHOW search_path`, and `DISCARD ALL`
 now lower to typed session catalog plans instead of adapter no-ops. Applying
 those plans mutates an explicit SQL catalog session used by table/schema
-resolution, while `SET LOCAL search_path` with any non-public namespace fails
-closed until Antfly has transaction-local session state. Role/session
+resolution. `SET [SESSION] search_path` preserves the ordered namespace list in
+the typed plan, and the source parity corpus pins both public-only and
+multi-namespace session search paths so schema-resolution metadata cannot
+collapse back into an adapter-only no-op. `SET LOCAL search_path` with any
+non-public namespace fails closed until Antfly has transaction-local session
+state. Role/session
 authorization changes, arbitrary settings, timeout settings, default storage
 settings, unsupported values for otherwise inert settings, `SHOW ALL`, and
 partial `DISCARD` variants still fail closed. The allowlist lives in

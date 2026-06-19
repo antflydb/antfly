@@ -4456,6 +4456,7 @@ pub const AppParityCorpusCoverage = struct {
     adapter_noop_schema_namespace: bool = false,
     adapter_noop_extension: bool = false,
     session_set_search_path: bool = false,
+    session_set_search_path_multi_namespace: bool = false,
     session_reset_search_path: bool = false,
     session_show_search_path: bool = false,
     session_discard: bool = false,
@@ -5771,7 +5772,11 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_advisory_unlock = self.ddl_advisory_unlock or sql_adapter.planHasExactStringToken(entry.plan, ":action=", "unlock");
                     self.ddl_advisory_lock_two_keys = self.ddl_advisory_lock_two_keys or sql_adapter.planHasExactUsizeToken(entry.plan, ":keys=", 2);
                 },
-                .set_search_path => self.session_set_search_path = true,
+                .set_search_path => {
+                    self.session_set_search_path = true;
+                    self.session_set_search_path_multi_namespace = self.session_set_search_path_multi_namespace or
+                        (sql_adapter.planUsizeTokenValue(entry.plan, ":namespaces=") orelse 0) > 1;
+                },
                 .reset_search_path => self.session_reset_search_path = true,
                 .show_search_path => self.session_show_search_path = true,
                 .discard_all => self.session_discard = true,
@@ -6910,6 +6915,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_comment_index);
         try std.testing.expect(self.ddl_comment_constraint);
         try std.testing.expect(self.session_set_search_path);
+        try std.testing.expect(self.session_set_search_path_multi_namespace);
         try std.testing.expect(self.session_reset_search_path);
         try std.testing.expect(self.session_show_search_path);
         try std.testing.expect(self.session_discard);
