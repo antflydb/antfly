@@ -4748,6 +4748,20 @@ pub fn populateMetadata(self: anytype, txn: anytype, results: *search_results.Se
 fn populateMetadataWithScratch(self: anytype, txn: anytype, results: *search_results.SearchResults, scratch: anytype) !void {
     try self.bindTxnLike(txn);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
+        if (results.items.items.len <= small_metadata_batch_count) {
+            var lookups_stack: [small_metadata_batch_count]FixedKeyLookup = undefined;
+            var key_views_stack: [small_metadata_batch_count][]const u8 = undefined;
+            var values_stack: [small_metadata_batch_count]?[]const u8 = undefined;
+            try populateMetadataBatchedWithScratch(
+                self,
+                txn,
+                results,
+                lookups_stack[0..results.items.items.len],
+                key_views_stack[0..results.items.items.len],
+                values_stack[0..results.items.items.len],
+            );
+            return;
+        }
         try scratch.ensureQueryCapacity(self.alloc, results.items.items.len);
         try populateMetadataBatchedWithScratch(self, txn, results, scratch.lookups, scratch.key_views, scratch.values);
         return;
