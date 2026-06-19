@@ -3883,8 +3883,10 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_create: bool = false,
     ddl_function_replace: bool = false,
     ddl_function_drop: bool = false,
+    ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
     ddl_procedure_drop: bool = false,
+    ddl_procedure_drop_cascade: bool = false,
     ddl_role_create: bool = false,
     ddl_role_alter: bool = false,
     ddl_role_drop: bool = false,
@@ -5392,9 +5394,15 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_create = true;
                     self.ddl_function_replace = self.ddl_function_replace or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
                 },
-                .drop_function => self.ddl_function_drop = true,
+                .drop_function => {
+                    self.ddl_function_drop = true;
+                    self.ddl_function_drop_cascade = self.ddl_function_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
                 .create_procedure => self.ddl_procedure_create = true,
-                .drop_procedure => self.ddl_procedure_drop = true,
+                .drop_procedure => {
+                    self.ddl_procedure_drop = true;
+                    self.ddl_procedure_drop_cascade = self.ddl_procedure_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
                 .create_role => self.ddl_role_create = true,
                 .alter_role => self.ddl_role_alter = true,
                 .drop_role => self.ddl_role_drop = true,
@@ -6166,8 +6174,10 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_function_create);
         try std.testing.expect(self.ddl_function_replace);
         try std.testing.expect(self.ddl_function_drop);
+        try std.testing.expect(self.ddl_function_drop_cascade);
         try std.testing.expect(self.ddl_procedure_create);
         try std.testing.expect(self.ddl_procedure_drop);
+        try std.testing.expect(self.ddl_procedure_drop_cascade);
         try std.testing.expect(self.ddl_role_create);
         try std.testing.expect(self.ddl_role_alter);
         try std.testing.expect(self.ddl_role_drop);

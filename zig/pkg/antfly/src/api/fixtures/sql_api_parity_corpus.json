@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "8e42030bdc6cccf6b8233c86c7c6afa88074c9f6ed92103e84f4e8435cd9c3a3",
-  "source_entry_count": 917,
-  "entry_count": 917,
+  "source_sha256": "eeac4ee0ebaf2422ca8b2070f8e8a56b46bad9ae4e53d84994206946e9251cca",
+  "source_entry_count": 919,
+  "entry_count": 919,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3430,6 +3430,17 @@
       "sql": "DROP FUNCTION audit_changes()"
     },
     {
+      "name": "drop function cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_function",
+        "table_name": "audit_changes",
+        "operations": 1
+      },
+      "plan": "ddl:drop_function:name=audit_changes:args=1:if_exists=true:cascade=true",
+      "sql": "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE"
+    },
+    {
       "name": "create procedure catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3457,6 +3468,17 @@
       },
       "plan": "ddl:drop_procedure:name=rotate_usage:args=0:if_exists=false",
       "sql": "DROP PROCEDURE rotate_usage()"
+    },
+    {
+      "name": "drop procedure cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_procedure",
+        "table_name": "rotate_usage",
+        "operations": 1
+      },
+      "plan": "ddl:drop_procedure:name=rotate_usage:args=1:if_exists=true:cascade=true",
+      "sql": "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE"
     },
     {
       "name": "partitioned table create catalog ddl",

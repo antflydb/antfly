@@ -44966,6 +44966,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:drop_function:name=audit_changes:args=0:if_exists=true", drop_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, drop_function));
 
+    var drop_function_cascade = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE;");
+    defer drop_function_cascade.deinit(alloc);
+    const drop_function_cascade_fingerprint = try ddlFingerprintAlloc(alloc, drop_function_cascade);
+    defer alloc.free(drop_function_cascade_fingerprint);
+    try std.testing.expectEqualStrings("ddl:drop_function:name=audit_changes:args=1:if_exists=true:cascade=true", drop_function_cascade_fingerprint);
+
     var create_procedure = try lowerDdlPlanAlloc(alloc, "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql;");
     defer create_procedure.deinit(alloc);
     const create_procedure_fingerprint = try ddlFingerprintAlloc(alloc, create_procedure);
@@ -44979,6 +44985,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(drop_procedure_fingerprint);
     try std.testing.expectEqualStrings("ddl:drop_procedure:name=rotate_usage:args=0:if_exists=false", drop_procedure_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, drop_procedure));
+
+    var drop_procedure_cascade = try lowerDdlPlanAlloc(alloc, "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE;");
+    defer drop_procedure_cascade.deinit(alloc);
+    const drop_procedure_cascade_fingerprint = try ddlFingerprintAlloc(alloc, drop_procedure_cascade);
+    defer alloc.free(drop_procedure_cascade_fingerprint);
+    try std.testing.expectEqualStrings("ddl:drop_procedure:name=rotate_usage:args=1:if_exists=true:cascade=true", drop_procedure_cascade_fingerprint);
 
     var grant_privilege = try lowerDdlPlanAlloc(alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;");
     defer grant_privilege.deinit(alloc);

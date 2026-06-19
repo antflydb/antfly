@@ -3838,6 +3838,17 @@
       "sql": "DROP FUNCTION audit_changes()"
     },
     {
+      "name": "drop function cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_function",
+        "table_name": "audit_changes",
+        "operations": 1
+      },
+      "plan": "ddl:drop_function:name=audit_changes:args=1:if_exists=true:cascade=true",
+      "sql": "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE"
+    },
+    {
       "name": "create procedure catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3865,6 +3876,17 @@
       },
       "plan": "ddl:drop_procedure:name=rotate_usage:args=0:if_exists=false",
       "sql": "DROP PROCEDURE rotate_usage()"
+    },
+    {
+      "name": "drop procedure cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_procedure",
+        "table_name": "rotate_usage",
+        "operations": 1
+      },
+      "plan": "ddl:drop_procedure:name=rotate_usage:args=1:if_exists=true:cascade=true",
+      "sql": "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE"
     },
     {
       "name": "partitioned table create catalog ddl",
