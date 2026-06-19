@@ -1367,12 +1367,25 @@ pub const LazyDirectorySnapshot = struct {
         alloc: Allocator,
         candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
     ) !void {
-        for (self.manifest.segments) |entry| {
-            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-            try appendSegmentCentroidDirectoryRecordCandidatesAlloc(alloc, self.io, self.dir, .{
-                .meta = entry.meta,
-                .path = entry.path,
-            }, candidates);
+        if (self.manifest.segments_sorted_by_segment_id) {
+            var segment_index = self.manifest.segments.len;
+            while (segment_index > 0) {
+                segment_index -= 1;
+                const entry = self.manifest.segments[segment_index];
+                if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+                try appendSegmentCentroidDirectoryRecordCandidatesAlloc(alloc, self.io, self.dir, .{
+                    .meta = entry.meta,
+                    .path = entry.path,
+                }, candidates, true);
+            }
+        } else {
+            for (self.manifest.segments) |entry| {
+                if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+                try appendSegmentCentroidDirectoryRecordCandidatesAlloc(alloc, self.io, self.dir, .{
+                    .meta = entry.meta,
+                    .path = entry.path,
+                }, candidates, false);
+            }
         }
     }
 };
@@ -2742,6 +2755,7 @@ const DeltaIndexRange = struct {
 const ValueIndexRange = struct {
     offset: usize,
     end: usize,
+    first_index: usize,
     past_index: usize,
 };
 
@@ -3925,6 +3939,7 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
     dir: std.Io.Dir,
     entry: ManifestEntry,
     candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+    skip_superseded_candidates: bool,
 ) !void {
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
@@ -3947,6 +3962,11 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
         }
 
         const range = try centroidDirectoryIndexRange(index_data.data, entry.meta, index);
+        if (skip_superseded_candidates and try centroidDirectoryRangeFullyCoveredByCandidates(index_data.data, range, entry.meta.segment_id, candidates)) {
+            index = range.past_index;
+            continue;
+        }
+
         const range_len = range.end - range.offset;
         const bytes = if (range_len <= stack_values.len) blk: {
             break :blk stack_values[0..range_len];
@@ -3964,6 +3984,7 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
         while (record_index < range.past_index) : (record_index += 1) {
             const record_entry = try indexEntryFromBytes(index_data.data[record_index * index_entry_size ..][0..index_entry_size]);
             if (record_entry.kind != .centroid_directory) continue;
+            if (skip_superseded_candidates and centroidRecordCandidateCovers(candidates, record_entry.posting_id, entry.meta.segment_id)) continue;
             const value = try valueFromBufferedRange(bytes, range.offset, record_entry);
             var record = try posting.CentroidDirectoryFormat.decode(alloc, value);
             try putCentroidRecordCandidate(alloc, candidates, entry.meta.segment_id, &record);
@@ -3971,6 +3992,30 @@ fn appendSegmentCentroidDirectoryRecordCandidatesAlloc(
 
         index = range.past_index;
     }
+}
+
+fn centroidDirectoryRangeFullyCoveredByCandidates(
+    index_data: []const u8,
+    range: ValueIndexRange,
+    segment_id: u64,
+    candidates: *const std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+) !bool {
+    var record_index = range.first_index;
+    while (record_index < range.past_index) : (record_index += 1) {
+        const record_entry = try indexEntryFromBytes(index_data[record_index * index_entry_size ..][0..index_entry_size]);
+        if (record_entry.kind != .centroid_directory) continue;
+        if (!centroidRecordCandidateCovers(candidates, record_entry.posting_id, segment_id)) return false;
+    }
+    return true;
+}
+
+fn centroidRecordCandidateCovers(
+    candidates: *const std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+    posting_id: PostingId,
+    segment_id: u64,
+) bool {
+    const existing = candidates.get(posting_id) orelse return false;
+    return existing.segment_id >= segment_id;
 }
 
 fn centroidDirectoryIndexRange(index_data: []const u8, meta: SegmentMeta, first_index: usize) !ValueIndexRange {
@@ -3997,6 +4042,7 @@ fn centroidDirectoryIndexRange(index_data: []const u8, meta: SegmentMeta, first_
     return .{
         .offset = range_offset,
         .end = range_end,
+        .first_index = first_index,
         .past_index = past_index,
     };
 }
@@ -7004,6 +7050,77 @@ pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
     try std.testing.expectEqualSlices(posting.VectorId, &.{ 20, 30, 40 }, scratch.member_ids[0..scratch_count]);
 }
 
+pub fn testLazyCentroidRecordLoadSkipsSupersededSegments() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .mutation_version = 1,
+        .payload_version = 1,
+        .flags = 0,
+        .parent = 1,
+        .level = 0,
+        .member_count = 1,
+        .bounds_radius = 1.0,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    defer alloc.free(old_centroid);
+    var old_writer = Writer.init(alloc);
+    defer old_writer.deinit();
+    try old_writer.appendCentroidDirectory(7, old_centroid);
+    var committed_old = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &old_writer, .{});
+    defer committed_old.deinit(alloc);
+
+    const new_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 2,
+        .mutation_version = 4,
+        .payload_version = 5,
+        .flags = 0,
+        .parent = 2,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 2.0,
+        .centroid = &.{ 3.0, 4.0 },
+    });
+    defer alloc.free(new_centroid);
+    var new_writer = Writer.init(alloc);
+    defer new_writer.deinit();
+    try new_writer.appendCentroidDirectory(7, new_centroid);
+    var committed_new = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &new_writer, .{});
+    defer committed_new.deinit(alloc);
+
+    const original_old = try tmp.dir.readFileAlloc(std.testing.io, committed_old.entry.path, alloc, .limited(committed_old.entry.meta.byte_len + 1));
+    defer alloc.free(original_old);
+    const old_reader = try Reader.init(original_old);
+    const old_centroid_location = (try old_reader.getCentroidDirectoryLocation(7)).?;
+    var corrupt_old = try alloc.dupe(u8, original_old);
+    defer alloc.free(corrupt_old);
+    corrupt_old[old_centroid_location.offset] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed_old.entry.path,
+        .data = corrupt_old,
+    });
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    try std.testing.expect(lazy.manifest.segments_sorted_by_segment_id);
+
+    const records = try lazy.snapshot().loadCentroidDirectoryRecordsAlloc(alloc);
+    defer {
+        for (records) |*record| record.deinit(alloc);
+        alloc.free(records);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(PostingId, 7), records[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 2), records[0].generation);
+    try std.testing.expectEqual(@as(u64, 4), records[0].mutation_version);
+}
+
 pub fn testLazyDirectoryStoreBulkLoadsCentroidsWithPartialReads() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7824,6 +7941,10 @@ test "posting segment eager snapshot uses adaptive overlay replay for large tail
 
 test "posting segment lazy directory store uses newest point records by segment id" {
     try testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId();
+}
+
+test "posting segment lazy centroid record load skips superseded segments" {
+    try testLazyCentroidRecordLoadSkipsSupersededSegments();
 }
 
 test "posting segment lazy directory store bulk loads centroids with partial reads" {
