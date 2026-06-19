@@ -719,13 +719,15 @@ fn appendFlatCentroidBlocksFromEntries(
 
     var block_count: usize = 0;
     var posting_offset: usize = 0;
-    for (entries.items) |entry| {
+    for (entries.items) |*entry| {
         posting_ids[block_count] = entry.posting_id;
         parents[block_count] = entry.parent;
         levels[block_count] = entry.level;
         states[block_count] = entry.state;
         radii[block_count] = entry.bounds_radius;
         @memcpy(centroids[block_count * dims ..][0..dims], entry.centroid[0..dims]);
+        self.alloc.free(entry.centroid);
+        entry.centroid = &.{};
         block_count += 1;
 
         if (block_count == block_size) {
