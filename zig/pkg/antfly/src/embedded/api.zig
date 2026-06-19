@@ -226,6 +226,16 @@ pub const Api = struct {
         const removed = try self.db.deleteEnrichment(kind, name);
         return try namedBoolMutationJson(alloc, "removed", name, removed);
     }
+
+    pub fn getSchemaJson(self: *Api, alloc: Allocator) ![]u8 {
+        const schema_json = (try self.db.getSchemaJson(alloc)) orelse return try alloc.dupe(u8, "null");
+        return schema_json;
+    }
+
+    pub fn setSchemaJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        try self.db.setSchemaJson(alloc, body);
+        return try alloc.dupe(u8, "{\"updated\":true}");
+    }
 };
 
 const ParsedLookupRequest = struct {
@@ -688,5 +698,47 @@ test "embedded api openLite manages index and enrichment definitions over aflite
         const removed_enrichment = try reopened.dropEnrichmentJson(alloc, .chunk, "body_chunks_v1");
         defer alloc.free(removed_enrichment);
         try std.testing.expect(std.mem.indexOf(u8, removed_enrichment, "\"removed\":true") != null);
+    }
+}
+
+test "embedded api openLite persists schema json over aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-schema.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+
+    {
+        var api = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer api.close();
+
+        const updated = try api.setSchemaJson(alloc, schema_json);
+        defer alloc.free(updated);
+        try std.testing.expect(std.mem.indexOf(u8, updated, "\"updated\":true") != null);
+    }
+
+    {
+        var reopened = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer reopened.close();
+
+        const persisted = try reopened.getSchemaJson(alloc);
+        defer alloc.free(persisted);
+        try std.testing.expectEqualStrings(schema_json, persisted);
     }
 }

@@ -75,6 +75,7 @@ const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
+const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -116,6 +117,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 };
 const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
+const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -6079,6 +6081,23 @@ pub const DB = struct {
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
+    }
+
+    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        try self.setSchema(runtime_schema);
+        try self.core.putStoreBatch(&.{.{
+            .key = public_schema_json_key,
+            .value = schema_json,
+        }}, &.{});
+    }
+
+    pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
+        return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {

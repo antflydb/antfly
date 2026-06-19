@@ -122,6 +122,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "query")) return try query(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "index")) return try indexCommand(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "enrichment")) return try enrichmentCommand(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "schema")) return try schemaCommand(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "run-until-idle")) return try runUntilIdle(init.gpa, init.io, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
@@ -366,6 +367,45 @@ fn enrichmentDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
     const json = try mutationJson(allocator, "removed", resolved_name, removed);
     defer allocator.free(json);
     writeJsonLine(io, json);
+}
+
+fn schemaCommand(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const action = args.next() orelse cli.fatal("schema subcommand is required", .{});
+    if (std.mem.eql(u8, action, "get")) return try schemaGet(allocator, io, args);
+    if (std.mem.eql(u8, action, "set")) return try schemaSet(allocator, io, args);
+    cli.fatal("unknown schema subcommand: {s}", .{action});
+}
+
+fn schemaGet(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    requireNoMoreArgs(args);
+
+    var lite = try LiteDb.open(allocator, path, .status_only);
+    defer lite.close();
+
+    const schema_json = try lite.db.getSchemaJson(allocator);
+    if (schema_json) |json| {
+        defer allocator.free(json);
+        writeJsonLine(io, json);
+    } else {
+        writeJsonLine(io, "null");
+    }
+}
+
+fn schemaSet(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    const file_path = parseFileFlag(args);
+
+    const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
+    defer allocator.free(body);
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    try lite.db.setSchemaJson(allocator, body);
+    writeJsonLine(io, "{\"updated\":true}");
 }
 
 fn runUntilIdle(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -648,6 +688,8 @@ fn printUsage(argv0: []const u8) void {
         \\  enrichment list <db.aflite>
         \\  enrichment create <db.aflite> --file enrichment.json
         \\  enrichment drop <db.aflite> --kind <chunk|asset|embedding> --name <name>
+        \\  schema get <db.aflite>
+        \\  schema set <db.aflite> --file schema.json
         \\  run-until-idle <db.aflite>
         \\
     , .{argv0});

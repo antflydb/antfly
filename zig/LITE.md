@@ -73,6 +73,8 @@ antfly lite init app.aflite
 antfly lite status app.aflite
 antfly lite batch app.aflite --file writes.json
 antfly lite query app.aflite --file query.json
+antfly lite schema set app.aflite --file schema.json
+antfly lite schema get app.aflite
 antfly lite index create app.aflite --file index.json
 antfly lite enrichment create app.aflite --file enrichment.json
 antfly lite run-until-idle app.aflite

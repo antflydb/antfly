@@ -215,6 +215,14 @@ pub const DB = struct {
     pub fn setSchema(self: *DB, table_schema: support.schema.TableSchema) !void {
         try self.inner.setSchema(table_schema);
     }
+
+    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        try self.inner.setSchemaJson(alloc, schema_json);
+    }
+
+    pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
+        return try self.inner.getSchemaJson(alloc);
+    }
 };
 
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
