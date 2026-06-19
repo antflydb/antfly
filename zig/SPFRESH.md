@@ -2501,11 +2501,13 @@ The two-level query path also reuses distance-only scratch for coarse block
 selection, so scoring block centroids does not grow vector-fetch buffers by the
 number of centroid blocks or inflate the query-result slab. Selected block IDs
 live in a stack/usize scratch buffer instead of `SearchScratch.positions`, and
-`SearchScratch` exposes distance-only growth for coarse block scoring. Directory
-blocks also retain the coarse centroid's metric measure, so non-quantized block
-scoring can use the same precomputed candidate-measure path as posting-centroid
-scoring instead of recomputing block centroid norms/measures on every query.
-Adaptive two-level queries also delay the posting-count-sized
+adaptive two-level probes size that buffer to the bounded selected-block
+candidate window instead of the full directory block count. `SearchScratch`
+exposes distance-only growth for coarse block scoring. Directory blocks also
+retain the coarse centroid's metric measure, so non-quantized block scoring can
+use the same precomputed candidate-measure path as posting-centroid scoring
+instead of recomputing block centroid norms/measures on every query. Adaptive
+two-level queries also delay the posting-count-sized
 distance/error-bound scratch reservation until the selected block set is known
 to full-scan the directory and use the global posting quantized payload; pruned
 block probes stay at block/per-block scratch size. The optimized gate checks the

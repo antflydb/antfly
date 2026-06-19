@@ -1172,23 +1172,31 @@ pub fn selectFlatRabitqPostings(
     const max_block_postings = @max(self.config.flat_centroid_block_size, @as(usize, 1));
     const base_distance_capacity = @max(directory.blocks.len, max_block_postings);
     try scratch.ensureDistanceOnlyCapacity(self.alloc, base_distance_capacity);
-    var selected_block_stack: [flat_centroid_query_probe_stack_capacity]usize = undefined;
-    const use_selected_block_stack = directory.blocks.len <= selected_block_stack.len;
-    var selected_block_storage = if (use_selected_block_stack)
-        selected_block_stack[0..directory.blocks.len]
-    else
-        try self.alloc.alloc(usize, directory.blocks.len);
-    defer if (!use_selected_block_stack) self.alloc.free(selected_block_storage);
-    var selected_blocks: []usize = selected_block_storage[0..0];
-    if (self.config.centroid_directory_mode == .two_level_rabitq and directory.blocks.len > 1) {
-        const fixed_block_probe_count = self.config.flat_centroid_block_probe_count != 0;
-        const block_probe_limit = effectiveFlatCentroidBlockProbeCount(
+    const use_two_level_blocks = self.config.centroid_directory_mode == .two_level_rabitq and directory.blocks.len > 1;
+    const fixed_block_probe_count = use_two_level_blocks and self.config.flat_centroid_block_probe_count != 0;
+    const block_probe_limit = if (use_two_level_blocks)
+        effectiveFlatCentroidBlockProbeCount(
             fixed_block_probe_count,
             self.config.flat_centroid_block_probe_count,
             directory.blocks.len,
             self.config.flat_centroid_block_size,
             probe_limit,
-        );
+        )
+    else
+        directory.blocks.len;
+    const selected_block_capacity = if (use_two_level_blocks and block_probe_limit < directory.blocks.len)
+        flatCentroidBlockProbeCandidateCount(fixed_block_probe_count, directory.blocks.len, block_probe_limit)
+    else
+        directory.blocks.len;
+    var selected_block_stack: [flat_centroid_query_probe_stack_capacity]usize = undefined;
+    const use_selected_block_stack = selected_block_capacity <= selected_block_stack.len;
+    var selected_block_storage = if (use_selected_block_stack)
+        selected_block_stack[0..selected_block_capacity]
+    else
+        try self.alloc.alloc(usize, selected_block_capacity);
+    defer if (!use_selected_block_stack) self.alloc.free(selected_block_storage);
+    var selected_blocks: []usize = selected_block_storage[0..0];
+    if (use_two_level_blocks) {
         if (block_probe_limit >= directory.blocks.len) {
             for (directory.blocks, 0..) |_, block_index| selected_block_storage[block_index] = block_index;
             selected_blocks = selected_block_storage[0..directory.blocks.len];
