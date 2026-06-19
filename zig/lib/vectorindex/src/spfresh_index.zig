@@ -1144,7 +1144,7 @@ pub fn selectFlatRabitqPostings(
         std.mem.sort(FlatCentroidProbe, candidates, {}, flatProbeLess);
         var scored_candidates: usize = 0;
         for (candidates) |candidate| {
-            if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
+            if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) break;
             const block = &directory.blocks[candidate.block_index];
             const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
             const distance = vec.distanceToQueryWithCandidateMeasure(
@@ -1195,7 +1195,7 @@ pub fn selectFlatRabitqPostings(
                 std.mem.sort(FlatCentroidProbe, candidates, {}, flatProbeLess);
                 var scored_candidates: usize = 0;
                 for (candidates) |candidate| {
-                    if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
+                    if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) break;
                     const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
                     const distance = vec.distanceToQueryWithCandidateMeasure(
                         query,
@@ -2238,6 +2238,18 @@ test "flat probe collector candidates sort by lower bound before exact scoring" 
     try std.testing.expectEqual(@as(u64, 4), items[0].posting_id);
     try std.testing.expectEqual(@as(u64, 2), items[1].posting_id);
     try std.testing.expectEqual(@as(u64, 3), items[2].posting_id);
+}
+
+test "flat probe collector rejection is monotonic for sorted lower bounds" {
+    var storage: [2]FlatCentroidProbe = undefined;
+    var collector = FlatProbeCollector.init(&storage);
+
+    collector.insert(.{ .posting_id = 1, .distance = 1, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 2, .distance = 2, .error_bound = 0 });
+
+    try std.testing.expect(!collector.wouldRejectLowerBound(1));
+    try std.testing.expect(collector.wouldRejectLowerBound(2));
+    try std.testing.expect(collector.wouldRejectLowerBound(3));
 }
 
 test "centroid block probe collector preserves distance tie ordering" {
