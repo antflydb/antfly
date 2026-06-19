@@ -727,11 +727,17 @@ pub const DdlForeignKeyTimingSyntax = enum {
     deferred,
 };
 
+pub const DdlForeignKeyMatchSyntax = enum {
+    simple,
+    full,
+};
+
 pub const DdlForeignKeyOptionsSyntax = struct {
     on_delete: DdlForeignKeyActionSyntax = .restrict,
     on_update: DdlForeignKeyActionSyntax = .restrict,
     deferrable: bool = false,
     timing: DdlForeignKeyTimingSyntax = .immediate,
+    match: DdlForeignKeyMatchSyntax = .simple,
 };
 
 pub const DdlForeignKeyColumnListSyntax = struct {
@@ -3924,6 +3930,7 @@ pub fn parseOptionalDdlKnownDefault(tokens: []const Token, pos: *usize) !?DdlKno
 pub fn parseDdlForeignKeyOptions(tokens: []const Token, pos: *usize) !DdlForeignKeyOptionsSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     var options: DdlForeignKeyOptionsSyntax = .{};
+    var match_seen = false;
     while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon)) {
         if (peekDdlNotValid(tokens, pos.*)) break;
         if (cursor.matchKeyword("on")) {
@@ -3946,6 +3953,18 @@ pub fn parseDdlForeignKeyOptions(tokens: []const Token, pos: *usize) !DdlForeign
             } else {
                 try cursor.expectKeyword("immediate");
                 options.timing = .immediate;
+            }
+        } else if (cursor.matchKeyword("match")) {
+            if (match_seen) return error.UnsupportedSqlShape;
+            match_seen = true;
+            if (cursor.matchKeyword("simple")) {
+                options.match = .simple;
+            } else if (cursor.matchKeyword("full")) {
+                options.match = .full;
+            } else if (cursor.matchKeyword("partial")) {
+                return error.UnsupportedSqlShape;
+            } else {
+                return error.UnsupportedSqlShape;
             }
         } else {
             return error.UnsupportedSqlShape;
@@ -6966,6 +6985,7 @@ test "sql adapter grammar parses ddl foreign key options" {
     try std.testing.expectEqual(DdlForeignKeyActionSyntax.set_null, action.on_update);
     try std.testing.expect(action.deferrable);
     try std.testing.expectEqual(DdlForeignKeyTimingSyntax.deferred, action.timing);
+    try std.testing.expectEqual(DdlForeignKeyMatchSyntax.simple, action.match);
     try std.testing.expect(peekDdlNotValid(action_tokens.items, action_pos));
 
     var no_action_tokens = try lexer.tokenizeAlloc(alloc, "ON DELETE NO ACTION ON UPDATE RESTRICT,");
@@ -6976,6 +6996,7 @@ test "sql adapter grammar parses ddl foreign key options" {
     try std.testing.expectEqual(DdlForeignKeyActionSyntax.restrict, no_action.on_update);
     try std.testing.expect(!no_action.deferrable);
     try std.testing.expectEqual(DdlForeignKeyTimingSyntax.immediate, no_action.timing);
+    try std.testing.expectEqual(DdlForeignKeyMatchSyntax.simple, no_action.match);
     try std.testing.expect(no_action_tokens.items[no_action_pos].kind == .comma);
 
     var immediate_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY IMMEDIATE)");
@@ -6985,6 +7006,33 @@ test "sql adapter grammar parses ddl foreign key options" {
     try std.testing.expect(!immediate.deferrable);
     try std.testing.expectEqual(DdlForeignKeyTimingSyntax.immediate, immediate.timing);
     try std.testing.expect(immediate_tokens.items[immediate_pos].kind == .rparen);
+
+    var match_full_tokens = try lexer.tokenizeAlloc(alloc, "MATCH FULL DEFERRABLE INITIALLY DEFERRED)");
+    defer lexer.freeTokens(alloc, &match_full_tokens);
+    var match_full_pos: usize = 0;
+    const match_full = try parseDdlForeignKeyOptions(match_full_tokens.items, &match_full_pos);
+    try std.testing.expectEqual(DdlForeignKeyMatchSyntax.full, match_full.match);
+    try std.testing.expect(match_full.deferrable);
+    try std.testing.expectEqual(DdlForeignKeyTimingSyntax.deferred, match_full.timing);
+    try std.testing.expect(match_full_tokens.items[match_full_pos].kind == .rparen);
+
+    var match_simple_tokens = try lexer.tokenizeAlloc(alloc, "MATCH SIMPLE NOT DEFERRABLE)");
+    defer lexer.freeTokens(alloc, &match_simple_tokens);
+    var match_simple_pos: usize = 0;
+    const match_simple = try parseDdlForeignKeyOptions(match_simple_tokens.items, &match_simple_pos);
+    try std.testing.expectEqual(DdlForeignKeyMatchSyntax.simple, match_simple.match);
+    try std.testing.expect(!match_simple.deferrable);
+    try std.testing.expect(match_simple_tokens.items[match_simple_pos].kind == .rparen);
+
+    var match_partial_tokens = try lexer.tokenizeAlloc(alloc, "MATCH PARTIAL)");
+    defer lexer.freeTokens(alloc, &match_partial_tokens);
+    var match_partial_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlForeignKeyOptions(match_partial_tokens.items, &match_partial_pos));
+
+    var duplicate_match_tokens = try lexer.tokenizeAlloc(alloc, "MATCH FULL MATCH SIMPLE)");
+    defer lexer.freeTokens(alloc, &duplicate_match_tokens);
+    var duplicate_match_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlForeignKeyOptions(duplicate_match_tokens.items, &duplicate_match_pos));
 
     var invalid_action_tokens = try lexer.tokenizeAlloc(alloc, "ON DELETE SET DEFAULT)");
     defer lexer.freeTokens(alloc, &invalid_action_tokens);

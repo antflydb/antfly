@@ -165,6 +165,7 @@ pub const DdlIndexMethod = ddl_plan.DdlIndexMethod;
 pub const DdlIndexOpClass = ddl_plan.DdlIndexOpClass;
 pub const DdlForeignKeyActionSyntax = grammar.DdlForeignKeyActionSyntax;
 pub const DdlForeignKeyColumnListSyntax = grammar.DdlForeignKeyColumnListSyntax;
+pub const DdlForeignKeyMatchSyntax = grammar.DdlForeignKeyMatchSyntax;
 pub const DdlForeignKeyOptionsSyntax = grammar.DdlForeignKeyOptionsSyntax;
 pub const DdlForeignKeyTimingSyntax = grammar.DdlForeignKeyTimingSyntax;
 pub const DdlKnownDefaultSyntax = grammar.DdlKnownDefaultSyntax;

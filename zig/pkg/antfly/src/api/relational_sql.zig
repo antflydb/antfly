@@ -5559,6 +5559,7 @@ const Parser = struct {
             .on_update = options.on_update,
             .deferrable = options.deferrable,
             .timing = options.timing,
+            .match = options.match,
         };
     }
 
@@ -5611,6 +5612,7 @@ const Parser = struct {
             .on_update = options.on_update,
             .deferrable = options.deferrable,
             .timing = options.timing,
+            .match = options.match,
         };
     }
 
@@ -5619,6 +5621,7 @@ const Parser = struct {
         on_update: runtime_schema.ForeignKeyAction = .restrict,
         deferrable: bool = false,
         timing: runtime_schema.ForeignKeyTiming = .immediate,
+        match: runtime_schema.ForeignKeyMatch = .simple,
     };
 
     fn parseDdlForeignKeyOptions(self: *@This()) !DdlForeignKeyOptions {
@@ -5628,6 +5631,7 @@ const Parser = struct {
             .on_update = ddlForeignKeyActionFromSyntax(options.on_update),
             .deferrable = options.deferrable,
             .timing = ddlForeignKeyTimingFromSyntax(options.timing),
+            .match = ddlForeignKeyMatchFromSyntax(options.match),
         };
     }
 
@@ -5644,6 +5648,13 @@ const Parser = struct {
         return switch (timing) {
             .immediate => .immediate,
             .deferred => .deferred,
+        };
+    }
+
+    fn ddlForeignKeyMatchFromSyntax(match_syntax: sql_adapter.DdlForeignKeyMatchSyntax) runtime_schema.ForeignKeyMatch {
+        return switch (match_syntax) {
+            .simple => .simple,
+            .full => .full,
         };
     }
 
@@ -41294,7 +41305,7 @@ test "postgres sql adapter lowers application inline foreign key ddl into typed 
         alloc,
         \\CREATE TABLE cloud_groups (
         \\  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        \\  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        \\  organization_id UUID NOT NULL REFERENCES organizations(id) MATCH FULL ON DELETE CASCADE,
         \\  name VARCHAR(100) NOT NULL,
         \\  slug VARCHAR(100) NOT NULL,
         \\  description TEXT,
@@ -41323,11 +41334,13 @@ test "postgres sql adapter lowers application inline foreign key ddl into typed 
             try std.testing.expectEqualStrings("organization_id", plan.foreign_keys[0].child_columns[0]);
             try std.testing.expectEqualStrings("organizations", plan.foreign_keys[0].parent_table);
             try std.testing.expectEqualStrings("id", plan.foreign_keys[0].parent_columns[0]);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, plan.foreign_keys[0].match);
             try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, plan.foreign_keys[0].on_delete);
             try std.testing.expectEqualStrings("users_created_by_fkey", plan.foreign_keys[1].name);
             try std.testing.expectEqualStrings("created_by", plan.foreign_keys[1].child_columns[0]);
             try std.testing.expectEqualStrings("users", plan.foreign_keys[1].parent_table);
             try std.testing.expectEqualStrings("id", plan.foreign_keys[1].parent_columns[0]);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.simple, plan.foreign_keys[1].match);
             try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, plan.foreign_keys[1].on_delete);
             try std.testing.expectEqual(@as(usize, 1), plan.checks.len);
             try std.testing.expectEqualStrings("cloud_groups_slug_not_empty", plan.checks[0].name);
@@ -41969,7 +41982,7 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
         \\  ADD COLUMN metadata jsonb DEFAULT '{"source":"migration"}',
         \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
         \\  ADD CONSTRAINT usage_records_tenant_status_key UNIQUE (tenant_id, status),
-        \\  ADD CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE SET NULL,
+        \\  ADD CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) MATCH FULL ON DELETE SET NULL,
         \\  ADD CONSTRAINT usage_records_amount_check CHECK (amount >= 0);
         ,
     );
@@ -42017,6 +42030,7 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
                     try std.testing.expectEqualStrings("tenant_id", foreign_key.child_columns[0]);
                     try std.testing.expectEqualStrings("tenants", foreign_key.parent_table);
                     try std.testing.expectEqualStrings("id", foreign_key.parent_columns[0]);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, foreign_key.match);
                     try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, foreign_key.on_delete);
                     try std.testing.expectEqual(runtime_schema.ForeignKeyValidationState.unvalidated, foreign_key.validation_state);
                 },

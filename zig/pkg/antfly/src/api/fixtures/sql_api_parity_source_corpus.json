@@ -7037,6 +7037,21 @@
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;"
     },
     {
+      "name": "schema additive match full foreign key migration",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_table",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1",
+      "apply_setup_sql": [
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text, region text);"
+      ],
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
+      "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_region_fkey FOREIGN KEY (user_id, region) REFERENCES users(id, region) MATCH FULL DEFERRABLE INITIALLY DEFERRED;"
+    },
+    {
       "name": "schema validate foreign key constraint",
       "family": "ddl",
       "summary": {
