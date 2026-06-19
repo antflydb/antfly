@@ -6492,8 +6492,9 @@ snapshots and status responses expose these jobs alongside other derived work
 so controllers can resume after restart and table-schema promotion can depend
 on durable job completion rather than request-local state. Rebuild and
 validation work use the same design shape: catalog mutation emits typed work,
-metadata owns the durable job, workers report progress through metadata, and
-promotion consumes only completed jobs for the expected generation.
+metadata owns the durable job, workers claim work through first-class
+begin/finish/invalidate metadata transitions with retry after expired leases,
+and promotion consumes only completed jobs for the expected generation.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from

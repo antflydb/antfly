@@ -150,6 +150,9 @@ pub const TransitionCommand = union(enum) {
     remove_schema_rewrite_job: struct {
         job_id: u64,
     },
+    begin_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobBeginRequest,
+    finish_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobFinishRequest,
+    invalidate_schema_rewrite_job: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
     promote_secondary_index_ready: metadata_table_manager.SecondaryIndexReadyPromotionRequest,
     compare_and_swap_table_schema: metadata_table_manager.TableSchemaCompareAndSwapRequest,
     upsert_split_transition: metadata.SplitTransitionRecord,
@@ -274,6 +277,15 @@ pub const TransitionCommand = union(enum) {
             },
             .invalidate_secondary_index_rebuild_range => |*request| {
                 freeSecondaryIndexRebuildRangeInvalidateRequest(alloc, request.*);
+            },
+            .begin_schema_rewrite_job => |*request| {
+                freeSchemaRewriteJobBeginRequest(alloc, request.*);
+            },
+            .finish_schema_rewrite_job => |*request| {
+                freeSchemaRewriteJobFinishRequest(alloc, request.*);
+            },
+            .invalidate_schema_rewrite_job => |*request| {
+                freeSchemaRewriteJobInvalidateRequest(alloc, request.*);
             },
             .promote_secondary_index_ready => |*request| {
                 freeSecondaryIndexReadyPromotionRequest(alloc, request.*);
@@ -1861,31 +1873,19 @@ pub const RaftApplyStore = struct {
                 try self.applySecondaryIndexRebuildRangeInvalidateTxn(txn, group_id, request);
             },
             .upsert_schema_rewrite_job => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try schemaRewriteJobKeyForGroup(&key_buf, group_id, record.job_id);
-                const value = try encodeSchemaRewriteJobRecord(self.alloc, record);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .schema_rewrite_job,
-                    .metadata_group_id = group_id,
-                    .table_id = record.table_id,
-                });
+                try self.putSchemaRewriteJobTxn(txn, group_id, record);
             },
             .remove_schema_rewrite_job => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try schemaRewriteJobKeyForGroup(&key_buf, group_id, record.job_id);
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .schema_rewrite_job,
-                    .metadata_group_id = group_id,
-                    .table_id = 0,
-                });
+                try self.deleteSchemaRewriteJobTxn(txn, group_id, record.job_id);
+            },
+            .begin_schema_rewrite_job => |request| {
+                try self.applySchemaRewriteJobBeginTxn(txn, group_id, request);
+            },
+            .finish_schema_rewrite_job => |request| {
+                try self.applySchemaRewriteJobFinishTxn(txn, group_id, request);
+            },
+            .invalidate_schema_rewrite_job => |request| {
+                try self.applySchemaRewriteJobInvalidateTxn(txn, group_id, request);
             },
             .promote_secondary_index_ready => |request| {
                 try self.applySecondaryIndexReadyPromotionTxn(txn, group_id, request);
@@ -2932,6 +2932,116 @@ pub const RaftApplyStore = struct {
         });
     }
 
+    fn applySchemaRewriteJobBeginTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SchemaRewriteJobBeginRequest,
+    ) !void {
+        var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
+        defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        const claimable = std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_declared) or
+            (std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+        if (!claimable) {
+            if (std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running)) return error.SchemaRewriteJobClaimBusy;
+            return error.SchemaRewriteJobNotDeclared;
+        }
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_running);
+        try replaceOwnedString(self.alloc, &record.lease_owner, request.lease_owner);
+        record.lease_expires_at_ms = request.lease_expires_at_ms;
+        record.attempts +%= 1;
+        try self.putSchemaRewriteJobTxn(txn, group_id, record);
+    }
+
+    fn applySchemaRewriteJobFinishTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SchemaRewriteJobFinishRequest,
+    ) !void {
+        var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
+        defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_ready);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        record.completed_row_count = request.completed_row_count;
+        try replaceOwnedString(self.alloc, &record.progress_row_key, request.progress_row_key);
+        try replaceOwnedString(self.alloc, &record.last_error, "");
+        try self.putSchemaRewriteJobTxn(txn, group_id, record);
+    }
+
+    fn applySchemaRewriteJobInvalidateTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
+    ) !void {
+        var record = (try self.loadSchemaRewriteJobTxn(txn, group_id, request.job_id)) orelse return error.UnknownSchemaRewriteJob;
+        defer metadata_table_manager.freeSchemaRewriteJob(self.alloc, record);
+        try replaceOwnedString(self.alloc, &record.state, metadata_table_manager.schema_rewrite_invalid);
+        try replaceOwnedString(self.alloc, &record.lease_owner, "");
+        record.lease_expires_at_ms = 0;
+        try replaceOwnedString(self.alloc, &record.last_error, request.last_error);
+        try self.putSchemaRewriteJobTxn(txn, group_id, record);
+    }
+
+    fn loadSchemaRewriteJobTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        job_id: u64,
+    ) !?metadata.SchemaRewriteJobRecord {
+        var key_buf: [160]u8 = undefined;
+        const key = try schemaRewriteJobKeyForGroup(&key_buf, group_id, job_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try decodeSchemaRewriteJobRecord(self.alloc, encoded);
+    }
+
+    fn putSchemaRewriteJobTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.SchemaRewriteJobRecord,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try schemaRewriteJobKeyForGroup(&key_buf, group_id, record.job_id);
+        const value = try encodeSchemaRewriteJobRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .schema_rewrite_job,
+            .metadata_group_id = group_id,
+            .table_id = record.table_id,
+        });
+    }
+
+    fn deleteSchemaRewriteJobTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        job_id: u64,
+    ) !void {
+        const existing = (try self.loadSchemaRewriteJobTxn(txn, group_id, job_id)) orelse null;
+        defer if (existing) |record_existing| metadata_table_manager.freeSchemaRewriteJob(self.alloc, record_existing);
+        var key_buf: [160]u8 = undefined;
+        const key = try schemaRewriteJobKeyForGroup(&key_buf, group_id, job_id);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .schema_rewrite_job,
+            .metadata_group_id = group_id,
+            .table_id = if (existing) |record_existing| record_existing.table_id else 0,
+        });
+    }
+
     fn applySecondaryIndexReadyPromotionTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -3124,6 +3234,18 @@ fn freeSecondaryIndexRebuildRangeInvalidateRequest(alloc: std.mem.Allocator, req
     alloc.free(request.last_error);
 }
 
+fn freeSchemaRewriteJobBeginRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SchemaRewriteJobBeginRequest) void {
+    alloc.free(request.lease_owner);
+}
+
+fn freeSchemaRewriteJobFinishRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SchemaRewriteJobFinishRequest) void {
+    alloc.free(request.progress_row_key);
+}
+
+fn freeSchemaRewriteJobInvalidateRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) void {
+    alloc.free(request.last_error);
+}
+
 fn freeSecondaryIndexReadyPromotionRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) void {
     alloc.free(request.index_name);
     alloc.free(request.expected_schema_json);
@@ -3240,6 +3362,9 @@ const TransitionTag = enum(u8) {
     remove_tablespace = 69,
     upsert_schema_rewrite_job = 70,
     remove_schema_rewrite_job = 71,
+    begin_schema_rewrite_job = 72,
+    finish_schema_rewrite_job = 73,
+    invalidate_schema_rewrite_job = 74,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -3461,6 +3586,18 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_schema_rewrite_job => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_schema_rewrite_job));
             try appendInt(alloc, &out, u64, record.job_id);
+        },
+        .begin_schema_rewrite_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.begin_schema_rewrite_job));
+            try appendSchemaRewriteJobBeginRequest(alloc, &out, request);
+        },
+        .finish_schema_rewrite_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.finish_schema_rewrite_job));
+            try appendSchemaRewriteJobFinishRequest(alloc, &out, request);
+        },
+        .invalidate_schema_rewrite_job => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.invalidate_schema_rewrite_job));
+            try appendSchemaRewriteJobInvalidateRequest(alloc, &out, request);
         },
         .promote_secondary_index_ready => |request| {
             try out.append(alloc, @intFromEnum(TransitionTag.promote_secondary_index_ready));
@@ -3733,6 +3870,15 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .remove_schema_rewrite_job => .{
             .remove_schema_rewrite_job = .{ .job_id = try readInt(encoded, &pos, u64) },
+        },
+        .begin_schema_rewrite_job => .{
+            .begin_schema_rewrite_job = try readSchemaRewriteJobBeginRequest(alloc, encoded, &pos),
+        },
+        .finish_schema_rewrite_job => .{
+            .finish_schema_rewrite_job = try readSchemaRewriteJobFinishRequest(alloc, encoded, &pos),
+        },
+        .invalidate_schema_rewrite_job => .{
+            .invalidate_schema_rewrite_job = try readSchemaRewriteJobInvalidateRequest(alloc, encoded, &pos),
         },
         .promote_secondary_index_ready => .{
             .promote_secondary_index_ready = try readSecondaryIndexReadyPromotionRequest(alloc, encoded, &pos),
@@ -5174,6 +5320,36 @@ fn appendSchemaRewriteJobRecord(
     try appendRequiredString(alloc, out, record.last_error);
 }
 
+fn appendSchemaRewriteJobBeginRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.SchemaRewriteJobBeginRequest,
+) !void {
+    try appendInt(alloc, out, u64, request.job_id);
+    try appendRequiredString(alloc, out, request.lease_owner);
+    try appendInt(alloc, out, u64, request.now_ms);
+    try appendInt(alloc, out, u64, request.lease_expires_at_ms);
+}
+
+fn appendSchemaRewriteJobFinishRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.SchemaRewriteJobFinishRequest,
+) !void {
+    try appendInt(alloc, out, u64, request.job_id);
+    try appendInt(alloc, out, u64, request.completed_row_count);
+    try appendRequiredString(alloc, out, request.progress_row_key);
+}
+
+fn appendSchemaRewriteJobInvalidateRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
+) !void {
+    try appendInt(alloc, out, u64, request.job_id);
+    try appendRequiredString(alloc, out, request.last_error);
+}
+
 fn appendSecondaryIndexReadyPromotionRequest(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -6037,6 +6213,52 @@ fn readSchemaRewriteJobRecord(
         .attempts = attempts,
         .completed_row_count = completed_row_count,
         .progress_row_key = progress_row_key,
+        .last_error = last_error,
+    };
+}
+
+fn readSchemaRewriteJobBeginRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.SchemaRewriteJobBeginRequest {
+    const job_id = try readInt(encoded, pos, u64);
+    const lease_owner = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(lease_owner);
+    return .{
+        .job_id = job_id,
+        .lease_owner = lease_owner,
+        .now_ms = try readInt(encoded, pos, u64),
+        .lease_expires_at_ms = try readInt(encoded, pos, u64),
+    };
+}
+
+fn readSchemaRewriteJobFinishRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.SchemaRewriteJobFinishRequest {
+    const job_id = try readInt(encoded, pos, u64);
+    const completed_row_count = try readInt(encoded, pos, u64);
+    const progress_row_key = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(progress_row_key);
+    return .{
+        .job_id = job_id,
+        .completed_row_count = completed_row_count,
+        .progress_row_key = progress_row_key,
+    };
+}
+
+fn readSchemaRewriteJobInvalidateRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.SchemaRewriteJobInvalidateRequest {
+    const job_id = try readInt(encoded, pos, u64);
+    const last_error = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(last_error);
+    return .{
+        .job_id = job_id,
         .last_error = last_error,
     };
 }
@@ -7262,17 +7484,28 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
             .schema_generation = 42,
             .action = "rewrite",
             .reason = "row_images",
-            .state = metadata_table_manager.schema_rewrite_running,
             .target_column = "status_norm",
             .expression = status_expr,
-            .lease_owner = "worker-a",
-            .lease_expires_at_ms = 1234,
-            .attempts = 1,
-            .completed_row_count = 7,
-            .progress_row_key = "order:h",
         },
     });
     defer std.testing.allocator.free(rewrite_cmd);
+    const begin_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_schema_rewrite_job = .{
+            .job_id = 9101,
+            .lease_owner = "worker-a",
+            .now_ms = 1000,
+            .lease_expires_at_ms = 1234,
+        },
+    });
+    defer std.testing.allocator.free(begin_rewrite_cmd);
+    const finish_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_schema_rewrite_job = .{
+            .job_id = 9101,
+            .completed_row_count = 17,
+            .progress_row_key = "order:z",
+        },
+    });
+    defer std.testing.allocator.free(finish_rewrite_cmd);
     const removed_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_schema_rewrite_job = .{
             .job_id = 9102,
@@ -7287,12 +7520,33 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         .remove_schema_rewrite_job = .{ .job_id = 9102 },
     });
     defer std.testing.allocator.free(remove_cmd);
+    const invalidated_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_schema_rewrite_job = .{
+            .job_id = 9103,
+            .table_id = 41,
+            .schema_generation = 42,
+            .action = "validate",
+            .reason = "constraints",
+        },
+    });
+    defer std.testing.allocator.free(invalidated_cmd);
+    const invalidate_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .invalidate_schema_rewrite_job = .{
+            .job_id = 9103,
+            .last_error = "schema generation moved",
+        },
+    });
+    defer std.testing.allocator.free(invalidate_cmd);
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = rewrite_cmd },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = removed_cmd },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = remove_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = begin_rewrite_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = finish_rewrite_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = removed_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = remove_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = invalidated_cmd },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = invalidate_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -7301,7 +7555,7 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 41,
-            .commit_index = 4,
+            .commit_index = 8,
             .entries_bytes = encoded_entries,
         });
     }
@@ -7310,23 +7564,37 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
     defer reopened.deinit();
     const jobs = try reopened.listSchemaRewriteJobs(std.testing.allocator, 41);
     defer reopened.freeSchemaRewriteJobs(std.testing.allocator, jobs);
-    try std.testing.expectEqual(@as(usize, 1), jobs.len);
-    try std.testing.expectEqual(@as(u64, 9101), jobs[0].job_id);
-    try std.testing.expectEqual(@as(u64, 41), jobs[0].table_id);
-    try std.testing.expectEqual(@as(u64, 42), jobs[0].schema_generation);
-    try std.testing.expectEqualStrings("rewrite", jobs[0].action);
-    try std.testing.expectEqualStrings("row_images", jobs[0].reason);
-    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_running, jobs[0].state);
-    try std.testing.expectEqualStrings("status_norm", jobs[0].target_column);
-    try std.testing.expect(jobs[0].expression != null);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, jobs[0].expression.?.kind);
-    try std.testing.expectEqual(@as(usize, 1), jobs[0].expression.?.operands.len);
-    try std.testing.expectEqualStrings("status", jobs[0].expression.?.operands[0].field);
-    try std.testing.expectEqualStrings("worker-a", jobs[0].lease_owner);
-    try std.testing.expectEqual(@as(u64, 1234), jobs[0].lease_expires_at_ms);
-    try std.testing.expectEqual(@as(u32, 1), jobs[0].attempts);
-    try std.testing.expectEqual(@as(u64, 7), jobs[0].completed_row_count);
-    try std.testing.expectEqualStrings("order:h", jobs[0].progress_row_key);
+    try std.testing.expectEqual(@as(usize, 2), jobs.len);
+
+    var saw_ready = false;
+    var saw_invalid = false;
+    for (jobs) |job| {
+        try std.testing.expectEqual(@as(u64, 41), job.table_id);
+        try std.testing.expectEqual(@as(u64, 42), job.schema_generation);
+        if (job.job_id == 9101) {
+            try std.testing.expectEqualStrings("rewrite", job.action);
+            try std.testing.expectEqualStrings("row_images", job.reason);
+            try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_ready, job.state);
+            try std.testing.expectEqualStrings("status_norm", job.target_column);
+            try std.testing.expect(job.expression != null);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, job.expression.?.kind);
+            try std.testing.expectEqual(@as(usize, 1), job.expression.?.operands.len);
+            try std.testing.expectEqualStrings("status", job.expression.?.operands[0].field);
+            try std.testing.expectEqualStrings("", job.lease_owner);
+            try std.testing.expectEqual(@as(u64, 0), job.lease_expires_at_ms);
+            try std.testing.expectEqual(@as(u32, 1), job.attempts);
+            try std.testing.expectEqual(@as(u64, 17), job.completed_row_count);
+            try std.testing.expectEqualStrings("order:z", job.progress_row_key);
+            saw_ready = true;
+        } else if (job.job_id == 9103) {
+            try std.testing.expectEqualStrings("validate", job.action);
+            try std.testing.expectEqualStrings("constraints", job.reason);
+            try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_invalid, job.state);
+            try std.testing.expectEqualStrings("schema generation moved", job.last_error);
+            saw_invalid = true;
+        }
+    }
+    try std.testing.expect(saw_ready and saw_invalid);
 }
 
 test "metadata raft apply store promotes secondary index schema with compare and swap" {

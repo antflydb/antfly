@@ -1893,6 +1893,18 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .remove_schema_rewrite_job = .{ .job_id = job_id } });
     }
 
+    pub fn beginSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_schema_rewrite_job = request });
+    }
+
+    pub fn finishSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_schema_rewrite_job = request });
+    }
+
+    pub fn invalidateSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
+    }
+
     pub fn promoteSecondaryIndexReady(self: *MetadataService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
         try self.proposeTransitionCommand(.{ .promote_secondary_index_ready = request });
     }
@@ -3473,6 +3485,18 @@ pub const MetadataHttpService = struct {
 
     pub fn removeSchemaRewriteJob(self: *MetadataHttpService, job_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_schema_rewrite_job = .{ .job_id = job_id } });
+    }
+
+    pub fn beginSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_schema_rewrite_job = request });
+    }
+
+    pub fn finishSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_schema_rewrite_job = request });
+    }
+
+    pub fn invalidateSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
     }
 
     pub fn promoteSecondaryIndexReady(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {

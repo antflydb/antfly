@@ -211,6 +211,24 @@ pub const SchemaRewriteJobRecord = struct {
     last_error: []const u8 = "",
 };
 
+pub const SchemaRewriteJobBeginRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    now_ms: u64 = 0,
+    lease_expires_at_ms: u64,
+};
+
+pub const SchemaRewriteJobFinishRequest = struct {
+    job_id: u64,
+    completed_row_count: u64,
+    progress_row_key: []const u8,
+};
+
+pub const SchemaRewriteJobInvalidateRequest = struct {
+    job_id: u64,
+    last_error: []const u8,
+};
+
 pub const ForeignKeyReferenceRangeSelector = struct {
     child_table_id: u64,
     constraint_name: []const u8,
@@ -1182,6 +1200,45 @@ pub const TableManager = struct {
         return false;
     }
 
+    pub fn beginSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobBeginRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        const claimable = std.mem.eql(u8, record.state, schema_rewrite_declared) or
+            (std.mem.eql(u8, record.state, schema_rewrite_running) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+        if (!claimable) {
+            if (std.mem.eql(u8, record.state, schema_rewrite_running)) return error.SchemaRewriteJobClaimBusy;
+            return error.SchemaRewriteJobNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = schema_rewrite_running;
+        updated.lease_owner = request.lease_owner;
+        updated.lease_expires_at_ms = request.lease_expires_at_ms;
+        updated.attempts +%= 1;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn finishSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobFinishRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        if (!std.mem.eql(u8, record.state, schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
+        var updated = record.*;
+        updated.state = schema_rewrite_ready;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.completed_row_count = request.completed_row_count;
+        updated.progress_row_key = request.progress_row_key;
+        updated.last_error = "";
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn invalidateSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobInvalidateRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        var updated = record.*;
+        updated.state = schema_rewrite_invalid;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.last_error;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
     pub fn beginForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
         try group_ids.requireDataGroupId(request.left_group_id);
         try group_ids.requireDataGroupId(request.right_group_id);
@@ -1537,6 +1594,13 @@ pub const TableManager = struct {
             if (!std.mem.eql(u8, record.index_name, selector.index_name)) continue;
             if (!std.mem.eql(u8, record.start_row_key, selector.start_row_key)) continue;
             return record;
+        }
+        return null;
+    }
+
+    fn findSchemaRewriteJob(self: *TableManager, job_id: u64) ?*SchemaRewriteJobRecord {
+        for (self.schema_rewrite_jobs.items) |*record| {
+            if (record.job_id == job_id) return record;
         }
         return null;
     }
@@ -3487,6 +3551,98 @@ test "table manager owns schema rewrite jobs" {
     const remaining = try manager.listSchemaRewriteJobs(std.testing.allocator);
     defer manager.freeSchemaRewriteJobs(std.testing.allocator, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table manager applies schema rewrite job lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9101,
+        .table_id = 7,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+    });
+
+    try manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1234,
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings(schema_rewrite_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-a", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 1234), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 1), jobs[0].attempts);
+    }
+
+    try std.testing.expectError(error.SchemaRewriteJobClaimBusy, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .now_ms = 1200,
+        .lease_expires_at_ms = 2000,
+    }));
+    try manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .now_ms = 1234,
+        .lease_expires_at_ms = 2000,
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-b", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 2000), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 2), jobs[0].attempts);
+    }
+
+    try manager.finishSchemaRewriteJob(.{
+        .job_id = 9101,
+        .completed_row_count = 17,
+        .progress_row_key = "order:z",
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_ready, jobs[0].state);
+        try std.testing.expect(schemaRewriteJobComplete(jobs[0]));
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 17), jobs[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:z", jobs[0].progress_row_key);
+    }
+
+    try std.testing.expectError(error.SchemaRewriteJobNotDeclared, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-c",
+        .now_ms = 3000,
+        .lease_expires_at_ms = 4000,
+    }));
+    try manager.invalidateSchemaRewriteJob(.{
+        .job_id = 9101,
+        .last_error = "schema generation moved",
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_invalid, jobs[0].state);
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqualStrings("schema generation moved", jobs[0].last_error);
+    }
+
+    try std.testing.expectError(error.UnknownSchemaRewriteJob, manager.finishSchemaRewriteJob(.{
+        .job_id = 9999,
+        .completed_row_count = 1,
+        .progress_row_key = "order:a",
+    }));
 }
 
 test "table manager applies secondary index rebuild lifecycle operations" {
