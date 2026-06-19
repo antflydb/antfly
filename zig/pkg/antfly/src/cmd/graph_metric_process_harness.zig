@@ -865,33 +865,57 @@ fn hasRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, required: Pr
 }
 
 fn hasServiceRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return hasServiceLifecycleReleaseGate(summary, required) and
+        hasServiceMultipageReleaseGate(summary, required) and
+        hasServiceActiveReadReleaseGate(summary, required);
+}
+
+fn hasServiceLifecycleReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
     return summary.launch_families == required.launch_families and
         summary.service_owner_restart_families == required.service_owner_restart_families and
         summary.service_publish_cleanup_families == required.service_publish_cleanup_families and
         summary.service_publish_failure_families == required.service_publish_failure_families and
-        summary.service_multipage_worker_pool_families == required.service_multipage_worker_pool_families and
+        summary.service_cleanup_takeover_families == required.service_cleanup_takeover_families;
+}
+
+fn hasServiceMultipageReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return summary.service_multipage_worker_pool_families == required.service_multipage_worker_pool_families and
         summary.service_multipage_coordinator_takeover_families == required.service_multipage_coordinator_takeover_families and
         summary.service_multipage_worker_pool_takeover_families == required.service_multipage_worker_pool_takeover_families and
         summary.service_multipage_worker_phase_proofs == required.service_multipage_worker_phase_proofs and
         summary.service_multipage_coordinator_phase_proofs == required.service_multipage_coordinator_phase_proofs and
-        summary.service_multipage_takeover_phase_proofs == required.service_multipage_takeover_phase_proofs and
-        summary.service_cleanup_takeover_families == required.service_cleanup_takeover_families and
-        summary.service_active_public_read_families == required.service_active_public_read_families;
+        summary.service_multipage_takeover_phase_proofs == required.service_multipage_takeover_phase_proofs;
 }
 
-fn hasDirectRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+fn hasServiceActiveReadReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return summary.service_active_public_read_families == required.service_active_public_read_families;
+}
+
+fn hasDirectPublishReadReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
     return summary.direct_publish_cleanup_families == required.direct_publish_cleanup_families and
         summary.direct_publish_failure_families == required.direct_publish_failure_families and
         summary.direct_active_public_read_families == required.direct_active_public_read_families and
         summary.fixed_iteration_families == required.fixed_iteration_families;
 }
 
-fn hasFailureReclaimReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+fn hasDirectReclaimReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
     return summary.direct_page_reclaim_phase_proofs == required.direct_page_reclaim_phase_proofs and
         summary.direct_reclaimed_attempt_completion_phase_proofs == required.direct_reclaimed_attempt_completion_phase_proofs and
-        summary.direct_stale_attempt_rejection_phase_proofs == required.direct_stale_attempt_rejection_phase_proofs and
-        summary.exhausted_attempt_families == required.exhausted_attempt_families and
+        summary.direct_stale_attempt_rejection_phase_proofs == required.direct_stale_attempt_rejection_phase_proofs;
+}
+
+fn hasDirectExhaustionFencingReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return summary.exhausted_attempt_families == required.exhausted_attempt_families and
         summary.same_worker_fencing_proofs == required.same_worker_fencing_proofs;
+}
+
+fn hasDirectRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return hasDirectPublishReadReleaseGate(summary, required);
+}
+
+fn hasFailureReclaimReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return hasDirectReclaimReleaseGate(summary, required) and
+        hasDirectExhaustionFencingReleaseGate(summary, required);
 }
 
 fn emitProcessHarnessReleaseSummary(io: std.Io, summary: ProcessHarnessReleaseSummary) !void {
@@ -902,12 +926,18 @@ fn emitProcessHarnessReleaseSummary(io: std.Io, summary: ProcessHarnessReleaseSu
     defer out.flush() catch {};
 
     try out.print(
-        "{{\"event\":\"graph_metric_process_harness_summary\",\"remote_owner_release_gate\":{},\"service_remote_owner_release_gate\":{},\"direct_remote_owner_release_gate\":{},\"failure_reclaim_release_gate\":{}",
+        "{{\"event\":\"graph_metric_process_harness_summary\",\"remote_owner_release_gate\":{},\"service_remote_owner_release_gate\":{},\"service_lifecycle_release_gate\":{},\"service_multipage_release_gate\":{},\"service_active_read_release_gate\":{},\"direct_remote_owner_release_gate\":{},\"direct_publish_read_release_gate\":{},\"failure_reclaim_release_gate\":{},\"direct_reclaim_release_gate\":{},\"direct_exhaustion_fencing_release_gate\":{}",
         .{
             hasRemoteOwnerReleaseGate(summary, required),
             hasServiceRemoteOwnerReleaseGate(summary, required),
+            hasServiceLifecycleReleaseGate(summary, required),
+            hasServiceMultipageReleaseGate(summary, required),
+            hasServiceActiveReadReleaseGate(summary, required),
             hasDirectRemoteOwnerReleaseGate(summary, required),
+            hasDirectPublishReadReleaseGate(summary, required),
             hasFailureReclaimReleaseGate(summary, required),
+            hasDirectReclaimReleaseGate(summary, required),
+            hasDirectExhaustionFencingReleaseGate(summary, required),
         },
     );
     try out.print(

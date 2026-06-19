@@ -5171,12 +5171,16 @@ than PR unit coverage:
   distributed promotion gate uses the ReleaseFast promotion artifact. The
   process-owner summary emits a top-level
   `remote_owner_release_gate` plus service, direct, and failure/reclaim
-  component booleans, with required/observed service cleanup-takeover counts
-  for killed degree, PageRank, eigenvector, and paired-HITS cleanup owners,
-  required/observed service multi-page worker, coordinator, and takeover phase
-  proof counts, and
-  required/observed direct reclaimed-attempt-completion plus stale-attempt-rejection
-  counts for abandoned direct page attempts; the
+  component booleans. The service gate is split into
+  `service_lifecycle_release_gate`, `service_multipage_release_gate`, and
+  `service_active_read_release_gate`; the direct/failure side is split into
+  `direct_publish_read_release_gate`, `direct_reclaim_release_gate`, and
+  `direct_exhaustion_fencing_release_gate`. The same row carries
+  required/observed service cleanup-takeover counts for killed degree,
+  PageRank, eigenvector, and paired-HITS cleanup owners, required/observed
+  service multi-page worker, coordinator, and takeover phase proof counts, and
+  required/observed direct reclaimed-attempt-completion plus
+  stale-attempt-rejection counts for abandoned direct page attempts; the
   release-qualification summary emits configured and observed deployment-shaped
   local-gate booleans.
   Together those two final JSON
