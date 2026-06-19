@@ -102,6 +102,12 @@ pub fn isURLWithHostNoHiddenWhitespace(raw: []const u8) bool {
     return uri.scheme.len > 0 and uri.host != null;
 }
 
+pub fn isHTTPURLWithHostNoHiddenWhitespace(raw: []const u8) bool {
+    const uri = parseURLNoHiddenWhitespace(raw) catch return false;
+    if (uri.host == null) return false;
+    return std.mem.eql(u8, uri.scheme, "http") or std.mem.eql(u8, uri.scheme, "https");
+}
+
 pub fn containsASCIIWhitespace(raw: []const u8) bool {
     for (raw) |byte| {
         if (isASCIIWhitespace(byte)) return true;
@@ -162,8 +168,11 @@ test "storage.ha validation parses URLs and rejects hidden whitespace" {
     try std.testing.expectEqualStrings("https", uri.scheme);
     try std.testing.expect(uri.host != null);
     try std.testing.expect(isURLWithHostNoHiddenWhitespace("http://127.0.0.1:8080"));
+    try std.testing.expect(isHTTPURLWithHostNoHiddenWhitespace("https://primary.antfly.svc:8080"));
     try std.testing.expect(!isURLWithHostNoHiddenWhitespace("http://primary antfly.svc:8080"));
     try std.testing.expect(!isURLWithHostNoHiddenWhitespace("http://primary.antfly.svc:8080/\tadmin"));
     try std.testing.expect(!isURLWithHostNoHiddenWhitespace("not-a-url"));
     try std.testing.expect(!isURLWithHostNoHiddenWhitespace("file:///tmp/primary"));
+    try std.testing.expect(!isHTTPURLWithHostNoHiddenWhitespace("ftp://primary.antfly.svc:8080"));
+    try std.testing.expect(!isHTTPURLWithHostNoHiddenWhitespace("file:///tmp/primary"));
 }

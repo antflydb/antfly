@@ -1394,7 +1394,7 @@ fn validateHAAdminURL(raw: []const u8) ![]const u8 {
         .ok => {},
         .missing, .padded => return error.InvalidHAAdminURL,
     }
-    if (!validation.isURLWithHostNoHiddenWhitespace(raw)) return error.InvalidHAAdminURL;
+    if (!validation.isHTTPURLWithHostNoHiddenWhitespace(raw)) return error.InvalidHAAdminURL;
     return raw;
 }
 
@@ -1555,6 +1555,7 @@ test "storage.ha admin cli rejects padded and invalid HA strings" {
     try std.testing.expectError(error.InvalidHAAdminURL, parse(alloc, &.{ "operator", "plan", "--primary-admin-url", "http://primary ha.default.svc:8081" }));
     try std.testing.expectError(error.InvalidHAAdminURL, parse(alloc, &.{ "operator", "plan", "--primary-admin-url", "http://primary-ha.default.svc:8081/\tadmin" }));
     try std.testing.expectError(error.InvalidHAAdminURL, parse(alloc, &.{ "operator", "plan", "--primary-admin-url", "not-a-url" }));
+    try std.testing.expectError(error.InvalidHAAdminURL, parse(alloc, &.{ "operator", "plan", "--primary-admin-url", "ftp://primary-ha.default.svc:8081" }));
     try std.testing.expectError(error.InvalidNodeId, parse(alloc, &.{ "operator", "plan", "--standby", "standby a" }));
     try std.testing.expectError(error.InvalidNodeId, parse(alloc, &.{ "fence", "acquire", "--cluster-id", "1", "--timeline-id", "1", "--epoch", "1", "--old-primary-id", "primary-a", "--promoted-node-id", " standby-b", "--new-timeline-id", "2", "--new-epoch", "2", "--required-lsn", "3", "--observed-lsn", "3" }));
     try std.testing.expectError(error.InvalidNodeId, parse(alloc, &.{ "rejoin", "assess", "--node-id", "primary a", "--cluster-id", "1", "--timeline-id", "1", "--epoch", "1", "--last-lsn", "3" }));
