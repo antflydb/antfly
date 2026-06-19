@@ -84,6 +84,19 @@ pub const InspectReport = struct {
     issue: ?[]const u8 = null,
 };
 
+pub const CheckReport = struct {
+    valid: bool,
+    file_size: u64,
+    valid_prefix_size: u64,
+    tail_bytes: u64,
+    record_count: u64,
+    live_file_count: u64,
+    live_bytes: u64,
+    compact_size: u64,
+    reclaimable_bytes: u64,
+    issue: ?[]const u8 = null,
+};
+
 pub const NativeFile = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,
@@ -137,6 +150,37 @@ pub const NativeFile = struct {
 
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
         return self.header.checkpoints[self.header.active_checkpoint];
+    }
+
+    pub fn check(self: *NativeFile) !CheckReport {
+        const checkpoint = self.activeCheckpoint();
+        const page_size: u64 = self.header.page_size;
+        const expected_size = checkpoint.page_count * page_size;
+        const file_size = (try self.file.stat(self.io_impl.io())).size;
+
+        const report = CheckReport{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = @min(file_size, expected_size),
+            .tail_bytes = if (file_size > expected_size) file_size - expected_size else 0,
+            .record_count = if (checkpoint.page_count > 0) checkpoint.page_count - 1 else 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = expected_size,
+            .reclaimable_bytes = 0,
+        };
+
+        if (checkpoint.page_count == 0) return invalidCheck(report, "invalid_page_count");
+        if (file_size < expected_size) return invalidCheck(report, "truncated_file");
+
+        _ = self.countChainPages(.catalog, checkpoint.catalog_root_page) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        _ = self.countChainPages(.document, checkpoint.document_root_page) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        if (report.tail_bytes != 0) return invalidCheck(report, "tail_bytes");
+        return report;
     }
 
     pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
@@ -256,6 +300,23 @@ pub const NativeFile = struct {
         return try decodePagePayloadAlloc(allocator, page, kind);
     }
 
+    fn countChainPages(self: *NativeFile, kind: PageKind, root_page_id: u64) !u64 {
+        var count: u64 = 0;
+        var page_id = root_page_id;
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, kind);
+            defer self.allocator.free(payload);
+            page_id = switch (kind) {
+                .catalog => (try decodeCatalogEntry(payload)).previous_page,
+                .document => (try decodeDocumentEntry(payload)).previous_page,
+                .data => return error.UnexpectedNativePageKind,
+            };
+            count += 1;
+            if (count > self.activeCheckpoint().page_count) return error.InvalidNativePageChain;
+        }
+        return count;
+    }
+
     fn appendPage(self: *NativeFile, kind: PageKind, contents: []const u8, checkpoint: CheckpointSlot) !u64 {
         if (self.read_only) return error.ReadOnly;
         if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
@@ -314,6 +375,49 @@ pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
     var header_bytes: [header_size]u8 = undefined;
     try readExactAt(file, io, &header_bytes, 0);
     return inspectBytes(&header_bytes);
+}
+
+pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+
+    const file_size = (try file.stat(io)).size;
+    var header_bytes: [header_size]u8 = undefined;
+    const read = try file.readPositionalAll(io, &header_bytes, 0);
+    if (read != header_size) {
+        return invalidCheck(.{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = 0,
+            .tail_bytes = file_size,
+            .record_count = 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = 0,
+            .reclaimable_bytes = 0,
+        }, "truncated_header");
+    }
+    _ = decodeHeader(&header_bytes) catch |err| {
+        return invalidCheck(.{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = 0,
+            .tail_bytes = file_size,
+            .record_count = 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = 0,
+            .reclaimable_bytes = 0,
+        }, issueForDecodeError(err));
+    };
+
+    var native_file = try NativeFile.open(allocator, path, true);
+    defer native_file.close();
+    return try native_file.check();
 }
 
 pub fn inspectBytes(raw: []const u8) InspectReport {
@@ -540,6 +644,30 @@ fn issueForDecodeError(err: anyerror) []const u8 {
         error.InvalidNativeCheckpointSlot => "invalid_checkpoint_slot",
         else => "invalid_header",
     };
+}
+
+fn issueForPageCheckError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidPageId => "invalid_page_id",
+        error.TruncatedNativePage => "truncated_page",
+        error.InvalidNativePageMagic => "invalid_page_magic",
+        error.InvalidNativePageKind => "invalid_page_kind",
+        error.UnexpectedNativePageKind => "unexpected_page_kind",
+        error.InvalidNativePageLength => "invalid_page_length",
+        error.NativePageChecksumMismatch => "page_checksum_mismatch",
+        error.TruncatedNativeCatalogEntry => "truncated_catalog_entry",
+        error.TruncatedNativeDocumentEntry => "truncated_document_entry",
+        error.InvalidNativeDocumentEntryFlags => "invalid_document_entry_flags",
+        error.InvalidNativePageChain => "invalid_page_chain",
+        else => "invalid_page",
+    };
+}
+
+fn invalidCheck(report: CheckReport, issue: []const u8) CheckReport {
+    var invalid = report;
+    invalid.valid = false;
+    invalid.issue = issue;
+    return invalid;
 }
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
@@ -850,4 +978,109 @@ test "lite native document store detects corrupted root page" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getDocumentAlloc(allocator, "doc:1"));
+}
+
+test "lite native check validates committed root chains" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putCatalogRecord("schema", "{\"version\":1}");
+    try file.putDocument("doc:1", "{\"title\":\"one\"}");
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(?[]const u8, null), report.issue);
+    try std.testing.expectEqual(@as(u64, 2), report.record_count);
+    try std.testing.expectEqual(@as(u64, default_page_size * 3), report.file_size);
+    try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
+}
+
+test "lite native check reports corrupted committed document page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-corrupt.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native check reports truncated committed file" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-truncated.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, default_page_size + 16);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("truncated_file", report.issue.?);
+}
+
+test "lite native checkFile reports corrupted header" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-header-corrupt.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", page_size_offset);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
 }

@@ -1580,7 +1580,7 @@ fn openLiteHandle(path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, out_
         .open_mode = open_mode,
         .external_derived_checkpoints = false,
     };
-    backend.configureDbOpenOptions(&opts);
+    backend.configureDbOpenOptions(&opts) catch |err| return capi.mapError(err);
 
     const db = db_mod.DB.open(alloc, path, opts) catch |err| return capi.mapError(err);
     handle.* = .{

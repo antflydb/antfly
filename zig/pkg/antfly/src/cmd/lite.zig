@@ -40,7 +40,7 @@ const LiteDb = struct {
             .open_mode = open_mode,
             .external_derived_checkpoints = false,
         };
-        backend.configureDbOpenOptions(&opts);
+        try backend.configureDbOpenOptions(&opts);
 
         const db = db_mod.DB.open(allocator, path, opts) catch |err| {
             return err;

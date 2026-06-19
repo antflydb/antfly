@@ -99,7 +99,7 @@ pub const DB = struct {
         errdefer lite_backend.deinit();
 
         var db_opts = toDbOpenOptions(opts, profile);
-        lite_backend.configureDbOpenOptions(&db_opts);
+        try lite_backend.configureDbOpenOptions(&db_opts);
 
         const inner = db_mod.DB.open(alloc, path, db_opts) catch |err| {
             return err;
