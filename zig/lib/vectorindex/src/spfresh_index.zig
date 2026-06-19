@@ -1141,6 +1141,7 @@ pub fn selectFlatRabitqPostings(
             }
         }
         const candidates = candidate_collector.items();
+        std.mem.sort(FlatCentroidProbe, candidates, {}, flatProbeLess);
         var scored_candidates: usize = 0;
         for (candidates) |candidate| {
             if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
@@ -1191,6 +1192,7 @@ pub fn selectFlatRabitqPostings(
                     });
                 }
                 const candidates = candidate_collector.items();
+                std.mem.sort(FlatCentroidProbe, candidates, {}, flatProbeLess);
                 var scored_candidates: usize = 0;
                 for (candidates) |candidate| {
                     if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
@@ -2220,6 +2222,22 @@ test "flat probe collector keeps bounded lowest lower bounds" {
     try std.testing.expectEqual(@as(u64, 6), items[0].posting_id);
     try std.testing.expectEqual(@as(u64, 4), items[1].posting_id);
     try std.testing.expectEqual(@as(u64, 2), items[2].posting_id);
+}
+
+test "flat probe collector candidates sort by lower bound before exact scoring" {
+    var storage: [3]FlatCentroidProbe = undefined;
+    var collector = FlatProbeCollector.init(&storage);
+
+    collector.insert(.{ .posting_id = 1, .distance = 9, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 2, .distance = 5, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 3, .distance = 7, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 4, .distance = 3, .error_bound = 0 });
+
+    const items = collector.items();
+    std.mem.sort(FlatCentroidProbe, items, {}, flatProbeLess);
+    try std.testing.expectEqual(@as(u64, 4), items[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 2), items[1].posting_id);
+    try std.testing.expectEqual(@as(u64, 3), items[2].posting_id);
 }
 
 test "centroid block probe collector preserves distance tie ordering" {
