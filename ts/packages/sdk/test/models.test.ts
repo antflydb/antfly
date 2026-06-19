@@ -49,6 +49,65 @@ describe("model helpers", () => {
     expect(manifest).toContain('"source": "antflydb/clipclap:gguf:Q4_K"');
   });
 
+  it("defaults the reranker base ref to Q4_K", async () => {
+    const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
+    const fetchMock = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/api/models/antflydb/mxbai-rerank-base-v1/tree/main?recursive=1")) {
+        return Response.json([
+          { path: "config.json", type: "file", size: 2 },
+          { path: "mxbai-rerank-base-v1.Q4_K.gguf", type: "file", size: 4 },
+          { path: "mxbai-rerank-base-v1.Q8_0.gguf", type: "file", size: 4 },
+        ]);
+      }
+      if (url.endsWith("/antflydb/mxbai-rerank-base-v1/resolve/main/config.json")) return new Response("{}");
+      if (url.endsWith("/antflydb/mxbai-rerank-base-v1/resolve/main/mxbai-rerank-base-v1.Q4_K.gguf")) return new Response("q4_k");
+      return new Response("missing", { status: 404 });
+    };
+
+    const dir = await pullHuggingFaceModel("antflydb/mxbai-rerank-base-v1", {
+      modelsDir: root,
+      huggingFaceBaseUrl: "https://hf.test",
+      fetch: fetchMock as typeof fetch,
+    });
+
+    await expect(stat(join(dir, "mxbai-rerank-base-v1.Q4_K.gguf"))).resolves.toBeTruthy();
+    await expect(stat(join(dir, "mxbai-rerank-base-v1.Q8_0.gguf"))).rejects.toThrow();
+    const manifest = await readFile(join(dir, "model_manifest.json"), "utf8");
+    expect(manifest).toContain('"source": "antflydb/mxbai-rerank-base-v1:gguf:Q4_K"');
+  });
+
+  it("preserves repo-relative paths for files with duplicate basenames", async () => {
+    const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
+    const fetchMock = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/api/models/antflydb/gliner2-base-v1/tree/main?recursive=1")) {
+        return Response.json([
+          { path: "config.json", type: "file", size: 4 },
+          { path: "encoder_config/config.json", type: "file", size: 4 },
+          { path: "gliner2-encoder.Q4_K.gguf", type: "file", size: 7 },
+          { path: "gliner2-head.Q4_K.gguf", type: "file", size: 4 },
+        ]);
+      }
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/config.json")) return new Response("root");
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/encoder_config/config.json")) return new Response("encd");
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/gliner2-encoder.Q4_K.gguf")) return new Response("encoder");
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/gliner2-head.Q4_K.gguf")) return new Response("head");
+      return new Response("missing", { status: 404 });
+    };
+
+    const dir = await pullHuggingFaceModel("antflydb/gliner2-base-v1:gguf:Q4_K", {
+      modelsDir: root,
+      huggingFaceBaseUrl: "https://hf.test",
+      fetch: fetchMock as typeof fetch,
+    });
+
+    await expect(readFile(join(dir, "config.json"), "utf8")).resolves.toBe("root");
+    await expect(readFile(join(dir, "encoder_config", "config.json"), "utf8")).resolves.toBe("encd");
+    const manifest = await readFile(join(dir, "model_manifest.json"), "utf8");
+    expect(manifest).toContain('"name": "encoder_config/config.json"');
+  });
+
   it("rejects pulls without a matching runnable artifact", async () => {
     const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
     const fetchMock = async (input: string | URL | Request): Promise<Response> => {

@@ -84,3 +84,46 @@ func TestPullHuggingFaceModelSelectsClipclapQ4K(t *testing.T) {
 		t.Fatalf("manifest did not record tagged source: %s", manifest)
 	}
 }
+
+func TestPullHuggingFaceModelDefaultsRerankerToQ4K(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/models/antflydb/mxbai-rerank-base-v1/tree/main":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[
+				{"path":"config.json","type":"file","size":2},
+				{"path":"mxbai-rerank-base-v1.Q4_K.gguf","type":"file","size":4},
+				{"path":"mxbai-rerank-base-v1.Q8_0.gguf","type":"file","size":4}
+			]`))
+		case "/antflydb/mxbai-rerank-base-v1/resolve/main/config.json":
+			_, _ = w.Write([]byte(`{}`))
+		case "/antflydb/mxbai-rerank-base-v1/resolve/main/mxbai-rerank-base-v1.Q4_K.gguf":
+			_, _ = w.Write([]byte(`q4_k`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	modelsDir := t.TempDir()
+	modelDir, err := PullHuggingFaceModel(context.Background(), "antflydb/mxbai-rerank-base-v1", ModelPullOptions{
+		ModelsDir:          modelsDir,
+		HuggingFaceBaseURL: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("PullHuggingFaceModel: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(modelDir, "mxbai-rerank-base-v1.Q4_K.gguf")); err != nil {
+		t.Fatalf("Q4_K gguf missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(modelDir, "mxbai-rerank-base-v1.Q8_0.gguf")); !os.IsNotExist(err) {
+		t.Fatalf("Q8_0 gguf should not be downloaded, err=%v", err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(modelDir, "model_manifest.json"))
+	if err != nil {
+		t.Fatalf("manifest missing: %v", err)
+	}
+	if !strings.Contains(string(manifest), `"source": "antflydb/mxbai-rerank-base-v1:gguf:Q4_K"`) {
+		t.Fatalf("manifest did not record resolved Q4_K source: %s", manifest)
+	}
+}

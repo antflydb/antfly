@@ -136,6 +136,58 @@ func TestPullHuggingFaceModelRequiresMatchingArtifact(t *testing.T) {
 	}
 }
 
+func TestPullHuggingFaceModelPreservesRepoRelativePaths(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/models/antflydb/gliner2-base-v1/tree/main":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[
+				{"path":"config.json","type":"file","size":4},
+				{"path":"encoder_config/config.json","type":"file","size":4},
+				{"path":"gliner2-encoder.Q4_K.gguf","type":"file","size":7},
+				{"path":"gliner2-head.Q4_K.gguf","type":"file","size":4}
+			]`))
+		case "/antflydb/gliner2-base-v1/resolve/main/config.json":
+			_, _ = w.Write([]byte(`root`))
+		case "/antflydb/gliner2-base-v1/resolve/main/encoder_config/config.json":
+			_, _ = w.Write([]byte(`encd`))
+		case "/antflydb/gliner2-base-v1/resolve/main/gliner2-encoder.Q4_K.gguf":
+			_, _ = w.Write([]byte(`encoder`))
+		case "/antflydb/gliner2-base-v1/resolve/main/gliner2-head.Q4_K.gguf":
+			_, _ = w.Write([]byte(`head`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	modelsDir := t.TempDir()
+	modelDir, err := PullHuggingFaceModel(context.Background(), "antflydb/gliner2-base-v1:gguf:Q4_K", ModelSpec{
+		Task:           "extractor",
+		DefaultFormat:  ModelFormatGGUF,
+		DefaultVariant: "Q4_K",
+	}, ModelPullOptions{
+		ModelsDir:          modelsDir,
+		HuggingFaceBaseURL: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("PullHuggingFaceModel: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(modelDir, "config.json")); err != nil || string(data) != "root" {
+		t.Fatalf("root config = %q, %v; want root", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(modelDir, "encoder_config", "config.json")); err != nil || string(data) != "encd" {
+		t.Fatalf("encoder config = %q, %v; want encd", data, err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(modelDir, "model_manifest.json"))
+	if err != nil {
+		t.Fatalf("manifest missing: %v", err)
+	}
+	if !strings.Contains(string(manifest), `"name": "encoder_config/config.json"`) {
+		t.Fatalf("manifest did not record repo-relative nested path: %s", manifest)
+	}
+}
+
 func TestPullHuggingFaceModelReportsResumeAndResolvedSource(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

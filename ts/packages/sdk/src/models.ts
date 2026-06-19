@@ -32,7 +32,12 @@ export const SUPPORTED_MODELS: readonly SupportedModel[] = Object.freeze([
     defaultFormat: MODEL_FORMAT_GGUF,
     defaultVariant: "Q4_K",
   },
-  { name: DEFAULT_RERANKER_MODEL, task: "reranker" },
+  {
+    name: DEFAULT_RERANKER_MODEL,
+    task: "reranker",
+    defaultFormat: MODEL_FORMAT_GGUF,
+    defaultVariant: "Q4_K",
+  },
 ]);
 
 export interface ModelPullProgress {
@@ -130,7 +135,7 @@ export async function pullHuggingFaceModel(
   let blobsDone = 0;
   const files: Array<{ name: string; size: number }> = [];
   for (const entry of selected) {
-    const destPath = path.join(targetDir, path.basename(entry.path));
+    const { destPath } = localModelFile(path, targetDir, entry.path);
     const expectedSize = entry.size || 0;
     try {
       const stat = await fs.stat(destPath);
@@ -168,8 +173,7 @@ export async function pullHuggingFaceModel(
     resumedBytes,
   });
   for (const entry of selected) {
-    const destName = path.basename(entry.path);
-    const destPath = path.join(targetDir, destName);
+    const { name: destName, destPath } = localModelFile(path, targetDir, entry.path);
     const expectedSize = entry.size || 0;
     try {
       const stat = await fs.stat(destPath);
@@ -267,6 +271,23 @@ export function modelRefString(ref: ModelRef): string {
   return out;
 }
 
+function localModelFile(path: typeof import("node:path"), modelDir: string, remotePath: string): { name: string; destPath: string } {
+  const name = safeLocalModelRelPath(remotePath);
+  return { name, destPath: path.join(modelDir, ...name.split("/")) };
+}
+
+function safeLocalModelRelPath(remotePath: string): string {
+  const normalized = remotePath.trim().split("\\").join("/");
+  if (!normalized || normalized.startsWith("/")) {
+    throw new Error(`unsafe HuggingFace file path ${JSON.stringify(remotePath)}`);
+  }
+  const parts = normalized.split("/");
+  if (parts.some((part) => !validPathComponent(part))) {
+    throw new Error(`unsafe HuggingFace file path ${JSON.stringify(remotePath)}`);
+  }
+  return parts.join("/");
+}
+
 async function listHuggingFaceFiles(
   fetchImpl: typeof fetch,
   baseUrl: string,
@@ -325,6 +346,7 @@ async function downloadFile(
   options: ModelPullOptions
 ): Promise<void> {
   const fs = await import("node:fs/promises");
+  const path = await import("node:path");
   const { createWriteStream } = await import("node:fs");
   const { once } = await import("node:events");
   const response = await fetchImpl(`${baseUrl}/${escapeRepoId(repoId)}/resolve/main/${escapeFilePath(entry.path)}`, {
@@ -335,6 +357,7 @@ async function downloadFile(
 
   let downloaded = 0;
   const reader = response.body.getReader();
+  await fs.mkdir(path.dirname(destPath), { recursive: true });
   const tmpPath = `${destPath}.tmp`;
   const out = createWriteStream(tmpPath);
   let streamError: Error | undefined;

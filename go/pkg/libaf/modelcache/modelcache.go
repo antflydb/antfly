@@ -206,7 +206,10 @@ func PullHuggingFaceModel(ctx context.Context, model string, spec ModelSpec, opt
 	var completedBytes, resumedBytes int64
 	var blobsDone int
 	for _, entry := range selected {
-		destPath := filepath.Join(modelDir, filepath.Base(entry.Path))
+		destPath, err := localModelFilePath(modelDir, entry.Path)
+		if err != nil {
+			return "", err
+		}
 		if info, err := os.Stat(destPath); err == nil && entry.Size > 0 && info.Size() == entry.Size {
 			resumedBytes += info.Size()
 			blobsDone++
@@ -247,8 +250,10 @@ func PullHuggingFaceModel(ctx context.Context, model string, spec ModelSpec, opt
 		},
 	}
 	for _, entry := range selected {
-		destName := filepath.Base(entry.Path)
-		destPath := filepath.Join(modelDir, destName)
+		destName, destPath, err := localModelFile(modelDir, entry.Path)
+		if err != nil {
+			return "", err
+		}
 		if info, err := os.Stat(destPath); err == nil && entry.Size > 0 && info.Size() == entry.Size {
 			manifest.Files = append(manifest.Files, localManifestFile{Name: destName, Size: info.Size()})
 			reportProgress(opts.Progress, ModelPullProgress{
@@ -341,6 +346,36 @@ func (r ModelRef) String() string {
 
 func validPathComponent(part string) bool {
 	return part != "" && part != "." && part != ".." && !strings.Contains(part, `/`) && !strings.Contains(part, `\`)
+}
+
+func localModelFile(modelDir, remotePath string) (string, string, error) {
+	rel, err := safeLocalModelRelPath(remotePath)
+	if err != nil {
+		return "", "", err
+	}
+	return rel, filepath.Join(modelDir, filepath.FromSlash(rel)), nil
+}
+
+func localModelFilePath(modelDir, remotePath string) (string, error) {
+	rel, err := safeLocalModelRelPath(remotePath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(modelDir, filepath.FromSlash(rel)), nil
+}
+
+func safeLocalModelRelPath(remotePath string) (string, error) {
+	remotePath = strings.TrimSpace(strings.ReplaceAll(remotePath, `\`, `/`))
+	if remotePath == "" || strings.HasPrefix(remotePath, "/") {
+		return "", fmt.Errorf("unsafe HuggingFace file path %q", remotePath)
+	}
+	parts := strings.Split(remotePath, "/")
+	for _, part := range parts {
+		if !validPathComponent(part) {
+			return "", fmt.Errorf("unsafe HuggingFace file path %q", remotePath)
+		}
+	}
+	return strings.Join(parts, "/"), nil
 }
 
 // BaseModelName returns owner/repo for model refs with optional tags.

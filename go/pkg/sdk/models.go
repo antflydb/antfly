@@ -51,7 +51,7 @@ type SupportedModel struct {
 var supportedModels = []SupportedModel{
 	{Name: DefaultTextEmbeddingModel, Task: "embedder", DefaultFormat: ModelFormatGGUF, DefaultVariant: "Q4_K"},
 	{Name: DefaultExtractorModel, Task: "extractor", DefaultFormat: ModelFormatGGUF, DefaultVariant: "Q4_K"},
-	{Name: DefaultRerankerModel, Task: "reranker"},
+	{Name: DefaultRerankerModel, Task: "reranker", DefaultFormat: ModelFormatGGUF, DefaultVariant: "Q4_K"},
 }
 
 // SupportedModels returns the Antfly-hosted model set supported by the SDK.
