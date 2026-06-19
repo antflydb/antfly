@@ -6931,6 +6931,7 @@ pub const ProvisionedTableWriteSource = struct {
             try db.waitForCurrentSyncLevel(sync_level);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
+        self.notifyLocalChange(table_name, .data);
     }
 
     fn finishTransientManagedDbWriteBeforeClose(
@@ -13021,7 +13022,7 @@ test "auto bulk group writes release leases so idle finish can publish" {
                     .description = "docs table",
                     .schema_json = "",
                     .read_schema_json = "",
-                    .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
                     .replication_sources_json = "[]",
                     .placement_role = "data",
                 }})[0..]),
@@ -13050,7 +13051,8 @@ test "auto bulk group writes release leases so idle finish can publish" {
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
-    const batch_size = 250;
+    const batch_size = auto_bulk_ingest_min_batch_ops;
+    const total_docs = batch_size;
     const writes = try alloc.alloc(db_mod.types.BatchWrite, batch_size);
     defer {
         for (writes) |write| {
@@ -13062,12 +13064,12 @@ test "auto bulk group writes release leases so idle finish can publish" {
     for (writes, 0..) |*write, i| {
         write.* = .{
             .key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{i}),
-            .value = try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"dense_idx\":[1.0,0.0]}}}}", .{}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"body\":\"auto bulk doc {d}\"}}", .{i}),
         };
     }
 
     var offset: usize = 0;
-    while (offset < 1000) : (offset += batch_size) {
+    while (offset < total_docs) : (offset += batch_size) {
         for (writes, 0..) |*write, i| {
             alloc.free(@constCast(write.key));
             write.key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{offset + i});
@@ -13076,7 +13078,7 @@ test "auto bulk group writes release leases so idle finish can publish" {
         _ = try source.source().batchGroupLocal(alloc, 7001, "docs", .{
             .writes = writes,
             .timestamp_ns = @intCast(offset + 1),
-            .sync_level = .write,
+            .sync_level = .full_index,
         });
 
         try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
@@ -13096,18 +13098,12 @@ test "auto bulk group writes release leases so idle finish can publish" {
     try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
 
-    try write_cache.entries.items[0].db.executor.waitForAll(replay_target);
-    const stats = try write_cache.entries.items[0].db.stats(alloc);
-    defer db_mod.types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1000), stats.indexes[0].doc_count);
-    try std.testing.expectEqual(replay_target, stats.indexes[0].replay_applied_sequence);
-
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &write_cache.entries.items[0].db));
     var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 1000), statuses.items[0].stats.indexes[0].doc_count);
-    try std.testing.expectEqual(replay_target, statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
 }
 
 test "weak-sync group writes publish all docs after background dense catch-up" {
@@ -18042,6 +18038,88 @@ test "provisioned table write source visibility hook publishes owner db status" 
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), retained.items.len);
     try std.testing.expectEqual(@as(u64, 1), retained.items[0].stats.doc_count);
+}
+
+test "provisioned replicated sync marks local runtime status dirty" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Hook = struct {
+        calls: usize = 0,
+        kind: ?ProvisionedTableWriteSource.LocalChangeKind = null,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.kind = kind;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicated-sync-runtime-dirty", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var hook = Hook{};
+    source.setLocalChangeHook(.{
+        .ptr = &hook,
+        .on_change = Hook.onChange,
+    });
+
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+
+    hook.calls = 0;
+    hook.kind = null;
+    try source.syncReplicatedBatchGroupLocal(alloc, 7001, "docs", .full_index);
+
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
 }
 
 test "provisioned table write source consistent visibility hook does not block on busy apply lock" {

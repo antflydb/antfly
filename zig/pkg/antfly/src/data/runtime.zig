@@ -3426,10 +3426,15 @@ pub const DataServer = struct {
     }
 
     fn markLocalGroupDataChanged(self: *DataServer) void {
-        _ = self;
         // Data writes can be high-frequency during ingest. Keep serving the
         // cached group-status snapshot until its TTL expires; structural
-        // changes still invalidate immediately.
+        // changes still invalidate immediately. Runtime index status is
+        // already cached by the writer, so mark the store report dirty without
+        // forcing a local group-status refresh. The next runtime round should
+        // publish promptly; otherwise slow debug builds can sit behind the
+        // periodic tick gate even though fresh writer status is available.
+        self.store_status_dirty = true;
+        self.store_status_ticks = store_status_report_interval_ticks;
     }
 
     fn markRuntimeStatusDirty(
@@ -9454,8 +9459,10 @@ test "data runtime local group status provider collects and caches group statuse
     try std.testing.expectEqual(@as(usize, 1), second.len);
     const hook = server.localChangeHook();
     server.store_status_dirty = false;
+    server.store_status_ticks = 0;
     hook.on_change(hook.ptr, "docs", .data);
-    try std.testing.expect(!server.store_status_dirty);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
 
     server.invalidateLocalGroupStatusCache();

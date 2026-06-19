@@ -3568,16 +3568,24 @@ pub const DB = struct {
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
-        lockApply(self);
-        defer self.core.unlockApply();
-        const resources = self.core.batchExecutionResources();
-        resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            const resources = self.core.batchExecutionResources();
+            resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
+                self.bulk_ingest_coalescer.clear(self.alloc);
+                self.clearBulkIngestIdentityAllNewLocked();
+                return err;
+            };
             self.bulk_ingest_coalescer.clear(self.alloc);
             self.clearBulkIngestIdentityAllNewLocked();
-            return err;
-        };
-        self.bulk_ingest_coalescer.clear(self.alloc);
-        self.clearBulkIngestIdentityAllNewLocked();
+        }
+        flushDeferredExternalBulkExecutorNotificationOrTarget(
+            self.async_context,
+            self.executor,
+            self.core.nextDerivedSequence(),
+        );
+        if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
     }
 
     pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
@@ -12270,6 +12278,8 @@ pub const DB = struct {
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
+            .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
     }
 
@@ -23477,10 +23487,10 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
 
 fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
     _ = from_sequence;
-    _ = target_sequence;
-    if (index_ref.kind != .dense_vector) return true;
-
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
+    const persisted_applied = try apply_state.loadAppliedSequence(ctx.alloc, ctx.store, index_ref.name);
+    if (persisted_applied >= target_sequence) return true;
+    if (index_ref.kind != .dense_vector) return true;
 
     ctx.apply_mutex.lockExclusive();
     defer ctx.apply_mutex.unlockExclusive();
