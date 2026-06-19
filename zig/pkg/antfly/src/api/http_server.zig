@@ -54,6 +54,7 @@ const serverless_query = @import("../serverless/query/mod.zig");
 const lake_base_source = @import("../serverless/manifest/base_source.zig");
 const lake_artifact_ref = @import("../serverless/manifest/artifact_ref.zig");
 const lake_sidecar_manifest = @import("../serverless/segment/sidecar_manifest.zig");
+const lake_source_binding_api = @import("../serverless/segment/source_binding.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -74,6 +75,7 @@ const runtime_status = @import("runtime_status.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("../platform/time.zig");
 const foreign_mod = @import("../foreign/mod.zig");
+const rowsource_api = @import("../storage/rowsource/types.zig");
 const foreign_sources_api = @import("foreign_sources.zig");
 const json_helpers = @import("json_helpers.zig");
 const eval_openapi = @import("antfly_eval_openapi");
@@ -8626,19 +8628,7 @@ pub const ApiHttpServer = struct {
         const artifacts = self.cfg.external_lake_artifact_store orelse return out;
         if (out.base.sidecars.len == 0 or query.text_patterns.len == 0) return out;
 
-        const plan = (try textSidecarCandidatePlanForRowsQueryAlloc(
-            self.alloc,
-            out.base.sidecars,
-            query,
-        )) orelse return out;
-        defer if (plan.sidecar_names) |names| self.alloc.free(names);
-
-        out.owned_candidates = try serverless_query.lakeTextSidecarCandidateSetsFromArtifactStoreAlloc(
-            self.alloc,
-            artifacts,
-            out.base.sidecars,
-            plan,
-        );
+        out.owned_candidates = try self.textSidecarCandidateSetsForRowsQueryAlloc(artifacts, out.base.sidecars, query);
         out.has_owned_candidates = true;
         if (out.owned_candidates.sets.len == 0) return out;
 
@@ -8662,6 +8652,39 @@ pub const ApiHttpServer = struct {
             );
         }
         return out;
+    }
+
+    fn textSidecarCandidateSetsForRowsQueryAlloc(
+        self: *ApiHttpServer,
+        artifacts: *serverless_artifacts.ArtifactStore,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+        query: db_mod.types.RelationalRowsQueryRequest,
+    ) !serverless_query.LakeOwnedSidecarCandidateSets {
+        var sets = std.ArrayListUnmanaged(serverless_query.LakeOwnedSidecarCandidateSet).empty;
+        errdefer {
+            for (sets.items) |*set| set.deinit(self.alloc);
+            sets.deinit(self.alloc);
+        }
+
+        for (query.text_patterns) |predicate| {
+            const plan = (try textSidecarCandidatePlanForRowsTextPatternAlloc(
+                self.alloc,
+                sidecars,
+                predicate,
+            )) orelse continue;
+            defer if (plan.sidecar_names) |names| self.alloc.free(names);
+
+            var produced = try serverless_query.lakeTextSidecarCandidateSetsFromArtifactStoreAlloc(
+                self.alloc,
+                artifacts,
+                sidecars,
+                plan,
+            );
+            defer produced.deinit(self.alloc);
+            try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(self.alloc, &sets, produced.sets);
+        }
+
+        return .{ .sets = try sets.toOwnedSlice(self.alloc) };
     }
 
     fn externalLakeSidecarContextForRowsAggregateAlloc(
@@ -8708,22 +8731,30 @@ pub const ApiHttpServer = struct {
         query: db_mod.types.RelationalRowsQueryRequest,
     ) !?serverless_query.LakeTextSidecarCandidatePlan {
         for (query.text_patterns) |predicate| {
-            const term = textCandidateTermFromPattern(predicate) orelse continue;
-            const sidecar_names = try textSidecarNamesForFieldAlloc(alloc, sidecars, predicate.field);
-            if (sidecar_names.len == 0) {
-                alloc.free(sidecar_names);
-                continue;
-            }
-            return .{
-                .request = .{
-                    .text = term,
-                    .operator = .any_terms,
-                    .limit = std.math.maxInt(usize),
-                },
-                .sidecar_names = sidecar_names,
-            };
+            if (try textSidecarCandidatePlanForRowsTextPatternAlloc(alloc, sidecars, predicate)) |plan| return plan;
         }
         return null;
+    }
+
+    fn textSidecarCandidatePlanForRowsTextPatternAlloc(
+        alloc: std.mem.Allocator,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+        predicate: db_mod.types.RelationalRowsTextPatternPredicate,
+    ) !?serverless_query.LakeTextSidecarCandidatePlan {
+        const term = textCandidateTermFromPattern(predicate) orelse return null;
+        const sidecar_names = try textSidecarNamesForFieldAlloc(alloc, sidecars, predicate.field);
+        if (sidecar_names.len == 0) {
+            alloc.free(sidecar_names);
+            return null;
+        }
+        return .{
+            .request = .{
+                .text = term,
+                .operator = .any_terms,
+                .limit = std.math.maxInt(usize),
+            },
+            .sidecar_names = sidecar_names,
+        };
     }
 
     fn textCandidateTermFromPattern(predicate: db_mod.types.RelationalRowsTextPatternPredicate) ?[]const u8 {
@@ -8749,6 +8780,115 @@ pub const ApiHttpServer = struct {
             try names.append(alloc, sidecar.name);
         }
         return try names.toOwnedSlice(alloc);
+    }
+
+    fn appendOwnedCandidateSetsIntersectingDuplicatesAlloc(
+        alloc: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(serverless_query.LakeOwnedSidecarCandidateSet),
+        incoming: []const serverless_query.LakeOwnedSidecarCandidateSet,
+    ) !void {
+        for (incoming) |candidate_set| {
+            if (ownedCandidateSetIndexByName(out.items, candidate_set.sidecar_name)) |existing_idx| {
+                const intersected = try intersectOwnedRowRefsAlloc(
+                    alloc,
+                    out.items[existing_idx].row_refs,
+                    candidate_set.row_refs,
+                );
+                lake_source_binding_api.freeOwnedRowRefs(alloc, out.items[existing_idx].row_refs);
+                out.items[existing_idx].row_refs = intersected;
+                continue;
+            }
+            var cloned = try cloneOwnedCandidateSetAlloc(alloc, candidate_set);
+            errdefer cloned.deinit(alloc);
+            try out.append(alloc, cloned);
+        }
+    }
+
+    fn ownedCandidateSetIndexByName(
+        values: []const serverless_query.LakeOwnedSidecarCandidateSet,
+        name: []const u8,
+    ) ?usize {
+        for (values, 0..) |value, idx| {
+            if (std.mem.eql(u8, value.sidecar_name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn cloneOwnedCandidateSetAlloc(
+        alloc: std.mem.Allocator,
+        source: serverless_query.LakeOwnedSidecarCandidateSet,
+    ) !serverless_query.LakeOwnedSidecarCandidateSet {
+        const sidecar_name = try alloc.dupe(u8, source.sidecar_name);
+        errdefer alloc.free(sidecar_name);
+        return .{
+            .sidecar_name = sidecar_name,
+            .row_refs = try cloneRowRefsAlloc(alloc, source.row_refs),
+        };
+    }
+
+    fn cloneRowRefsAlloc(
+        alloc: std.mem.Allocator,
+        row_refs: []const rowsource_api.RowRef,
+    ) ![]rowsource_api.RowRef {
+        const out = try alloc.alloc(rowsource_api.RowRef, row_refs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |row_ref| lake_source_binding_api.freeOwnedRowRef(alloc, row_ref);
+            alloc.free(out);
+        }
+        for (row_refs, 0..) |row_ref, idx| {
+            out[idx] = try cloneRowRefAlloc(alloc, row_ref);
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn intersectOwnedRowRefsAlloc(
+        alloc: std.mem.Allocator,
+        lhs: []const rowsource_api.RowRef,
+        rhs: []const rowsource_api.RowRef,
+    ) ![]rowsource_api.RowRef {
+        var out = std.ArrayListUnmanaged(rowsource_api.RowRef).empty;
+        errdefer {
+            for (out.items) |row_ref| lake_source_binding_api.freeOwnedRowRef(alloc, row_ref);
+            out.deinit(alloc);
+        }
+        for (lhs) |row_ref| {
+            if (!rowRefSliceContains(rhs, row_ref)) continue;
+            if (rowRefSliceContains(out.items, row_ref)) continue;
+            try out.append(alloc, try cloneRowRefAlloc(alloc, row_ref));
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn cloneRowRefAlloc(
+        alloc: std.mem.Allocator,
+        row_ref: rowsource_api.RowRef,
+    ) !rowsource_api.RowRef {
+        const key = try lake_source_binding_api.rowRefKeyAlloc(alloc, row_ref);
+        defer alloc.free(key);
+        return try lake_source_binding_api.rowRefFromKeyAlloc(alloc, key);
+    }
+
+    fn rowRefSliceContains(values: []const rowsource_api.RowRef, needle: rowsource_api.RowRef) bool {
+        for (values) |value| {
+            if (rowRefsEqual(value, needle)) return true;
+        }
+        return false;
+    }
+
+    fn rowRefsEqual(lhs: rowsource_api.RowRef, rhs: rowsource_api.RowRef) bool {
+        if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+        return switch (lhs) {
+            .relational_key => |lhs_key| std.mem.eql(u8, lhs_key, rhs.relational_key),
+            .serverless => |lhs_ref| std.mem.eql(u8, lhs_ref.fragment_id, rhs.serverless.fragment_id) and
+                lhs_ref.row_ordinal == rhs.serverless.row_ordinal,
+            .external => |lhs_ref| std.mem.eql(u8, lhs_ref.source_id, rhs.external.source_id) and
+                std.mem.eql(u8, lhs_ref.snapshot_id, rhs.external.snapshot_id) and
+                std.mem.eql(u8, lhs_ref.file_id, rhs.external.file_id) and
+                lhs_ref.row_group_ordinal == rhs.external.row_group_ordinal and
+                lhs_ref.row_ordinal == rhs.external.row_ordinal,
+        };
     }
 
     fn concatCandidateSetsAlloc(
@@ -19383,14 +19523,13 @@ test "api http server routes public external lake row queries through configured
     const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
     const external_source_api = @import("../serverless/external_source/mod.zig");
     const external_rowsource = @import("../storage/rowsource/external.zig");
-    const rowsource_api = @import("../storage/rowsource/types.zig");
     const lake_source_binding = @import("../serverless/segment/source_binding.zig");
     const lake_sidecar_text_build = @import("../serverless/build/lake_sidecar_text.zig");
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"},"description":{"type":"text"}},"required":["amount","discount","tenant","rank","description"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"},"description":{"type":"text"},"category":{"type":"text"}},"required":["amount","discount","tenant","rank","description","category"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
     const gcs_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"gs://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"},"description":{"type":"text"}},"required":["amount","discount","tenant","rank","description"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"gs://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tenant":{"type":"numeric"},"rank":{"type":"numeric"},"description":{"type":"text"},"category":{"type":"text"}},"required":["amount","discount","tenant","rank","description","category"],"additionalProperties":false}}},"primary_key":{"columns":["amount"]}}
     ;
 
     const FakeSource = struct {
@@ -19512,6 +19651,7 @@ test "api http server routes public external lake row queries through configured
     };
     const parquet_text_columns = [_]serverless_query.LakeParquetTestPlainByteArrayColumn{
         .{ .column_id = "description", .values = &[_][]const u8{ "alpha", "beta", "gamma" } },
+        .{ .column_id = "category", .values = &[_][]const u8{ "ops", "news", "news" } },
     };
     const parquet_object = try serverless_query.buildLakeParquetTestPlainI64AndByteArrayObjectAlloc(alloc, &parquet_columns, &parquet_text_columns);
     defer alloc.free(parquet_object);
@@ -19540,8 +19680,10 @@ test "api http server routes public external lake row queries through configured
         try external_rowsource.makeRowRef(external_binding, "part-a.parquet", 0, 2),
     };
     const descriptions = [_][]const u8{ "alpha", "beta", "gamma" };
+    const categories = [_][]const u8{ "ops", "news", "news" };
     const sidecar_columns = [_]rowsource_api.ColumnVector{
         .{ .name = "description", .values = .{ .bytes = &descriptions } },
+        .{ .name = "category", .values = .{ .bytes = &categories } },
     };
     const sidecar_batches = [_]rowsource_api.ColumnBatch{.{
         .snapshot = external_binding.snapshot(),
@@ -19576,6 +19718,26 @@ test "api http server routes public external lake row queries through configured
         },
     );
     defer text_sidecar.deinit(alloc);
+    const category_binding = lake_source_binding.bindingFromSnapshot(
+        .text,
+        .external_parquet,
+        external_binding.snapshot(),
+        external_binding.schema_fingerprint,
+        &[_][]const u8{"category"},
+        "sha256:text-category",
+    );
+    var category_sidecar = try lake_sidecar_text_build.publishTextSidecarFromRowSourceAlloc(
+        alloc,
+        &artifact_store,
+        sidecar_source.rowSource(),
+        category_binding,
+        .{
+            .name = "events.category.text",
+            .text_column = "category",
+            .config_json = "{\"analyzer\":\"simple\"}",
+        },
+    );
+    defer category_sidecar.deinit(alloc);
 
     var source = FakeSource{ .tables = .{ .{
         .table_id = 1,
@@ -19589,11 +19751,14 @@ test "api http server routes public external lake row queries through configured
         .desired_replica_count = 1,
     } } };
     var base_reads = FakeBaseReads{};
-    const sidecars = [_]lake_sidecar_manifest.DeclaredArtifact{text_sidecar.declaration};
+    const sidecars = [_]lake_sidecar_manifest.DeclaredArtifact{
+        text_sidecar.declaration,
+        category_sidecar.declaration,
+    };
     var resolver = FakeLakeResolver{
         .memory = &memory,
         .expected_serving_cache_max_bytes = 4096,
-        .expected_sidecar_count = 1,
+        .expected_sidecar_count = 2,
     };
     var server = ApiHttpServer.init(
         alloc,
@@ -19654,10 +19819,23 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 20), text_sidecar_rows[0].object.get("amount").?.integer);
     try std.testing.expect(text_sidecar_rows[0].object.get("description") == null);
 
+    var multi_text_sidecar_response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"all\":[{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"},{\"field\":\"category\",\"op\":\"text_pattern\",\"pattern\":\"news\"}]}}}", null);
+    defer multi_text_sidecar_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), multi_text_sidecar_response.status);
+    try std.testing.expectEqual(@as(u32, 4), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_multi_text_sidecar = try std.json.parseFromSlice(std.json.Value, alloc, multi_text_sidecar_response.body, .{ .allocate = .alloc_always });
+    defer parsed_multi_text_sidecar.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_multi_text_sidecar.value.object.get("total").?.integer);
+    const multi_text_sidecar_rows = parsed_multi_text_sidecar.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), multi_text_sidecar_rows.len);
+    try std.testing.expectEqual(@as(i64, 20), multi_text_sidecar_rows[0].object.get("amount").?.integer);
+
     var text_aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"source\":{\"where\":{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"}},\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}", null);
     defer text_aggregate_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), text_aggregate_response.status);
-    try std.testing.expectEqual(@as(u32, 4), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 5), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_text_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, text_aggregate_response.body, .{ .allocate = .alloc_always });
@@ -19672,7 +19850,7 @@ test "api http server routes public external lake row queries through configured
     var aggregate_response = try server.handlePublicTableRowsAggregate("events", "{\"aggregate\":{\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"net_amount_sum\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]}},{\"name\":\"large_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter\":{\"field\":\"amount\",\"op\":\"gte\",\"value\":20}},{\"name\":\"rank_two_amount_sum\",\"op\":\"sum\",\"field\":\"amount\",\"filter_in\":[{\"field\":\"rank\",\"op\":\"in\",\"value\":[2]}]}]}}", null);
     defer aggregate_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), aggregate_response.status);
-    try std.testing.expectEqual(@as(u32, 5), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 6), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, aggregate_response.body, .{ .allocate = .alloc_always });
@@ -19699,7 +19877,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer source_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), source_response.status);
-    try std.testing.expectEqual(@as(u32, 6), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 7), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_source = try std.json.parseFromSlice(std.json.Value, alloc, source_response.body, .{ .allocate = .alloc_always });
@@ -19721,7 +19899,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), explain_response.status);
-    try std.testing.expectEqual(@as(u32, 7), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 8), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_explain = try std.json.parseFromSlice(std.json.Value, alloc, explain_response.body, .{ .allocate = .alloc_always });
@@ -19748,12 +19926,12 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expect(std.mem.startsWith(u8, explain_plan.get("snapshot_id").?.string, "sha256:"));
     try std.testing.expectEqualStrings("schema-v1", explain_plan.get("schema_fingerprint").?.string);
     const sidecar_selection = explain_plan.get("sidecar_selection").?.object;
-    try std.testing.expectEqual(@as(i64, 1), sidecar_selection.get("declared_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), sidecar_selection.get("selected_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), sidecar_selection.get("declared_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), sidecar_selection.get("selected_count").?.integer);
     try std.testing.expectEqual(@as(i64, 0), sidecar_selection.get("not_requested_count").?.integer);
     const sidecar_candidates = explain_plan.get("sidecar_candidates").?.object;
     try std.testing.expectEqual(@as(i64, 0), sidecar_candidates.get("supplied_set_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), sidecar_candidates.get("selected_without_candidates_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), sidecar_candidates.get("selected_without_candidates_count").?.integer);
     const range_cache = explain_plan.get("range_cache_accounting").?.object;
     const total_range_cache = range_cache.get("total").?.object;
     try std.testing.expectEqual(@as(i64, 0), total_range_cache.get("stored_bytes").?.integer);
@@ -19765,7 +19943,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer query_explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), query_explain_response.status);
-    try std.testing.expectEqual(@as(u32, 8), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 9), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, query_explain_response.body, .{ .allocate = .alloc_always });
@@ -19791,7 +19969,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer text_query_explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), text_query_explain_response.status);
-    try std.testing.expectEqual(@as(u32, 9), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 10), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_text_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, text_query_explain_response.body, .{ .allocate = .alloc_always });
@@ -19805,6 +19983,27 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 1), text_query_candidates.get("intersected_ref_count").?.integer);
     try std.testing.expect(text_query_candidates.get("hydration_possible").?.bool);
 
+    var multi_text_query_explain_response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/events/rows/explain",
+        .body = "{\"query\":{\"select\":[\"amount\"],\"where\":{\"all\":[{\"field\":\"description\",\"op\":\"text_pattern\",\"pattern\":\"beta\"},{\"field\":\"category\",\"op\":\"text_pattern\",\"pattern\":\"news\"}]}}}",
+    });
+    defer multi_text_query_explain_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), multi_text_query_explain_response.status);
+    try std.testing.expectEqual(@as(u32, 11), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_multi_text_query_explain = try std.json.parseFromSlice(std.json.Value, alloc, multi_text_query_explain_response.body, .{ .allocate = .alloc_always });
+    defer parsed_multi_text_query_explain.deinit();
+    const multi_text_query_explain_plan = parsed_multi_text_query_explain.value.object.get("plan").?.object;
+    const multi_text_query_candidates = multi_text_query_explain_plan.get("sidecar_candidates").?.object;
+    try std.testing.expectEqual(@as(i64, 2), multi_text_query_candidates.get("supplied_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), multi_text_query_candidates.get("supplied_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), multi_text_query_candidates.get("usable_set_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), multi_text_query_candidates.get("usable_ref_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), multi_text_query_candidates.get("intersected_ref_count").?.integer);
+    try std.testing.expect(multi_text_query_candidates.get("hydration_possible").?.bool);
+
     var text_aggregate_explain_response = try server.handle(.{
         .method = .POST,
         .uri = "/tables/events/rows/explain",
@@ -19812,7 +20011,7 @@ test "api http server routes public external lake row queries through configured
     });
     defer text_aggregate_explain_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), text_aggregate_explain_response.status);
-    try std.testing.expectEqual(@as(u32, 10), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 12), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
     var parsed_text_aggregate_explain = try std.json.parseFromSlice(std.json.Value, alloc, text_aggregate_explain_response.body, .{ .allocate = .alloc_always });
@@ -19831,8 +20030,8 @@ test "api http server routes public external lake row queries through configured
     var gcs_response = try server.handlePublicTableRowsQuery("events_gcs", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":7}}}", null);
     defer gcs_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), gcs_response.status);
-    try std.testing.expectEqual(@as(u32, 11), resolver.open_count);
-    try std.testing.expectEqual(@as(u32, 10), resolver.s3_open_count);
+    try std.testing.expectEqual(@as(u32, 13), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 12), resolver.s3_open_count);
     try std.testing.expectEqual(@as(u32, 1), resolver.gcs_open_count);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 
