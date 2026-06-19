@@ -983,8 +983,9 @@ implementations cleanly:
    the fixed vector-fetch arrays, and exact fallback sizes those fixed fetch
    arrays by vector-cache misses instead of total leaf members. Common exact
    fallback leaves also collect vector-cache misses on stack scratch before
-   falling back to retained member-id scratch. Posting-delta tail cache entries
-   slab their
+   falling back to retained member-id scratch, and their external batch scoring
+   path uses stack metadata/lookup scratch for common miss counts before
+   growing the retained query slab. Posting-delta tail cache entries slab their
    sequence/id/op arrays and discard oversized opportunistic prefetch entries
    instead of retaining large decoded tails in query scratch; prefetch also
    checks value record counts before record decode so oversized tails are

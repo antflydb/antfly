@@ -3228,26 +3228,48 @@ fn scoreLeafMemberIds(
 
     if (fetch_count == 0) return;
 
-    try scratch.ensureVectorFetchCapacity(self.alloc, fetch_count);
-    const exact_distances = scratch.distances[0..fetch_count];
+    try scratch.ensureDistanceOnlyCapacity(self.alloc, fetch_count);
+    try scratch.ensureVectorBatchCapacity(self.alloc, fetch_count);
     var external_scored = false;
     const Index = comptime childType(@TypeOf(self));
     if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratch")) {
-        external_scored = try self.scoreExternalVectorsSortedWithScratch(
-            txn,
-            fetch_member_ids[0..fetch_count],
-            exact_query,
-            exact_query_measure,
-            exact_distances,
-            scratch.metadata,
-            scratch.lookups,
-            scratch.key_views,
-            scratch.values,
-            scratch.vector_batch,
-        );
+        const external_distances = scratch.distances[0..fetch_count];
+        if (fetch_count <= small_metadata_batch_count) {
+            var metadata_stack: [small_metadata_batch_count]?[]const u8 = undefined;
+            var lookups_stack: [small_metadata_batch_count]FixedKeyLookup = undefined;
+            var key_views_stack: [small_metadata_batch_count][]const u8 = undefined;
+            var values_stack: [small_metadata_batch_count]?[]const u8 = undefined;
+            external_scored = try self.scoreExternalVectorsSortedWithScratch(
+                txn,
+                fetch_member_ids[0..fetch_count],
+                exact_query,
+                exact_query_measure,
+                external_distances,
+                metadata_stack[0..fetch_count],
+                lookups_stack[0..fetch_count],
+                key_views_stack[0..fetch_count],
+                values_stack[0..fetch_count],
+                scratch.vector_batch,
+            );
+        } else {
+            try scratch.ensureQueryCapacity(self.alloc, fetch_count);
+            external_scored = try self.scoreExternalVectorsSortedWithScratch(
+                txn,
+                fetch_member_ids[0..fetch_count],
+                exact_query,
+                exact_query_measure,
+                external_distances,
+                scratch.metadata,
+                scratch.lookups,
+                scratch.key_views,
+                scratch.values,
+                scratch.vector_batch,
+            );
+        }
     }
 
     if (external_scored) {
+        const exact_distances = scratch.distances[0..fetch_count];
         for (fetch_member_ids[0..fetch_count], 0..) |member_id, i| {
             const dist = exact_distances[i];
             if (!std.math.isFinite(dist)) continue;
@@ -3260,6 +3282,8 @@ fn scoreLeafMemberIds(
         return;
     }
 
+    try scratch.ensureVectorFetchCapacity(self.alloc, fetch_count);
+    const exact_distances = scratch.distances[0..fetch_count];
     const vector_views = scratch.vector_views[0..fetch_count];
     try loadVectorIdsSortedWithScratch(
         self,
