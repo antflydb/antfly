@@ -763,6 +763,45 @@ fn lessFixedKeyLookup(_: void, lhs: FixedKeyLookup, rhs: FixedKeyLookup) bool {
     return std.mem.order(u8, lhs.key[0..], rhs.key[0..]) == .lt;
 }
 
+fn sortFixedKeyLookupsIfNeeded(lookups: []FixedKeyLookup) void {
+    if (lookups.len < 2) return;
+    for (lookups[1..], 1..) |lookup, i| {
+        if (lessFixedKeyLookup({}, lookup, lookups[i - 1])) {
+            std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
+            return;
+        }
+    }
+}
+
+test "fixed key lookup sort skips already sorted keys" {
+    var key_1: [10]u8 = undefined;
+    var key_2: [10]u8 = undefined;
+    var key_3: [10]u8 = undefined;
+    _ = hbc.encodeVecKey(&key_1, 1);
+    _ = hbc.encodeVecKey(&key_2, 2);
+    _ = hbc.encodeVecKey(&key_3, 3);
+
+    var sorted = [_]FixedKeyLookup{
+        .{ .item_index = 0, .vector_id = 1, .key = key_1 },
+        .{ .item_index = 1, .vector_id = 2, .key = key_2 },
+        .{ .item_index = 2, .vector_id = 3, .key = key_3 },
+    };
+    sortFixedKeyLookupsIfNeeded(sorted[0..]);
+    try std.testing.expectEqual(@as(u64, 1), sorted[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 2), sorted[1].vector_id);
+    try std.testing.expectEqual(@as(u64, 3), sorted[2].vector_id);
+
+    var unsorted = [_]FixedKeyLookup{
+        .{ .item_index = 2, .vector_id = 3, .key = key_3 },
+        .{ .item_index = 0, .vector_id = 1, .key = key_1 },
+        .{ .item_index = 1, .vector_id = 2, .key = key_2 },
+    };
+    sortFixedKeyLookupsIfNeeded(unsorted[0..]);
+    try std.testing.expectEqual(@as(u64, 1), unsorted[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 2), unsorted[1].vector_id);
+    try std.testing.expectEqual(@as(u64, 3), unsorted[2].vector_id);
+}
+
 pub fn loadNode(self: anytype, txn: anytype, node_id: u64) !types.Node {
     if (try self.getCachedNodeClone(node_id)) |cached| return cached;
 
@@ -2363,7 +2402,7 @@ pub fn getMetadataManySortedInTxnWithScratch(
     const key_views = key_views_storage[0..lookup_count];
     const values = values_storage[0..lookup_count];
     @memset(values, null);
-    std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
+    sortFixedKeyLookupsIfNeeded(lookups);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
@@ -3744,7 +3783,7 @@ fn loadVectorIdsSortedWithScratch(
     const lookups = lookup_storage[0..lookup_count];
     const key_views = key_views_storage[0..lookup_count];
     const values = values_storage[0..lookup_count];
-    std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
+    sortFixedKeyLookupsIfNeeded(lookups);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
     try txn.getManySorted(.vecs, key_views, values);
@@ -4633,7 +4672,7 @@ fn populateMetadataBatchedWithScratch(
     const lookups = lookup_storage[0..lookup_count];
     const key_views = key_views_storage[0..lookup_count];
     const values = values_storage[0..lookup_count];
-    std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
+    sortFixedKeyLookupsIfNeeded(lookups);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
     try txn.getManySorted(.vecs, key_views, values);

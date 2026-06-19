@@ -853,7 +853,10 @@ implementations cleanly:
    heap allocation. Centroid recompute and quantized
    refresh also use stack-backed paired vector scratch for common dimensions,
    and overfull leaf splitting uses the same shape while materializing split
-   inputs, falling back to one combined heap allocation instead of two.
+   inputs, falling back to one combined heap allocation instead of two. Sorted
+   vector and metadata batch lookups now also skip the `FixedKeyLookup` sort
+   when their generated keys are already ordered, while preserving the sort for
+   unsorted callers.
    Routing scratch now slabs child ids, distances, error bounds, and
    competitive candidate storage behind one backing allocation while preserving
    retained-scratch byte accounting.
