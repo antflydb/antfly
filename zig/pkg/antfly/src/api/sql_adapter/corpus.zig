@@ -3998,6 +3998,10 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_query: bool = false,
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
+    unsupported_ddl_copy_file_endpoint: bool = false,
+    unsupported_ddl_copy_program_endpoint: bool = false,
+    unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
+    unsupported_ddl_copy_unsupported_options: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_covering_expression_index_plan: bool = false,
@@ -5201,6 +5205,22 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
         } else if (entry.family == .unsupported_ddl) {
+            self.unsupported_ddl_copy_file_endpoint = self.unsupported_ddl_copy_file_endpoint or
+                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
+                    std.mem.startsWith(u8, entry.sql, "COPY ") and
+                    std.mem.indexOf(u8, entry.sql, " FROM '/") != null);
+            self.unsupported_ddl_copy_program_endpoint = self.unsupported_ddl_copy_program_endpoint or
+                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
+                    std.mem.startsWith(u8, entry.sql, "COPY ") and
+                    std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null);
+            self.unsupported_ddl_copy_wrong_stream_endpoint = self.unsupported_ddl_copy_wrong_stream_endpoint or
+                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
+                    std.mem.startsWith(u8, entry.sql, "COPY ") and
+                    std.mem.indexOf(u8, entry.sql, " TO STDIN") != null);
+            self.unsupported_ddl_copy_unsupported_options = self.unsupported_ddl_copy_unsupported_options or
+                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
+                    std.mem.startsWith(u8, entry.sql, "COPY ") and
+                    std.mem.indexOf(u8, entry.sql, "HEADER") != null);
             self.unsupported_ddl_covering_expression_index_plan = self.unsupported_ddl_covering_expression_index_plan or
                 (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
                     std.mem.indexOf(u8, entry.sql, "lower(") != null and
@@ -6207,6 +6227,10 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_set_operation_union);
         try std.testing.expect(self.unsupported_read_set_operation_intersect);
         try std.testing.expect(self.unsupported_read_set_operation_except);
+        try std.testing.expect(self.unsupported_ddl_copy_file_endpoint);
+        try std.testing.expect(self.unsupported_ddl_copy_program_endpoint);
+        try std.testing.expect(self.unsupported_ddl_copy_wrong_stream_endpoint);
+        try std.testing.expect(self.unsupported_ddl_copy_unsupported_options);
         try std.testing.expect(self.unsupported_ddl_covering_expression_index_plan);
         try std.testing.expect(self.unsupported_ddl_covering_gin_index_plan);
         try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);

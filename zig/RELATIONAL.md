@@ -4955,7 +4955,10 @@ checks, unique/FK participants, row-policy/authorization checks, 2PC staging,
 retryable range routing, and deterministic error reporting for imports, and
 through typed snapshot/range-read plans for exports. PostgreSQL `COPY` syntax
 can become an adapter frontend for those contracts, but it must not bypass
-row-batch, mutation-source, or routed read semantics.
+row-batch, mutation-source, or routed read semantics. Until server-file,
+`PROGRAM`, alternate stream endpoints, and richer COPY options have native
+bulk-I/O endpoint and validation contracts, the source parity corpus requires
+them to fail closed under `bulk_io_plan`.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,

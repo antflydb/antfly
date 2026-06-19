@@ -16,6 +16,7 @@ const std = @import("std");
 
 pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
+    bulk_io_plan,
     covering_derived_index_plan,
     cte_mutation_source_plan,
     deferrable_primary_key,
@@ -75,6 +76,7 @@ pub fn classificationReasonIsUnsupportedRequirement(reason: SqlAdapterClassifica
 
 test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_plan"));
+    try std.testing.expect(classificationReasonTokenIsKnown("bulk_io_plan"));
     try std.testing.expect(classificationReasonTokenIsKnown("covering_derived_index_plan"));
     try std.testing.expect(classificationReasonTokenIsKnown("cte_mutation_source_plan"));
     try std.testing.expectEqual(SqlAdapterClassificationReason.prepared_transaction_plan, classificationReasonFromToken("prepared_transaction_plan").?);

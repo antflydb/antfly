@@ -4845,6 +4845,10 @@ pub fn parseBulkIoTailAlloc(
     const endpoint = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var endpoint_transferred = false;
     errdefer if (!endpoint_transferred) alloc.free(endpoint);
+    switch (direction) {
+        .from => if (!std.ascii.eqlIgnoreCase(endpoint, "STDIN")) return error.UnsupportedSqlShape,
+        .to => if (!std.ascii.eqlIgnoreCase(endpoint, "STDOUT")) return error.UnsupportedSqlShape,
+    }
 
     var format: ?[]const u8 = null;
     var format_transferred = false;
@@ -8478,6 +8482,11 @@ test "sql adapter grammar parses bulk io tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+
+    var wrong_endpoint_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDIN;");
+    defer lexer.freeTokens(alloc, &wrong_endpoint_tokens);
+    var wrong_endpoint_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, wrong_endpoint_tokens.items, &wrong_endpoint_pos));
 }
 
 test "sql adapter grammar parses notification channel tails" {

@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "6478afac8847dd914730fc116f7a3e603cf0484f9592295aaccec891086f6eb6",
-  "source_entry_count": 910,
-  "entry_count": 910,
+  "source_sha256": "9311eb34b07c94ef589290e3e34b5f1beee7257933871861a92a5616c3405c67",
+  "source_entry_count": 914,
+  "entry_count": 914,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3364,6 +3364,34 @@
       },
       "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv)"
+    },
+    {
+      "name": "unsupported copy from server file endpoint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) FROM '/tmp/usage.csv' WITH (FORMAT csv)"
+    },
+    {
+      "name": "unsupported copy from program endpoint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) FROM PROGRAM 'cat /tmp/usage.csv'"
+    },
+    {
+      "name": "unsupported copy wrong stream endpoint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) TO STDIN"
+    },
+    {
+      "name": "unsupported copy header option",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (HEADER true)"
     },
     {
       "name": "create function catalog ddl",

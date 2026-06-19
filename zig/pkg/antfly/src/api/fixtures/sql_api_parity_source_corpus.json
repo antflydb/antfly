@@ -3774,6 +3774,34 @@
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv)"
     },
     {
+      "name": "unsupported copy from server file endpoint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) FROM '/tmp/usage.csv' WITH (FORMAT csv)"
+    },
+    {
+      "name": "unsupported copy from program endpoint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) FROM PROGRAM 'cat /tmp/usage.csv'"
+    },
+    {
+      "name": "unsupported copy wrong stream endpoint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) TO STDIN"
+    },
+    {
+      "name": "unsupported copy header option",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=bulk_io_plan",
+      "classification_reason": "bulk_io_plan",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (HEADER true)"
+    },
+    {
       "name": "create function catalog ddl",
       "family": "ddl",
       "summary": {
