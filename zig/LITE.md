@@ -124,6 +124,25 @@ The LSM and index layers already think in logical files, manifests, WAL
 segments, table files, and atomic writes. A single-file container can present
 those logical paths from inside one physical file.
 
+This is intentionally a container/VFS direction, not a separate Lite-native
+database engine for v1. Replacing the LSM path would require reimplementing
+document ordering, range scans, WAL/recovery semantics, manifests, index file
+lifecycles, compaction, backup, and restore semantics that the existing Antfly
+DB and index stack already exercise. The v1 production target should therefore
+be:
+
+```text
+Antfly DB and indexes
+  -> existing LSM Storage interface
+    -> .aflite single-file container
+```
+
+A future Lite-native backend should stay possible, but should be driven by
+evidence that the container approach cannot meet product requirements: startup
+replay is too expensive, write amplification is unacceptable, logical-file churn
+forces too much vacuuming, page-level random access becomes mandatory, or the
+index stack needs tighter coupling than logical storage objects can provide.
+
 Directory-backed LSM storage should remain available as an internal development,
 debug, and conformance-test profile. It should not be the public Lite v1
 contract.

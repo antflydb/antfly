@@ -236,6 +236,22 @@ pub const Api = struct {
         try self.db.setSchemaJson(alloc, body);
         return try alloc.dupe(u8, "{\"updated\":true}");
     }
+
+    pub fn exportPortable(self: *Api, alloc: Allocator, out: *std.ArrayList(u8)) !void {
+        try self.db.exportPortable(alloc, out);
+    }
+
+    pub fn importPortable(self: *Api, alloc: Allocator, backup: []const u8) !void {
+        try self.db.importPortable(alloc, backup);
+    }
+
+    pub fn checkLiteJson(self: *Api, alloc: Allocator) ![]u8 {
+        return try std.json.Stringify.valueAlloc(alloc, try self.db.checkLite(), .{});
+    }
+
+    pub fn vacuumLiteJson(self: *Api, alloc: Allocator) ![]u8 {
+        return try std.json.Stringify.valueAlloc(alloc, try self.db.vacuumLite(), .{});
+    }
 };
 
 const ParsedLookupRequest = struct {
@@ -740,5 +756,81 @@ test "embedded api openLite persists schema json over aflite file" {
         const persisted = try reopened.getSchemaJson(alloc);
         defer alloc.free(persisted);
         try std.testing.expectEqualStrings(schema_json, persisted);
+    }
+}
+
+test "embedded api openLite exports imports checks and vacuums portable backup" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-src.aflite", .{tmp.sub_path});
+    defer alloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-dst.aflite", .{tmp.sub_path});
+    defer alloc.free(dst_path);
+
+    var backup = std.ArrayList(u8).empty;
+    defer backup.deinit(alloc);
+
+    {
+        var api = try Api.openLite(alloc, src_path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer api.close();
+
+        const batch_a = try api.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:a\":{\"title\":\"first\"},\"doc:gone\":{\"title\":\"remove\"}}}",
+        );
+        defer alloc.free(batch_a);
+        const batch_b = try api.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:a\":{\"title\":\"second\"}},\"deletes\":[\"doc:gone\"]}",
+        );
+        defer alloc.free(batch_b);
+
+        const check_before = try api.checkLiteJson(alloc);
+        defer alloc.free(check_before);
+        try std.testing.expect(std.mem.indexOf(u8, check_before, "\"valid\":true") != null);
+
+        const vacuumed = try api.vacuumLiteJson(alloc);
+        defer alloc.free(vacuumed);
+        try std.testing.expect(std.mem.indexOf(u8, vacuumed, "\"reclaimed_bytes\":") != null);
+
+        const check_after = try api.checkLiteJson(alloc);
+        defer alloc.free(check_after);
+        try std.testing.expect(std.mem.indexOf(u8, check_after, "\"valid\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, check_after, "\"reclaimable_bytes\":0") != null);
+
+        try api.exportPortable(alloc, &backup);
+        try std.testing.expect(backup.items.len > 0);
+    }
+
+    {
+        var restored = try Api.openLite(alloc, dst_path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer restored.close();
+
+        try restored.importPortable(alloc, backup.items);
+        const lookup_json = try restored.lookupJson(
+            alloc,
+            "doc:a",
+            "{\"fields\":[\"title\"]}",
+        );
+        defer alloc.free(lookup_json);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"found\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"second\"") != null);
+
+        const deleted_json = try restored.lookupJson(alloc, "doc:gone", "");
+        defer alloc.free(deleted_json);
+        try std.testing.expect(std.mem.indexOf(u8, deleted_json, "\"found\":false") != null);
     }
 }

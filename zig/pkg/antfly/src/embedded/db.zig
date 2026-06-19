@@ -29,6 +29,8 @@ const IndexBackendOptions = @TypeOf((db_mod.OpenOptions{}).index_backends);
 pub const types = support.db_types;
 pub const RemoteTemplateRenderConfig = template_remote_host.RenderConfig;
 pub const RemoteTemplateRenderer = template_remote_host.HostRenderer;
+pub const LiteCheckReport = support.lsm_backend.AfliteContainerStorage.CheckReport;
+pub const LiteVacuumReport = support.lsm_backend.AfliteContainerStorage.VacuumReport;
 
 pub const OpenOptions = struct {
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -222,6 +224,24 @@ pub const DB = struct {
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
         return try self.inner.getSchemaJson(alloc);
+    }
+
+    pub fn exportPortable(self: *DB, alloc: Allocator, out: *std.ArrayList(u8)) !void {
+        try support.portable_backup.exportPortable(alloc, self.inner.core.store, out);
+    }
+
+    pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
+        try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
+    }
+
+    pub fn checkLite(self: *DB) !LiteCheckReport {
+        const lite_storage = self.owned_lite_storage orelse return error.NotLiteDatabase;
+        return try lite_storage.check();
+    }
+
+    pub fn vacuumLite(self: *DB) !LiteVacuumReport {
+        const lite_storage = self.owned_lite_storage orelse return error.NotLiteDatabase;
+        return try lite_storage.vacuum();
     }
 };
 

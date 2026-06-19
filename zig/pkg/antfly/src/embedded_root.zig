@@ -31,6 +31,7 @@ pub const schema = @import("storage/schema.zig");
 pub const batch = @import("api/batch.zig");
 pub const query = @import("api/query.zig");
 pub const query_contract = @import("api/query_contract.zig");
+pub const portable_backup = @import("storage/portable_backup.zig");
 
 test {
     _ = backend_adapter;
@@ -49,4 +50,5 @@ test {
     _ = batch;
     _ = query;
     _ = query_contract;
+    _ = portable_backup;
 }
