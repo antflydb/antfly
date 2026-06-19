@@ -853,13 +853,14 @@ fn appendFlatCentroidBlocksFromEntries(
 ) !usize {
     const posting_count = entries.items.len;
     if (posting_count == 0) return 0;
+    const effective_block_size = @max(block_size, 1);
+    try blocks.ensureUnusedCapacity(self.alloc, std.math.divCeil(usize, posting_count, effective_block_size) catch unreachable);
     if (self.config.centroid_directory_mode == .two_level_rabitq and entries.items.len > block_size and dims > 0) {
         const sorted_by_hilbert = try populateFlatCentroidHilbertSortKeys(self, entries.items, dims);
         const sort_dim = if (sorted_by_hilbert) 0 else chooseFlatCentroidSortDimension(entries.items, dims);
         std.mem.sort(FlatCentroidEntry, entries.items, FlatCentroidEntrySortContext{ .dim = sort_dim }, flatCentroidEntryLess);
     }
 
-    const effective_block_size = @max(block_size, 1);
     var posting_offset: usize = 0;
     while (posting_offset < entries.items.len) {
         const block_end = @min(posting_offset + effective_block_size, entries.items.len);
@@ -965,6 +966,7 @@ fn buildFlatCentroidDirectoryFromRecords(self: anytype, txn: anytype, root_node:
     }
     var state_lookup = try PostingStateLookup.init(self, txn);
     defer state_lookup.deinit(self.alloc);
+    try entries.ensureTotalCapacity(self.alloc, records.len);
 
     for (records) |*record| {
         if (record.member_count == 0 or record.centroid.len != dims) continue;

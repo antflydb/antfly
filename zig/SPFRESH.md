@@ -864,7 +864,9 @@ implementations cleanly:
    Flat/two-level centroid-directory blocks now slab posting metadata arrays
    and f32 centroid/radius/measure arrays into two backing allocations per
    block, and directory construction fills those slabs directly from sorted
-   entries instead of first copying through block-sized scratch arrays.
+   entries instead of first copying through block-sized scratch arrays. The
+   record-backed build path also pre-sizes entry and block lists from exact
+   record/posting counts, avoiding geometric growth churn on rebuild.
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed
