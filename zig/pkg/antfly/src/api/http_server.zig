@@ -19195,6 +19195,7 @@ test "api http server routes public external lake row queries through configured
             .checksum = "sha256:artifact",
         },
     }};
+    const desired_sidecars = [_]serverless_query.LakeSidecarDesired{.{ .name = "events.description.text" }};
     var resolver = FakeLakeResolver{
         .memory = &memory,
         .expected_serving_cache_max_bytes = 4096,
@@ -19207,6 +19208,7 @@ test "api http server routes public external lake row queries through configured
             .external_lake_serving_cache_max_bytes = 4096,
             .external_lake_sidecar_context = .{
                 .sidecars = sidecars[0..],
+                .desired_sidecars = desired_sidecars[0..],
             },
         },
         source.iface(),

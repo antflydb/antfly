@@ -23,6 +23,7 @@ const Allocator = std.mem.Allocator;
 const text_segment = @import("../text_segment/mod.zig");
 const sparse_segment = @import("../sparse_segment/mod.zig");
 const vector_segment = @import("../vector_segment/mod.zig");
+const graph_segment = @import("../graph_segment/mod.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
@@ -68,6 +69,26 @@ pub const VectorCandidateRequest = struct {
 
 pub const VectorCandidatePlan = struct {
     request: VectorCandidateRequest,
+    sidecar_names: ?[]const []const u8 = null,
+};
+
+pub const GraphCandidateMode = enum {
+    neighbors,
+    traverse,
+};
+
+pub const GraphCandidateRequest = struct {
+    start_node_id: []const u8,
+    mode: GraphCandidateMode = .neighbors,
+    direction: query_request.GraphQueryDirection = .out,
+    edge_types: ?[]const []const u8 = null,
+    max_depth: u32 = 3,
+    limit: usize = 100,
+    include_start: bool = false,
+};
+
+pub const GraphCandidatePlan = struct {
+    request: GraphCandidateRequest,
     sidecar_names: ?[]const []const u8 = null,
 };
 
@@ -297,6 +318,67 @@ pub fn vectorCandidateSetsFromArtifactStoreAlloc(
     return .{ .sets = try sets.toOwnedSlice(alloc) };
 }
 
+pub fn graphCandidateSetFromPayloadAlloc(
+    alloc: Allocator,
+    declaration: sidecar_manifest.DeclaredArtifact,
+    payload: []const u8,
+    request: GraphCandidateRequest,
+) !OwnedCandidateSet {
+    try declaration.validate();
+    if (declaration.binding.sidecar_kind != .graph) return error.UnsupportedLakeSidecarCandidateSource;
+    if (declaration.artifact.kind != artifact_ref.ArtifactKind.graph_segment) return error.UnsupportedLakeSidecarCandidateSource;
+
+    const start_ref = try source_binding.rowRefFromKeyAlloc(alloc, request.start_node_id);
+    defer source_binding.freeOwnedRowRef(alloc, start_ref);
+    try source_binding.validateCandidateRowRefsAgainstBinding(declaration.binding, &[_]rowsource.RowRef{start_ref});
+
+    var segment = try graph_segment.decodeAlloc(alloc, payload);
+    defer graph_segment.freeSegment(alloc, &segment);
+
+    const keys = switch (request.mode) {
+        .neighbors => try graphNeighborCandidateKeysAlloc(alloc, segment, request),
+        .traverse => try graphTraversalCandidateKeysAlloc(alloc, segment, request),
+    };
+    defer {
+        for (keys) |key| alloc.free(@constCast(key));
+        if (keys.len > 0) alloc.free(keys);
+    }
+
+    const refs = try source_binding.rowRefsFromKeysAlloc(alloc, declaration.binding, keys);
+    errdefer source_binding.freeOwnedRowRefs(alloc, refs);
+    return .{
+        .sidecar_name = try alloc.dupe(u8, declaration.name),
+        .row_refs = refs,
+    };
+}
+
+pub fn graphCandidateSetsFromArtifactStoreAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    plan: GraphCandidatePlan,
+) !OwnedCandidateSets {
+    if (plan.request.start_node_id.len == 0 or plan.request.limit == 0) return .{ .sets = try alloc.alloc(OwnedCandidateSet, 0) };
+
+    const selected = try selectedGraphDeclarationsAlloc(alloc, declarations, plan.sidecar_names);
+    defer if (selected.len > 0) alloc.free(selected);
+
+    var sets = std.ArrayListUnmanaged(OwnedCandidateSet).empty;
+    errdefer {
+        for (sets.items) |*set| set.deinit(alloc);
+        sets.deinit(alloc);
+    }
+    try sets.ensureUnusedCapacity(alloc, selected.len);
+
+    for (selected) |declaration| {
+        const payload = try artifacts.getAlloc(declaration.artifact.artifact_id);
+        defer artifacts.allocator.free(payload);
+        sets.appendAssumeCapacity(try graphCandidateSetFromPayloadAlloc(alloc, declaration, payload, plan.request));
+    }
+
+    return .{ .sets = try sets.toOwnedSlice(alloc) };
+}
+
 fn selectedTextDeclarationsAlloc(
     alloc: Allocator,
     declarations: []const sidecar_manifest.DeclaredArtifact,
@@ -316,6 +398,31 @@ fn selectedTextDeclarationsAlloc(
 
     for (declarations) |declaration| {
         if (!isTextDeclaration(declaration)) continue;
+        if (selected.items.len != 0) return error.AmbiguousLakeSidecarCandidateSource;
+        try selected.append(alloc, declaration);
+    }
+    return try selected.toOwnedSlice(alloc);
+}
+
+fn selectedGraphDeclarationsAlloc(
+    alloc: Allocator,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    maybe_names: ?[]const []const u8,
+) ![]sidecar_manifest.DeclaredArtifact {
+    var selected = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
+    errdefer selected.deinit(alloc);
+
+    if (maybe_names) |names| {
+        for (names) |name| {
+            if (name.len == 0) return error.InvalidLakeSidecarCandidateRequest;
+            const declaration = findGraphDeclaration(declarations, name) orelse return error.MissingLakeSidecarCandidateSource;
+            try selected.append(alloc, declaration);
+        }
+        return try selected.toOwnedSlice(alloc);
+    }
+
+    for (declarations) |declaration| {
+        if (!isGraphDeclaration(declaration)) continue;
         if (selected.items.len != 0) return error.AmbiguousLakeSidecarCandidateSource;
         try selected.append(alloc, declaration);
     }
@@ -383,6 +490,17 @@ fn findTextDeclaration(
     return null;
 }
 
+fn findGraphDeclaration(
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    name: []const u8,
+) ?sidecar_manifest.DeclaredArtifact {
+    for (declarations) |declaration| {
+        if (!isGraphDeclaration(declaration)) continue;
+        if (std.mem.eql(u8, declaration.name, name)) return declaration;
+    }
+    return null;
+}
+
 fn findVectorDeclaration(
     declarations: []const sidecar_manifest.DeclaredArtifact,
     name: []const u8,
@@ -409,12 +527,130 @@ fn isTextDeclaration(declaration: sidecar_manifest.DeclaredArtifact) bool {
     return declaration.binding.sidecar_kind == .text and declaration.artifact.kind == artifact_ref.ArtifactKind.text_segment;
 }
 
+fn isGraphDeclaration(declaration: sidecar_manifest.DeclaredArtifact) bool {
+    return declaration.binding.sidecar_kind == .graph and declaration.artifact.kind == artifact_ref.ArtifactKind.graph_segment;
+}
+
 fn isVectorDeclaration(declaration: sidecar_manifest.DeclaredArtifact) bool {
     return declaration.binding.sidecar_kind == .vector and declaration.artifact.kind == artifact_ref.ArtifactKind.vector_segment;
 }
 
 fn isSparseDeclaration(declaration: sidecar_manifest.DeclaredArtifact) bool {
     return declaration.binding.sidecar_kind == .sparse and declaration.artifact.kind == artifact_ref.ArtifactKind.sparse_segment;
+}
+
+fn graphNeighborCandidateKeysAlloc(
+    alloc: Allocator,
+    segment: graph_segment.Segment,
+    request: GraphCandidateRequest,
+) ![]const []const u8 {
+    const adjacency = findGraphAdjacency(segment, request.start_node_id) orelse return try alloc.alloc([]const u8, 0);
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
+    }
+    if (request.direction == .out or request.direction == .both) {
+        try appendGraphNeighborKeysAlloc(alloc, &keys, adjacency.out_edges, request);
+    }
+    if (request.direction == .in or request.direction == .both) {
+        try appendGraphNeighborKeysAlloc(alloc, &keys, adjacency.in_edges, request);
+    }
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn appendGraphNeighborKeysAlloc(
+    alloc: Allocator,
+    keys: *std.ArrayListUnmanaged([]const u8),
+    edges: []const graph_segment.Edge,
+    request: GraphCandidateRequest,
+) !void {
+    for (edges) |edge| {
+        if (keys.items.len >= request.limit) return;
+        if (!graphEdgeTypeMatches(request.edge_types, edge.edge_type)) continue;
+        try keys.append(alloc, try alloc.dupe(u8, edge.neighbor_id));
+    }
+}
+
+const GraphQueueItem = struct {
+    node_id: []const u8,
+    depth: u32,
+};
+
+fn graphTraversalCandidateKeysAlloc(
+    alloc: Allocator,
+    segment: graph_segment.Segment,
+    request: GraphCandidateRequest,
+) ![]const []const u8 {
+    if (findGraphAdjacency(segment, request.start_node_id) == null) return try alloc.alloc([]const u8, 0);
+
+    var queue = std.ArrayListUnmanaged(GraphQueueItem).empty;
+    defer queue.deinit(alloc);
+    try queue.append(alloc, .{ .node_id = request.start_node_id, .depth = 0 });
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    try seen.put(alloc, request.start_node_id, {});
+
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
+    }
+
+    var cursor: usize = 0;
+    while (cursor < queue.items.len and keys.items.len < request.limit) : (cursor += 1) {
+        const item = queue.items[cursor];
+        if (item.depth > request.max_depth) continue;
+        if (item.depth > 0 or request.include_start) {
+            try keys.append(alloc, try alloc.dupe(u8, item.node_id));
+            if (keys.items.len >= request.limit) break;
+        }
+        if (item.depth == request.max_depth) continue;
+        const adjacency = findGraphAdjacency(segment, item.node_id) orelse continue;
+        if (request.direction == .out or request.direction == .both) {
+            try enqueueGraphTraversalEdgesAlloc(alloc, &queue, &seen, adjacency.out_edges, item, request);
+        }
+        if (request.direction == .in or request.direction == .both) {
+            try enqueueGraphTraversalEdgesAlloc(alloc, &queue, &seen, adjacency.in_edges, item, request);
+        }
+    }
+
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn enqueueGraphTraversalEdgesAlloc(
+    alloc: Allocator,
+    queue: *std.ArrayListUnmanaged(GraphQueueItem),
+    seen: *std.StringHashMapUnmanaged(void),
+    edges: []const graph_segment.Edge,
+    current: GraphQueueItem,
+    request: GraphCandidateRequest,
+) !void {
+    for (edges) |edge| {
+        if (!graphEdgeTypeMatches(request.edge_types, edge.edge_type)) continue;
+        const gop = try seen.getOrPut(alloc, edge.neighbor_id);
+        if (gop.found_existing) continue;
+        try queue.append(alloc, .{
+            .node_id = edge.neighbor_id,
+            .depth = current.depth + 1,
+        });
+    }
+}
+
+fn findGraphAdjacency(segment: graph_segment.Segment, node_id: []const u8) ?graph_segment.Adjacency {
+    for (segment.adjacencies) |adjacency| {
+        if (std.mem.eql(u8, adjacency.node_id, node_id)) return adjacency;
+    }
+    return null;
+}
+
+fn graphEdgeTypeMatches(edge_types: ?[]const []const u8, candidate: []const u8) bool {
+    const values = edge_types orelse return true;
+    for (values) |edge_type| {
+        if (std.mem.eql(u8, edge_type, candidate)) return true;
+    }
+    return false;
 }
 
 test "lake text sidecar candidate producer decodes external row refs from hits" {
@@ -1028,5 +1264,274 @@ test "lake vector sidecar candidate producer rejects stale sidecar doc ids" {
             .limit = 1,
             .num_probes = 1,
         }, &stats),
+    );
+}
+
+test "lake graph sidecar candidate producer loads neighbor payloads from artifact store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const artifact_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifacts", .{tmp.sub_path});
+    defer alloc.free(artifact_path);
+    var fs = try artifacts_mod.FsStore.init(alloc, artifact_path);
+    var store = fs.artifactStore();
+    defer store.deinit();
+
+    const binding = source_binding.Binding{
+        .sidecar_kind = .graph,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"graph_edges"},
+        .index_config_hash = "sha256:graph",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 0,
+        } },
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 1,
+        } },
+    };
+    const key_a = try source_binding.rowRefKeyAlloc(alloc, row_refs[0]);
+    defer alloc.free(key_a);
+    const key_b = try source_binding.rowRefKeyAlloc(alloc, row_refs[1]);
+    defer alloc.free(key_b);
+    var segment = graph_segment.Segment{
+        .adjacencies = try alloc.alloc(graph_segment.Adjacency, 2),
+    };
+    defer graph_segment.freeSegment(alloc, &segment);
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, key_a),
+        .out_edges = try alloc.alloc(graph_segment.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, key_b),
+        .edge_type = try alloc.dupe(u8, "cites"),
+        .weight = 2.0,
+    };
+    segment.adjacencies[1] = .{
+        .node_id = try alloc.dupe(u8, key_b),
+        .out_edges = try alloc.alloc(graph_segment.Edge, 0),
+        .in_edges = try alloc.alloc(graph_segment.Edge, 1),
+    };
+    segment.adjacencies[1].in_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, key_a),
+        .edge_type = try alloc.dupe(u8, "cites"),
+        .weight = 2.0,
+    };
+    const payload = try graph_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(payload);
+    var meta = try store.put(payload);
+    defer meta.deinit(alloc);
+
+    const declaration = sidecar_manifest.DeclaredArtifact{
+        .name = "events.graph",
+        .binding = binding,
+        .artifact = .{
+            .kind = .graph_segment,
+            .name = "events.graph",
+            .artifact_id = meta.artifact_id,
+            .byte_len = meta.byte_len,
+            .checksum = meta.checksum,
+        },
+    };
+    const sidecar_names = [_][]const u8{"events.graph"};
+    var candidates = try graphCandidateSetsFromArtifactStoreAlloc(alloc, &store, &[_]sidecar_manifest.DeclaredArtifact{declaration}, .{
+        .request = .{
+            .start_node_id = key_a,
+            .mode = .neighbors,
+            .direction = .out,
+            .edge_types = &[_][]const u8{"cites"},
+            .limit = 10,
+        },
+        .sidecar_names = &sidecar_names,
+    });
+    defer candidates.deinit(alloc);
+    const lake_candidate_sets = try candidates.asLakeRowsCandidateSetsAlloc(alloc);
+    defer alloc.free(lake_candidate_sets);
+
+    try std.testing.expectEqual(@as(usize, 1), lake_candidate_sets.len);
+    try std.testing.expectEqualStrings("events.graph", lake_candidate_sets[0].sidecar_name);
+    try std.testing.expectEqual(@as(usize, 1), lake_candidate_sets[0].row_refs.len);
+    try std.testing.expectEqualStrings("file-a.parquet", lake_candidate_sets[0].row_refs[0].external.file_id);
+    try std.testing.expectEqual(@as(u64, 1), lake_candidate_sets[0].row_refs[0].external.row_ordinal);
+}
+
+test "lake graph sidecar candidate producer traverses external row refs" {
+    const alloc = std.testing.allocator;
+    const binding = source_binding.Binding{
+        .sidecar_kind = .graph,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"graph_edges"},
+        .index_config_hash = "sha256:graph",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 0,
+        } },
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 1,
+        } },
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 2,
+        } },
+    };
+    const key_a = try source_binding.rowRefKeyAlloc(alloc, row_refs[0]);
+    defer alloc.free(key_a);
+    const key_b = try source_binding.rowRefKeyAlloc(alloc, row_refs[1]);
+    defer alloc.free(key_b);
+    const key_c = try source_binding.rowRefKeyAlloc(alloc, row_refs[2]);
+    defer alloc.free(key_c);
+    var segment = graph_segment.Segment{
+        .adjacencies = try alloc.alloc(graph_segment.Adjacency, 3),
+    };
+    defer graph_segment.freeSegment(alloc, &segment);
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, key_a),
+        .out_edges = try alloc.alloc(graph_segment.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, key_b),
+        .edge_type = try alloc.dupe(u8, "cites"),
+        .weight = 1.0,
+    };
+    segment.adjacencies[1] = .{
+        .node_id = try alloc.dupe(u8, key_b),
+        .out_edges = try alloc.alloc(graph_segment.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment.Edge, 0),
+    };
+    segment.adjacencies[1].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, key_c),
+        .edge_type = try alloc.dupe(u8, "cites"),
+        .weight = 1.0,
+    };
+    segment.adjacencies[2] = .{
+        .node_id = try alloc.dupe(u8, key_c),
+        .out_edges = try alloc.alloc(graph_segment.Edge, 0),
+        .in_edges = try alloc.alloc(graph_segment.Edge, 0),
+    };
+    const payload = try graph_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(payload);
+    var candidates = try graphCandidateSetFromPayloadAlloc(alloc, .{
+        .name = "events.graph",
+        .binding = binding,
+        .artifact = .{
+            .kind = .graph_segment,
+            .name = "events.graph",
+            .artifact_id = "artifact:graph",
+            .byte_len = payload.len,
+            .checksum = "sha256:graph",
+        },
+    }, payload, .{
+        .start_node_id = key_a,
+        .mode = .traverse,
+        .direction = .out,
+        .edge_types = &[_][]const u8{"cites"},
+        .max_depth = 2,
+        .limit = 10,
+    });
+    defer candidates.deinit(alloc);
+
+    try std.testing.expectEqualStrings("events.graph", candidates.sidecar_name);
+    try std.testing.expectEqual(@as(usize, 2), candidates.row_refs.len);
+    try std.testing.expectEqual(@as(u64, 1), candidates.row_refs[0].external.row_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), candidates.row_refs[1].external.row_ordinal);
+}
+
+test "lake graph sidecar candidate producer rejects stale edge row refs" {
+    const alloc = std.testing.allocator;
+    const binding = source_binding.Binding{
+        .sidecar_kind = .graph,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"graph_edges"},
+        .index_config_hash = "sha256:graph",
+    };
+    const start_ref = rowsource.RowRef{ .external = .{
+        .source_id = "events",
+        .snapshot_id = "iceberg-7",
+        .file_id = "file-a.parquet",
+        .row_group_ordinal = 0,
+        .row_ordinal = 0,
+    } };
+    const stale_ref = rowsource.RowRef{ .external = .{
+        .source_id = "events",
+        .snapshot_id = "iceberg-8",
+        .file_id = "file-a.parquet",
+        .row_group_ordinal = 0,
+        .row_ordinal = 1,
+    } };
+    const key_a = try source_binding.rowRefKeyAlloc(alloc, start_ref);
+    defer alloc.free(key_a);
+    const stale_key = try source_binding.rowRefKeyAlloc(alloc, stale_ref);
+    defer alloc.free(stale_key);
+    var segment = graph_segment.Segment{
+        .adjacencies = try alloc.alloc(graph_segment.Adjacency, 1),
+    };
+    defer graph_segment.freeSegment(alloc, &segment);
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, key_a),
+        .out_edges = try alloc.alloc(graph_segment.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, stale_key),
+        .edge_type = try alloc.dupe(u8, "cites"),
+        .weight = 1.0,
+    };
+    const payload = try graph_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(payload);
+
+    try std.testing.expectError(
+        error.SidecarSourceBindingMismatch,
+        graphCandidateSetFromPayloadAlloc(alloc, .{
+            .name = "events.graph",
+            .binding = binding,
+            .artifact = .{
+                .kind = .graph_segment,
+                .name = "events.graph",
+                .artifact_id = "artifact:graph",
+                .byte_len = payload.len,
+                .checksum = "sha256:graph",
+            },
+        }, payload, .{
+            .start_node_id = key_a,
+            .mode = .neighbors,
+            .direction = .out,
+            .limit = 10,
+        }),
     );
 }

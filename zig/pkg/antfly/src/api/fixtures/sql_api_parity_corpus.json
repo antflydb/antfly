@@ -4890,250 +4890,6 @@
       "sql": "SELECT id FROM usage_records WHERE name ILIKE $1"
     },
     {
-      "name": "subquery primary update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "returning": 1,
-        "join_on": 1
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id"
-    },
-    {
-      "name": "subquery non-primary update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "join_on": 1
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records)"
-    },
-    {
-      "name": "correlated subquery update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "join_on": 2
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.status = usage_records.status)"
-    },
-    {
-      "name": "correlated filtered subquery update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "predicates": 1,
-        "operations": 1,
-        "join_on": 2
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status)"
-    },
-    {
-      "name": "row value subquery update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "join_on": 2
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE (id, status) IN (SELECT organization_id, status FROM archived_records)"
-    },
-    {
-      "name": "computed semijoin update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "returning": 1,
-        "join_on": 1,
-        "row_claim_skip_locked": true
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
-    },
-    {
-      "name": "exists semijoin update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "predicates": 1,
-        "operations": 1,
-        "returning": 1,
-        "join_on": 1,
-        "row_claim_skip_locked": true
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id"
-    },
-    {
-      "name": "computed exists semijoin update selector routes to joined mutation source",
-      "family": "update_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "returning": 1,
-        "join_on": 1,
-        "row_claim_skip_locked": true
-      },
-      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
-    },
-    {
-      "name": "non unique delete selector routes to mutation source",
-      "family": "delete_source",
-      "summary": {
-        "table_name": "usage_records",
-        "predicates": 1,
-        "returning": 1,
-        "row_claim_skip_locked": false
-      },
-      "plan": "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=1:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id"
-    },
-    {
-      "name": "unsupported non-unique point delete selector",
-      "family": "unsupported_delete",
-      "plan": "unsupported:delete:requires=non_unique_point_selector",
-      "classification_reason": "non_unique_point_selector",
-      "sql": "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id"
-    },
-    {
-      "name": "table-wide raw delete routes to claimed mutation source",
-      "family": "delete_source",
-      "summary": {
-        "table_name": "usage_records",
-        "returning": 0,
-        "row_claim_skip_locked": false
-      },
-      "plan": "delete_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records"
-    },
-    {
-      "name": "subquery primary delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "returning": 0,
-        "join_on": 1
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT id FROM archived_records)"
-    },
-    {
-      "name": "subquery non-primary delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "join_on": 1
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records)"
-    },
-    {
-      "name": "correlated subquery delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "join_on": 2
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.status = usage_records.status)"
-    },
-    {
-      "name": "correlated filtered subquery delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "predicates": 1,
-        "join_on": 2
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status)"
-    },
-    {
-      "name": "row value subquery delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "join_on": 2
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE (id, status) IN (SELECT organization_id, status FROM archived_records)"
-    },
-    {
-      "name": "computed semijoin delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "returning": 1,
-        "join_on": 1,
-        "row_claim_skip_locked": true
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
-      "sql": "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
-    },
-    {
-      "name": "exists semijoin delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "predicates": 1,
-        "returning": 1,
-        "join_on": 1,
-        "row_claim_skip_locked": true
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id"
-    },
-    {
-      "name": "computed exists semijoin delete selector routes to joined mutation source",
-      "family": "delete_joined_source",
-      "summary": {
-        "table_name": "usage_records",
-        "returning": 1,
-        "join_on": 1,
-        "row_claim_skip_locked": true
-      },
-      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
-      "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
-    },
-    {
-      "name": "unsupported multi-output subquery delete selector",
-      "family": "unsupported_delete",
-      "plan": "unsupported:delete:requires=multi_output_subquery_delete_selector",
-      "classification_reason": "multi_output_subquery_delete_selector",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
-    },
-    {
-      "name": "unsupported multi-output subquery joined update selector",
-      "family": "unsupported_update_joined_source",
-      "plan": "unsupported:update_joined_source:requires=multi_output_subquery_update_selector",
-      "classification_reason": "multi_output_subquery_update_selector",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id, status FROM archived_records)"
-    },
-    {
-      "name": "unsupported multi-output subquery joined delete selector",
-      "family": "unsupported_delete_joined_source",
-      "plan": "unsupported:delete_joined_source:requires=multi_output_subquery_delete_selector",
-      "classification_reason": "multi_output_subquery_delete_selector",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
-    },
-    {
-      "name": "unsupported joined update non-target row lock",
-      "family": "unsupported_update_joined_source",
-      "plan": "unsupported:update_joined_source:requires=row_lock_mode_plan",
-      "classification_reason": "row_lock_mode_plan",
-      "sql": "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id"
-    },
-    {
       "name": "cte-backed semijoin update mutation source",
       "family": "update_joined_source",
       "summary": {
@@ -10781,6 +10537,250 @@
       "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=1:ops=0:returning=1:returning_expr=0:returning_all=0:rewrite=1",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"source_pk\":{\"type\":\"keyword\"},\"id\":{\"type\":\"keyword\"}},\"required\":[\"source_pk\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"source_pk\"]}}",
       "sql": "UPDATE usage_records SET id = source.id FROM source_records AS source WHERE usage_records.id = source.source_pk FOR UPDATE RETURNING id"
+    },
+    {
+      "name": "subquery primary update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "returning": 1,
+        "join_on": 1
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id"
+    },
+    {
+      "name": "subquery non-primary update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records)"
+    },
+    {
+      "name": "correlated subquery update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "join_on": 2
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.status = usage_records.status)"
+    },
+    {
+      "name": "correlated filtered subquery update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "operations": 1,
+        "join_on": 2
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status)"
+    },
+    {
+      "name": "row value subquery update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "join_on": 2
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE (id, status) IN (SELECT organization_id, status FROM archived_records)"
+    },
+    {
+      "name": "computed semijoin update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": true
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
+    },
+    {
+      "name": "exists semijoin update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "operations": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": true
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id"
+    },
+    {
+      "name": "computed exists semijoin update selector routes to joined mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": true
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
+    },
+    {
+      "name": "non unique delete selector routes to mutation source",
+      "family": "delete_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "returning": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=1:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id"
+    },
+    {
+      "name": "unsupported non-unique point delete selector",
+      "family": "unsupported_delete",
+      "plan": "unsupported:delete:requires=non_unique_point_selector",
+      "classification_reason": "non_unique_point_selector",
+      "sql": "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id"
+    },
+    {
+      "name": "table-wide raw delete routes to claimed mutation source",
+      "family": "delete_source",
+      "summary": {
+        "table_name": "usage_records",
+        "returning": 0,
+        "row_claim_skip_locked": false
+      },
+      "plan": "delete_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records"
+    },
+    {
+      "name": "subquery primary delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "returning": 0,
+        "join_on": 1
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records WHERE id IN (SELECT id FROM archived_records)"
+    },
+    {
+      "name": "subquery non-primary delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "join_on": 1
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records)"
+    },
+    {
+      "name": "correlated subquery delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "join_on": 2
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.status = usage_records.status)"
+    },
+    {
+      "name": "correlated filtered subquery delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "join_on": 2
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status)"
+    },
+    {
+      "name": "row value subquery delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "join_on": 2
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records WHERE (id, status) IN (SELECT organization_id, status FROM archived_records)"
+    },
+    {
+      "name": "computed semijoin delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": true
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "sql": "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
+    },
+    {
+      "name": "exists semijoin delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": true
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0",
+      "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id"
+    },
+    {
+      "name": "computed exists semijoin delete selector routes to joined mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": true
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
+    },
+    {
+      "name": "unsupported multi-output subquery delete selector",
+      "family": "unsupported_delete",
+      "plan": "unsupported:delete:requires=multi_output_subquery_delete_selector",
+      "classification_reason": "multi_output_subquery_delete_selector",
+      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
+    },
+    {
+      "name": "unsupported multi-output subquery joined update selector",
+      "family": "unsupported_update_joined_source",
+      "plan": "unsupported:update_joined_source:requires=multi_output_subquery_update_selector",
+      "classification_reason": "multi_output_subquery_update_selector",
+      "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id, status FROM archived_records)"
+    },
+    {
+      "name": "unsupported multi-output subquery joined delete selector",
+      "family": "unsupported_delete_joined_source",
+      "plan": "unsupported:delete_joined_source:requires=multi_output_subquery_delete_selector",
+      "classification_reason": "multi_output_subquery_delete_selector",
+      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
+    },
+    {
+      "name": "unsupported joined update non-target row lock",
+      "family": "unsupported_update_joined_source",
+      "plan": "unsupported:update_joined_source:requires=row_lock_mode_plan",
+      "classification_reason": "row_lock_mode_plan",
+      "sql": "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id"
     }
   ]
 }
