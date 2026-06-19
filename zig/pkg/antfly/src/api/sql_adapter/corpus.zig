@@ -3973,6 +3973,7 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_read_set_operation_union: bool = false,
     unsupported_read_set_operation_intersect: bool = false,
     unsupported_read_set_operation_except: bool = false,
+    unsupported_read_ordered_set_aggregate_plan: bool = false,
     read_row_lock_nowait: bool = false,
     read_row_lock_share: bool = false,
     read_row_lock_key_share: bool = false,
@@ -5049,6 +5050,9 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_set_operation_except = self.unsupported_read_set_operation_except or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
                     std.mem.indexOf(u8, entry.sql, " EXCEPT ") != null);
+            self.unsupported_read_ordered_set_aggregate_plan = self.unsupported_read_ordered_set_aggregate_plan or
+                (std.mem.eql(u8, entry.classification_reason, "ordered_set_aggregate_plan") and
+                    std.mem.indexOf(u8, entry.sql, "WITHIN GROUP") != null);
             self.unsupported_read_row_lock_target = self.unsupported_read_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
@@ -6052,6 +6056,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_set_operation_union);
         try std.testing.expect(self.unsupported_read_set_operation_intersect);
         try std.testing.expect(self.unsupported_read_set_operation_except);
+        try std.testing.expect(self.unsupported_read_ordered_set_aggregate_plan);
         try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);

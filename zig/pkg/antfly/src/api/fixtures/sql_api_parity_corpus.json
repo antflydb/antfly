@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 888,
-  "entry_count": 888,
+  "source_entry_count": 889,
+  "entry_count": 889,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4674,6 +4674,13 @@
       "plan": "unsupported:read:requires=aggregate_duplicate_output_name",
       "classification_reason": "aggregate_duplicate_output_name",
       "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
+    },
+    {
+      "name": "unsupported ordered-set percentile aggregate plan",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=ordered_set_aggregate_plan",
+      "classification_reason": "ordered_set_aggregate_plan",
+      "sql": "SELECT customer_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount FROM usage_records GROUP BY customer_id"
     },
     {
       "name": "select into relation population plan",
