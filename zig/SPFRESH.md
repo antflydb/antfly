@@ -1108,8 +1108,10 @@ implementations cleanly:
     stats-then-replay scans, delta-location lists, and owned delta slices that
     existed before. Segment delta-tail stats also read a posting's contiguous
     delta-value range once per segment instead of issuing one range read per
-    delta value while still verifying each value checksum. Fold scratch release
-    now resets transient replay state and
+    delta value while still verifying each value checksum. Mixed-generation
+    segment delta filtering now grows list/scratch output by live records rather
+    than reserving the rest of the encoded tail after the first live record.
+    Fold scratch release now resets transient replay state and
     trims retained buffers under the configured byte budget before caching the
     scratch for reuse, so exact-size fold encoders do not still pin a previous
     worst-case posting's memory. The HBC

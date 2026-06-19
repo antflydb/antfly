@@ -770,15 +770,7 @@ pub const Catalog = struct {
                         while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
                         continue;
                     }
-                    var reserved = false;
-                    while (try delta_iter.next()) |record| {
-                        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                        if (!reserved) {
-                            try records.ensureUnusedCapacity(alloc, delta_iter.recordCount() - delta_iter.index + 1);
-                            reserved = true;
-                        }
-                        records.appendAssumeCapacity(record);
-                    }
+                    try appendDeltaIteratorAfterGenerationAlloc(alloc, &delta_iter, generation, records);
                 } else {
                     try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
                     while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
@@ -810,15 +802,7 @@ pub const Catalog = struct {
                         while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
                         continue;
                     }
-                    var reserved = false;
-                    while (try delta_iter.next()) |record| {
-                        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                        if (!reserved) {
-                            try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount() - delta_iter.index + 1);
-                            reserved = true;
-                        }
-                        scratch.appendDeltaRecordAssumeCapacity(record);
-                    }
+                    try appendDeltaIteratorAfterGenerationIntoScratchAlloc(alloc, &delta_iter, generation, scratch);
                 } else {
                     try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
                     while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
@@ -2123,16 +2107,7 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
                 try appendDeltaValueAllRecordsAlloc(alloc, value, &records);
                 continue;
             }
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-            var reserved = false;
-            while (try iterator.next()) |record| {
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                if (!reserved) {
-                    try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
-                    reserved = true;
-                }
-                records.appendAssumeCapacity(record);
-            }
+            try appendDeltaValueAfterGenerationAlloc(alloc, value, generation, &records);
         } else {
             try appendDeltaValueAllRecordsAlloc(alloc, value, &records);
         }
@@ -2168,22 +2143,7 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
             try appendDeltaValueAllRecordsWithStatsAlloc(alloc, value, records, stats);
             continue;
         }
-
-        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-        stats.records += iterator.recordCount();
-        stats.encoded_value_bytes += value.len;
-        var reserved = false;
-        while (try iterator.next()) |record| {
-            if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-            if (!reserved) {
-                try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
-                reserved = true;
-            }
-            stats.records_after_generation += 1;
-            if (record.op == .tombstone) stats.tombstones_after_generation += 1;
-            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-            records.appendAssumeCapacity(record);
-        }
+        try appendDeltaValueAfterGenerationWithStatsAlloc(alloc, value, base_generation, records, stats);
     }
 }
 
@@ -2213,22 +2173,7 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
             try appendDeltaValueAllRecordsIntoScratchWithStatsAlloc(alloc, value, scratch, stats);
             continue;
         }
-
-        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-        stats.records += iterator.recordCount();
-        stats.encoded_value_bytes += value.len;
-        var reserved = false;
-        while (try iterator.next()) |record| {
-            if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-            if (!reserved) {
-                try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount() - iterator.index + 1);
-                reserved = true;
-            }
-            stats.records_after_generation += 1;
-            if (record.op == .tombstone) stats.tombstones_after_generation += 1;
-            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-            scratch.appendDeltaRecordAssumeCapacity(record);
-        }
+        try appendDeltaValueAfterGenerationIntoScratchWithStatsAlloc(alloc, value, base_generation, scratch, stats);
     }
 }
 
@@ -3000,13 +2945,9 @@ pub const DirectoryBatchWriter = struct {
                     sortPostingDeltaRecordsIfNeeded(records.items);
                     return try records.toOwnedSlice(alloc);
                 }
-                var reserved = false;
-                for (batch.records.items, 0..) |record, i| {
+                for (batch.records.items) |record| {
                     if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                    if (!reserved) {
-                        try records.ensureUnusedCapacity(alloc, batch.records.items.len - i);
-                        reserved = true;
-                    }
+                    try records.ensureUnusedCapacity(alloc, 1);
                     records.appendAssumeCapacity(record);
                 }
             } else {
@@ -3045,14 +2986,10 @@ pub const DirectoryBatchWriter = struct {
                     .stats = stats,
                 };
             }
-            var reserved = false;
-            for (batch.records.items, 0..) |record, i| {
+            for (batch.records.items) |record| {
                 stats.records += 1;
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                if (!reserved) {
-                    try records.ensureUnusedCapacity(alloc, batch.records.items.len - i);
-                    reserved = true;
-                }
+                try records.ensureUnusedCapacity(alloc, 1);
                 stats.records_after_generation += 1;
                 if (record.op == .tombstone) stats.tombstones_after_generation += 1;
                 stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
@@ -3089,14 +3026,10 @@ pub const DirectoryBatchWriter = struct {
                 batch.accumulateAllRecordsAfterGenerationStats(&stats);
                 return stats;
             }
-            var reserved = false;
-            for (batch.records.items, 0..) |record, i| {
+            for (batch.records.items) |record| {
                 stats.records += 1;
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                if (!reserved) {
-                    try ensureDeltaRecordAppendCapacity(alloc, scratch, batch.records.items.len - i);
-                    reserved = true;
-                }
+                try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
                 stats.records_after_generation += 1;
                 if (record.op == .tombstone) stats.tombstones_after_generation += 1;
                 stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
@@ -3372,15 +3305,7 @@ pub const DirectoryBatchWriter = struct {
                     while (try iterator.next()) |record| records.appendAssumeCapacity(record);
                     continue;
                 }
-                var reserved = false;
-                while (try iterator.next()) |record| {
-                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                    if (!reserved) {
-                        try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
-                        reserved = true;
-                    }
-                    records.appendAssumeCapacity(record);
-                }
+                try appendDeltaIteratorAfterGenerationAlloc(alloc, &iterator, generation, records);
             } else {
                 try records.ensureUnusedCapacity(alloc, iterator.recordCount());
                 while (try iterator.next()) |record| records.appendAssumeCapacity(record);
@@ -3402,21 +3327,7 @@ pub const DirectoryBatchWriter = struct {
                 try appendDeltaValueAllRecordsWithStatsAlloc(alloc, entry.value, records, stats);
                 continue;
             }
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
-            stats.records += iterator.recordCount();
-            stats.encoded_value_bytes += entry.value.len;
-            var reserved = false;
-            while (try iterator.next()) |record| {
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                if (!reserved) {
-                    try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
-                    reserved = true;
-                }
-                stats.records_after_generation += 1;
-                if (record.op == .tombstone) stats.tombstones_after_generation += 1;
-                stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-                records.appendAssumeCapacity(record);
-            }
+            try appendDeltaValueAfterGenerationWithStatsAlloc(alloc, entry.value, base_generation, records, stats);
         }
     }
 
@@ -3434,21 +3345,7 @@ pub const DirectoryBatchWriter = struct {
                 try appendDeltaValueAllRecordsIntoScratchWithStatsAlloc(alloc, entry.value, scratch, stats);
                 continue;
             }
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
-            stats.records += iterator.recordCount();
-            stats.encoded_value_bytes += entry.value.len;
-            var reserved = false;
-            while (try iterator.next()) |record| {
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                if (!reserved) {
-                    try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount() - iterator.index + 1);
-                    reserved = true;
-                }
-                stats.records_after_generation += 1;
-                if (record.op == .tombstone) stats.tombstones_after_generation += 1;
-                stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-                scratch.appendDeltaRecordAssumeCapacity(record);
-            }
+            try appendDeltaValueAfterGenerationIntoScratchWithStatsAlloc(alloc, entry.value, base_generation, scratch, stats);
         }
     }
 
@@ -4123,6 +4020,29 @@ fn appendDeltaValueAllRecordsAlloc(
     while (try iterator.next()) |record| records.appendAssumeCapacity(record);
 }
 
+fn appendDeltaValueAfterGenerationAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    generation: u64,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    try appendDeltaIteratorAfterGenerationAlloc(alloc, &iterator, generation, records);
+}
+
+fn appendDeltaIteratorAfterGenerationAlloc(
+    alloc: Allocator,
+    iterator: *posting.PostingFormat.DeltaTailIterator,
+    generation: u64,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+) !void {
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+        try records.ensureUnusedCapacity(alloc, 1);
+        records.appendAssumeCapacity(record);
+    }
+}
+
 fn appendDeltaValueAllRecordsWithStatsAlloc(
     alloc: Allocator,
     value: []const u8,
@@ -4136,6 +4056,26 @@ fn appendDeltaValueAllRecordsWithStatsAlloc(
     stats.records_after_generation += record_count;
     try records.ensureUnusedCapacity(alloc, record_count);
     while (try iterator.next()) |record| {
+        if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+        stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+        records.appendAssumeCapacity(record);
+    }
+}
+
+fn appendDeltaValueAfterGenerationWithStatsAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    generation: u64,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+    stats: *posting.PostingDeltaTailStats,
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    stats.records += iterator.recordCount();
+    stats.encoded_value_bytes += value.len;
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+        try records.ensureUnusedCapacity(alloc, 1);
+        stats.records_after_generation += 1;
         if (record.op == .tombstone) stats.tombstones_after_generation += 1;
         stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
         records.appendAssumeCapacity(record);
@@ -4157,6 +4097,39 @@ fn appendDeltaValueAllRecordsIntoScratchWithStatsAlloc(
     while (try iterator.next()) |record| {
         if (record.op == .tombstone) stats.tombstones_after_generation += 1;
         stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+        scratch.appendDeltaRecordAssumeCapacity(record);
+    }
+}
+
+fn appendDeltaValueAfterGenerationIntoScratchWithStatsAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    generation: u64,
+    scratch: anytype,
+    stats: *posting.PostingDeltaTailStats,
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    stats.records += iterator.recordCount();
+    stats.encoded_value_bytes += value.len;
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+        try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
+        stats.records_after_generation += 1;
+        if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+        stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+        scratch.appendDeltaRecordAssumeCapacity(record);
+    }
+}
+
+fn appendDeltaIteratorAfterGenerationIntoScratchAlloc(
+    alloc: Allocator,
+    iterator: *posting.PostingFormat.DeltaTailIterator,
+    generation: u64,
+    scratch: anytype,
+) !void {
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+        try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
         scratch.appendDeltaRecordAssumeCapacity(record);
     }
 }
@@ -6699,6 +6672,35 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
     try std.testing.expectEqualSlices(posting.VectorId, materialized, scratch.member_ids[0..scratch_count]);
     const sorted_scratch_count = (try snapshot.materializeSortedMembersIntoScratch(alloc, 7, &scratch)).?;
     try std.testing.expectEqualSlices(posting.VectorId, materialized, scratch.member_ids[0..sorted_scratch_count]);
+}
+
+test "posting segment filtered delta scratch grows by live records only" {
+    const alloc = std.testing.allocator;
+    const records = [_]posting.PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 1) << 32) | 1, .op = .insert, .vector_id = 41 },
+        .{ .sequence = (@as(u64, 1) << 32) | 2, .op = .tombstone, .vector_id = 42 },
+        .{ .sequence = (@as(u64, 1) << 32) | 3, .op = .insert, .vector_id = 43 },
+        .{ .sequence = (@as(u64, 1) << 32) | 4, .op = .tombstone, .vector_id = 44 },
+        .{ .sequence = (@as(u64, 1) << 32) | 5, .op = .insert, .vector_id = 45 },
+        .{ .sequence = (@as(u64, 1) << 32) | 6, .op = .tombstone, .vector_id = 46 },
+        .{ .sequence = (@as(u64, 1) << 32) | 7, .op = .insert, .vector_id = 47 },
+        .{ .sequence = (@as(u64, 1) << 32) | 8, .op = .tombstone, .vector_id = 48 },
+        .{ .sequence = (@as(u64, 1) << 32) | 9, .op = .insert, .vector_id = 49 },
+    };
+    const encoded = try posting.PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+    var stats = posting.PostingDeltaTailStats{};
+
+    try appendDeltaValueAfterGenerationIntoScratchWithStatsAlloc(alloc, encoded, 1, &scratch, &stats);
+
+    try std.testing.expectEqual(@as(usize, records.len), stats.records);
+    try std.testing.expectEqual(@as(usize, 1), stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 1), scratch.deltaRecordCount());
+    try std.testing.expectEqual(@as(usize, 8), scratch.delta_records.len);
+    try std.testing.expectEqual(records[0], scratch.deltaRecords()[0]);
 }
 
 test "posting lazy latest member scan prefers newer equal-sequence segment" {
