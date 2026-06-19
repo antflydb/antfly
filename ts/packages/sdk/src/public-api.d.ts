@@ -5186,7 +5186,7 @@ export interface components {
         RowsAggregateSpec: {
             name: string;
             /** @enum {string} */
-            op: "count" | "sum" | "min" | "max" | "avg" | "array_agg" | "string_agg" | "percentile_cont" | "percentile_disc" | "bool_or" | "bool_and";
+            op: "count" | "sum" | "min" | "max" | "avg" | "array_agg" | "string_agg" | "percentile_cont" | "percentile_disc" | "mode" | "bool_or" | "bool_and";
             field?: string;
             expr?: components["schemas"]["RowsExpression"];
             distinct?: boolean;
@@ -5205,7 +5205,7 @@ export interface components {
              */
             percentile_max_items?: number;
             /**
-             * @description Ordered-set sample direction for percentile_cont and percentile_disc.
+             * @description Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
              * @default asc
              * @enum {string}
              */

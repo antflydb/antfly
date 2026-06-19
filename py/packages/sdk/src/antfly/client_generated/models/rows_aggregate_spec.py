@@ -49,7 +49,7 @@ class RowsAggregateSpec:
         percentile_max_items (int | Unset): Maximum bounded per-group sample count for percentile_cont and
             percentile_disc.
         percentile_order (RowsAggregateSpecPercentileOrder | Unset): Ordered-set sample direction for percentile_cont
-            and percentile_disc. Default: RowsAggregateSpecPercentileOrder.ASC.
+            and percentile_disc; deterministic tie-break direction for mode. Default: RowsAggregateSpecPercentileOrder.ASC.
         array_max_items (int | Unset):
         array_order_by (list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset):
         delimiter (str | Unset): Delimiter for string_agg aggregate specs.

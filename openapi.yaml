@@ -11915,6 +11915,7 @@ components:
             - string_agg
             - percentile_cont
             - percentile_disc
+            - mode
             - bool_or
             - bool_and
         field:
@@ -11954,7 +11955,8 @@ components:
             - asc
             - desc
           default: asc
-          description: Ordered-set sample direction for percentile_cont and percentile_disc.
+          description: Ordered-set sample direction for percentile_cont and percentile_disc; deterministic
+            tie-break direction for mode.
         array_max_items:
           type: integer
           format: int64

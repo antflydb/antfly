@@ -22418,6 +22418,7 @@ pub const DB = struct {
         bool_or: bool = false,
         bool_and: bool = true,
         distinct_seen: std.StringHashMapUnmanaged(void) = .empty,
+        mode_counts: std.StringHashMapUnmanaged(u64) = .empty,
         array_items: std.ArrayListUnmanaged(RelationalRowsAggregateArrayItem) = .empty,
         array_seen: usize = 0,
         percentile_samples: std.ArrayListUnmanaged(f64) = .empty,
@@ -22428,6 +22429,9 @@ pub const DB = struct {
             var keys = self.distinct_seen.keyIterator();
             while (keys.next()) |key_ptr| alloc.free(@constCast(key_ptr.*));
             self.distinct_seen.deinit(alloc);
+            var mode_keys = self.mode_counts.keyIterator();
+            while (mode_keys.next()) |key_ptr| alloc.free(@constCast(key_ptr.*));
+            self.mode_counts.deinit(alloc);
             for (self.array_items.items) |*item| item.deinit(alloc);
             self.array_items.deinit(alloc);
             self.percentile_samples.deinit(alloc);
@@ -22455,6 +22459,31 @@ pub const DB = struct {
             gop.value_ptr.* = {};
             key_transferred = true;
             return true;
+        }
+
+        fn recordModeValue(
+            self: *@This(),
+            alloc: Allocator,
+            value: std.json.Value,
+            max_items: u32,
+        ) !void {
+            if (max_items == 0) return error.InvalidQueryRequest;
+            const key = try relationalRowsAggregateDistinctKeyJsonAlloc(alloc, value);
+            var key_transferred = false;
+            errdefer if (!key_transferred) alloc.free(key);
+            if (self.mode_counts.getPtr(key)) |count| {
+                alloc.free(key);
+                count.* += 1;
+                self.count += 1;
+                return;
+            }
+            if (self.mode_counts.count() >= @as(usize, max_items)) return error.ResourceBudgetExceeded;
+            const gop = try self.mode_counts.getOrPut(alloc, key);
+            if (gop.found_existing) unreachable;
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = 1;
+            key_transferred = true;
+            self.count += 1;
         }
 
         fn appendArrayValue(
@@ -22617,6 +22646,17 @@ pub const DB = struct {
                         if (parsed.value == .null) continue;
                         const number = jsonNumberAsF64(parsed.value) orelse return error.InvalidQueryRequest;
                         try self.metrics[i].appendPercentileSample(alloc, number, spec.percentile_max_items);
+                    },
+                    .mode => {
+                        if (spec.distinct) return error.InvalidQueryRequest;
+                        if (spec.distinct_max_items == 0) return error.InvalidQueryRequest;
+                        const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
+                        defer alloc.free(value_json);
+                        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                        defer parsed.deinit();
+                        if (parsed.value == .null) continue;
+                        if (compareRelationalRowsJsonScalars(parsed.value, parsed.value) == null) return error.InvalidQueryRequest;
+                        try self.metrics[i].recordModeValue(alloc, parsed.value, spec.distinct_max_items);
                     },
                     .min, .max => {
                         const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
@@ -22815,6 +22855,7 @@ pub const DB = struct {
                     try writeRelationalRowsPercentileValueJson(writer, spec.op, metric.percentile_samples.items, spec.percentile.?);
                 }
             },
+            .mode => try writeRelationalRowsAggregateModeJson(alloc, writer, metric, spec.percentile_order),
             .min => if (metric.min_json) |value|
                 try writer.writeAll(value)
             else
@@ -22859,6 +22900,41 @@ pub const DB = struct {
                 try writer.writeAll(if (metric.bool_and) "true" else "false");
             },
         }
+    }
+
+    fn writeRelationalRowsAggregateModeJson(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        metric: RelationalRowsAggregateMetric,
+        direction: types.RelationalRowsQueryOrderDirection,
+    ) !void {
+        var best_key: ?[]const u8 = null;
+        var best_count: u64 = 0;
+        var iterator = metric.mode_counts.iterator();
+        while (iterator.next()) |entry| {
+            const candidate_key = entry.key_ptr.*;
+            const candidate_count = entry.value_ptr.*;
+            var replace = candidate_count > best_count;
+            if (!replace and candidate_count == best_count) {
+                if (best_key) |current_key| {
+                    var parsed_candidate = std.json.parseFromSlice(std.json.Value, alloc, candidate_key, .{}) catch return error.InvalidQueryRequest;
+                    defer parsed_candidate.deinit();
+                    var parsed_current = std.json.parseFromSlice(std.json.Value, alloc, current_key, .{}) catch return error.InvalidQueryRequest;
+                    defer parsed_current.deinit();
+                    const comparison = compareRelationalRowsJsonScalars(parsed_candidate.value, parsed_current.value) orelse return error.InvalidQueryRequest;
+                    replace = switch (direction) {
+                        .asc => comparison == .lt,
+                        .desc => comparison == .gt,
+                    };
+                }
+            }
+            if (replace or best_key == null) {
+                best_key = candidate_key;
+                best_count = candidate_count;
+            }
+        }
+        if (best_key) |key| return try writer.writeAll(key);
+        return try writer.writeAll("null");
     }
 
     fn relationalRowsAggregateArrayItemLessThan(ctx: RelationalRowsQuerySortContext, lhs: RelationalRowsAggregateArrayItem, rhs: RelationalRowsAggregateArrayItem) bool {
@@ -91145,6 +91221,8 @@ test "relational rows aggregate supports distinct metric state" {
         .{ .name = "joined_statuses", .op = .string_agg, .field = "status", .string_delimiter = ",", .array_max_items = 8 },
         .{ .name = "distinct_joined_statuses", .op = .string_agg, .field = "status", .distinct = true, .string_delimiter = "|", .array_max_items = 8 },
         .{ .name = "amount_ordered_joined_statuses", .op = .string_agg, .field = "status", .string_delimiter = ">", .array_max_items = 2, .array_order_by = amount_desc_order[0..] },
+        .{ .name = "modal_status", .op = .mode, .field = "status" },
+        .{ .name = "modal_status_desc", .op = .mode, .field = "status", .percentile_order = .desc },
     };
     var result = try db.aggregateRelationalRows(alloc, runtime_schema, .{
         .group_by = group_by[0..],
@@ -91154,8 +91232,8 @@ test "relational rows aggregate supports distinct metric state" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":2,\"amount_sum\":40,\"distinct_amount_sum\":30,\"first_statuses\":[\"open\",\"open\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"closed\",\"open\"],\"joined_statuses\":\"open,open,closed\",\"distinct_joined_statuses\":\"open|closed\",\"amount_ordered_joined_statuses\":\"closed>open\"}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"row_count\":2,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":1,\"amount_sum\":14,\"distinct_amount_sum\":7,\"first_statuses\":[\"open\",\"closed\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"open\",\"closed\"],\"joined_statuses\":\"open,closed\",\"distinct_joined_statuses\":\"open|closed\",\"amount_ordered_joined_statuses\":\"open>closed\"}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":2,\"amount_sum\":40,\"distinct_amount_sum\":30,\"first_statuses\":[\"open\",\"open\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"closed\",\"open\"],\"joined_statuses\":\"open,open,closed\",\"distinct_joined_statuses\":\"open|closed\",\"amount_ordered_joined_statuses\":\"closed>open\",\"modal_status\":\"open\",\"modal_status_desc\":\"open\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"row_count\":2,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":1,\"amount_sum\":14,\"distinct_amount_sum\":7,\"first_statuses\":[\"open\",\"closed\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"open\",\"closed\"],\"joined_statuses\":\"open,closed\",\"distinct_joined_statuses\":\"open|closed\",\"amount_ordered_joined_statuses\":\"open>closed\",\"modal_status\":\"closed\",\"modal_status_desc\":\"open\"}", result.rows[1]);
 
     const filter_open_rhs = [_]types.RelationalRowsExpression{.{
         .kind = .value,

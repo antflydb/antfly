@@ -4399,6 +4399,7 @@ pub const AppParityCorpusCoverage = struct {
     aggregate_percentile_desc: bool = false,
     aggregate_percentile_nulls: bool = false,
     aggregate_percentile_array: bool = false,
+    aggregate_mode: bool = false,
     aggregate_group_expression: bool = false,
     aggregate_group_expression_alias: bool = false,
     aggregate_having_expression: bool = false,
@@ -4933,6 +4934,8 @@ pub const AppParityCorpusCoverage = struct {
                         std.mem.indexOf(u8, entry.sql, " NULLS ") != null);
                 self.aggregate_percentile_array = self.aggregate_percentile_array or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":percentile_array=");
+                self.aggregate_mode = self.aggregate_mode or
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":mode=");
                 self.aggregate_group_expression = self.aggregate_group_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=");
                 self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=") and
                     std.mem.indexOf(u8, entry.sql, "GROUP BY status_key") != null);
@@ -6177,7 +6180,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_set_operation_union);
         try std.testing.expect(self.unsupported_read_set_operation_intersect);
         try std.testing.expect(self.unsupported_read_set_operation_except);
-        try std.testing.expect(self.unsupported_read_ordered_set_aggregate_plan);
         try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
@@ -6449,6 +6451,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.aggregate_percentile_desc);
         try std.testing.expect(self.aggregate_percentile_nulls);
         try std.testing.expect(self.aggregate_percentile_array);
+        try std.testing.expect(self.aggregate_mode);
         try std.testing.expect(self.aggregate_octet_length_expression);
         try std.testing.expect(self.aggregate_bit_length_expression);
         try std.testing.expect(self.aggregate_scalar_minmax);

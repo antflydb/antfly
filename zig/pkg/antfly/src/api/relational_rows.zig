@@ -6070,6 +6070,7 @@ fn parseRowsAggregateSpecAlloc(
         break :blk 0;
     };
     if (distinct and distinct_max_items == 0) return error.InvalidRowsRequest;
+    if (op == .mode and distinct) return error.InvalidRowsRequest;
 
     var percentiles: []const f64 = &.{};
     var percentiles_transferred = false;
@@ -6097,7 +6098,7 @@ fn parseRowsAggregateSpecAlloc(
         break :blk 0;
     };
     if (isRowsPercentileAggregateOp(op) and percentile_max_items == 0) return error.InvalidRowsRequest;
-    const percentile_order = if (isRowsPercentileAggregateOp(op))
+    const percentile_order = if (isRowsPercentileAggregateOp(op) or op == .mode)
         try parseRowsAggregatePercentileOrder(value.object.get("percentile_order"))
     else blk: {
         if (value.object.get("percentile_order") != null) return error.InvalidRowsRequest;
@@ -6222,6 +6223,7 @@ fn parseRowsAggregateOp(value: []const u8) ?db_mod.types.RelationalRowsAggregate
     if (std.mem.eql(u8, value, "avg")) return .avg;
     if (std.mem.eql(u8, value, "percentile_cont")) return .percentile_cont;
     if (std.mem.eql(u8, value, "percentile_disc")) return .percentile_disc;
+    if (std.mem.eql(u8, value, "mode")) return .mode;
     if (std.mem.eql(u8, value, "array_agg")) return .array_agg;
     if (std.mem.eql(u8, value, "string_agg")) return .string_agg;
     if (std.mem.eql(u8, value, "bool_or")) return .bool_or;
@@ -6270,6 +6272,7 @@ fn validateRowsAggregateFieldInput(
         .count, .array_agg => {},
         .string_agg => if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidRowsRequest,
         .sum, .avg, .percentile_cont, .percentile_disc => if (column.field_type != .numeric) return error.InvalidRowsRequest,
+        .mode => if (!rowsAggregateModeTypeAllowed(column.field_type)) return error.InvalidRowsRequest,
         .min, .max => if (!rowsAggregateMinMaxTypeAllowed(column.field_type)) return error.InvalidRowsRequest,
         .bool_or, .bool_and => if (column.field_type != .boolean) return error.InvalidRowsRequest,
     }
@@ -6285,9 +6288,19 @@ fn validateRowsAggregateExpressionInput(
         .count, .array_agg => {},
         .string_agg => try validateRowsQueryTextExpression(alloc, schema, expression),
         .sum, .avg, .percentile_cont, .percentile_disc => try validateRowsQueryNumericExpression(alloc, schema, expression),
+        .mode => try validateRowsAggregateModeExpressionInput(alloc, schema, expression),
         .min, .max => try validateRowsAggregateMinMaxExpressionInput(alloc, schema, expression),
         .bool_or, .bool_and => try validateRowsQueryBooleanExpression(alloc, schema, expression),
     }
+}
+
+fn validateRowsAggregateModeExpressionInput(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    expression: db_mod.types.RelationalRowsExpression,
+) !void {
+    const output_type = try rowsExpressionOutputType(alloc, schema, expression);
+    if (!rowsAggregateModeTypeAllowed(output_type)) return error.InvalidRowsRequest;
 }
 
 fn validateRowsAggregateMinMaxExpressionInput(
@@ -6301,6 +6314,10 @@ fn validateRowsAggregateMinMaxExpressionInput(
 
 fn rowsAggregateMinMaxTypeAllowed(field_type: runtime_schema.AntflyType) bool {
     return rowsExpressionTypeIsTextLike(field_type) or field_type == .numeric or field_type == .datetime;
+}
+
+fn rowsAggregateModeTypeAllowed(field_type: runtime_schema.AntflyType) bool {
+    return rowsExpressionTypeIsTextLike(field_type) or field_type == .numeric or field_type == .datetime or field_type == .boolean;
 }
 
 fn parseRowsAggregateFilterExpressionsAlloc(
@@ -7464,7 +7481,7 @@ fn rowsAggregateOutputType(
         .string_agg => .keyword,
         .percentile_cont, .percentile_disc => if (aggregation.percentiles.len > 0) .array else .numeric,
         .count, .sum, .avg => .numeric,
-        .min, .max => try rowsAggregateInputType(alloc, schema, aggregation),
+        .min, .max, .mode => try rowsAggregateInputType(alloc, schema, aggregation),
         .bool_or, .bool_and => .boolean,
     };
 }
@@ -7487,7 +7504,7 @@ fn rowsAggregateInputType(
 fn rowsAggregateOutputNullable(aggregation: db_mod.types.RelationalRowsAggregateSpec) bool {
     return switch (aggregation.op) {
         .count, .sum, .array_agg => false,
-        .min, .max, .avg, .percentile_cont, .percentile_disc, .string_agg, .bool_or, .bool_and => true,
+        .min, .max, .avg, .percentile_cont, .percentile_disc, .mode, .string_agg, .bool_or, .bool_and => true,
     };
 }
 
@@ -22394,6 +22411,30 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectEqual(runtime_schema.AntflyType.array, findRelationalColumn(percentile_output_columns, "amount_percentiles").?.field_type);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, findRelationalColumn(percentile_output_columns, "amount_percentiles").?.array_item_type.?);
 
+    var mode_request = try parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"modal_status\",\"op\":\"mode\",\"field\":\"status\",\"percentile_order\":\"desc\"},{\"name\":\"modal_status_key\",\"op\":\"mode\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}]}",
+        schema,
+    );
+    defer mode_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), mode_request.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.mode, mode_request.aggregations[0].op);
+    try std.testing.expectEqualStrings("status", mode_request.aggregations[0].field.?);
+    try std.testing.expectEqual(RowsQueryOrderDirection.desc, mode_request.aggregations[0].percentile_order);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.mode, mode_request.aggregations[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mode_request.aggregations[1].expression.?.kind);
+    const mode_output_columns = try rowsAggregateOutputColumnsAlloc(
+        std.testing.allocator,
+        schema,
+        mode_request.group_by,
+        mode_request.group_expressions,
+        mode_request.aggregations,
+    );
+    defer if (mode_output_columns.len > 0) std.testing.allocator.free(mode_output_columns);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, findRelationalColumn(mode_output_columns, "modal_status").?.field_type);
+    try std.testing.expect(findRelationalColumn(mode_output_columns, "modal_status").?.nullable);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, findRelationalColumn(mode_output_columns, "modal_status_key").?.field_type);
+
     var group_expression_array_request = try parseRowsAggregateRequest(
         std.testing.allocator,
         "{\"group_expressions\":[{\"as\":\"scope_parts\",\"expr\":{\"op\":\"string_to_array\",\"args\":[{\"field\":\"scope\"},{\"value\":\" \"}]}}],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"}]}",
@@ -22501,6 +22542,16 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
         std.testing.allocator,
         "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"percentile_cont\",\"field\":\"amount\",\"percentile\":0.5,\"percentile_order\":\"sideways\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"mode\",\"field\":\"metadata\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"mode\",\"field\":\"status\",\"distinct\":true}]}",
         schema,
     ));
 

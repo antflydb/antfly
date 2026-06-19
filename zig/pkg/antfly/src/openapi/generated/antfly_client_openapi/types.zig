@@ -7821,7 +7821,7 @@ pub const RowsAggregateSpec = struct {
     percentiles: ?[]const f64 = null,
     /// Maximum bounded per-group sample count for percentile_cont and percentile_disc.
     percentile_max_items: ?i64 = null,
-    /// Ordered-set sample direction for percentile_cont and percentile_disc.
+    /// Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
     percentile_order: ?[]const u8 = null,
     array_max_items: ?i64 = null,
     array_order_by: ?[]const RowsQueryOrder = null,

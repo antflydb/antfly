@@ -1891,6 +1891,7 @@ pub const RelationalRowsAggregateOp = enum {
     avg,
     percentile_cont,
     percentile_disc,
+    mode,
     array_agg,
     string_agg,
     bool_or,

@@ -9,6 +9,7 @@ class RowsAggregateSpecOp(str, Enum):
     COUNT = "count"
     MAX = "max"
     MIN = "min"
+    MODE = "mode"
     PERCENTILE_CONT = "percentile_cont"
     PERCENTILE_DISC = "percentile_disc"
     STRING_AGG = "string_agg"
