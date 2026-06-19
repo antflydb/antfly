@@ -2056,11 +2056,14 @@ pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, options);
     defer manifest.deinit(alloc);
 
-    var live_paths = std.StringHashMapUnmanaged(void).empty;
-    defer live_paths.deinit(alloc);
+    var live_names = std.StringHashMapUnmanaged(void).empty;
+    defer live_names.deinit(alloc);
     const live_path_capacity = std.math.cast(u32, manifest.segments.len) orelse return error.PostingSegmentManifestTooLarge;
-    try live_paths.ensureTotalCapacity(alloc, live_path_capacity);
-    for (manifest.segments) |entry| live_paths.putAssumeCapacity(entry.path, {});
+    try live_names.ensureTotalCapacity(alloc, live_path_capacity);
+    for (manifest.segments) |entry| {
+        const name = canonicalSegmentFileNameFromPath(entry.path) orelse continue;
+        try live_names.put(alloc, name, {});
+    }
 
     var stats = DirectoryGarbageCollectionStats{
         .manifest_segments = manifest.segments.len,
@@ -2078,19 +2081,14 @@ pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
         }
 
         stats.segment_files += 1;
-        {
-            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
-            defer alloc.free(path);
-
-            if (live_paths.contains(path)) {
-                stats.referenced_segment_files += 1;
-                continue;
-            }
-
-            stats.orphan_segment_files += 1;
-            try dir.deleteFile(io, path);
-            stats.deleted_segment_files += 1;
+        if (live_names.contains(entry.name)) {
+            stats.referenced_segment_files += 1;
+            continue;
         }
+
+        stats.orphan_segment_files += 1;
+        try postings_dir.deleteFile(io, entry.name);
+        stats.deleted_segment_files += 1;
     }
 
     return stats;
@@ -2125,12 +2123,8 @@ pub fn collectDirectoryTemporaryGarbageAlloc(alloc: Allocator, io: std.Io, dir: 
         if (is_segment_tmp) stats.segment_temp_files += 1;
         if (is_manifest_tmp) stats.manifest_temp_files += 1;
 
-        {
-            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
-            defer alloc.free(path);
-            try dir.deleteFile(io, path);
-            stats.deleted_temp_files += 1;
-        }
+        try postings_dir.deleteFile(io, entry.name);
+        stats.deleted_temp_files += 1;
     }
 
     return stats;
@@ -2415,6 +2409,15 @@ fn isCanonicalSegmentTemporaryFileName(name: []const u8) bool {
     return name.len == 25 and
         std.mem.eql(u8, name[21..], ".tmp") and
         isCanonicalSegmentFileName(name[0..21]);
+}
+
+fn canonicalSegmentFileNameFromPath(path: []const u8) ?[]const u8 {
+    if (path.len != segment_directory.len + 1 + 21) return null;
+    if (!std.mem.eql(u8, path[0..segment_directory.len], segment_directory)) return null;
+    if (path[segment_directory.len] != '/') return null;
+    const name = path[segment_directory.len + 1 ..];
+    if (!isCanonicalSegmentFileName(name)) return null;
+    return name;
 }
 
 fn manifestTemporaryFileNameAlloc(alloc: Allocator, manifest_path: []const u8) ![]u8 {
@@ -7165,6 +7168,10 @@ pub fn testDirectoryGarbageCollectionDeletesManifestOrphans() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    try std.testing.expectEqualStrings("0000000000000001.afps", canonicalSegmentFileNameFromPath("postings/0000000000000001.afps").?);
+    try std.testing.expect(canonicalSegmentFileNameFromPath("other/0000000000000001.afps") == null);
+    try std.testing.expect(canonicalSegmentFileNameFromPath("postings/not-a-segment") == null);
 
     const base_old = try posting.PostingFormat.encodeBase(alloc, .{
         .posting_id = 7,
