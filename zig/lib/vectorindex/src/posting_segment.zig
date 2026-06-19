@@ -37,6 +37,7 @@ const manifest_checksum_size: usize = 4;
 const overlay_plan_min_delta_records: usize = 8;
 const compact_sorted_delta_max_records: usize = 64;
 const compact_sorted_delta_scratch_max_records: usize = 512;
+const delta_value_live_precount_min_records: usize = 32;
 const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
 const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const base_data_batch_bulk_read_max_bytes: usize = 1024 * 1024;
@@ -783,7 +784,7 @@ pub const Catalog = struct {
                         while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
                         continue;
                     }
-                    try appendDeltaIteratorAfterGenerationAlloc(alloc, &delta_iter, generation, records);
+                    try appendDeltaValueAfterGenerationAlloc(alloc, delta_value.value, generation, records);
                 } else {
                     try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
                     while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
@@ -822,7 +823,7 @@ pub const Catalog = struct {
                         while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
                         continue;
                     }
-                    try appendDeltaIteratorAfterGenerationIntoScratchAlloc(alloc, &delta_iter, generation, scratch);
+                    try appendDeltaValueAfterGenerationIntoScratchAlloc(alloc, delta_value.value, generation, scratch);
                 } else {
                     try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
                     while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
@@ -2608,7 +2609,7 @@ const PendingDeltaBatch = struct {
         }
 
         const live = self.liveSummaryAfterGeneration(base_generation);
-        accumulatePendingDeltaLiveSummary(live, out);
+        accumulateDeltaLiveSummary(live, out);
     }
 
     fn latestRecordAfterGenerationForMember(
@@ -2667,7 +2668,7 @@ const PendingDeltaBatch = struct {
     }
 };
 
-fn accumulatePendingDeltaLiveSummary(
+fn accumulateDeltaLiveSummary(
     summary: PendingDeltaLiveSummary,
     stats: *posting.PostingDeltaTailStats,
 ) void {
@@ -3154,7 +3155,7 @@ pub const DirectoryBatchWriter = struct {
             const live = batch.liveSummaryAfterGeneration(base_generation);
             try records.ensureUnusedCapacity(alloc, live.records_after_generation);
             stats.records += batch.records.items.len;
-            accumulatePendingDeltaLiveSummary(live, &stats);
+            accumulateDeltaLiveSummary(live, &stats);
             for (batch.records.items) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 records.appendAssumeCapacity(record);
@@ -3193,7 +3194,7 @@ pub const DirectoryBatchWriter = struct {
             const live = batch.liveSummaryAfterGeneration(base_generation);
             try ensureDeltaRecordAppendCapacity(alloc, scratch, live.records_after_generation);
             stats.records += batch.records.items.len;
-            accumulatePendingDeltaLiveSummary(live, &stats);
+            accumulateDeltaLiveSummary(live, &stats);
             for (batch.records.items) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 scratch.appendDeltaRecordAssumeCapacity(record);
@@ -3468,7 +3469,7 @@ pub const DirectoryBatchWriter = struct {
                     while (try iterator.next()) |record| records.appendAssumeCapacity(record);
                     continue;
                 }
-                try appendDeltaIteratorAfterGenerationAlloc(alloc, &iterator, generation, records);
+                try appendDeltaValueAfterGenerationAlloc(alloc, entry.value, generation, records);
             } else {
                 try records.ensureUnusedCapacity(alloc, iterator.recordCount());
                 while (try iterator.next()) |record| records.appendAssumeCapacity(record);
@@ -4362,6 +4363,12 @@ fn appendDeltaValueAfterGenerationAlloc(
     records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
 ) !void {
     var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    if (iterator.recordCount() >= delta_value_live_precount_min_records) {
+        const live = try deltaValueLiveSummaryAfterGeneration(value, generation);
+        try records.ensureUnusedCapacity(alloc, live.records_after_generation);
+        try appendDeltaValueAfterGenerationAssumeCapacity(value, generation, records);
+        return;
+    }
     try appendDeltaIteratorAfterGenerationAlloc(alloc, &iterator, generation, records);
 }
 
@@ -4374,6 +4381,18 @@ fn appendDeltaIteratorAfterGenerationAlloc(
     while (try iterator.next()) |record| {
         if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
         try records.ensureUnusedCapacity(alloc, 1);
+        records.appendAssumeCapacity(record);
+    }
+}
+
+fn appendDeltaValueAfterGenerationAssumeCapacity(
+    value: []const u8,
+    generation: u64,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
         records.appendAssumeCapacity(record);
     }
 }
@@ -4405,8 +4424,16 @@ fn appendDeltaValueAfterGenerationWithStatsAlloc(
     stats: *posting.PostingDeltaTailStats,
 ) !void {
     var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-    stats.records += iterator.recordCount();
+    const record_count = iterator.recordCount();
+    stats.records += record_count;
     stats.encoded_value_bytes += value.len;
+    if (record_count >= delta_value_live_precount_min_records) {
+        const live = try deltaValueLiveSummaryAfterGeneration(value, generation);
+        try records.ensureUnusedCapacity(alloc, live.records_after_generation);
+        accumulateDeltaLiveSummary(live, stats);
+        try appendDeltaValueAfterGenerationAssumeCapacity(value, generation, records);
+        return;
+    }
     while (try iterator.next()) |record| {
         if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
         try records.ensureUnusedCapacity(alloc, 1);
@@ -4444,8 +4471,16 @@ fn appendDeltaValueAfterGenerationIntoScratchWithStatsAlloc(
     stats: *posting.PostingDeltaTailStats,
 ) !void {
     var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-    stats.records += iterator.recordCount();
+    const record_count = iterator.recordCount();
+    stats.records += record_count;
     stats.encoded_value_bytes += value.len;
+    if (record_count >= delta_value_live_precount_min_records) {
+        const live = try deltaValueLiveSummaryAfterGeneration(value, generation);
+        try ensureDeltaRecordAppendCapacity(alloc, scratch, live.records_after_generation);
+        accumulateDeltaLiveSummary(live, stats);
+        try appendDeltaValueAfterGenerationIntoScratchAssumeCapacity(value, generation, scratch);
+        return;
+    }
     while (try iterator.next()) |record| {
         if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
         try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
@@ -4456,17 +4491,48 @@ fn appendDeltaValueAfterGenerationIntoScratchWithStatsAlloc(
     }
 }
 
-fn appendDeltaIteratorAfterGenerationIntoScratchAlloc(
-    alloc: Allocator,
-    iterator: *posting.PostingFormat.DeltaTailIterator,
+fn appendDeltaValueAfterGenerationIntoScratchAssumeCapacity(
+    value: []const u8,
     generation: u64,
     scratch: anytype,
 ) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+        scratch.appendDeltaRecordAssumeCapacity(record);
+    }
+}
+
+fn appendDeltaValueAfterGenerationIntoScratchAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    generation: u64,
+    scratch: anytype,
+) !void {
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    if (iterator.recordCount() >= delta_value_live_precount_min_records) {
+        const live = try deltaValueLiveSummaryAfterGeneration(value, generation);
+        try ensureDeltaRecordAppendCapacity(alloc, scratch, live.records_after_generation);
+        try appendDeltaValueAfterGenerationIntoScratchAssumeCapacity(value, generation, scratch);
+        return;
+    }
     while (try iterator.next()) |record| {
         if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
         try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
         scratch.appendDeltaRecordAssumeCapacity(record);
     }
+}
+
+fn deltaValueLiveSummaryAfterGeneration(value: []const u8, generation: u64) !PendingDeltaLiveSummary {
+    var summary = PendingDeltaLiveSummary{};
+    var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+    while (try iterator.next()) |record| {
+        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+        summary.records_after_generation += 1;
+        if (record.op == .tombstone) summary.tombstones_after_generation += 1;
+        summary.max_sequence_after_generation = @max(summary.max_sequence_after_generation, record.sequence);
+    }
+    return summary;
 }
 
 fn accumulateDeltaValueAllRecordsStats(value: []const u8, stats: *posting.PostingDeltaTailStats) !void {
@@ -7172,6 +7238,46 @@ test "posting segment filtered delta scratch grows by live records only" {
     try std.testing.expectEqual(records[0], scratch.deltaRecords()[0]);
 }
 
+test "posting segment large filtered delta scratch pre-counts live records" {
+    const alloc = std.testing.allocator;
+    const stale_count: usize = 8;
+    const live_count: usize = delta_value_live_precount_min_records;
+    const record_count = stale_count + live_count;
+    const records = try alloc.alloc(posting.PostingDeltaRecord, record_count);
+    defer alloc.free(records);
+
+    for (records[0..stale_count], 0..) |*record, i| {
+        record.* = .{
+            .sequence = (@as(u64, 1) << 32) | @as(u64, @intCast(i + 1)),
+            .op = .insert,
+            .vector_id = @intCast(100 + i),
+        };
+    }
+    for (records[stale_count..], 0..) |*record, i| {
+        record.* = .{
+            .sequence = (@as(u64, 2) << 32) | @as(u64, @intCast(i + 1)),
+            .op = if (i == 0) .tombstone else .insert,
+            .vector_id = @intCast(200 + i),
+        };
+    }
+
+    const encoded = try posting.PostingFormat.encodeDeltaTail(alloc, records);
+    defer alloc.free(encoded);
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+    var stats = posting.PostingDeltaTailStats{};
+
+    try appendDeltaValueAfterGenerationIntoScratchWithStatsAlloc(alloc, encoded, 1, &scratch, &stats);
+
+    try std.testing.expectEqual(record_count, stats.records);
+    try std.testing.expectEqual(live_count, stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 1), stats.tombstones_after_generation);
+    try std.testing.expectEqual(records[record_count - 1].sequence, stats.max_sequence_after_generation);
+    try std.testing.expectEqual(live_count, scratch.deltaRecordCount());
+    try std.testing.expectEqual(live_count, scratch.delta_records.len);
+    try std.testing.expectEqual(records[stale_count], scratch.deltaRecords()[0]);
+}
+
 test "posting lazy latest member scan prefers newer equal-sequence segment" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8031,7 +8137,7 @@ test "posting segment pending delta batch live summary pre-counts mixed generati
 
     var stats = posting.PostingDeltaTailStats{};
     stats.records = records.len;
-    accumulatePendingDeltaLiveSummary(mixed, &stats);
+    accumulateDeltaLiveSummary(mixed, &stats);
     try std.testing.expectEqual(@as(usize, records.len), stats.records);
     try std.testing.expectEqual(@as(usize, 3), stats.records_after_generation);
     try std.testing.expectEqual(@as(usize, 1), stats.tombstones_after_generation);

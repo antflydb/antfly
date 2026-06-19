@@ -112,7 +112,10 @@ Current status:
   fold/materialization and latest-op scans, so all-live tail values do not pay a
   generation test on every decoded record. Committed segment catalog replay uses
   segment min/max delta-sequence metadata to skip all-stale segments and to take
-  the all-live append path for every delta value in fully newer segments.
+  the all-live append path for every delta value in fully newer segments. Large
+  mixed-generation encoded segment delta values now pre-count live records
+  before appending, so replay reserves exact output capacity once while small
+  mixed tails stay on the cheaper single-pass path.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
