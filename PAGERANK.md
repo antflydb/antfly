@@ -5123,9 +5123,9 @@ than PR unit coverage:
   four-family summary floor. Retained storage budgets now
   include explicit attempt-record ceilings in addition to score, metric,
   control, failure, and event records, while the cleanup invariant still
-  requires zero retained attempt records after fresh and failed cleanup. That
-  target now passes `--require-deployment-shaped-release-gate`, so the harness
-  fails before running if the invocation cannot emit
+  requires zero retained attempt records after fresh and failed cleanup. The
+  promotion recipe passes `--require-deployment-shaped-release-gate`, so the
+  harness fails before running if the invocation cannot emit
   `deployment_shaped_release_gate: true`.
   The required shape now includes the promotion workload floor, all-family
   execution, split/reopen ownership evidence, four-family coverage,
@@ -5141,11 +5141,11 @@ than PR unit coverage:
   fan-in floors, promotion failure-churn floors, and promotion operations
   floors; the config row reports the
   requested shape, while the summary row reports the observed result. The
-  promotion-budgeted target intentionally leaves local/planned wall-clock
+  promotion recipe intentionally leaves local/planned wall-clock
   latency thresholds disabled until deployment baselines exist, while cleanup
   latency is now part of the deployment-shaped promotion requirement. The
-  smoke-budgeted target keeps only loose runaway guards for local, planned, and
-  cleanup phases. The argument-forwarding harness also accepts
+  smoke recipe keeps only loose runaway guards for local, planned, and cleanup
+  phases. The argument-forwarding harness also accepts
   `--profile smoke` and `--profile promotion` for focused family or budget
   overrides. The local composed gate is
   `zig build graph-metric-distributed-release-gate`, with Make wrappers
@@ -5155,7 +5155,7 @@ than PR unit coverage:
   PR and release-prep runs can verify the narrow remote-owner contract, the
   all-family resumable/fan-in release smoke, and the fast budget surface
   together. The distributed release gate uses the same default-optimized
-  release-qualification smoke artifact as the local smoke target, while the
+  release-qualification artifact as the parameterized smoke recipe, while the
   distributed promotion gate uses the ReleaseFast promotion artifact. The
   process-owner summary emits a top-level
   `remote_owner_release_gate` plus service, direct, and failure/reclaim
@@ -5179,7 +5179,7 @@ than PR unit coverage:
   and release-qualification work explicit instead of hiding it behind
   compile-only wrapper targets.
   It is intentionally
-  smaller than the promotion-budgeted target and does not replace
+  smaller than the promotion recipe and does not replace
   deployment-scale hosted owner, fan-in, cleanup, or latency evidence. Release
   prep can use the heavier composed target
   `zig build graph-metric-distributed-promotion-gate`, with Make wrappers
