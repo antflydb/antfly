@@ -261,6 +261,33 @@
       "sql": "RESET search_path;"
     },
     {
+      "name": "app setting session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_setting"
+      },
+      "plan": "ddl:session:set_setting:setting=app.tenant_id:setting_kind=app:local=false",
+      "sql": "SET app.tenant_id = 'tenant-a';"
+    },
+    {
+      "name": "runtime setting session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_setting"
+      },
+      "plan": "ddl:session:set_setting:setting=statement_timeout:setting_kind=runtime:local=false",
+      "sql": "SET statement_timeout = '1ms';"
+    },
+    {
+      "name": "reset app setting session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "reset_setting"
+      },
+      "plan": "ddl:session:reset_setting:setting=app.tenant_id:setting_kind=app",
+      "sql": "RESET app.tenant_id;"
+    },
+    {
       "name": "reset all session catalog syntax",
       "family": "ddl",
       "summary": {
@@ -4012,10 +4039,14 @@
       "sql": "ALTER ROLE app_writer RESET statement_timeout"
     },
     {
-      "name": "unsupported role setting expression value",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=role_setting_plan",
-      "classification_reason": "role_setting_plan",
+      "name": "alter role current setting catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id:value_source=current_setting",
       "sql": "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id')"
     },
     {

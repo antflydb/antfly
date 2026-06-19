@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "7167b2085a2d9aac5f059a5d54644811395f99e27e9beb0a000c5622a1918d12",
-  "source_entry_count": 981,
-  "entry_count": 981,
+  "source_sha256": "38c758c337a413c369b74f5b1052c870a5cd7b93f125dd33703eb603dbae23a6",
+  "source_entry_count": 984,
+  "entry_count": 984,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -261,6 +261,33 @@
       },
       "plan": "ddl:session:reset_search_path",
       "sql": "RESET search_path;"
+    },
+    {
+      "name": "app setting session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_setting"
+      },
+      "plan": "ddl:session:set_setting:setting=app.tenant_id:setting_kind=app:local=false",
+      "sql": "SET app.tenant_id = 'tenant-a';"
+    },
+    {
+      "name": "runtime setting session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_setting"
+      },
+      "plan": "ddl:session:set_setting:setting=statement_timeout:setting_kind=runtime:local=false",
+      "sql": "SET statement_timeout = '1ms';"
+    },
+    {
+      "name": "reset app setting session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "reset_setting"
+      },
+      "plan": "ddl:session:reset_setting:setting=app.tenant_id:setting_kind=app",
+      "sql": "RESET app.tenant_id;"
     },
     {
       "name": "reset all session catalog syntax",
@@ -3599,10 +3626,14 @@
       "sql": "ALTER ROLE app_writer RESET statement_timeout"
     },
     {
-      "name": "unsupported role setting expression value",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=role_setting_plan",
-      "classification_reason": "role_setting_plan",
+      "name": "alter role current setting catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id:value_source=current_setting",
       "sql": "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id')"
     },
     {

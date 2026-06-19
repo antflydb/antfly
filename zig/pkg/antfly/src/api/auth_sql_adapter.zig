@@ -37,6 +37,7 @@ pub const SqlAuthTableRef = struct {
 pub const SqlAuthCatalog = struct {
     database_name: []const u8 = tables_api.default_database_name,
     search_path: []const []const u8 = &.{tables_api.default_namespace_name},
+    settings: []const catalog_resources.SqlSessionSetting = &.{},
     public_table_names: ?[]const []const u8 = null,
     tables: []const SqlAuthTableRef = &.{},
 
@@ -44,6 +45,7 @@ pub const SqlAuthCatalog = struct {
         return .{
             .current_database_name = self.database_name,
             .search_path = self.search_path,
+            .settings = self.settings,
         };
     }
 };
@@ -60,7 +62,7 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalog(
     switch (plan) {
         .authorization_catalog => |authorization_plan| switch (authorization_plan) {
             .create_role => |create| return try executeCreateRole(manager, alloc, create),
-            .alter_role => |alter| return try executeAlterRole(manager, alloc, alter),
+            .alter_role => |alter| return try executeAlterRole(manager, alloc, alter, catalog),
             .drop_role => |drop| return try executeDropRole(manager, alloc, drop),
             .grant_privilege => |grant| return try executePrivilegeChange(manager, alloc, grant, .grant, catalog),
             .revoke_privilege => |revoke| return try executePrivilegeChange(manager, alloc, revoke, .revoke, catalog),
@@ -90,15 +92,16 @@ fn executeAlterRole(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
     plan: relational_sql.AlterRolePlan,
+    catalog: SqlAuthCatalog,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const subject = try principalSubjectAlloc(manager, alloc, plan.role_name);
     defer alloc.free(subject);
     switch (plan.setting_kind) {
         .app => switch (plan.operation) {
             .set => if (plan.database_name) |database_name| {
-                try manager.setRoleDatabaseSetting(subject, database_name, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape);
+                try manager.setRoleDatabaseSetting(subject, database_name, plan.setting_name, try alterRoleSettingValue(catalog, plan));
             } else {
-                try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape);
+                try manager.setRoleSetting(subject, plan.setting_name, try alterRoleSettingValue(catalog, plan));
             },
             .reset => if (plan.database_name) |database_name| {
                 manager.removeRoleDatabaseSetting(subject, database_name, plan.setting_name) catch |err| switch (err) {
@@ -113,7 +116,7 @@ fn executeAlterRole(
             },
         },
         .runtime => switch (plan.operation) {
-            .set => try manager.setRoleRuntimeSetting(subject, plan.database_name, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape),
+            .set => try manager.setRoleRuntimeSetting(subject, plan.database_name, plan.setting_name, try alterRoleSettingValue(catalog, plan)),
             .reset => manager.removeRoleRuntimeSetting(subject, plan.database_name, plan.setting_name) catch |err| switch (err) {
                 error.RoleSettingNotFound => {},
                 else => return err,
@@ -121,6 +124,14 @@ fn executeAlterRole(
         },
     }
     return try changedRecordAlloc(alloc);
+}
+
+fn alterRoleSettingValue(catalog: SqlAuthCatalog, plan: relational_sql.AlterRolePlan) ![]const u8 {
+    const value = plan.setting_value orelse return error.UnsupportedSqlShape;
+    return switch (value) {
+        .literal => |literal| literal,
+        .current_setting => |name| catalog.session().settingValue(name) orelse return error.UnsupportedSqlShape,
+    };
 }
 
 fn executeDropRole(

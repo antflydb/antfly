@@ -5710,10 +5710,11 @@ pub const DB = struct {
         const force_artifacts = [_][]const u8{artifact_name};
         try self.batchInternal(.{
             .writes = &writes,
-            .sync_level = .full_index,
+            .sync_level = .write,
         }, null, .{
             .force_generated_artifact_names = &force_artifacts,
         });
+        try self.runUntilIdle();
         return true;
     }
 
@@ -34853,7 +34854,7 @@ fn shouldPrecomputeGeneratedRequest(
 ) !bool {
     return switch (mode) {
         .none => false,
-        .all => true,
+        .all => !try isDocumentExtractionAssetRequest(self.alloc, request),
         .full_text_only => blk: {
             if (request.kind != .chunk_text) break :blk false;
             const include_default_full_text = try chunking_types_mod.parseHasFullTextIndexFromSlice(self.alloc, request.chunker_json);
@@ -34865,6 +34866,13 @@ fn shouldPrecomputeGeneratedRequest(
             break :blk text_indexes.len > 0;
         },
     };
+}
+
+fn isDocumentExtractionAssetRequest(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    if (request.kind != .asset) return false;
+    var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
+    defer producer_cfg.deinit(alloc);
+    return producer_cfg.type == .document_extraction;
 }
 
 const VisitState = enum { unvisited, visiting, done };
@@ -36752,6 +36760,10 @@ test "dense target advance is blocked while catch-up bulk session is active" {
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
     });
     defer db.close();
 
@@ -49801,8 +49813,9 @@ test "db document extraction asset materializes unit artifacts from data url" {
             .key = "doc:a",
             .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 
@@ -49838,8 +49851,9 @@ test "db document extraction asset materializes unit artifacts from data url" {
             .key = "doc:a",
             .value = "{\"url\":\"\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, manifest_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
@@ -49897,7 +49911,12 @@ test "db document extraction routes mixed files using source metadata fields" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
     defer db.close();
 
     try db.addEnrichment(.{
@@ -49915,8 +49934,9 @@ test "db document extraction routes mixed files using source metadata fields" {
             .key = "doc:a",
             .value = "{\"url\":\"data:application/octet-stream;base64,YWxwaGEgYmV0YQ==\",\"filename\":\"notes.md\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
     defer alloc.free(manifest_key);
@@ -49944,6 +49964,10 @@ test "db document extraction stores docx section units" {
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
     });
     defer db.close();
 
@@ -49960,8 +49984,9 @@ test "db document extraction stores docx section units" {
             .key = "doc:docx",
             .value = "{\"filename\":\"report.docx\",\"mime_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\",\"url\":\"data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,UEsDBBQAAAAAAAAAAABUVz0vhwAAAIcAAAARAAAAd29yZC9kb2N1bWVudC54bWw8dzpkb2N1bWVudCB4bWxuczp3PSJ3Ij48dzpib2R5Pjx3OnA+PHc6cj48dzp0PkFscGhhIERCPC93OnQ+PC93OnI+PC93OnA+PHc6cD48dzpyPjx3OnQ+QmV0YSBEQjwvdzp0PjwvdzpyPjwvdzpwPjwvdzpib2R5Pjwvdzpkb2N1bWVudD5QSwECFAAUAAAAAAAAAAAAVFc9L4cAAACHAAAAEQAAAAAAAAAAAAAAAAAAAAAAd29yZC9kb2N1bWVudC54bWxQSwUGAAAAAAEAAQA/AAAAtgAAAAAA\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:docx", "asset", "document_units_v1");
     defer alloc.free(manifest_key);
@@ -49991,6 +50016,10 @@ test "db document extraction stores zip archive entry units" {
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
     });
     defer db.close();
 
@@ -50007,8 +50036,9 @@ test "db document extraction stores zip archive entry units" {
             .key = "doc:archive",
             .value = "{\"filename\":\"bundle.zip\",\"mime_type\":\"application/zip\",\"url\":\"data:application/zip;base64,UEsDBBQAAAAAAAAAAADxLiMkDwAAAA8AAAAPAAAAZG9jcy9yZWFkbWUudHh0QXJjaGl2ZSBEQiB0ZXh0UEsBAhQAFAAAAAAAAAAAAPEuIyQPAAAADwAAAA8AAAAAAAAAAAAAAAAAAAAAAGRvY3MvcmVhZG1lLnR4dFBLBQYAAAAAAQABAD0AAAA8AAAAAAA=\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:archive", "asset", "document_units_v1");
     defer alloc.free(manifest_key);
@@ -50039,6 +50069,10 @@ test "db document extraction stores image pending OCR unit" {
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
     });
     defer db.close();
 
@@ -50055,8 +50089,9 @@ test "db document extraction stores image pending OCR unit" {
             .key = "doc:image",
             .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:image", "asset", "document_units_v1");
     defer alloc.free(manifest_key);
@@ -50111,8 +50146,9 @@ test "db document extraction completes image OCR with reader producer" {
             .key = "doc:image-ocr",
             .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
@@ -50206,8 +50242,9 @@ test "db document extraction stores structured OCR confidence and coordinates" {
             .key = "doc:image-ocr-structured",
             .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr-structured", "document_units_v1", "image:000001");
     defer alloc.free(unit_key);
@@ -50262,8 +50299,9 @@ test "db document extraction completes audio transcription with transcriber prod
             .key = "doc:audio-transcript",
             .value = "{\"filename\":\"audio.mp3\",\"mime_type\":\"audio/mpeg\",\"url\":\"data:audio/mpeg;base64,SUQzYXVkaW8gYnl0ZXM=\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
@@ -50295,6 +50333,10 @@ test "db document extraction stores rfc822 email units" {
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
     });
     defer db.close();
 
@@ -50311,8 +50353,9 @@ test "db document extraction stores rfc822 email units" {
             .key = "doc:email",
             .value = "{\"filename\":\"message.eml\",\"mime_type\":\"message/rfc822\",\"url\":\"data:message/rfc822;base64,U3ViamVjdDogQWxwaGENCkZyb206IGFAZXhhbXBsZS50ZXN0DQoNCkhlbGxvIGVtYWls\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:email", "asset", "document_units_v1");
     defer alloc.free(manifest_key);
@@ -50349,6 +50392,10 @@ test "db document extraction stores multipart rfc822 text parts" {
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
     });
     defer db.close();
 
@@ -50365,8 +50412,9 @@ test "db document extraction stores multipart rfc822 text parts" {
             .key = "doc:multipart-email",
             .value = "{\"filename\":\"message.eml\",\"mime_type\":\"message/rfc822\",\"url\":\"data:message/rfc822;base64,U3ViamVjdDogQWxwaGENCkNvbnRlbnQtVHlwZTogbXVsdGlwYXJ0L2FsdGVybmF0aXZlOyBib3VuZGFyeT0iYjEiDQoNCi0tYjENCkNvbnRlbnQtVHlwZTogdGV4dC9wbGFpbg0KDQpQbGFpbiBib2R5DQotLWIxDQpDb250ZW50LVR5cGU6IHRleHQvaHRtbA0KDQo8cD5IVE1MIGJvZHk8L3A+DQotLWIxLS0NCg==\"}",
         }},
-        .sync_level = .enrichments,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:multipart-email", "asset", "document_units_v1");
     defer alloc.free(manifest_key);
@@ -50399,7 +50447,12 @@ test "db document extraction stores unsupported file manifest without searchable
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
     defer db.close();
 
     try db.addEnrichment(.{
@@ -50420,8 +50473,9 @@ test "db document extraction stores unsupported file manifest without searchable
             .key = "doc:bin",
             .value = "{\"url\":\"data:application/octet-stream;base64,AAEC\"}",
         }},
-        .sync_level = .full_index,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bin", "asset", "document_units_v1");
     defer alloc.free(manifest_key);
@@ -50528,10 +50582,12 @@ test "db document extraction skips stable unit local rewrites without text consu
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
+    var fake = TestAssetProducer{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = counting.interface(),
+            .asset_producer = fake.producer(),
         },
     });
     defer db.close();
@@ -50568,7 +50624,7 @@ test "db document extraction skips stable unit local rewrites without text consu
             .key = "doc:a",
             .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
         }},
-        .sync_level = .full_index,
+        .sync_level = .write,
     });
     try db.runUntilIdle();
     const first_calls = counting.calls;
@@ -50909,7 +50965,7 @@ test "db document extraction manifest inspection and reprocess API" {
             .key = "doc:a",
             .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
         }},
-        .sync_level = .full_index,
+        .sync_level = .write,
     });
     try db.runUntilIdle();
     const first_calls = counting.calls;
@@ -51013,8 +51069,9 @@ test "db document extraction manifest inspection and reprocess API" {
             .key = "doc:b",
             .value = "{\"url\":\"data:text/plain;base64,ZGVsdGEgZXBzaWxvbg==\"}",
         }},
-        .sync_level = .full_index,
+        .sync_level = .write,
     });
+    try db.runUntilIdle();
 
     var range_first = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .limit = 1 });
     defer range_first.deinit(alloc);

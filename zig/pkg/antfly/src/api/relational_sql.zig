@@ -2532,6 +2532,7 @@ pub fn executePreparedTransactionRecoveryIntent(
 pub const OwnedSqlCatalogSession = struct {
     current_database_name: []u8,
     search_path: []const []const u8,
+    settings: []const catalog_resources.SqlSessionSetting = &.{},
     transaction_local_search_path: bool = false,
 
     pub fn fromSessionAlloc(alloc: std.mem.Allocator, source_session: catalog_resources.SqlCatalogSession) !OwnedSqlCatalogSession {
@@ -2549,9 +2550,26 @@ pub const OwnedSqlCatalogSession = struct {
             search_path[i] = try alloc.dupe(u8, name);
             initialized += 1;
         }
+        var settings = try alloc.alloc(catalog_resources.SqlSessionSetting, source_session.settings.len);
+        var initialized_settings: usize = 0;
+        errdefer {
+            for (settings[0..initialized_settings]) |setting| {
+                alloc.free(@constCast(setting.name));
+                alloc.free(@constCast(setting.value));
+            }
+            if (settings.len > 0) alloc.free(settings);
+        }
+        for (source_session.settings, 0..) |setting, i| {
+            settings[i] = .{
+                .name = try alloc.dupe(u8, setting.name),
+                .value = try alloc.dupe(u8, setting.value),
+            };
+            initialized_settings += 1;
+        }
         return .{
             .current_database_name = current_database_name,
             .search_path = search_path,
+            .settings = settings,
             .transaction_local_search_path = false,
         };
     }
@@ -2560,6 +2578,7 @@ pub const OwnedSqlCatalogSession = struct {
         return .{
             .current_database_name = self.current_database_name,
             .search_path = self.search_path,
+            .settings = self.settings,
         };
     }
 
@@ -2567,9 +2586,92 @@ pub const OwnedSqlCatalogSession = struct {
         alloc.free(self.current_database_name);
         for (self.search_path) |name| alloc.free(@constCast(name));
         if (self.search_path.len > 0) alloc.free(self.search_path);
+        for (self.settings) |setting| {
+            alloc.free(@constCast(setting.name));
+            alloc.free(@constCast(setting.value));
+        }
+        if (self.settings.len > 0) alloc.free(self.settings);
         self.* = undefined;
     }
 };
+
+fn replaceSessionSettingAlloc(
+    alloc: std.mem.Allocator,
+    settings: []const catalog_resources.SqlSessionSetting,
+    name: []const u8,
+    value: []const u8,
+) ![]const catalog_resources.SqlSessionSetting {
+    var found = false;
+    for (settings) |setting| {
+        if (std.ascii.eqlIgnoreCase(setting.name, name)) {
+            found = true;
+            break;
+        }
+    }
+    const out_len = settings.len + @as(usize, @intFromBool(!found));
+    const out = try alloc.alloc(catalog_resources.SqlSessionSetting, out_len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |setting| {
+            alloc.free(@constCast(setting.name));
+            alloc.free(@constCast(setting.value));
+        }
+        alloc.free(out);
+    }
+    var wrote_new = false;
+    for (settings) |setting| {
+        if (std.ascii.eqlIgnoreCase(setting.name, name)) {
+            out[initialized] = .{
+                .name = try alloc.dupe(u8, name),
+                .value = try alloc.dupe(u8, value),
+            };
+            wrote_new = true;
+        } else {
+            out[initialized] = .{
+                .name = try alloc.dupe(u8, setting.name),
+                .value = try alloc.dupe(u8, setting.value),
+            };
+        }
+        initialized += 1;
+    }
+    if (!wrote_new) {
+        out[initialized] = .{
+            .name = try alloc.dupe(u8, name),
+            .value = try alloc.dupe(u8, value),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn removeSessionSettingAlloc(
+    alloc: std.mem.Allocator,
+    settings: []const catalog_resources.SqlSessionSetting,
+    name: []const u8,
+) ![]const catalog_resources.SqlSessionSetting {
+    var kept: usize = 0;
+    for (settings) |setting| {
+        if (!std.ascii.eqlIgnoreCase(setting.name, name)) kept += 1;
+    }
+    const out = try alloc.alloc(catalog_resources.SqlSessionSetting, kept);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |setting| {
+            alloc.free(@constCast(setting.name));
+            alloc.free(@constCast(setting.value));
+        }
+        alloc.free(out);
+    }
+    for (settings) |setting| {
+        if (std.ascii.eqlIgnoreCase(setting.name, name)) continue;
+        out[initialized] = .{
+            .name = try alloc.dupe(u8, setting.name),
+            .value = try alloc.dupe(u8, setting.value),
+        };
+        initialized += 1;
+    }
+    return out;
+}
 
 pub fn applySessionCatalogPlanAlloc(
     alloc: std.mem.Allocator,
@@ -2594,6 +2696,30 @@ pub fn applySessionCatalogPlanAlloc(
             }
             updated.search_path = search_path;
             updated.transaction_local_search_path = set.local;
+            return updated;
+        },
+        .set_setting => |set| {
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
+            errdefer updated.deinit(alloc);
+            const settings = try replaceSessionSettingAlloc(alloc, updated.settings, set.name, set.value);
+            for (updated.settings) |setting| {
+                alloc.free(@constCast(setting.name));
+                alloc.free(@constCast(setting.value));
+            }
+            if (updated.settings.len > 0) alloc.free(updated.settings);
+            updated.settings = settings;
+            return updated;
+        },
+        .reset_setting => |reset| {
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
+            errdefer updated.deinit(alloc);
+            const settings = try removeSessionSettingAlloc(alloc, updated.settings, reset.name);
+            for (updated.settings) |setting| {
+                alloc.free(@constCast(setting.name));
+                alloc.free(@constCast(setting.value));
+            }
+            if (updated.settings.len > 0) alloc.free(updated.settings);
+            updated.settings = settings;
             return updated;
         },
         .reset_search_path, .discard_all => {
@@ -3108,6 +3234,14 @@ fn expectAppliedDdlWorkActions(applied: AppliedDdlSchemaJson, expected: []const 
             .validate => try std.testing.expectEqual(AppliedDdlWorkReason.constraints, applied.work_items[i].reason),
             .rewrite => try std.testing.expectEqual(AppliedDdlWorkReason.row_images, applied.work_items[i].reason),
         }
+    }
+}
+
+fn expectAlterRoleLiteralSettingValue(expected: []const u8, value: ?AlterRolePlan.SettingValue) !void {
+    const actual = value orelse return error.TestUnexpectedResult;
+    switch (actual) {
+        .literal => |literal| try std.testing.expectEqualStrings(expected, literal),
+        .current_setting => return error.TestUnexpectedResult,
     }
 }
 
@@ -4006,6 +4140,15 @@ const Parser = struct {
                     else => return err,
                 }
             }
+            {
+                const checkpoint = self.pos;
+                if (self.parseSetSessionSettingDdl()) |plan| {
+                    return .{ .session_catalog = .{ .set_setting = plan } };
+                } else |err| switch (err) {
+                    error.UnsupportedSqlShape => self.pos = checkpoint,
+                    else => return err,
+                }
+            }
             try self.parseAdapterNoopSetStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
@@ -4017,6 +4160,15 @@ const Parser = struct {
             if (self.peekKeyword("all")) {
                 try self.parseAdapterNoopResetStatementTail();
                 return .{ .session_catalog = .discard_all };
+            }
+            {
+                const checkpoint = self.pos;
+                if (self.parseResetSessionSettingDdl()) |plan| {
+                    return .{ .session_catalog = .{ .reset_setting = plan } };
+                } else |err| switch (err) {
+                    error.UnsupportedSqlShape => self.pos = checkpoint,
+                    else => return err,
+                }
             }
             try self.parseAdapterNoopResetStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
@@ -4065,8 +4217,16 @@ const Parser = struct {
         return .{ .namespaces = namespaces, .local = syntax.local };
     }
 
+    fn parseSetSessionSettingDdl(self: *@This()) !sql_adapter.SetSessionSettingPlan {
+        return try sql_adapter.parseSetSessionSettingTailAlloc(self.alloc, self.tokens, &self.pos);
+    }
+
     fn parseAdapterNoopResetStatementTail(self: *@This()) !void {
         try sql_adapter.parseAdapterNoopResetStatementTail(self.tokens, &self.pos);
+    }
+
+    fn parseResetSessionSettingDdl(self: *@This()) !sql_adapter.ResetSessionSettingPlan {
+        return try sql_adapter.parseResetSessionSettingTailAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseResetSearchPathDdl(self: *@This()) !void {
@@ -46371,7 +46531,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(AlterRolePlan.Operation.set, alter_role_plan.operation);
     try std.testing.expectEqual(AlterRolePlan.SettingKind.app, alter_role_plan.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", alter_role_plan.setting_name);
-    try std.testing.expectEqualStrings("acme", alter_role_plan.setting_value orelse return error.TestUnexpectedResult);
+    try expectAlterRoleLiteralSettingValue("acme", alter_role_plan.setting_value);
     const alter_role_fingerprint = try ddlFingerprintAlloc(alloc, alter_role);
     defer alloc.free(alter_role_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id", alter_role_fingerprint);
@@ -46391,7 +46551,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(AlterRolePlan.Operation.set, scoped_alter_role_plan.operation);
     try std.testing.expectEqual(AlterRolePlan.SettingKind.app, scoped_alter_role_plan.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", scoped_alter_role_plan.setting_name);
-    try std.testing.expectEqualStrings("acme", scoped_alter_role_plan.setting_value orelse return error.TestUnexpectedResult);
+    try expectAlterRoleLiteralSettingValue("acme", scoped_alter_role_plan.setting_value);
     const scoped_alter_role_fingerprint = try ddlFingerprintAlloc(alloc, scoped_alter_role);
     defer alloc.free(scoped_alter_role_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=app.tenant_id", scoped_alter_role_fingerprint);
@@ -46449,7 +46609,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(AlterRolePlan.Operation.set, runtime_alter_role_plan.operation);
     try std.testing.expectEqual(AlterRolePlan.SettingKind.runtime, runtime_alter_role_plan.setting_kind);
     try std.testing.expectEqualStrings("statement_timeout", runtime_alter_role_plan.setting_name);
-    try std.testing.expectEqualStrings("1ms", runtime_alter_role_plan.setting_value orelse return error.TestUnexpectedResult);
+    try expectAlterRoleLiteralSettingValue("1ms", runtime_alter_role_plan.setting_value);
     const runtime_alter_role_fingerprint = try ddlFingerprintAlloc(alloc, runtime_alter_role);
     defer alloc.free(runtime_alter_role_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=set:setting=statement_timeout:setting_kind=runtime", runtime_alter_role_fingerprint);
@@ -46477,7 +46637,22 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(runtime_reset_role_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=reset:setting=statement_timeout:setting_kind=runtime", runtime_reset_role_fingerprint);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');"));
+    var current_setting_alter_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');");
+    defer current_setting_alter_role.deinit(alloc);
+    const current_setting_alter_role_plan = switch (current_setting_alter_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter_plan| alter_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    switch (current_setting_alter_role_plan.setting_value orelse return error.TestUnexpectedResult) {
+        .current_setting => |name| try std.testing.expectEqualStrings("app.tenant_id", name),
+        .literal => return error.TestUnexpectedResult,
+    }
+    const current_setting_alter_role_fingerprint = try ddlFingerprintAlloc(alloc, current_setting_alter_role);
+    defer alloc.free(current_setting_alter_role_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id:value_source=current_setting", current_setting_alter_role_fingerprint);
 
     var drop_role = try lowerDdlPlanAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
     defer drop_role.deinit(alloc);
@@ -47578,6 +47753,47 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(@as(usize, 1), empty_path_session.search_path.len);
     try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, empty_path_session.session().primarySearchPathNamespace());
 
+    var set_app_setting = try lowerDdlPlanAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    defer set_app_setting.deinit(alloc);
+    const set_app_setting_fingerprint = try ddlFingerprintAlloc(alloc, set_app_setting);
+    defer alloc.free(set_app_setting_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:set_setting:setting=app.tenant_id:setting_kind=app:local=false", set_app_setting_fingerprint);
+    const set_app_setting_plan = switch (set_app_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var app_setting_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_app_setting_plan);
+    defer app_setting_session.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant-a", app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    var set_runtime_setting = try lowerDdlPlanAlloc(alloc, "SET statement_timeout = '1ms';");
+    defer set_runtime_setting.deinit(alloc);
+    const set_runtime_setting_fingerprint = try ddlFingerprintAlloc(alloc, set_runtime_setting);
+    defer alloc.free(set_runtime_setting_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:set_setting:setting=statement_timeout:setting_kind=runtime:local=false", set_runtime_setting_fingerprint);
+    const set_runtime_setting_plan = switch (set_runtime_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var runtime_setting_session = try applySessionCatalogPlanAlloc(alloc, app_setting_session.session(), set_runtime_setting_plan);
+    defer runtime_setting_session.deinit(alloc);
+    try std.testing.expectEqualStrings("1ms", runtime_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("tenant-a", runtime_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    var reset_app_setting = try lowerDdlPlanAlloc(alloc, "RESET app.tenant_id;");
+    defer reset_app_setting.deinit(alloc);
+    const reset_app_setting_fingerprint = try ddlFingerprintAlloc(alloc, reset_app_setting);
+    defer alloc.free(reset_app_setting_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:reset_setting:setting=app.tenant_id:setting_kind=app", reset_app_setting_fingerprint);
+    const reset_app_setting_plan = switch (reset_app_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var reset_app_setting_session = try applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), reset_app_setting_plan);
+    defer reset_app_setting_session.deinit(alloc);
+    try std.testing.expect(reset_app_setting_session.session().settingValue("app.tenant_id") == null);
+    try std.testing.expectEqualStrings("1ms", reset_app_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+
     var reset_session = try lowerDdlPlanAlloc(alloc, "RESET ALL;");
     defer reset_session.deinit(alloc);
     const reset_session_fingerprint = try ddlFingerprintAlloc(alloc, reset_session);
@@ -47611,13 +47827,11 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET ROLE app_user;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET row_security = off;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET LOCAL lock_timeout = '5s';"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET statement_timeout = '1ms';"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET idle_in_transaction_session_timeout = '5s';"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET default_tablespace = fastspace;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET default_table_access_method = heap;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET client_encoding = 'LATIN1';"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET standard_conforming_strings = off;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "RESET statement_timeout;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET unknown_setting = 'x';"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SHOW ALL;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "DISCARD TEMP;"));
@@ -58108,6 +58322,8 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
         .adapter_noop => |plan| try adapterNoopFingerprintAlloc(alloc, "ddl", @tagName(plan.reason)),
         .session_catalog => |plan| switch (plan) {
             .set_search_path => |set| try std.fmt.allocPrint(alloc, "ddl:session:set_search_path:namespaces={d}:local={}", .{ set.namespaces.len, set.local }),
+            .set_setting => |set| try std.fmt.allocPrint(alloc, "ddl:session:set_setting:setting={s}:setting_kind={s}:local={}", .{ set.name, @tagName(set.kind), set.local }),
+            .reset_setting => |reset| try std.fmt.allocPrint(alloc, "ddl:session:reset_setting:setting={s}:setting_kind={s}", .{ reset.name, @tagName(reset.kind) }),
             .reset_search_path => try alloc.dupe(u8, "ddl:session:reset_search_path"),
             .show_search_path => try alloc.dupe(u8, "ddl:session:show_search_path"),
             .discard_all => try alloc.dupe(u8, "ddl:session:discard_all"),
@@ -58422,6 +58638,10 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 if (alter.setting_kind != .app) {
                     fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "setting_kind", @tagName(alter.setting_kind));
                 }
+                if (alter.setting_value) |setting_value| switch (setting_value) {
+                    .literal => {},
+                    .current_setting => fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "value_source", "current_setting"),
+                };
                 break :blk fingerprint;
             },
             .drop_role => |drop| try std.fmt.allocPrint(
@@ -59691,7 +59911,9 @@ fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !voi
         .adapter_noop => return error.TestUnexpectedResult,
         .session_catalog => |plan| switch (plan) {
             .set_search_path => try std.testing.expectEqual(AppParityDdlTag.set_search_path, expected),
+            .set_setting => try std.testing.expectEqual(AppParityDdlTag.set_setting, expected),
             .reset_search_path => try std.testing.expectEqual(AppParityDdlTag.reset_search_path, expected),
+            .reset_setting => try std.testing.expectEqual(AppParityDdlTag.reset_setting, expected),
             .show_search_path => try std.testing.expectEqual(AppParityDdlTag.show_search_path, expected),
             .discard_all => try std.testing.expectEqual(AppParityDdlTag.discard_all, expected),
         },

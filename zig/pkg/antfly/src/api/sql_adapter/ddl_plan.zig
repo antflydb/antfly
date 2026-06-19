@@ -31,6 +31,8 @@ pub const AdapterNoopDdlPlan = struct {
 
 pub const SessionCatalogPlan = union(enum) {
     set_search_path: SetSearchPathPlan,
+    set_setting: SetSessionSettingPlan,
+    reset_setting: ResetSessionSettingPlan,
     reset_search_path,
     show_search_path,
     discard_all,
@@ -38,6 +40,8 @@ pub const SessionCatalogPlan = union(enum) {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .set_search_path => |*plan| plan.deinit(alloc),
+            .set_setting => |*plan| plan.deinit(alloc),
+            .reset_setting => |*plan| plan.deinit(alloc),
             else => {},
         }
         self.* = undefined;
@@ -50,6 +54,34 @@ pub const SetSearchPathPlan = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeStringSlice(alloc, self.namespaces);
+        self.* = undefined;
+    }
+};
+
+pub const SessionSettingKind = enum {
+    app,
+    runtime,
+};
+
+pub const SetSessionSettingPlan = struct {
+    name: []const u8,
+    value: []const u8,
+    kind: SessionSettingKind = .app,
+    local: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
+pub const ResetSessionSettingPlan = struct {
+    name: []const u8,
+    kind: SessionSettingKind = .app,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
         self.* = undefined;
     }
 };
@@ -868,19 +900,31 @@ pub const AlterRolePlan = struct {
         app,
         runtime,
     };
+    pub const SettingValue = union(enum) {
+        literal: []const u8,
+        current_setting: []const u8,
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .literal => |value| alloc.free(value),
+                .current_setting => |name| alloc.free(name),
+            }
+            self.* = undefined;
+        }
+    };
 
     role_name: []const u8,
     database_name: ?[]const u8 = null,
     operation: Operation = .set,
     setting_kind: SettingKind = .app,
     setting_name: []const u8,
-    setting_value: ?[]const u8 = null,
+    setting_value: ?SettingValue = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.role_name);
         if (self.database_name) |database_name| alloc.free(database_name);
         alloc.free(self.setting_name);
-        if (self.setting_value) |setting_value| alloc.free(setting_value);
+        if (self.setting_value) |*setting_value| setting_value.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2548,7 +2592,7 @@ test "SQL adapter DDL function and authorization plans own strings" {
     var alter_role: AuthorizationCatalogPlan = .{ .alter_role = .{
         .role_name = try alloc.dupe(u8, "app_user"),
         .setting_name = try alloc.dupe(u8, "app.tenant_id"),
-        .setting_value = try alloc.dupe(u8, "tenant-a"),
+        .setting_value = .{ .literal = try alloc.dupe(u8, "tenant-a") },
     } };
     alter_role.deinit(alloc);
 

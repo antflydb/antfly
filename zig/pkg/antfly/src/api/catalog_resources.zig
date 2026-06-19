@@ -69,6 +69,11 @@ pub const NamespaceTarget = struct {
     namespace_name: []const u8,
 };
 
+pub const SqlSessionSetting = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub fn namespaceTargetFromOptional(
     database_name: ?[]const u8,
     namespace_name: ?[]const u8,
@@ -114,6 +119,7 @@ pub fn storageTableNameForTargetAlloc(alloc: std.mem.Allocator, target: TableTar
 pub const SqlCatalogSession = struct {
     current_database_name: []const u8 = default_database_name,
     search_path: []const []const u8 = &.{default_namespace_name},
+    settings: []const SqlSessionSetting = &.{},
 
     pub fn default() SqlCatalogSession {
         return .{};
@@ -127,6 +133,13 @@ pub const SqlCatalogSession = struct {
     pub fn currentDatabase(self: SqlCatalogSession) []const u8 {
         if (self.current_database_name.len == 0) return default_database_name;
         return self.current_database_name;
+    }
+
+    pub fn settingValue(self: SqlCatalogSession, name: []const u8) ?[]const u8 {
+        for (self.settings) |setting| {
+            if (std.ascii.eqlIgnoreCase(setting.name, name)) return setting.value;
+        }
+        return null;
     }
 
     pub fn tableTargetFromObjectName(self: SqlCatalogSession, object_name: []const u8) !TableTarget {

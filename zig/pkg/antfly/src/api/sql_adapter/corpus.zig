@@ -162,7 +162,9 @@ pub const AppParityDdlTag = enum {
     transaction_mode,
     advisory_lock,
     set_search_path,
+    set_setting,
     reset_search_path,
+    reset_setting,
     show_search_path,
     discard_all,
     create_index,
@@ -1560,7 +1562,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .prepare_statement, .execute_statement, .deallocate_statement => false,
         .declare_cursor, .fetch_cursor, .close_cursor => false,
         .savepoint_transaction, .release_savepoint, .rollback_to_savepoint => false,
-        .set_search_path, .reset_search_path, .show_search_path, .discard_all => false,
+        .set_search_path, .set_setting, .reset_search_path, .reset_setting, .show_search_path, .discard_all => false,
         .comment_metadata => true,
         .table_lock, .constraint_mode, .transaction_mode, .advisory_lock => false,
         .create_table,
@@ -1911,7 +1913,9 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .release_savepoint,
         .rollback_to_savepoint,
         .set_search_path,
+        .set_setting,
         .reset_search_path,
+        .reset_setting,
         .show_search_path,
         .discard_all,
         => expected == 0,
@@ -4041,6 +4045,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_role_alter: bool = false,
     ddl_role_alter_database_scope: bool = false,
     ddl_role_alter_reset: bool = false,
+    ddl_role_alter_current_setting: bool = false,
     ddl_role_alter_runtime_setting: bool = false,
     ddl_role_alter_runtime_reset: bool = false,
     ddl_role_drop: bool = false,
@@ -4261,7 +4266,6 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
-    unsupported_ddl_role_setting_expression: bool = false,
     unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
@@ -4604,7 +4608,10 @@ pub const AppParityCorpusCoverage = struct {
     session_set_search_path: bool = false,
     session_set_search_path_local: bool = false,
     session_set_search_path_multi_namespace: bool = false,
+    session_set_app_setting: bool = false,
+    session_set_runtime_setting: bool = false,
     session_reset_search_path: bool = false,
+    session_reset_app_setting: bool = false,
     session_show_search_path: bool = false,
     session_discard: bool = false,
     query_distinct_on: bool = false,
@@ -5504,10 +5511,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
                     std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                     std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null);
-            self.unsupported_ddl_role_setting_expression = self.unsupported_ddl_role_setting_expression or
-                (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
-                    std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
-                    std.mem.indexOf(u8, entry.sql, "current_setting") != null);
             self.unsupported_ddl_routine_function_body = self.unsupported_ddl_routine_function_body or
                 (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
@@ -5700,6 +5703,8 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_role_alter = true;
                     self.ddl_role_alter_database_scope = self.ddl_role_alter_database_scope or std.mem.indexOf(u8, entry.plan, ":database=") != null;
                     self.ddl_role_alter_reset = self.ddl_role_alter_reset or std.mem.indexOf(u8, entry.plan, ":operation=reset:") != null;
+                    self.ddl_role_alter_current_setting = self.ddl_role_alter_current_setting or
+                        std.mem.indexOf(u8, entry.plan, ":value_source=current_setting") != null;
                     self.ddl_role_alter_runtime_setting = self.ddl_role_alter_runtime_setting or
                         std.mem.indexOf(u8, entry.plan, ":setting_kind=runtime") != null and
                             std.mem.indexOf(u8, entry.plan, ":operation=set:") != null;
@@ -5967,7 +5972,15 @@ pub const AppParityCorpusCoverage = struct {
                     self.session_set_search_path_multi_namespace = self.session_set_search_path_multi_namespace or
                         (sql_adapter.planUsizeTokenValue(entry.plan, ":namespaces=") orelse 0) > 1;
                 },
+                .set_setting => {
+                    self.session_set_app_setting = self.session_set_app_setting or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":setting_kind=", "app");
+                    self.session_set_runtime_setting = self.session_set_runtime_setting or
+                        sql_adapter.planHasExactStringToken(entry.plan, ":setting_kind=", "runtime");
+                },
                 .reset_search_path => self.session_reset_search_path = true,
+                .reset_setting => self.session_reset_app_setting = self.session_reset_app_setting or
+                    sql_adapter.planHasExactStringToken(entry.plan, ":setting_kind=", "app"),
                 .show_search_path => self.session_show_search_path = true,
                 .discard_all => self.session_discard = true,
                 .create_index => {

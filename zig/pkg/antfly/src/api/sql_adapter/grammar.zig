@@ -971,13 +971,13 @@ pub const AlterRoleSyntax = struct {
     operation: ddl_plan.AlterRolePlan.Operation = .set,
     setting_kind: ddl_plan.AlterRolePlan.SettingKind = .app,
     setting_name: []const u8,
-    setting_value: ?[]const u8 = null,
+    setting_value: ?ddl_plan.AlterRolePlan.SettingValue = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.role_name));
         if (self.database_name) |database_name| alloc.free(@constCast(database_name));
         alloc.free(@constCast(self.setting_name));
-        if (self.setting_value) |setting_value| alloc.free(@constCast(setting_value));
+        if (self.setting_value) |*setting_value| setting_value.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1785,6 +1785,28 @@ pub fn parseSetSearchPathTailAlloc(alloc: std.mem.Allocator, tokens: []const Tok
     return .{ .namespaces = try namespaces.toOwnedSlice(alloc), .local = local };
 }
 
+pub fn parseSetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []const Token, pos: *usize) !ddl_plan.SetSessionSettingPlan {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const local = cursor.matchKeyword("local");
+    if (!local) _ = cursor.matchKeyword("session");
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const kind = sessionSettingKindForName(setting.text) orelse return error.UnsupportedSqlShape;
+    if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
+    const value = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    if (value.text.len == 0) return error.UnsupportedSqlShape;
+    const name_owned = try alloc.dupe(u8, setting.text);
+    errdefer alloc.free(name_owned);
+    const value_owned = try alloc.dupe(u8, value.text);
+    errdefer alloc.free(value_owned);
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{
+        .name = name_owned,
+        .value = value_owned,
+        .kind = kind,
+        .local = local,
+    };
+}
+
 pub fn parseAdapterNoopResetStatementTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchKeyword("all")) {
@@ -1795,6 +1817,16 @@ pub fn parseAdapterNoopResetStatementTail(tokens: []const Token, pos: *usize) !v
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (!adapterNoopResetSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
     try parseAdapterNoopStatementEnd(cursor);
+}
+
+pub fn parseResetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []const Token, pos: *usize) !ddl_plan.ResetSessionSettingPlan {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const kind = sessionSettingKindForName(setting.text) orelse return error.UnsupportedSqlShape;
+    const name_owned = try alloc.dupe(u8, setting.text);
+    errdefer alloc.free(name_owned);
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{ .name = name_owned, .kind = kind };
 }
 
 pub fn parseResetSearchPathTail(tokens: []const Token, pos: *usize) !void {
@@ -5254,15 +5286,24 @@ pub fn parseAlterRoleCatalogTailAlloc(
         .app
     else
         .runtime;
-    var setting_value: ?[]const u8 = null;
+    var setting_value: ?ddl_plan.AlterRolePlan.SettingValue = null;
     var value_transferred = true;
     if (operation == .set) {
         try cursor.expectToken(.eq);
-        if (cursor.atEnd() or cursor.peekKind(.semicolon) or !cursor.peekKind(.string)) return error.UnsupportedSqlShape;
-        setting_value = try alloc.dupe(u8, tokens[pos.*].text);
+        if (cursor.atEnd() or cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
+        if (cursor.matchToken(.string)) |value| {
+            setting_value = .{ .literal = try alloc.dupe(u8, value.text) };
+        } else if (cursor.matchKeyword("current_setting")) {
+            try cursor.expectToken(.lparen);
+            const source = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+            if (source.text.len == 0) return error.UnsupportedSqlShape;
+            setting_value = .{ .current_setting = try alloc.dupe(u8, source.text) };
+            try cursor.expectToken(.rparen);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
         value_transferred = false;
-        errdefer if (!value_transferred) if (setting_value) |value| alloc.free(value);
-        pos.* += 1;
+        errdefer if (!value_transferred) if (setting_value) |*value| value.deinit(alloc);
     }
     try parseAdapterNoopStatementEnd(cursor);
     role_transferred = true;
@@ -6777,6 +6818,12 @@ fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
         std.ascii.eqlIgnoreCase(setting, "client_min_messages");
 }
 
+fn sessionSettingKindForName(setting: []const u8) ?ddl_plan.SessionSettingKind {
+    if (std.mem.startsWith(u8, setting, "app.") and setting.len > "app.".len) return .app;
+    if (std.mem.eql(u8, setting, "statement_timeout") or std.mem.eql(u8, setting, "timezone")) return .runtime;
+    return null;
+}
+
 fn sqlSessionNamespaceNameValid(name: []const u8) bool {
     if (name.len == 0) return false;
     const first = name[0];
@@ -7071,6 +7118,33 @@ test "sql adapter grammar rejects semantic session changes as noops" {
     defer lexer.freeTokens(alloc, &timeout_tokens);
     var timeout_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopSetStatementTail(timeout_tokens.items, &timeout_pos));
+    timeout_pos = 0;
+    var timeout_setting = try parseSetSessionSettingTailAlloc(alloc, timeout_tokens.items, &timeout_pos);
+    defer timeout_setting.deinit(alloc);
+    try std.testing.expectEqual(timeout_tokens.items.len, timeout_pos);
+    try std.testing.expectEqual(ddl_plan.SessionSettingKind.runtime, timeout_setting.kind);
+    try std.testing.expectEqualStrings("statement_timeout", timeout_setting.name);
+    try std.testing.expectEqualStrings("1ms", timeout_setting.value);
+
+    var app_setting_tokens = try lexer.tokenizeAlloc(alloc, "LOCAL app.tenant_id = 'tenant-a';");
+    defer lexer.freeTokens(alloc, &app_setting_tokens);
+    var app_setting_pos: usize = 0;
+    var app_setting = try parseSetSessionSettingTailAlloc(alloc, app_setting_tokens.items, &app_setting_pos);
+    defer app_setting.deinit(alloc);
+    try std.testing.expectEqual(app_setting_tokens.items.len, app_setting_pos);
+    try std.testing.expectEqual(ddl_plan.SessionSettingKind.app, app_setting.kind);
+    try std.testing.expect(app_setting.local);
+    try std.testing.expectEqualStrings("app.tenant_id", app_setting.name);
+    try std.testing.expectEqualStrings("tenant-a", app_setting.value);
+
+    var reset_app_tokens = try lexer.tokenizeAlloc(alloc, "app.tenant_id;");
+    defer lexer.freeTokens(alloc, &reset_app_tokens);
+    var reset_app_pos: usize = 0;
+    var reset_app = try parseResetSessionSettingTailAlloc(alloc, reset_app_tokens.items, &reset_app_pos);
+    defer reset_app.deinit(alloc);
+    try std.testing.expectEqual(reset_app_tokens.items.len, reset_app_pos);
+    try std.testing.expectEqual(ddl_plan.SessionSettingKind.app, reset_app.kind);
+    try std.testing.expectEqualStrings("app.tenant_id", reset_app.name);
 
     var show_all_tokens = try lexer.tokenizeAlloc(alloc, "ALL;");
     defer lexer.freeTokens(alloc, &show_all_tokens);
@@ -9202,6 +9276,14 @@ test "sql adapter grammar parses view catalog tails" {
     try std.testing.expectEqualStrings("current_accounts", rename.new_view_name);
 }
 
+fn expectAlterRoleLiteralSettingValue(expected: []const u8, value: ?ddl_plan.AlterRolePlan.SettingValue) !void {
+    const actual = value orelse return error.TestUnexpectedResult;
+    switch (actual) {
+        .literal => |literal| try std.testing.expectEqualStrings(expected, literal),
+        .current_setting => return error.TestUnexpectedResult,
+    }
+}
+
 test "sql adapter grammar parses authorization catalog tails" {
     const alloc = std.testing.allocator;
 
@@ -9223,7 +9305,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, alter_role.operation);
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.app, alter_role.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", alter_role.setting_name);
-    try std.testing.expectEqualStrings("acme", alter_role.setting_value orelse return error.TestUnexpectedResult);
+    try expectAlterRoleLiteralSettingValue("acme", alter_role.setting_value);
 
     var scoped_alter_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme';");
     defer lexer.freeTokens(alloc, &scoped_alter_role_tokens);
@@ -9236,7 +9318,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, scoped_alter_role.operation);
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.app, scoped_alter_role.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", scoped_alter_role.setting_name);
-    try std.testing.expectEqualStrings("acme", scoped_alter_role.setting_value orelse return error.TestUnexpectedResult);
+    try expectAlterRoleLiteralSettingValue("acme", scoped_alter_role.setting_value);
 
     var reset_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer RESET app.tenant_id;");
     defer lexer.freeTokens(alloc, &reset_role_tokens);
@@ -9272,7 +9354,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, runtime_role_setting.operation);
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.runtime, runtime_role_setting.setting_kind);
     try std.testing.expectEqualStrings("statement_timeout", runtime_role_setting.setting_name);
-    try std.testing.expectEqualStrings("1ms", runtime_role_setting.setting_value orelse return error.TestUnexpectedResult);
+    try expectAlterRoleLiteralSettingValue("1ms", runtime_role_setting.setting_value);
 
     var runtime_reset_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer RESET statement_timeout;");
     defer lexer.freeTokens(alloc, &runtime_reset_role_tokens);
@@ -9285,10 +9367,16 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqualStrings("statement_timeout", runtime_reset_role.setting_name);
     try std.testing.expect(runtime_reset_role.setting_value == null);
 
-    var unsupported_role_value_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');");
-    defer lexer.freeTokens(alloc, &unsupported_role_value_tokens);
-    var unsupported_role_value_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterRoleCatalogTailAlloc(alloc, unsupported_role_value_tokens.items, &unsupported_role_value_pos));
+    var current_role_value_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');");
+    defer lexer.freeTokens(alloc, &current_role_value_tokens);
+    var current_role_value_pos: usize = 0;
+    var current_role_value = try parseAlterRoleCatalogTailAlloc(alloc, current_role_value_tokens.items, &current_role_value_pos);
+    defer current_role_value.deinit(alloc);
+    try std.testing.expectEqual(current_role_value_tokens.items.len, current_role_value_pos);
+    switch (current_role_value.setting_value orelse return error.TestUnexpectedResult) {
+        .current_setting => |name| try std.testing.expectEqualStrings("app.tenant_id", name),
+        .literal => return error.TestUnexpectedResult,
+    }
 
     var drop_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE IF EXISTS app_writer;");
     defer lexer.freeTokens(alloc, &drop_role_tokens);

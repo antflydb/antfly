@@ -475,6 +475,7 @@ pub const StatusSource = struct {
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_relational_sql_ddl_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_prepared_transaction_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.PreparedTransactionPlan, timestamp_ns: u64) anyerror!relational_sql.PreparedTransactionCoordinatorResult = null,
         apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_tablespace_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.TablespaceCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         set_database_tablespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, tablespace_name: ?[]const u8) anyerror!void = null,
@@ -570,12 +571,23 @@ pub const StatusSource = struct {
         }
         if (!std.mem.eql(u8, session.currentDatabase(), catalog_resources.default_database_name) or
             !std.mem.eql(u8, session.primarySearchPathNamespace(), catalog_resources.default_namespace_name) or
-            session.search_path.len > 1)
+            session.search_path.len > 1 or
+            session.settings.len > 0)
         {
             return error.UnsupportedOperation;
         }
         const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, sql);
+    }
+
+    pub fn applyPreparedTransactionPlan(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        plan: relational_sql.PreparedTransactionPlan,
+        timestamp_ns: u64,
+    ) !relational_sql.PreparedTransactionCoordinatorResult {
+        const fn_ptr = self.vtable.apply_prepared_transaction_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, plan, timestamp_ns);
     }
 
     pub fn applyDatabaseCatalogPlan(self: StatusSource, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -768,6 +780,14 @@ pub const StatusSource = struct {
                 return try applyRelationalSqlDdlOnServiceWithSession(cast(ptr), alloc, sql, session);
             }
 
+            fn applyPreparedTransactionPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.PreparedTransactionPlan, timestamp_ns: u64) anyerror!relational_sql.PreparedTransactionCoordinatorResult {
+                const svc = cast(ptr);
+                if (comptime @hasDecl(T, "applyPreparedTransactionPlan")) {
+                    return try svc.applyPreparedTransactionPlan(alloc, plan, timestamp_ns);
+                }
+                return error.UnsupportedOperation;
+            }
+
             fn applyDatabaseCatalogPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
                 return try applyDatabaseCatalogPlanOnService(cast(ptr), alloc, plan);
             }
@@ -886,6 +906,7 @@ pub const StatusSource = struct {
             .update_schema = Gen.updateSchema,
             .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
             .apply_relational_sql_ddl_with_session = Gen.applyRelationalSqlDdlWithSession,
+            .apply_prepared_transaction_plan = Gen.applyPreparedTransactionPlan,
             .apply_database_catalog_plan = Gen.applyDatabaseCatalogPlan,
             .apply_tablespace_catalog_plan = Gen.applyTablespaceCatalogPlan,
             .set_database_tablespace = Gen.setDatabaseTablespace,
@@ -2314,6 +2335,10 @@ pub const ApiHttpServer = struct {
                 applied.noop = true;
                 return applied;
             },
+            .prepared_transaction => |prepared_plan| {
+                _ = try self.source.applyPreparedTransactionPlan(self.alloc, prepared_plan, sqlDdlTimestampNs());
+                return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+            },
             else => {},
         }
 
@@ -2325,6 +2350,63 @@ pub const ApiHttpServer = struct {
             }
         }
         return try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
+    }
+
+    pub fn executeBulkSqlCopyFromStdinWithSession(
+        self: *ApiHttpServer,
+        sql: []const u8,
+        stdin_payload: []const u8,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !relational_rows_api.OwnedRowsBatchRequest {
+        var ddl_plan = try relational_sql.lowerDdlPlanAlloc(self.alloc, sql);
+        defer ddl_plan.deinit(self.alloc);
+        const bulk_plan = switch (ddl_plan) {
+            .bulk_io => |plan| plan,
+            else => return error.UnsupportedSqlShape,
+        };
+        const execution_plan = try relational_sql.bulkSqlIoExecutionPlanFromDdlPlan(bulk_plan);
+        if (execution_plan.operation != .import_rows or
+            execution_plan.native_route != .rows_batch or
+            execution_plan.stream != .stdin)
+        {
+            return error.UnsupportedSqlShape;
+        }
+
+        const target = try session.tableTargetFromObjectName(execution_plan.table_name);
+        try self.requireSqlBulkIoPermission(target, execution_plan, authenticated_identity);
+
+        const source = self.table_writes orelse return error.UnsupportedOperation;
+        const schema = try self.runtimeSchemaForCatalogRows(target);
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var rows_req = try relational_sql.bulkSqlIoImportRowsBatchFromStdinAlloc(self.alloc, schema, execution_plan, stdin_payload);
+        errdefer rows_req.deinit(self.alloc);
+
+        _ = (try source.batchCatalog(self.alloc, target, rows_req.req)) orelse return error.TableNotFound;
+        std.log.info("sql bulk io applied action={s} table={s}.{s}.{s} rows={d}", .{
+            @tagName(execution_plan.audit_action),
+            target.database_name,
+            target.namespace_name,
+            target.table_name,
+            rows_req.writes.len,
+        });
+        return rows_req;
+    }
+
+    fn requireSqlBulkIoPermission(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        plan: relational_sql.BulkSqlIoExecutionPlan,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !void {
+        if (!self.cfg.auth_enabled) return;
+        const identity = authenticated_identity orelse return error.Unauthorized;
+        const resource = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
+        defer self.alloc.free(resource);
+        if (!permissionsAllow(identity.permissions, plan.required_resource_type, resource, plan.required_permission)) {
+            return error.Forbidden;
+        }
     }
 
     const OwnedSqlAuthCatalog = struct {
@@ -2367,6 +2449,7 @@ pub const ApiHttpServer = struct {
             .value = .{
                 .database_name = session.currentDatabase(),
                 .search_path = session.search_path,
+                .settings = session.settings,
             },
         };
 
@@ -2409,6 +2492,7 @@ pub const ApiHttpServer = struct {
             .value = .{
                 .database_name = session.currentDatabase(),
                 .search_path = session.search_path,
+                .settings = session.settings,
                 .public_table_names = names[0..filled],
                 .tables = table_refs[0..filled],
             },
@@ -11690,6 +11774,10 @@ pub const ApiHttpServer = struct {
     }
 };
 
+fn sqlDdlTimestampNs() u64 {
+    return platform_time.realtimeNs();
+}
+
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(alloc);
     alloc.free(@constCast(shards));
@@ -16862,6 +16950,17 @@ test "api http server applies SQL DDL with explicit catalog session" {
     defer created_role.deinit(alloc);
     try auth.manager.addRoleToUser("alice", "role:app_reader");
 
+    var set_tenant = try server.applyRelationalSqlDdlWithSession("SET app.tenant_id = 'tenant-a';", &session);
+    defer set_tenant.deinit(alloc);
+    try std.testing.expect(set_tenant.noop);
+    try std.testing.expectEqualStrings("tenant-a", session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    var stored_tenant = try server.applyRelationalSqlDdlWithSession("ALTER ROLE app_reader SET app.tenant_id = current_setting('app.tenant_id');", &session);
+    defer stored_tenant.deinit(alloc);
+    const role_tenant = try auth.manager.getRoleSetting("role:app_reader", "app.tenant_id");
+    defer alloc.free(role_tenant);
+    try std.testing.expectEqualStrings("tenant-a", role_tenant);
+
     var set_path = try server.applyRelationalSqlDdlWithSession("SET search_path TO analytics, public;", &session);
     defer set_path.deinit(alloc);
     try std.testing.expect(set_path.noop);
@@ -16883,6 +16982,221 @@ test "api http server applies SQL DDL with explicit catalog session" {
     try std.testing.expect(set_local.noop);
     try std.testing.expectEqualStrings("public", session.search_path[0]);
     try std.testing.expect(session.transaction_local_search_path);
+}
+
+test "api http server routes prepared transaction SQL DDL to coordinator recovery" {
+    const alloc = std.testing.allocator;
+    const mem_backend = @import("../storage/mem_backend.zig");
+    const FakeSource = struct {
+        backend: *mem_backend.Backend,
+        applied: usize = 0,
+        last_pending: bool = false,
+        last_committed: bool = false,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_prepared_transaction_plan = applyPreparedTransactionPlan,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyPreparedTransactionPlan(
+            ptr: *anyopaque,
+            alloc_arg: std.mem.Allocator,
+            plan: relational_sql.PreparedTransactionPlan,
+            timestamp_ns: u64,
+        ) !relational_sql.PreparedTransactionCoordinatorResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var runtime_store = try self.backend.runtimeStore(alloc_arg, .{ .name = "sql-prepared-txn-server" });
+            defer runtime_store.deinit();
+            const result = try relational_sql.executePreparedTransactionRecoveryPlan(alloc_arg, &runtime_store, plan, timestamp_ns);
+            self.applied += 1;
+            self.last_pending = result.status == .pending;
+            self.last_committed = result.status == .committed;
+            return result;
+        }
+    };
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var source = FakeSource{ .backend = &backend };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var prepared = try server.applyRelationalSqlDdlWithSession("PREPARE TRANSACTION 'usage_batch';", &session);
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), source.applied);
+    try std.testing.expect(source.last_pending);
+
+    var committed = try server.applyRelationalSqlDdlWithSession("COMMIT PREPARED 'usage_batch';", &session);
+    defer committed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), source.applied);
+    try std.testing.expect(source.last_committed);
+
+    try std.testing.expectError(
+        error.PreparedTransactionDecisionConflict,
+        server.applyRelationalSqlDdlWithSession("ROLLBACK PREPARED 'usage_batch';", &session),
+    );
+}
+
+test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 91,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 91, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 17,
+                    .name = "events",
+                    .database_name = "tenant_ops",
+                    .namespace_name = "analytics",
+                    .schema_json = schema_json,
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const FakeWrites = struct {
+        calls: usize = 0,
+        first_row_json: []u8 = &.{},
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.first_row_json.len > 0) allocator.free(self.first_row_json);
+        }
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .batch_catalog = batchCatalog,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn batchCatalog(ptr: *anyopaque, allocator: std.mem.Allocator, target: catalog_resources.TableTarget, req: db_mod.types.BatchRequest) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("events", target.table_name);
+            try std.testing.expectEqual(@as(usize, 2), req.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), req.deletes.len);
+            if (self.first_row_json.len > 0) allocator.free(self.first_row_json);
+            self.first_row_json = try allocator.dupe(u8, req.writes[0].value);
+            self.calls += 1;
+            return {};
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    defer writes.deinit(alloc);
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .auth_enabled = true },
+        source.iface(),
+        null,
+        writes.source(),
+    );
+    const analytics_path = [_][]const u8{"analytics"};
+    const session: catalog_resources.SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = analytics_path[0..],
+    };
+
+    try std.testing.expectError(
+        error.Unauthorized,
+        server.executeBulkSqlCopyFromStdinWithSession(
+            "COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);",
+            "id,status\nu1,Ready\nu2,Done\n",
+            session,
+            null,
+        ),
+    );
+
+    var write_permission = try usermgr.Permission.initOwned(alloc, .table, "tenant_ops.analytics.events", .write);
+    errdefer write_permission.deinit(alloc);
+    const permissions = try alloc.alloc(usermgr.Permission, 1);
+    errdefer alloc.free(permissions);
+    permissions[0] = write_permission;
+    const username = try alloc.dupe(u8, "alice");
+    errdefer alloc.free(username);
+    var identity = AuthenticatedIdentity{
+        .username = username,
+        .permissions = permissions,
+    };
+    defer identity.deinit(alloc);
+
+    var copied = try server.executeBulkSqlCopyFromStdinWithSession(
+        "COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);",
+        "id,status\nu1,Ready\nu2,Done\n",
+        session,
+        &identity,
+    );
+    defer copied.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), writes.calls);
+    try std.testing.expectEqual(@as(usize, 2), copied.writes.len);
+    var first_row = try std.json.parseFromSlice(std.json.Value, alloc, writes.first_row_json, .{});
+    defer first_row.deinit();
+    try std.testing.expectEqualStrings("u1", first_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("Ready", first_row.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("ready", first_row.value.object.get("status_key").?.string);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        server.executeBulkSqlCopyFromStdinWithSession(
+            "COPY events TO STDOUT WITH (FORMAT csv);",
+            "",
+            session,
+            &identity,
+        ),
+    );
 }
 
 test "api http server serves api key and row filter routes" {

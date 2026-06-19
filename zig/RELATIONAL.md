@@ -5006,9 +5006,12 @@ optional database scope, so PostgreSQL GUC-style defaults do not contaminate the
 `app.*` row-security setting store. If inherited roles
 define the same native app setting with different values, effective-setting
 resolution fails closed; a direct user setting for the same key is an explicit
-override. Unsupported role-setting forms such as expression-valued defaults
-still fail closed until they have explicit native semantics; the source parity
-corpus pins that remaining expression case under `role_setting_plan`.
+override. Session `SET app.<key> = ...`, `SET statement_timeout = ...`, and
+matching `RESET app.<key>` lower to typed session catalog plans, and
+`ALTER ROLE ... SET app.<key> = current_setting('app.<key>')` stores the current
+typed session value through the same auth execution boundary. Arbitrary
+expression-valued role defaults still fail closed until they have explicit
+native semantics.
 
 `COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
 to typed bulk import/export intent that captures table identity, selected
@@ -5033,16 +5036,19 @@ the row-batch import surface; `COPY TO STDOUT` requires a read permission,
 audits as `copy_to`, and routes to the row-query export surface. The bridge also
 marks both directions as requiring an external SQL protocol stream so the SQL
 text cannot masquerade as payload. `COPY FROM STDIN` has an initial native CSV
-executor that converts the supplied stream into the row-batch API. The decoder
-keeps per-field quote metadata, so default CSV `NULL ''` handling distinguishes
-unquoted empty fields from quoted empty strings and `FORCE_NULL`/`FORCE_NOT_NULL`
-follow PostgreSQL CSV semantics before row JSON reaches typed schema validation.
-The remaining production layer is the broader streaming executor contract
-around that decoder: chunked protocol backpressure, defaults, generated columns,
-checks, unique/FK participants, row-policy/authorization checks, 2PC staging,
-retryable range routing, deterministic reject-limit accounting, and export
-encoding of query snapshots. PostgreSQL `COPY` syntax is therefore an adapter
-frontend for those
+executor that converts the supplied stream into the row-batch API, and
+`ApiHttpServer.executeBulkSqlCopyFromStdinWithSession` resolves the SQL target
+through the current catalog session, checks the concrete table write permission,
+loads the relational schema for typed default/generated/check validation, and
+dispatches the resulting rows through the catalog-aware row-batch write source.
+The decoder keeps per-field quote metadata, so default CSV `NULL ''` handling
+distinguishes unquoted empty fields from quoted empty strings and
+`FORCE_NULL`/`FORCE_NOT_NULL` follow PostgreSQL CSV semantics before row JSON
+reaches typed schema validation. The remaining production layer is the broader
+streaming executor contract around that path: chunked protocol backpressure,
+row-policy checks, 2PC staging, retryable range routing, deterministic
+reject-limit accounting, and export encoding of query snapshots. PostgreSQL
+`COPY` syntax is therefore an adapter frontend for those
 contracts, but it must not bypass row-batch, mutation-source, or routed read
 semantics. Until server-file, `PROGRAM`, alternate stream endpoints, binary
 format, legacy OID options, and broader row-filtered `COPY FROM ... WHERE`
