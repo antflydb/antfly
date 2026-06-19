@@ -8771,15 +8771,36 @@ pub const ApiHttpServer = struct {
         sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
         field: []const u8,
     ) ![]const []const u8 {
-        var names = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer names.deinit(alloc);
+        var matched_name: ?[]const u8 = null;
         for (sidecars) |sidecar| {
             if (sidecar.binding.sidecar_kind != .text) continue;
             if (!stringSliceContains(sidecar.binding.column_bindings, field)) continue;
-            if (stringSliceContains(names.items, sidecar.name)) continue;
-            try names.append(alloc, sidecar.name);
+            if (matched_name != null) return error.AmbiguousLakeSidecarCandidateSource;
+            matched_name = sidecar.name;
         }
-        return try names.toOwnedSlice(alloc);
+        const name = matched_name orelse return try alloc.alloc([]const u8, 0);
+        const names = try alloc.alloc([]const u8, 1);
+        names[0] = name;
+        return names;
+    }
+
+    fn lakeSidecarCandidatePlanningErrorResponse(
+        self: *ApiHttpServer,
+        err: anyerror,
+    ) !http_common.HttpResponse {
+        return switch (err) {
+            error.InvalidLakeSidecarCandidateRequest,
+            error.MissingLakeSidecarCandidateSource,
+            error.AmbiguousLakeSidecarCandidateSource,
+            error.InvalidSidecarRowRefKey,
+            => try textResponse(self.alloc, 400, "invalid lake sidecar candidate request"),
+            error.StaleLakeSidecar,
+            error.SidecarSourceBindingMismatch,
+            => try textResponse(self.alloc, 409, "lake sidecar snapshot mismatch"),
+            error.UnsupportedLakeSidecarCandidateSource,
+            => try textResponse(self.alloc, 501, "lake sidecar candidate unavailable"),
+            else => err,
+        };
     }
 
     fn appendOwnedCandidateSetsIntersectingDuplicatesAlloc(
@@ -8989,7 +9010,7 @@ pub const ApiHttpServer = struct {
         var sidecar_request_context = self.externalLakeSidecarContextForRowsExplainAlloc(schema, body, authenticated_identity, table_name) catch |err| switch (err) {
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows explain request"),
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
-            else => return err,
+            else => return try self.lakeSidecarCandidatePlanningErrorResponse(err),
         };
         defer sidecar_request_context.deinit(self.alloc);
         var lake_source = self.openPublicExternalLakeRowsSourceWithOptionsAlloc(
@@ -9261,7 +9282,7 @@ pub const ApiHttpServer = struct {
         defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
         var sidecar_context = if (schema.external_base_source != null)
-            try self.externalLakeSidecarContextForRowsQueryAlloc(plan.query)
+            self.externalLakeSidecarContextForRowsQueryAlloc(plan.query) catch |err| return try self.lakeSidecarCandidatePlanningErrorResponse(err)
         else
             OwnedExternalLakeSidecarRequestContext{ .base = self.cfg.external_lake_sidecar_context };
         defer sidecar_context.deinit(self.alloc);
@@ -9322,7 +9343,7 @@ pub const ApiHttpServer = struct {
         defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
         var sidecar_context = if (schema.external_base_source != null)
-            try self.externalLakeSidecarContextForRowsAggregateAlloc(plan.aggregate)
+            self.externalLakeSidecarContextForRowsAggregateAlloc(plan.aggregate) catch |err| return try self.lakeSidecarCandidatePlanningErrorResponse(err)
         else
             OwnedExternalLakeSidecarRequestContext{ .base = self.cfg.external_lake_sidecar_context };
         defer sidecar_context.deinit(self.alloc);
@@ -19516,6 +19537,93 @@ test "api http server executes public relational row plan endpoints" {
     try std.testing.expectEqual(@as(u16, 403), unsupported_mutation_resp.status);
 }
 
+test "api http server lake text candidate planning rejects ambiguous field sidecars" {
+    const alloc = std.testing.allocator;
+    const description_columns = [_][]const u8{"description"};
+    const category_columns = [_][]const u8{"category"};
+    const base_binding = lake_source_binding_api.Binding{
+        .sidecar_kind = .text,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "snapshot-1",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = description_columns[0..],
+        .index_config_hash = "sha256:text-simple",
+    };
+    const sidecars = [_]lake_sidecar_manifest.DeclaredArtifact{
+        .{
+            .name = "events.description.simple",
+            .binding = base_binding,
+            .artifact = .{
+                .kind = .text_segment,
+                .name = "events.description.simple",
+                .artifact_id = "artifact:text-simple",
+                .byte_len = 1,
+                .checksum = "sha256:text-simple",
+            },
+        },
+        .{
+            .name = "events.category.simple",
+            .binding = .{
+                .sidecar_kind = .text,
+                .source_kind = .external_parquet,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "snapshot-1",
+                .schema_fingerprint = "schema-v1",
+                .column_bindings = category_columns[0..],
+                .index_config_hash = "sha256:text-category",
+            },
+            .artifact = .{
+                .kind = .text_segment,
+                .name = "events.category.simple",
+                .artifact_id = "artifact:text-category",
+                .byte_len = 1,
+                .checksum = "sha256:text-category",
+            },
+        },
+        .{
+            .name = "events.description.keyword",
+            .binding = .{
+                .sidecar_kind = .text,
+                .source_kind = .external_parquet,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "snapshot-1",
+                .schema_fingerprint = "schema-v1",
+                .column_bindings = description_columns[0..],
+                .index_config_hash = "sha256:text-keyword",
+            },
+            .artifact = .{
+                .kind = .text_segment,
+                .name = "events.description.keyword",
+                .artifact_id = "artifact:text-keyword",
+                .byte_len = 1,
+                .checksum = "sha256:text-keyword",
+            },
+        },
+    };
+
+    const category_plan = (try ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
+        alloc,
+        sidecars[0..],
+        .{ .field = "category", .pattern = "news" },
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(category_plan.sidecar_names.?);
+    try std.testing.expectEqual(@as(usize, 1), category_plan.sidecar_names.?.len);
+    try std.testing.expectEqualStrings("events.category.simple", category_plan.sidecar_names.?[0]);
+
+    try std.testing.expectError(
+        error.AmbiguousLakeSidecarCandidateSource,
+        ApiHttpServer.textSidecarCandidatePlanForRowsTextPatternAlloc(
+            alloc,
+            sidecars[0..],
+            .{ .field = "description", .pattern = "beta" },
+        ),
+    );
+}
+
 test "api http server routes public external lake row queries through configured resolver" {
     const alloc = std.testing.allocator;
     const object_storage_api = @import("../storage/object_storage.zig");
@@ -19726,10 +19834,11 @@ test "api http server routes public external lake row queries through configured
         &[_][]const u8{"category"},
         "sha256:text-category",
     );
+    var category_sidecar_source = try external_rowsource.BatchSource.init(external_binding, &sidecar_batches);
     var category_sidecar = try lake_sidecar_text_build.publishTextSidecarFromRowSourceAlloc(
         alloc,
         &artifact_store,
-        sidecar_source.rowSource(),
+        category_sidecar_source.rowSource(),
         category_binding,
         .{
             .name = "events.category.text",
