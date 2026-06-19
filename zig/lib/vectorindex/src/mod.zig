@@ -207,6 +207,10 @@ test "posting segment skips sorting ordered pending entries" {
     try posting_segment.testSortPendingEntriesIfNeededSkipsOrderedInput();
 }
 
+test "posting segment skips sorting ordered batch point reads" {
+    try posting_segment.testSortBatchPointValueReadsIfNeededSkipsOrderedInput();
+}
+
 test "posting segment validates footer and version" {
     try posting_segment.testValidatesFooterAndVersion();
 }

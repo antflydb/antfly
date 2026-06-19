@@ -3878,6 +3878,16 @@ fn batchPointValueReadLess(_: void, lhs: BatchPointValueRead, rhs: BatchPointVal
     return lhs.found.offset < rhs.found.offset;
 }
 
+fn sortBatchPointValueReadsIfNeeded(reads: []BatchPointValueRead) void {
+    var index: usize = 1;
+    while (index < reads.len) : (index += 1) {
+        if (batchPointValueReadLess({}, reads[index], reads[index - 1])) {
+            std.mem.sort(BatchPointValueRead, reads, {}, batchPointValueReadLess);
+            return;
+        }
+    }
+}
+
 fn readSegmentBatchPointValuesAlloc(
     alloc: Allocator,
     io: std.Io,
@@ -3887,7 +3897,7 @@ fn readSegmentBatchPointValuesAlloc(
     out: []?[]u8,
 ) !void {
     if (reads.len == 0) return;
-    std.mem.sort(BatchPointValueRead, reads, {}, batchPointValueReadLess);
+    sortBatchPointValueReadsIfNeeded(reads);
 
     const file = try dir.openFile(io, entry.path, .{});
     defer file.close(io);
@@ -5096,6 +5106,34 @@ pub fn testSortPendingEntriesIfNeededSkipsOrderedInput() !void {
     try std.testing.expectEqual(EntryKind.delta, unordered[1].kind);
     try std.testing.expectEqual(@as(u64, 7), unordered[1].sequence);
     try std.testing.expectEqual(@as(PostingId, 2), unordered[2].posting_id);
+}
+
+pub fn testSortBatchPointValueReadsIfNeededSkipsOrderedInput() !void {
+    var ordered = [_]BatchPointValueRead{
+        .{ .output_index = 1, .found = .{ .posting_id = 1, .kind = .base, .sequence = 0, .offset = 8, .len = 2, .value_checksum = 0 } },
+        .{ .output_index = 3, .found = .{ .posting_id = 3, .kind = .base, .sequence = 0, .offset = 16, .len = 2, .value_checksum = 0 } },
+        .{ .output_index = 4, .found = .{ .posting_id = 4, .kind = .base, .sequence = 0, .offset = 16, .len = 2, .value_checksum = 0 } },
+    };
+    sortBatchPointValueReadsIfNeeded(&ordered);
+    try std.testing.expectEqual(@as(usize, 8), ordered[0].found.offset);
+    try std.testing.expectEqual(@as(usize, 1), ordered[0].output_index);
+    try std.testing.expectEqual(@as(usize, 16), ordered[1].found.offset);
+    try std.testing.expectEqual(@as(usize, 3), ordered[1].output_index);
+    try std.testing.expectEqual(@as(usize, 16), ordered[2].found.offset);
+    try std.testing.expectEqual(@as(usize, 4), ordered[2].output_index);
+
+    var unordered = [_]BatchPointValueRead{
+        .{ .output_index = 4, .found = .{ .posting_id = 4, .kind = .base, .sequence = 0, .offset = 16, .len = 2, .value_checksum = 0 } },
+        .{ .output_index = 1, .found = .{ .posting_id = 1, .kind = .base, .sequence = 0, .offset = 8, .len = 2, .value_checksum = 0 } },
+        .{ .output_index = 3, .found = .{ .posting_id = 3, .kind = .base, .sequence = 0, .offset = 16, .len = 2, .value_checksum = 0 } },
+    };
+    sortBatchPointValueReadsIfNeeded(&unordered);
+    try std.testing.expectEqual(@as(usize, 8), unordered[0].found.offset);
+    try std.testing.expectEqual(@as(usize, 1), unordered[0].output_index);
+    try std.testing.expectEqual(@as(usize, 16), unordered[1].found.offset);
+    try std.testing.expectEqual(@as(usize, 3), unordered[1].output_index);
+    try std.testing.expectEqual(@as(usize, 16), unordered[2].found.offset);
+    try std.testing.expectEqual(@as(usize, 4), unordered[2].output_index);
 }
 
 pub fn testValidatesFooterAndVersion() !void {
@@ -7629,6 +7667,10 @@ test "posting segment rejects duplicate logical entries" {
 
 test "posting segment skips sorting ordered pending entries" {
     try testSortPendingEntriesIfNeededSkipsOrderedInput();
+}
+
+test "posting segment skips sorting ordered batch point reads" {
+    try testSortBatchPointValueReadsIfNeededSkipsOrderedInput();
 }
 
 test "posting segment validates footer and version" {
