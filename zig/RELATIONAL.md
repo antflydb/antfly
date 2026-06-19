@@ -1209,7 +1209,8 @@ authorization catalog grammar for `CREATE ROLE`, `ALTER ROLE ... SET`,
 logical-replication catalog grammar for `CREATE PUBLICATION`,
 `ALTER PUBLICATION ... ADD TABLE`, `DROP PUBLICATION`,
 `CREATE SUBSCRIPTION`, `ALTER SUBSCRIPTION ENABLE/DISABLE`, and
-`DROP SUBSCRIPTION`,
+`DROP SUBSCRIPTION`, including table-list/all-tables publications,
+multi-publication subscriptions, enable/disable state, and idempotent drops,
 type-system catalog grammar for collation, operator, aggregate, and cast
 create/drop/rename forms,
 routine catalog grammar for `CREATE FUNCTION`, `CREATE PROCEDURE`,

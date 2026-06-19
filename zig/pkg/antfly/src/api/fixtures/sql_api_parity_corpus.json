@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "68e4877c0841d0d063a47f7b794d7d832851c42725ee4a4d5047a59933a2c30a",
-  "source_entry_count": 933,
-  "entry_count": 933,
+  "source_sha256": "ab9d82409116c9f84d35c04fa2dbe16c10688f5e953401c9694f6f376cb40d10",
+  "source_entry_count": 938,
+  "entry_count": 938,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -753,6 +753,17 @@
       "sql": "CREATE PUBLICATION usage_pub FOR TABLE usage_records"
     },
     {
+      "name": "create publication all tables catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_publication",
+        "table_name": "usage_pub_all",
+        "operations": 0
+      },
+      "plan": "ddl:create_publication:publication=usage_pub_all:tables=0:all=true",
+      "sql": "CREATE PUBLICATION usage_pub_all FOR ALL TABLES"
+    },
+    {
       "name": "alter publication catalog ddl",
       "family": "ddl",
       "summary": {
@@ -774,6 +785,16 @@
       "sql": "DROP PUBLICATION usage_pub"
     },
     {
+      "name": "drop publication idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_publication",
+        "table_name": "usage_pub"
+      },
+      "plan": "ddl:drop_publication:publication=usage_pub:if_exists=true",
+      "sql": "DROP PUBLICATION IF EXISTS usage_pub"
+    },
+    {
       "name": "create subscription catalog ddl",
       "family": "ddl",
       "summary": {
@@ -783,6 +804,17 @@
       },
       "plan": "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1",
       "sql": "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub"
+    },
+    {
+      "name": "create subscription multi-publication catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_subscription",
+        "table_name": "usage_sub_multi",
+        "operations": 2
+      },
+      "plan": "ddl:create_subscription:subscription=usage_sub_multi:connection=true:publications=2",
+      "sql": "CREATE SUBSCRIPTION usage_sub_multi CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub, usage_audit_pub"
     },
     {
       "name": "alter subscription catalog ddl",
@@ -795,6 +827,16 @@
       "sql": "ALTER SUBSCRIPTION usage_sub DISABLE"
     },
     {
+      "name": "alter subscription enable catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_subscription",
+        "table_name": "usage_sub"
+      },
+      "plan": "ddl:alter_subscription:subscription=usage_sub:enabled=true",
+      "sql": "ALTER SUBSCRIPTION usage_sub ENABLE"
+    },
+    {
       "name": "drop subscription catalog ddl",
       "family": "ddl",
       "summary": {
@@ -803,6 +845,16 @@
       },
       "plan": "ddl:drop_subscription:subscription=usage_sub:if_exists=false",
       "sql": "DROP SUBSCRIPTION usage_sub"
+    },
+    {
+      "name": "drop subscription idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_subscription",
+        "table_name": "usage_sub"
+      },
+      "plan": "ddl:drop_subscription:subscription=usage_sub:if_exists=true",
+      "sql": "DROP SUBSCRIPTION IF EXISTS usage_sub"
     },
     {
       "name": "listen notification channel catalog ddl",

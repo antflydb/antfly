@@ -747,6 +747,17 @@
       "sql": "CREATE PUBLICATION usage_pub FOR TABLE usage_records"
     },
     {
+      "name": "create publication all tables catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_publication",
+        "table_name": "usage_pub_all",
+        "operations": 0
+      },
+      "plan": "ddl:create_publication:publication=usage_pub_all:tables=0:all=true",
+      "sql": "CREATE PUBLICATION usage_pub_all FOR ALL TABLES"
+    },
+    {
       "name": "alter publication catalog ddl",
       "family": "ddl",
       "summary": {
@@ -768,6 +779,16 @@
       "sql": "DROP PUBLICATION usage_pub"
     },
     {
+      "name": "drop publication idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_publication",
+        "table_name": "usage_pub"
+      },
+      "plan": "ddl:drop_publication:publication=usage_pub:if_exists=true",
+      "sql": "DROP PUBLICATION IF EXISTS usage_pub"
+    },
+    {
       "name": "create subscription catalog ddl",
       "family": "ddl",
       "summary": {
@@ -777,6 +798,17 @@
       },
       "plan": "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1",
       "sql": "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub"
+    },
+    {
+      "name": "create subscription multi-publication catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_subscription",
+        "table_name": "usage_sub_multi",
+        "operations": 2
+      },
+      "plan": "ddl:create_subscription:subscription=usage_sub_multi:connection=true:publications=2",
+      "sql": "CREATE SUBSCRIPTION usage_sub_multi CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub, usage_audit_pub"
     },
     {
       "name": "alter subscription catalog ddl",
@@ -789,6 +821,16 @@
       "sql": "ALTER SUBSCRIPTION usage_sub DISABLE"
     },
     {
+      "name": "alter subscription enable catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_subscription",
+        "table_name": "usage_sub"
+      },
+      "plan": "ddl:alter_subscription:subscription=usage_sub:enabled=true",
+      "sql": "ALTER SUBSCRIPTION usage_sub ENABLE"
+    },
+    {
       "name": "drop subscription catalog ddl",
       "family": "ddl",
       "summary": {
@@ -797,6 +839,16 @@
       },
       "plan": "ddl:drop_subscription:subscription=usage_sub:if_exists=false",
       "sql": "DROP SUBSCRIPTION usage_sub"
+    },
+    {
+      "name": "drop subscription idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_subscription",
+        "table_name": "usage_sub"
+      },
+      "plan": "ddl:drop_subscription:subscription=usage_sub:if_exists=true",
+      "sql": "DROP SUBSCRIPTION IF EXISTS usage_sub"
     },
     {
       "name": "listen notification channel catalog ddl",

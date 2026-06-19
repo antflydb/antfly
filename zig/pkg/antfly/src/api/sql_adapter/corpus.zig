@@ -3945,11 +3945,19 @@ pub const AppParityCorpusCoverage = struct {
     ddl_notification_notify: bool = false,
     ddl_notification_unlisten: bool = false,
     ddl_publication_create: bool = false,
+    ddl_publication_create_all_tables: bool = false,
+    ddl_publication_create_table_list: bool = false,
     ddl_publication_alter: bool = false,
+    ddl_publication_alter_add_table: bool = false,
     ddl_publication_drop: bool = false,
+    ddl_publication_drop_if_exists: bool = false,
     ddl_subscription_create: bool = false,
+    ddl_subscription_create_multi_publication: bool = false,
     ddl_subscription_alter: bool = false,
+    ddl_subscription_alter_enable: bool = false,
+    ddl_subscription_alter_disable: bool = false,
     ddl_subscription_drop: bool = false,
+    ddl_subscription_drop_if_exists: bool = false,
     ddl_collation_create: bool = false,
     ddl_collation_rename: bool = false,
     ddl_collation_drop: bool = false,
@@ -5533,12 +5541,33 @@ pub const AppParityCorpusCoverage = struct {
                 .listen_notification => self.ddl_notification_listen = true,
                 .notify_notification => self.ddl_notification_notify = true,
                 .unlisten_notification => self.ddl_notification_unlisten = true,
-                .create_publication => self.ddl_publication_create = true,
-                .alter_publication => self.ddl_publication_alter = true,
-                .drop_publication => self.ddl_publication_drop = true,
-                .create_subscription => self.ddl_subscription_create = true,
-                .alter_subscription => self.ddl_subscription_alter = true,
-                .drop_subscription => self.ddl_subscription_drop = true,
+                .create_publication => {
+                    self.ddl_publication_create = true;
+                    self.ddl_publication_create_all_tables = self.ddl_publication_create_all_tables or sql_adapter.planHasExactBoolToken(entry.plan, ":all=", true);
+                    self.ddl_publication_create_table_list = self.ddl_publication_create_table_list or sql_adapter.planHasNonZeroToken(entry.plan, ":tables=");
+                },
+                .alter_publication => {
+                    self.ddl_publication_alter = true;
+                    self.ddl_publication_alter_add_table = self.ddl_publication_alter_add_table or sql_adapter.planHasNonZeroToken(entry.plan, ":add_tables=");
+                },
+                .drop_publication => {
+                    self.ddl_publication_drop = true;
+                    self.ddl_publication_drop_if_exists = self.ddl_publication_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
+                },
+                .create_subscription => {
+                    self.ddl_subscription_create = true;
+                    self.ddl_subscription_create_multi_publication = self.ddl_subscription_create_multi_publication or
+                        sql_adapter.planHasExactUsizeToken(entry.plan, ":publications=", 2);
+                },
+                .alter_subscription => {
+                    self.ddl_subscription_alter = true;
+                    self.ddl_subscription_alter_enable = self.ddl_subscription_alter_enable or sql_adapter.planHasExactBoolToken(entry.plan, ":enabled=", true);
+                    self.ddl_subscription_alter_disable = self.ddl_subscription_alter_disable or sql_adapter.planHasExactBoolToken(entry.plan, ":enabled=", false);
+                },
+                .drop_subscription => {
+                    self.ddl_subscription_drop = true;
+                    self.ddl_subscription_drop_if_exists = self.ddl_subscription_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
+                },
                 .create_collation => self.ddl_collation_create = true,
                 .rename_collation => self.ddl_collation_rename = true,
                 .drop_collation => self.ddl_collation_drop = true,
@@ -6342,11 +6371,19 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_notification_notify);
         try std.testing.expect(self.ddl_notification_unlisten);
         try std.testing.expect(self.ddl_publication_create);
+        try std.testing.expect(self.ddl_publication_create_all_tables);
+        try std.testing.expect(self.ddl_publication_create_table_list);
         try std.testing.expect(self.ddl_publication_alter);
+        try std.testing.expect(self.ddl_publication_alter_add_table);
         try std.testing.expect(self.ddl_publication_drop);
+        try std.testing.expect(self.ddl_publication_drop_if_exists);
         try std.testing.expect(self.ddl_subscription_create);
+        try std.testing.expect(self.ddl_subscription_create_multi_publication);
         try std.testing.expect(self.ddl_subscription_alter);
+        try std.testing.expect(self.ddl_subscription_alter_enable);
+        try std.testing.expect(self.ddl_subscription_alter_disable);
         try std.testing.expect(self.ddl_subscription_drop);
+        try std.testing.expect(self.ddl_subscription_drop_if_exists);
         try std.testing.expect(self.ddl_collation_create);
         try std.testing.expect(self.ddl_collation_rename);
         try std.testing.expect(self.ddl_collation_drop);
