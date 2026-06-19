@@ -34,6 +34,7 @@
     "aggregate_percentile_cont",
     "aggregate_percentile_desc",
     "aggregate_percentile_disc",
+    "aggregate_percentile_nulls",
     "aggregate_regexp_numeric_expression",
     "aggregate_regexp_text_expression",
     "aggregate_scalar_minmax",

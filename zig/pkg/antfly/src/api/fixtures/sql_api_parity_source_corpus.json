@@ -5092,10 +5092,21 @@
       "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
     },
     {
-      "name": "unsupported ordered-set null placement percentile aggregate plan",
+      "name": "unsupported ordered-set multiple percentile aggregate plan",
       "family": "unsupported_read",
       "plan": "unsupported:read:requires=ordered_set_aggregate_plan",
       "classification_reason": "ordered_set_aggregate_plan",
+      "sql": "SELECT customer_id, percentile_cont([0.25, 0.75]) WITHIN GROUP (ORDER BY amount) AS amount_percentiles FROM usage_records GROUP BY customer_id"
+    },
+    {
+      "name": "ordered-set percentile aggregate with explicit null placement",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "group_by": 1,
+        "aggregations": 1
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=0:limit=-1",
       "sql": "SELECT customer_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount NULLS LAST) AS median_amount FROM usage_records GROUP BY customer_id"
     },
     {

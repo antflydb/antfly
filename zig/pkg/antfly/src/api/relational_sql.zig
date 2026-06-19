@@ -12712,8 +12712,8 @@ const Parser = struct {
                 if (order.field.len > 0) self.alloc.free(order.field);
                 if (order.expression) |owned| freeExpression(self.alloc, owned);
             }
-            const explicit_nulls_first = try self.applyOrderModifiers(&order);
-            if (explicit_nulls_first != null or order.null_test != null) return error.UnsupportedSqlShape;
+            _ = try self.applyOrderModifiers(&order);
+            if (order.null_test != null) return error.UnsupportedSqlShape;
             percentile_order = order.direction;
             if (order.field.len > 0) {
                 const column = relationalColumnForField(self.schema, order.field, null) orelse return error.InvalidSqlCatalog;
@@ -50200,9 +50200,22 @@ test "postgres sql adapter lowers exact percentile continuous aggregates" {
     try std.testing.expectEqual(@as(f64, 0.75), lowered.aggregate.aggregations[2].percentile.?);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.aggregations[2].percentile_order);
 
+    var explicit_nulls = try lowerAggregateAlloc(
+        alloc,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount NULLS LAST) AS median_amount FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer explicit_nulls.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), explicit_nulls.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, explicit_nulls.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("amount", explicit_nulls.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(@as(f64, 0.5), explicit_nulls.aggregate.aggregations[0].percentile.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, explicit_nulls.aggregate.aggregations[0].percentile_order);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
         alloc,
-        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount NULLS LAST) AS bad FROM usage_records",
+        "SELECT percentile_cont([0.25, 0.75]) WITHIN GROUP (ORDER BY amount) AS bad FROM usage_records",
         schema,
         &.{},
     ));

@@ -4397,6 +4397,7 @@ pub const AppParityCorpusCoverage = struct {
     aggregate_percentile_cont: bool = false,
     aggregate_percentile_disc: bool = false,
     aggregate_percentile_desc: bool = false,
+    aggregate_percentile_nulls: bool = false,
     aggregate_group_expression: bool = false,
     aggregate_group_expression_alias: bool = false,
     aggregate_having_expression: bool = false,
@@ -4926,6 +4927,9 @@ pub const AppParityCorpusCoverage = struct {
                 self.aggregate_percentile_desc = self.aggregate_percentile_desc or
                     (std.mem.indexOf(u8, entry.sql, "WITHIN GROUP") != null and
                         std.mem.indexOf(u8, entry.sql, " DESC") != null);
+                self.aggregate_percentile_nulls = self.aggregate_percentile_nulls or
+                    (std.mem.indexOf(u8, entry.sql, "WITHIN GROUP") != null and
+                        std.mem.indexOf(u8, entry.sql, " NULLS ") != null);
                 self.aggregate_group_expression = self.aggregate_group_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=");
                 self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=") and
                     std.mem.indexOf(u8, entry.sql, "GROUP BY status_key") != null);
@@ -6440,6 +6444,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.aggregate_percentile_cont);
         try std.testing.expect(self.aggregate_percentile_disc);
         try std.testing.expect(self.aggregate_percentile_desc);
+        try std.testing.expect(self.aggregate_percentile_nulls);
         try std.testing.expect(self.aggregate_octet_length_expression);
         try std.testing.expect(self.aggregate_bit_length_expression);
         try std.testing.expect(self.aggregate_scalar_minmax);
