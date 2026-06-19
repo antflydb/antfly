@@ -74,6 +74,11 @@ func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 			wantErr: "slot",
 		},
 		{
+			name:    "padded slot name",
+			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"name":"standby-a"`, `"name":" standby-a"`, 1),
+			wantErr: "slot",
+		},
+		{
 			name:    "invalid durability mode",
 			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"mode":"remote_write"`, `"mode":"remote-write"`, 1),
 			wantErr: "durability",
@@ -332,6 +337,19 @@ func TestHAClientPrimaryStatusResponseRejectsMissingRequiredGeneratedField(t *te
 	}
 	if !strings.Contains(err.Error(), "missing primary status retention field evidence") {
 		t.Fatalf("error = %q, want missing retention evidence", err.Error())
+	}
+}
+
+func TestValidateHAPrimaryStatusResponseEvidenceRejectsPaddedSlotName(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(haGeneratedPrimaryStatusJSON(), `"name":"standby-a"`, `"name":"standby-a "`, 1)
+	err := ValidateHAPrimaryStatusResponseEvidence([]byte(body))
+	if err == nil {
+		t.Fatalf("ValidateHAPrimaryStatusResponseEvidence returned nil error, want slot field evidence error")
+	}
+	if !strings.Contains(err.Error(), "slot field evidence") {
+		t.Fatalf("error = %q, want slot field evidence", err.Error())
 	}
 }
 

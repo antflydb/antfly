@@ -396,7 +396,7 @@ func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionSt
 }
 
 func haSlotStatusJSONComplete(slot haSlotStatusJSON) bool {
-	return strings.TrimSpace(slot.Name) != "" &&
+	return validHAIdentifier(slot.Name) &&
 		slot.TimelineID != nil &&
 		haUint64StatusValue(slot.TimelineID) > 0 &&
 		slot.Active != nil &&
@@ -413,7 +413,7 @@ func haSlotStatusJSONComplete(slot haSlotStatusJSON) bool {
 }
 
 func haSlotStatusJSONConsistent(currentLSN uint64, slot haSlotStatusJSON) error {
-	name := strings.TrimSpace(slot.Name)
+	name := slot.Name
 	restartLSN := haUint64StatusValue(slot.RestartLSN)
 	receivedLSN := haUint64StatusValue(slot.ReceivedLSN)
 	appliedLSN := haUint64StatusValue(slot.AppliedLSN)
