@@ -38,6 +38,13 @@ spec:
         args:
         - --leader-elect
         - --enable-inference-controllers=true
+        env:
+        - name: ANTFLY_HA_ADMIN_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: antfly-ha-admin-token
+              key: token
+              optional: true
         resources:
           limits:
             cpu: 500m

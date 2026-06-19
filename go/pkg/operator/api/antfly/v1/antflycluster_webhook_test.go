@@ -1802,6 +1802,1362 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081", RouteSelector: map[string]string{
+				"app.kubernetes.io/name":      "antfly-database",
+				"app.kubernetes.io/component": "standby-a",
+			}},
+			{Name: "standby-b", AdminURL: "http://standby-b-ha.default.svc:8081"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeRemoteApply,
+			Selection:     HAStandbySelectionAny,
+			Required:      1,
+			StandbyNames:  []string{"standby-a", "standby-b"},
+			FailurePolicy: HAFailurePolicyBlock,
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          0,
+			TableID:          0,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid hot-standby HA config, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAllowsEmptyDisabledConfig(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected empty disabled HA configuration to be accepted, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Mode = HAModeDisabled
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected explicit disabled HA configuration to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsManagedConfigWithoutHotStandbyMode(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Standbys: []HAStandbySpec{{Name: "standby-a"}},
+		Admin: &HAAdminSpec{
+			PrimaryURL: "http://primary-ha.default.svc:8081",
+		},
+		Retention: &HARetentionPolicy{MaxLagLSN: 5},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA configuration without HotStandby mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mode must be HotStandby when HA configuration fields are set") {
+		t.Fatalf("expected HA mode validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Mode = HAModeDisabled
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected disabled HA configuration with managed fields to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mode must be HotStandby when HA configuration fields are set") {
+		t.Fatalf("expected disabled HA mode validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStandbyAdminURL(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+			{Name: "standby-b"},
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected partial HA admin endpoint configuration to be valid without automatic failover, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAdminExecutionWithoutIdentity(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA admin execution without identity to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.executePlannedActions requires spec.highAvailability.identity") {
+		t.Fatalf("expected HA admin execution identity validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
+	cluster := baseSwarmCluster()
+	backoffLimit := int32(-1)
+	timeoutSeconds := int64(0)
+	ttlSecondsAfterFinished := int32(-10)
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:                 "primary-ha.default.svc:8081",
+			ExecutePlannedActions:      true,
+			JobBackoffLimit:            &backoffLimit,
+			JobTimeoutSeconds:          &timeoutSeconds,
+			JobTTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "grpc://standby-a-ha.default.svc:8081"},
+			{Name: "standby-b"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA admin endpoint configuration to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.primaryURL") ||
+		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
+		!strings.Contains(err.Error(), "admin.jobBackoffLimit") ||
+		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
+		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") {
+		t.Fatalf("expected invalid HA admin endpoint errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL: " http://primary-ha.default.svc:8081 ",
+		},
+		Standbys: []HAStandbySpec{{
+			Name:     "standby-a",
+			AdminURL: " http://standby-a-ha.default.svc:8081 ",
+		}},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRoleStandby,
+			NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{
+				SlotName:    "standby-a",
+				UpstreamURL: " http://primary-ha.default.svc:8081 ",
+			},
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded HA admin URLs to be rejected")
+	}
+	for _, want := range []string{
+		"admin.primaryURL must not have leading or trailing whitespace",
+		"standbys[0].adminURL must not have leading or trailing whitespace",
+		"runtime.standby.upstreamURL must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected padded admin URL error %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAdminURLsWithHiddenWhitespace(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL: "http://primary-ha.default.svc:8081/\tadmin",
+		},
+		Standbys: []HAStandbySpec{{
+			Name:     "standby-a",
+			AdminURL: "http://standby-a-ha.default.svc:8081/\vadmin",
+		}},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRoleStandby,
+			NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{
+				SlotName:    "standby-a",
+				UpstreamURL: "http://primary-ha.default.svc:8081/\fadmin",
+			},
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA admin URLs with hidden whitespace to be rejected")
+	}
+	for _, want := range []string{
+		"admin.primaryURL must not contain whitespace",
+		"standbys[0].adminURL must not contain whitespace",
+		"runtime.standby.upstreamURL must not contain whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected hidden whitespace admin URL error %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+			TokenEnvVar:           "bad=token",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA admin token environment variable to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.tokenEnvVar") {
+		t.Fatalf("expected admin.tokenEnvVar validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Admin.TokenEnvVar = "   "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected whitespace HA admin token environment variable to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.tokenEnvVar must not be whitespace") {
+		t.Fatalf("expected admin.tokenEnvVar whitespace validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Admin.TokenEnvVar = " CUSTOM_HA_ADMIN_TOKEN "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA admin token environment variable with surrounding whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.tokenEnvVar must be a valid environment variable name") {
+		t.Fatalf("expected admin.tokenEnvVar raw-name validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsWhitespacePaddedIdentityFields(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:     " standby-a ",
+			SlotName: " slot-a ",
+		}},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: " primary-a ",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: " primary-a ",
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{" standby-a "},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected whitespace-padded HA identities to be rejected")
+	}
+	for _, want := range []string{
+		"standbys[0].name must not have leading or trailing whitespace",
+		"standbys[0].slotName must not have leading or trailing whitespace",
+		"identity.currentPrimaryID must not have leading or trailing whitespace",
+		"runtime.nodeID must not have leading or trailing whitespace",
+		"syncPolicy.standbyNames[0] must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidIdentifiers(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:     "standby a",
+			SlotName: "slot a",
+		}},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "primary a",
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{"standby a"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA identifiers to be rejected")
+	}
+	for _, want := range []string{
+		"standbys[0].name must be a valid HA identifier",
+		"standbys[0].slotName must be a valid HA identifier",
+		"identity.currentPrimaryID must be a valid HA identifier",
+		"runtime.nodeID must be a valid HA identifier",
+		"syncPolicy.standbyNames[0] must be a valid HA identifier",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRolePrimary,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected incomplete HA runtime configuration to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.nodeID is required") ||
+		!strings.Contains(err.Error(), "runtime requires spec.highAvailability.identity") {
+		t.Fatalf("expected HA runtime identity/nodeID validation errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeRequiresSwarmMode(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA runtime configuration outside swarm mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime is only supported when spec.mode=Swarm") {
+		t.Fatalf("expected HA runtime swarm-mode validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeNodeIDMustMatchRoleIdentity(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "standby-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected primary runtime node identity mismatch to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.nodeID must match spec.highAvailability.identity.currentPrimaryID") {
+		t.Fatalf("expected primary runtime node identity validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRoleStandby
+	cluster.Spec.HighAvailability.Runtime.NodeID = "primary-a"
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected standby runtime using current primary node identity to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.nodeID must not match spec.highAvailability.identity.currentPrimaryID") {
+		t.Fatalf("expected standby runtime node identity validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected standby runtime with distinct node identity to be valid, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsWhitespaceFormerPrimaryLogPath(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:                 HARuntimeRolePrimary,
+			NodeID:               "primary-a",
+			FormerPrimaryLogPath: " \t ",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected whitespace former primary log path to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.formerPrimaryLogPath must not be whitespace") {
+		t.Fatalf("expected formerPrimaryLogPath validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsPaddedRuntimePaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:                 HARuntimeRolePrimary,
+			NodeID:               "primary-a",
+			FencePath:            " /antflydb/ha/fence.wal ",
+			FormerPrimaryLogPath: " /antflydb/ha/primary.wal ",
+			Primary: &HAPrimaryRuntimeSpec{
+				LogPath:   " /antflydb/ha/primary.wal ",
+				SlotsPath: " /antflydb/ha/slots ",
+			},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded HA primary runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.primary.logPath must not have leading or trailing whitespace",
+		"runtime.primary.slotsPath must not have leading or trailing whitespace",
+		"runtime.fencePath must not have leading or trailing whitespace",
+		"runtime.formerPrimaryLogPath must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "primary-a"
+	cluster.Spec.HighAvailability.Runtime = &HARuntimeSpec{
+		Role:      HARuntimeRoleStandby,
+		NodeID:    "standby-a",
+		FencePath: "/antflydb/ha/fence.wal",
+		Standby: &HAStandbyRuntimeSpec{
+			LogPath:      " /antflydb/ha/standby.wal ",
+			ProgressPath: " /antflydb/ha/progress.wal ",
+		},
+	}
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded HA standby runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.standby.logPath must not have leading or trailing whitespace",
+		"runtime.standby.progressPath must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedRuntimePaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:                 HARuntimeRolePrimary,
+			NodeID:               "primary-a",
+			FencePath:            "ha/fence.wal",
+			FormerPrimaryLogPath: "/antflydb/ha/../primary.wal",
+			Primary: &HAPrimaryRuntimeSpec{
+				LogPath:   "ha/primary.wal",
+				SlotsPath: "/antflydb/ha//slots",
+			},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected relative and non-normalized HA primary runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.primary.logPath must be an absolute normalized path",
+		"runtime.primary.slotsPath must be an absolute normalized path",
+		"runtime.fencePath must be an absolute normalized path",
+		"runtime.formerPrimaryLogPath must be an absolute normalized path",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "primary-a"
+	cluster.Spec.HighAvailability.Runtime = &HARuntimeSpec{
+		Role:      HARuntimeRoleStandby,
+		NodeID:    "standby-a",
+		FencePath: "/antflydb/ha/fence.wal",
+		Standby: &HAStandbyRuntimeSpec{
+			LogPath:      "ha/standby.wal",
+			ProgressPath: "/antflydb/ha/../progress.wal",
+		},
+	}
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected relative and non-normalized HA standby runtime paths to be rejected")
+	}
+	for _, want := range []string{
+		"runtime.standby.logPath must be an absolute normalized path",
+		"runtime.standby.progressPath must be an absolute normalized path",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidRuntimeAdminTokenEnvVar(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:             HARuntimeRolePrimary,
+			NodeID:           "primary-a",
+			AdminTokenEnvVar: "bad-token-env",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid runtime admin token environment variable to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.adminTokenEnvVar") {
+		t.Fatalf("expected runtime.adminTokenEnvVar validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = " ANTFLY_HA_ADMIN_TOKEN "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token environment variable with surrounding whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.adminTokenEnvVar") {
+		t.Fatalf("expected runtime.adminTokenEnvVar raw-name validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeAdminTokenRequiresPodEnvSource(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:             HARuntimeRolePrimary,
+			NodeID:           "primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token without pod env source to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef or spec.swarm.envFrom") {
+		t.Fatalf("expected runtime admin token source validation error, got: %v", err)
+	}
+
+	cluster.Spec.Swarm.EnvFrom = []corev1.EnvFromSource{{
+		SecretRef: &corev1.SecretEnvSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+		},
+	}}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected runtime admin token to accept spec.swarm.envFrom token source, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeAdminTokenAcceptsSecretRef(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:             HARuntimeRolePrimary,
+			NodeID:           "primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN",
+			AdminTokenSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+				Key:                  "token",
+			},
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected runtime admin token secret ref to be valid, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = ""
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected adminTokenSecretRef without adminTokenEnvVar to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenEnvVar is required when adminTokenSecretRef is set") {
+		t.Fatalf("expected adminTokenEnvVar-required validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = "ANTFLY_HA_ADMIN_TOKEN"
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = ""
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref without name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.name is required") {
+		t.Fatalf("expected adminTokenSecretRef name-required validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = " ha-admin-token "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref name with whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.name must not have leading or trailing whitespace") {
+		t.Fatalf("expected adminTokenSecretRef name whitespace validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = "HA_ADMIN_TOKEN"
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref invalid name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.name") ||
+		!strings.Contains(err.Error(), "is invalid") {
+		t.Fatalf("expected adminTokenSecretRef invalid-name validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Name = "ha-admin-token"
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = ""
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref without key to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.key is required") {
+		t.Fatalf("expected adminTokenSecretRef key-required validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = " token "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref key with whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.key must not have leading or trailing whitespace") {
+		t.Fatalf("expected adminTokenSecretRef key whitespace validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = "bad/key"
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token secret ref invalid key to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.key") ||
+		!strings.Contains(err.Error(), "is invalid") {
+		t.Fatalf("expected adminTokenSecretRef invalid-key validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Key = "token"
+	optional := true
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Optional = &optional
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected optional runtime admin token secret ref to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.optional must be false") {
+		t.Fatalf("expected adminTokenSecretRef optional validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationSource(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRoleStandby,
+			NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{
+				UpstreamURL: "grpc://primary.default.svc:8080",
+				SlotName:    "standby-a",
+			},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA standby runtime upstream URL to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.standby.upstreamURL") {
+		t.Fatalf("expected standby upstreamURL validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Standby.UpstreamURL = "http://primary.default.svc:8080"
+	cluster.Spec.HighAvailability.Runtime.Standby.SlotName = ""
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA standby runtime slotName to be required with upstreamURL")
+	}
+	if !strings.Contains(err.Error(), "runtime.standby.slotName is required when upstreamURL is set") {
+		t.Fatalf("expected standby slotName validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Standby.SlotName = " standby-a "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA standby runtime slotName with surrounding whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.standby.slotName must not have leading or trailing whitespace") {
+		t.Fatalf("expected standby slotName whitespace validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutDesiredStandbyAdminURL(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", RouteSelector: map[string]string{
+				"app.kubernetes.io/component": "standby-a",
+			}},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without standby admin URL to be rejected")
+	}
+	if !strings.Contains(err.Error(), "standbys[0].adminURL is required when automaticFailover is enabled") {
+		t.Fatalf("expected automatic failover standby admin URL validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidRouteSelector(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a",
+			RouteSelector: map[string]string{
+				"bad key": "standby-a",
+			},
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA route selector to be rejected")
+	}
+	if !strings.Contains(err.Error(), "standbys[0].routeSelector") {
+		t.Fatalf("expected route selector validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRequiresFencingForAutomaticFailover(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityNone,
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without fencing to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover.fencingAuthority") {
+		t.Fatalf("expected fencing validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutRouteSelector(t *testing.T) {
+	disabled := false
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+			{Name: "standby-b", Desired: &disabled, AdminURL: "http://standby-b-ha.default.svc:8081", RouteSelector: map[string]string{
+				"app.kubernetes.io/component": "standby-b",
+			}},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without a desired routable standby to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover requires at least one desired standby with routeSelector") {
+		t.Fatalf("expected automatic failover route selector validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutExecutionPrerequisites(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without admin execution prerequisites to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover requires spec.highAvailability.admin.executePlannedActions=true") ||
+		!strings.Contains(err.Error(), "automaticFailover requires spec.highAvailability.identity") {
+		t.Fatalf("expected automatic failover execution prerequisite errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsUnsupportedAutomaticFencingAuthority(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityExternal,
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected unsupported automatic fencing authority to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover.fencingAuthority must be KubernetesLease") {
+		t.Fatalf("expected unsupported fencing authority error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAllowsDefaultAsyncSyncPolicy(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeAsync,
+			Selection:     HAStandbySelectionAny,
+			FailurePolicy: HAFailurePolicyBlock,
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected explicit default async sync policy to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAsyncSyncOnlyFields(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeAsync,
+			Selection:     HAStandbySelectionFirst,
+			Required:      1,
+			StandbyNames:  []string{"standby-a"},
+			FailurePolicy: HAFailurePolicyDegradeToAsync,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected async sync policy with synchronous-only fields to be rejected")
+	}
+	for _, want := range []string{
+		"syncPolicy.required must be omitted when mode is Async",
+		"syncPolicy.standbyNames must be omitted when mode is Async",
+		"syncPolicy.selection must be Any or omitted when mode is Async",
+		"syncPolicy.failurePolicy must be Block or omitted when mode is Async",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected async sync policy error %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDeclared(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-a"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{"standby-missing"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected duplicate and missing sync standby validation errors")
+	}
+	if !strings.Contains(err.Error(), "duplicated") || !strings.Contains(err.Error(), "standby-missing") {
+		t.Fatalf("expected duplicate and undeclared standby errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDesired(t *testing.T) {
+	disabled := false
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-b", Desired: &disabled},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{"standby-b"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected sync policy naming an undesired standby to be rejected")
+	}
+	if !strings.Contains(err.Error(), "syncPolicy.standbyNames[0] \"standby-b\" must reference a desired standby") {
+		t.Fatalf("expected undesired sync standby validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilitySyncAllRequiresNoExplicitRequiredCount(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-b"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteApply,
+			Selection:    HAStandbySelectionAll,
+			StandbyNames: []string{"standby-a", "standby-b"},
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected ALL sync policy without required count to be accepted, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.SyncPolicy.Required = 1
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected ALL sync policy with required count to be rejected")
+	}
+	if !strings.Contains(err.Error(), "syncPolicy.required must be omitted when selection is All") {
+		t.Fatalf("expected ALL sync required-count validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsDuplicateSlotIdentities(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", SlotName: "shared-slot"},
+			{Name: "standby-b", SlotName: "shared-slot"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected duplicate slot identity validation error")
+	}
+	if !strings.Contains(err.Error(), "duplicates standby slot identity") {
+		t.Fatalf("expected duplicate slot identity error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsUnsatisfiableSyncCardinality(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-b"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteApply,
+			Selection:    HAStandbySelectionFirst,
+			Required:     4,
+			StandbyNames: []string{"standby-a", "standby-b", "standby-b"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected unsatisfiable sync policy validation errors")
+	}
+	if !strings.Contains(err.Error(), "required (4) cannot exceed standbyNames length (3)") {
+		t.Fatalf("expected sync cardinality error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "duplicates standbyNames") {
+		t.Fatalf("expected duplicate sync standby error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutStandbys(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without standbys to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover requires at least one declared standby") {
+		t.Fatalf("expected automatic failover standby validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsIncompleteIdentity(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100,
+			ShardID:   10,
+			TableID:   20,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected incomplete identity validation errors")
+	}
+	if !strings.Contains(err.Error(), "identity.timelineID") ||
+		!strings.Contains(err.Error(), "identity.epoch") ||
+		!strings.Contains(err.Error(), "identity.currentPrimaryID") {
+		t.Fatalf("expected incomplete identity errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsIncompleteSeedPaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:            "standby-a",
+			SeedContentRoot: "/backup/base-standby-a",
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected seed manifest path validation error")
+	}
+	if !strings.Contains(err.Error(), "seedManifestPath is required when seedContentRoot is set") {
+		t.Fatalf("expected seed path dependency error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsPaddedSeedPaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:             "standby-a",
+			SeedManifestPath: " /backup/base-standby-a/manifest.json ",
+			SeedContentRoot:  " /backup/base-standby-a ",
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded seed path validation errors")
+	}
+	for _, want := range []string{
+		"standbys[0].seedManifestPath must not have leading or trailing whitespace",
+		"standbys[0].seedContentRoot must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected padded seed path error %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedSeedPaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:             "standby-a",
+			SeedManifestPath: "backup/base-standby-a/manifest.json",
+			SeedContentRoot:  "/backup/base-standby-a/../base-standby-a",
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected relative and non-normalized seed path validation errors")
+	}
+	for _, want := range []string{
+		"standbys[0].seedManifestPath must be an absolute normalized path",
+		"standbys[0].seedContentRoot must be an absolute normalized path",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected seed path validation error %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsArmedSlotDropForDesiredStandby(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:              "standby-a",
+			DropSlotOnRemoval: true,
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected dropSlotOnRemoval validation error")
+	}
+	if !strings.Contains(err.Error(), "dropSlotOnRemoval requires desired=false") {
+		t.Fatalf("expected dropSlotOnRemoval dependency error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAdminJobPodSpecValidation(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			EnvFrom: []corev1.EnvFromSource{{
+				SecretRef: &corev1.SecretEnvSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "backup-credentials"},
+				},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: "ha-seed",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			}},
+			VolumeMounts: []corev1.VolumeMount{{
+				Name:      "ha-seed",
+				MountPath: "/backup",
+			}},
+		},
+		Standbys: []HAStandbySpec{{Name: "standby-a"}},
+	}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid HA admin pod spec, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Admin.VolumeMounts[0].Name = "missing"
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected dangling volumeMount validation error")
+	}
+	if !strings.Contains(err.Error(), "volumeMounts[0].name \"missing\" must reference spec.highAvailability.admin.volumes") {
+		t.Fatalf("expected dangling volumeMount error, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

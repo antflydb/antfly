@@ -1045,6 +1045,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Stable generated artifact name. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Register or replace an artifact enrichment
+         * @description Registers a table-level generated artifact definition. Reusing the same
+         *     artifact name replaces the existing mapping. Chunk enrichments may set
+         *     `full_text_index: true` to map generated chunk text into the table's
+         *     default full-text index.
+         */
+        put: operations["putArtifactEnrichment"];
+        post?: never;
+        /**
+         * Delete an artifact enrichment
+         * @description Removes the table-level generated artifact definition. Local table
+         *     reconciliation drops no-longer-desired enrichment registrations when it
+         *     is safe to do so.
+         */
+        delete: operations["deleteArtifactEnrichment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs": {
         parameters: {
             query?: never;
@@ -3440,6 +3474,8 @@ export interface components {
         };
         TableStatus: components["schemas"]["Table"] & {
             storage_status: components["schemas"]["StorageStatus"];
+            /** @description Table-level generated artifact enrichments registered outside a specific index. */
+            artifact_enrichments?: components["schemas"]["EnrichmentConfig"][];
         };
         /**
          * @description MongoDB-style update operator
@@ -7357,6 +7393,11 @@ export interface components {
             chunk_overlap?: number;
             /** @description Serialized chunker configuration for chunk enrichments. */
             chunker_json?: string;
+            /**
+             * @description When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
+             * @default false
+             */
+            full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
             /** @description Serialized asset producer configuration. */
@@ -10374,7 +10415,7 @@ export interface components {
             schema_json?: string;
         };
         /** @enum {string} */
-        ExtensionObjectKind: "data_shape" | "table_schema" | "extension_relation" | "generated_artifact" | "index" | "enrichment" | "resolver" | "mcp_tool" | "query_function" | "api_endpoint" | "a2a_agent" | "auth_policy" | "workflow" | "maintenance_task" | "provider_config" | "text_analyzer" | "text_tokenizer" | "provider_adapter" | "connector" | "index_backend";
+        ExtensionObjectKind: "data_shape" | "table_schema" | "extension_relation" | "generated_artifact" | "index" | "enrichment" | "resolver" | "mcp_tool" | "skill" | "agent" | "query_function" | "api_endpoint" | "a2a_agent" | "auth_policy" | "workflow" | "maintenance_task" | "provider_config" | "text_analyzer" | "text_tokenizer" | "provider_adapter" | "connector" | "index_backend";
         ExtensionObjectDecl: {
             kind: components["schemas"]["ExtensionObjectKind"];
             name: components["schemas"]["ExtensionIdentifier"];
@@ -11931,6 +11972,12 @@ export interface operations {
                  * @example title,author,metadata.tags
                  */
                 fields?: string;
+                /**
+                 * @description Read consistency for the lookup. The default `read_index` routes to
+                 *     the primary for linearizable reads. `stale` allows a hot standby to
+                 *     serve the lookup at its safe-read LSN.
+                 */
+                consistency?: "read_index" | "leader_lease" | "stale";
             };
             header?: never;
             path: {
@@ -12026,6 +12073,70 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DocumentArtifactTableReprocessResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    putArtifactEnrichment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Stable generated artifact name. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EnrichmentConfig"];
+            };
+        };
+        responses: {
+            /** @description Artifact enrichment registered */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteArtifactEnrichment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Stable generated artifact name. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact enrichment deleted */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
                 };
             };
             400: components["responses"]["BadRequest"];
