@@ -232,6 +232,30 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/invalid_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "chunk_size": 512,
+                "full_text_index": True,
+            },
+        )
+    assert exc_info.value.response.status_code == 400
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/orphan_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "missing_units_v1",
+                "field": "text",
+                "chunk_size": 512,
+                "full_text_index": True,
+            },
+        )
+    assert exc_info.value.response.status_code == 400
+
     assert (
         stateful_api.put(
             f"/tables/{table_name}/artifacts/document_units_v1/enrichment",
@@ -288,6 +312,10 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert '"chunk_size": 256' in replaced_detail
     assert '"chunk_overlap": 25' in replaced_detail
 
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment")
+    assert exc_info.value.response.status_code == 400
+
     decoded_name = "document chunks v2"
     assert (
         stateful_api.put(
@@ -306,6 +334,10 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     decoded_detail = json.dumps(decoded_table, sort_keys=True)
     assert decoded_name in decoded_detail
     assert quote(decoded_name, safe="") not in decoded_detail
+
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment") == {}
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment") == {}
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
 
 
 def test_stateful_table_rejects_document_full_text_create_index_with_inline_enrichments(stateful_api):

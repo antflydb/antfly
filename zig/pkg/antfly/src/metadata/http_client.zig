@@ -339,7 +339,7 @@ pub const MetadataHttpClient = struct {
             enrichment_name,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, null);
+        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, error.InvalidExtensionEnrichment);
     }
 
     pub fn requestTableSplit(

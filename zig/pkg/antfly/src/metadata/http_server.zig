@@ -489,6 +489,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
         try svc.upsertTable(updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -502,6 +503,7 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.upsertTable(updated);
@@ -792,6 +794,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
         try svc.upsertTable(updated);
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -805,6 +808,7 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.upsertTable(updated);
@@ -1317,7 +1321,7 @@ pub const MetadataHttpServer = struct {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
+                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
                         else => return err,
                     };
                     return try textResponse(self.alloc, 202, "accepted");
@@ -1362,6 +1366,7 @@ pub const MetadataHttpServer = struct {
                         error.TableNotFound, error.EnrichmentNotFound => return try textResponse(self.alloc, 404, "artifact enrichment not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
                         else => return err,
                     };
                     return try textResponse(self.alloc, 204, "");

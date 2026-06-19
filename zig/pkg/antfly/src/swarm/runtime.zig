@@ -437,6 +437,7 @@ const LocalSwarmMetadata = struct {
         var updated = table.*;
         updated.indexes_json = try antfly.public_api.indexes.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
         try self.persistLocked();
@@ -449,6 +450,7 @@ const LocalSwarmMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const indexes_json = (try antfly.public_api.indexes.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
         defer alloc.free(indexes_json);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try self.manager.upsertTable(updated);

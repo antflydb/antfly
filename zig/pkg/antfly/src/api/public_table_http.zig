@@ -126,6 +126,7 @@ pub const TableApi = struct {
     pub const ExecuteDeleteArtifactEnrichmentError = error{
         NotFound,
         MethodNotAllowed,
+        InvalidEnrichmentRequest,
         InternalFailure,
     };
 
@@ -702,6 +703,7 @@ pub fn handleDeleteArtifactEnrichment(
     api.executeDeleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment delete failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };

@@ -23,6 +23,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const indexes_api = @import("../api/indexes.zig");
 const table_reads = @import("../api/table_reads.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const tables_api = @import("../api/tables.zig");
@@ -224,8 +225,9 @@ pub fn reconcileDbIndexesWithOptions(
         desired_enrichments.deinit(alloc);
     }
     try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
-    try validateDesiredEnrichments(desired_enrichments.items);
+    try indexes_api.validateArtifactEnrichmentConfigs(desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
+    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
 
     const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
@@ -611,9 +613,12 @@ fn collectDesiredEnrichmentsFromJson(
     indexes_json: []const u8,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    try collectDesiredEnrichments(alloc, parsed.value, out);
+    {
+        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+        errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
+        try out.appendSlice(alloc, collected);
+        alloc.free(collected);
+    }
 }
 
 const EnrichmentEnsureSummary = struct {
@@ -635,50 +640,6 @@ fn ensureEnrichments(db: *db_mod.DB, desired: []const db_mod.types.EnrichmentCon
         }
     }
     return summary;
-}
-
-fn collectDesiredEnrichments(
-    alloc: std.mem.Allocator,
-    value: std.json.Value,
-    out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
-) !void {
-    switch (value) {
-        .object => |object| {
-            if (object.get("enrichments")) |enrichments| {
-                if (enrichments == .array) {
-                    for (enrichments.array.items) |item| {
-                        if (item != .object) continue;
-                        const parsed = try std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
-                            .allocate = .alloc_always,
-                            .ignore_unknown_fields = true,
-                        });
-                        defer parsed.deinit();
-                        var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
-                        errdefer owned.deinit(alloc);
-                        try out.append(alloc, owned);
-                    }
-                }
-            }
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                try collectDesiredEnrichments(alloc, entry.value_ptr.*, out);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| try collectDesiredEnrichments(alloc, item, out);
-        },
-        else => {},
-    }
-}
-
-fn validateDesiredEnrichments(desired: []const db_mod.types.EnrichmentConfig) !void {
-    for (desired, 0..) |cfg, i| {
-        for (desired[0..i]) |prior| {
-            if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
-            if (!enrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
-        }
-    }
 }
 
 fn dedupeDesiredEnrichments(
@@ -1614,6 +1575,53 @@ test "table provisioner replaces enrichment kind under the same artifact name" {
     try std.testing.expectEqualStrings("document_artifact_v1", enrichments[0].name);
     try std.testing.expectEqualStrings("body", enrichments[0].field);
     try std.testing.expectEqual(@as(u32, 256), enrichments[0].chunk_size);
+}
+
+test "table provisioner applies artifact enrichments in dependency order" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-enrichment-dependency-order";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","source_artifact_name":"document_units_v1","field":"text","chunk_size":512,"full_text_index":true},
+        \\    {"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json"}
+        \\  ]}
+    ;
+
+    const summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 18,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 18,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 2), summary.enrichments_added);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expect(findEnrichment(enrichments, .asset, "document_units_v1") != null);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "document_chunks_v1") != null);
 }
 
 test "table provisioner compares full text index configs semantically" {

@@ -793,6 +793,7 @@ fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_
     var updated_record = table.*;
     updated_record.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
     defer alloc.free(updated_record.indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
     try svc.upsertTable(updated_record);
     try svc.runRound();
 }
@@ -805,6 +806,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
 
     const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
     defer alloc.free(indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.upsertTable(updated_record);
@@ -5922,21 +5924,26 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(enrichment_json);
 
-        self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
-            error.TableNotFound => return error.NotFound,
-            error.ExtensionOwnedObject => return error.MethodNotAllowed,
-            error.UnsupportedOperation => return error.MethodNotAllowed,
-            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
-            else => {
-                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
-                return error.InternalFailure;
-            },
-        };
         const expected_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
             else => return error.InternalFailure,
         };
         defer alloc.free(expected_indexes_json);
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+
+        self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
+            error.TableNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
+            error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => {
+                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                return error.InternalFailure;
+            },
+        };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
             std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
             return error.InternalFailure;
@@ -5952,16 +5959,22 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const table_before = (self.loadOwnedTableRecord(table_name) catch return error.InternalFailure) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
-            error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
-            error.ExtensionOwnedObject => return error.MethodNotAllowed,
-            error.UnsupportedOperation => return error.MethodNotAllowed,
-            else => return error.InternalFailure,
-        };
         const expected_indexes_json = (indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table_before.indexes_json, artifact_name) catch return error.InternalFailure) orelse {
             return error.NotFound;
         };
         defer alloc.free(expected_indexes_json);
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+
+        self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
+            error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
+            error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch {
             return error.InternalFailure;
         };
