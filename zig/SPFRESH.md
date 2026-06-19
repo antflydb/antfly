@@ -1262,7 +1262,10 @@ implementations cleanly:
     allocating a candidate map or scanning segment indexes. Lazy base-data batch
     reads use the same known-empty proof for base records, returning the
     null-filled batch result before allocating scan scratch when a manifest is
-    known to contain only other record families.
+    known to contain only other record families. Lazy delta-tail load, stats,
+    latest-member, and scratch replay entrypoints now also return immediately
+    when manifest kind counts prove no delta values exist, so base/centroid-only
+    segment stores do not pay manifest scans or index opens for empty tails.
     Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read

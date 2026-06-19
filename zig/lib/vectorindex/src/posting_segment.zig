@@ -1108,6 +1108,7 @@ pub const LazyDirectorySnapshot = struct {
         scratch: anytype,
     ) !posting.PostingDeltaTailStats {
         var stats = posting.PostingDeltaTailStats{};
+        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) return stats;
         const start_index = if (self.manifest.segments_sorted_by_segment_id and min_segment_id != 0)
             lowerBoundOwnedManifestSegmentId(self.manifest.segments, min_segment_id)
         else
@@ -1167,6 +1168,7 @@ pub const LazyDirectorySnapshot = struct {
 
     pub fn deltaTailStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
         var out = posting.PostingDeltaTailStats{};
+        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) return out;
         for (self.manifest.segments) |entry| {
             if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) continue;
 
@@ -1198,6 +1200,7 @@ pub const LazyDirectorySnapshot = struct {
         vector_id: posting.VectorId,
         base_generation: u64,
     ) !?posting.PostingDeltaRecord {
+        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) return null;
         var best_sequence: u64 = 0;
         var best_record: ?posting.PostingDeltaRecord = null;
         var segment_index = self.manifest.segments.len;
@@ -1307,6 +1310,13 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn loadDeltaTailFilteredWithStatsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) !DeltaTailWithStats {
+        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) {
+            return .{
+                .records = try alloc.alloc(posting.PostingDeltaRecord, 0),
+                .stats = .{},
+            };
+        }
+
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
         var stats = posting.PostingDeltaTailStats{};
@@ -6331,6 +6341,29 @@ pub fn testSegmentDeltaReadersSkipBaseOnlyCorruption() !void {
 
     const tail_stats = try readSegmentDeltaTailStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 0);
     try std.testing.expectEqual(@as(usize, 0), tail_stats.records);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    const snapshot = lazy.snapshot();
+
+    const lazy_records = try snapshot.loadDeltaTail(alloc, 7);
+    defer alloc.free(lazy_records);
+    try std.testing.expectEqual(@as(usize, 0), lazy_records.len);
+
+    const lazy_with_stats = try snapshot.loadDeltaTailAfterGenerationWithStats(alloc, 7, 0);
+    defer lazy_with_stats.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), lazy_with_stats.records.len);
+    try std.testing.expectEqual(@as(usize, 0), lazy_with_stats.stats.records);
+
+    const lazy_stats = try snapshot.deltaTailStats(alloc, 7, 0);
+    try std.testing.expectEqual(@as(usize, 0), lazy_stats.records);
+    try std.testing.expect(try snapshot.latestDeltaRecordAfterGenerationForMember(alloc, 7, 10, 0) == null);
+
+    var lazy_scratch = posting.PostingStore.FoldScratch{};
+    defer lazy_scratch.deinit(alloc);
+    const lazy_scratch_stats = try snapshot.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, 7, 0, &lazy_scratch);
+    try std.testing.expectEqual(@as(usize, 0), lazy_scratch.deltaRecords().len);
+    try std.testing.expectEqual(@as(usize, 0), lazy_scratch_stats.records);
 }
 
 pub fn testSegmentDeltaReadersSkipOutOfRangeCorruption() !void {
