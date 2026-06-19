@@ -921,7 +921,7 @@ pub const LazyDirectorySnapshot = struct {
         @memset(out, null);
         errdefer deinitOptionalByteSlices(alloc, out);
         if (posting_ids.len == 0) return out;
-        if ((try segmentKindCapacityHint(self.manifest.segments, .base)).provesEmpty()) return out;
+        if (segmentKindProvesEmpty(self.manifest.segments, .base)) return out;
 
         const sorted_by_segment_id = self.manifest.segments_sorted_by_segment_id;
         const posting_ids_ascending = isAscendingU64(posting_ids);
@@ -1108,7 +1108,7 @@ pub const LazyDirectorySnapshot = struct {
         scratch: anytype,
     ) !posting.PostingDeltaTailStats {
         var stats = posting.PostingDeltaTailStats{};
-        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) return stats;
+        if (segmentKindProvesEmpty(self.manifest.segments, .delta)) return stats;
         const start_index = if (self.manifest.segments_sorted_by_segment_id and min_segment_id != 0)
             lowerBoundOwnedManifestSegmentId(self.manifest.segments, min_segment_id)
         else
@@ -1168,7 +1168,7 @@ pub const LazyDirectorySnapshot = struct {
 
     pub fn deltaTailStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
         var out = posting.PostingDeltaTailStats{};
-        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) return out;
+        if (segmentKindProvesEmpty(self.manifest.segments, .delta)) return out;
         for (self.manifest.segments) |entry| {
             if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) continue;
 
@@ -1200,7 +1200,7 @@ pub const LazyDirectorySnapshot = struct {
         vector_id: posting.VectorId,
         base_generation: u64,
     ) !?posting.PostingDeltaRecord {
-        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) return null;
+        if (segmentKindProvesEmpty(self.manifest.segments, .delta)) return null;
         var best_sequence: u64 = 0;
         var best_record: ?posting.PostingDeltaRecord = null;
         var segment_index = self.manifest.segments.len;
@@ -1310,7 +1310,7 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn loadDeltaTailFilteredWithStatsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) !DeltaTailWithStats {
-        if ((try segmentKindCapacityHint(self.manifest.segments, .delta)).provesEmpty()) {
+        if (segmentKindProvesEmpty(self.manifest.segments, .delta)) {
             return .{
                 .records = try alloc.alloc(posting.PostingDeltaRecord, 0),
                 .stats = .{},
@@ -5133,6 +5133,14 @@ fn centroidDirectoryCandidateCapacityHint(entries: []const OwnedManifestEntry) !
     return try segmentKindCapacityHint(entries, .centroid_directory);
 }
 
+fn segmentKindProvesEmpty(entries: []const OwnedManifestEntry, kind: EntryKind) bool {
+    for (entries) |entry| {
+        const count = knownSegmentKindCount(entry.meta, kind) orelse return false;
+        if (count != 0) return false;
+    }
+    return true;
+}
+
 fn segmentKindCapacityHint(entries: []const OwnedManifestEntry, kind: EntryKind) !SegmentKindCapacityHint {
     var hint = SegmentKindCapacityHint{};
     for (entries) |entry| {
@@ -6279,6 +6287,9 @@ pub fn testSegmentKindCapacityHintsUseKnownCounts() !void {
     try std.testing.expectEqual(@as(usize, 4), known_base_hint.count);
     try std.testing.expect(known_base_hint.all_kind_counts_known);
     try std.testing.expect(!known_base_hint.provesEmpty());
+    try std.testing.expect(segmentKindProvesEmpty(known_base_only_entries[0..], .centroid_directory));
+    try std.testing.expect(!segmentKindProvesEmpty(known_base_only_entries[0..], .base));
+    try std.testing.expect(!segmentKindProvesEmpty(manifest_entries[0..], .centroid_directory));
 
     const segments = [_]SegmentBlob{
         .{

@@ -1266,6 +1266,9 @@ implementations cleanly:
     latest-member, and scratch replay entrypoints now also return immediately
     when manifest kind counts prove no delta values exist, so base/centroid-only
     segment stores do not pay manifest scans or index opens for empty tails.
+    These known-empty checks short-circuit on unknown counts or the first segment
+    that contains the requested family, so non-empty hot paths do not first count
+    every manifest entry.
     Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read
