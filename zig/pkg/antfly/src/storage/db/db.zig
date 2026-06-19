@@ -33789,7 +33789,7 @@ fn documentArtifactManifestFromValueAlloc(
     if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
     const object = parsed.value.object;
 
-    var child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(alloc, manifest_json);
+    const child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(alloc, manifest_json);
     errdefer freeDocumentArtifactChildRanges(alloc, child_ranges);
 
     var merge_status: []u8 = "";

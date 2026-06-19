@@ -11472,16 +11472,16 @@
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready'), ('u4', 'duplicate') ON CONFLICT (id) DO UPDATE SET status = excluded.status"
     },
     {
-      "name": "unsupported invalid expression conflict target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=invalid_expression_conflict_target",
+      "name": "invalid expression conflict target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=invalid_expression_conflict_target",
       "classification_reason": "invalid_expression_conflict_target",
       "sql": "INSERT INTO usage_records (id, organization_id) VALUES ('u_expr_bad', 'o1') ON CONFLICT (upper(organization_id)) DO NOTHING"
     },
     {
-      "name": "unsupported invalid named conflict target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=invalid_named_conflict_target",
+      "name": "invalid named conflict target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=invalid_named_conflict_target",
       "classification_reason": "invalid_named_conflict_target",
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u_bad_named', 'pending') ON CONFLICT ON CONSTRAINT usage_records_id_key DO NOTHING"
     },

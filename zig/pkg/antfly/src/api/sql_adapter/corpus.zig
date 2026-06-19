@@ -4273,6 +4273,8 @@ pub const AppParityCorpusCoverage = struct {
     invalid_insert: bool = false,
     invalid_duplicate_row_batch_target: bool = false,
     invalid_duplicate_conflict_update_target: bool = false,
+    invalid_expression_conflict_target: bool = false,
+    invalid_named_conflict_target: bool = false,
     invalid_update: bool = false,
     invalid_duplicate_update_target: bool = false,
     unsupported_insert: bool = false,
@@ -4505,8 +4507,6 @@ pub const AppParityCorpusCoverage = struct {
     migration_equivalent_schema_rewrite: bool = false,
     migration_equivalent_schema_validation: bool = false,
     unsupported_ddl_system_time_temporal_table: bool = false,
-    unsupported_invalid_expression_conflict_target: bool = false,
-    unsupported_invalid_named_conflict_target: bool = false,
     unsupported_unvalidated_unique_conflict_target: bool = false,
     to_jsonb_value_wrapper: bool = false,
     to_jsonb_dynamic_expression: bool = false,
@@ -5367,6 +5367,8 @@ pub const AppParityCorpusCoverage = struct {
                 self.invalid_insert = true;
                 self.invalid_duplicate_row_batch_target = self.invalid_duplicate_row_batch_target or std.mem.eql(u8, entry.classification_reason, "duplicate_row_batch_target");
                 self.invalid_duplicate_conflict_update_target = self.invalid_duplicate_conflict_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_conflict_update_target");
+                self.invalid_expression_conflict_target = self.invalid_expression_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_expression_conflict_target");
+                self.invalid_named_conflict_target = self.invalid_named_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_named_conflict_target");
             },
             .invalid_update => {
                 self.invalid_update = true;
@@ -6505,8 +6507,6 @@ pub const AppParityCorpusCoverage = struct {
                 appParityAnyStringContains(entry.apply_setup_sql, "tenant_id, lower(") and
                 std.mem.indexOf(u8, entry.sql, "ON CONFLICT (tenant_id, lower(") != null);
         } else if (entry.family == .unsupported_insert) {
-            self.unsupported_invalid_expression_conflict_target = self.unsupported_invalid_expression_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_expression_conflict_target");
-            self.unsupported_invalid_named_conflict_target = self.unsupported_invalid_named_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_named_conflict_target");
             self.unsupported_unvalidated_unique_conflict_target = self.unsupported_unvalidated_unique_conflict_target or std.mem.eql(u8, entry.classification_reason, "enforced_unique_conflict_target");
         }
         if (entry.family == .insert and !uses_insert_conflict) {

@@ -3766,6 +3766,7 @@ pub fn build(b: *std.Build) void {
             "api http server restricts runtime schema debug to admins when auth is enabled",
             "api http server serves user management routes when auth is enabled",
             "api http server applies authorization SQL DDL through user manager",
+            "api http server applies SQL DDL with explicit catalog session",
             "sql auth adapter creates roles and applies table grants through user manager",
             "sql auth adapter resolves role setting conflicts deterministically",
             "user manager applies permission change batches atomically",

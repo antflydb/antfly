@@ -36,8 +36,16 @@ pub const SqlAuthTableRef = struct {
 
 pub const SqlAuthCatalog = struct {
     database_name: []const u8 = tables_api.default_database_name,
+    search_path: []const []const u8 = &.{tables_api.default_namespace_name},
     public_table_names: ?[]const []const u8 = null,
     tables: []const SqlAuthTableRef = &.{},
+
+    fn session(self: SqlAuthCatalog) catalog_resources.SqlCatalogSession {
+        return .{
+            .current_database_name = self.database_name,
+            .search_path = self.search_path,
+        };
+    }
 };
 
 pub fn executeRelationalSqlDdlOnUserManagerWithCatalog(
@@ -243,7 +251,7 @@ fn sqlAuthTableResourceNameAlloc(
     sql_object_name: []const u8,
     catalog: SqlAuthCatalog,
 ) ![]u8 {
-    return try catalog_resources.tableResourceNameFromSqlObjectAlloc(alloc, sql_object_name, catalog.database_name);
+    return try catalog_resources.tableResourceNameFromSqlObjectWithSessionAlloc(alloc, sql_object_name, catalog.session());
 }
 
 const SqlPrivilegeResourceTarget = struct {
@@ -268,15 +276,16 @@ fn resourceTargetForSqlPrivilegeObject(
         };
     }
     if (std.ascii.eqlIgnoreCase(object_kind, "schema") or std.ascii.eqlIgnoreCase(object_kind, "namespace")) {
+        const target = try catalog.session().namespaceTargetFromSchemaName(object_name);
         return .{
             .resource_type = .namespace,
-            .resource_name = try catalog_resources.namespaceResourceNameAlloc(alloc, catalog.database_name, object_name),
+            .resource_name = try catalog_resources.namespaceResourceNameAlloc(alloc, target.database_name, target.namespace_name),
         };
     }
     if (std.ascii.eqlIgnoreCase(object_kind, "table")) {
         return .{
             .resource_type = .table,
-            .resource_name = try catalog_resources.tableResourceNameFromSqlObjectAlloc(alloc, object_name, catalog.database_name),
+            .resource_name = try catalog_resources.tableResourceNameFromSqlObjectWithSessionAlloc(alloc, object_name, catalog.session()),
         };
     }
     if (std.ascii.eqlIgnoreCase(object_kind, "user")) return .{ .resource_type = .user, .resource_name = try alloc.dupe(u8, object_name) };
@@ -293,11 +302,11 @@ fn appendAllTablesInSchemaPrivilegeChanges(
     kind: PrivilegeChangeKind,
     catalog: SqlAuthCatalog,
 ) !void {
-    if (schema_name.len == 0 or std.mem.indexOfScalar(u8, schema_name, '.') != null) return error.UnsupportedSqlShape;
+    const schema_target = try catalog.session().namespaceTargetFromSchemaName(schema_name);
     var matched: usize = 0;
     for (catalog.tables) |table_ref| {
-        if (!std.mem.eql(u8, table_ref.database_name, catalog.database_name)) continue;
-        if (!std.mem.eql(u8, table_ref.namespace_name, schema_name)) continue;
+        if (!std.mem.eql(u8, table_ref.database_name, schema_target.database_name)) continue;
+        if (!std.mem.eql(u8, table_ref.namespace_name, schema_target.namespace_name)) continue;
         const resource_name = try catalog_resources.tableResourceNameAlloc(alloc, table_ref.database_name, table_ref.namespace_name, table_ref.table_name);
         defer alloc.free(resource_name);
         for (privilege_names) |privilege_name| {
@@ -307,7 +316,10 @@ fn appendAllTablesInSchemaPrivilegeChanges(
     }
     if (matched > 0) return;
 
-    if (catalog.tables.len == 0 and std.ascii.eqlIgnoreCase(schema_name, catalog_resources.default_namespace_name)) {
+    if (catalog.tables.len == 0 and
+        std.mem.eql(u8, schema_target.database_name, catalog_resources.default_database_name) and
+        std.ascii.eqlIgnoreCase(schema_target.namespace_name, catalog_resources.default_namespace_name))
+    {
         const table_names = catalog.public_table_names orelse return error.UnsupportedSqlShape;
         for (table_names) |table_name| {
             const resource_name = try catalog_resources.defaultPublicTableResourceNameAlloc(alloc, table_name);

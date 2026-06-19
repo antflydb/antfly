@@ -176,6 +176,15 @@ pub fn tableResourceNameFromSqlObjectAlloc(
     return try tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
 }
 
+pub fn tableResourceNameFromSqlObjectWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    object_name: []const u8,
+    session: SqlCatalogSession,
+) ![]u8 {
+    const target = try sqlTableTargetFromObjectNameWithSession(object_name, session);
+    return try tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
+
 pub fn tableResourceMatches(permission_resource: []const u8, requested_resource: []const u8) bool {
     if (std.mem.eql(u8, permission_resource, requested_resource)) return true;
     if (std.mem.indexOfScalar(u8, requested_resource, '.') == null) {

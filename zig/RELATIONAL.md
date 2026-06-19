@@ -6115,6 +6115,10 @@ in multi-row inserts and duplicate point-update target paths lower far enough
 to prove the statement is an invalid native mutation (`invalid:insert:reason=...`
 or `invalid:update:reason=...`) rather than claiming that `ON CONFLICT`,
 row-batch mutation, or update-transform support is missing.
+Malformed or non-existent `ON CONFLICT` targets follow the same rule: expression
+targets and named constraints that cannot bind to enforced catalog metadata are
+invalid insert requests, while valid but not-yet-executable target classes stay
+in the unsupported family with an explicit missing-feature token.
 
 Point-write returning fixtures pin the same deterministic row count in both the
 public summary metadata and the typed-plan fingerprint before row JSON is

@@ -26,6 +26,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const storage_schema = @import("../storage/schema.zig");
 const backups_api = @import("../api/backups.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
 const foreign_mod = @import("../foreign/mod.zig");

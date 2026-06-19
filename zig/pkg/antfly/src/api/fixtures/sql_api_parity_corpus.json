@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "f69845f8beeb05a861dc881afb3ef71b0188644136d82a365523a91523c24f4d",
+  "source_sha256": "7167b2085a2d9aac5f059a5d54644811395f99e27e9beb0a000c5622a1918d12",
   "source_entry_count": 981,
   "entry_count": 981,
   "skipped_entries": [
@@ -10708,16 +10708,16 @@
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready'), ('u4', 'duplicate') ON CONFLICT (id) DO UPDATE SET status = excluded.status"
     },
     {
-      "name": "unsupported invalid expression conflict target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=invalid_expression_conflict_target",
+      "name": "invalid expression conflict target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=invalid_expression_conflict_target",
       "classification_reason": "invalid_expression_conflict_target",
       "sql": "INSERT INTO usage_records (id, organization_id) VALUES ('u_expr_bad', 'o1') ON CONFLICT (upper(organization_id)) DO NOTHING"
     },
     {
-      "name": "unsupported invalid named conflict target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=invalid_named_conflict_target",
+      "name": "invalid named conflict target",
+      "family": "invalid_insert",
+      "plan": "invalid:insert:reason=invalid_named_conflict_target",
       "classification_reason": "invalid_named_conflict_target",
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u_bad_named', 'pending') ON CONFLICT ON CONSTRAINT usage_records_id_key DO NOTHING"
     },

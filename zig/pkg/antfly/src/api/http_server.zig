@@ -474,6 +474,7 @@ pub const StatusSource = struct {
         drop_catalog_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_relational_sql_ddl_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_tablespace_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.TablespaceCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         set_database_tablespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, tablespace_name: ?[]const u8) anyerror!void = null,
@@ -560,6 +561,19 @@ pub const StatusSource = struct {
     }
 
     pub fn applyRelationalSqlDdl(self: StatusSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+        return try self.applyRelationalSqlDdlWithSession(alloc, sql, catalog_resources.SqlCatalogSession.default());
+    }
+
+    pub fn applyRelationalSqlDdlWithSession(self: StatusSource, alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
+        if (self.vtable.apply_relational_sql_ddl_with_session) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, sql, session);
+        }
+        if (!std.mem.eql(u8, session.currentDatabase(), catalog_resources.default_database_name) or
+            !std.mem.eql(u8, session.primarySearchPathNamespace(), catalog_resources.default_namespace_name) or
+            session.search_path.len > 1)
+        {
+            return error.UnsupportedOperation;
+        }
         const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, sql);
     }
@@ -750,6 +764,10 @@ pub const StatusSource = struct {
                 return try applyRelationalSqlDdlOnService(cast(ptr), alloc, sql);
             }
 
+            fn applyRelationalSqlDdlWithSession(ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
+                return try applyRelationalSqlDdlOnServiceWithSession(cast(ptr), alloc, sql, session);
+            }
+
             fn applyDatabaseCatalogPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
                 return try applyDatabaseCatalogPlanOnService(cast(ptr), alloc, plan);
             }
@@ -867,6 +885,7 @@ pub const StatusSource = struct {
             .drop_catalog_table = Gen.dropCatalogTable,
             .update_schema = Gen.updateSchema,
             .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
+            .apply_relational_sql_ddl_with_session = Gen.applyRelationalSqlDdlWithSession,
             .apply_database_catalog_plan = Gen.applyDatabaseCatalogPlan,
             .apply_tablespace_catalog_plan = Gen.applyTablespaceCatalogPlan,
             .set_database_tablespace = Gen.setDatabaseTablespace,
@@ -2277,14 +2296,35 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn applyRelationalSqlDdl(self: *ApiHttpServer, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+        var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(self.alloc, catalog_resources.SqlCatalogSession.default());
+        defer session.deinit(self.alloc);
+        return try self.applyRelationalSqlDdlWithSession(sql, &session);
+    }
+
+    pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *relational_sql.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
+        var plan = try relational_sql.lowerDdlPlanAlloc(self.alloc, sql);
+        defer plan.deinit(self.alloc);
+        switch (plan) {
+            .session_catalog => |session_plan| {
+                var updated = try relational_sql.applySessionCatalogPlanAlloc(self.alloc, session.session(), session_plan);
+                errdefer updated.deinit(self.alloc);
+                session.deinit(self.alloc);
+                session.* = updated;
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                applied.noop = true;
+                return applied;
+            },
+            else => {},
+        }
+
         if (self.cfg.user_manager) |manager| {
-            var catalog = try self.sqlAuthCatalogForDdl(sql);
+            var catalog = try self.sqlAuthCatalogForDdlWithSession(sql, session.session());
             defer catalog.deinit(self.alloc);
             if (try auth_sql_adapter.executeRelationalSqlDdlOnUserManagerWithCatalog(manager, self.alloc, sql, catalog.value)) |applied| {
                 return applied;
             }
         }
-        return try self.source.applyRelationalSqlDdl(self.alloc, sql);
+        return try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
     }
 
     const OwnedSqlAuthCatalog = struct {
@@ -2306,6 +2346,10 @@ pub const ApiHttpServer = struct {
     };
 
     fn sqlAuthCatalogForDdl(self: *ApiHttpServer, sql: []const u8) !OwnedSqlAuthCatalog {
+        return try self.sqlAuthCatalogForDdlWithSession(sql, catalog_resources.SqlCatalogSession.default());
+    }
+
+    fn sqlAuthCatalogForDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
         var plan = relational_sql.lowerDdlPlanAlloc(self.alloc, sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return .{},
             else => return err,
@@ -2319,7 +2363,12 @@ pub const ApiHttpServer = struct {
             },
             else => false,
         };
-        if (!needs_public_tables) return .{};
+        if (!needs_public_tables) return .{
+            .value = .{
+                .database_name = session.currentDatabase(),
+                .search_path = session.search_path,
+            },
+        };
 
         var snapshot = (try self.source.adminSnapshot()) orelse return error.UnsupportedOperation;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -2358,7 +2407,8 @@ pub const ApiHttpServer = struct {
         }
         return .{
             .value = .{
-                .database_name = tables_api.default_database_name,
+                .database_name = session.currentDatabase(),
+                .search_path = session.search_path,
                 .public_table_names = names[0..filled],
                 .tables = table_refs[0..filled],
             },
@@ -16745,6 +16795,94 @@ test "api http server applies authorization SQL DDL through user manager" {
     var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
     defer dropped.deinit(alloc);
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read)));
+}
+
+test "api http server applies SQL DDL with explicit catalog session" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        saw_session_create: bool = false,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl_with_session = applyRelationalSqlDdlWithSession,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdlWithSession(
+            ptr: *anyopaque,
+            alloc_arg: std.mem.Allocator,
+            sql: []const u8,
+            session: catalog_resources.SqlCatalogSession,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var target = try tables_api.relationalSqlDdlTargetWithSessionAlloc(alloc_arg, sql, session);
+            defer target.deinit(alloc_arg);
+            try std.testing.expect(target.createsTable());
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("events", target.table_name);
+            self.saw_session_create = true;
+            return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc_arg);
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var user = try auth.manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .user_manager = &auth.manager,
+    }, source.iface(), null, null);
+
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{"public"},
+    });
+    defer session.deinit(alloc);
+
+    var created_role = try server.applyRelationalSqlDdlWithSession("CREATE ROLE app_reader;", &session);
+    defer created_role.deinit(alloc);
+    try auth.manager.addRoleToUser("alice", "role:app_reader");
+
+    var set_path = try server.applyRelationalSqlDdlWithSession("SET search_path TO analytics, public;", &session);
+    defer set_path.deinit(alloc);
+    try std.testing.expect(set_path.noop);
+    try std.testing.expectEqualStrings("analytics", session.search_path[0]);
+    try std.testing.expectEqualStrings("public", session.search_path[1]);
+    try std.testing.expect(!session.transaction_local_search_path);
+
+    var granted = try server.applyRelationalSqlDdlWithSession("GRANT SELECT ON TABLE events TO app_reader;", &session);
+    defer granted.deinit(alloc);
+    try std.testing.expect(try auth.manager.enforce("alice", .table, "tenant_ops.analytics.events", .read));
+    try std.testing.expect(!(try auth.manager.enforce("alice", .table, "default.public.events", .read)));
+
+    var created_table = try server.applyRelationalSqlDdlWithSession("CREATE TABLE events (id text PRIMARY KEY);", &session);
+    defer created_table.deinit(alloc);
+    try std.testing.expect(source.saw_session_create);
+
+    var set_local = try server.applyRelationalSqlDdlWithSession("SET LOCAL search_path TO public;", &session);
+    defer set_local.deinit(alloc);
+    try std.testing.expect(set_local.noop);
+    try std.testing.expectEqualStrings("public", session.search_path[0]);
+    try std.testing.expect(session.transaction_local_search_path);
 }
 
 test "api http server serves api key and row filter routes" {
