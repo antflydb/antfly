@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "da003d04c48073d8cd93d294b0e5641715097ef4278cf1380472586ceed38618",
-  "source_entry_count": 901,
-  "entry_count": 901,
+  "source_sha256": "664b5e92874f02661f49138376615afea3a8c2e1a16f20e0528f4e15da5bb973",
+  "source_entry_count": 903,
+  "entry_count": 903,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -6474,6 +6474,13 @@
       "sql": "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));"
     },
     {
+      "name": "unsupported covering generated expression secondary index",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=covering_derived_index_plan",
+      "classification_reason": "covering_derived_index_plan",
+      "sql": "CREATE INDEX usage_records_lower_email_cover_idx ON usage_records (lower(email)) INCLUDE (tenant_id);"
+    },
+    {
       "name": "schema upper expression secondary index",
       "family": "ddl",
       "summary": {
@@ -6521,6 +6528,13 @@
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=gin",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_metadata_gin ON usage_records USING gin (metadata jsonb_path_ops);"
+    },
+    {
+      "name": "unsupported covering json gin secondary index",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=covering_derived_index_plan",
+      "classification_reason": "covering_derived_index_plan",
+      "sql": "CREATE INDEX usage_records_metadata_gin_cover_idx ON usage_records USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);"
     },
     {
       "name": "schema array gin secondary index",

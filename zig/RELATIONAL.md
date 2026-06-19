@@ -2132,7 +2132,9 @@ predicate proof. They are durable catalog metadata that survives schema JSON and
 runtime-schema clone/drop/rename paths, and schema validation rejects include
 columns that do not exist or that repeat key columns. GIN and generated
 expression indexes reject `INCLUDE` until those catalog objects have native
-covering-column metadata instead of silently dropping the PostgreSQL semantics.
+covering-column metadata instead of silently dropping the PostgreSQL semantics;
+the source parity corpus requires both shapes to fail closed with
+`covering_derived_index_plan`.
 
 Unique expression constraints store the expression key directly on the unique
 constraint, evaluate the key from the committed row, and maintain the

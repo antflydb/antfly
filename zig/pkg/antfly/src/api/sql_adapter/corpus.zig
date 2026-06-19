@@ -4000,6 +4000,8 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
+    unsupported_ddl_covering_expression_index_plan: bool = false,
+    unsupported_ddl_covering_gin_index_plan: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
     unsupported_ddl_deferrable_unique_constraint: bool = false,
@@ -5192,6 +5194,14 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
         } else if (entry.family == .unsupported_ddl) {
+            self.unsupported_ddl_covering_expression_index_plan = self.unsupported_ddl_covering_expression_index_plan or
+                (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
+                    std.mem.indexOf(u8, entry.sql, "lower(") != null and
+                    std.mem.indexOf(u8, entry.sql, " INCLUDE ") != null);
+            self.unsupported_ddl_covering_gin_index_plan = self.unsupported_ddl_covering_gin_index_plan or
+                (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
+                    std.mem.indexOf(u8, entry.sql, " USING gin ") != null and
+                    std.mem.indexOf(u8, entry.sql, " INCLUDE ") != null);
             self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
                 (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
                     std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
@@ -6163,6 +6173,8 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_set_operation_union);
         try std.testing.expect(self.unsupported_read_set_operation_intersect);
         try std.testing.expect(self.unsupported_read_set_operation_except);
+        try std.testing.expect(self.unsupported_ddl_covering_expression_index_plan);
+        try std.testing.expect(self.unsupported_ddl_covering_gin_index_plan);
         try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
