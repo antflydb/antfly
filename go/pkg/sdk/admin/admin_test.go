@@ -2049,6 +2049,16 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	if err := ValidateHAFenceResponse(wrongActionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
 		t.Fatalf("wrong fence action node error = %v, want action node mismatch", err)
 	}
+	paddedActionTarget := response
+	paddedActionTarget.Action.Target = "standby-a "
+	if err := ValidateHAFenceResponse(paddedActionTarget); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+		t.Fatalf("padded fence action target error = %v, want action node mismatch", err)
+	}
+	paddedActionID := response
+	paddedActionID.Action.ActionId = "fence_acquire:standby-a "
+	if err := ValidateHAFenceResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+		t.Fatalf("padded fence action id error = %v, want action id mismatch", err)
+	}
 	invalidReceiptNode := response
 	invalidReceiptNode.Receipt.PromotedNodeId = "standby a"
 	if err := ValidateHAFenceResponse(invalidReceiptNode); err == nil || !strings.Contains(err.Error(), "receipt fields") {
@@ -2153,6 +2163,16 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	if err := ValidateHAPromotionAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
 		t.Fatalf("wrong promotion assess executor error = %v, want executor node mismatch", err)
 	}
+	paddedAssessTarget := assess
+	paddedAssessTarget.Action.Target = "standby-a "
+	if err := ValidateHAPromotionAssessResponse(paddedAssessTarget); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+		t.Fatalf("padded promotion assess target error = %v, want executor node mismatch", err)
+	}
+	paddedAssessActionID := assess
+	paddedAssessActionID.Action.ActionId = "promotion_assess:standby-a "
+	if err := ValidateHAPromotionAssessResponse(paddedAssessActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+		t.Fatalf("padded promotion assess action id error = %v, want action id mismatch", err)
+	}
 	inconsistentAssess := assess
 	inconsistentAssess.Assessment.HasRequiredLsn = false
 	if err := ValidateHAPromotionAssessResponse(inconsistentAssess); err == nil || !strings.Contains(err.Error(), "has_required_lsn") {
@@ -2189,6 +2209,16 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	wrongPromotionNode.Action.NodeId = "standby-b"
 	if err := ValidateHAPromotionResponse(wrongPromotionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
 		t.Fatalf("wrong promotion node error = %v, want action node mismatch", err)
+	}
+	paddedPromotionTarget := promotion
+	paddedPromotionTarget.Action.Target = "standby-a "
+	if err := ValidateHAPromotionResponse(paddedPromotionTarget); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+		t.Fatalf("padded promotion target error = %v, want action node mismatch", err)
+	}
+	paddedPromotionActionID := promotion
+	paddedPromotionActionID.Action.ActionId = "promotion:standby-a "
+	if err := ValidateHAPromotionResponse(paddedPromotionActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+		t.Fatalf("padded promotion action id error = %v, want action id mismatch", err)
 	}
 	wrongSwitchLSN := promotion
 	wrongSwitchLSN.Promotion.SwitchLsn = 10
@@ -2543,6 +2573,16 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 	wrongTarget.Action.Target = "primary-b"
 	if err := ValidateHARejoinAssessResponse(wrongTarget); err == nil || !strings.Contains(err.Error(), "target") {
 		t.Fatalf("wrong target error = %v, want target mismatch error", err)
+	}
+	paddedTarget := base
+	paddedTarget.Action.Target = " primary-a"
+	if err := ValidateHARejoinAssessResponse(paddedTarget); err == nil || !strings.Contains(err.Error(), "target") {
+		t.Fatalf("padded target error = %v, want target mismatch error", err)
+	}
+	paddedActionID := base
+	paddedActionID.Action.ActionId = "rejoin_assess:primary-a "
+	if err := ValidateHARejoinAssessResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+		t.Fatalf("padded action id error = %v, want action id mismatch error", err)
 	}
 	wrongAssessNode := base
 	wrongAssessNode.Action.NodeId = "primary-b"

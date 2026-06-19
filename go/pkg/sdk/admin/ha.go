@@ -721,17 +721,17 @@ func ValidateHACurrentFenceResponse(response HACurrentFenceResponse) error {
 }
 
 func validateHAFenceActionCorrelation(action HAActionReceipt, receipt HAFenceReceipt) error {
-	promoted := strings.TrimSpace(receipt.PromotedNodeId)
+	promoted := receipt.PromotedNodeId
 	if action.ActionKind != HAActionKindFenceAcquire {
 		return fmt.Errorf("fence response action kind mismatch")
 	}
 	if action.State != HAActionStateApplied && action.State != HAActionStateAlreadyApplied {
 		return fmt.Errorf("fence response action state mismatch")
 	}
-	if strings.TrimSpace(action.Target) != promoted || strings.TrimSpace(action.NodeId) != promoted {
+	if !validHAIdentifier(action.Target) || action.Target != promoted || action.NodeId != promoted {
 		return fmt.Errorf("fence response action node mismatch")
 	}
-	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+promoted {
+	if action.ActionId != string(action.ActionKind)+":"+promoted {
 		return fmt.Errorf("fence response action id does not match action kind and target")
 	}
 	return nil
@@ -824,17 +824,17 @@ func ValidateHAPromotionResponse(response HAPromotionResponse) error {
 
 func validateHAPromotionAssessReceiptCorrelation(response HAPromotionAssessResponse) error {
 	action := response.Action
-	target := strings.TrimSpace(action.Target)
+	target := action.Target
 	if action.ActionKind != HAActionKindPromotionAssess {
 		return fmt.Errorf("promotion assess response action kind mismatch")
 	}
 	if action.State != HAActionStateAssessed {
 		return fmt.Errorf("promotion assess response action state mismatch")
 	}
-	if strings.TrimSpace(action.NodeId) != target {
+	if !validHAIdentifier(target) || action.NodeId != target {
 		return fmt.Errorf("promotion assess response executor node mismatch")
 	}
-	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+target {
+	if action.ActionId != string(action.ActionKind)+":"+target {
 		return fmt.Errorf("promotion assess response action id does not match action kind and target")
 	}
 	return nil
@@ -843,17 +843,17 @@ func validateHAPromotionAssessReceiptCorrelation(response HAPromotionAssessRespo
 func validateHAPromotionReceiptCorrelation(response HAPromotionResponse) error {
 	action := response.Action
 	promotion := response.Promotion
-	nodeID := strings.TrimSpace(promotion.NodeId)
+	nodeID := promotion.NodeId
 	if action.ActionKind != HAActionKindPromotion {
 		return fmt.Errorf("promotion response action kind mismatch")
 	}
 	if action.State != HAActionStateApplied {
 		return fmt.Errorf("promotion response action state mismatch")
 	}
-	if strings.TrimSpace(action.Target) != nodeID || strings.TrimSpace(action.NodeId) != nodeID {
+	if !validHAIdentifier(action.Target) || action.Target != nodeID || action.NodeId != nodeID {
 		return fmt.Errorf("promotion response action node mismatch")
 	}
-	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+nodeID {
+	if action.ActionId != string(action.ActionKind)+":"+nodeID {
 		return fmt.Errorf("promotion response action id does not match action kind and target")
 	}
 	if promotion.SwitchLsn != response.Assessment.ReceivedLsn+1 {
@@ -970,11 +970,11 @@ func ValidateHARejoinAssessResponse(response HARejoinAssessResponse) error {
 
 func validateHARejoinReceiptCorrelation(response HARejoinAssessResponse) error {
 	action := response.Action
-	target := strings.TrimSpace(action.Target)
-	if target != strings.TrimSpace(response.Assessment.FormerNodeId) {
+	target := action.Target
+	if !validHAIdentifier(target) || target != response.Assessment.FormerNodeId {
 		return fmt.Errorf("rejoin response action target does not match former node")
 	}
-	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+target {
+	if action.ActionId != string(action.ActionKind)+":"+target {
 		return fmt.Errorf("rejoin response action id does not match action kind and target")
 	}
 
@@ -983,20 +983,20 @@ func validateHARejoinReceiptCorrelation(response HARejoinAssessResponse) error {
 		if action.State != HAActionStateAssessed {
 			return fmt.Errorf("rejoin assess response action state mismatch")
 		}
-		if strings.TrimSpace(action.NodeId) != target {
+		if action.NodeId != target {
 			return fmt.Errorf("rejoin assess response executor node mismatch")
 		}
 	case HAActionKindRejoinRewind:
 		if action.State != HAActionStateApplied && action.State != HAActionStateAlreadyApplied {
 			return fmt.Errorf("rejoin rewind response action state mismatch")
 		}
-		if strings.TrimSpace(action.NodeId) != target {
+		if action.NodeId != target {
 			return fmt.Errorf("rejoin rewind response executor node mismatch")
 		}
 		if response.Assessment.Action != HARejoinActionRewind {
 			return fmt.Errorf("rejoin rewind response assessment action mismatch")
 		}
-		if strings.TrimSpace(response.Rewind.NodeId) != target {
+		if response.Rewind.NodeId != target {
 			return fmt.Errorf("rejoin rewind response result node mismatch")
 		}
 	case HAActionKindRejoinReseed:
@@ -1006,7 +1006,7 @@ func validateHARejoinReceiptCorrelation(response HARejoinAssessResponse) error {
 		if response.Assessment.Action != HARejoinActionReseed {
 			return fmt.Errorf("rejoin reseed response assessment action mismatch")
 		}
-		if strings.TrimSpace(response.Reseed.NodeId) != target || strings.TrimSpace(response.Reseed.SlotName) != target {
+		if response.Reseed.NodeId != target || response.Reseed.SlotName != target {
 			return fmt.Errorf("rejoin reseed response result target mismatch")
 		}
 	default:
