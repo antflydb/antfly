@@ -1166,8 +1166,26 @@ pub const LazyDirectorySnapshot = struct {
             const index_data = try readSegmentIndexWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, &stack_index);
             defer index_data.deinit(alloc);
 
+            const delta_index_range = (try deltaIndexRange(index_data.data, entry.meta.entry_count, posting_id)) orelse continue;
+            const first_relevant_index = if (best_record != null and best_sequence != std.math.maxInt(u64))
+                lowerBoundIndexData(index_data.data, entry.meta.entry_count, posting_id, .delta, best_sequence + 1)
+            else
+                delta_index_range.first_index;
+            if (first_relevant_index >= delta_index_range.past_index) continue;
+
             var value_scratch: [stack_delta_value_range_max_bytes]u8 = undefined;
-            const range = (try readSegmentDeltaValueRangeWithScratchAlloc(alloc, self.io, self.dir, manifest_entry, index_data.data, posting_id, &value_scratch)) orelse continue;
+            const range = try readSegmentDeltaValueIndexRangeWithScratchAlloc(
+                alloc,
+                self.io,
+                self.dir,
+                manifest_entry,
+                index_data.data,
+                .{
+                    .first_index = first_relevant_index,
+                    .past_index = delta_index_range.past_index,
+                },
+                &value_scratch,
+            );
             defer range.deinit(alloc);
 
             var delta_index = range.past_index;
@@ -4393,16 +4411,41 @@ fn readSegmentDeltaValueRangeWithScratchAlloc(
     const first_entry = try indexEntryFromBytes(index_data[first_index * index_entry_size ..][0..index_entry_size]);
     if (first_entry.posting_id != posting_id or first_entry.kind != .delta) return null;
 
-    var range_offset = first_entry.offset;
-    var range_end = std.math.add(usize, first_entry.offset, first_entry.len) catch return error.CorruptedPostingSegment;
-    if (first_entry.offset > entry.meta.index_offset or range_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
-
     var past_index = first_index + 1;
     while (past_index < entry.meta.entry_count) : (past_index += 1) {
         const found = try indexEntryFromBytes(index_data[past_index * index_entry_size ..][0..index_entry_size]);
         if (found.posting_id != posting_id or found.kind != .delta) break;
-        const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
-        if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
+    }
+
+    return try readSegmentDeltaValueIndexRangeWithScratchAlloc(alloc, io, dir, entry, index_data, .{
+        .first_index = first_index,
+        .past_index = past_index,
+    }, value_scratch);
+}
+
+fn readSegmentDeltaValueIndexRangeWithScratchAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    index_data: []const u8,
+    range: DeltaIndexRange,
+    value_scratch: []u8,
+) !DeltaValueRange {
+    if (range.first_index >= range.past_index) return error.CorruptedPostingSegment;
+    if (range.past_index > entry.meta.entry_count) return error.CorruptedPostingSegment;
+
+    const first_entry = try deltaIndexEntryFromIndexData(index_data, range.first_index);
+    if (first_entry.kind != .delta) return error.CorruptedPostingSegment;
+    const posting_id = first_entry.posting_id;
+    var range_offset = first_entry.offset;
+    var range_end = try checkedSegmentValueEnd(entry.meta, first_entry);
+
+    var index = range.first_index + 1;
+    while (index < range.past_index) : (index += 1) {
+        const found = try deltaIndexEntryFromIndexData(index_data, index);
+        if (found.posting_id != posting_id or found.kind != .delta) return error.CorruptedPostingSegment;
+        const value_end = try checkedSegmentValueEnd(entry.meta, found);
         range_offset = @min(range_offset, found.offset);
         range_end = @max(range_end, value_end);
     }
@@ -4421,8 +4464,8 @@ fn readSegmentDeltaValueRangeWithScratchAlloc(
         .data = data,
         .owned = owned,
         .base_offset = range_offset,
-        .first_index = first_index,
-        .past_index = past_index,
+        .first_index = range.first_index,
+        .past_index = range.past_index,
     };
 }
 

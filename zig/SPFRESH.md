@@ -1244,7 +1244,9 @@ implementations cleanly:
     bases do not need a decoded member slice during fold. Query replay, lazy
     snapshot replay, explicit materialization, and fold replay all append segment
     delta records directly into retained scratch; folds collect tail stats in
-    that same pass. Pending and committed segment delta entries now use their min
+    that same pass. Latest-member scans bound each segment range read to delta
+    values whose sequence can still beat the current best record. Pending and
+    committed segment delta entries now use their min
     sequence to select all-record stats/replay/latest-op paths when the whole
     value is newer than the base generation. Allocation-returning delta loads,
     stats reads, and scratch replay now all skip segment bytes entirely when
