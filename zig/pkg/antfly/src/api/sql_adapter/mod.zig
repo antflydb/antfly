@@ -48,6 +48,7 @@ pub const AppParitySourceCorpusRoot = corpus.AppParitySourceCorpusRoot;
 pub const parseCoverageRequirementsRootAlloc = corpus.parseCoverageRequirementsRootAlloc;
 pub const freeCoverageRequirementsRoot = corpus.freeCoverageRequirementsRoot;
 pub const expectAppParityCoverageRequirements = corpus.expectAppParityCoverageRequirements;
+pub const sourceCorpusSha256HexAlloc = corpus.sourceCorpusSha256HexAlloc;
 pub const AggregateCatalogPlan = ddl_plan.AggregateCatalogPlan;
 pub const AnalyzeMaintenancePlan = ddl_plan.AnalyzeMaintenancePlan;
 pub const AnalyzeMaintenanceSyntax = grammar.AnalyzeMaintenanceSyntax;

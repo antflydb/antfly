@@ -311,6 +311,7 @@ pub const app_parity_source_corpus_format: u64 = 1;
 
 pub const AppParityFixtureRoot = struct {
     fixture_format: u64,
+    source_sha256: []const u8,
     source_entry_count: usize,
     entry_count: usize,
     skipped_entries: []const []const u8,
@@ -407,11 +408,33 @@ pub fn fixtureJsonOptionalU64(object: std.json.ObjectMap, field: []const u8, def
     };
 }
 
+pub fn sourceCorpusSha256HexAlloc(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const out = try alloc.alloc(u8, digest.len * 2);
+    for (digest, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+fn validateFixtureSourceSha256(text: []const u8) !void {
+    if (text.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.TestUnexpectedResult;
+    for (text) |ch| {
+        const lower = ch >= 'a' and ch <= 'f';
+        const digit = ch >= '0' and ch <= '9';
+        if (!lower and !digit) return error.TestUnexpectedResult;
+    }
+}
+
 pub fn parseFixtureRootAlloc(alloc: std.mem.Allocator, value: std.json.Value) !AppParityFixtureRoot {
     const root = try fixtureJsonObject(value);
-    try fixtureRequireOnlyKeys(root, &.{ "fixture_format", "source_entry_count", "entry_count", "skipped_entries", "schema_json", "entries" });
+    try fixtureRequireOnlyKeys(root, &.{ "fixture_format", "source_sha256", "source_entry_count", "entry_count", "skipped_entries", "schema_json", "entries" });
     const fixture_format = try fixtureJsonOptionalU64(root, "fixture_format", 0);
     if (fixture_format != app_parity_fixture_format) return error.TestUnexpectedResult;
+    const source_sha256 = try fixtureJsonString(root.get("source_sha256") orelse return error.TestUnexpectedResult);
+    try validateFixtureSourceSha256(source_sha256);
     const source_entry_count = try fixtureJsonOptionalUsize(root, "source_entry_count") orelse return error.TestUnexpectedResult;
     const entry_count = try fixtureJsonOptionalUsize(root, "entry_count") orelse return error.TestUnexpectedResult;
     const skipped_entries = try parseFixtureStringListAlloc(alloc, root, "skipped_entries");
@@ -426,6 +449,7 @@ pub fn parseFixtureRootAlloc(alloc: std.mem.Allocator, value: std.json.Value) !A
     if (source_entry_count != entries.len + skipped_entries.len) return error.TestUnexpectedResult;
     return .{
         .fixture_format = fixture_format,
+        .source_sha256 = source_sha256,
         .source_entry_count = source_entry_count,
         .entry_count = entry_count,
         .skipped_entries = skipped_entries,
@@ -988,10 +1012,12 @@ fn fixtureWriteSummaryField(writer: anytype, first: *bool, summary: AppParityPla
 pub fn fixtureJsonAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
+    source_sha256: []const u8,
     source_entry_count: usize,
     entries: []const AppParityFixtureEncodedEntry,
     skipped_entries: []const []const u8,
 ) ![]u8 {
+    try validateFixtureSourceSha256(source_sha256);
     var entries_out: std.Io.Writer.Allocating = .init(alloc);
     errdefer entries_out.deinit();
     const entries_writer = &entries_out.writer;
@@ -1034,8 +1060,8 @@ pub fn fixtureJsonAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.print(
-        "{{\n  \"fixture_format\": {},\n  \"source_entry_count\": {},\n  \"entry_count\": {},\n  \"skipped_entries\": [",
-        .{ app_parity_fixture_format, source_entry_count, entries.len },
+        "{{\n  \"fixture_format\": {},\n  \"source_sha256\": {f},\n  \"source_entry_count\": {},\n  \"entry_count\": {},\n  \"skipped_entries\": [",
+        .{ app_parity_fixture_format, std.json.fmt(source_sha256, .{}), source_entry_count, entries.len },
     );
     try writer.writeAll(skipped_json);
     try writer.print(
@@ -3121,9 +3147,11 @@ test "sql adapter corpus parses fixture entries and owns allocated slices" {
 
 test "sql adapter corpus parses fixture root metadata and owns skipped list" {
     const alloc = std.testing.allocator;
+    const source_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const fixture_json =
         \\{
         \\  "fixture_format": 1,
+        \\  "source_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         \\  "source_entry_count": 2,
         \\  "entry_count": 1,
         \\  "skipped_entries": ["unsupported recursive cte"],
@@ -3144,12 +3172,27 @@ test "sql adapter corpus parses fixture root metadata and owns skipped list" {
     const root = try parseFixtureRootAlloc(alloc, parsed.value);
     defer freeFixtureRoot(alloc, root);
     try std.testing.expectEqual(app_parity_fixture_format, root.fixture_format);
+    try std.testing.expectEqualStrings(source_sha256, root.source_sha256);
     try std.testing.expectEqual(@as(usize, 2), root.source_entry_count);
     try std.testing.expectEqual(@as(usize, 1), root.entry_count);
     try std.testing.expectEqual(@as(usize, 1), root.skipped_entries.len);
     try std.testing.expectEqualStrings("unsupported recursive cte", root.skipped_entries[0]);
     try std.testing.expectEqualStrings("{\"version\":1}", root.schema_json);
     try std.testing.expectEqual(@as(usize, 1), root.entries.len);
+
+    const missing_digest_json =
+        \\{
+        \\  "fixture_format": 1,
+        \\  "source_entry_count": 1,
+        \\  "entry_count": 1,
+        \\  "skipped_entries": [],
+        \\  "schema_json": "{\"version\":1}",
+        \\  "entries": [{"name": "read", "family": "read", "plan": "read:table=usage_records", "sql": "SELECT * FROM usage_records"}]
+        \\}
+    ;
+    var parsed_missing_digest = try std.json.parseFromSlice(std.json.Value, alloc, missing_digest_json, .{});
+    defer parsed_missing_digest.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseFixtureRootAlloc(alloc, parsed_missing_digest.value));
 }
 
 test "sql adapter corpus parses source corpus root entries" {
@@ -3306,9 +3349,11 @@ test "sql adapter corpus encodes fixture roots and entries" {
         .applied_plan = "applied:rebuild=false:validation=false:rewrite=false",
     }};
     const skipped = [_][]const u8{"unsupported generated expression"};
+    const source_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const encoded = try fixtureJsonAlloc(
         alloc,
         "{\"version\":1}",
+        source_sha256,
         2,
         &entries,
         &skipped,
@@ -3319,6 +3364,7 @@ test "sql adapter corpus encodes fixture roots and entries" {
     defer parsed.deinit();
     const root = try parseFixtureRootAlloc(alloc, parsed.value);
     defer freeFixtureRoot(alloc, root);
+    try std.testing.expectEqualStrings(source_sha256, root.source_sha256);
     try std.testing.expectEqual(@as(usize, 2), root.source_entry_count);
     try std.testing.expectEqual(@as(usize, 1), root.entry_count);
     try std.testing.expectEqualStrings("unsupported generated expression", root.skipped_entries[0]);

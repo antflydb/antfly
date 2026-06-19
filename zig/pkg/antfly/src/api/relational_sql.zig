@@ -54947,8 +54947,10 @@ const AppParityCorpusEntry = sql_adapter.AppParityCorpusEntry;
 const AppParityExternalSourceCorpus = struct {
     parsed: std.json.Parsed(std.json.Value),
     root: sql_adapter.AppParitySourceCorpusRoot,
+    source_sha256: []u8,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.source_sha256);
         sql_adapter.freeSourceCorpusRoot(alloc, self.root);
         self.parsed.deinit();
     }
@@ -54956,6 +54958,8 @@ const AppParityExternalSourceCorpus = struct {
 
 fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityExternalSourceCorpus {
     const source_json = @embedFile("fixtures/sql_api_parity_source_corpus.json");
+    const source_sha256 = try sql_adapter.sourceCorpusSha256HexAlloc(alloc, source_json);
+    errdefer alloc.free(source_sha256);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
     errdefer parsed.deinit();
 
@@ -54965,6 +54969,7 @@ fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityE
     return .{
         .parsed = parsed,
         .root = root,
+        .source_sha256 = source_sha256,
     };
 }
 
@@ -58954,6 +58959,7 @@ fn appParityAppliedDdlPlanAlloc(
 fn appParityFixtureJsonAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
+    source_sha256: []const u8,
     corpus: []const AppParityCorpusEntry,
 ) ![]u8 {
     var entries = std.ArrayListUnmanaged(sql_adapter.AppParityFixtureEncodedEntry).empty;
@@ -58985,19 +58991,20 @@ fn appParityFixtureJsonAlloc(
             .applied_plan = applied_plan,
         });
     }
-    return try sql_adapter.fixtureJsonAlloc(alloc, schema_json, corpus.len, entries.items, skipped_entries.items);
+    return try sql_adapter.fixtureJsonAlloc(alloc, schema_json, source_sha256, corpus.len, entries.items, skipped_entries.items);
 }
 
 fn maybeCheckOrPromoteAppParityFixture(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
+    source_sha256: []const u8,
     corpus: []const AppParityCorpusEntry,
 ) !void {
     const mode = try sql_adapter.fixtureGateModeFromEnvAlloc(alloc);
     defer sql_adapter.freeFixtureGateMode(alloc, mode);
     if (mode == .none) return;
 
-    const encoded = try appParityFixtureJsonAlloc(alloc, schema_json, corpus);
+    const encoded = try appParityFixtureJsonAlloc(alloc, schema_json, source_sha256, corpus);
     defer alloc.free(encoded);
     try sql_adapter.checkOrPromoteFixtureJson(alloc, mode, encoded);
 }
@@ -60607,7 +60614,7 @@ test "postgres sql adapter classifies application parity corpus" {
     var required_coverage = try parseAppParityCoverageRequirementsAlloc(alloc);
     defer required_coverage.deinit(alloc);
 
-    try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, corpus);
+    try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, external_source.source_sha256, corpus);
 
     var coverage = AppParityCorpusCoverage{};
     for (corpus) |entry| {
@@ -60626,6 +60633,10 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
 
     const fixture_root = try sql_adapter.parseFixtureRootAlloc(alloc, parsed_fixture.value);
     defer sql_adapter.freeFixtureRoot(alloc, fixture_root);
+    const source_json = @embedFile("fixtures/sql_api_parity_source_corpus.json");
+    const source_sha256 = try sql_adapter.sourceCorpusSha256HexAlloc(alloc, source_json);
+    defer alloc.free(source_sha256);
+    try std.testing.expectEqualStrings(source_sha256, fixture_root.source_sha256);
     const skipped_entries = fixture_root.skipped_entries;
     const schema_json = fixture_root.schema_json;
     try std.testing.expectEqual(@as(usize, 0), skipped_entries.len);
