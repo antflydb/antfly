@@ -24,6 +24,7 @@ const vec = @import("antfly_vector").vector;
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_query_probe_stack_capacity = 512;
 const flat_centroid_zero_stack_capacity = 4096;
+const leaf_bounds_radius_vector_scratch_stack_capacity = 4096;
 const boundary_reassignment_vector_scratch_stack_capacity = 8192;
 
 pub const FlatCentroidBlock = struct {
@@ -522,13 +523,22 @@ fn leafBoundsRadiusFromStorage(self: anytype, txn: anytype, node: *const types.N
     if (!node.is_leaf) return error.ExpectedLeaf;
     if (node.members.len == 0 or node.centroid.len == 0) return 0;
     const dims: usize = @intCast(self.metadata.dims);
-    const vectors = try self.alloc.alloc(f32, node.members.len * dims);
-    defer self.alloc.free(vectors);
-    try posting.PostingStore.loadTransformedVectorsForQuantizedRefresh(self, txn, node, vectors, .{});
+    const scratch_len = try std.math.mul(usize, dims, 2);
+    var scratch_stack: [leaf_bounds_radius_vector_scratch_stack_capacity]f32 = undefined;
+    const use_scratch_stack = scratch_len <= scratch_stack.len;
+    const scratch = if (use_scratch_stack)
+        scratch_stack[0..scratch_len]
+    else
+        try self.alloc.alloc(f32, scratch_len);
+    defer if (!use_scratch_stack) self.alloc.free(scratch);
+    const raw_scratch = scratch[0..dims];
+    const transformed_scratch = scratch[dims..scratch_len];
+
     var radius: f32 = 0;
-    for (0..node.members.len) |i| {
-        const vector = vectors[i * dims ..][0..dims];
-        radius = @max(radius, vec.distance(node.centroid, vector, self.config.metric));
+    for (node.members) |member_id| {
+        const raw = try self.getVectorScratch(txn, member_id, raw_scratch);
+        const transformed = self.transformVector(raw, transformed_scratch);
+        radius = @max(radius, vec.distance(node.centroid, transformed, self.config.metric));
     }
     return radius;
 }
