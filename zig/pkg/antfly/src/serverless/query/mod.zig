@@ -168,6 +168,7 @@ pub const coalesceLakePhysicalReadsAlloc = lake_range_io.coalescePhysicalReadsAl
 pub const readLakeIcebergSnapshotInventoryAlloc = lake_iceberg_snapshot.readSnapshotInventoryAlloc;
 pub const readLakeIcebergSnapshotInventoryAndDeletePlanAlloc = lake_iceberg_snapshot.readSnapshotInventoryAndDeletePlanAlloc;
 pub const readLakeIcebergSnapshotDeletePlanAlloc = lake_iceberg_snapshot.readSnapshotDeletePlanAlloc;
+pub const pinLakeIcebergInventoryDataFileObjectVersionsAlloc = lake_iceberg_snapshot.pinInventoryDataFileObjectVersions;
 pub const readLakeIcebergPositionDeleteRowRefsAlloc = lake_iceberg_snapshot.readPositionDeleteRowRefsAlloc;
 pub const readLakeIcebergDeleteRowRefsAlloc = lake_iceberg_snapshot.readDeleteRowRefsAlloc;
 pub const lakeIcebergPositionDeleteScanResultToRowRefsAlloc = lake_iceberg_deletes.positionDeleteScanResultToRowRefsAlloc;
@@ -391,6 +392,7 @@ test "serverless query module compiles" {
     _ = readLakeIcebergSnapshotInventoryAlloc;
     _ = readLakeIcebergSnapshotInventoryAndDeletePlanAlloc;
     _ = readLakeIcebergSnapshotDeletePlanAlloc;
+    _ = pinLakeIcebergInventoryDataFileObjectVersionsAlloc;
     _ = readLakeIcebergPositionDeleteRowRefsAlloc;
     _ = readLakeIcebergDeleteRowRefsAlloc;
     _ = lakeIcebergPositionDeleteScanResultToRowRefsAlloc;

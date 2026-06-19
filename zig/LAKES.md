@@ -566,7 +566,13 @@ The concrete work left for the data-lake path is therefore:
    `lake_rows` delete filter for the supported flat scalar cell types. Equality
    delete matching now also lazily discovers data-file footers when the Iceberg
    manifest inventory has no row-group metadata yet, then rebinds matched row
-   refs back to the caller-owned pinned inventory before returning them. The
+   refs back to the caller-owned pinned inventory before returning them.
+   Iceberg data-file sequence numbers are now carried as structured inventory
+   metadata and persisted by the external-source inventory codec, so equality
+   delete applicability no longer depends on parsing synthetic object-version
+   strings. Opened object-store Iceberg sources stat active data files before
+   scanning and replace manifest-synthetic file versions with provider
+   ETag/version identity while preserving those Iceberg sequence numbers. The
    Iceberg schema planning now also fails closed when the pinned schema carries
    top-level `struct`, `list`, or `map` fields, because Antfly's current scan
    contract still resolves Parquet columns by flat names rather than Iceberg

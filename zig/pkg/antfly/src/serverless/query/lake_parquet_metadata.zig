@@ -209,6 +209,7 @@ fn cloneFileAlloc(alloc: Allocator, file: external_source.FileEntry) !external_s
         .version_id = version_id,
         .byte_len = file.byte_len,
         .row_count = file.row_count,
+        .data_sequence_number = file.data_sequence_number,
         .row_groups = row_groups,
     };
 }
@@ -236,6 +237,7 @@ fn cloneFileWithFooterAlloc(
         .version_id = version_id,
         .byte_len = file.byte_len,
         .row_count = footer.row_count,
+        .data_sequence_number = file.data_sequence_number,
         .row_groups = row_groups,
     };
 }

@@ -5170,14 +5170,16 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
             .iceberg => blk: {
                 const metadata_uri = try icebergMetadataUriForOpenedStoreAlloc(alloc, client, bucket, prefix, binding.source_uri, source_options.object_uri_base);
                 defer alloc.free(metadata_uri);
-                const snapshot = try serverless_query.readLakeIcebergSnapshotInventoryAndDeletePlanAlloc(alloc, .{
+                var snapshot = try serverless_query.readLakeIcebergSnapshotInventoryAndDeletePlanAlloc(alloc, .{
                     .client = client,
                     .source_id = binding.table_id,
                     .metadata_uri = metadata_uri,
                     .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
                     .cache = source_options.cache,
                 });
+                errdefer snapshot.inventory.deinit(alloc);
                 iceberg_delete_plan = snapshot.delete_plan;
+                try serverless_query.pinLakeIcebergInventoryDataFileObjectVersionsAlloc(alloc, client, &snapshot.inventory);
                 break :blk snapshot.inventory;
             },
             .lance => return error.UnsupportedRowsQuery,
@@ -18384,6 +18386,16 @@ test "opened object storage lake source resolves iceberg table root inventory" {
     defer data_manifest.deinit(alloc);
     var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
     defer data_manifest_put.deinit(alloc);
+    const data_a = try alloc.alloc(u8, 4096);
+    defer alloc.free(data_a);
+    @memset(data_a, 0);
+    var data_a_put = try client.putObject("bucket", "events/data/a.parquet", data_a, .{});
+    defer data_a_put.deinit(alloc);
+    const data_b = try alloc.alloc(u8, 2048);
+    defer alloc.free(data_b);
+    @memset(data_b, 0);
+    var data_b_put = try client.putObject("bucket", "events/data/b.parquet", data_b, .{});
+    defer data_b_put.deinit(alloc);
 
     const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
         alloc,
@@ -18405,6 +18417,9 @@ test "opened object storage lake source resolves iceberg table root inventory" {
     try std.testing.expectEqualStrings("12", opened_source.owned_source.inventory.snapshot_id);
     try std.testing.expectEqual(@as(usize, 2), opened_source.owned_source.inventory.files.len);
     try std.testing.expectEqualStrings("s3://bucket/events/data/a.parquet", opened_source.owned_source.inventory.files[0].object_uri);
+    try std.testing.expect(opened_source.owned_source.inventory.files[0].etag.len != 0);
+    try std.testing.expect(opened_source.owned_source.inventory.files[0].version_id.len == 0);
+    try std.testing.expectEqual(@as(?i64, 42), opened_source.owned_source.inventory.files[0].data_sequence_number);
     const pinned_state = opened_source.pinnedState();
     try std.testing.expectEqual(external_source_api.Format.iceberg, pinned_state.format);
     try std.testing.expectEqual(@as(usize, 2), pinned_state.file_count);

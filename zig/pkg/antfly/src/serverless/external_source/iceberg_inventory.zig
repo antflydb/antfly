@@ -124,6 +124,7 @@ pub fn planInventoryFromDataFilesAlloc(
             .version_id = version_id,
             .byte_len = data_file.file_size_in_bytes,
             .row_count = data_file.record_count,
+            .data_sequence_number = data_file.data_sequence_number,
             .partition_values = partition_values,
             .row_groups = &.{},
         };
@@ -356,6 +357,7 @@ test "iceberg inventory planner creates active parquet inventory" {
     try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", inventory.files[0].object_uri);
     try std.testing.expectEqual(@as(u64, 3), inventory.files[0].row_count);
     try std.testing.expectEqual(@as(u64, 4096), inventory.files[0].byte_len);
+    try std.testing.expectEqual(@as(?i64, 2), inventory.files[0].data_sequence_number);
     try std.testing.expect(std.mem.startsWith(u8, inventory.files[0].version_id, "iceberg:v1:snapshot=12:"));
     try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", inventory.files[1].file_id);
     try std.testing.expectEqual(@as(usize, 1), inventory.files[1].partition_values.len);

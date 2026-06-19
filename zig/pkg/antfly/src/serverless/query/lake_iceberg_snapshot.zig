@@ -804,7 +804,7 @@ fn equalityDeleteAppliesToRowRef(
         else => return false,
     };
     const file = inventory.fileById(external.file_id) orelse return error.ExternalSourceFileNotFound;
-    const data_sequence = try icebergDataSequenceFromFileVersion(file.version_id);
+    const data_sequence = file.data_sequence_number orelse try icebergDataSequenceFromFileVersion(file.version_id);
     return data_sequence < delete_file.data_sequence_number;
 }
 
@@ -1055,6 +1055,39 @@ fn readMaybeCachedIcebergRangeAlloc(
         return try range_cache.readAlloc(alloc, parquet_reader, read);
     }
     return try parquet_reader.readPlannedAlloc(alloc, read);
+}
+
+pub fn pinInventoryDataFileObjectVersions(
+    alloc: Allocator,
+    source_client: object_storage.ObjectStorage,
+    inventory: *external_source.Inventory,
+) !void {
+    if (inventory.format != .iceberg) return error.InvalidIcebergSnapshotRead;
+    var client = source_client;
+    client.allocator = alloc;
+    for (inventory.files) |*file| {
+        const location = try lake_range_io.objectLocationForUri(file.object_uri);
+        var meta = try client.statObject(location.bucket, location.key);
+        defer meta.deinit(alloc);
+        if (meta.content_length != file.byte_len) return error.IcebergManifestLengthMismatch;
+
+        const etag: []u8 = if (meta.etag) |value| try alloc.dupe(u8, value) else &.{};
+        errdefer if (etag.len > 0) alloc.free(etag);
+        const version_id: []u8 = if (meta.version_id) |value| try alloc.dupe(u8, value) else if (etag.len == 0) blk: {
+            break :blk try std.fmt.allocPrint(
+                alloc,
+                "object-stat:v1:uri={s}:len={d}",
+                .{ file.object_uri, meta.content_length },
+            );
+        } else &.{};
+        errdefer if (version_id.len > 0) alloc.free(version_id);
+
+        if (file.etag.len > 0) alloc.free(file.etag);
+        if (file.version_id.len > 0) alloc.free(file.version_id);
+        file.etag = etag;
+        file.version_id = version_id;
+    }
+    try inventory.validate();
 }
 
 fn objectVersionForMetadataAlloc(
@@ -1546,6 +1579,7 @@ test "iceberg snapshot reader discovers data footers for equality deletes" {
         .version_id = try alloc.dupe(u8, "iceberg:v1:data_seq=5:file_seq=6"),
         .byte_len = data_object.len,
         .row_count = 3,
+        .data_sequence_number = 5,
         .row_groups = &.{},
     };
 
