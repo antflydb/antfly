@@ -2681,6 +2681,8 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
         error.InvalidExtensionEnrichment,
+        error.InvalidEnrichmentConfig,
+        error.ConflictingEnrichmentConfig,
         error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
         error.EmptyName,

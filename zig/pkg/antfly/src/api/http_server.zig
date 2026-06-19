@@ -7090,6 +7090,8 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
         error.InvalidExtensionEnrichment,
+        error.InvalidEnrichmentConfig,
+        error.ConflictingEnrichmentConfig,
         error.InvalidExtensionLifecycleRequest,
         error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
@@ -7404,6 +7406,7 @@ fn planExtensionStorageMemberDeltaAlloc(
         }
 
         if (!changed) continue;
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, owned_indexes_json.?);
         var updated_record = try metadata_table_manager.cloneTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, updated_record);
         alloc.free(@constCast(updated_record.indexes_json));
@@ -9696,6 +9699,52 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual_embed\"") != null);
     try std.testing.expectEqual(@as(usize, 1), service.installed_removes);
     try std.testing.expectEqual(@as(usize, 2), service.member_removes);
+}
+
+test "extension lifecycle storage delta validates artifact enrichment dependencies" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"document_units_v1\",\"chunk_size\":512}]}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const source_only = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "docaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .enrichment,
+        .object_name = "document_units_v1",
+        .table_name = "docs",
+    }};
+
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        planExtensionStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, source_only[0..], &.{}),
+    );
+
+    const source_and_dependent = [_]extension_domain.ExtensionMember{
+        source_only[0],
+        .{
+            .extension_name = "docaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .enrichment,
+            .object_name = "document_chunks_v1",
+            .table_name = "docs",
+        },
+    };
+    const updates = try planExtensionStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, source_and_dependent[0..], &.{});
+    defer freeExtensionLifecycleTables(std.testing.allocator, updates);
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_units_v1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_chunks_v1") == null);
 }
 
 test "direct index deletion rejects extension-owned indexes" {
