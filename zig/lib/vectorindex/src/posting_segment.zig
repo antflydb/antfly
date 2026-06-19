@@ -779,13 +779,15 @@ pub const Catalog = struct {
             var reader = try Reader.init(segment.data);
             const range = try reader.deltasWithCount(posting_id);
             if (range.count == 0) continue;
+            if (all_segment_records_after_generation) {
+                try records.ensureUnusedCapacity(alloc, try deltaIteratorAllRecordCount(range));
+                try appendDeltaIteratorAllRecordsAssumeCapacity(range, records);
+                continue;
+            }
             var iter = range.iterator;
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
-                if (all_segment_records_after_generation) {
-                    try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
-                    while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
-                } else if (min_generation) |generation| {
+                if (min_generation) |generation| {
                     if (posting.PostingFormat.deltaSequenceGeneration(delta_value.sequence) > generation) {
                         try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
                         while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
@@ -820,13 +822,15 @@ pub const Catalog = struct {
             var reader = try Reader.init(segment.data);
             const range = try reader.deltasWithCount(posting_id);
             if (range.count == 0) continue;
+            if (all_segment_records_after_generation) {
+                try ensureDeltaRecordAppendCapacity(alloc, scratch, try deltaIteratorAllRecordCount(range));
+                try appendDeltaIteratorAllRecordsIntoScratchAssumeCapacity(range, scratch);
+                continue;
+            }
             var iter = range.iterator;
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
-                if (all_segment_records_after_generation) {
-                    try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
-                    while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
-                } else if (min_generation) |generation| {
+                if (min_generation) |generation| {
                     if (posting.PostingFormat.deltaSequenceGeneration(delta_value.sequence) > generation) {
                         try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
                         while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
@@ -4615,6 +4619,38 @@ fn appendDeltaValueAllRecordsAlloc(
     var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
     try records.ensureUnusedCapacity(alloc, iterator.recordCount());
     while (try iterator.next()) |record| records.appendAssumeCapacity(record);
+}
+
+fn deltaIteratorAllRecordCount(range: DeltaIteratorWithCount) !usize {
+    var record_count: usize = 0;
+    var iter = range.iterator;
+    while (try iter.next()) |delta_value| {
+        var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
+        record_count = try std.math.add(usize, record_count, delta_iter.recordCount());
+    }
+    return record_count;
+}
+
+fn appendDeltaIteratorAllRecordsAssumeCapacity(
+    range: DeltaIteratorWithCount,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+) !void {
+    var iter = range.iterator;
+    while (try iter.next()) |delta_value| {
+        var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
+        while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
+    }
+}
+
+fn appendDeltaIteratorAllRecordsIntoScratchAssumeCapacity(
+    range: DeltaIteratorWithCount,
+    scratch: anytype,
+) !void {
+    var iter = range.iterator;
+    while (try iter.next()) |delta_value| {
+        var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
+        while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
+    }
 }
 
 fn readDeltaValueRangeAllRecordsOwnedAlloc(
