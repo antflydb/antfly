@@ -26,6 +26,7 @@ const primary_mod = @import("primary.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
+const validation = @import("validation.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -708,7 +709,7 @@ fn validateActionReceipt(
     if (receipt.action_id.len == 0) return err;
     if (!std.mem.eql(u8, receipt.action_kind, expected_kind)) return err;
     if (!receiptStateMatches(receipt.state, expected_state)) return err;
-    if (receipt.target.len == 0 or receipt.node_id.len == 0) return err;
+    if (receipt.target.len == 0 or !validation.isIdentifier(receipt.node_id)) return err;
     if (expected_target) |target| {
         if (!std.mem.eql(u8, receipt.target, target)) return err;
         if (!std.mem.startsWith(u8, receipt.action_id, expected_kind)) return err;
@@ -729,7 +730,7 @@ fn validateIdentity(identity: admin_api.HAIdentity, err: anyerror) !void {
 }
 
 fn validateReplicationSlot(slot: admin_api.HAReplicationSlot) !void {
-    if (slot.slot_name.len == 0) return error.AdminReplicationSlotResponseMismatch;
+    if (!validation.isIdentifier(slot.slot_name)) return error.AdminReplicationSlotResponseMismatch;
     if (slot.timeline_id <= 0) return error.AdminReplicationSlotResponseMismatch;
     if (slot.restart_lsn < 0 or slot.received_lsn < 0 or slot.applied_lsn < 0 or slot.safe_read_lsn < 0 or slot.current_lsn < 0) {
         return error.AdminReplicationSlotResponseMismatch;
@@ -787,7 +788,7 @@ fn validateStandbyBootstrapResponse(response: admin_api.HAStandbyBootstrapRespon
 
 fn validateFenceReceipt(receipt: admin_api.HAFenceReceipt) !void {
     try validateIdentity(receipt.identity, error.AdminFenceResponseMismatch);
-    if (receipt.old_primary_id.len == 0 or receipt.promoted_node_id.len == 0 or receipt.token.len == 0) {
+    if (!validation.isIdentifier(receipt.old_primary_id) or !validation.isIdentifier(receipt.promoted_node_id) or receipt.token.len == 0) {
         return error.AdminFenceResponseMismatch;
     }
     if (receipt.parent_timeline_id <= 0 or receipt.parent_epoch <= 0 or receipt.new_timeline_id <= 0 or receipt.new_epoch <= 0) {
@@ -876,6 +877,9 @@ fn validateOwnerJobCheckResponse(response: admin_api.HAOwnerJobCheckResponse) !v
 fn validatePromotionAssessResponse(response: admin_api.HAPromotionAssessResponse, request: admin_api.PromotionAssessRequest) !void {
     try validateSchemaVersion(response.schema_version, error.AdminPromotionResponseMismatch);
     try validateActionReceipt(response.action, "promotion_assess", "assessed", null, error.AdminPromotionResponseMismatch);
+    if (!validation.isIdentifier(response.action.target) or !std.mem.eql(u8, response.action.target, response.action.node_id)) {
+        return error.AdminPromotionResponseMismatch;
+    }
     if (response.assessment.required_lsn < 0 or response.assessment.received_lsn < 0 or response.assessment.applied_lsn < 0) {
         return error.AdminPromotionResponseMismatch;
     }
@@ -969,6 +973,7 @@ fn validatePromotionResponse(
     request: ?admin_api.FenceAcquireRequest,
 ) !void {
     if (response.schema_version <= 0) return error.AdminPromotionResponseMismatch;
+    if (!validation.isIdentifier(response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
     try validateActionReceipt(response.action, "promotion", "applied", response.promotion.node_id, error.AdminPromotionResponseMismatch);
     if (!std.mem.eql(u8, response.action.target, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
     if (!std.mem.eql(u8, response.action.node_id, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
@@ -1054,6 +1059,7 @@ fn validateRejoinResponse(
     }
 
     const assessment = response.assessment;
+    if (!validation.isIdentifier(assessment.former_node_id)) return error.AdminRejoinResponseMismatch;
     if (!std.mem.eql(u8, assessment.former_node_id, request.node_id)) {
         return error.AdminRejoinResponseMismatch;
     }
@@ -1094,6 +1100,7 @@ fn validateRejoinResponse(
         .rewind => {
             const rewind = response.rewind orelse return error.AdminRejoinResponseMismatch;
             if (response.reseed != null) return error.AdminRejoinResponseMismatch;
+            if (!validation.isIdentifier(rewind.node_id)) return error.AdminRejoinResponseMismatch;
             if (!std.mem.eql(u8, rewind.node_id, request.node_id)) return error.AdminRejoinResponseMismatch;
             if (rewind.fork_lsn != assessment.fork_lsn) return error.AdminRejoinResponseMismatch;
             if (rewind.previous_last_lsn != assessment.former_last_lsn) return error.AdminRejoinResponseMismatch;
@@ -1104,6 +1111,7 @@ fn validateRejoinResponse(
         .reseed => {
             const reseed = response.reseed orelse return error.AdminRejoinResponseMismatch;
             if (response.rewind != null) return error.AdminRejoinResponseMismatch;
+            if (!validation.isIdentifier(reseed.node_id) or !validation.isIdentifier(reseed.slot_name)) return error.AdminRejoinResponseMismatch;
             if (!std.mem.eql(u8, reseed.node_id, request.node_id)) return error.AdminRejoinResponseMismatch;
             if (!std.mem.eql(u8, reseed.slot_name, request.node_id)) return error.AdminRejoinResponseMismatch;
             if (reseed.target_timeline_id != assessment.target_timeline_id) return error.AdminRejoinResponseMismatch;
@@ -2082,6 +2090,32 @@ test "storage.ha http client rejects invalid typed admin responses" {
     {
         var executor = StaticJsonExecutor{
             .body =
+            \\{"schema_version":1,"slots":[{"slot_name":"standby a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"current_lsn":0}]}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(
+            error.AdminReplicationSlotResponseMismatch,
+            client.listReplicationSlots("http://ha-admin.test"),
+        );
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary a"},"slot_action":"create","slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"current_lsn":0}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(
+            error.AdminReplicationSlotResponseMismatch,
+            client.createReplicationSlot("http://ha-admin.test", "standby-a", 0),
+        );
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
             \\{"schema_version":1,"action":{"action_id":"base_backup_begin:base-a","action_kind":"base_backup_begin","target":"base-a","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-a","backup_lsn":0,"start_record_lsn":1}
             ,
         };
@@ -2100,6 +2134,31 @@ test "storage.ha http client rejects invalid typed admin responses" {
         };
         var client = Client.init(alloc, executor.executor());
         try std.testing.expectError(error.AdminFenceResponseMismatch, client.currentFence("http://ha-admin.test"));
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"held":true,"receipt":{"identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"old_primary_id":"primary a","promoted_node_id":"standby-a","parent_timeline_id":1,"parent_epoch":1,"new_timeline_id":2,"new_epoch":2,"required_lsn":1,"observed_lsn":1,"generation":1,"forced":false,"token":"token","reason":""}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(error.AdminFenceResponseMismatch, client.currentFence("http://ha-admin.test"));
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a ","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":0,"received_lsn":0,"applied_lsn":0,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(error.AdminPromotionResponseMismatch, client.assessPromotion("http://ha-admin.test", .{
+            .required_lsn = 0,
+            .fencing_confirmed = true,
+            .force = false,
+            .use_current_fence = false,
+        }));
     }
 
     {
