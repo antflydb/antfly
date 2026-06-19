@@ -1474,7 +1474,6 @@ fn serveUnifiedInner(
     // Internal group routes are still served by the legacy ApiHttpServer
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
-    try registerPublicArtifactRoutes(&server);
     try registerMcpRoutes(&server);
     try registerExtensionRoutes(&server);
     try registerInternalGroupRoutes(&server);
@@ -1559,35 +1558,11 @@ fn registerExtensionRoutes(server: anytype) !void {
     }
 }
 
-fn registerPublicArtifactRoutes(server: anytype) !void {
-    const route = "/db/v1" ++ antfly.public_api.http_routes.Routes.tables_prefix ++ ":table_name" ++ antfly.public_api.http_routes.Routes.artifacts_marker ++ ":artifact_name" ++ antfly.public_api.http_routes.Routes.enrichment_suffix;
-    try server.put(route, publicBridgeHandler);
-    try server.delete(route, publicBridgeHandler);
-}
-
 fn registerAntfarmRoutes(server: anytype) !void {
     try server.get("/", antfarmIndexHandler);
     try server.get("/assets/*", antfarmAssetHandler);
     try server.get("/fonts/*", antfarmFontHandler);
     try server.get("/*", antfarmSpaHandler);
-}
-
-fn publicBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-    const server = active_api_server orelse {
-        _ = ctx.status(503);
-        return ctx.text("not ready");
-    };
-
-    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
-        error.UnsupportedMethod => {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        },
-        else => return err,
-    };
-
-    var resp = try server.handle(legacy_req);
-    return AntflyApiHandler.respond(ctx, &resp);
 }
 
 fn antfarmIndexHandler(ctx: *httpx.Context) anyerror!httpx.Response {
