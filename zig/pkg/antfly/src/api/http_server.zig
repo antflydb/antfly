@@ -2431,7 +2431,8 @@ pub const ApiHttpServer = struct {
         };
         const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
         defer self.alloc.free(resource_name);
-        try self.applyRowsQueryRequestRowFilterForDatabase(target.database_name, resource_name, authenticated_identity, schema, &query_plan.query);
+        const identity = if (authenticated_identity) |value| value.* else null;
+        try self.applyRowsQueryRequestRowFilterForDatabase(target.database_name, resource_name, identity, schema, &query_plan.query);
         defer self.deinitRowsAuthFilterQueryAdditions(&query_plan.query);
 
         var result = (try source.rowsQueryPlanCatalog(self.alloc, target, schema, query_plan, .read_index)) orelse return error.TableNotFound;
@@ -17390,9 +17391,16 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     try std.testing.expectEqualStrings("ready", first_row.value.object.get("status_key").?.string);
 
     const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
-    errdefer alloc.free(row_filters);
+    var row_filters_transferred = false;
+    var row_filter_initialized = false;
+    errdefer if (!row_filters_transferred) {
+        if (row_filter_initialized) row_filters[0].deinit(alloc);
+        alloc.free(row_filters);
+    };
     row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "tenant_ops.analytics.events", "{\"term\":{\"status\":\"Ready\"}}");
+    row_filter_initialized = true;
     identity.row_filter = row_filters;
+    row_filters_transferred = true;
 
     try std.testing.expectError(
         error.PermissionDenied,
