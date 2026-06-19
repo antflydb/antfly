@@ -59870,8 +59870,8 @@ test "app parity fixture metadata requires typed summary anchors" {
         .name = "unsupported family plan mismatch",
         .sql = "DELETE FROM usage_records WHERE status = 'closed'",
         .family = .unsupported_delete,
-        .classification_reason = "non_unique_point_selector",
-        .plan = "unsupported:update:requires=non_unique_point_selector",
+        .classification_reason = "multi_output_subquery_delete_selector",
+        .plan = "unsupported:update:requires=multi_output_subquery_delete_selector",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -59903,8 +59903,8 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "DELETE FROM usage_records WHERE status = 'closed'",
         .family = .unsupported_delete,
         .summary = .{ .table_name = "usage_records", .predicates = 1 },
-        .classification_reason = "non_unique_point_selector",
-        .plan = "unsupported:delete:requires=non_unique_point_selector",
+        .classification_reason = "multi_output_subquery_delete_selector",
+        .plan = "unsupported:delete:requires=multi_output_subquery_delete_selector",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
