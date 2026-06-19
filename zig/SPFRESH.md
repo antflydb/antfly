@@ -139,7 +139,10 @@ Current status:
   temporary-file cleanup now track live canonical basenames and delete through
   the opened postings directory, and manifest temp matching compares entry names
   against the configured manifest basename in place, avoiding per-file path
-  allocation while scanning maintenance directories.
+  allocation while scanning maintenance directories. Lazy segment base-data
+  batch reads also use stack-backed newest-segment tracking for small unsorted
+  manifests, so recovery/fallback snapshots do not allocate an extra segment-id
+  array just to resolve winners.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and

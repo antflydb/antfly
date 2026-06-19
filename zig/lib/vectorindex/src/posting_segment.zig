@@ -42,6 +42,7 @@ const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
 const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const base_data_batch_bulk_read_max_bytes: usize = 1024 * 1024;
 const base_data_batch_bulk_read_max_gap_bytes: usize = 16 * 1024;
+const base_data_batch_best_segment_stack_capacity: usize = 512;
 const base_data_batch_unresolved_stack_capacity: usize = 512;
 const base_data_batch_point_read_stack_capacity: usize = 512;
 const writer_value_offsets_stack_capacity: usize = 512;
@@ -888,12 +889,17 @@ pub const LazyDirectorySnapshot = struct {
         if (posting_ids.len == 0) return out;
 
         const sorted_by_segment_id = self.manifest.segments_sorted_by_segment_id;
+        var best_segment_ids_stack: [base_data_batch_best_segment_stack_capacity]u64 = undefined;
+        const use_best_segment_ids_stack = !sorted_by_segment_id and posting_ids.len <= best_segment_ids_stack.len;
         var best_segment_ids: []u64 = &.{};
         if (!sorted_by_segment_id) {
-            best_segment_ids = try alloc.alloc(u64, posting_ids.len);
+            best_segment_ids = if (use_best_segment_ids_stack)
+                best_segment_ids_stack[0..posting_ids.len]
+            else
+                try alloc.alloc(u64, posting_ids.len);
             @memset(best_segment_ids, 0);
         }
-        defer if (!sorted_by_segment_id) alloc.free(best_segment_ids);
+        defer if (!sorted_by_segment_id and !use_best_segment_ids_stack) alloc.free(best_segment_ids);
 
         var unresolved_stack: [base_data_batch_unresolved_stack_capacity]usize = undefined;
         const use_unresolved_stack = sorted_by_segment_id and posting_ids.len <= unresolved_stack.len;
