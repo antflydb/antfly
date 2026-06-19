@@ -297,17 +297,22 @@ pub fn searchJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     try writer.writer.writeAll("{\"results\":[");
     var first = true;
     var matched: usize = 0;
-    try writeMatchedEntries(alloc, &writer.writer, options, &first, request.text, request.filter, request.page_size, &matched);
+    try writeMatchedEntries(alloc, &writer.writer, options, &first, request.text, request.filter, request.page_start, request.page_size, &matched);
     if (options.mode == .tenant) {
-        try writeSearchAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, request.page_size, &matched);
-        try writeSearchCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, request.page_size, &matched);
-        if (extension_context) |ctx| try writeMatchedExtensionEntries(alloc, &writer.writer, options, &first, ctx, request.text, request.filter, request.page_size, &matched);
+        try writeSearchAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, request.page_start, request.page_size, &matched);
+        try writeSearchCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, request.text, request.filter, request.page_start, request.page_size, &matched);
+        if (extension_context) |ctx| try writeMatchedExtensionEntries(alloc, &writer.writer, options, &first, ctx, request.text, request.filter, request.page_start, request.page_size, &matched);
     }
     try writer.writer.writeAll("],\"federation\":");
     try std.json.Stringify.value(request.federation.name(), .{}, &writer.writer);
     if (request.federation.includesReferrals()) try writer.writer.writeAll(",\"referrals\":[]");
     try writer.writer.writeAll(",\"count\":");
     try writer.writer.print("{d}", .{matched});
+    const page_end = request.page_start + request.page_size;
+    if (matched > page_end) {
+        try writer.writer.writeAll(",\"pageToken\":");
+        try writeStringFmt(&writer.writer, "{d}", .{page_end});
+    }
     try writer.writer.writeByte('}');
     return try writer.toOwnedSlice();
 }
@@ -436,6 +441,7 @@ const SearchRequest = struct {
     text: ?[]const u8 = null,
     filter: ?std.json.Value = null,
     federation: FederationMode = .auto,
+    page_start: usize = 0,
     page_size: usize = default_page_size,
     facet_fields: [max_facets][]const u8 = undefined,
     facet_field_count: usize = 0,
@@ -527,6 +533,7 @@ fn parseSearchRequest(alloc: std.mem.Allocator, body: []const u8) !SearchRequest
     var request: SearchRequest = .{ .parsed = parsed };
     if (parsed.value.object.get("federation")) |value| request.federation = try FederationMode.parse(value);
     if (parsed.value.object.get("pageSize")) |value| request.page_size = try parsePageSize(value);
+    if (parsed.value.object.get("pageToken")) |value| request.page_start = try parsePageToken(value);
     try parseFacetFields(&request, parsed.value);
     const query = parsed.value.object.get("query") orelse return request;
     if (query != .object) return error.InvalidArdSearchRequest;
@@ -540,6 +547,19 @@ fn parseSearchRequest(alloc: std.mem.Allocator, body: []const u8) !SearchRequest
         if (value != .object) return error.InvalidArdSearchRequest;
     }
     return request;
+}
+
+fn parsePageToken(value: std.json.Value) !usize {
+    return switch (value) {
+        .string => |token| {
+            if (token.len == 0) return error.InvalidArdSearchRequest;
+            const parsed = std.fmt.parseUnsigned(usize, token, 10) catch return error.InvalidArdSearchRequest;
+            if (parsed > std.math.maxInt(usize) - SearchRequest.max_page_size) return error.InvalidArdSearchRequest;
+            return parsed;
+        },
+        .null => 0,
+        else => error.InvalidArdSearchRequest,
+    };
 }
 
 fn parsePageSize(value: std.json.Value) !usize {
@@ -753,21 +773,22 @@ fn writeMatchedEntries(
     first: *bool,
     text: ?[]const u8,
     filter: ?std.json.Value,
+    page_start: usize,
     page_size: usize,
     matched: *usize,
 ) !void {
     for (static_entries) |entry| {
-        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, page_size, matched, text);
+        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, page_start, page_size, matched, text);
     }
     if (options.mode == .tenant) {
         for (tenant_entries) |entry| {
-            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, page_size, matched, text);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, page_start, page_size, matched, text);
         }
         var parsed_skills = try parseDefaultSkills(alloc);
         defer parsed_skills.deinit();
         for (parsed_skills.value) |skill| {
             const entry = try defaultSkillEntry(skill);
-            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, page_size, matched, text);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options, first, entry, page_start, page_size, matched, text);
         }
     }
 }
@@ -843,6 +864,7 @@ fn writeMatchedExtensionEntries(
     ctx: ExtensionCatalogContext,
     text: ?[]const u8,
     filter: ?std.json.Value,
+    page_start: usize,
     page_size: usize,
     matched: *usize,
 ) !void {
@@ -860,24 +882,24 @@ fn writeMatchedExtensionEntries(
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
                     extensionPackageEntryMatches(package.*, package_capabilities, text, filter, options.publisher_domain))
                 {
-                    try writeSearchExtensionPackageEntry(writer, options, first, package.*, page_size, matched, text);
+                    try writeSearchExtensionPackageEntry(writer, options, first, package.*, page_start, page_size, matched, text);
                 }
             }
         }
         if (has_visible_skill) {
-            try writeSearchExtensionSkillEntries(alloc, writer, options, first, ctx, installed, page_size, matched, text, filter);
+            try writeSearchExtensionSkillEntries(alloc, writer, options, first, ctx, installed, page_start, page_size, matched, text, filter);
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp or has_visible_skill) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             installedExtensionEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
         {
-            try writeSearchInstalledExtensionEntry(writer, options, first, installed, page_size, matched, text);
+            try writeSearchInstalledExtensionEntry(writer, options, first, installed, page_start, page_size, matched, text);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
                 extensionMcpEntryMatches(installed, installed_capabilities, text, filter, options.publisher_domain))
             {
-                try writeSearchExtensionMcpEntry(writer, options, first, installed, page_size, matched, text);
+                try writeSearchExtensionMcpEntry(writer, options, first, installed, page_start, page_size, matched, text);
             }
         }
     }
@@ -936,12 +958,13 @@ fn writeSearchAggregateMcpEntry(
     extension_context: ?ExtensionCatalogContext,
     text: ?[]const u8,
     filter: ?std.json.Value,
+    page_start: usize,
     page_size: usize,
     matched: *usize,
 ) !void {
     if (!(try aggregateMcpVisible(alloc, extension_context))) return;
     if (!catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry) or !entryMatches(aggregate_mcp_entry, options.publisher_domain, text, filter)) return;
-    try writeSearchEntry(writer, options, first, aggregate_mcp_entry, page_size, matched, text);
+    try writeSearchEntry(writer, options, first, aggregate_mcp_entry, page_start, page_size, matched, text);
 }
 
 fn writeAgentAggregateMcpEntry(
@@ -995,12 +1018,13 @@ fn writeSearchCopilotMcpProfileEntry(
     extension_context: ?ExtensionCatalogContext,
     text: ?[]const u8,
     filter: ?std.json.Value,
+    page_start: usize,
     page_size: usize,
     matched: *usize,
 ) !void {
     if (!(try copilotMcpProfileVisible(alloc, extension_context))) return;
     if (!catalogOptionsAllowStaticEntry(options, copilot_mcp_profile_entry) or !entryMatches(copilot_mcp_profile_entry, options.publisher_domain, text, filter)) return;
-    try writeSearchEntry(writer, options, first, copilot_mcp_profile_entry, page_size, matched, text);
+    try writeSearchEntry(writer, options, first, copilot_mcp_profile_entry, page_start, page_size, matched, text);
 }
 
 fn writeAgentCopilotMcpProfileEntry(
@@ -1068,8 +1092,8 @@ fn writeExtensionSkillEntry(
     try writer.writeByte('}');
 }
 
-fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension, page_size: usize, matched: *usize, text: ?[]const u8) !void {
-    if (!recordSearchMatch(page_size, matched)) return;
+fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension, page_start: usize, page_size: usize, matched: *usize, text: ?[]const u8) !void {
+    if (!recordSearchMatch(page_start, page_size, matched)) return;
     if (first.*) {
         first.* = false;
     } else {
@@ -1082,8 +1106,8 @@ fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, options: CatalogOp
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
 }
 
-fn writeSearchExtensionPackageEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, package: extension_domain.PackageManifest, page_size: usize, matched: *usize, text: ?[]const u8) !void {
-    if (!recordSearchMatch(page_size, matched)) return;
+fn writeSearchExtensionPackageEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, package: extension_domain.PackageManifest, page_start: usize, page_size: usize, matched: *usize, text: ?[]const u8) !void {
+    if (!recordSearchMatch(page_start, page_size, matched)) return;
     if (first.*) {
         first.* = false;
     } else {
@@ -1103,11 +1127,12 @@ fn writeSearchExtensionSkillEntry(
     installed: extension_domain.InstalledExtension,
     member: extension_domain.ExtensionMember,
     skill: ParsedExtensionSkill,
+    page_start: usize,
     page_size: usize,
     matched: *usize,
     text: ?[]const u8,
 ) !void {
-    if (!recordSearchMatch(page_size, matched)) return;
+    if (!recordSearchMatch(page_start, page_size, matched)) return;
     if (first.*) {
         first.* = false;
     } else {
@@ -1120,8 +1145,8 @@ fn writeSearchExtensionSkillEntry(
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
 }
 
-fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension, page_size: usize, matched: *usize, text: ?[]const u8) !void {
-    if (!recordSearchMatch(page_size, matched)) return;
+fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, installed: extension_domain.InstalledExtension, page_start: usize, page_size: usize, matched: *usize, text: ?[]const u8) !void {
+    if (!recordSearchMatch(page_start, page_size, matched)) return;
     if (first.*) {
         first.* = false;
     } else {
@@ -1184,6 +1209,7 @@ fn writeSearchExtensionSkillEntries(
     first: *bool,
     ctx: ExtensionCatalogContext,
     installed: extension_domain.InstalledExtension,
+    page_start: usize,
     page_size: usize,
     matched: *usize,
     text: ?[]const u8,
@@ -1196,7 +1222,7 @@ fn writeSearchExtensionSkillEntries(
         var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
         defer skill.deinit();
         if (!extensionSkillAllowedAndMatches(options, installed, member, skill, text, filter)) continue;
-        try writeSearchExtensionSkillEntry(writer, options, first, installed, member, skill, page_size, matched, text);
+        try writeSearchExtensionSkillEntry(writer, options, first, installed, member, skill, page_start, page_size, matched, text);
     }
 }
 
@@ -2203,11 +2229,12 @@ fn writeSearchEntry(
     options: CatalogOptions,
     first: *bool,
     entry: Entry,
+    page_start: usize,
     page_size: usize,
     matched: *usize,
     text: ?[]const u8,
 ) !void {
-    if (!recordSearchMatch(page_size, matched)) return;
+    if (!recordSearchMatch(page_start, page_size, matched)) return;
     if (first.*) {
         first.* = false;
     } else {
@@ -2216,9 +2243,9 @@ fn writeSearchEntry(
     try entry.writeSearchResult(writer, options, if (text == null or text.?.len == 0) 100 else 90);
 }
 
-fn recordSearchMatch(page_size: usize, matched: *usize) bool {
+fn recordSearchMatch(page_start: usize, page_size: usize, matched: *usize) bool {
     matched.* += 1;
-    return matched.* <= page_size;
+    return matched.* > page_start and matched.* <= page_start + page_size;
 }
 
 fn entryMatches(entry: Entry, publisher_domain: []const u8, text: ?[]const u8, filter: ?std.json.Value) bool {
@@ -2843,10 +2870,21 @@ test "ARD search validates federation and returns referral envelope" {
     defer paged_parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), paged_parsed.value.object.get("results").?.array.items.len);
     try std.testing.expect(paged_parsed.value.object.get("count").?.integer > 2);
+    try std.testing.expectEqualStrings("2", paged_parsed.value.object.get("pageToken").?.string);
+
+    const next_page_body = try searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"Antfly\"},\"federation\":\"none\",\"pageSize\":2,\"pageToken\":\"2\"}", false);
+    defer std.testing.allocator.free(next_page_body);
+
+    var next_page_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, next_page_body, .{});
+    defer next_page_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), next_page_parsed.value.object.get("results").?.array.items.len);
+    try std.testing.expectEqual(paged_parsed.value.object.get("count").?.integer, next_page_parsed.value.object.get("count").?.integer);
 
     try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"recursive\"}", false));
     try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"retrieval\"},\"pageSize\":0}", false));
     try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"retrieval\"},\"pageSize\":101}", false));
+    try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"retrieval\"},\"pageToken\":2}", false));
+    try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"retrieval\"},\"pageToken\":\"not-a-token\"}", false));
 }
 
 test "ARD explore returns requested facet buckets over scoped entries" {
