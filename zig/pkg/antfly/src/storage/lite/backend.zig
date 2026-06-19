@@ -17,6 +17,7 @@ const db_mod = @import("../db/db.zig");
 const backend_erased = @import("../backend_erased.zig");
 const bridge = @import("bridge.zig");
 const docstore = @import("docstore.zig");
+const index_storage = @import("index_storage.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -57,6 +58,7 @@ pub const Handle = struct {
     engine: EngineKind,
     bridge_storage: ?*bridge.ContainerStorage = null,
     native_docstore: ?*docstore.Store = null,
+    native_index_storage: ?*index_storage.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
@@ -82,6 +84,10 @@ pub const Handle = struct {
                 }
             },
             .native_single_file => {
+                if (self.native_index_storage) |storage| {
+                    self.allocator.destroy(storage);
+                    self.native_index_storage = null;
+                }
                 if (self.native_runtime_store) |runtime_store| {
                     runtime_store.deinit();
                     self.allocator.destroy(runtime_store);
@@ -111,6 +117,20 @@ pub const Handle = struct {
             .native_single_file => {
                 opts.primary_backend = .{ .mem = .{} };
                 opts.primary_runtime_store = self.native_runtime_store.?;
+                const storage = self.native_index_storage.?.storage();
+                opts.index_backends.text_main_backend = .lsm;
+                opts.index_backends.dense_storage_backend = .lsm;
+                opts.index_backends.sparse_backend = .lsm;
+                opts.index_backends.graph_reverse_backend = .lsm;
+                opts.index_backends.text_lsm_storage = storage;
+                opts.index_backends.dense_lsm_storage = storage;
+                opts.index_backends.sparse_lsm_storage = storage;
+                opts.index_backends.graph_lsm_storage = storage;
+                opts.index_backends.text_main_lsm_options.storage = storage;
+                opts.index_backends.text_wal_lsm_options.storage = storage;
+                opts.index_backends.dense_lsm_options.storage = storage;
+                opts.index_backends.sparse_lsm_options.storage = storage;
+                opts.index_backends.graph_reverse_lsm_options.storage = storage;
                 opts.external_derived_checkpoints = false;
             },
         }
@@ -154,6 +174,10 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     store.* = try docstore.Store.open(allocator, path, opts.read_only);
     errdefer store.close();
 
+    const native_index_storage = try allocator.create(index_storage.Store);
+    errdefer allocator.destroy(native_index_storage);
+    native_index_storage.* = index_storage.Store.init(allocator, store);
+
     const runtime_store = try allocator.create(backend_erased.Store);
     errdefer allocator.destroy(runtime_store);
 
@@ -164,6 +188,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         .allocator = allocator,
         .engine = .native_single_file,
         .native_docstore = store,
+        .native_index_storage = native_index_storage,
         .native_runtime_store = runtime_store,
     };
 }
@@ -241,6 +266,14 @@ test "lite backend native engine creates and checks aflite file" {
     try handle.configureDbOpenOptions(&db_opts);
     try std.testing.expect(db_opts.primary_runtime_store != null);
     try std.testing.expect(db_opts.primary_backend == .mem);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.text_main_backend), .lsm), db_opts.index_backends.text_main_backend);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .lsm), db_opts.index_backends.dense_storage_backend);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .lsm), db_opts.index_backends.sparse_backend);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.graph_reverse_backend), .lsm), db_opts.index_backends.graph_reverse_backend);
+    try std.testing.expect(db_opts.index_backends.text_lsm_storage != null);
+    try std.testing.expect(db_opts.index_backends.dense_lsm_storage != null);
+    try std.testing.expect(db_opts.index_backends.sparse_lsm_storage != null);
+    try std.testing.expect(db_opts.index_backends.graph_lsm_storage != null);
 
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(report.file_size, vacuumed.before_size);

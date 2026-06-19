@@ -5884,7 +5884,21 @@ pub const IndexManager = struct {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
-            .dense_vector, .sparse_vector, .graph => try ensureIndexDir(self.alloc, self.base_path, path),
+            .dense_vector => {
+                if (self.dense_lsm_storage == null) {
+                    try ensureIndexDir(self.alloc, self.base_path, path);
+                }
+            },
+            .sparse_vector => {
+                if (self.sparse_lsm_storage == null) {
+                    try ensureIndexDir(self.alloc, self.base_path, path);
+                }
+            },
+            .graph => {
+                if (self.graph_lsm_storage == null) {
+                    try ensureIndexDir(self.alloc, self.base_path, path);
+                }
+            },
             .algebraic => {},
         }
     }
@@ -6262,7 +6276,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(forward_path);
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
-                const reverse_store_missing = if (comptime builtin.os.tag == .freestanding) true else blk: {
+                const reverse_store_missing = if (self.graph_lsm_storage != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
                     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {

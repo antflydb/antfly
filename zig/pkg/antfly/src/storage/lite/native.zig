@@ -46,6 +46,9 @@ pub const PageKind = enum(u8) {
     value = 4,
 };
 
+const catalog_key_len_mask: u32 = 0x00ff_ffff;
+const catalog_delete_flag: u32 = 1 << 31;
+const catalog_external_value_flag: u32 = 1 << 30;
 const document_delete_flag: u8 = 1 << 0;
 const document_external_value_flag: u8 = 1 << 1;
 const value_page_header_size: usize = 8;
@@ -54,6 +57,9 @@ pub const CatalogEntry = struct {
     previous_page: u64,
     key: []const u8,
     value: []const u8,
+    is_delete: bool = false,
+    external_value_root_page: u64 = 0,
+    external_value_len: usize = 0,
 };
 
 pub const DocumentEntry = struct {
@@ -71,6 +77,12 @@ const ValuePage = struct {
 };
 
 pub const DocumentMutation = struct {
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+};
+
+pub const CatalogMutation = struct {
     key: []const u8,
     value: []const u8 = "",
     is_delete: bool = false,
@@ -252,21 +264,51 @@ pub const NativeFile = struct {
     }
 
     pub fn putCatalogRecord(self: *NativeFile, key: []const u8, value: []const u8) !void {
+        try self.putCatalogBatch(&.{.{ .key = key, .value = value }});
+    }
+
+    pub fn deleteCatalogRecord(self: *NativeFile, key: []const u8) !void {
+        try self.putCatalogBatch(&.{.{ .key = key, .is_delete = true }});
+    }
+
+    pub fn putCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (mutations.len == 0) return;
+        for (mutations) |mutation| try self.validateCatalogMutation(mutation);
+
         const previous = self.activeCheckpoint();
-        const page_id = previous.page_count;
-        var payload = std.ArrayListUnmanaged(u8).empty;
-        defer payload.deinit(self.allocator);
-        try encodeCatalogEntry(self.allocator, &payload, .{
-            .previous_page = previous.catalog_root_page,
-            .key = key,
-            .value = value,
-        });
+        var next_root_page = previous.catalog_root_page;
+        var next_page_id = previous.page_count;
+
+        for (mutations) |mutation| {
+            var external_value_root_page: u64 = 0;
+            if (!mutation.is_delete and !self.catalogEntryFitsInline(mutation.key, mutation.value)) {
+                external_value_root_page = next_page_id;
+                next_page_id = try self.writeValuePages(next_page_id, mutation.value);
+            }
+
+            const page_id = next_page_id;
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntry(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = mutation.key,
+                .value = mutation.value,
+                .is_delete = mutation.is_delete,
+                .external_value_root_page = external_value_root_page,
+            });
+            try self.writePage(page_id, .catalog, payload.items);
+            next_root_page = page_id;
+            next_page_id += 1;
+        }
+
+        try self.file.sync(self.io_impl.io());
 
         var next = previous;
         next.commit_sequence += 1;
-        next.catalog_root_page = page_id;
-        next.page_count = page_id + 1;
-        _ = try self.appendPage(.catalog, payload.items, next);
+        next.catalog_root_page = next_root_page;
+        next.page_count = next_page_id;
+        try self.publishCheckpoint(next);
     }
 
     pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
@@ -275,19 +317,22 @@ pub const NativeFile = struct {
             const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
             defer allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
-            if (std.mem.eql(u8, entry.key, key)) return try allocator.dupe(u8, entry.value);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) return null;
+                return try self.catalogEntryValueAlloc(allocator, entry);
+            }
             page_id = entry.previous_page;
         }
         return null;
     }
 
     pub fn snapshotCatalogRecordsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedCatalogRecord {
-        var map = std.StringHashMapUnmanaged([]u8).empty;
+        var map = std.StringHashMapUnmanaged(?[]u8).empty;
         defer {
             var it = map.iterator();
             while (it.next()) |entry| {
                 allocator.free(entry.key_ptr.*);
-                allocator.free(entry.value_ptr.*);
+                if (entry.value_ptr.*) |value| allocator.free(value);
             }
             map.deinit(allocator);
         }
@@ -301,8 +346,8 @@ pub const NativeFile = struct {
             if (!map.contains(entry.key)) {
                 const owned_key = try allocator.dupe(u8, entry.key);
                 errdefer allocator.free(owned_key);
-                const owned_value = try allocator.dupe(u8, entry.value);
-                errdefer allocator.free(owned_value);
+                const owned_value = if (entry.is_delete) null else try self.catalogEntryValueAlloc(allocator, entry);
+                errdefer if (owned_value) |value| allocator.free(value);
                 try map.put(allocator, owned_key, owned_value);
             }
             page_id = entry.previous_page;
@@ -318,9 +363,10 @@ pub const NativeFile = struct {
         }
         var it = map.iterator();
         while (it.next()) |entry| {
+            const stored_value = entry.value_ptr.* orelse continue;
             const key = try allocator.dupe(u8, entry.key_ptr.*);
             errdefer allocator.free(key);
-            const value = try allocator.dupe(u8, entry.value_ptr.*);
+            const value = try allocator.dupe(u8, stored_value);
             errdefer allocator.free(value);
             try records.append(allocator, .{ .key = key, .value = value });
         }
@@ -492,12 +538,18 @@ pub const NativeFile = struct {
         var live_bytes: u64 = 0;
 
         for (catalog_records) |record| {
+            const external_value_root_page = if (record.value.len == 0 or self.catalogEntryFitsInline(record.key, record.value))
+                0
+            else
+                try appendValuePagesToImage(self.allocator, &image, page_size, self.maxValuePagePayloadBytes(), &next_page_id, record.value);
+
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
             try encodeCatalogEntry(self.allocator, &payload, .{
                 .previous_page = catalog_root_page,
                 .key = record.key,
                 .value = record.value,
+                .external_value_root_page = external_value_root_page,
             });
             catalog_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .catalog, payload.items);
             live_bytes +|= record.key.len + record.value.len;
@@ -560,6 +612,28 @@ pub const NativeFile = struct {
         return self.maxPagePayloadBytes() - value_page_header_size;
     }
 
+    fn validateCatalogMutation(self: *const NativeFile, mutation: CatalogMutation) !void {
+        if (mutation.key.len > catalog_key_len_mask or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        const fixed_len = 16 + mutation.key.len;
+        if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+        if (mutation.is_delete) return;
+        if (mutation.value.len <= self.maxPagePayloadBytes() - fixed_len) return;
+        if (value_page_header_size > self.maxPagePayloadBytes()) return error.InvalidNativePageLength;
+        if (fixed_len + 8 > self.maxPagePayloadBytes()) return error.PageTooLarge;
+    }
+
+    fn catalogEntryFitsInline(self: *const NativeFile, key: []const u8, value: []const u8) bool {
+        const fixed_len = 16 + key.len;
+        return fixed_len <= self.maxPagePayloadBytes() and value.len <= self.maxPagePayloadBytes() - fixed_len;
+    }
+
+    fn catalogEntryValueAlloc(self: *NativeFile, allocator: Allocator, entry: CatalogEntry) ![]u8 {
+        if (entry.external_value_root_page != 0) {
+            return try self.readValuePagesAlloc(allocator, entry.external_value_root_page, entry.external_value_len);
+        }
+        return try allocator.dupe(u8, entry.value);
+    }
+
     fn validateDocumentMutation(self: *const NativeFile, mutation: DocumentMutation) !void {
         if (mutation.key.len > std.math.maxInt(u32) or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
         const fixed_len = 20 + mutation.key.len;
@@ -595,7 +669,13 @@ pub const NativeFile = struct {
             const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, kind);
             defer self.allocator.free(payload);
             page_id = switch (kind) {
-                .catalog => (try decodeCatalogEntry(payload)).previous_page,
+                .catalog => blk: {
+                    const entry = try decodeCatalogEntry(payload);
+                    if (entry.external_value_root_page != 0) {
+                        try self.validateValuePages(entry.external_value_root_page, entry.external_value_len);
+                    }
+                    break :blk entry.previous_page;
+                },
                 .document => blk: {
                     const entry = try decodeDocumentEntry(payload);
                     if (entry.external_value_root_page != 0) {
@@ -1006,31 +1086,61 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
 }
 
 fn encodeCatalogEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: CatalogEntry) !void {
-    if (entry.key.len > std.math.maxInt(u32) or entry.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    if (entry.key.len > catalog_key_len_mask or entry.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    if (entry.is_delete and entry.external_value_root_page != 0) return error.InvalidNativeCatalogEntryFlags;
+    const external_value = entry.external_value_root_page != 0;
+    if (external_value and entry.value.len == 0) return error.InvalidNativeValueChain;
+
     const start = out.items.len;
-    try out.resize(allocator, start + 16 + entry.key.len + entry.value.len);
+    const stored_value_len: usize = if (external_value) 8 else entry.value.len;
+    try out.resize(allocator, start + 16 + entry.key.len + stored_value_len);
     const encoded = out.items[start..];
     std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
-    std.mem.writeInt(u32, encoded[8..12], @intCast(entry.key.len), .little);
+    const key_len_flags: u32 =
+        @as(u32, @intCast(entry.key.len)) |
+        (if (entry.is_delete) catalog_delete_flag else 0) |
+        (if (external_value) catalog_external_value_flag else 0);
+    std.mem.writeInt(u32, encoded[8..12], key_len_flags, .little);
     std.mem.writeInt(u32, encoded[12..16], @intCast(entry.value.len), .little);
     @memcpy(encoded[16..][0..entry.key.len], entry.key);
-    @memcpy(encoded[16 + entry.key.len ..][0..entry.value.len], entry.value);
+    if (external_value) {
+        std.mem.writeInt(u64, encoded[16 + entry.key.len ..][0..8], entry.external_value_root_page, .little);
+    } else {
+        @memcpy(encoded[16 + entry.key.len ..][0..entry.value.len], entry.value);
+    }
 }
 
 fn decodeCatalogEntry(raw: []const u8) !CatalogEntry {
     if (raw.len < 16) return error.TruncatedNativeCatalogEntry;
     const previous_page = std.mem.readInt(u64, raw[0..8], .little);
-    const key_len = std.mem.readInt(u32, raw[8..12], .little);
+    const key_len_flags = std.mem.readInt(u32, raw[8..12], .little);
+    const flags = key_len_flags & ~catalog_key_len_mask;
+    if (flags & ~(catalog_delete_flag | catalog_external_value_flag) != 0) return error.InvalidNativeCatalogEntryFlags;
+    const is_delete = flags & catalog_delete_flag != 0;
+    const external_value = flags & catalog_external_value_flag != 0;
+    if (is_delete and external_value) return error.InvalidNativeCatalogEntryFlags;
+
+    const key_len = key_len_flags & catalog_key_len_mask;
     const value_len = std.mem.readInt(u32, raw[12..16], .little);
-    const payload_len = @as(u64, key_len) + @as(u64, value_len);
+    const stored_value_len: u64 = if (external_value) 8 else value_len;
+    const payload_len = @as(u64, key_len) + stored_value_len;
     if (payload_len > raw.len - 16) return error.TruncatedNativeCatalogEntry;
     const key_start: usize = 16;
     const key_end = key_start + @as(usize, @intCast(key_len));
-    const value_end = key_end + @as(usize, @intCast(value_len));
+    const stored_value_end = key_end + @as(usize, @intCast(stored_value_len));
+    const external_value_root_page = if (external_value) blk: {
+        if (value_len == 0) return error.InvalidNativeValueChain;
+        const root = std.mem.readInt(u64, raw[key_end..][0..8], .little);
+        if (root == 0) return error.InvalidNativeValueChain;
+        break :blk root;
+    } else 0;
     return .{
         .previous_page = previous_page,
         .key = raw[key_start..key_end],
-        .value = raw[key_end..value_end],
+        .value = if (external_value) raw[key_end..key_end] else raw[key_end..stored_value_end],
+        .is_delete = is_delete,
+        .external_value_root_page = external_value_root_page,
+        .external_value_len = if (external_value) @intCast(value_len) else 0,
     };
 }
 
@@ -1138,6 +1248,7 @@ fn issueForPageCheckError(err: anyerror) []const u8 {
         error.InvalidNativePageLength => "invalid_page_length",
         error.NativePageChecksumMismatch => "page_checksum_mismatch",
         error.TruncatedNativeCatalogEntry => "truncated_catalog_entry",
+        error.InvalidNativeCatalogEntryFlags => "invalid_catalog_entry_flags",
         error.TruncatedNativeDocumentEntry => "truncated_document_entry",
         error.InvalidNativeDocumentEntryFlags => "invalid_document_entry_flags",
         error.InvalidNativePageChain => "invalid_page_chain",
@@ -1381,6 +1492,45 @@ test "lite native catalog stores and reopens records" {
     try std.testing.expectEqualStrings("ready", index);
 
     try std.testing.expectEqual(@as(?[]u8, null), try reopened.getCatalogRecordAlloc(allocator, "missing"));
+}
+
+test "lite native catalog supports tombstones and spilled values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-catalog-large.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, default_page_size * 3);
+    defer allocator.free(large);
+    for (large, 0..) |*byte, i| byte.* = @intCast(i % 251);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putCatalogRecord("index:large", large);
+        try file.putCatalogRecord("index:gone", "delete me");
+        try file.deleteCatalogRecord("index:gone");
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const got = (try reopened.getCatalogRecordAlloc(allocator, "index:large")).?;
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(u8, large, got);
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getCatalogRecordAlloc(allocator, "index:gone"));
+
+    const records = try reopened.snapshotCatalogRecordsAlloc(allocator);
+    defer NativeFile.freeSnapshotCatalogRecords(allocator, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings("index:large", records[0].key);
+    try std.testing.expectEqualSlices(u8, large, records[0].value);
+
+    const report = try reopened.check();
+    try std.testing.expect(report.valid);
 }
 
 test "lite native catalog detects corrupted root page" {

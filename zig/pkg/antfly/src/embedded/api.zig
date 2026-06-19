@@ -717,6 +717,76 @@ test "embedded api openLite manages index and enrichment definitions over aflite
     }
 }
 
+test "embedded api openLite keeps full text index inside native aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-native-index.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    const sidecar_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
+    defer alloc.free(sidecar_path);
+
+    {
+        var api = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer api.close();
+
+        const created_index = try api.addIndexJson(
+            alloc,
+            "{\"name\":\"ft_body\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+        );
+        defer alloc.free(created_index);
+        try std.testing.expect(std.mem.indexOf(u8, created_index, "\"created\":true") != null);
+
+        const batch_json = try api.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:a\":{\"body\":\"native lite full text\"}},\"sync\":\"full_index\"}",
+        );
+        defer alloc.free(batch_json);
+        try std.testing.expect(std.mem.indexOf(u8, batch_json, "\"inserted\":1") != null);
+
+        const query_json = try api.searchJson(
+            alloc,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"native lite\"}},\"limit\":1}",
+        );
+        defer alloc.free(query_json);
+        try std.testing.expect(std.mem.indexOf(u8, query_json, "\"doc:a\"") != null);
+    }
+
+    {
+        var reopened = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer reopened.close();
+
+        const query_json = try reopened.searchJson(
+            alloc,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"full text\"}},\"limit\":1}",
+        );
+        defer alloc.free(query_json);
+        try std.testing.expect(std.mem.indexOf(u8, query_json, "\"doc:a\"") != null);
+    }
+
+    const sidecar_missing = blk: {
+        var dir = std.Io.Dir.cwd().openDir(std.testing.io, sidecar_path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => break :blk true,
+            else => return err,
+        };
+        dir.close(std.testing.io);
+        break :blk false;
+    };
+    try std.testing.expect(sidecar_missing);
+}
+
 test "embedded api openLite persists schema json over aflite file" {
     const alloc = std.testing.allocator;
 
