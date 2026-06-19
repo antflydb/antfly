@@ -2042,9 +2042,8 @@ fn catalogOptionsAllowMedia(options: CatalogOptions, media_type: []const u8, tag
     }
     if (options.profile) |profile| {
         if (!std.mem.eql(u8, profile, "copilot")) return false;
-        return std.mem.eql(u8, media_type, "application/mcp-server+json") or
-            std.mem.eql(u8, media_type, "application/ai-skill+md") or
-            jsonStringSliceContains(tags, "copilot");
+        if (std.mem.eql(u8, media_type, "application/mcp-server+json")) return true;
+        return jsonStringSliceContains(tags, profile);
     }
     return true;
 }
@@ -2299,6 +2298,51 @@ test "ARD extension package entries use trust provenance for artifact digests" {
     try expectMetadataValuesAreScalars(installed_entry.object.get("metadata").?);
     try std.testing.expectEqualStrings("table:docs", installed_entry.object.get("metadata").?.object.get("scope").?.string);
     try std.testing.expect(installed_entry.object.get("trustManifest") != null);
+}
+
+test "ARD profile filter keeps only profile-compatible skills" {
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:memory",
+        .scope = .{ .kind = .table, .table_name = "memories" },
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "memoryaf",
+        .scope = .{ .kind = .table, .table_name = "memories" },
+        .object_kind = .skill,
+        .object_name = "memory",
+        .table_name = "memories",
+        .owner_metadata_json = "{\"displayName\":\"Memoryaf\",\"description\":\"Use Memoryaf from Copilot.\",\"profile\":\"copilot\",\"tags\":[\"memory\"],\"capabilities\":[\"memory-search\"],\"body\":\"# Memoryaf\"}",
+    }};
+    const ctx: ExtensionCatalogContext = .{
+        .installed_extensions = &installed,
+        .extension_members = &members,
+    };
+
+    const body = try catalogJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant, .profile = "copilot" },
+        ctx,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Antfly Copilot MCP Profile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Antfly Query Builder") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Antfly Retrieval") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const entries = parsed.value.object.get("entries").?.array.items;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.object.get("type").?.string, "application/ai-skill+md")) {
+            const metadata = entry.object.get("metadata").?.object;
+            try std.testing.expectEqualStrings("copilot", metadata.get("profile").?.string);
+        }
+    }
 }
 
 test "ARD search filters scoped catalog entries" {
