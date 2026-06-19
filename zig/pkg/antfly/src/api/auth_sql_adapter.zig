@@ -60,6 +60,7 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalog(
         .row_security_catalog => |row_security_plan| switch (row_security_plan) {
             .alter_table => |alter| return try executeAlterRowSecurity(manager, alloc, alter),
             .create_policy => |create| return try executeCreateRowSecurityPolicy(manager, alloc, create),
+            .alter_policy => |alter| return try executeAlterRowSecurityPolicy(manager, alloc, alter),
             .drop_policy => |drop| return try executeDropRowSecurityPolicy(manager, alloc, drop),
         },
         else => return null,
@@ -172,6 +173,17 @@ fn executeCreateRowSecurityPolicy(
     const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
     defer alloc.free(filter_json);
     try manager.createSqlRowSecurityPolicy(plan.policy_name, plan.table_name, filter_json);
+    return try changedRecordAlloc(alloc);
+}
+
+fn executeAlterRowSecurityPolicy(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    plan: relational_sql.AlterRowSecurityPolicyPlan,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
+    defer alloc.free(filter_json);
+    try manager.replaceSqlRowSecurityPolicy(plan.policy_name, plan.table_name, filter_json);
     return try changedRecordAlloc(alloc);
 }
 
@@ -773,6 +785,13 @@ test "sql auth adapter applies row security policies through user manager" {
     defer alloc.free(stored_literal);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", stored_literal);
 
+    var altered_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_literal_policy ON usage_records USING (status = 'archived');")).?;
+    defer altered_policy.deinit(alloc);
+    const altered_literal = try manager.getSqlRowSecurityPolicy("usage_records_literal_policy", "usage_records");
+    defer alloc.free(altered_literal);
+    try std.testing.expectEqualStrings("{\"term\":{\"status\":\"archived\"}}", altered_literal);
+    try std.testing.expectError(error.RowFilterNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY missing_policy ON usage_records USING (status = 'active');"));
+
     const filters = try manager.getRowFilters("alice");
     defer {
         for (filters) |*entry| entry.deinit(alloc);
@@ -781,7 +800,7 @@ test "sql auth adapter applies row security policies through user manager" {
     try std.testing.expectEqual(@as(usize, 1), filters.len);
     try std.testing.expectEqualStrings("usage_records", filters[0].table);
     try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"$auth\":\"settings.app.tenant_id\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"status\":\"archived\"") != null);
 
     try std.testing.expectError(error.PolicyExists, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
     var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;

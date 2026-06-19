@@ -47,6 +47,19 @@ pub const CreateRowSecurityPolicySyntax = struct {
     }
 };
 
+pub const AlterRowSecurityPolicySyntax = struct {
+    policy_name: []const u8,
+    table_name: []const u8,
+    predicate: ddl_plan.RowSecurityPolicyPredicate,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.policy_name));
+        alloc.free(@constCast(self.table_name));
+        self.predicate.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const DropRowSecurityPolicySyntax = struct {
     policy_name: []const u8,
     table_name: []const u8,
@@ -1436,6 +1449,36 @@ pub fn parseCreateRowSecurityPolicyCatalogTailAlloc(
     tokens: []const Token,
     pos: *usize,
 ) !CreateRowSecurityPolicySyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("policy");
+    const policy_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var policy_transferred = false;
+    errdefer if (!policy_transferred) alloc.free(policy_name);
+    try cursor.expectKeyword("on");
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    try cursor.expectKeyword("using");
+    var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
+    var predicate_transferred = false;
+    errdefer if (!predicate_transferred) predicate.deinit(alloc);
+    try parseAdapterNoopStatementEnd(cursor);
+
+    policy_transferred = true;
+    table_transferred = true;
+    predicate_transferred = true;
+    return .{
+        .policy_name = policy_name,
+        .table_name = table_name,
+        .predicate = predicate,
+    };
+}
+
+pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterRowSecurityPolicySyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("policy");
     const policy_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
@@ -6403,6 +6446,21 @@ test "sql adapter grammar parses row security catalog tails" {
     };
     try std.testing.expectEqualStrings("tenant_id", literal_predicate.field);
     try std.testing.expectEqualStrings("\"tenant-a\"", literal_predicate.value_json);
+
+    var alter_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (status = 'active');");
+    defer lexer.freeTokens(alloc, &alter_tokens);
+    var alter_pos: usize = 0;
+    var alter = try parseAlterRowSecurityPolicyCatalogTailAlloc(alloc, alter_tokens.items, &alter_pos);
+    defer alter.deinit(alloc);
+    try std.testing.expectEqual(alter_tokens.items.len, alter_pos);
+    try std.testing.expectEqualStrings("tenant_policy", alter.policy_name);
+    try std.testing.expectEqualStrings("usage_records", alter.table_name);
+    const alter_predicate = switch (alter.predicate) {
+        .literal_equals => |alter_predicate| alter_predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", alter_predicate.field);
+    try std.testing.expectEqualStrings("\"active\"", alter_predicate.value_json);
 
     var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);

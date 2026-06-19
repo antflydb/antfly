@@ -4925,12 +4925,14 @@ resolved from the authenticated user's effective native role settings; a missing
 setting fails closed during request filter resolution. Creating a policy stores
 policy metadata but does not make the filter active until `ALTER TABLE ...
 ENABLE ROW LEVEL SECURITY` marks that table as RLS-enabled in the native auth
-policy store. `DROP POLICY` removes the hidden policy subject for that table,
-while `DROP POLICY IF EXISTS` is an idempotent no-op. Compound policy
-expressions, policy replacement, and per-role `TO ...` policy targeting still
-fail closed until they have durable native policy state, request-context
-bindings, and planner/executor validation; the source parity corpus pins all
-three shapes under the stable `row_security_policy_plan` reason.
+policy store. `ALTER POLICY ... USING (...)` replaces the hidden policy
+subject's native row-filter metadata and fails if the policy does not already
+exist. `DROP POLICY` removes the hidden policy subject for that table, while
+`DROP POLICY IF EXISTS` is an idempotent no-op. Compound policy expressions and
+per-role `TO ...` policy targeting still fail closed until they have durable
+native policy state, request-context bindings, and planner/executor validation;
+the source parity corpus pins both shapes under the stable
+`row_security_policy_plan` reason.
 `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` clears the native table enable bit
 idempotently; stored policies remain catalog metadata but stop contributing
 effective row filters until the table is enabled again. Storage must not

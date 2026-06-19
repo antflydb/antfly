@@ -112,6 +112,7 @@ pub const AppParityDdlTag = enum {
     enable_row_security,
     disable_row_security,
     create_row_policy,
+    alter_row_policy,
     drop_row_policy,
     create_database,
     alter_database,
@@ -1504,7 +1505,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege => false,
         .copy_from, .copy_to => false,
         .create_partitioned_table, .create_table_partition, .attach_table_partition, .detach_table_partition => false,
-        .enable_row_security, .disable_row_security, .create_row_policy, .drop_row_policy => false,
+        .enable_row_security, .disable_row_security, .create_row_policy, .alter_row_policy, .drop_row_policy => false,
         .create_database, .alter_database, .drop_database => false,
         .create_tablespace, .rename_tablespace, .drop_tablespace => false,
         .listen_notification, .notify_notification, .unlisten_notification => false,
@@ -1815,6 +1816,7 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .enable_row_security,
         .disable_row_security,
         .create_row_policy,
+        .alter_row_policy,
         .drop_row_policy,
         .create_update_policy,
         => expected == 1,
@@ -3946,6 +3948,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_disable: bool = false,
     ddl_row_security_create_policy: bool = false,
     ddl_row_security_literal_policy: bool = false,
+    ddl_row_security_alter_policy: bool = false,
     ddl_row_security_drop_policy: bool = false,
     ddl_database_create: bool = false,
     ddl_database_alter: bool = false,
@@ -4141,7 +4144,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
     unsupported_ddl_row_security_policy_expression: bool = false,
-    unsupported_ddl_row_security_policy_replacement: bool = false,
     unsupported_ddl_row_security_policy_targeting: bool = false,
     unsupported_ddl_row_rewrite_expression_plan: bool = false,
     unsupported_ddl_transaction_scoped_search_path: bool = false,
@@ -5423,9 +5425,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
                     std.mem.indexOf(u8, entry.sql, "current_setting") == null);
-            self.unsupported_ddl_row_security_policy_replacement = self.unsupported_ddl_row_security_policy_replacement or
-                (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
-                    std.mem.startsWith(u8, entry.sql, "ALTER POLICY "));
             self.unsupported_ddl_row_security_policy_targeting = self.unsupported_ddl_row_security_policy_targeting or
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
@@ -5635,6 +5634,7 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_row_security_create_policy = true;
                     self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
                 },
+                .alter_row_policy => self.ddl_row_security_alter_policy = true,
                 .drop_row_policy => self.ddl_row_security_drop_policy = true,
                 .create_database => self.ddl_database_create = true,
                 .alter_database => {
@@ -6595,6 +6595,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_row_security_disable);
         try std.testing.expect(self.ddl_row_security_create_policy);
         try std.testing.expect(self.ddl_row_security_literal_policy);
+        try std.testing.expect(self.ddl_row_security_alter_policy);
         try std.testing.expect(self.ddl_row_security_drop_policy);
         try std.testing.expect(self.ddl_database_create);
         try std.testing.expect(self.ddl_database_alter);
@@ -6747,7 +6748,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_routine_procedure_body);
         try std.testing.expect(self.unsupported_ddl_routine_option);
         try std.testing.expect(self.unsupported_ddl_row_security_policy_expression);
-        try std.testing.expect(self.unsupported_ddl_row_security_policy_replacement);
         try std.testing.expect(self.unsupported_ddl_row_security_policy_targeting);
         try std.testing.expect(self.unsupported_ddl_row_rewrite_expression_plan);
         try std.testing.expect(self.unsupported_ddl_transaction_scoped_search_path);

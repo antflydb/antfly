@@ -3835,10 +3835,14 @@
       "sql": "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active')"
     },
     {
-      "name": "unsupported row security policy replacement",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=row_security_policy_plan",
-      "classification_reason": "row_security_policy_plan",
+      "name": "row security alter policy catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_row_policy",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:alter_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id",
       "sql": "ALTER POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'))"
     },
     {

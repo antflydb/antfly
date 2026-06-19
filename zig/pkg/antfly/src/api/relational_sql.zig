@@ -270,6 +270,7 @@ pub const CreateUpdatePolicyPlan = sql_adapter.CreateUpdatePolicyPlan;
 pub const RowSecurityCatalogPlan = sql_adapter.RowSecurityCatalogPlan;
 pub const AlterRowSecurityPlan = sql_adapter.AlterRowSecurityPlan;
 pub const CreateRowSecurityPolicyPlan = sql_adapter.CreateRowSecurityPolicyPlan;
+pub const AlterRowSecurityPolicyPlan = sql_adapter.AlterRowSecurityPolicyPlan;
 pub const DropRowSecurityPolicyPlan = sql_adapter.DropRowSecurityPolicyPlan;
 pub const RowSecurityPolicyPredicate = sql_adapter.RowSecurityPolicyPredicate;
 pub const RowSecurityCurrentSettingPredicate = sql_adapter.RowSecurityCurrentSettingPredicate;
@@ -3168,6 +3169,7 @@ const Parser = struct {
             if (self.peekKeyword("collation")) return .{ .type_system_catalog = .{ .collation = .{ .rename = try self.parseRenameCollationDdl() } } };
             if (self.peekKeyword("view")) return .{ .view_catalog = .{ .rename = try self.parseRenameViewDdl() } };
             if (self.peekKeyword("role")) return .{ .authorization_catalog = .{ .alter_role = try self.parseAlterRoleDdl() } };
+            if (self.peekKeyword("policy")) return .{ .row_security_catalog = .{ .alter_policy = try self.parseAlterRowSecurityPolicyDdl() } };
             if (self.peekKeyword("table")) {
                 const checkpoint = self.pos;
                 if (self.parseAlterRowSecurityDdl()) |row_security| {
@@ -4478,6 +4480,18 @@ const Parser = struct {
 
     fn parseCreateRowSecurityPolicyDdl(self: *@This()) !CreateRowSecurityPolicyPlan {
         var syntax = try sql_adapter.parseCreateRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .policy_name = syntax.policy_name,
+            .table_name = syntax.table_name,
+            .predicate = syntax.predicate,
+        };
+    }
+
+    fn parseAlterRowSecurityPolicyDdl(self: *@This()) !AlterRowSecurityPolicyPlan {
+        var syntax = try sql_adapter.parseAlterRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         var transferred = false;
         errdefer if (!transferred) syntax.deinit(self.alloc);
         transferred = true;
@@ -45503,6 +45517,28 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_active_policy:table=usage_records:kind=literal_eq:field=status:value_json_hex=2261637469766522", create_literal_row_policy_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_literal_row_policy));
 
+    var alter_row_policy = try lowerDdlPlanAlloc(alloc, "ALTER POLICY usage_records_tenant_policy ON usage_records USING (status = 'active');");
+    defer alter_row_policy.deinit(alloc);
+    const alter_row_policy_plan = switch (alter_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .alter_policy => |alter_plan| alter_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("usage_records_tenant_policy", alter_row_policy_plan.policy_name);
+    try std.testing.expectEqualStrings("usage_records", alter_row_policy_plan.table_name);
+    const alter_row_policy_predicate = switch (alter_row_policy_plan.predicate) {
+        .literal_equals => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", alter_row_policy_predicate.field);
+    try std.testing.expectEqualStrings("\"active\"", alter_row_policy_predicate.value_json);
+    const alter_row_policy_fingerprint = try ddlFingerprintAlloc(alloc, alter_row_policy);
+    defer alloc.free(alter_row_policy_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=literal_eq:field=status:value_json_hex=2261637469766522", alter_row_policy_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, alter_row_policy));
+
     var drop_row_policy = try lowerDdlPlanAlloc(alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;");
     defer drop_row_policy.deinit(alloc);
     const drop_row_policy_plan = switch (drop_row_policy) {
@@ -56879,6 +56915,22 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     );
                 },
             },
+            .alter_policy => |alter| switch (alter.predicate) {
+                .current_setting_equals => |predicate| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
+                    .{ alter.policy_name, alter.table_name, predicate.field, predicate.setting_name },
+                ),
+                .literal_equals => |predicate| blk: {
+                    const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, predicate.value_json);
+                    defer alloc.free(value_json_hex);
+                    break :blk try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_row_policy:policy={s}:table={s}:kind=literal_eq:field={s}:value_json_hex={s}",
+                        .{ alter.policy_name, alter.table_name, predicate.field, value_json_hex },
+                    );
+                },
+            },
             .drop_policy => |drop| try std.fmt.allocPrint(
                 alloc,
                 "ddl:drop_row_policy:policy={s}:table={s}:if_exists={}",
@@ -57867,6 +57919,11 @@ fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !voi
             .create_policy => |create| {
                 try std.testing.expectEqual(AppParityDdlTag.create_row_policy, expected);
                 try expectOptionalTableName(summary.table_name, create.table_name);
+                try expectOptionalUsize(summary.operations, 1);
+            },
+            .alter_policy => |alter| {
+                try std.testing.expectEqual(AppParityDdlTag.alter_row_policy, expected);
+                try expectOptionalTableName(summary.table_name, alter.table_name);
                 try expectOptionalUsize(summary.operations, 1);
             },
             .drop_policy => |drop| {

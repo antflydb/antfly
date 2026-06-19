@@ -1087,6 +1087,14 @@ pub const UserManager = struct {
         try self.setSubjectRowFilter(subject, table, filter_json);
     }
 
+    pub fn replaceSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8) !void {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        const existing = try self.getSubjectRowFilter(subject, table);
+        self.alloc.free(existing);
+        try self.setSubjectRowFilter(subject, table, filter_json);
+    }
+
     pub fn dropSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8) !void {
         const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
         defer self.alloc.free(subject);
