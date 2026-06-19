@@ -1907,6 +1907,10 @@ execution bridge: representative SQL statements are classified through
 `lowerReadPlanAlloc`, executed as the resulting typed relational storage plans,
 and checked for deterministic left-join null-extension, CTE aggregate grouping,
 window ranking, lateral null-extension, and explicit output ordering.
+Catalog-backed equality join and bounded lateral regressions lower through the
+table catalog, collect each side from its own DB handle under its own runtime
+schema, and feed the same typed join/lateral executors, so source-schema
+planning and execution cannot silently fall back to same-table assumptions.
 The native REST/SDK row-query, aggregate, window, join, and lateral plan helpers
 have the same DB-backed preimage bridge, so CTE-backed `RowsQueryPlan`,
 `RowsAggregatePlan`, `RowsWindowPlan`, `RowsJoinPlan`, and `RowsLateralPlan`

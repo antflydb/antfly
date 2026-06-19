@@ -70068,6 +70068,194 @@ test "postgres sql adapter typed read plans execute through relational storage" 
     }
 }
 
+test "postgres sql adapter catalog-backed read plans execute across source schemas" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const customer_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"kind":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const balance_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"kind":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id","organization_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var parsed_target = try schema_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target.deinit(alloc);
+    const target_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_target);
+    defer runtime_schema.freeSchema(alloc, target_schema);
+    var parsed_customer = try schema_api.parseValidatedTableSchema(alloc, customer_schema_json);
+    defer parsed_customer.deinit(alloc);
+    const customer_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_customer);
+    defer runtime_schema.freeSchema(alloc, customer_schema);
+    var parsed_balance = try schema_api.parseValidatedTableSchema(alloc, balance_schema_json);
+    defer parsed_balance.deinit(alloc);
+    const balance_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_balance);
+    defer runtime_schema.freeSchema(alloc, balance_schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-catalog-read-target", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const customer_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-catalog-read-customers", .{tmp.sub_path});
+    defer alloc.free(customer_path);
+    const balance_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-catalog-read-balances", .{tmp.sub_path});
+    defer alloc.free(balance_path);
+
+    var target_db = try db_mod.DB.open(alloc, target_path, .{});
+    defer target_db.close();
+    try target_db.applyTableSchemaJson(alloc, target_schema_json, .{});
+    var customer_db = try db_mod.DB.open(alloc, customer_path, .{});
+    defer customer_db.close();
+    try customer_db.applyTableSchemaJson(alloc, customer_schema_json, .{});
+    var balance_db = try db_mod.DB.open(alloc, balance_path, .{});
+    defer balance_db.close();
+    try balance_db.applyTableSchemaJson(alloc, balance_schema_json, .{});
+
+    const target_jsons = [_][]const u8{
+        "{\"id\":\"o1\",\"tenant_id\":\"t1\",\"customer_id\":\"c1\",\"kind\":\"order\",\"amount\":10}",
+        "{\"id\":\"o2\",\"tenant_id\":\"t1\",\"customer_id\":\"c2\",\"kind\":\"order\",\"amount\":5}",
+        "{\"id\":\"o3\",\"tenant_id\":\"t2\",\"customer_id\":\"missing\",\"kind\":\"order\",\"amount\":7}",
+        "{\"id\":\"skip\",\"tenant_id\":\"t1\",\"customer_id\":\"c1\",\"kind\":\"invoice\",\"amount\":100}",
+        "{\"id\":\"org1\",\"tenant_id\":\"t1\",\"kind\":\"organization\",\"amount\":0}",
+        "{\"id\":\"org2\",\"tenant_id\":\"t1\",\"kind\":\"organization\",\"amount\":0}",
+        "{\"id\":\"org3\",\"tenant_id\":\"t1\",\"kind\":\"organization\",\"amount\":0}",
+    };
+    var target_keys: [target_jsons.len][]u8 = undefined;
+    for (target_jsons, 0..) |row_json, i| target_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, row_json);
+    defer {
+        for (target_keys) |key| alloc.free(key);
+    }
+    try target_db.batch(.{
+        .writes = &.{
+            .{ .key = target_keys[0], .value = target_jsons[0] },
+            .{ .key = target_keys[1], .value = target_jsons[1] },
+            .{ .key = target_keys[2], .value = target_jsons[2] },
+            .{ .key = target_keys[3], .value = target_jsons[3] },
+            .{ .key = target_keys[4], .value = target_jsons[4] },
+            .{ .key = target_keys[5], .value = target_jsons[5] },
+            .{ .key = target_keys[6], .value = target_jsons[6] },
+        },
+        .sync_level = .write,
+    });
+
+    const customer_jsons = [_][]const u8{
+        "{\"id\":\"c1\",\"tenant_id\":\"t1\",\"kind\":\"customer\",\"name\":\"Alice\"}",
+        "{\"id\":\"c2\",\"tenant_id\":\"t1\",\"kind\":\"lead\",\"name\":\"Bot\"}",
+        "{\"id\":\"c3\",\"tenant_id\":\"t2\",\"kind\":\"customer\",\"name\":\"Cara\"}",
+    };
+    var customer_keys: [customer_jsons.len][]u8 = undefined;
+    for (customer_jsons, 0..) |row_json, i| customer_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, customer_schema, row_json);
+    defer {
+        for (customer_keys) |key| alloc.free(key);
+    }
+    try customer_db.batch(.{
+        .writes = &.{
+            .{ .key = customer_keys[0], .value = customer_jsons[0] },
+            .{ .key = customer_keys[1], .value = customer_jsons[1] },
+            .{ .key = customer_keys[2], .value = customer_jsons[2] },
+        },
+        .sync_level = .write,
+    });
+
+    const balance_jsons = [_][]const u8{
+        "{\"id\":\"b1\",\"organization_id\":\"org1\",\"kind\":\"balance\",\"amount\":4,\"created_at\":10}",
+        "{\"id\":\"b2\",\"organization_id\":\"org1\",\"kind\":\"balance\",\"amount\":9,\"created_at\":20}",
+        "{\"id\":\"b3\",\"organization_id\":\"org2\",\"kind\":\"balance\",\"amount\":7,\"created_at\":15}",
+        "{\"id\":\"b4\",\"organization_id\":\"org2\",\"kind\":\"forecast\",\"amount\":100,\"created_at\":30}",
+    };
+    var balance_keys: [balance_jsons.len][]u8 = undefined;
+    for (balance_jsons, 0..) |row_json, i| balance_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, balance_schema, row_json);
+    defer {
+        for (balance_keys) |key| alloc.free(key);
+    }
+    try balance_db.batch(.{
+        .writes = &.{
+            .{ .key = balance_keys[0], .value = balance_jsons[0] },
+            .{ .key = balance_keys[1], .value = balance_jsons[1] },
+            .{ .key = balance_keys[2], .value = balance_jsons[2] },
+            .{ .key = balance_keys[3], .value = balance_jsons[3] },
+        },
+        .sync_level = .write,
+    });
+
+    var customer_catalog = AppParitySourceSchemaCatalog.init("customer_records", customer_schema_json);
+    var catalog_join_plan = try lowerReadPlanWithCatalogAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN customer_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY amount DESC NULLS LAST, order_id ASC LIMIT 5",
+        target_schema,
+        &.{},
+        customer_catalog.iface(),
+    );
+    defer catalog_join_plan.deinit(alloc);
+    switch (catalog_join_plan) {
+        .join => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.left_table_name);
+            try std.testing.expectEqualStrings("customer_records", lowered.right_table_name);
+
+            var left_source = lowered.join.left;
+            left_source.select = &.{};
+            left_source.select_all = true;
+            var right_source = lowered.join.right;
+            right_source.select = &.{};
+            right_source.select_all = true;
+
+            var left_rows = try target_db.queryRelationalRows(alloc, target_schema, left_source);
+            defer left_rows.deinit(alloc);
+            var right_rows = try customer_db.queryRelationalRows(alloc, customer_schema, right_source);
+            defer right_rows.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 3), left_rows.total);
+            try std.testing.expectEqual(@as(u32, 2), right_rows.total);
+
+            var result = try db_mod.DB.joinRelationalRowsFromSourceRowsAlloc(alloc, lowered.join, left_rows.rows, right_rows.rows);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 3), result.total_rows);
+            try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+            try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":null,\"amount\":7}", result.rows[1]);
+            try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var balance_catalog = AppParitySourceSchemaCatalog.init("balance_records", balance_schema_json);
+    var catalog_lateral_plan = try lowerReadPlanWithCatalogAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM balance_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC NULLS LAST, organization_id ASC LIMIT 10",
+        target_schema,
+        &.{},
+        balance_catalog.iface(),
+    );
+    defer catalog_lateral_plan.deinit(alloc);
+    switch (catalog_lateral_plan) {
+        .lateral => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.left_table_name);
+            try std.testing.expectEqualStrings("balance_records", lowered.right_table_name);
+
+            var left_source = lowered.plan.lateral.left;
+            left_source.select = &.{};
+            left_source.select_all = true;
+
+            var left_rows = try target_db.queryRelationalRows(alloc, target_schema, left_source);
+            defer left_rows.deinit(alloc);
+            var right_rows = try balance_db.queryRelationalRows(alloc, balance_schema, .{ .select_all = true });
+            defer right_rows.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 3), left_rows.total);
+            try std.testing.expectEqual(@as(u32, 4), right_rows.total);
+
+            var result = try db_mod.DB.lateralRelationalRowsFromSourceRowsStaticAlloc(alloc, lowered.plan.lateral, left_rows.rows, right_rows.rows);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 3), result.total_rows);
+            try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+            try std.testing.expectEqualStrings("{\"organization_id\":\"org1\",\"latest_amount\":9}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"organization_id\":\"org2\",\"latest_amount\":7}", result.rows[1]);
+            try std.testing.expectEqualStrings("{\"organization_id\":\"org3\",\"latest_amount\":null}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "postgres sql adapter lowers row_number window query plans" {
     const alloc = std.testing.allocator;
     const schema_json =
