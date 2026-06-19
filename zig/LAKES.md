@@ -557,10 +557,14 @@ The concrete work left for the data-lake path is therefore:
    scanning now exist for the first path. Position-delete files are scanned with
    projected `file_path`/`pos` columns, converted through the scan-result
    row-ref adapter, and passed through the common `lake_rows` delete filter.
-   Equality-delete manifest entries now preserve validated `equality_ids`, so
-   the future matcher can map delete rows to Iceberg schema field ids instead
-   of reparsing manifests. The remaining work is to implement active
-   equality-delete matching and complete schema evolution checks.
+   Equality-delete manifest entries now preserve validated `equality_ids`,
+   Iceberg metadata planning retains top-level field-id-to-column-name mappings
+   when schema JSON is available, structured delete plans carry resolved
+   equality column names, and the shared delete helper can turn scanned
+   equality-delete tuples plus scanned data tuples into deleted row refs for the
+   supported flat scalar cell types. The remaining work is to wire that matcher
+   through object-storage equality-delete Parquet scans and complete schema
+   evolution checks.
 5. Complete sidecar builders over real external row refs: full-text, dense
    vector, sparse, graph, algebraic group-by, and algebraic expression-fold
    paths now consume pinned `RowSource` batches and publish declared sidecar

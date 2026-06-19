@@ -39,12 +39,23 @@ pub const SnapshotRef = struct {
     }
 };
 
+pub const SchemaField = struct {
+    id: i32,
+    name: []u8,
+
+    pub fn deinit(self: *SchemaField, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
 pub const Plan = struct {
     metadata_uri: []u8,
     table_uuid: []u8,
     location: []u8,
     current_snapshot_id: []u8,
     schema_fingerprint: []u8,
+    schema_fields: []SchemaField = &.{},
     snapshots: []SnapshotRef,
     current_snapshot_index: usize,
 
@@ -54,6 +65,8 @@ pub const Plan = struct {
         alloc.free(self.location);
         alloc.free(self.current_snapshot_id);
         alloc.free(self.schema_fingerprint);
+        for (self.schema_fields) |*field| field.deinit(alloc);
+        if (self.schema_fields.len > 0) alloc.free(self.schema_fields);
         for (self.snapshots) |*snapshot| snapshot.deinit(alloc);
         alloc.free(self.snapshots);
         self.* = undefined;
@@ -61,6 +74,13 @@ pub const Plan = struct {
 
     pub fn currentSnapshot(self: Plan) SnapshotRef {
         return self.snapshots[self.current_snapshot_index];
+    }
+
+    pub fn fieldNameForId(self: Plan, field_id: i32) ?[]const u8 {
+        for (self.schema_fields) |field| {
+            if (field.id == field_id) return field.name;
+        }
+        return null;
     }
 
     pub fn validate(self: Plan) !void {
@@ -78,6 +98,13 @@ pub const Plan = struct {
         }
         if (!std.mem.eql(u8, self.current_snapshot_id, self.currentSnapshot().snapshot_id)) {
             return error.InvalidIcebergMetadata;
+        }
+        for (self.schema_fields, 0..) |field, idx| {
+            if (field.id < 0 or field.name.len == 0) return error.InvalidIcebergMetadata;
+            for (self.schema_fields[0..idx]) |previous| {
+                if (previous.id == field.id) return error.InvalidIcebergMetadata;
+                if (std.mem.eql(u8, previous.name, field.name)) return error.InvalidIcebergMetadata;
+            }
         }
     }
 };
@@ -183,6 +210,7 @@ pub fn parseMetadataPlanAlloc(
     errdefer alloc.free(location_copy);
     const schema_fingerprint = try schemaFingerprintAlloc(alloc, root, got_schema_id);
     errdefer alloc.free(schema_fingerprint);
+    const schema_fields = try schemaFieldsForIdAlloc(alloc, root, got_schema_id);
     const owned_target_snapshot_id = target_snapshot_id.?;
     target_snapshot_id = null;
 
@@ -192,6 +220,7 @@ pub fn parseMetadataPlanAlloc(
         .location = location_copy,
         .current_snapshot_id = owned_target_snapshot_id,
         .schema_fingerprint = schema_fingerprint,
+        .schema_fields = schema_fields,
         .snapshots = snapshots,
         .current_snapshot_index = got_target_index,
     };
@@ -280,6 +309,55 @@ fn schemaValueForId(schemas_value: std.json.Value, schema_id: i64) !std.json.Val
         found = schema_value;
     }
     return found orelse error.InvalidIcebergMetadata;
+}
+
+fn schemaFieldsForIdAlloc(
+    alloc: Allocator,
+    root: std.json.ObjectMap,
+    schema_id: i64,
+) ![]SchemaField {
+    const schemas_value = root.get("schemas") orelse return &.{};
+    const schema_value = try schemaValueForId(schemas_value, schema_id);
+    try validateSchemaDefinition(schema_value);
+    const schema_object = switch (schema_value) {
+        .object => |object| object,
+        else => return error.InvalidIcebergMetadata,
+    };
+    const fields_value = schema_object.get("fields") orelse return error.InvalidIcebergMetadata;
+    const fields_array = switch (fields_value) {
+        .array => |array| array,
+        else => return error.InvalidIcebergMetadata,
+    };
+
+    const fields = try alloc.alloc(SchemaField, fields_array.items.len);
+    errdefer alloc.free(fields);
+    var initialized: usize = 0;
+    errdefer deinitSchemaFieldItems(alloc, fields[0..initialized]);
+
+    for (fields_array.items, 0..) |field_value, idx| {
+        const field_object = switch (field_value) {
+            .object => |object| object,
+            else => return error.InvalidIcebergMetadata,
+        };
+        const field_id_i64 = try requiredI64(field_object, "id");
+        const field_id = std.math.cast(i32, field_id_i64) orelse return error.InvalidIcebergMetadata;
+        fields[idx] = .{
+            .id = field_id,
+            .name = try alloc.dupe(u8, try requiredString(field_object, "name")),
+        };
+        initialized += 1;
+    }
+
+    return fields;
+}
+
+fn deinitSchemaFields(alloc: Allocator, fields: []SchemaField) void {
+    deinitSchemaFieldItems(alloc, fields);
+    if (fields.len > 0) alloc.free(fields);
+}
+
+fn deinitSchemaFieldItems(alloc: Allocator, fields: []SchemaField) void {
+    for (fields) |*field| field.deinit(alloc);
 }
 
 fn validateSchemaDefinition(schema_value: std.json.Value) !void {
@@ -439,6 +517,10 @@ test "iceberg metadata plan resolves current snapshot manifest list" {
         "s3://bucket/warehouse/events/metadata/snap-123.avro",
         plan.currentSnapshot().manifest_list_uri,
     );
+    try std.testing.expectEqual(@as(usize, 2), plan.schema_fields.len);
+    try std.testing.expectEqualStrings("tenant_id", plan.fieldNameForId(1).?);
+    try std.testing.expectEqualStrings("amount", plan.fieldNameForId(2).?);
+    try std.testing.expect(plan.fieldNameForId(3) == null);
 }
 
 test "iceberg metadata plan resolves requested historical snapshot" {
@@ -529,6 +611,7 @@ test "iceberg metadata plan can use current snapshot schema id" {
     defer plan.deinit(alloc);
 
     try std.testing.expectEqualStrings("iceberg-schema:8", plan.schema_fingerprint);
+    try std.testing.expectEqual(@as(usize, 0), plan.schema_fields.len);
 }
 
 test "iceberg metadata plan requires schema id for requested historical snapshot" {

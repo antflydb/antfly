@@ -52,6 +52,7 @@ pub const IcebergDeleteFile = struct {
     data_sequence_number: i64,
     file_sequence_number: i64,
     equality_ids: []i32 = &.{},
+    equality_columns: [][]u8 = &.{},
     record_count: u64,
     file_size_in_bytes: u64,
 
@@ -59,6 +60,8 @@ pub const IcebergDeleteFile = struct {
         alloc.free(self.file_path);
         alloc.free(self.file_format);
         if (self.equality_ids.len > 0) alloc.free(self.equality_ids);
+        for (self.equality_columns) |column| alloc.free(column);
+        if (self.equality_columns.len > 0) alloc.free(self.equality_columns);
         self.* = undefined;
     }
 
@@ -73,10 +76,19 @@ pub const IcebergDeleteFile = struct {
         if (self.record_count == 0) return error.InvalidIcebergDeleteManifest;
         if (self.file_size_in_bytes == 0) return error.InvalidIcebergDeleteManifest;
         if (self.content == .equality_deletes and self.equality_ids.len == 0) return error.InvalidIcebergDeleteManifest;
+        if (self.equality_columns.len != 0 and self.equality_columns.len != self.equality_ids.len) {
+            return error.InvalidIcebergDeleteManifest;
+        }
         for (self.equality_ids, 0..) |field_id, idx| {
             if (field_id < 0) return error.InvalidIcebergDeleteManifest;
             for (self.equality_ids[0..idx]) |previous| {
                 if (previous == field_id) return error.InvalidIcebergDeleteManifest;
+            }
+        }
+        for (self.equality_columns, 0..) |column, idx| {
+            if (column.len == 0) return error.InvalidIcebergDeleteManifest;
+            for (self.equality_columns[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous, column)) return error.InvalidIcebergDeleteManifest;
             }
         }
     }
@@ -276,7 +288,7 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
 
                 var delete_manifest = try iceberg_avro.parseDataManifestAlloc(alloc, manifest_bytes);
                 defer delete_manifest.deinit(alloc);
-                try appendActiveDeleteFilesFromManifestAlloc(alloc, &delete_files, manifest_entry, delete_manifest);
+                try appendActiveDeleteFilesFromManifestAlloc(alloc, &delete_files, manifest_entry, delete_manifest, metadata_plan);
             },
         }
     }
@@ -343,7 +355,7 @@ pub fn readSnapshotDeletePlanAlloc(
 
         var delete_manifest = try iceberg_avro.parseDataManifestAlloc(alloc, manifest_bytes);
         defer delete_manifest.deinit(alloc);
-        try appendActiveDeleteFilesFromManifestAlloc(alloc, &delete_files, manifest_entry, delete_manifest);
+        try appendActiveDeleteFilesFromManifestAlloc(alloc, &delete_files, manifest_entry, delete_manifest, metadata_plan);
     }
 
     const files = try delete_files.toOwnedSlice(alloc);
@@ -602,6 +614,7 @@ fn appendActiveDeleteFilesFromManifestAlloc(
     out: *std.ArrayListUnmanaged(IcebergDeleteFile),
     manifest_entry: iceberg_avro.ManifestListEntry,
     manifest: iceberg_avro.DataManifest,
+    metadata_plan: iceberg_metadata.Plan,
 ) !void {
     var added_files: u32 = 0;
     var existing_files: u32 = 0;
@@ -619,12 +632,12 @@ fn appendActiveDeleteFilesFromManifestAlloc(
             .added => {
                 added_files += 1;
                 added_rows += entry.record_count;
-                try appendDeleteFileFromEntryAlloc(alloc, out, entry);
+                try appendDeleteFileFromEntryAlloc(alloc, out, entry, metadata_plan);
             },
             .existing => {
                 existing_files += 1;
                 existing_rows += entry.record_count;
-                try appendDeleteFileFromEntryAlloc(alloc, out, entry);
+                try appendDeleteFileFromEntryAlloc(alloc, out, entry, metadata_plan);
             },
             .deleted => {
                 deleted_files += 1;
@@ -646,6 +659,7 @@ fn appendDeleteFileFromEntryAlloc(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(IcebergDeleteFile),
     entry: iceberg_avro.DataFileEntry,
+    metadata_plan: iceberg_metadata.Plan,
 ) !void {
     var delete_file = IcebergDeleteFile{
         .content = entry.content,
@@ -655,6 +669,7 @@ fn appendDeleteFileFromEntryAlloc(
         .data_sequence_number = entry.data_sequence_number,
         .file_sequence_number = entry.file_sequence_number,
         .equality_ids = try cloneI32SliceAlloc(alloc, entry.equality_ids),
+        .equality_columns = try cloneEqualityColumnNamesAlloc(alloc, entry.equality_ids, metadata_plan),
         .record_count = entry.record_count,
         .file_size_in_bytes = entry.file_size_in_bytes,
     };
@@ -666,6 +681,26 @@ fn appendDeleteFileFromEntryAlloc(
 fn cloneI32SliceAlloc(alloc: Allocator, source: []const i32) ![]i32 {
     if (source.len == 0) return &.{};
     return try alloc.dupe(i32, source);
+}
+
+fn cloneEqualityColumnNamesAlloc(
+    alloc: Allocator,
+    equality_ids: []const i32,
+    metadata_plan: iceberg_metadata.Plan,
+) ![][]u8 {
+    if (equality_ids.len == 0 or metadata_plan.schema_fields.len == 0) return &.{};
+    const columns = try alloc.alloc([]u8, equality_ids.len);
+    errdefer alloc.free(columns);
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |column| alloc.free(column);
+    }
+    for (equality_ids, 0..) |field_id, idx| {
+        const column_name = metadata_plan.fieldNameForId(field_id) orelse return error.UnsupportedIcebergDeletes;
+        columns[idx] = try alloc.dupe(u8, column_name);
+        initialized += 1;
+    }
+    return columns;
 }
 
 fn deinitDeleteFileItems(alloc: Allocator, files: []IcebergDeleteFile) void {
@@ -1069,7 +1104,7 @@ test "iceberg snapshot reader plans equality delete files with equality ids" {
     var client = memory.client();
     try client.makeBucket("bucket");
 
-    var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
+    var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJsonWithSchema(), .{});
     defer metadata_file.deinit(alloc);
     var delete_manifest = try buildEqualityDeleteManifestFixture(alloc);
     defer delete_manifest.deinit(alloc);
@@ -1095,6 +1130,9 @@ test "iceberg snapshot reader plans equality delete files with equality ids" {
     try std.testing.expectEqualStrings("s3://bucket/t/deletes/eq-a.parquet", plan.files[0].file_path);
     try std.testing.expectEqualStrings("PARQUET", plan.files[0].file_format);
     try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2 }, plan.files[0].equality_ids);
+    try std.testing.expectEqual(@as(usize, 2), plan.files[0].equality_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", plan.files[0].equality_columns[0]);
+    try std.testing.expectEqualStrings("amount", plan.files[0].equality_columns[1]);
     try std.testing.expectEqual(@as(u64, 1), plan.files[0].record_count);
     try std.testing.expectEqual(@as(u64, 1024), plan.files[0].file_size_in_bytes);
 }
@@ -1284,6 +1322,35 @@ fn testMetadataJson() []const u8 {
     \\  "table-uuid": "uuid-events",
     \\  "location": "s3://bucket/t",
     \\  "current-schema-id": 7,
+    \\  "current-snapshot-id": 12,
+    \\  "snapshots": [
+    \\    {
+    \\      "snapshot-id": 12,
+    \\      "sequence-number": 42,
+    \\      "timestamp-ms": 1700000000000,
+    \\      "manifest-list": "s3://bucket/t/metadata/snap-12.avro"
+    \\    }
+    \\  ]
+    \\}
+    ;
+}
+
+fn testMetadataJsonWithSchema() []const u8 {
+    return
+    \\{
+    \\  "format-version": 2,
+    \\  "table-uuid": "uuid-events",
+    \\  "location": "s3://bucket/t",
+    \\  "current-schema-id": 7,
+    \\  "schemas": [
+    \\    {
+    \\      "schema-id": 7,
+    \\      "fields": [
+    \\        {"id": 1, "name": "tenant_id", "required": true, "type": "string"},
+    \\        {"id": 2, "name": "amount", "required": false, "type": "long"}
+    \\      ]
+    \\    }
+    \\  ],
     \\  "current-snapshot-id": 12,
     \\  "snapshots": [
     \\    {
