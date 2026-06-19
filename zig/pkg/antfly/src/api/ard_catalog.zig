@@ -1993,6 +1993,7 @@ fn extensionPackageEntryMatches(
         text,
         filter,
         publisher_domain,
+        true,
         struct {
             fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
                 const item: *const extension_domain.PackageManifest = @ptrCast(@alignCast(ctx));
@@ -2001,6 +2002,27 @@ fn extensionPackageEntryMatches(
                 if (std.mem.eql(u8, key, "trusted")) return jsonValueMatchesBool(value, item.trusted);
                 if (std.mem.eql(u8, key, "artifactCount")) return jsonValueMatchesInteger(value, @intCast(item.artifacts.len));
                 if (std.mem.eql(u8, key, "capabilitiesRequestedCount")) return jsonValueMatchesInteger(value, @intCast(item.capabilities_requested.len));
+                return false;
+            }
+        }.matches,
+        struct {
+            fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
+                const item: *const extension_domain.PackageManifest = @ptrCast(@alignCast(ctx));
+                if (std.mem.eql(u8, key, "provenance.relation")) return jsonValueMatchesString(value, "publishedFrom") or jsonValueMatchesString(value, "derivedFrom");
+                if (std.mem.eql(u8, key, "provenance.sourceDigest")) {
+                    if (jsonValueMatchesString(value, item.digest)) return true;
+                    for (item.artifacts) |artifact| {
+                        if (artifact.digest.len > 0 and jsonValueMatchesString(value, artifact.digest)) return true;
+                    }
+                    return false;
+                }
+                if (std.mem.eql(u8, key, "provenance.sourceId")) {
+                    if (jsonValueMatchesFmt(value, "/extensions/v1/packages/{s}/versions/{s}", .{ item.name, item.version })) return true;
+                    for (item.artifacts) |artifact| {
+                        if (jsonValueMatchesString(value, artifact.path)) return true;
+                    }
+                    return false;
+                }
                 return false;
             }
         }.matches,
@@ -2024,6 +2046,7 @@ fn installedExtensionEntryMatches(
         text,
         filter,
         publisher_domain,
+        true,
         struct {
             fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
                 const item: *const extension_domain.InstalledExtension = @ptrCast(@alignCast(ctx));
@@ -2036,6 +2059,15 @@ fn installedExtensionEntryMatches(
                 if (std.mem.eql(u8, key, "scopeKind")) return jsonValueMatchesString(value, @tagName(item.scope.kind));
                 if (std.mem.eql(u8, key, "scopeTableName")) return item.scope.kind == .table and jsonValueMatchesString(value, item.scope.table_name);
                 if (std.mem.eql(u8, key, "grantedCapabilitiesCount")) return jsonValueMatchesInteger(value, @intCast(item.granted_capabilities.len));
+                return false;
+            }
+        }.matches,
+        struct {
+            fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
+                const item: *const extension_domain.InstalledExtension = @ptrCast(@alignCast(ctx));
+                if (std.mem.eql(u8, key, "provenance.relation")) return jsonValueMatchesString(value, "derivedFrom");
+                if (std.mem.eql(u8, key, "provenance.sourceDigest")) return item.package_digest.len > 0 and jsonValueMatchesString(value, item.package_digest);
+                if (std.mem.eql(u8, key, "provenance.sourceId")) return jsonValueMatchesFmt(value, "/extensions/v1/packages/{s}/versions/{s}", .{ item.package_name, item.package_version });
                 return false;
             }
         }.matches,
@@ -2059,11 +2091,17 @@ fn extensionMcpEntryMatches(
         text,
         filter,
         publisher_domain,
+        false,
         struct {
             fn matches(ctx: *const anyopaque, key: []const u8, value: std.json.Value) bool {
                 const item: *const extension_domain.InstalledExtension = @ptrCast(@alignCast(ctx));
                 if (std.mem.eql(u8, key, "endpoint")) return jsonValueMatchesFmt(value, "/mcp/v1/extensions/{s}", .{item.name});
                 if (std.mem.eql(u8, key, "extension")) return jsonValueMatchesString(value, item.name);
+                return false;
+            }
+        }.matches,
+        struct {
+            fn matches(_: *const anyopaque, _: []const u8, _: std.json.Value) bool {
                 return false;
             }
         }.matches,
@@ -2080,7 +2118,9 @@ fn dynamicEntryMatches(
     text: ?[]const u8,
     filter: ?std.json.Value,
     publisher_domain: []const u8,
+    has_trust_manifest: bool,
     metadataMatches: *const fn (*const anyopaque, []const u8, std.json.Value) bool,
+    trustManifestMatches: *const fn (*const anyopaque, []const u8, std.json.Value) bool,
     metadata_context: *const anyopaque,
 ) bool {
     if (text) |query| {
@@ -2106,6 +2146,11 @@ fn dynamicEntryMatches(
                 if (!jsonValueMatchesString(value, publisher_domain)) return false;
             } else if (std.mem.startsWith(u8, key, "metadata.")) {
                 if (!metadataMatches(metadata_context, key["metadata.".len..], value)) return false;
+            } else if (std.mem.startsWith(u8, key, "trustManifest.")) {
+                const trust_key = key["trustManifest.".len..];
+                if (!has_trust_manifest or
+                    (!commonTrustManifestMatches(publisher_domain, trust_key, value) and
+                        !trustManifestMatches(metadata_context, trust_key, value))) return false;
             } else {
                 return false;
             }
@@ -2277,6 +2322,20 @@ fn entryMatchesFilter(entry: Entry, publisher_domain: []const u8, key: []const u
     if (std.mem.eql(u8, key, "capabilities")) return jsonValueMatchesAnyString(value, entry.capabilities);
     if (std.mem.eql(u8, key, "publisher") or std.mem.eql(u8, key, "publisherId")) return jsonValueMatchesString(value, publisher_domain);
     if (std.mem.startsWith(u8, key, "metadata.")) return entry.metadata != null and containsJsonStringField(entry.metadata.?, key["metadata.".len..], value);
+    if (std.mem.startsWith(u8, key, "trustManifest.")) {
+        const trust_key = key["trustManifest.".len..];
+        const trust_manifest = entry.trust_manifest orelse return false;
+        return commonTrustManifestMatches(publisher_domain, trust_key, value) or containsJsonStringField(trust_manifest, trust_key, value);
+    }
+    return false;
+}
+
+fn commonTrustManifestMatches(publisher_domain: []const u8, key: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, key, "identity")) return jsonValueMatchesFmt(value, "did:web:{s}", .{publisher_domain});
+    if (std.mem.eql(u8, key, "identityType")) return jsonValueMatchesString(value, "did");
+    if (std.mem.eql(u8, key, "trustSchema.identifier")) return jsonValueMatchesString(value, "urn:antfly:ard:trust-schema:v1");
+    if (std.mem.eql(u8, key, "trustSchema.version")) return jsonValueMatchesString(value, "1");
+    if (std.mem.eql(u8, key, "trustSchema.verificationMethods")) return jsonValueMatchesString(value, "did") or jsonValueMatchesString(value, "dns-01");
     return false;
 }
 
@@ -2754,6 +2813,46 @@ test "ARD search supports extension metadata filters" {
     const mcp_results = mcp_parsed.value.object.get("results").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), mcp_results.len);
     try std.testing.expect(std.mem.indexOf(u8, mcp_results[0].object.get("identifier").?.string, ":extension:docsaf:mcp") != null);
+
+    const package_trust_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/antfly-extension-package+json\"],\"trustManifest.identity\":[\"did:web:antfly.local\"],\"trustManifest.identityType\":[\"did\"],\"trustManifest.trustSchema.identifier\":[\"urn:antfly:ard:trust-schema:v1\"],\"trustManifest.provenance.sourceDigest\":[\"sha256:docs-wasm\"],\"trustManifest.provenance.relation\":[\"derivedFrom\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(package_trust_body);
+    var package_trust_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, package_trust_body, .{});
+    defer package_trust_parsed.deinit();
+    const package_trust_results = package_trust_parsed.value.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), package_trust_results.len);
+    try std.testing.expect(std.mem.indexOf(u8, package_trust_results[0].object.get("identifier").?.string, ":extension-package:docsaf:1.0.0") != null);
+
+    const installed_trust_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/antfly-installed-extension+json\"],\"trustManifest.provenance.sourceDigest\":[\"sha256:docs\"],\"trustManifest.provenance.relation\":[\"derivedFrom\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(installed_trust_body);
+    var installed_trust_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, installed_trust_body, .{});
+    defer installed_trust_parsed.deinit();
+    const installed_trust_results = installed_trust_parsed.value.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), installed_trust_results.len);
+    try std.testing.expect(std.mem.indexOf(u8, installed_trust_results[0].object.get("identifier").?.string, ":extension:docsaf:installed") != null);
+
+    const mcp_trust_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/mcp-server+json\"],\"trustManifest.identity\":[\"did:web:antfly.local\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(mcp_trust_body);
+    var mcp_trust_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, mcp_trust_body, .{});
+    defer mcp_trust_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mcp_trust_parsed.value.object.get("results").?.array.items.len);
 }
 
 test "ARD profile filter keeps only profile-compatible skills" {
