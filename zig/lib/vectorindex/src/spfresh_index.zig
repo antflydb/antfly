@@ -1778,16 +1778,13 @@ fn mergeUnderfullPostingWithNearestSibling(
 
     for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-    var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-    errdefer self.alloc.free(new_children);
     var wi_child: usize = 0;
     for (parent.children) |cid| {
         if (cid == leaf.id) continue;
-        new_children[wi_child] = cid;
+        parent.children[wi_child] = cid;
         wi_child += 1;
     }
-    self.alloc.free(parent.children);
-    parent.children = new_children;
+    parent.children = try self.alloc.realloc(parent.children, wi_child);
     try self.recomputeInternalCentroid(txn, &parent);
     try self.saveNodeWithOptionsMode(txn, &parent, save_options, false);
     try self.deleteNode(txn, leaf.id);

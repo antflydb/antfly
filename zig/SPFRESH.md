@@ -931,6 +931,9 @@ implementations cleanly:
    refresh also use stack-backed paired vector scratch for common dimensions,
    and overfull leaf splitting uses the same shape while materializing split
    inputs, falling back to one combined heap allocation instead of two.
+   Underfull sibling merges now compact the parent child list in place and
+   shrink it with `realloc` instead of allocating a second child array before
+   publishing the parent update.
    Boundary reassignment now stack-backs the common loaded child-leaf slice,
    move list, per-child planned-in/out counters, and changed flags before
    falling back to heap arrays for unusually large parents or move budgets.
