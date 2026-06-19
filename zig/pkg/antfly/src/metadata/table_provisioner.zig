@@ -560,6 +560,7 @@ fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const u8) 
 fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: db_mod.types.IndexConfig) !bool {
     if (a.kind != b.kind) return false;
     if (a.kind == .full_text) return fullTextIndexConfigsEqual(alloc, a.config_json, b.config_json);
+    if (a.kind == .algebraic) return algebraicIndexConfigsEqual(alloc, a.config_json, b.config_json);
     return std.mem.eql(u8, a.config_json, b.config_json);
 }
 
@@ -576,6 +577,14 @@ fn fullTextIndexConfigsEqual(alloc: std.mem.Allocator, a_json: []const u8, b_jso
     var b_parsed = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
     defer b_parsed.deinit();
     return jsonValuesEqualIgnoringTopLevelEnrichments(a_parsed.value, b_parsed.value, true);
+}
+
+fn algebraicIndexConfigsEqual(alloc: std.mem.Allocator, a_json: []const u8, b_json: []const u8) !bool {
+    var a_parsed = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
+    defer a_parsed.deinit();
+    var b_parsed = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
+    defer b_parsed.deinit();
+    return jsonValuesEqualIgnoringTopLevelEnrichments(a_parsed.value, b_parsed.value, false);
 }
 
 fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Value, top_level: bool) bool {
@@ -1150,7 +1159,13 @@ test "table provisioner reconciles stored algebraic metadata without public type
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
     const config_json =
-        \\{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}
+        \\{
+        \\  "version": 1,
+        \\  "schema_version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"product","path":"product","type":"string"}],
+        \\  "materializations": []
+        \\}
     ;
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
