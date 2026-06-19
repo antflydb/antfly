@@ -470,6 +470,13 @@ pub const SearchScratch = struct {
         if (new_bytes > old_bytes) self.noteScratchAllocation(new_bytes);
     }
 
+    pub fn canAppendPostingDeltaTailCacheRecords(self: *const SearchScratch, record_count: usize) bool {
+        const active = &self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot];
+        if (!active.valid) return false;
+        return active.count <= posting_delta_tail_cache_max_records and
+            record_count <= posting_delta_tail_cache_max_records - active.count;
+    }
+
     pub fn invalidatePostingDeltaTailCache(self: *SearchScratch) void {
         self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].valid = false;
         self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].count = 0;
@@ -1107,12 +1114,15 @@ test "SearchScratch posting delta tail cache discards oversized tails" {
     defer scratch.deinit(alloc);
 
     scratch.beginPostingDeltaTailCache(10);
+    try std.testing.expect(scratch.canAppendPostingDeltaTailCacheRecords(posting_delta_tail_cache_max_records));
+    try std.testing.expect(!scratch.canAppendPostingDeltaTailCacheRecords(posting_delta_tail_cache_max_records + 1));
     var i: usize = 0;
     while (i < posting_delta_tail_cache_max_records) : (i += 1) {
         try scratch.appendPostingDeltaTailCacheRecord(alloc, @intCast(i + 1), @intCast(100 + i), @intCast(i % 3));
     }
     const bounded = scratch.cachedPostingDeltaTail(10) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, posting_delta_tail_cache_max_records), bounded.sequences.len);
+    try std.testing.expect(!scratch.canAppendPostingDeltaTailCacheRecords(1));
 
     try scratch.appendPostingDeltaTailCacheRecord(alloc, @intCast(i + 1), @intCast(100 + i), @intCast(i % 3));
     try std.testing.expect(scratch.cachedPostingDeltaTail(10) == null);

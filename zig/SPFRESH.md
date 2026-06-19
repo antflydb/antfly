@@ -885,9 +885,11 @@ implementations cleanly:
    batch coalesced existing updates reuse one compare/transform scratch pair
    across posting groups. Posting-delta tail cache entries slab their
    sequence/id/op arrays and discard oversized opportunistic prefetch entries
-   instead of retaining large decoded tails in query scratch. Query/fold overlay
-   append IDs plus live flags share one backing allocation. Fold compact delta
-   IDs plus ops are likewise slabbed.
+   instead of retaining large decoded tails in query scratch; prefetch also
+   checks value record counts before record decode so oversized tails are
+   skipped without building throwaway decoded arrays. Query/fold overlay append
+   IDs plus live flags share one backing allocation. Fold compact delta IDs
+   plus ops are likewise slabbed.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.

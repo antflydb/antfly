@@ -3669,9 +3669,13 @@ pub const PostingStore = struct {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
             const entry_all_live = try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation);
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            const cache_tail_value = canAppendPostingDeltaTailValueToCache(scratch, iterator.recordCount());
+            if (!cache_tail_value) invalidatePostingDeltaTailCacheIfSupported(scratch);
             while (try iterator.next()) |record| {
                 if (comptime @hasDecl(Scratch, "appendPostingDeltaTailCacheRecord")) {
-                    try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
+                    if (cache_tail_value) {
+                        try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
+                    }
                 }
                 if (!entry_all_live and PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 result.records += 1;
@@ -3761,9 +3765,13 @@ pub const PostingStore = struct {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
             const entry_all_live = try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation);
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            const cache_tail_value = canAppendPostingDeltaTailValueToCache(scratch, iterator.recordCount());
+            if (!cache_tail_value) invalidatePostingDeltaTailCacheIfSupported(scratch);
             while (try iterator.next()) |record| {
                 if (comptime @hasDecl(Scratch, "appendPostingDeltaTailCacheRecord")) {
-                    try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
+                    if (cache_tail_value) {
+                        try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
+                    }
                 }
                 if (!entry_all_live and PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 result.records += 1;
@@ -4025,6 +4033,27 @@ pub const PostingStore = struct {
         }
     }
 
+    fn canAppendPostingDeltaTailValueToCache(scratch: anytype, record_count: usize) bool {
+        const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(scratch),
+        };
+        if (comptime @hasDecl(Scratch, "canAppendPostingDeltaTailCacheRecords")) {
+            return scratch.canAppendPostingDeltaTailCacheRecords(record_count);
+        }
+        return true;
+    }
+
+    fn invalidatePostingDeltaTailCacheIfSupported(scratch: anytype) void {
+        const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(scratch),
+        };
+        if (comptime @hasDecl(Scratch, "invalidatePostingDeltaTailCache")) {
+            scratch.invalidatePostingDeltaTailCache();
+        }
+    }
+
     fn prefetchNearbyDeltaTails(
         alloc: std.mem.Allocator,
         scratch: anytype,
@@ -4050,10 +4079,15 @@ pub const PostingStore = struct {
                 active_posting_id = next_posting_id;
                 cached_postings += 1;
             }
+            var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            if (!canAppendPostingDeltaTailValueToCache(scratch, iterator.recordCount())) {
+                invalidatePostingDeltaTailCacheIfSupported(scratch);
+                maybe_entry = try cursor.next();
+                continue;
+            }
             if (comptime @hasDecl(std.meta.Child(@TypeOf(scratch)), "notePostingDeltaTailPrefetchDecodedBytes")) {
                 scratch.notePostingDeltaTailPrefetchDecodedBytes(entry.value.len);
             }
-            var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             while (try iterator.next()) |record| {
                 try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
             }
