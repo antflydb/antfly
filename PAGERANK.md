@@ -5103,21 +5103,27 @@ than PR unit coverage:
   executed-round, failed-retry, worker-step, coordinator-step, attempt-record,
   and four-family summary budgets, giving PR validation a fast pass/fail
   exercise of every release-budget category without claiming production latency
-  baselines. `zig build graph-metric-release-qualification-promotion` and
+  baselines. The smoke and build-only targets use the build's selected
+  optimization mode, so local correctness validation can run in Debug or
+  ReleaseSafe without paying the optimized promotion compile cost; use
+  `zig build graph-metric-release-qualification-releasefast-build` when only
+  the optimized harness artifact is needed. `zig build
+  graph-metric-release-qualification-promotion` and
   `make zig-graph-metric-release-qualification-promotion` run the larger
-  release-profile floor. `zig build
+  release-profile floor through the ReleaseFast harness. `zig build
   graph-metric-release-qualification-promotion-budgeted` and
   `make zig-graph-metric-release-qualification-promotion-budgeted` run that
-  same promotion floor with conservative pass/fail budgets for published-read
-  latency, fresh-failure latency, fan-in latency, retained storage records, page
-  claims, cleanup ticks, executed rounds, failed rebuild retries, worker steps,
-  coordinator steps, and minimum split worker identity progress, plus a
-  four-family summary floor. Retained storage budgets now include explicit
-  attempt-record ceilings in addition to score, metric, control, failure, and
-  event records, while the cleanup invariant still requires zero retained
-  attempt records after fresh and failed cleanup. That target now passes
-  `--require-deployment-shaped-release-gate`, so the harness fails before
-  running if the invocation cannot emit `deployment_shaped_release_gate: true`.
+  same ReleaseFast promotion floor with conservative pass/fail budgets for
+  published-read latency, fresh-failure latency, fan-in latency, retained
+  storage records, page claims, cleanup ticks, executed rounds, failed rebuild
+  retries, worker steps, coordinator steps, and minimum split worker identity
+  progress, plus a four-family summary floor. Retained storage budgets now
+  include explicit attempt-record ceilings in addition to score, metric,
+  control, failure, and event records, while the cleanup invariant still
+  requires zero retained attempt records after fresh and failed cleanup. That
+  target now passes `--require-deployment-shaped-release-gate`, so the harness
+  fails before running if the invocation cannot emit
+  `deployment_shaped_release_gate: true`.
   The required shape now includes the promotion workload floor, all-family
   execution, split/reopen ownership evidence, four-family coverage,
   split-worker progress floors, promotion fan-in and failure-churn floors,

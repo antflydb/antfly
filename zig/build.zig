@@ -6527,13 +6527,24 @@ pub fn build(b: *std.Build) void {
     const graph_metric_release_qualification_mod = b.createModule(.{
         .root_source_file = b.path("bench/graph/graph_metric_release_qualification.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     graph_metric_release_qualification_mod.addImport("antfly-zig", lib_mod);
 
     const graph_metric_release_qualification = b.addExecutable(.{
         .name = "graph_metric_release_qualification",
         .root_module = graph_metric_release_qualification_mod,
+    });
+    const graph_metric_release_qualification_releasefast_mod = b.createModule(.{
+        .root_source_file = b.path("bench/graph/graph_metric_release_qualification.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    graph_metric_release_qualification_releasefast_mod.addImport("antfly-zig", lib_mod);
+
+    const graph_metric_release_qualification_releasefast = b.addExecutable(.{
+        .name = "graph_metric_release_qualification_releasefast",
+        .root_module = graph_metric_release_qualification_releasefast_mod,
     });
 
     const run_graph_metric_release_qualification = b.addRunArtifact(graph_metric_release_qualification);
@@ -6594,7 +6605,7 @@ pub fn build(b: *std.Build) void {
     run_graph_metric_release_qualification_smoke_budgeted.addArgs(graph_metric_release_qualification_smoke_budgeted_args);
     const graph_metric_release_qualification_smoke_budgeted_step = b.step("graph-metric-release-qualification-smoke-budgeted", "Run smoke graph metric release qualification profile with storage and scheduler budgets");
     graph_metric_release_qualification_smoke_budgeted_step.dependOn(&run_graph_metric_release_qualification_smoke_budgeted.step);
-    const run_graph_metric_release_qualification_promotion = b.addRunArtifact(graph_metric_release_qualification);
+    const run_graph_metric_release_qualification_promotion = b.addRunArtifact(graph_metric_release_qualification_releasefast);
     run_graph_metric_release_qualification_promotion.addArgs(&.{ "--profile", "promotion" });
     const graph_metric_release_qualification_promotion_step = b.step("graph-metric-release-qualification-promotion", "Run promotion graph metric release qualification profile");
     graph_metric_release_qualification_promotion_step.dependOn(&run_graph_metric_release_qualification_promotion.step);
@@ -6641,12 +6652,14 @@ pub fn build(b: *std.Build) void {
         "4",
         "--require-deployment-shaped-release-gate",
     };
-    const run_graph_metric_release_qualification_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification);
+    const run_graph_metric_release_qualification_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification_releasefast);
     run_graph_metric_release_qualification_promotion_budgeted.addArgs(graph_metric_release_qualification_promotion_budgeted_args);
     const graph_metric_release_qualification_promotion_budgeted_step = b.step("graph-metric-release-qualification-promotion-budgeted", "Run promotion graph metric release qualification profile with storage and scheduler budgets");
     graph_metric_release_qualification_promotion_budgeted_step.dependOn(&run_graph_metric_release_qualification_promotion_budgeted.step);
     const build_graph_metric_release_qualification_step = b.step("graph-metric-release-qualification-build", "Build graph metric release qualification harness without running it");
     build_graph_metric_release_qualification_step.dependOn(&graph_metric_release_qualification.step);
+    const build_graph_metric_release_qualification_releasefast_step = b.step("graph-metric-release-qualification-releasefast-build", "Build optimized graph metric release qualification harness without running it");
+    build_graph_metric_release_qualification_releasefast_step.dependOn(&graph_metric_release_qualification_releasefast.step);
 
     const algebraic_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/algebraic_bench.zig"),
