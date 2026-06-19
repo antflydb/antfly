@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("../external_source/types.zig");
 const rowsource_bridge = @import("../external_source/rowsource_bridge.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const lake_rows = @import("lake_rows.zig");
 
 pub const PositionDeleteRow = struct {
     data_file_path: []const u8,
@@ -33,6 +34,32 @@ pub const PositionDeleteRow = struct {
         if (self.data_file_path.len == 0) return error.InvalidIcebergPositionDelete;
     }
 };
+
+pub const PositionDeleteColumnNames = struct {
+    data_file_path: []const u8 = "file_path",
+    row_position: []const u8 = "pos",
+
+    pub fn validate(self: PositionDeleteColumnNames) !void {
+        if (self.data_file_path.len == 0) return error.InvalidIcebergPositionDeleteColumns;
+        if (self.row_position.len == 0) return error.InvalidIcebergPositionDeleteColumns;
+        if (std.mem.eql(u8, self.data_file_path, self.row_position)) return error.InvalidIcebergPositionDeleteColumns;
+    }
+};
+
+pub fn positionDeleteScanResultToRowRefsAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    result: lake_rows.ScanResult,
+    columns: PositionDeleteColumnNames,
+) ![]rowsource.RowRef {
+    try columns.validate();
+    var delete_rows = std.ArrayListUnmanaged(PositionDeleteRow).empty;
+    defer delete_rows.deinit(alloc);
+    for (result.rows) |row| {
+        try delete_rows.append(alloc, try positionDeleteRowFromProjectedRow(row, columns));
+    }
+    return try positionDeleteRowsToRowRefsAlloc(alloc, inventory, delete_rows.items);
+}
 
 pub fn positionDeleteRowsToRowRefsAlloc(
     alloc: Allocator,
@@ -65,6 +92,29 @@ pub fn positionDeleteRowsToRowRefsAlloc(
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+fn positionDeleteRowFromProjectedRow(
+    row: lake_rows.ProjectedRow,
+    columns: PositionDeleteColumnNames,
+) !PositionDeleteRow {
+    const data_file_path = row.find(columns.data_file_path) orelse return error.IcebergPositionDeleteColumnNotFound;
+    const row_position = row.find(columns.row_position) orelse return error.IcebergPositionDeleteColumnNotFound;
+    const path_value = data_file_path.value orelse return error.InvalidIcebergPositionDelete;
+    const position_value = row_position.value orelse return error.InvalidIcebergPositionDelete;
+    const path = switch (path_value) {
+        .bytes => |value| value,
+        else => return error.UnsupportedIcebergPositionDeleteColumn,
+    };
+    const position_i64 = switch (position_value) {
+        .i64 => |value| value,
+        else => return error.UnsupportedIcebergPositionDeleteColumn,
+    };
+    if (position_i64 < 0) return error.InvalidIcebergPositionDelete;
+    return .{
+        .data_file_path = path,
+        .row_position = @intCast(position_i64),
+    };
 }
 
 const RowGroupPosition = struct {
@@ -170,6 +220,94 @@ test "iceberg position delete rows map to external row refs" {
     try std.testing.expectEqual(@as(u64, 1), refs[1].external.row_ordinal);
 }
 
+test "iceberg position delete scan result maps to external row refs" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/t"),
+        .snapshot_id = try alloc.dupe(u8, "12"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "s3://bucket/t/data/a.parquet"),
+        .object_uri = try alloc.dupe(u8, "object://bucket/t/data/a.parquet"),
+        .version_id = try alloc.dupe(u8, "iceberg:v1:snapshot=12"),
+        .byte_len = 1024,
+        .row_count = 4,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
+            .{ .ordinal = 0, .row_count = 2 },
+            .{ .ordinal = 1, .row_count = 2 },
+        }),
+    };
+
+    var result = lake_rows.ScanResult{
+        .rows = try alloc.alloc(lake_rows.ProjectedRow, 2),
+        .total = 2,
+    };
+    var initialized: usize = 0;
+    var partial_cleanup = true;
+    errdefer if (partial_cleanup) {
+        for (result.rows[0..initialized]) |*row| row.deinit(alloc);
+        alloc.free(result.rows);
+    };
+    result.rows[0] = try testPositionDeleteProjectedRowAlloc(alloc, "s3://bucket/t/data/a.parquet", 1);
+    initialized += 1;
+    result.rows[1] = try testPositionDeleteProjectedRowAlloc(alloc, "s3://bucket/t/data/a.parquet", 2);
+    initialized += 1;
+    partial_cleanup = false;
+    defer result.deinit(alloc);
+
+    const refs = try positionDeleteScanResultToRowRefsAlloc(alloc, inventory, result, .{});
+    defer alloc.free(refs);
+
+    try std.testing.expectEqual(@as(usize, 2), refs.len);
+    try std.testing.expectEqual(@as(u32, 0), refs[0].external.row_group_ordinal);
+    try std.testing.expectEqual(@as(u64, 1), refs[0].external.row_ordinal);
+    try std.testing.expectEqual(@as(u32, 1), refs[1].external.row_group_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), refs[1].external.row_ordinal);
+}
+
+test "iceberg position delete scan result rejects malformed rows" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/t"),
+        .snapshot_id = try alloc.dupe(u8, "12"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "s3://bucket/t/data/a.parquet"),
+        .object_uri = try alloc.dupe(u8, "object://bucket/t/data/a.parquet"),
+        .version_id = try alloc.dupe(u8, "iceberg:v1:snapshot=12"),
+        .byte_len = 1024,
+        .row_count = 1,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
+            .{ .ordinal = 0, .row_count = 1 },
+        }),
+    };
+
+    var result = lake_rows.ScanResult{
+        .rows = try alloc.alloc(lake_rows.ProjectedRow, 1),
+        .total = 1,
+    };
+    var partial_cleanup = true;
+    errdefer if (partial_cleanup) alloc.free(result.rows);
+    result.rows[0] = try testPositionDeleteProjectedRowAlloc(alloc, "s3://bucket/t/data/a.parquet", -1);
+    partial_cleanup = false;
+    defer result.deinit(alloc);
+
+    try std.testing.expectError(
+        error.InvalidIcebergPositionDelete,
+        positionDeleteScanResultToRowRefsAlloc(alloc, inventory, result, .{}),
+    );
+}
+
 test "iceberg position delete rows require row group metadata" {
     const alloc = std.testing.allocator;
     var inventory = external_source.Inventory{
@@ -228,4 +366,33 @@ test "iceberg position delete rows reject out of bounds positions" {
         error.IcebergPositionDeleteRowOutOfBounds,
         positionDeleteRowsToRowRefsAlloc(alloc, inventory, &delete_rows),
     );
+}
+
+fn testPositionDeleteProjectedRowAlloc(
+    alloc: Allocator,
+    file_path: []const u8,
+    pos: i64,
+) !lake_rows.ProjectedRow {
+    const cells = try alloc.alloc(lake_rows.ProjectedCell, 2);
+    var initialized: usize = 0;
+    errdefer {
+        for (cells[0..initialized]) |*cell| cell.deinit(alloc);
+        alloc.free(cells);
+    }
+
+    cells[0] = .{
+        .name = try alloc.dupe(u8, "file_path"),
+        .value = .{ .bytes = try alloc.dupe(u8, file_path) },
+    };
+    initialized += 1;
+    cells[1] = .{
+        .name = try alloc.dupe(u8, "pos"),
+        .value = .{ .i64 = pos },
+    };
+    initialized += 1;
+
+    return .{
+        .row_ref = .{ .relational_key = "delete-row" },
+        .cells = cells,
+    };
 }

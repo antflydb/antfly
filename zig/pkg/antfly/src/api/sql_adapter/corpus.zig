@@ -3953,6 +3953,10 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_deferrable_primary_key: bool = false,
     unsupported_ddl_transaction_scoped_search_path: bool = false,
     unsupported_write: bool = false,
+    unsupported_write_recursive_cte_insert: bool = false,
+    unsupported_write_recursive_cte_update: bool = false,
+    unsupported_write_recursive_cte_delete: bool = false,
+    unsupported_write_recursive_cte_merge: bool = false,
     unsupported_insert: bool = false,
     unsupported_update: bool = false,
     unsupported_update_source: bool = false,
@@ -5054,6 +5058,22 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":matched_update_expr=") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":not_matched_insert_expr="));
         } else if (entry.family == .unsupported_write) {
+            self.unsupported_write_recursive_cte_insert = self.unsupported_write_recursive_cte_insert or
+                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
+                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
+                    std.mem.indexOf(u8, entry.sql, " INSERT INTO ") != null);
+            self.unsupported_write_recursive_cte_update = self.unsupported_write_recursive_cte_update or
+                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
+                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
+                    std.mem.indexOf(u8, entry.sql, " UPDATE ") != null);
+            self.unsupported_write_recursive_cte_delete = self.unsupported_write_recursive_cte_delete or
+                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
+                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
+                    std.mem.indexOf(u8, entry.sql, " DELETE FROM ") != null);
+            self.unsupported_write_recursive_cte_merge = self.unsupported_write_recursive_cte_merge or
+                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
+                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
+                    std.mem.indexOf(u8, entry.sql, " MERGE INTO ") != null);
             self.unsupported_write_truncate_multi_table = self.unsupported_write_truncate_multi_table or
                 (std.mem.eql(u8, entry.classification_reason, "multi_table_generation_barrier") and
                     std.mem.indexOf(u8, entry.sql, ", archived_records") != null);
@@ -6036,6 +6056,10 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
         try std.testing.expect(self.unsupported_ddl_prepare_recursive_cte_statement);
+        try std.testing.expect(self.unsupported_write_recursive_cte_insert);
+        try std.testing.expect(self.unsupported_write_recursive_cte_update);
+        try std.testing.expect(self.unsupported_write_recursive_cte_delete);
+        try std.testing.expect(self.unsupported_write_recursive_cte_merge);
         try std.testing.expect(self.unsupported_ddl_deferrable_unique_constraint);
         try std.testing.expect(self.unsupported_ddl_deferrable_primary_key);
         try std.testing.expect(self.unsupported_ddl_transaction_scoped_search_path);

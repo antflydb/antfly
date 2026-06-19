@@ -64,6 +64,34 @@
       "sql": "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
     },
     {
+      "name": "unsupported recursive cte insert write plan",
+      "family": "unsupported_write",
+      "plan": "unsupported:write:requires=recursive_cte_stream_plan",
+      "classification_reason": "recursive_cte_stream_plan",
+      "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) INSERT INTO archived_records (id) SELECT id FROM source_rows"
+    },
+    {
+      "name": "unsupported recursive cte update write plan",
+      "family": "unsupported_write",
+      "plan": "unsupported:write:requires=recursive_cte_stream_plan",
+      "classification_reason": "recursive_cte_stream_plan",
+      "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
+    },
+    {
+      "name": "unsupported recursive cte delete write plan",
+      "family": "unsupported_write",
+      "plan": "unsupported:write:requires=recursive_cte_stream_plan",
+      "classification_reason": "recursive_cte_stream_plan",
+      "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)"
+    },
+    {
+      "name": "unsupported recursive cte merge write plan",
+      "family": "unsupported_write",
+      "plan": "unsupported:write:requires=recursive_cte_stream_plan",
+      "classification_reason": "recursive_cte_stream_plan",
+      "sql": "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
+    },
+    {
       "name": "unsupported deferrable unique constraint",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=deferrable_unique_constraint",

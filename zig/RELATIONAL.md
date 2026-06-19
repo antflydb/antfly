@@ -1825,13 +1825,14 @@ the typed aggregate filter arrays directly.
 
 The fixture-backed gate also requires supported fingerprints for point,
 claimed-source, and joined-source primary-key rewrites that lower to `rewrite_identity`, plus fail-closed
-unsupported classifications for view DDL, recursive CTE read/query plans,
+unsupported classifications for view DDL, recursive CTE read/query/direct-write plans,
 duplicate physical row targets inside one SQL-lowered row batch, invalid
 conflict update targets, non-unique direct point update selectors, scalar-target
 multi-output subquery delete selectors, so recursive read streams cannot bypass
-the typed read-plan classifier, multi-row `INSERT` cannot lower into two writes
-for the same typed primary key, cross-owner DML cannot rekey rows until it has a
-range-claimed identity-rewrite staging contract, unclaimed broad deletes
+the typed read-plan classifier, recursive insert/update/delete/merge streams
+cannot bypass the typed write-plan classifier, multi-row `INSERT` cannot lower
+into two writes for the same typed primary key, cross-owner DML cannot rekey rows
+until it has a range-claimed identity-rewrite staging contract, unclaimed broad deletes
 cannot bypass the mutation-source contract, invalid scalar-target multi-output
 subqueries cannot smuggle ambiguous source tuples into a scalar semi-join
 selector, and view metadata cannot pass through until it has native catalog

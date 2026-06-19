@@ -568,6 +568,7 @@ pub const ObjectRangeRowsQueryRequest = struct {
     projected_columns: []const []const u8,
     predicate: ?lake_rows.Predicate = null,
     limit: ?usize = null,
+    deleted_row_refs: []const rowsource.RowRef = &.{},
     coalesce_options: range_io.CoalesceOptions = .{},
     sidecars: []const sidecar_manifest.DeclaredArtifact = &.{},
     desired_sidecars: []const lake_sidecar_selection.DesiredSidecar = &.{},
@@ -1456,6 +1457,7 @@ pub fn querySupportedI64ObjectRangeRowsAlloc(
         .projected_columns = request.projected_columns,
         .predicate = request.predicate,
         .limit = request.limit,
+        .deleted_row_refs = request.deleted_row_refs,
     };
     if (maybe_binding) |binding| {
         const base_source = try binding.toManifestBaseSource(request.inventory.snapshot_id, null);
@@ -4837,6 +4839,27 @@ test "parquet object range row group source reads chunks into lake rows" {
     try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
     try std.testing.expectEqual(@as(u32, 1), row_ref.row_group_ordinal);
     try std.testing.expectEqual(@as(u64, 1), row_ref.row_ordinal);
+
+    const deleted_row_refs = [_]rowsource.RowRef{.{ .external = .{
+        .source_id = "events",
+        .snapshot_id = "sha256:objects",
+        .file_id = "part-a.parquet",
+        .row_group_ordinal = 1,
+        .row_ordinal = 1,
+    } }};
+    var filtered = try querySupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .reader = range_reader.reader(),
+        .inventory = inventory,
+        .projected_columns = &projection,
+        .deleted_row_refs = &deleted_row_refs,
+    });
+    defer filtered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), filtered.total);
+    try std.testing.expectEqual(@as(usize, 3), filtered.rows.len);
+    try std.testing.expectEqual(@as(i64, 10), filtered.rows[0].find("amount").?.value.?.i64);
+    try std.testing.expectEqual(@as(i64, 20), filtered.rows[1].find("amount").?.value.?.i64);
+    try std.testing.expectEqual(@as(i64, 30), filtered.rows[2].find("amount").?.value.?.i64);
 }
 
 test "parquet object range row group source coalesces adjacent projected chunks" {

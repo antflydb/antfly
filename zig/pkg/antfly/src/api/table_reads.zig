@@ -5908,6 +5908,7 @@ pub fn executePinnedExternalLakeRowsScanAlloc(
         .projected_columns = request.projected_columns,
         .predicate = request.predicate,
         .limit = request.limit,
+        .deleted_row_refs = request.deleted_row_refs,
         .coalesce_options = coalesce_options,
         .sidecars = sidecar_context.sidecars,
         .desired_sidecars = sidecar_context.desired_sidecars,
