@@ -112,6 +112,8 @@ const Skill = struct {
     url: []const u8,
     display_name: []const u8,
     description: []const u8,
+    metadata: []const u8 = "{\"scope\":\"tenant\"}",
+    tags: []const []const u8 = &.{ "skill", "workflow" },
     capabilities: []const []const u8,
     representative_queries: []const []const u8,
     body: []const u8,
@@ -445,6 +447,24 @@ pub fn skillMarkdownAlloc(alloc: std.mem.Allocator, slug: []const u8) !?[]u8 {
     return try alloc.dupe(u8, skill.body);
 }
 
+pub fn extensionSkillMarkdownAlloc(alloc: std.mem.Allocator, route: []const u8, ctx: ExtensionCatalogContext) !?[]u8 {
+    const parsed_route = parseExtensionSkillRoute(route) orelse return null;
+    for (ctx.installed_extensions) |installed| {
+        if (!std.mem.eql(u8, installed.name, parsed_route.extension_name)) continue;
+        for (ctx.extension_members) |member| {
+            if (member.object_kind != .skill) continue;
+            if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+            if (!std.mem.eql(u8, member.object_name, parsed_route.skill_name)) continue;
+            if (!(try extensionMemberVisible(alloc, installed, member, ctx.permissions))) return null;
+            var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
+            defer skill.deinit();
+            if (skill.body.len > 0) return try alloc.dupe(u8, skill.body);
+            return try extensionSkillMarkdownFromDescriptorAlloc(alloc, installed, member, skill);
+        }
+    }
+    return null;
+}
+
 pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8, extension_context: ?ExtensionCatalogContext) !?[]u8 {
     if (std.mem.eql(u8, name, "profiles/copilot")) {
         return try alloc.dupe(u8,
@@ -667,10 +687,12 @@ fn collectExtensionFacets(
 ) !void {
     for (ctx.installed_extensions, 0..) |installed, index| {
         const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        const has_visible_skill = try installedExtensionHasVisibleSkill(alloc, installed, ctx.extension_members, ctx.permissions);
         const installed_capabilities = try capabilityNamesAlloc(alloc, installed.granted_capabilities);
         defer alloc.free(installed_capabilities);
 
-        if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
+        const can_expose_extension = try visibleInstalledCanExposeExtension(alloc, installed, ctx);
+        if (can_expose_extension) {
             if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
                 const package_capabilities = try capabilityNamesAlloc(alloc, package.capabilities_requested);
                 defer alloc.free(package_capabilities);
@@ -683,7 +705,10 @@ fn collectExtensionFacets(
                 }
             }
         }
-        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
+        if (has_visible_skill) {
+            try collectExtensionSkillFacets(alloc, facets, options, ctx, installed, text, filter, matched);
+        }
+        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp or has_visible_skill) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
         {
@@ -809,9 +834,11 @@ fn writeExtensionEntries(
 ) !void {
     for (ctx.installed_extensions, 0..) |installed, index| {
         const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        const has_visible_skill = try installedExtensionHasVisibleSkill(alloc, installed, ctx.extension_members, ctx.permissions);
         const installed_capabilities = try capabilityNamesAlloc(alloc, installed.granted_capabilities);
         defer alloc.free(installed_capabilities);
-        if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
+        const can_expose_extension = try visibleInstalledCanExposeExtension(alloc, installed, ctx);
+        if (can_expose_extension) {
             if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
                 const package_capabilities = try capabilityNamesAlloc(alloc, package.capabilities_requested);
                 defer alloc.free(package_capabilities);
@@ -823,7 +850,10 @@ fn writeExtensionEntries(
                 }
             }
         }
-        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
+        if (has_visible_skill) {
+            try writeExtensionSkillEntries(alloc, writer, options, first, ctx, installed, text, filter);
+        }
+        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp or has_visible_skill) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
         {
@@ -851,9 +881,11 @@ fn writeMatchedExtensionEntries(
 ) !void {
     for (ctx.installed_extensions, 0..) |installed, index| {
         const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        const has_visible_skill = try installedExtensionHasVisibleSkill(alloc, installed, ctx.extension_members, ctx.permissions);
         const installed_capabilities = try capabilityNamesAlloc(alloc, installed.granted_capabilities);
         defer alloc.free(installed_capabilities);
-        if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
+        const can_expose_extension = try visibleInstalledCanExposeExtension(alloc, installed, ctx);
+        if (can_expose_extension) {
             if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
                 const package_capabilities = try capabilityNamesAlloc(alloc, package.capabilities_requested);
                 defer alloc.free(package_capabilities);
@@ -865,7 +897,10 @@ fn writeMatchedExtensionEntries(
                 }
             }
         }
-        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
+        if (has_visible_skill) {
+            try writeSearchExtensionSkillEntries(alloc, writer, options, first, ctx, installed, matched, text, filter);
+        }
+        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp or has_visible_skill) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
         {
@@ -930,6 +965,24 @@ fn writeExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []const u8, 
     try writer.writeByte('}');
 }
 
+fn writeExtensionSkillEntry(
+    writer: *std.Io.Writer,
+    publisher_domain: []const u8,
+    first: *bool,
+    installed: extension_domain.InstalledExtension,
+    member: extension_domain.ExtensionMember,
+    skill: ParsedExtensionSkill,
+) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeByte(',');
+    }
+    try writer.writeByte('{');
+    try writeExtensionSkillFields(writer, publisher_domain, installed, member, skill);
+    try writer.writeByte('}');
+}
+
 fn writeSearchInstalledExtensionEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
     if (first.*) {
         first.* = false;
@@ -958,6 +1011,29 @@ fn writeSearchExtensionPackageEntry(writer: *std.Io.Writer, publisher_domain: []
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
 }
 
+fn writeSearchExtensionSkillEntry(
+    writer: *std.Io.Writer,
+    publisher_domain: []const u8,
+    first: *bool,
+    installed: extension_domain.InstalledExtension,
+    member: extension_domain.ExtensionMember,
+    skill: ParsedExtensionSkill,
+    matched: *usize,
+    text: ?[]const u8,
+) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeByte(',');
+    }
+    matched.* += 1;
+    try writer.writeByte('{');
+    try writeExtensionSkillFields(writer, publisher_domain, installed, member, skill);
+    try writer.writeAll(",\"score\":");
+    try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
+    try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
+}
+
 fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []const u8, first: *bool, installed: extension_domain.InstalledExtension, matched: *usize, text: ?[]const u8) !void {
     if (first.*) {
         first.* = false;
@@ -970,6 +1046,71 @@ fn writeSearchExtensionMcpEntry(writer: *std.Io.Writer, publisher_domain: []cons
     try writer.writeAll(",\"score\":");
     try writer.print("{d}", .{if (text == null or text.?.len == 0) @as(u16, 100) else 90});
     try writer.writeAll(",\"source\":\"/ard/v1/catalog\"}");
+}
+
+fn collectExtensionSkillFacets(
+    alloc: std.mem.Allocator,
+    facets: []FacetAccumulator,
+    options: CatalogOptions,
+    ctx: ExtensionCatalogContext,
+    installed: extension_domain.InstalledExtension,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    matched: *usize,
+) !void {
+    for (ctx.extension_members) |member| {
+        if (member.object_kind != .skill) continue;
+        if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+        if (!(try extensionMemberVisible(alloc, installed, member, ctx.permissions))) continue;
+        var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
+        defer skill.deinit();
+        if (!extensionSkillAllowedAndMatches(options, installed, member, skill, text, filter)) continue;
+        matched.* += 1;
+        try addDynamicFacets(alloc, facets, options.publisher_domain, "application/ai-skill+md", skill.tags(), skill.capabilities());
+    }
+}
+
+fn writeExtensionSkillEntries(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: CatalogOptions,
+    first: *bool,
+    ctx: ExtensionCatalogContext,
+    installed: extension_domain.InstalledExtension,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+) !void {
+    for (ctx.extension_members) |member| {
+        if (member.object_kind != .skill) continue;
+        if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+        if (!(try extensionMemberVisible(alloc, installed, member, ctx.permissions))) continue;
+        var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
+        defer skill.deinit();
+        if (!extensionSkillAllowedAndMatches(options, installed, member, skill, text, filter)) continue;
+        try writeExtensionSkillEntry(writer, options.publisher_domain, first, installed, member, skill);
+    }
+}
+
+fn writeSearchExtensionSkillEntries(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: CatalogOptions,
+    first: *bool,
+    ctx: ExtensionCatalogContext,
+    installed: extension_domain.InstalledExtension,
+    matched: *usize,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+) !void {
+    for (ctx.extension_members) |member| {
+        if (member.object_kind != .skill) continue;
+        if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+        if (!(try extensionMemberVisible(alloc, installed, member, ctx.permissions))) continue;
+        var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
+        defer skill.deinit();
+        if (!extensionSkillAllowedAndMatches(options, installed, member, skill, text, filter)) continue;
+        try writeSearchExtensionSkillEntry(writer, options.publisher_domain, first, installed, member, skill, matched, text);
+    }
 }
 
 fn writeExtensionPackageFields(writer: *std.Io.Writer, publisher_domain: []const u8, package: extension_domain.PackageManifest) !void {
@@ -1086,6 +1227,43 @@ fn writeExtensionMcpFields(writer: *std.Io.Writer, publisher_domain: []const u8,
     try writer.writeByte('}');
 }
 
+fn writeExtensionSkillFields(
+    writer: *std.Io.Writer,
+    publisher_domain: []const u8,
+    installed: extension_domain.InstalledExtension,
+    member: extension_domain.ExtensionMember,
+    skill: ParsedExtensionSkill,
+) !void {
+    try writer.writeAll("\"identifier\":");
+    try writeStringFmt(writer, "urn:ai:{s}:antfly:extension:{s}:skill:{s}", .{ publisher_domain, installed.name, member.object_name });
+    try writer.writeAll(",\"displayName\":");
+    try std.json.Stringify.value(skill.display_name, .{}, writer);
+    try writer.writeAll(",\"type\":\"application/ai-skill+md\",\"description\":");
+    try std.json.Stringify.value(skill.description, .{}, writer);
+    try writer.writeAll(",\"url\":");
+    try writeStringFmt(writer, "/ard/v1/skills/extensions/{s}/{s}", .{ installed.name, member.object_name });
+    try writer.writeAll(",\"tags\":");
+    try writeStringArray(writer, skill.tags());
+    if (skill.capabilities().len > 0) {
+        try writer.writeAll(",\"capabilities\":");
+        try writeStringArray(writer, skill.capabilities());
+    }
+    if (skill.representativeQueries().len > 0) {
+        try writer.writeAll(",\"representativeQueries\":");
+        try writeStringArray(writer, skill.representativeQueries());
+    }
+    try writer.writeAll(",\"metadata\":{\"scope\":\"extension\",\"extension\":");
+    try std.json.Stringify.value(installed.name, .{}, writer);
+    try writer.writeAll(",\"skill\":");
+    try std.json.Stringify.value(member.object_name, .{}, writer);
+    try writer.writeAll(",\"objectKind\":\"skill\"");
+    if (skill.profile) |profile| {
+        try writer.writeAll(",\"profile\":");
+        try std.json.Stringify.value(profile, .{}, writer);
+    }
+    try writer.writeByte('}');
+}
+
 fn extensionMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, installed: extension_domain.InstalledExtension, ctx: ExtensionCatalogContext) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
@@ -1101,7 +1279,7 @@ fn extensionMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, installed: extensio
     for (ctx.extension_members) |member| {
         if (member.object_kind != .mcp_tool) continue;
         if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
-        if (!(try extensionMcpMemberVisible(alloc, installed, member, ctx.permissions))) continue;
+        if (!(try extensionMemberVisible(alloc, installed, member, ctx.permissions))) continue;
         if (first) {
             first = false;
         } else {
@@ -1117,6 +1295,228 @@ fn extensionMcpDescriptorJsonAlloc(alloc: std.mem.Allocator, installed: extensio
     }
     try writer.writer.writeAll("]}");
     return try writer.toOwnedSlice();
+}
+
+const ExtensionSkillRoute = struct {
+    extension_name: []const u8,
+    skill_name: []const u8,
+};
+
+const ParsedExtensionSkill = struct {
+    const max_tags = 16;
+    const max_capabilities = 16;
+    const max_representative_queries = 8;
+
+    parsed: std.json.Parsed(std.json.Value),
+    display_name: []const u8,
+    description: []const u8,
+    body: []const u8 = "",
+    profile: ?[]const u8 = null,
+    tag_values: [max_tags][]const u8 = undefined,
+    tag_count: usize = 0,
+    capability_values: [max_capabilities][]const u8 = undefined,
+    capability_count: usize = 0,
+    representative_query_values: [max_representative_queries][]const u8 = undefined,
+    representative_query_count: usize = 0,
+
+    fn deinit(self: *ParsedExtensionSkill) void {
+        self.parsed.deinit();
+    }
+
+    fn tags(self: *const ParsedExtensionSkill) []const []const u8 {
+        return self.tag_values[0..self.tag_count];
+    }
+
+    fn capabilities(self: *const ParsedExtensionSkill) []const []const u8 {
+        return self.capability_values[0..self.capability_count];
+    }
+
+    fn representativeQueries(self: *const ParsedExtensionSkill) []const []const u8 {
+        return self.representative_query_values[0..self.representative_query_count];
+    }
+
+    fn addTag(self: *ParsedExtensionSkill, value: []const u8) void {
+        if (value.len == 0 or self.tag_count >= max_tags or jsonStringSliceContains(self.tags(), value)) return;
+        self.tag_values[self.tag_count] = value;
+        self.tag_count += 1;
+    }
+
+    fn addCapability(self: *ParsedExtensionSkill, value: []const u8) void {
+        if (value.len == 0 or self.capability_count >= max_capabilities or jsonStringSliceContains(self.capabilities(), value)) return;
+        self.capability_values[self.capability_count] = value;
+        self.capability_count += 1;
+    }
+
+    fn addRepresentativeQuery(self: *ParsedExtensionSkill, value: []const u8) void {
+        if (value.len == 0 or self.representative_query_count >= max_representative_queries or jsonStringSliceContains(self.representativeQueries(), value)) return;
+        self.representative_query_values[self.representative_query_count] = value;
+        self.representative_query_count += 1;
+    }
+};
+
+fn parseExtensionSkillRoute(route: []const u8) ?ExtensionSkillRoute {
+    const prefix = "extensions/";
+    if (!std.mem.startsWith(u8, route, prefix)) return null;
+    const rest = route[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const extension_name = rest[0..slash];
+    const skill_name = rest[slash + 1 ..];
+    if (extension_name.len == 0 or skill_name.len == 0 or std.mem.indexOfScalar(u8, skill_name, '/') != null) return null;
+    return .{ .extension_name = extension_name, .skill_name = skill_name };
+}
+
+fn parseExtensionSkillDescriptor(
+    alloc: std.mem.Allocator,
+    installed: extension_domain.InstalledExtension,
+    member: extension_domain.ExtensionMember,
+) !ParsedExtensionSkill {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, member.owner_metadata_json, .{});
+    errdefer parsed.deinit();
+    const object = parsed.value.object;
+    var out = ParsedExtensionSkill{
+        .parsed = parsed,
+        .display_name = jsonObjectStringField(object, "displayName") orelse
+            jsonObjectStringField(object, "display_name") orelse
+            jsonObjectStringField(object, "name") orelse
+            member.object_name,
+        .description = jsonObjectStringField(object, "description") orelse "Antfly extension skill.",
+        .body = jsonObjectStringField(object, "body") orelse
+            jsonObjectStringField(object, "markdown") orelse "",
+        .profile = jsonObjectStringField(object, "profile"),
+    };
+
+    out.addTag("skill");
+    out.addTag("workflow");
+    out.addTag("extension");
+    out.addTag(installed.name);
+    out.addTag(member.object_name);
+    if (out.profile) |profile| out.addTag(profile);
+    addJsonStringArrayFieldToTags(&out, object, "tags");
+
+    addJsonStringArrayFieldToCapabilities(&out, object, "capabilities");
+    addJsonCapabilityArrayFieldToCapabilities(&out, object, "required_capabilities");
+    if (out.capabilities().len == 0) {
+        for (installed.granted_capabilities) |capability| out.addCapability(capability.name);
+    }
+
+    addJsonStringArrayFieldToRepresentativeQueries(&out, object, "representativeQueries");
+    addJsonStringArrayFieldToRepresentativeQueries(&out, object, "representative_queries");
+    return out;
+}
+
+fn extensionSkillAllowedAndMatches(
+    options: CatalogOptions,
+    installed: extension_domain.InstalledExtension,
+    member: extension_domain.ExtensionMember,
+    skill: ParsedExtensionSkill,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+) bool {
+    if (!catalogOptionsAllowMedia(options, "application/ai-skill+md", skill.tags())) return false;
+    if (text) |query| {
+        if (std.mem.trim(u8, query, " \t\r\n").len > 0 and
+            !containsIgnoreCase(skill.display_name, query) and
+            !containsIgnoreCase(skill.description, query) and
+            !containsIgnoreCase("application/ai-skill+md", query) and
+            !containsIgnoreCase(installed.name, query) and
+            !containsIgnoreCase(member.object_name, query) and
+            !anyContainsIgnoreCase(skill.tags(), query) and
+            !anyContainsIgnoreCase(skill.capabilities(), query) and
+            !anyContainsIgnoreCase(skill.representativeQueries(), query)) return false;
+    }
+    if (filter) |filter_value| {
+        var iterator = filter_value.object.iterator();
+        while (iterator.next()) |kv| {
+            const key = kv.key_ptr.*;
+            const value = kv.value_ptr.*;
+            if (std.mem.eql(u8, key, "type")) {
+                if (!jsonValueMatchesString(value, "application/ai-skill+md")) return false;
+            } else if (std.mem.eql(u8, key, "tags")) {
+                if (!jsonValueMatchesAnyString(value, skill.tags())) return false;
+            } else if (std.mem.eql(u8, key, "capabilities")) {
+                if (!jsonValueMatchesAnyString(value, skill.capabilities())) return false;
+            } else if (std.mem.eql(u8, key, "publisher") or std.mem.eql(u8, key, "publisherId")) {
+                if (!jsonValueMatchesString(value, options.publisher_domain)) return false;
+            } else if (std.mem.eql(u8, key, "metadata.scope")) {
+                if (!jsonValueMatchesString(value, "extension")) return false;
+            } else if (std.mem.eql(u8, key, "metadata.extension")) {
+                if (!jsonValueMatchesString(value, installed.name)) return false;
+            } else if (std.mem.eql(u8, key, "metadata.skill")) {
+                if (!jsonValueMatchesString(value, member.object_name)) return false;
+            } else if (std.mem.eql(u8, key, "metadata.profile")) {
+                if (skill.profile == null or !jsonValueMatchesString(value, skill.profile.?)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn extensionSkillMarkdownFromDescriptorAlloc(
+    alloc: std.mem.Allocator,
+    installed: extension_domain.InstalledExtension,
+    member: extension_domain.ExtensionMember,
+    skill: ParsedExtensionSkill,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        \\# {s}
+        \\
+        \\{s}
+        \\
+        \\Extension: `{s}`
+        \\
+        \\Use `/mcp/v1/extensions/{s}` only when the same Antfly identity can discover the extension's MCP tools.
+        \\
+        \\Skill object: `{s}`
+        \\
+    ,
+        .{ skill.display_name, skill.description, installed.name, installed.name, member.object_name },
+    );
+}
+
+fn jsonObjectStringField(object: anytype, name: []const u8) ?[]const u8 {
+    const value = object.get(name) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
+fn addJsonStringArrayFieldToTags(skill: *ParsedExtensionSkill, object: anytype, name: []const u8) void {
+    const value = object.get(name) orelse return;
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        if (item == .string) skill.addTag(item.string);
+    }
+}
+
+fn addJsonStringArrayFieldToCapabilities(skill: *ParsedExtensionSkill, object: anytype, name: []const u8) void {
+    const value = object.get(name) orelse return;
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        if (item == .string) skill.addCapability(item.string);
+    }
+}
+
+fn addJsonCapabilityArrayFieldToCapabilities(skill: *ParsedExtensionSkill, object: anytype, name: []const u8) void {
+    const value = object.get(name) orelse return;
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        switch (item) {
+            .string => |capability| skill.addCapability(capability),
+            .object => |capability_object| {
+                const capability_name = jsonObjectStringField(capability_object, "name") orelse continue;
+                skill.addCapability(capability_name);
+            },
+            else => {},
+        }
+    }
+}
+
+fn addJsonStringArrayFieldToRepresentativeQueries(skill: *ParsedExtensionSkill, object: anytype, name: []const u8) void {
+    const value = object.get(name) orelse return;
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        if (item == .string) skill.addRepresentativeQuery(item.string);
+    }
 }
 
 fn writeExtensionScopeString(writer: *std.Io.Writer, scope: extension_domain.ExtensionScope) !void {
@@ -1161,7 +1561,8 @@ fn visibleInstalledCanExposeExtension(
     ctx: ExtensionCatalogContext,
 ) !bool {
     return installedExtensionVisible(installed, ctx.permissions) or
-        try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions) or
+        try installedExtensionHasVisibleSkill(alloc, installed, ctx.extension_members, ctx.permissions);
 }
 
 fn findInstalledPackage(packages: []const extension_domain.PackageManifest, installed: extension_domain.InstalledExtension) ?*const extension_domain.PackageManifest {
@@ -1200,12 +1601,27 @@ fn installedExtensionHasVisibleMcpTool(
     for (members) |member| {
         if (member.object_kind != .mcp_tool) continue;
         if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
-        if (try extensionMcpMemberVisible(alloc, installed, member, permissions)) return true;
+        if (try extensionMemberVisible(alloc, installed, member, permissions)) return true;
     }
     return false;
 }
 
-fn extensionMcpMemberVisible(
+fn installedExtensionHasVisibleSkill(
+    alloc: std.mem.Allocator,
+    installed: extension_domain.InstalledExtension,
+    members: []const extension_domain.ExtensionMember,
+    permissions: ?[]const usermgr.Permission,
+) !bool {
+    if (installed.status != .ready) return false;
+    for (members) |member| {
+        if (member.object_kind != .skill) continue;
+        if (!std.mem.eql(u8, member.extension_name, installed.name)) continue;
+        if (try extensionMemberVisible(alloc, installed, member, permissions)) return true;
+    }
+    return false;
+}
+
+fn extensionMemberVisible(
     alloc: std.mem.Allocator,
     installed: extension_domain.InstalledExtension,
     member: extension_domain.ExtensionMember,
@@ -1404,8 +1820,8 @@ fn skillEntry(skill: Skill) Entry {
         .media_type = "application/ai-skill+md",
         .description = skill.description,
         .url = skill.url,
-        .metadata = "{\"scope\":\"tenant\"}",
-        .tags = &.{ "skill", "workflow" },
+        .metadata = skill.metadata,
+        .tags = skill.tags,
         .capabilities = skill.capabilities,
         .representative_queries = skill.representative_queries,
     };

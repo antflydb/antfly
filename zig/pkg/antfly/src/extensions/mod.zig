@@ -120,6 +120,7 @@ pub const ExtensionObjectKind = enum {
     enrichment,
     resolver,
     mcp_tool,
+    skill,
     query_function,
     api_endpoint,
     a2a_agent,
@@ -144,6 +145,7 @@ pub fn objectKindV1(kind: ExtensionObjectKind) bool {
         .enrichment,
         .resolver,
         .mcp_tool,
+        .skill,
         => true,
         else => false,
     };

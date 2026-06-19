@@ -18704,6 +18704,7 @@ components:
         - enrichment
         - resolver
         - mcp_tool
+        - skill
         - query_function
         - api_endpoint
         - a2a_agent

@@ -2084,7 +2084,15 @@ pub const ApiHttpServer = struct {
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
-            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, slug)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, slug)) orelse blk: {
+                var snapshot_opt = try self.source.adminSnapshot();
+                defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+                break :blk (try ard_catalog.extensionSkillMarkdownAlloc(
+                    self.alloc,
+                    slug,
+                    self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity) orelse return try jsonErrorResponse(self.alloc, 404, "not found"),
+                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
             return try self.bodyResponseOwned(200, "text/markdown; charset=utf-8", body, false);
         }
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_resources_prefix)) {
@@ -10770,6 +10778,14 @@ test "api http server filters extension mcp tools by trusted principal table per
                         .table_name = "memories",
                         .owner_metadata_json = "{\"description\":\"Search memories\",\"input_schema\":{\"type\":\"object\"},\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}]}",
                     },
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .skill,
+                        .object_name = "memory",
+                        .table_name = "memories",
+                        .owner_metadata_json = "{\"displayName\":\"Memoryaf\",\"description\":\"Use the memory extension for storing, listing, and searching memories.\",\"profile\":\"copilot\",\"tags\":[\"memoryaf\"],\"capabilities\":[\"memory-store\",\"memory-search\",\"extension-tools\"],\"representativeQueries\":[\"remember this for later\",\"search my saved memories\",\"list memoryaf MCP tools\"],\"body\":\"# Memoryaf\\n\\nUse this skill when an agent needs to store, list, or search memories through a visible Memoryaf extension.\\n\\nUse `/mcp/v1/extensions/memoryaf` or the Copilot MCP profile only when the same Antfly identity can discover the Memoryaf MCP tools.\\n\"}",
+                    },
                 })[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
@@ -10849,7 +10865,16 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension-package:memoryaf:1.0.0") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") != null);
+
+    var hidden_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_memory_skill.status);
 
     var ard_extension_mcp_resource = try server.handle(.{
         .method = .GET,
@@ -10870,6 +10895,49 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer hidden_extension_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_mcp_resource.status);
+
+    const memory_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:bob","tenant":"tenant-1","tables":["memories"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(memory_payload);
+    const memory_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, memory_payload);
+    defer std.testing.allocator.free(memory_token);
+    const memory_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = memory_token },
+    };
+
+    var memory_catalog_resp = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .headers = &memory_headers,
+    });
+    defer memory_catalog_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_catalog_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") != null);
+
+    var memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory",
+        .headers = &memory_headers,
+    });
+    defer memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_skill.status);
+    try std.testing.expectEqualStrings("text/markdown; charset=utf-8", memory_skill.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, memory_skill.body, "# Memoryaf") != null);
+
+    var memory_skill_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &memory_headers,
+        .body = "{\"query\":{\"text\":\"memoryaf\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
+    });
+    defer memory_skill_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_skill_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_skill_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
 
     var ard_filtered_catalog_resp = try server.handle(.{
         .method = .GET,

@@ -284,18 +284,22 @@ Initial skills:
 - `antfly-retrieval`: retrieve and synthesize context from Antfly tables.
 - `antfly-schema-design`: design tables, schemas, indexes, enrichments, and query processors.
 - `antfly-extension-management`: install, configure, enable, disable, and inspect extensions.
-- `memoryaf`: use the memory extension for storing, listing, and searching memories.
+
+Extension-owned skills must be declared by extension metadata, not hardcoded into Antfly. An extension can contribute an `ExtensionObjectKind.skill` member whose `owner_metadata_json` describes display text, markdown body, tags, profile, capabilities, representative queries, and required capabilities. Memoryaf, for example, should contribute its memory skill from the Memoryaf package or install metadata.
+
+Extension-owned skills must be emitted only when the corresponding installed extension skill member is visible to the caller. The skill artifact route must apply the same extension visibility check as the catalog entry.
 
 Serve skill artifacts under the ARD namespace:
 
 ```text
 /ard/v1/skills/{skill}
+/ard/v1/skills/extensions/{extension}/{skill}
 ```
 
 ARD entries:
 
 - `type`: `application/ai-skill+md`
-- `url`: `/ard/v1/skills/{skill}`
+- `url`: `/ard/v1/skills/{skill}` for built-in Antfly skills, `/ard/v1/skills/extensions/{extension}/{skill}` for extension-owned skills
 - `capabilities`: short task labels
 - `representativeQueries`: 2-5 natural-language examples
 
