@@ -135,8 +135,9 @@ Current status:
   manifest length and configured segment cap, avoiding growth churn while
   choosing bounded compaction inputs. Segment garbage and temporary-file cleanup
   now track live canonical basenames and delete through the opened postings
-  directory, avoiding per-file path allocation while scanning maintenance
-  directories.
+  directory, and manifest temp matching compares entry names against the
+  configured manifest basename in place, avoiding per-file path allocation while
+  scanning maintenance directories.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and

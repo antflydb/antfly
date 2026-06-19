@@ -2094,10 +2094,8 @@ pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     return stats;
 }
 
-pub fn collectDirectoryTemporaryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryTemporaryCleanupStats {
+pub fn collectDirectoryTemporaryGarbageAlloc(_: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryTemporaryCleanupStats {
     var stats = DirectoryTemporaryCleanupStats{};
-    const manifest_tmp_name = try manifestTemporaryFileNameAlloc(alloc, options.manifest_path);
-    defer alloc.free(manifest_tmp_name);
 
     var postings_dir = dir.openDir(io, segment_directory, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return stats,
@@ -2114,7 +2112,7 @@ pub fn collectDirectoryTemporaryGarbageAlloc(alloc: Allocator, io: std.Io, dir: 
         }
 
         const is_segment_tmp = isCanonicalSegmentTemporaryFileName(entry.name);
-        const is_manifest_tmp = std.mem.eql(u8, entry.name, manifest_tmp_name);
+        const is_manifest_tmp = isManifestTemporaryFileName(options.manifest_path, entry.name);
         if (!is_segment_tmp and !is_manifest_tmp) {
             stats.skipped_entries += 1;
             continue;
@@ -2420,8 +2418,11 @@ fn canonicalSegmentFileNameFromPath(path: []const u8) ?[]const u8 {
     return name;
 }
 
-fn manifestTemporaryFileNameAlloc(alloc: Allocator, manifest_path: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}.tmp", .{std.fs.path.basename(manifest_path)});
+fn isManifestTemporaryFileName(manifest_path: []const u8, name: []const u8) bool {
+    const basename = std.fs.path.basename(manifest_path);
+    if (name.len != basename.len + 4) return false;
+    return std.mem.eql(u8, name[0..basename.len], basename) and
+        std.mem.eql(u8, name[basename.len..], ".tmp");
 }
 
 fn isLowerHex(byte: u8) bool {
@@ -7236,6 +7237,11 @@ pub fn testDirectoryTemporaryGarbageCollectionDeletesOnlyKnownTemps() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    try std.testing.expect(isManifestTemporaryFileName(default_manifest_path, "manifest.afpm.tmp"));
+    try std.testing.expect(isManifestTemporaryFileName("postings/custom.afpm", "custom.afpm.tmp"));
+    try std.testing.expect(!isManifestTemporaryFileName("postings/custom.afpm", "manifest.afpm.tmp"));
+    try std.testing.expect(!isManifestTemporaryFileName("postings/custom.afpm", "custom.afpm.tmp2"));
 
     const empty_stats = try collectDirectoryTemporaryGarbageAlloc(alloc, std.testing.io, tmp.dir, .{});
     try std.testing.expectEqual(@as(usize, 0), empty_stats.scanned_entries);
