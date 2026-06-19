@@ -3932,10 +3932,15 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_drop_policy: bool = false,
     ddl_database_create: bool = false,
     ddl_database_alter: bool = false,
+    ddl_database_alter_setting: bool = false,
     ddl_database_drop: bool = false,
+    ddl_database_drop_if_exists: bool = false,
+    ddl_database_drop_force: bool = false,
     ddl_tablespace_create: bool = false,
+    ddl_tablespace_create_location: bool = false,
     ddl_tablespace_rename: bool = false,
     ddl_tablespace_drop: bool = false,
+    ddl_tablespace_drop_if_exists: bool = false,
     ddl_notification_listen: bool = false,
     ddl_notification_notify: bool = false,
     ddl_notification_unlisten: bool = false,
@@ -5507,11 +5512,24 @@ pub const AppParityCorpusCoverage = struct {
                 .create_row_policy => self.ddl_row_security_create_policy = true,
                 .drop_row_policy => self.ddl_row_security_drop_policy = true,
                 .create_database => self.ddl_database_create = true,
-                .alter_database => self.ddl_database_alter = true,
-                .drop_database => self.ddl_database_drop = true,
-                .create_tablespace => self.ddl_tablespace_create = true,
+                .alter_database => {
+                    self.ddl_database_alter = true;
+                    self.ddl_database_alter_setting = self.ddl_database_alter_setting or sql_adapter.planHasNonZeroToken(entry.plan, ":ops=");
+                },
+                .drop_database => {
+                    self.ddl_database_drop = true;
+                    self.ddl_database_drop_if_exists = self.ddl_database_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
+                    self.ddl_database_drop_force = self.ddl_database_drop_force or sql_adapter.planHasExactBoolToken(entry.plan, ":force=", true);
+                },
+                .create_tablespace => {
+                    self.ddl_tablespace_create = true;
+                    self.ddl_tablespace_create_location = self.ddl_tablespace_create_location or sql_adapter.planHasExactBoolToken(entry.plan, ":location=", true);
+                },
                 .rename_tablespace => self.ddl_tablespace_rename = true,
-                .drop_tablespace => self.ddl_tablespace_drop = true,
+                .drop_tablespace => {
+                    self.ddl_tablespace_drop = true;
+                    self.ddl_tablespace_drop_if_exists = self.ddl_tablespace_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
+                },
                 .listen_notification => self.ddl_notification_listen = true,
                 .notify_notification => self.ddl_notification_notify = true,
                 .unlisten_notification => self.ddl_notification_unlisten = true,
@@ -6311,10 +6329,15 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_row_security_drop_policy);
         try std.testing.expect(self.ddl_database_create);
         try std.testing.expect(self.ddl_database_alter);
+        try std.testing.expect(self.ddl_database_alter_setting);
         try std.testing.expect(self.ddl_database_drop);
+        try std.testing.expect(self.ddl_database_drop_if_exists);
+        try std.testing.expect(self.ddl_database_drop_force);
         try std.testing.expect(self.ddl_tablespace_create);
+        try std.testing.expect(self.ddl_tablespace_create_location);
         try std.testing.expect(self.ddl_tablespace_rename);
         try std.testing.expect(self.ddl_tablespace_drop);
+        try std.testing.expect(self.ddl_tablespace_drop_if_exists);
         try std.testing.expect(self.ddl_notification_listen);
         try std.testing.expect(self.ddl_notification_notify);
         try std.testing.expect(self.ddl_notification_unlisten);

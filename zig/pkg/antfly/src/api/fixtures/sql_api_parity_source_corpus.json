@@ -686,6 +686,16 @@
       "sql": "DROP DATABASE tenant_ops"
     },
     {
+      "name": "drop database force catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_database",
+        "table_name": "tenant_ops"
+      },
+      "plan": "ddl:drop_database:database=tenant_ops:if_exists=true:force=true",
+      "sql": "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE)"
+    },
+    {
       "name": "create tablespace catalog ddl",
       "family": "ddl",
       "summary": {
@@ -714,6 +724,16 @@
       },
       "plan": "ddl:drop_tablespace:tablespace=fastspace_archive:if_exists=false",
       "sql": "DROP TABLESPACE fastspace_archive"
+    },
+    {
+      "name": "drop tablespace idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_tablespace",
+        "table_name": "fastspace_archive"
+      },
+      "plan": "ddl:drop_tablespace:tablespace=fastspace_archive:if_exists=true",
+      "sql": "DROP TABLESPACE IF EXISTS fastspace_archive"
     },
     {
       "name": "create publication catalog ddl",
