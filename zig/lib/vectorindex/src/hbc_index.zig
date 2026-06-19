@@ -3143,7 +3143,6 @@ fn scoreLeafMemberIds(
     const start = now_fn_u64();
     defer profile.leaf_score_ns += elapsed_fn_u64(start);
     const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
-    try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
     if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
         if (try loadQuantizedReadHandleProfiled(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, .leaf, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
             defer {
@@ -3153,6 +3152,7 @@ fn scoreLeafMemberIds(
             const quantized = quantized_handle.ptr();
             profile.approx_leaves_scored += 1;
             const count = member_ids.len;
+            try scratch.ensureDistanceOnlyCapacity(self.alloc, count);
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
@@ -3175,6 +3175,7 @@ fn scoreLeafMemberIds(
             const quantized = quantized_handle.ptr();
             profile.approx_leaves_scored += 1;
             const count = member_ids.len;
+            try scratch.ensureDistanceOnlyCapacity(self.alloc, count);
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
@@ -3199,6 +3200,7 @@ fn scoreLeafMemberIds(
         }
     }
 
+    try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
     const fetch_member_ids = scratch.member_ids[0..member_ids.len];
     var fetch_count: usize = 0;
     for (member_ids) |member_id| {
