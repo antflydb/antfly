@@ -869,6 +869,9 @@ implementations cleanly:
    record/posting counts, avoiding geometric growth churn on rebuild. Coarse
    block quantization now reads block centroids through a source view instead
    of copying them into a temporary dense centroid array.
+   Directory block construction also reuses one zero-centroid quantization
+   vector across all blocks in a rebuild instead of allocating/clearing it per
+   block.
    Leaf bounds-radius recompute now streams member vectors through two-vector
    scratch instead of allocating a full leaf matrix during centroid-directory
    repair.

@@ -690,13 +690,10 @@ fn appendFlatCentroidBlockFromEntries(
     entries: []const FlatCentroidEntry,
     dims: usize,
     posting_offset: usize,
+    zero: []const f32,
 ) !void {
     if (entries.len == 0) return;
-    var zero_stack: [flat_centroid_zero_stack_capacity]f32 = undefined;
-    const use_zero_stack = dims <= zero_stack.len;
-    const zero = if (use_zero_stack) zero_stack[0..dims] else try self.alloc.alloc(f32, dims);
-    defer if (!use_zero_stack) self.alloc.free(zero);
-    @memset(zero, 0);
+    std.debug.assert(zero.len == dims);
 
     const metadata = try allocFlatCentroidBlockMetadataStorage(self.alloc, entries.len);
     errdefer self.alloc.free(metadata.storage);
@@ -882,11 +879,17 @@ fn appendFlatCentroidBlocksFromEntries(
         std.mem.sort(FlatCentroidEntry, entries.items, FlatCentroidEntrySortContext{ .dim = sort_dim }, flatCentroidEntryLess);
     }
 
+    var zero_stack: [flat_centroid_zero_stack_capacity]f32 = undefined;
+    const use_zero_stack = dims <= zero_stack.len;
+    const zero = if (use_zero_stack) zero_stack[0..dims] else try self.alloc.alloc(f32, dims);
+    defer if (!use_zero_stack) self.alloc.free(zero);
+    @memset(zero, 0);
+
     var posting_offset: usize = 0;
     while (posting_offset < entries.items.len) {
         const block_end = @min(posting_offset + effective_block_size, entries.items.len);
         const block_entries = entries.items[posting_offset..block_end];
-        try appendFlatCentroidBlockFromEntries(self, blocks, block_entries, dims, posting_offset);
+        try appendFlatCentroidBlockFromEntries(self, blocks, block_entries, dims, posting_offset, zero);
         for (block_entries) |*entry| {
             self.alloc.free(entry.centroid);
             entry.centroid = &.{};
