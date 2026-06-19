@@ -1808,13 +1808,9 @@ pub const PostingFormat = struct {
             .records = iterator.recordCount(),
             .encoded_value_bytes = data.len,
         };
-        var reserved = false;
         while (try iterator.next()) |record| {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-            if (!reserved) {
-                try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount() - iterator.index + 1);
-                reserved = true;
-            }
+            try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
             stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
@@ -5819,6 +5815,34 @@ test "posting delta tail scan grows delta scratch geometrically for live records
     try std.testing.expectEqual(@as(usize, records.len), scratch.deltaRecordCount());
     try std.testing.expectEqual(@as(usize, 8), scratch.delta_records.len);
     try std.testing.expectEqualSlices(PostingDeltaRecord, records[0..], scratch.deltaRecordsMut());
+}
+
+test "posting delta tail scan grows delta scratch by live records only" {
+    const alloc = std.testing.allocator;
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 1) << 32) | 1, .op = .insert, .vector_id = 41 },
+        .{ .sequence = (@as(u64, 1) << 32) | 2, .op = .tombstone, .vector_id = 42 },
+        .{ .sequence = (@as(u64, 1) << 32) | 3, .op = .insert, .vector_id = 43 },
+        .{ .sequence = (@as(u64, 1) << 32) | 4, .op = .tombstone, .vector_id = 44 },
+        .{ .sequence = (@as(u64, 1) << 32) | 5, .op = .insert, .vector_id = 45 },
+        .{ .sequence = (@as(u64, 1) << 32) | 6, .op = .tombstone, .vector_id = 46 },
+        .{ .sequence = (@as(u64, 1) << 32) | 7, .op = .insert, .vector_id = 47 },
+        .{ .sequence = (@as(u64, 1) << 32) | 8, .op = .tombstone, .vector_id = 48 },
+        .{ .sequence = (@as(u64, 1) << 32) | 9, .op = .insert, .vector_id = 49 },
+    };
+    const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const stats = try PostingFormat.scanDeltaTailAfterGenerationIntoScratch(alloc, &scratch, encoded, 1);
+
+    try std.testing.expectEqual(@as(usize, records.len), stats.records);
+    try std.testing.expectEqual(@as(usize, 1), stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 1), scratch.deltaRecordCount());
+    try std.testing.expectEqual(@as(usize, 8), scratch.delta_records.len);
+    try std.testing.expectEqual(records[0], scratch.deltaRecordsMut()[0]);
 }
 
 test "posting delta tail uses varint encoding for small single-record values" {

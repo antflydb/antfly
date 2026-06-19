@@ -905,7 +905,10 @@ implementations cleanly:
    posting-delta key sequence proves the whole value is newer than the base
    generation, avoiding a per-record generation branch without weakening value
    validation. LSM replay paths use the same all-live key boundary for fold and
-   materialization scans.
+   materialization scans. Mixed-generation delta-tail replay now grows buffered
+   delta-record scratch geometrically per live record instead of reserving the
+   rest of the encoded tail after the first live record, keeping retained
+   scratch proportional to records that can affect the current base.
 
    Expected win: fold decisions, backlog stats, and membership checks can avoid
    decoding or allocating full member arrays.
