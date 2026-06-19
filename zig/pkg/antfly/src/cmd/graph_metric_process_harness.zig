@@ -472,7 +472,7 @@ pub fn main(init: std.process.Init) !void {
     try verifyMetricFresh(alloc, eigenvector_launch_db_path, "eigenvector", eigenvector_launch_target_generation);
     release_summary.launch_families += 1;
 
-    const hits_launch_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_launch_db_path);
+    const hits_launch_target_generation = try seedHitsDbWithSources(alloc, hits_launch_db_path, 8);
     try runLaunchProcess(alloc, init.io, antfly_exe, hits_launch_db_path, "hits");
     try verifyHitsFresh(alloc, hits_launch_db_path, hits_launch_target_generation);
     release_summary.launch_families += 1;

@@ -35,8 +35,6 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "Table"));
     try std.testing.expect(@hasDecl(generated, "TableStatus"));
     try std.testing.expect(@hasDecl(generated, "IndexStatus"));
-    try std.testing.expect(@hasDecl(generated, "IndexStats"));
-    try std.testing.expect(@hasDecl(generated, "FullTextIndexStats"));
     try std.testing.expect(@hasDecl(generated, "TableMigration"));
     try std.testing.expect(@hasDecl(generated, "QueryRequest"));
     try std.testing.expect(@hasDecl(generated, "BackupRequest"));
@@ -681,8 +679,9 @@ test "public openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@FieldType(generated.Table, "schema") == ?schema_generated.TableSchema);
     try std.testing.expect(@FieldType(generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
     try std.testing.expect(@FieldType(generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
-    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "steps") == ?generated.RetrievalAgentSteps);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "generation") == ?generating_api_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "eval") == ?eval_generated.EvalConfig);
 }
 
 test "client openapi module resolves shared refs through owner modules" {
@@ -752,9 +751,10 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "retrievalAgent"));
     try std.testing.expect(@hasField(client_generated.TableStatus, "artifact_enrichments"));
     try std.testing.expect(@hasField(client_generated.EnrichmentConfig, "full_text_index"));
-    try std.testing.expect(@FieldType(client_generated.CreateTableRequest, "schema") == ?schema_generated.TableSchema);
-    try std.testing.expect(@FieldType(client_generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
-    try std.testing.expect(@FieldType(client_generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
-    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
+    try std.testing.expect(@FieldType(client_generated.CreateTableRequest, "schema") == ?client_generated.TableSchema);
+    try std.testing.expect(@FieldType(client_generated.QueryRequest, "pruner") == ?client_generated.Pruner);
+    try std.testing.expect(@FieldType(client_generated.QueryRequest, "reranker") == ?client_generated.RerankerConfig);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "steps") == ?client_generated.RetrievalAgentSteps);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentSteps, "generation") == ?client_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentSteps, "eval") == ?client_generated.EvalConfig);
 }

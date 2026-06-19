@@ -19728,16 +19728,13 @@ test "api http server serves table lookup with version header" {
         title: []const u8,
     };
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-lookup";
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-http-lookup", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var db = try db_mod.DB.open(alloc, path, .{});
-    defer {
-        db.close();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    }
+    defer db.close();
     try db.batch(.{
         .writes = &.{
             .{
