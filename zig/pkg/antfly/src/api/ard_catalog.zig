@@ -384,7 +384,7 @@ pub fn skillMarkdownAlloc(alloc: std.mem.Allocator, options: CatalogOptions, slu
     return try alloc.dupe(u8, skill.body);
 }
 
-pub fn extensionSkillMarkdownAlloc(alloc: std.mem.Allocator, route: []const u8, ctx: ExtensionCatalogContext) !?[]u8 {
+pub fn extensionSkillMarkdownAlloc(alloc: std.mem.Allocator, options: CatalogOptions, route: []const u8, ctx: ExtensionCatalogContext) !?[]u8 {
     const parsed_route = parseExtensionSkillRoute(route) orelse return null;
     for (ctx.installed_extensions) |installed| {
         if (!std.mem.eql(u8, installed.name, parsed_route.extension_name)) continue;
@@ -395,6 +395,7 @@ pub fn extensionSkillMarkdownAlloc(alloc: std.mem.Allocator, route: []const u8, 
             if (!(try extensionMemberVisible(alloc, installed, member, ctx.permissions))) return null;
             var skill = try parseExtensionSkillDescriptor(alloc, installed, member);
             defer skill.deinit();
+            if (!extensionSkillAllowedAndMatches(options, installed, member, skill, null, null)) return null;
             if (skill.body.len > 0) return try alloc.dupe(u8, skill.body);
             return try extensionSkillMarkdownFromDescriptorAlloc(alloc, installed, member, skill);
         }

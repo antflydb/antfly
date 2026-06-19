@@ -2101,11 +2101,13 @@ pub const ApiHttpServer = struct {
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
-            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity), slug)) orelse blk: {
+            const options = self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity);
+            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
                 var snapshot_opt = try self.source.adminSnapshot();
                 defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
                 break :blk (try ard_catalog.extensionSkillMarkdownAlloc(
                     self.alloc,
+                    options,
                     slug,
                     self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity) orelse return try jsonErrorResponse(self.alloc, 404, "not found"),
                 )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
@@ -11197,6 +11199,31 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), memory_skill.status);
     try std.testing.expectEqualStrings("text/markdown; charset=utf-8", memory_skill.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, memory_skill.body, "# Memoryaf") != null);
+
+    var profile_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory?profile=copilot",
+        .headers = &memory_headers,
+    });
+    defer profile_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_memory_skill.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_memory_skill.body, "# Memoryaf") != null);
+
+    var mcp_filtered_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory?include=mcp",
+        .headers = &memory_headers,
+    });
+    defer mcp_filtered_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), mcp_filtered_memory_skill.status);
+
+    var wrong_type_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory?types=application/mcp-server+json",
+        .headers = &memory_headers,
+    });
+    defer wrong_type_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), wrong_type_memory_skill.status);
 
     var memory_skill_search = try server.handle(.{
         .method = .POST,
