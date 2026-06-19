@@ -4719,27 +4719,11 @@ fn applyBufferedDeltaRecordsIntoScratch(
     sortPostingDeltaRecordsIfNeeded(records);
 
     if (base_members_are_sorted and records.len <= compact_sorted_delta_scratch_max_records) {
-        if (records.len > compact_sorted_delta_max_records) {
-            member_count.* = try posting.PostingFormat.applySortedDeltaRecordsToSortedScratchAssumeSorted(
-                alloc,
-                scratch,
-                member_count.*,
-                records,
-            );
-            return;
-        }
-        var compact_ids: [compact_sorted_delta_max_records]posting.VectorId = undefined;
-        var compact_ops: [compact_sorted_delta_max_records]posting.PostingDeltaOp = undefined;
-        for (records, 0..) |record, i| {
-            compact_ids[i] = record.vector_id;
-            compact_ops[i] = record.op;
-        }
-        member_count.* = try posting.PostingFormat.applySortedCompactOpsToSortedScratchAssumeSorted(
+        member_count.* = try posting.PostingFormat.applySortedDeltaRecordsToSortedScratchAssumeSorted(
             alloc,
             scratch,
             member_count.*,
-            compact_ids[0..records.len],
-            compact_ops[0..records.len],
+            records,
         );
         return;
     }
@@ -8042,6 +8026,49 @@ test "posting segment sorted materialization uses merge replay for medium tails"
     }
     try std.testing.expectEqual(@as(usize, 0), scratch.removed_members.count());
     try std.testing.expectEqual(@as(usize, 0), scratch.appended_positions.count());
+}
+
+test "posting segment sorted materialization uses direct record replay for small tails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_members = [_]posting.VectorId{ 10, 20, 30 };
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &base_members,
+    });
+    defer alloc.free(base);
+    var base_writer = Writer.init(alloc);
+    defer base_writer.deinit();
+    try base_writer.appendBase(7, base);
+    var committed_base = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &base_writer, .{});
+    defer committed_base.deinit(alloc);
+
+    const records = [_]posting.PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .insert, .vector_id = 15 },
+        .{ .sequence = (@as(u64, 2) << 32) | 2, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = (@as(u64, 2) << 32) | 3, .op = .insert, .vector_id = 20 },
+        .{ .sequence = (@as(u64, 2) << 32) | 4, .op = .insert, .vector_id = 40 },
+    };
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &records);
+    defer alloc.free(delta);
+    var delta_writer = Writer.init(alloc);
+    defer delta_writer.deinit();
+    try delta_writer.appendDelta(7, records[0].sequence, delta);
+    var committed_delta = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &delta_writer, .{});
+    defer committed_delta.deinit(alloc);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const member_count = (try lazy.snapshot().materializeSortedMembersIntoScratch(alloc, 7, &scratch)).?;
+
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 15, 20, 30, 40 }, scratch.member_ids[0..member_count]);
+    try std.testing.expectEqual(@as(usize, 0), scratch.compactDeltaRecordCount());
 }
 
 test "posting segment lazy materialization uses adaptive overlay replay for large tails" {
