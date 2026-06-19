@@ -36,6 +36,9 @@ const page_size_offset: usize = 12;
 const header_size_offset: usize = 16;
 const active_checkpoint_offset: usize = 20;
 const checkpoint_slots_offset: usize = 64;
+const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
+const checkpoint_slot_payload_size: usize = 48;
+const checkpoint_slot_checksum_offset: usize = checkpoint_slot_payload_size;
 const header_checksum_offset: usize = header_size - 4;
 const page_crc_offset: usize = 12;
 
@@ -1050,18 +1053,23 @@ pub fn decodeHeader(raw: []const u8) !Header {
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
 
     const expected_checksum = std.mem.readInt(u32, header_raw[header_checksum_offset..][0..4], .little);
-    if (expected_checksum != headerChecksum(header_raw)) return error.NativeHeaderChecksumMismatch;
+    if (expected_checksum != headerChecksum(header_raw) and expected_checksum != legacyHeaderChecksum(header_raw)) return error.NativeHeaderChecksumMismatch;
 
     const page_size = std.mem.readInt(u32, header_raw[page_size_offset..][0..4], .little);
     if (!validPageSize(page_size)) return error.InvalidNativePageSize;
 
-    const active_checkpoint = header_raw[active_checkpoint_offset];
-    if (active_checkpoint >= checkpoint_slot_count) return error.InvalidNativeCheckpointSlot;
+    const active_hint = header_raw[active_checkpoint_offset];
 
     var checkpoints: [checkpoint_slot_count]CheckpointSlot = undefined;
+    var valid_slots: [checkpoint_slot_count]bool = .{false} ** checkpoint_slot_count;
     for (&checkpoints, 0..) |*slot, index| {
-        slot.* = decodeCheckpointSlot(header_raw[checkpointOffset(index)..][0..checkpoint_slot_size]);
+        slot.* = decodeCheckpointSlot(header_raw[checkpointOffset(index)..][0..checkpoint_slot_size]) catch {
+            slot.* = .{};
+            continue;
+        };
+        valid_slots[index] = validCheckpointSlot(slot.*);
     }
+    const active_checkpoint = try selectActiveCheckpoint(checkpoints, valid_slots, active_hint);
 
     return .{
         .page_size = page_size,
@@ -1082,10 +1090,13 @@ fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot) void {
     std.mem.writeInt(u64, out[24..32], slot.index_catalog_root_page, .little);
     std.mem.writeInt(u64, out[32..40], slot.free_map_root_page, .little);
     std.mem.writeInt(u64, out[40..48], slot.page_count, .little);
+    std.mem.writeInt(u32, out[checkpoint_slot_checksum_offset..][0..4], checkpointSlotChecksum(out), .little);
 }
 
-fn decodeCheckpointSlot(raw: []const u8) CheckpointSlot {
+fn decodeCheckpointSlot(raw: []const u8) !CheckpointSlot {
     std.debug.assert(raw.len == checkpoint_slot_size);
+    const expected_checksum = std.mem.readInt(u32, raw[checkpoint_slot_checksum_offset..][0..4], .little);
+    if (expected_checksum != 0 and expected_checksum != checkpointSlotChecksum(raw)) return error.NativeCheckpointChecksumMismatch;
     return .{
         .commit_sequence = std.mem.readInt(u64, raw[0..8], .little),
         .catalog_root_page = std.mem.readInt(u64, raw[8..16], .little),
@@ -1094,6 +1105,42 @@ fn decodeCheckpointSlot(raw: []const u8) CheckpointSlot {
         .free_map_root_page = std.mem.readInt(u64, raw[32..40], .little),
         .page_count = std.mem.readInt(u64, raw[40..48], .little),
     };
+}
+
+fn validCheckpointSlot(slot: CheckpointSlot) bool {
+    if (slot.page_count == 0) return false;
+    if (!validCheckpointRoot(slot.catalog_root_page, slot.page_count)) return false;
+    if (!validCheckpointRoot(slot.document_root_page, slot.page_count)) return false;
+    if (!validCheckpointRoot(slot.index_catalog_root_page, slot.page_count)) return false;
+    if (!validCheckpointRoot(slot.free_map_root_page, slot.page_count)) return false;
+    return true;
+}
+
+fn validCheckpointRoot(root_page: u64, page_count: u64) bool {
+    return root_page == 0 or root_page < page_count;
+}
+
+fn selectActiveCheckpoint(
+    checkpoints: [checkpoint_slot_count]CheckpointSlot,
+    valid_slots: [checkpoint_slot_count]bool,
+    active_hint: u8,
+) !u8 {
+    var best: ?u8 = null;
+    for (checkpoints, 0..) |slot, index| {
+        if (!valid_slots[index]) continue;
+        const slot_index: u8 = @intCast(index);
+        if (best) |best_index| {
+            const best_slot = checkpoints[best_index];
+            if (slot.commit_sequence > best_slot.commit_sequence or
+                (slot.commit_sequence == best_slot.commit_sequence and slot_index == active_hint))
+            {
+                best = slot_index;
+            }
+        } else {
+            best = slot_index;
+        }
+    }
+    return best orelse error.InvalidNativeCheckpoint;
 }
 
 fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
@@ -1268,7 +1315,21 @@ fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
 
 fn headerChecksum(raw: []const u8) u32 {
     var crc = std.hash.Crc32.init();
+    crc.update(raw[0..active_checkpoint_offset]);
+    crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
+    crc.update(raw[checkpoint_slots_end..header_checksum_offset]);
+    return crc.final();
+}
+
+fn legacyHeaderChecksum(raw: []const u8) u32 {
+    var crc = std.hash.Crc32.init();
     crc.update(raw[0..header_checksum_offset]);
+    return crc.final();
+}
+
+fn checkpointSlotChecksum(raw: []const u8) u32 {
+    var crc = std.hash.Crc32.init();
+    crc.update(raw[0..checkpoint_slot_payload_size]);
     return crc.final();
 }
 
@@ -1285,6 +1346,8 @@ fn issueForDecodeError(err: anyerror) []const u8 {
         error.NativeHeaderChecksumMismatch => "header_checksum_mismatch",
         error.InvalidNativePageSize => "invalid_page_size",
         error.InvalidNativeCheckpointSlot => "invalid_checkpoint_slot",
+        error.NativeCheckpointChecksumMismatch => "checkpoint_checksum_mismatch",
+        error.InvalidNativeCheckpoint => "invalid_checkpoint",
         else => "invalid_header",
     };
 }
@@ -1344,6 +1407,68 @@ test "lite native header rejects corrupted checksum" {
     const report = inspectBytes(&encoded);
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
+}
+
+test "lite native header accepts legacy whole-header checksum" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{});
+    std.mem.writeInt(u32, encoded[header_checksum_offset..][0..4], legacyHeaderChecksum(&encoded), .little);
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 0), header.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 1), header.checkpoints[header.active_checkpoint].page_count);
+}
+
+test "lite native header selects newest valid checkpoint slot" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{
+        .active_checkpoint = 0,
+        .checkpoints = .{
+            .{ .commit_sequence = 1, .page_count = 2 },
+            .{ .commit_sequence = 2, .page_count = 3 },
+        },
+    });
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 1), header.active_checkpoint);
+
+    const report = inspectBytes(&encoded);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u8, 1), report.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 2), report.commit_sequence);
+    try std.testing.expectEqual(@as(u64, 3), report.page_count);
+}
+
+test "lite native header recovers from corrupted active checkpoint hint" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{
+        .active_checkpoint = 1,
+        .checkpoints = .{
+            .{ .commit_sequence = 1, .page_count = 2 },
+            .{ .commit_sequence = 2, .page_count = 3 },
+        },
+    });
+    encoded[active_checkpoint_offset] = 0xff;
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 1), header.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 2), header.checkpoints[header.active_checkpoint].commit_sequence);
+}
+
+test "lite native header falls back from a checksum-bad checkpoint slot" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{
+        .active_checkpoint = 1,
+        .checkpoints = .{
+            .{ .commit_sequence = 1, .page_count = 2 },
+            .{ .commit_sequence = 2, .page_count = 3 },
+        },
+    });
+    encoded[checkpointOffset(1)] ^= 0xff;
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 0), header.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 1), header.checkpoints[header.active_checkpoint].commit_sequence);
 }
 
 test "lite native create writes inspectable aflite file" {
