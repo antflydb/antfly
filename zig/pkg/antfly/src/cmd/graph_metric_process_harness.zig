@@ -146,7 +146,7 @@ const required_process_harness_release_summary = ProcessHarnessReleaseSummary{
     .direct_page_reclaim_phase_proofs = 20,
     .direct_reclaimed_attempt_completion_phase_proofs = 20,
     .direct_stale_attempt_rejection_phase_proofs = 20,
-    .fixed_iteration_families = 2,
+    .fixed_iteration_families = 3,
     .exhausted_attempt_families = 3,
     .same_worker_fencing_proofs = 2,
 };
@@ -372,6 +372,10 @@ pub fn main(init: std.process.Init) !void {
     const eigenvector_fixed_iteration_db_path = ".zig-cache/tmp/graph-metric-process-eigenvector-fixed-iteration-db";
     std.Io.Dir.cwd().deleteTree(init.io, eigenvector_fixed_iteration_db_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(init.io, eigenvector_fixed_iteration_db_path) catch {};
+
+    const hits_fixed_iteration_db_path = ".zig-cache/tmp/graph-metric-process-hits-fixed-iteration-db";
+    std.Io.Dir.cwd().deleteTree(init.io, hits_fixed_iteration_db_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(init.io, hits_fixed_iteration_db_path) catch {};
 
     const eigenvector_publish_cleanup_db_path = ".zig-cache/tmp/graph-metric-process-eigenvector-publish-cleanup-db";
     std.Io.Dir.cwd().deleteTree(init.io, eigenvector_publish_cleanup_db_path) catch {};
@@ -814,6 +818,16 @@ pub fn main(init: std.process.Init) !void {
     const hits_supervisor_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_supervisor_db_path);
     try runSupervisorProcess(alloc, init.io, antfly_exe, hits_supervisor_db_path);
     try verifyHitsFresh(alloc, hits_supervisor_db_path, hits_supervisor_target_generation);
+
+    const hits_fixed_iteration_target_generation = try seedHitsDbWithActiveBuildMaxIterations(alloc, hits_fixed_iteration_db_path, 1, 0.000001);
+    try runSupervisorProcess(alloc, init.io, antfly_exe, hits_fixed_iteration_db_path);
+    try verifyHitsFixedIterationMetadata(
+        alloc,
+        hits_fixed_iteration_db_path,
+        hits_fixed_iteration_target_generation,
+        1,
+    );
+    release_summary.fixed_iteration_families += 1;
 
     const hits_publish_cleanup_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_publish_cleanup_db_path);
     try verifyHitsPublishAndCleanupRestart(alloc, init.io, antfly_exe, hits_publish_cleanup_db_path, hits_publish_cleanup_target_generation);
