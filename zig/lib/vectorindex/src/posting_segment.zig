@@ -997,6 +997,7 @@ pub const LazyDirectorySnapshot = struct {
                     point_read_count = try appendBasePointReadsForSortedPositions(
                         index_data.data,
                         entry.meta.entry_count,
+                        entry.meta.base_count,
                         posting_ids,
                         sorted_candidate_positions,
                         point_reads_storage,
@@ -2306,6 +2307,7 @@ fn pointIndexEntryFromIndexData(index_data: []const u8, entry_count: usize, post
 fn appendBasePointReadsForSortedPositions(
     index_data: []const u8,
     entry_count: usize,
+    base_count: usize,
     posting_ids: []const PostingId,
     positions: []const usize,
     out: []BatchPointValueRead,
@@ -2316,6 +2318,7 @@ fn appendBasePointReadsForSortedPositions(
 
     var index = lowerBoundIndexData(index_data, entry_count, posting_ids[positions[0]], .base, 0);
     var count: usize = 0;
+    var found_base_entries: usize = 0;
     var last_posting_id: PostingId = 0;
     var last_found: ?IndexEntry = null;
     var have_last = false;
@@ -2343,7 +2346,9 @@ fn appendBasePointReadsForSortedPositions(
                 last_found = found;
                 out[count] = .{ .output_index = position, .found = found };
                 count += 1;
+                found_base_entries += 1;
                 index += 1;
+                if (base_count != 0 and found_base_entries >= base_count) return count;
             }
             break;
         }
@@ -6006,7 +6011,7 @@ pub fn testAppendBasePointReadsForSortedPositionsMergesIndexScan() !void {
     const posting_ids = [_]PostingId{ 1, 2, 3, 3, 4, 5 };
     const positions = [_]usize{ 0, 1, 2, 3, 4, 5 };
     var reads: [posting_ids.len]BatchPointValueRead = undefined;
-    const count = try appendBasePointReadsForSortedPositions(index_data.items, 5, &posting_ids, &positions, &reads);
+    const count = try appendBasePointReadsForSortedPositions(index_data.items, 5, 3, &posting_ids, &positions, &reads);
 
     try std.testing.expectEqual(@as(usize, 4), count);
     try std.testing.expectEqual(@as(usize, 0), reads[0].output_index);

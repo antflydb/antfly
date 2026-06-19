@@ -1242,7 +1242,10 @@ implementations cleanly:
     entry counts. Newly written segment files populate base, delta-value, and
     centroid-directory counts from the segment index, and eager/lazy point,
     base batch, and centroid-directory scans use those counts to skip segment
-    indexes when the requested record family cannot be present. Segment
+    indexes when the requested record family cannot be present. Sorted base
+    batch index merges also stop after all known base entries in a segment have
+    been found, while still returning duplicate batch requests for the same
+    posting. Segment
     compaction uses the same counts to skip delta-only segments during the
     point-candidate pass and point-only segments during the delta-retention
     pass, while preserving the old full scan when kind counts are unknown.
