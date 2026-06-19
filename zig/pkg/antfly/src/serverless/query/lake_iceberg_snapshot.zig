@@ -24,10 +24,12 @@ const external_source = @import("../external_source/types.zig");
 const iceberg_avro = @import("../external_source/iceberg_avro.zig");
 const iceberg_inventory = @import("../external_source/iceberg_inventory.zig");
 const iceberg_metadata = @import("../external_source/iceberg_metadata.zig");
+const lake_iceberg_deletes = @import("lake_iceberg_deletes.zig");
 const lake_object_reader = @import("lake_object_reader.zig");
 const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 const lake_range_io = @import("lake_range_io.zig");
 const object_storage = @import("../../storage/object_storage.zig");
+const rowsource = @import("../../storage/rowsource/types.zig");
 
 pub const SnapshotReadRequest = struct {
     client: object_storage.ObjectStorage,
@@ -105,6 +107,27 @@ pub const IcebergDeletePlan = struct {
     }
 };
 
+pub const SnapshotWithDeletePlan = struct {
+    inventory: external_source.Inventory,
+    delete_plan: IcebergDeletePlan = .{ .files = &.{} },
+
+    pub fn deinit(self: *SnapshotWithDeletePlan, alloc: Allocator) void {
+        self.inventory.deinit(alloc);
+        self.delete_plan.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PositionDeleteRowRefsReadRequest = struct {
+    reader: lake_parquet_rowgroup.ObjectRangeReader,
+    client: ?object_storage.ObjectStorage = null,
+    cache: ?*lake_parquet_rowgroup.ObjectRangeCache = null,
+    data_inventory: external_source.Inventory,
+    delete_plan: IcebergDeletePlan,
+    coalesce_options: lake_range_io.CoalesceOptions = .{},
+    footer_probe_bytes: u64 = 64 * 1024,
+};
+
 pub fn readSnapshotInventoryAlloc(
     alloc: Allocator,
     request: SnapshotReadRequest,
@@ -176,6 +199,99 @@ pub fn readSnapshotInventoryAlloc(
     });
 }
 
+pub fn readSnapshotInventoryAndDeletePlanAlloc(
+    alloc: Allocator,
+    request: SnapshotReadRequest,
+) !SnapshotWithDeletePlan {
+    try request.validate();
+    var client = request.client;
+    client.allocator = alloc;
+
+    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null);
+    defer alloc.free(metadata_bytes);
+    var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
+        alloc,
+        request.metadata_uri,
+        metadata_bytes,
+        request.requested_snapshot_id,
+    );
+    defer metadata_plan.deinit(alloc);
+
+    const current_snapshot = metadata_plan.currentSnapshot();
+    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null);
+    defer alloc.free(manifest_list_bytes);
+    var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
+    defer manifest_list.deinit(alloc);
+
+    const decoded_manifests = try alloc.alloc(iceberg_inventory.DecodedManifest, manifest_list.entries.len);
+    defer alloc.free(decoded_manifests);
+    var initialized: usize = 0;
+    defer {
+        for (decoded_manifests[0..initialized]) |*decoded| {
+            decoded.manifest.deinit(alloc);
+        }
+    }
+
+    var delete_files = std.ArrayListUnmanaged(IcebergDeleteFile).empty;
+    errdefer deinitDeleteFileItems(alloc, delete_files.items);
+    defer delete_files.deinit(alloc);
+
+    for (manifest_list.entries) |manifest_entry| {
+        switch (manifest_entry.content) {
+            .data => {
+                const manifest_bytes = try readFullObjectAlloc(
+                    alloc,
+                    &client,
+                    request.cache,
+                    manifest_entry.manifest_path,
+                    .iceberg_metadata,
+                    manifest_entry.manifest_length,
+                );
+                defer alloc.free(manifest_bytes);
+                decoded_manifests[initialized] = .{
+                    .manifest_path = manifest_entry.manifest_path,
+                    .manifest = try iceberg_avro.parseDataManifestAlloc(alloc, manifest_bytes),
+                };
+                initialized += 1;
+            },
+            .deletes => {
+                const manifest_bytes = try readFullObjectAlloc(
+                    alloc,
+                    &client,
+                    request.cache,
+                    manifest_entry.manifest_path,
+                    .iceberg_delete_metadata,
+                    manifest_entry.manifest_length,
+                );
+                defer alloc.free(manifest_bytes);
+
+                var delete_manifest = try iceberg_avro.parseDataManifestAlloc(alloc, manifest_bytes);
+                defer delete_manifest.deinit(alloc);
+                try appendActiveDeleteFilesFromManifestAlloc(alloc, &delete_files, manifest_entry, delete_manifest);
+            },
+        }
+    }
+
+    var inventory = try planInventoryFromDecodedDataManifestsAllowingDeletesAlloc(
+        alloc,
+        request.source_id,
+        metadata_plan,
+        manifest_list,
+        decoded_manifests[0..initialized],
+    );
+    errdefer inventory.deinit(alloc);
+
+    const files = try delete_files.toOwnedSlice(alloc);
+    var delete_plan = IcebergDeletePlan{ .files = files };
+    errdefer delete_plan.deinit(alloc);
+    try delete_plan.validate();
+
+    return .{
+        .inventory = inventory,
+        .delete_plan = delete_plan,
+    };
+}
+
 pub fn readSnapshotDeletePlanAlloc(
     alloc: Allocator,
     request: SnapshotReadRequest,
@@ -226,6 +342,229 @@ pub fn readSnapshotDeletePlanAlloc(
     errdefer plan.deinit(alloc);
     try plan.validate();
     return plan;
+}
+
+pub fn readPositionDeleteRowRefsAlloc(
+    alloc: Allocator,
+    request: PositionDeleteRowRefsReadRequest,
+) ![]rowsource.RowRef {
+    try request.data_inventory.validate();
+    if (request.data_inventory.format != .iceberg) return error.InvalidIcebergPositionDeleteInventory;
+    try request.delete_plan.validate();
+    if (request.delete_plan.activeEqualityDeleteFileCount() != 0) return error.UnsupportedIcebergDeletes;
+    if (request.delete_plan.activePositionDeleteFileCount() == 0) return try alloc.alloc(rowsource.RowRef, 0);
+
+    var delete_inventory = try positionDeleteFilesInventoryAlloc(alloc, request.data_inventory, request.delete_plan, request.client);
+    defer delete_inventory.deinit(alloc);
+
+    const columns = [_][]const u8{ "file_path", "pos" };
+    var discovered = if (request.cache) |cache|
+        try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc(
+            alloc,
+            request.reader,
+            cache,
+            delete_inventory,
+            &columns,
+            request.footer_probe_bytes,
+        )
+    else
+        try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+            alloc,
+            request.reader,
+            delete_inventory,
+            &columns,
+            request.footer_probe_bytes,
+        );
+    defer discovered.deinit(alloc);
+
+    var delete_rows = try lake_parquet_rowgroup.querySupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .reader = request.reader,
+        .cache = request.cache,
+        .inventory = discovered.inventory,
+        .projected_columns = &columns,
+        .coalesce_options = request.coalesce_options,
+    });
+    defer delete_rows.deinit(alloc);
+
+    return try lake_iceberg_deletes.positionDeleteScanResultToRowRefsAlloc(
+        alloc,
+        request.data_inventory,
+        delete_rows,
+        .{},
+    );
+}
+
+fn planInventoryFromDecodedDataManifestsAllowingDeletesAlloc(
+    alloc: Allocator,
+    source_id: []const u8,
+    metadata_plan: iceberg_metadata.Plan,
+    manifest_list: iceberg_avro.ManifestList,
+    data_manifests: []const iceberg_inventory.DecodedManifest,
+) !external_source.Inventory {
+    var total_entries: usize = 0;
+    for (manifest_list.entries) |manifest_entry| {
+        if (manifest_entry.content != .data) continue;
+        const decoded = try decodedManifestForPath(data_manifests, manifest_entry.manifest_path);
+        try validateDataManifestSummary(manifest_entry, decoded.manifest);
+        total_entries += decoded.manifest.entries.len;
+    }
+    if (total_entries == 0) return error.EmptyIcebergInventory;
+
+    const data_files = try alloc.alloc(iceberg_avro.DataFileEntry, total_entries);
+    defer alloc.free(data_files);
+    var next_file: usize = 0;
+    for (manifest_list.entries) |manifest_entry| {
+        if (manifest_entry.content != .data) continue;
+        const decoded = try decodedManifestForPath(data_manifests, manifest_entry.manifest_path);
+        for (decoded.manifest.entries) |entry| {
+            data_files[next_file] = entry;
+            next_file += 1;
+        }
+    }
+
+    return try iceberg_inventory.planInventoryFromDataFilesAlloc(alloc, .{
+        .source_id = source_id,
+        .source_uri = metadata_plan.location,
+        .snapshot_id = metadata_plan.current_snapshot_id,
+        .schema_fingerprint = metadata_plan.schema_fingerprint,
+        .data_files = data_files,
+    });
+}
+
+fn decodedManifestForPath(
+    decoded_manifests: []const iceberg_inventory.DecodedManifest,
+    manifest_path: []const u8,
+) !iceberg_inventory.DecodedManifest {
+    var found: ?iceberg_inventory.DecodedManifest = null;
+    for (decoded_manifests) |decoded| {
+        if (!std.mem.eql(u8, decoded.manifest_path, manifest_path)) continue;
+        if (found != null) return error.DuplicateIcebergManifest;
+        found = decoded;
+    }
+    return found orelse error.MissingIcebergManifest;
+}
+
+fn validateDataManifestSummary(
+    manifest_entry: iceberg_avro.ManifestListEntry,
+    manifest: iceberg_avro.DataManifest,
+) !void {
+    if (!hasManifestSummary(manifest_entry)) return;
+
+    var added_files: u32 = 0;
+    var existing_files: u32 = 0;
+    var deleted_files: u32 = 0;
+    var added_rows: u64 = 0;
+    var existing_rows: u64 = 0;
+    var deleted_rows: u64 = 0;
+    for (manifest.entries) |entry| {
+        if (entry.content != .data) return error.InvalidIcebergDataManifest;
+        switch (entry.status) {
+            .added => {
+                added_files += 1;
+                added_rows += entry.record_count;
+            },
+            .existing => {
+                existing_files += 1;
+                existing_rows += entry.record_count;
+            },
+            .deleted => {
+                deleted_files += 1;
+                deleted_rows += entry.record_count;
+            },
+        }
+    }
+
+    if (added_files != manifest_entry.added_files_count) return error.IcebergManifestSummaryMismatch;
+    if (existing_files != manifest_entry.existing_files_count) return error.IcebergManifestSummaryMismatch;
+    if (deleted_files != manifest_entry.deleted_files_count) return error.IcebergManifestSummaryMismatch;
+    if (added_rows != manifest_entry.added_rows_count) return error.IcebergManifestSummaryMismatch;
+    if (existing_rows != manifest_entry.existing_rows_count) return error.IcebergManifestSummaryMismatch;
+    if (deleted_rows != manifest_entry.deleted_rows_count) return error.IcebergManifestSummaryMismatch;
+}
+
+fn positionDeleteFilesInventoryAlloc(
+    alloc: Allocator,
+    data_inventory: external_source.Inventory,
+    delete_plan: IcebergDeletePlan,
+    maybe_client: ?object_storage.ObjectStorage,
+) !external_source.Inventory {
+    const file_count = delete_plan.activePositionDeleteFileCount();
+    if (file_count == 0) return error.InvalidIcebergDeleteManifest;
+
+    const files = try alloc.alloc(external_source.FileEntry, file_count);
+    errdefer alloc.free(files);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |*file| file.deinit(alloc);
+    }
+
+    for (delete_plan.files) |delete_file| {
+        if (delete_file.content != .position_deletes) continue;
+        files[initialized] = try positionDeleteFileEntryAlloc(alloc, data_inventory, delete_file, maybe_client);
+        initialized += 1;
+    }
+
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, data_inventory.source_id),
+        .source_uri = try alloc.dupe(u8, data_inventory.source_uri),
+        .snapshot_id = try alloc.dupe(u8, data_inventory.snapshot_id),
+        .schema_fingerprint = try alloc.dupe(u8, "iceberg-position-delete:v1:file_path-pos"),
+        .files = files,
+    };
+    errdefer inventory.deinit(alloc);
+    try inventory.validate();
+    return inventory;
+}
+
+fn positionDeleteFileEntryAlloc(
+    alloc: Allocator,
+    data_inventory: external_source.Inventory,
+    delete_file: IcebergDeleteFile,
+    maybe_client: ?object_storage.ObjectStorage,
+) !external_source.FileEntry {
+    const file_id = try alloc.dupe(u8, delete_file.file_path);
+    errdefer alloc.free(file_id);
+    const object_uri = try alloc.dupe(u8, delete_file.file_path);
+    errdefer alloc.free(object_uri);
+    var etag: []u8 = &.{};
+    errdefer if (etag.len > 0) alloc.free(etag);
+    var version_id: []u8 = &.{};
+    errdefer if (version_id.len > 0) alloc.free(version_id);
+
+    if (maybe_client) |source_client| {
+        var client = source_client;
+        client.allocator = alloc;
+        const location = try lake_range_io.objectLocationForUri(delete_file.file_path);
+        var meta = try client.statObject(location.bucket, location.key);
+        defer meta.deinit(alloc);
+        if (meta.content_length != delete_file.file_size_in_bytes) return error.IcebergManifestLengthMismatch;
+        if (meta.etag) |value| etag = try alloc.dupe(u8, value);
+        if (meta.version_id) |value| version_id = try alloc.dupe(u8, value);
+        if (etag.len == 0 and version_id.len == 0) {
+            version_id = try std.fmt.allocPrint(
+                alloc,
+                "object-stat:v1:uri={s}:len={d}",
+                .{ delete_file.file_path, meta.content_length },
+            );
+        }
+    } else {
+        version_id = try std.fmt.allocPrint(
+            alloc,
+            "iceberg-position-delete:v1:snapshot={s}:data-seq={d}:file-seq={d}:path={s}",
+            .{ data_inventory.snapshot_id, delete_file.data_sequence_number, delete_file.file_sequence_number, delete_file.file_path },
+        );
+    }
+
+    return .{
+        .file_id = file_id,
+        .object_uri = object_uri,
+        .etag = etag,
+        .version_id = version_id,
+        .byte_len = delete_file.file_size_in_bytes,
+        .row_count = delete_file.record_count,
+        .row_groups = &.{},
+    };
 }
 
 fn readDeleteManifestHasActiveDeletesAlloc(
@@ -706,6 +1045,85 @@ test "iceberg snapshot reader plans active delete files" {
     try std.testing.expectEqualStrings("PARQUET", plan.files[0].file_format);
     try std.testing.expectEqual(@as(u64, 1), plan.files[0].record_count);
     try std.testing.expectEqual(@as(u64, 1024), plan.files[0].file_size_in_bytes);
+}
+
+test "iceberg snapshot reader scans position delete parquet files into row refs" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    const data_file_path = "s3://bucket/t/data/a.parquet";
+    const delete_file_path = "s3://bucket/t/deletes/pos-a.parquet";
+    const pos_columns = [_]lake_parquet_rowgroup.TestPlainI64Column{.{
+        .column_id = "pos",
+        .values = &[_]i64{ 0, 2 },
+    }};
+    const file_path_columns = [_]lake_parquet_rowgroup.TestPlainByteArrayColumn{.{
+        .column_id = "file_path",
+        .values = &[_][]const u8{ data_file_path, data_file_path },
+    }};
+    const delete_object = try lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(
+        alloc,
+        &pos_columns,
+        &file_path_columns,
+    );
+    defer alloc.free(delete_object);
+    var delete_put = try client.putObject("bucket", "t/deletes/pos-a.parquet", delete_object, .{});
+    defer delete_put.deinit(alloc);
+
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/t"),
+        .snapshot_id = try alloc.dupe(u8, "12"),
+        .schema_fingerprint = try alloc.dupe(u8, "iceberg-schema:7"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, data_file_path),
+        .object_uri = try alloc.dupe(u8, data_file_path),
+        .version_id = try alloc.dupe(u8, "iceberg:v1:snapshot=12"),
+        .byte_len = 4096,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
+            .{ .ordinal = 0, .row_count = 2 },
+            .{ .ordinal = 1, .row_count = 1 },
+        }),
+    };
+
+    var plan = IcebergDeletePlan{ .files = try alloc.alloc(IcebergDeleteFile, 1) };
+    defer plan.deinit(alloc);
+    plan.files[0] = .{
+        .content = .position_deletes,
+        .file_path = try alloc.dupe(u8, delete_file_path),
+        .file_format = try alloc.dupe(u8, "PARQUET"),
+        .snapshot_id = 12,
+        .data_sequence_number = 42,
+        .file_sequence_number = 43,
+        .record_count = 2,
+        .file_size_in_bytes = delete_object.len,
+    };
+
+    var range_reader = lake_object_reader.ObjectStorageRangeReader.init(client);
+    const refs = try readPositionDeleteRowRefsAlloc(alloc, .{
+        .reader = range_reader.parquetReader(),
+        .client = client,
+        .data_inventory = inventory,
+        .delete_plan = plan,
+    });
+    defer alloc.free(refs);
+
+    try std.testing.expectEqual(@as(usize, 2), refs.len);
+    try std.testing.expectEqualStrings("events", refs[0].external.source_id);
+    try std.testing.expectEqualStrings("12", refs[0].external.snapshot_id);
+    try std.testing.expectEqualStrings(data_file_path, refs[0].external.file_id);
+    try std.testing.expectEqual(@as(u32, 0), refs[0].external.row_group_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), refs[0].external.row_ordinal);
+    try std.testing.expectEqual(@as(u32, 1), refs[1].external.row_group_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), refs[1].external.row_ordinal);
 }
 
 test "iceberg snapshot reader ignores inactive delete manifests" {
