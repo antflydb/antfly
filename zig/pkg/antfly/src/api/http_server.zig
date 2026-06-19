@@ -10416,6 +10416,14 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer forbidden_spec.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 403), forbidden_spec.status);
 
+    var forbidden_auth_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/auth.yaml",
+        .headers = &trusted_principal_headers,
+    });
+    defer forbidden_auth_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), forbidden_auth_spec.status);
+
     var hidden_admin_skill = try server.handle(.{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-extension-management",
@@ -10456,6 +10464,16 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expectEqual(@as(u16, 200), admin_spec.status);
     try std.testing.expectEqualStrings("application/yaml", admin_spec.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, admin_spec.body, "title: Antfly Extensions API") != null);
+
+    var admin_auth_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/auth.yaml",
+        .authorization = admin_auth,
+    });
+    defer admin_auth_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), admin_auth_spec.status);
+    try std.testing.expectEqualStrings("application/yaml", admin_auth_spec.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, admin_auth_spec.body, "title: User Management API") != null);
 
     var admin_skill = try server.handle(.{
         .method = .GET,
