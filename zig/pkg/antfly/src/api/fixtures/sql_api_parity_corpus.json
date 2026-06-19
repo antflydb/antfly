@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "ab9d82409116c9f84d35c04fa2dbe16c10688f5e953401c9694f6f376cb40d10",
-  "source_entry_count": 938,
-  "entry_count": 938,
+  "source_sha256": "9cffb7bdb5c45167a16211277742572d7a1d4ecbf0c81e3893451de6833c9f6b",
+  "source_entry_count": 939,
+  "entry_count": 939,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -917,6 +917,16 @@
       },
       "plan": "ddl:drop_collation:collation=ci_text:if_exists=false",
       "sql": "DROP COLLATION ci_text"
+    },
+    {
+      "name": "drop collation idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_collation",
+        "table_name": "ci_text"
+      },
+      "plan": "ddl:drop_collation:collation=ci_text:if_exists=true",
+      "sql": "DROP COLLATION IF EXISTS ci_text"
     },
     {
       "name": "create operator catalog ddl",

@@ -913,6 +913,16 @@
       "sql": "DROP COLLATION ci_text"
     },
     {
+      "name": "drop collation idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_collation",
+        "table_name": "ci_text"
+      },
+      "plan": "ddl:drop_collation:collation=ci_text:if_exists=true",
+      "sql": "DROP COLLATION IF EXISTS ci_text"
+    },
+    {
       "name": "create operator catalog ddl",
       "family": "ddl",
       "summary": {

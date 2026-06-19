@@ -3959,13 +3959,22 @@ pub const AppParityCorpusCoverage = struct {
     ddl_subscription_drop: bool = false,
     ddl_subscription_drop_if_exists: bool = false,
     ddl_collation_create: bool = false,
+    ddl_collation_create_options: bool = false,
     ddl_collation_rename: bool = false,
     ddl_collation_drop: bool = false,
+    ddl_collation_drop_if_exists: bool = false,
     ddl_operator_create: bool = false,
+    ddl_operator_create_options: bool = false,
     ddl_operator_drop: bool = false,
+    ddl_operator_drop_args: bool = false,
     ddl_aggregate_create: bool = false,
+    ddl_aggregate_create_args: bool = false,
+    ddl_aggregate_create_options: bool = false,
     ddl_aggregate_drop: bool = false,
+    ddl_aggregate_drop_args: bool = false,
     ddl_cast_create: bool = false,
+    ddl_cast_create_assignment: bool = false,
+    ddl_cast_create_function: bool = false,
     ddl_cast_drop: bool = false,
     ddl_vacuum_maintenance: bool = false,
     ddl_analyze_maintenance: bool = false,
@@ -5568,14 +5577,37 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_subscription_drop = true;
                     self.ddl_subscription_drop_if_exists = self.ddl_subscription_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
                 },
-                .create_collation => self.ddl_collation_create = true,
+                .create_collation => {
+                    self.ddl_collation_create = true;
+                    self.ddl_collation_create_options = self.ddl_collation_create_options or sql_adapter.planHasNonZeroToken(entry.plan, ":options=");
+                },
                 .rename_collation => self.ddl_collation_rename = true,
-                .drop_collation => self.ddl_collation_drop = true,
-                .create_operator => self.ddl_operator_create = true,
-                .drop_operator => self.ddl_operator_drop = true,
-                .create_aggregate => self.ddl_aggregate_create = true,
-                .drop_aggregate => self.ddl_aggregate_drop = true,
-                .create_cast => self.ddl_cast_create = true,
+                .drop_collation => {
+                    self.ddl_collation_drop = true;
+                    self.ddl_collation_drop_if_exists = self.ddl_collation_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
+                },
+                .create_operator => {
+                    self.ddl_operator_create = true;
+                    self.ddl_operator_create_options = self.ddl_operator_create_options or sql_adapter.planHasNonZeroToken(entry.plan, ":options=");
+                },
+                .drop_operator => {
+                    self.ddl_operator_drop = true;
+                    self.ddl_operator_drop_args = self.ddl_operator_drop_args or sql_adapter.planHasNonZeroToken(entry.plan, ":args=");
+                },
+                .create_aggregate => {
+                    self.ddl_aggregate_create = true;
+                    self.ddl_aggregate_create_args = self.ddl_aggregate_create_args or sql_adapter.planHasNonZeroToken(entry.plan, ":args=");
+                    self.ddl_aggregate_create_options = self.ddl_aggregate_create_options or sql_adapter.planHasNonZeroToken(entry.plan, ":options=");
+                },
+                .drop_aggregate => {
+                    self.ddl_aggregate_drop = true;
+                    self.ddl_aggregate_drop_args = self.ddl_aggregate_drop_args or sql_adapter.planHasNonZeroToken(entry.plan, ":args=");
+                },
+                .create_cast => {
+                    self.ddl_cast_create = true;
+                    self.ddl_cast_create_assignment = self.ddl_cast_create_assignment or sql_adapter.planHasExactBoolToken(entry.plan, ":assignment=", true);
+                    self.ddl_cast_create_function = self.ddl_cast_create_function or std.mem.indexOf(u8, entry.plan, ":function=") != null;
+                },
                 .drop_cast => self.ddl_cast_drop = true,
                 .vacuum_maintenance => self.ddl_vacuum_maintenance = true,
                 .analyze_maintenance => self.ddl_analyze_maintenance = true,
@@ -6385,13 +6417,22 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_subscription_drop);
         try std.testing.expect(self.ddl_subscription_drop_if_exists);
         try std.testing.expect(self.ddl_collation_create);
+        try std.testing.expect(self.ddl_collation_create_options);
         try std.testing.expect(self.ddl_collation_rename);
         try std.testing.expect(self.ddl_collation_drop);
+        try std.testing.expect(self.ddl_collation_drop_if_exists);
         try std.testing.expect(self.ddl_operator_create);
+        try std.testing.expect(self.ddl_operator_create_options);
         try std.testing.expect(self.ddl_operator_drop);
+        try std.testing.expect(self.ddl_operator_drop_args);
         try std.testing.expect(self.ddl_aggregate_create);
+        try std.testing.expect(self.ddl_aggregate_create_args);
+        try std.testing.expect(self.ddl_aggregate_create_options);
         try std.testing.expect(self.ddl_aggregate_drop);
+        try std.testing.expect(self.ddl_aggregate_drop_args);
         try std.testing.expect(self.ddl_cast_create);
+        try std.testing.expect(self.ddl_cast_create_assignment);
+        try std.testing.expect(self.ddl_cast_create_function);
         try std.testing.expect(self.ddl_cast_drop);
         try std.testing.expect(self.ddl_vacuum_maintenance);
         try std.testing.expect(self.ddl_analyze_maintenance);

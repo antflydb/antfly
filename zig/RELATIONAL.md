@@ -1212,7 +1212,8 @@ logical-replication catalog grammar for `CREATE PUBLICATION`,
 `DROP SUBSCRIPTION`, including table-list/all-tables publications,
 multi-publication subscriptions, enable/disable state, and idempotent drops,
 type-system catalog grammar for collation, operator, aggregate, and cast
-create/drop/rename forms,
+create/drop/rename forms, including option counts, operator/aggregate
+signatures, cast function/assignment metadata, and idempotent collation drops,
 routine catalog grammar for `CREATE FUNCTION`, `CREATE PROCEDURE`,
 `DROP FUNCTION`, and `DROP PROCEDURE`,
 sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
