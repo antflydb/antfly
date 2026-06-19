@@ -36223,6 +36223,7 @@ fn cloneDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Re
     errdefer freeDdlGeneratedValue(alloc, out);
     out.field = if (generated.field) |field| try alloc.dupe(u8, field) else null;
     out.fields = try cloneStringSlice(alloc, generated.fields);
+    out.expression = if (generated.expression) |expression| try cloneExpressionAlloc(alloc, expression) else null;
     return out;
 }
 
@@ -41908,6 +41909,31 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
+    var rich_expression_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_replace_idx ON usage_records (replace(status, 'old', 'new'));",
+    );
+    defer rich_expression_index.deinit(alloc);
+    switch (rich_expression_index) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_status_replace_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expect(plan.generated_expression != null);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, plan.generated_expression.?.op);
+            const expression = plan.generated_expression.?.expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, expression.kind);
+            try std.testing.expectEqual(@as(usize, 3), expression.operands.len);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
     var wrapped_unique_expression = try lowerDdlPlanAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (tenant_id, (lower(email)));",
@@ -43584,6 +43610,24 @@ test "postgres sql adapter applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("tenant_id", concat_ws_generated.generated.?.fields[0]);
     try std.testing.expectEqualStrings("status", concat_ws_generated.generated.?.fields[1]);
     try std.testing.expectEqualStrings(":", concat_ws_generated.generated.?.separator);
+
+    var rich_expression_generated_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX users_status_replace_idx ON users (replace(status, 'old', 'new'));",
+    );
+    defer rich_expression_generated_index.deinit(alloc);
+    const rich_expression_generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, concat_ws_generated_schema, rich_expression_generated_index);
+    defer runtime_schema.freeSchema(alloc, rich_expression_generated_schema);
+    const rich_expression_generated = relationalColumnForField(rich_expression_generated_schema, "users_status_replace_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rich_expression_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, rich_expression_generated.index_lifecycle);
+    try std.testing.expect(rich_expression_generated.index_generation != 0);
+    try std.testing.expect(rich_expression_generated.index_name != null);
+    try std.testing.expectEqualStrings("users_status_replace_idx", rich_expression_generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, rich_expression_generated.generated.?.op);
+    const rich_expression = rich_expression_generated.generated.?.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, rich_expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), rich_expression.operands.len);
 
     var unique_index = try lowerDdlPlanAlloc(
         alloc,
@@ -45905,6 +45949,28 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     try std.testing.expectEqualStrings("email", md5_expression.generated.?.field.?);
     try std.testing.expect(md5_expression.index_name != null);
     try std.testing.expectEqualStrings("users_md5_email_idx", md5_expression.index_name.?);
+
+    var rich_expression_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX users_status_replace_idx ON users (replace(status, 'old', 'new'));",
+    );
+    defer rich_expression_index.deinit(alloc);
+    var rich_expression_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, md5_expression_indexed.schema_json, rich_expression_index);
+    defer rich_expression_indexed.deinit(alloc);
+    try std.testing.expect(rich_expression_indexed.requires_rebuild);
+    try std.testing.expect(!rich_expression_indexed.validation_required);
+    var parsed_rich_expression_indexed = try schema_api.parseValidatedTableSchema(alloc, rich_expression_indexed.schema_json);
+    defer parsed_rich_expression_indexed.deinit(alloc);
+    const rich_expression_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_rich_expression_indexed);
+    defer runtime_schema.freeSchema(alloc, rich_expression_runtime);
+    const rich_expression = relationalColumnForField(rich_expression_runtime, "users_status_replace_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rich_expression.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, rich_expression.generated.?.op);
+    const rich_expression_ast = rich_expression.generated.?.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, rich_expression_ast.kind);
+    try std.testing.expectEqual(@as(usize, 3), rich_expression_ast.operands.len);
+    try std.testing.expect(rich_expression.index_name != null);
+    try std.testing.expectEqualStrings("users_status_replace_idx", rich_expression.index_name.?);
 
     var index = try lowerDdlPlanAlloc(
         alloc,

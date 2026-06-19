@@ -6932,6 +6932,21 @@
       "sql": "CREATE INDEX usage_records_md5_email_idx ON usage_records (md5(email));"
     },
     {
+      "name": "schema rich expression secondary index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=expression",
+      "apply_setup_sql": [
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"
+      ],
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
+      "sql": "CREATE INDEX usage_records_status_replace_idx ON usage_records (replace(status, 'old', 'new'));"
+    },
+    {
       "name": "schema json gin secondary index",
       "family": "ddl",
       "summary": {

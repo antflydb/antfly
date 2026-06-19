@@ -4358,6 +4358,7 @@ pub const AppParityCorpusCoverage = struct {
     schema_expression_unique_conflict_target: bool = false,
     schema_mixed_expression_unique_conflict_target: bool = false,
     schema_nulls_not_distinct_unique: bool = false,
+    schema_rich_expression_secondary_index: bool = false,
     schema_temporal_numrange_insert: bool = false,
     schema_temporal_daterange_insert: bool = false,
     schema_temporal_open_daterange_insert: bool = false,
@@ -4759,6 +4760,9 @@ pub const AppParityCorpusCoverage = struct {
         self.schema_nulls_not_distinct_unique = self.schema_nulls_not_distinct_unique or (entry.family == .ddl and
             std.mem.indexOf(u8, entry.sql, "UNIQUE ") != null and
             std.mem.indexOf(u8, entry.sql, "NULLS NOT DISTINCT") != null);
+        self.schema_rich_expression_secondary_index = self.schema_rich_expression_secondary_index or (entry.family == .ddl and
+            entry.summary.ddl_tag == .create_index and
+            sql_adapter.planHasExactStringToken(entry.plan, ":generated_op=", "expression"));
         self.schema_temporal_portion_update = self.schema_temporal_portion_update or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
             sql_adapter.planHasExactStringToken(entry.plan, "update_source:table=", "prices") and
@@ -6474,6 +6478,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.schema_partial_unique_conflict_target);
         try std.testing.expect(self.schema_expression_unique_conflict_target);
         try std.testing.expect(self.schema_mixed_expression_unique_conflict_target);
+        try std.testing.expect(self.schema_rich_expression_secondary_index);
         try self.expectTemporalRangeColumnDmlCoverage();
         try std.testing.expect(self.unsupported_duplicate_row_batch_target);
         try std.testing.expect(self.unsupported_duplicate_conflict_update_target);

@@ -3391,11 +3391,12 @@ pub fn parseDdlStoredGeneratedValueAlloc(
 pub fn peekDdlIndexElementExpression(
     tokens: []const Token,
     pos: usize,
-    include_generated_concat: bool,
+    include_generated_expression: bool,
 ) bool {
     var scan = pos;
     while (scan < tokens.len and tokens[scan].kind == .lparen) : (scan += 1) {}
     if (scan >= tokens.len or tokens[scan].kind != .identifier) return false;
+    if (scan + 1 >= tokens.len or tokens[scan + 1].kind != .lparen) return false;
     const text = tokens[scan].text;
     if (std.ascii.eqlIgnoreCase(text, "lower") or
         std.ascii.eqlIgnoreCase(text, "upper") or
@@ -3403,8 +3404,7 @@ pub fn peekDdlIndexElementExpression(
     {
         return true;
     }
-    return include_generated_concat and
-        (std.ascii.eqlIgnoreCase(text, "concat") or std.ascii.eqlIgnoreCase(text, "concat_ws"));
+    return include_generated_expression;
 }
 
 pub fn consumeDdlIndexExpressionWrappers(tokens: []const Token, pos: *usize) usize {
@@ -7315,9 +7315,18 @@ test "sql adapter grammar parses ddl index expression wrappers" {
     try std.testing.expect(!peekDdlIndexElementExpression(concat_tokens.items, 0, false));
     try std.testing.expect(peekDdlIndexElementExpression(concat_tokens.items, 0, true));
 
+    var replace_tokens = try lexer.tokenizeAlloc(alloc, "(replace(status, 'a', 'b'))");
+    defer lexer.freeTokens(alloc, &replace_tokens);
+    try std.testing.expect(!peekDdlIndexElementExpression(replace_tokens.items, 0, false));
+    try std.testing.expect(peekDdlIndexElementExpression(replace_tokens.items, 0, true));
+
     var column_tokens = try lexer.tokenizeAlloc(alloc, "(email)");
     defer lexer.freeTokens(alloc, &column_tokens);
     try std.testing.expect(!peekDdlIndexElementExpression(column_tokens.items, 0, true));
+
+    var function_name_column_tokens = try lexer.tokenizeAlloc(alloc, "(lower)");
+    defer lexer.freeTokens(alloc, &function_name_column_tokens);
+    try std.testing.expect(!peekDdlIndexElementExpression(function_name_column_tokens.items, 0, true));
 }
 
 test "sql adapter grammar parses ddl collations" {

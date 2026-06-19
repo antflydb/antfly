@@ -410,6 +410,7 @@
     "schema_mixed_expression_unique_conflict_target",
     "schema_nulls_not_distinct_unique",
     "schema_partial_unique_conflict_target",
+    "schema_rich_expression_secondary_index",
     "schema_temporal_daterange_constructor_insert",
     "schema_temporal_daterange_insert",
     "schema_temporal_fk_ddl",
