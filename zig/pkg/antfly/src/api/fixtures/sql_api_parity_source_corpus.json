@@ -5661,6 +5661,67 @@
       "plan": "unsupported:update_joined_source:requires=row_lock_mode_plan",
       "classification_reason": "row_lock_mode_plan",
       "sql": "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id"
+    },
+    {
+      "name": "cte-backed semijoin update mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "operations": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
+      "sql": "WITH ready_sources AS (SELECT id FROM archived_records WHERE status = 'ready') UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM ready_sources) RETURNING id"
+    },
+    {
+      "name": "cte-backed semijoin delete mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
+      "sql": "WITH stale_sources AS (SELECT id FROM archived_records WHERE status = 'stale') DELETE FROM usage_records WHERE id IN (SELECT id FROM stale_sources) RETURNING id"
+    },
+    {
+      "name": "cte-backed direct joined update mutation source",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "source_assignments": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=1:ops=0:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
+      "sql": "WITH ready_sources AS (SELECT id, status FROM source_records WHERE status = 'ready') UPDATE usage_records SET status = source.status FROM ready_sources AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id"
+    },
+    {
+      "name": "cte-backed direct joined delete mutation source",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "returning": 1,
+        "join_on": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
+      "sql": "WITH stale_sources AS (SELECT id, status FROM source_records WHERE status = 'stale') DELETE FROM usage_records USING stale_sources AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id"
+    },
+    {
+      "name": "unsupported cte-backed merge mutation",
+      "family": "unsupported_merge_mutation",
+      "plan": "unsupported:merge_mutation:requires=cte_mutation_source_plan",
+      "classification_reason": "cte_mutation_source_plan",
+      "sql": "WITH ready_sources AS (SELECT id, status FROM archived_records WHERE status = 'ready') MERGE INTO usage_records AS target USING ready_sources AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status"
     }
   ]
 }
