@@ -372,7 +372,10 @@ pub fn searchJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     if (options.mode == .tenant) {
         if (extension_context) |ctx| try writeMatchedExtensionEntries(alloc, &writer.writer, options, &first, ctx, request.text, request.filter, &matched);
     }
-    try writer.writer.writeAll("],\"federation\":\"none\",\"count\":");
+    try writer.writer.writeAll("],\"federation\":");
+    try std.json.Stringify.value(request.federation.name(), .{}, &writer.writer);
+    if (request.federation.includesReferrals()) try writer.writer.writeAll(",\"referrals\":[]");
+    try writer.writer.writeAll(",\"count\":");
     try writer.writer.print("{d}", .{matched});
     try writer.writer.writeByte('}');
     return try writer.toOwnedSlice();
@@ -460,6 +463,7 @@ const SearchRequest = struct {
     parsed: ?std.json.Parsed(std.json.Value) = null,
     text: ?[]const u8 = null,
     filter: ?std.json.Value = null,
+    federation: FederationMode = .none,
     facet_fields: [max_facets][]const u8 = undefined,
     facet_field_count: usize = 0,
 
@@ -469,6 +473,37 @@ const SearchRequest = struct {
 
     fn facetFields(self: SearchRequest) []const []const u8 {
         return self.facet_fields[0..self.facet_field_count];
+    }
+};
+
+const FederationMode = enum {
+    none,
+    referrals,
+    auto,
+
+    fn parse(value: std.json.Value) !FederationMode {
+        return switch (value) {
+            .string => |mode| {
+                if (std.mem.eql(u8, mode, "none")) return .none;
+                if (std.mem.eql(u8, mode, "referrals")) return .referrals;
+                if (std.mem.eql(u8, mode, "auto")) return .auto;
+                return error.InvalidArdSearchRequest;
+            },
+            .null => .none,
+            else => error.InvalidArdSearchRequest,
+        };
+    }
+
+    fn name(self: FederationMode) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .referrals => "referrals",
+            .auto => "auto",
+        };
+    }
+
+    fn includesReferrals(self: FederationMode) bool {
+        return self == .referrals or self == .auto;
     }
 };
 
@@ -514,6 +549,7 @@ fn parseSearchRequest(alloc: std.mem.Allocator, body: []const u8) !SearchRequest
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArdSearchRequest;
     var request: SearchRequest = .{ .parsed = parsed };
+    if (parsed.value.object.get("federation")) |value| request.federation = try FederationMode.parse(value);
     try parseFacetFields(&request, parsed.value);
     const query = parsed.value.object.get("query") orelse return request;
     if (query != .object) return error.InvalidArdSearchRequest;
@@ -1568,6 +1604,20 @@ test "ARD search supports publisher and metadata filters" {
     const results = parsed.value.object.get("results").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("Antfly Public OpenAPI", results[0].object.get("displayName").?.string);
+}
+
+test "ARD search validates federation and returns referral envelope" {
+    const body = try searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"referrals\"}", false);
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("referrals", parsed.value.object.get("federation").?.string);
+    try std.testing.expect(parsed.value.object.get("referrals") != null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("referrals").?.array.items.len);
+
+    try std.testing.expectError(error.InvalidArdSearchRequest, searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"recursive\"}", false));
 }
 
 test "ARD explore returns requested facet buckets over scoped entries" {

@@ -3319,6 +3319,7 @@ pub fn build(b: *std.Build) void {
             "api http server filters extension mcp tools by trusted principal table permissions",
             "ARD search filters scoped catalog entries",
             "ARD search supports publisher and metadata filters",
+            "ARD search validates federation and returns referral envelope",
             "ARD explore returns requested facet buckets over scoped entries",
             "ARD extension package entries use trust provenance for artifact digests",
             "auth row filter resolver expands username references",

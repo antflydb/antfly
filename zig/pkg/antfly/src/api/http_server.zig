@@ -10439,6 +10439,24 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/mcp-server+json\"") == null);
 
+    var federated_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"referrals\"}",
+    });
+    defer federated_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), federated_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"federation\":\"referrals\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"referrals\":[]") != null);
+
+    var invalid_federation = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"recursive\"}",
+    });
+    defer invalid_federation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_federation.status);
+
     var explore = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.ard_v1_explore,

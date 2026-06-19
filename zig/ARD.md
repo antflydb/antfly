@@ -96,7 +96,8 @@ Behavior:
 - Accepts the ARD query model: `{ "query": { "text": "...", "filter": { ... } } }`.
 - Requires non-empty `query.text`, matching ARD Search semantics. Filter-only discovery belongs on `/ard/v1/explore`.
 - Returns ranked catalog entries.
-- Supports `federation` modes when federation is implemented: `auto`, `referrals`, and `none`.
+- Accepts ARD `federation` modes: `none`, `referrals`, and `auto`.
+- Returns local scoped results for all modes. Until Colony or external registries are configured, `referrals` and `auto` return an explicit empty `referrals` array rather than silently pretending federation is unavailable.
 - Uses Antfly itself to index and search generated catalog entries when practical.
 
 This should come after the catalog builder is stable.
@@ -418,14 +419,15 @@ Later:
 - Build a scoped in-memory implementation first.
 - Optionally index catalog entries into Antfly for hybrid search.
 - Support common filters: `type`, `tags`, `capabilities`, `publisher`/`publisherId` derived from the `urn:ai` identifier, and `metadata.*`.
-- Support `federation: none` initially, then `referrals` and `auto` once Colony or external registries are integrated.
+- Validate `federation` as `none`, `referrals`, or `auto`; return local scoped results for all modes.
+- Return an empty `referrals` array for `referrals`/`auto` until Colony or external registries are integrated.
 
 ### PR 5: Trust and Federation
 
 - Add `trustManifest` support.
 - Add package and artifact digest links.
 - Consider `application/ai-registry+json` entries for Antfly/Colony registries.
-- Consider referrals to Colony-managed or external registries.
+- Populate `referrals` from Colony-managed or external registries.
 
 ## Open Questions
 
