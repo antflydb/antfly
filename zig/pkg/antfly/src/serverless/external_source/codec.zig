@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("types.zig");
 
 const magic = "AFXS";
-const version: u32 = 11;
+const version: u32 = 12;
 
 pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8 {
     try inventory.validate();
@@ -74,6 +74,7 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
                 try appendOptionalF64(alloc, &out, chunk.stats_min_f64);
                 try appendOptionalF64(alloc, &out, chunk.stats_max_f64);
                 try out.append(alloc, if (chunk.nullable) 1 else 0);
+                try appendOptionalI32(alloc, &out, chunk.field_id);
             }
         }
     }
@@ -87,7 +88,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidExternalSourceInventoryMagic;
     cursor += magic.len;
     const got_version = try readU32(bytes, &cursor);
-    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
+    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != 11 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
     if (cursor >= bytes.len) return error.InvalidExternalSourceInventory;
     const format = try decodeFormat(bytes[cursor]);
     cursor += 1;
@@ -196,6 +197,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
                     if (raw > 1) return error.InvalidExternalSourceInventory;
                     break :blk raw == 1;
                 } else false;
+                const field_id: ?i32 = if (got_version >= 12) try readOptionalI32(bytes, &cursor) else null;
                 chunk.* = .{
                     .column_id = column_id,
                     .file_offset = chunk_file_offset,
@@ -217,6 +219,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
                     .stats_min_f64 = stats_min_f64,
                     .stats_max_f64 = stats_max_f64,
                     .nullable = nullable,
+                    .field_id = field_id,
                 };
                 keep_chunk = true;
                 initialized_chunks += 1;
@@ -300,6 +303,15 @@ fn appendI32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: i32) !vo
     try out.appendSlice(alloc, &buf);
 }
 
+fn appendOptionalI32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: ?i32) !void {
+    if (value) |got| {
+        try out.append(alloc, 1);
+        try appendI32(alloc, out, got);
+    } else {
+        try out.append(alloc, 0);
+    }
+}
+
 fn appendI64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: i64) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(i64, &buf, value, .little);
@@ -361,6 +373,17 @@ fn readI32(bytes: []const u8, cursor: *usize) !i32 {
     const value = std.mem.readInt(i32, bytes[cursor.*..][0..4], .little);
     cursor.* += 4;
     return value;
+}
+
+fn readOptionalI32(bytes: []const u8, cursor: *usize) !?i32 {
+    if (cursor.* >= bytes.len) return error.InvalidExternalSourceInventory;
+    const raw = bytes[cursor.*];
+    cursor.* += 1;
+    return switch (raw) {
+        0 => null,
+        1 => try readI32(bytes, cursor),
+        else => error.InvalidExternalSourceInventory,
+    };
 }
 
 fn readI64(bytes: []const u8, cursor: *usize) !i64 {
@@ -455,6 +478,7 @@ test "external source inventory codec round-trips file inventory" {
                     .logical_type = try alloc.dupe(u8, "timestamp_micros"),
                     .decimal_precision = 0,
                     .decimal_scale = 0,
+                    .field_id = 2,
                     .stats_min_i64 = 10,
                     .stats_max_i64 = 20,
                     .stats_min_bytes = try alloc.dupe(u8, "acct:a"),
@@ -495,6 +519,7 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqualStrings("timestamp_micros", decoded.files[0].row_groups[0].column_chunks[0].logical_type);
     try std.testing.expectEqual(@as(i32, 0), decoded.files[0].row_groups[0].column_chunks[0].decimal_precision);
     try std.testing.expectEqual(@as(i32, 0), decoded.files[0].row_groups[0].column_chunks[0].decimal_scale);
+    try std.testing.expectEqual(@as(?i32, 2), decoded.files[0].row_groups[0].column_chunks[0].field_id);
     try std.testing.expectEqual(@as(?i64, 10), decoded.files[0].row_groups[0].column_chunks[0].stats_min_i64);
     try std.testing.expectEqual(@as(?i64, 20), decoded.files[0].row_groups[0].column_chunks[0].stats_max_i64);
     try std.testing.expectEqualStrings("acct:a", decoded.files[0].row_groups[0].column_chunks[0].stats_min_bytes.?);

@@ -36,6 +36,7 @@ pub const ColumnChunk = struct {
     logical_type: []u8 = &.{},
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
+    field_id: ?i32 = null,
     stats_min_i64: ?i64 = null,
     stats_max_i64: ?i64 = null,
     stats_min_bytes: ?[]u8 = null,
@@ -62,6 +63,9 @@ pub const ColumnChunk = struct {
         if (self.compressed_len == 0) return error.InvalidExternalSourceInventory;
         if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
         if (self.compressed_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
+        if (self.field_id) |id| {
+            if (id < 0) return error.InvalidExternalSourceInventory;
+        }
         if (self.stats_min_i64 != null and self.stats_max_i64 != null and self.stats_min_i64.? > self.stats_max_i64.?) return error.InvalidExternalSourceInventory;
         if ((self.stats_min_bytes == null) != (self.stats_max_bytes == null)) return error.InvalidExternalSourceInventory;
         if (self.stats_min_bytes) |min| {

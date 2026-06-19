@@ -317,6 +317,7 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .stats_min_f64 = chunk.stats_min_f64,
         .stats_max_f64 = chunk.stats_max_f64,
         .nullable = chunk.nullable,
+        .field_id = chunk.field_id,
     };
 }
 
@@ -374,6 +375,7 @@ const SchemaElement = struct {
     logical_type: []u8 = &.{},
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
+    field_id: ?i32 = null,
 
     fn deinit(self: *SchemaElement, alloc: Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
@@ -389,6 +391,7 @@ const SchemaColumn = struct {
     logical_type: []u8 = &.{},
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
+    field_id: ?i32 = null,
 
     fn deinit(self: *SchemaColumn, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
@@ -440,6 +443,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
     var logical_type: []u8 = &.{};
     var decimal_precision: i32 = 0;
     var decimal_scale: i32 = 0;
+    var field_id: ?i32 = null;
     errdefer if (name) |value| alloc.free(value);
     errdefer if (logical_type.len > 0) alloc.free(logical_type);
 
@@ -461,6 +465,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
             },
             7 => decimal_scale = try reader.readRequiredI32(field.type),
             8 => decimal_precision = try reader.readRequiredI32(field.type),
+            9 => field_id = try reader.readRequiredI32(field.type),
             10 => {
                 if (logical_type.len > 0) {
                     alloc.free(logical_type);
@@ -486,6 +491,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
         .logical_type = logical_type,
         .decimal_precision = decimal_precision,
         .decimal_scale = decimal_scale,
+        .field_id = field_id,
     };
 }
 
@@ -519,6 +525,7 @@ fn collectSchemaColumnsAlloc(
                 .logical_type = logical_type,
                 .decimal_precision = element.decimal_precision,
                 .decimal_scale = element.decimal_scale,
+                .field_id = element.field_id,
             });
         } else {
             try collectSchemaColumnsAlloc(alloc, elements, cursor, element.child_count, element_nullable, path, columns);
@@ -566,6 +573,7 @@ fn applySchemaNullability(alloc: Allocator, row_groups: []external_source.RowGro
             }
             chunk.decimal_precision = schema_column.decimal_precision;
             chunk.decimal_scale = schema_column.decimal_scale;
+            chunk.field_id = schema_column.field_id;
         }
     }
 }
@@ -1337,6 +1345,7 @@ test "parquet metadata parser derives nullable columns from schema repetition" {
     try std.testing.expectEqual(@as(usize, 1), footer.row_groups[0].column_chunks.len);
     try std.testing.expectEqualStrings("amount", footer.row_groups[0].column_chunks[0].column_id);
     try std.testing.expect(footer.row_groups[0].column_chunks[0].nullable);
+    try std.testing.expectEqual(@as(?i32, 2), footer.row_groups[0].column_chunks[0].field_id);
 
     var required_bytes = try buildSingleColumnMetadataFixtureWithSchema(alloc, false);
     defer required_bytes.deinit(alloc);
@@ -1616,6 +1625,8 @@ fn buildSingleColumnMetadataFixtureWithSchema(alloc: Allocator, nullable: bool) 
     try appendI32(&out, alloc, if (nullable) 1 else 0);
     try appendField(&out, alloc, &leaf_prev, 4, .binary);
     try appendBinary(&out, alloc, "amount");
+    try appendField(&out, alloc, &leaf_prev, 9, .i32);
+    try appendI32(&out, alloc, 2);
     try appendStop(&out, alloc);
 
     try appendField(&out, alloc, &file_prev, 3, .i64);
