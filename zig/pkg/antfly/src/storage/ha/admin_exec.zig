@@ -41,6 +41,7 @@ const session = @import("session.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
+const validation = @import("validation.zig");
 const write_gate = @import("write_gate.zig");
 
 var test_path_counter: u64 = 0;
@@ -185,12 +186,10 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
         },
         .primary_status => |snapshot| blk: {
             const node_id = primaryActionNodeID(maybe_ctx) orelse return error.PrimaryNodeIDUnavailable;
-            if (std.mem.trim(u8, node_id, " \t\r\n").len == 0) return error.PrimaryNodeIDUnavailable;
             break :blk try renderPrimaryStatusJsonAlloc(alloc, node_id, snapshot);
         },
         .standby_status => |snapshot| blk: {
             const node_id = standbyActionNodeID(maybe_ctx) orelse return error.StandbyNodeIDUnavailable;
-            if (std.mem.trim(u8, node_id, " \t\r\n").len == 0) return error.StandbyNodeIDUnavailable;
             break :blk try renderStandbyStatusJsonAlloc(alloc, node_id, snapshot);
         },
         .commit_check => |gate| try renderCommitCheckJsonAlloc(alloc, gate),
@@ -202,9 +201,7 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
         .fence_current => |maybe_fence_result| try renderFenceCurrentJsonAlloc(alloc, maybe_fence_result),
         .promote_assess => |assessment| {
             if (standbyActionNodeID(maybe_ctx)) |node_id| {
-                if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) {
-                    return try renderPromotionAssessJsonAlloc(alloc, node_id, assessment);
-                }
+                return try renderPromotionAssessJsonAlloc(alloc, node_id, assessment);
             }
             return try renderJsonAlloc(alloc, result);
         },
@@ -1099,13 +1096,14 @@ fn executeWriteCheck(ctx: Context, command: admin_cli.WriteCheckCommand) !write_
 fn evaluatePrimaryWriteWithContext(ctx: Context, request: write_gate.Request) !write_gate.Decision {
     const primary = try requirePrimary(ctx);
     if (ctx.fence_store) |fence_store| {
-        if (ctx.primary_node_id) |node_id| {
+        if (primaryActionNodeID(ctx)) |node_id| {
             return try write_gate.evaluateFencedPrimary(.{
                 .primary = primary,
                 .fence_store = fence_store,
                 .node_id = node_id,
             }, request);
         }
+        return error.PrimaryNodeIDUnavailable;
     }
     return try admin.evaluatePrimaryWrite(primary, request);
 }
@@ -1392,7 +1390,7 @@ fn appendActionReceiptLines(
     try appendLine(alloc, out, "action.target", target);
     try appendLine(alloc, out, "action.state", state);
     if (node_id) |raw_node_id| {
-        if (std.mem.trim(u8, raw_node_id, " \t\r\n").len != 0) {
+        if (validation.isIdentifier(raw_node_id)) {
             try appendLine(alloc, out, "action.node_id", raw_node_id);
         }
     }
@@ -1400,12 +1398,16 @@ fn appendActionReceiptLines(
 
 fn primaryActionNodeID(maybe_ctx: ?Context) ?[]const u8 {
     const ctx = maybe_ctx orelse return null;
-    return ctx.primary_node_id;
+    const node_id = ctx.primary_node_id orelse return null;
+    if (validation.isIdentifier(node_id)) return node_id;
+    return null;
 }
 
 fn standbyActionNodeID(maybe_ctx: ?Context) ?[]const u8 {
     const ctx = maybe_ctx orelse return null;
-    return ctx.standby_node_id;
+    const node_id = ctx.standby_node_id orelse return null;
+    if (validation.isIdentifier(node_id)) return node_id;
+    return null;
 }
 
 fn appendCreateSlotResponseLines(
@@ -2034,6 +2036,9 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     const created_context_table = try renderTableForContextAlloc(alloc, .{ .primary_node_id = "primary-a" }, created);
     defer alloc.free(created_context_table);
     try expectContains(created_context_table, "action.node_id=primary-a\n");
+    const invalid_created_context_table = try renderTableForContextAlloc(alloc, .{ .primary_node_id = "primary/a" }, created);
+    defer alloc.free(invalid_created_context_table);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_created_context_table, "action.node_id=") == null);
 
     var ack_plan = try admin_cli.parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "1", "--received-lsn", "2", "--applied-lsn", "1", "--safe-read-lsn", "1" });
     defer ack_plan.deinit(alloc);
@@ -2107,6 +2112,10 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try expectContains(status_json.body, "\"node_id\":\"primary-a\"");
     try expectContains(status_json.body, "\"durability\"");
     try expectContains(status_json.body, "\"last_error\":\"IntentionalApplyFailure\"");
+    try std.testing.expectError(
+        error.PrimaryNodeIDUnavailable,
+        renderJsonWithContextAlloc(alloc, .{ .primary_node_id = "primary/a" }, primary_status),
+    );
 
     var status_plan = try admin_cli.parse(alloc, &.{
         "status",
@@ -2702,6 +2711,10 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(primary_write_table, "result=write_check\n");
     try expectContains(primary_write_table, "action=allow_write\n");
     try expectContains(primary_write_table, "can_write=true\n");
+    try std.testing.expectError(
+        error.PrimaryNodeIDUnavailable,
+        execute(alloc, .{ .primary = &primary, .primary_node_id = "primary/a", .fence_store = &fence_store }, primary_write_plan),
+    );
 
     var standby_write_plan = try admin_cli.parse(alloc, &.{ "write", "check", "--role", "standby" });
     defer standby_write_plan.deinit(alloc);
