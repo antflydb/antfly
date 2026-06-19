@@ -30,7 +30,26 @@ pub const GroupByRequest = struct {
     group_column: []const u8,
     value_column: []const u8 = &.{},
     op: algebraic_segment.AggregateOp,
+    materialized_source: ?MaterializedSourceRef = null,
     deleted_row_refs: []const rowsource.RowRef = &.{},
+};
+
+pub const MaterializedSourceRef = struct {
+    kind: rowsource.SourceKind,
+    source_id: []const u8 = &.{},
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+
+    pub fn validate(self: MaterializedSourceRef) !void {
+        if (self.snapshot_id.len == 0) return error.InvalidLakeRowsQuery;
+        if (self.schema_fingerprint.len == 0) return error.InvalidLakeRowsQuery;
+        switch (self.kind) {
+            .external_parquet, .external_iceberg, .external_lance => {
+                if (self.source_id.len == 0) return error.InvalidLakeRowsQuery;
+            },
+            .relational_store, .json_materialized, .serverless_fragment => {},
+        }
+    }
 };
 
 pub const GroupResult = struct {
@@ -184,6 +203,9 @@ pub fn executeGroupByAlloc(
     materialized: ?*const algebraic_segment.Reader,
 ) !GroupByResult {
     try validateRequest(request);
+    if (request.materialized_source) |required| {
+        if (required.kind != source.kind) return error.LakeRowsMaterializedSourceMismatch;
+    }
     if (materialized) |reader| {
         if (request.deleted_row_refs.len == 0 and materializedMatches(reader.*, request)) {
             return try resultFromAlgebraicAlloc(alloc, reader.*);
@@ -430,6 +452,7 @@ fn rowRefsExcludingDeletedAlloc(
 fn validateRequest(request: GroupByRequest) !void {
     if (request.group_column.len == 0) return error.InvalidLakeRowsQuery;
     if (request.op != .count and request.value_column.len == 0) return error.InvalidLakeRowsQuery;
+    if (request.materialized_source) |required| try required.validate();
 }
 
 fn validateScanRequest(request: ScanRequest) !void {
@@ -556,9 +579,30 @@ fn findSidecarDeclaration(
 }
 
 fn materializedMatches(reader: algebraic_segment.Reader, request: GroupByRequest) bool {
+    if (request.materialized_source) |required| {
+        if (!materializedSourceMatches(reader.segment.source, required)) return false;
+    }
     return std.mem.eql(u8, reader.segment.aggregate.group_column, request.group_column) and
         std.mem.eql(u8, reader.segment.aggregate.value_column, request.value_column) and
         reader.segment.aggregate.op == request.op;
+}
+
+fn materializedSourceMatches(source: algebraic_segment.SourceRef, required: MaterializedSourceRef) bool {
+    return source.kind == algebraicSourceKindForRowSourceKind(required.kind) and
+        std.mem.eql(u8, source.source_id, required.source_id) and
+        std.mem.eql(u8, source.snapshot_id, required.snapshot_id) and
+        std.mem.eql(u8, source.schema_fingerprint, required.schema_fingerprint);
+}
+
+fn algebraicSourceKindForRowSourceKind(kind: rowsource.SourceKind) algebraic_segment.SourceKind {
+    return switch (kind) {
+        .relational_store => .relational_store,
+        .json_materialized => .relational_store,
+        .serverless_fragment => .serverless_fragment,
+        .external_parquet => .external_parquet,
+        .external_iceberg => .external_iceberg,
+        .external_lance => .external_lance,
+    };
 }
 
 fn resultFromAlgebraicAlloc(
@@ -870,12 +914,79 @@ test "lake rows group-by can use algebraic segment materialization" {
         .group_column = "tenant",
         .value_column = "amount",
         .op = .sum_i64,
+        .materialized_source = .{
+            .kind = .serverless_fragment,
+            .source_id = "orders",
+            .snapshot_id = "manifest-1",
+            .schema_fingerprint = "schema-v1",
+        },
     }, &reader);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.groups.len);
     try std.testing.expectEqual(@as(i64, 42), result.find("t1").?.sum_i64);
     try std.testing.expectEqual(.algebraic_segment, result.source);
+}
+
+test "lake rows group-by rejects stale algebraic materialization source" {
+    const alloc = std.testing.allocator;
+    const local = @import("../../storage/rowsource/local.zig");
+
+    var segment = algebraic_segment.Segment{
+        .source = .{
+            .kind = .relational_store,
+            .snapshot_id = try alloc.dupe(u8, "manifest-1"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "orders"),
+        },
+        .aggregate = .{
+            .group_column = try alloc.dupe(u8, "tenant"),
+            .value_column = try alloc.dupe(u8, "amount"),
+            .op = .sum_i64,
+            .groups = try alloc.alloc(algebraic_segment.GroupFold, 1),
+        },
+    };
+    defer segment.deinit(alloc);
+    segment.aggregate.groups[0] = .{
+        .key = try alloc.dupe(u8, "t1"),
+        .value = .{ .sum_i64 = 999 },
+    };
+
+    const encoded = try algebraic_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+    var reader = try algebraic_segment.Reader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+
+    const row_refs = [_]rowsource.RowRef{.{ .relational_key = "row:a" }};
+    const tenants = [_][]const u8{"t1"};
+    const amounts = [_]i64{10};
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "manifest-2" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try local.relationalStoreSource(&batches);
+
+    var result = try executeGroupByAlloc(alloc, batch_source.rowSource(), .{
+        .group_column = "tenant",
+        .value_column = "amount",
+        .op = .sum_i64,
+        .materialized_source = .{
+            .kind = .relational_store,
+            .source_id = "orders",
+            .snapshot_id = "manifest-2",
+            .schema_fingerprint = "schema-v1",
+        },
+    }, &reader);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.groups.len);
+    try std.testing.expectEqual(@as(i64, 10), result.find("t1").?.sum_i64);
+    try std.testing.expectEqual(.rowsource_scan, result.source);
 }
 
 test "lake rows scans projected local rows with a predicate" {
