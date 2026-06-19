@@ -27,6 +27,7 @@ pub const CatalogOptions = struct {
     publisher_domain: []const u8 = "antfly.local",
     display_name: []const u8 = "Antfly",
     is_admin: bool = false,
+    permissions: ?[]const usermgr.Permission = null,
     profile: ?[]const u8 = null,
     types: ?[]const u8 = null,
     include: ?[]const u8 = null,
@@ -52,6 +53,7 @@ const Entry = struct {
     capabilities: []const []const u8 = &.{},
     representative_queries: []const []const u8 = &.{},
     admin_only: bool = false,
+    required_permission: RequiredPermission = .none,
 
     fn write(self: Entry, writer: *std.Io.Writer, options: CatalogOptions) !void {
         try writer.writeByte('{');
@@ -108,6 +110,13 @@ const Entry = struct {
     }
 };
 
+const RequiredPermission = enum {
+    none,
+    table_read,
+    table_admin,
+    admin,
+};
+
 const Skill = struct {
     slug: []const u8,
     url: []const u8,
@@ -119,6 +128,7 @@ const Skill = struct {
     representative_queries: []const []const u8,
     body: []const u8,
     admin_only: bool = false,
+    required_permission: RequiredPermission = .none,
 };
 
 const skills = [_]Skill{
@@ -127,6 +137,7 @@ const skills = [_]Skill{
         .url = "/ard/v1/skills/antfly-query-builder",
         .display_name = "Antfly Query Builder",
         .description = "Translate user intent into Antfly table queries and query-builder requests.",
+        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:read\"}",
         .capabilities = &.{ "query-builder", "table-query", "schema-aware-search" },
         .representative_queries = &.{
             "turn this question into an Antfly query",
@@ -143,12 +154,14 @@ const skills = [_]Skill{
         \\Keep table and field selection scoped to resources visible to the authenticated tenant identity.
         \\
         ,
+        .required_permission = .table_read,
     },
     .{
         .slug = "antfly-retrieval",
         .url = "/ard/v1/skills/antfly-retrieval",
         .display_name = "Antfly Retrieval",
         .description = "Retrieve, rank, and synthesize context from Antfly tables.",
+        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:read\"}",
         .capabilities = &.{ "retrieval", "hybrid-search", "context-synthesis" },
         .representative_queries = &.{
             "retrieve context for this incident",
@@ -165,12 +178,14 @@ const skills = [_]Skill{
         \\Do not infer access to tables or rows that are not visible through the caller's Antfly identity.
         \\
         ,
+        .required_permission = .table_read,
     },
     .{
         .slug = "antfly-schema-design",
         .url = "/ard/v1/skills/antfly-schema-design",
         .display_name = "Antfly Schema Design",
         .description = "Design Antfly tables, schemas, indexes, enrichments, and query processors.",
+        .metadata = "{\"scope\":\"tenant\",\"requiredPermissions\":\"table:admin\"}",
         .capabilities = &.{ "schema-design", "index-design", "table-management" },
         .representative_queries = &.{
             "design a schema for these documents",
@@ -187,6 +202,7 @@ const skills = [_]Skill{
         \\Validate that requested indexes and enrichments are available in the deployment before recommending them.
         \\
         ,
+        .required_permission = .table_admin,
     },
     .{
         .slug = "antfly-extension-management",
@@ -211,6 +227,7 @@ const skills = [_]Skill{
         \\
         ,
         .admin_only = true,
+        .required_permission = .admin,
     },
 };
 
@@ -2133,7 +2150,17 @@ fn isAgentLike(entry: Entry) bool {
 
 fn catalogOptionsAllowStaticEntry(options: CatalogOptions, entry: Entry) bool {
     if (entry.admin_only and !options.is_admin) return false;
+    if (!catalogOptionsAllowRequiredPermission(options, entry.required_permission)) return false;
     return catalogOptionsAllowMedia(options, entry.media_type, entry.tags);
+}
+
+fn catalogOptionsAllowRequiredPermission(options: CatalogOptions, required: RequiredPermission) bool {
+    return switch (required) {
+        .none => true,
+        .admin => options.is_admin,
+        .table_read => if (options.permissions) |permissions| identityHasAnyPermission(permissions, .table, .read) else true,
+        .table_admin => if (options.permissions) |permissions| identityHasAnyPermission(permissions, .table, .admin) else true,
+    };
 }
 
 fn catalogOptionsAllowMedia(options: CatalogOptions, media_type: []const u8, tags: []const []const u8) bool {
@@ -2190,6 +2217,7 @@ fn skillEntry(skill: Skill) Entry {
         .capabilities = skill.capabilities,
         .representative_queries = skill.representative_queries,
         .admin_only = skill.admin_only,
+        .required_permission = skill.required_permission,
     };
 }
 
@@ -2459,20 +2487,65 @@ test "ARD catalog resolves artifact urls against configured base url" {
 }
 
 test "ARD catalog hides admin-only built-in skills from non-admin entries" {
-    const non_admin = try catalogJsonAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = false });
+    var read_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(std.testing.allocator, .table, "docs", .read),
+    };
+    defer read_permission[0].deinit(std.testing.allocator);
+    const non_admin = try catalogJsonAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = false, .permissions = &read_permission });
     defer std.testing.allocator.free(non_admin);
     try std.testing.expect(std.mem.indexOf(u8, non_admin, "Antfly Extension Management") == null);
 
-    const admin = try catalogJsonAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = true });
+    const admin = try catalogJsonAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = true, .permissions = &read_permission });
     defer std.testing.allocator.free(admin);
     try std.testing.expect(std.mem.indexOf(u8, admin, "Antfly Extension Management") != null);
 
-    const hidden_skill = try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = false }, "antfly-extension-management");
+    const hidden_skill = try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = false, .permissions = &read_permission }, "antfly-extension-management");
     try std.testing.expect(hidden_skill == null);
 
-    const visible_skill = (try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = true }, "antfly-extension-management")).?;
+    const visible_skill = (try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .is_admin = true, .permissions = &read_permission }, "antfly-extension-management")).?;
     defer std.testing.allocator.free(visible_skill);
     try std.testing.expect(std.mem.indexOf(u8, visible_skill, "# Antfly Extension Management") != null);
+}
+
+test "ARD catalog applies declared table permissions to built-in skills" {
+    const no_permission = try catalogJsonAlloc(std.testing.allocator, .{
+        .mode = .tenant,
+        .permissions = &.{},
+    });
+    defer std.testing.allocator.free(no_permission);
+    try std.testing.expect(std.mem.indexOf(u8, no_permission, "Antfly Query Builder") == null);
+    try std.testing.expect(std.mem.indexOf(u8, no_permission, "Antfly Retrieval") == null);
+    try std.testing.expect(std.mem.indexOf(u8, no_permission, "Antfly Schema Design") == null);
+
+    var read_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(std.testing.allocator, .table, "docs", .read),
+    };
+    defer read_permission[0].deinit(std.testing.allocator);
+    const read_catalog = try catalogJsonAlloc(std.testing.allocator, .{
+        .mode = .tenant,
+        .permissions = &read_permission,
+    });
+    defer std.testing.allocator.free(read_catalog);
+    try std.testing.expect(std.mem.indexOf(u8, read_catalog, "Antfly Query Builder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_catalog, "Antfly Retrieval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_catalog, "Antfly Schema Design") == null);
+
+    var admin_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(std.testing.allocator, .table, "docs", .admin),
+    };
+    defer admin_permission[0].deinit(std.testing.allocator);
+    const table_admin_catalog = try catalogJsonAlloc(std.testing.allocator, .{
+        .mode = .tenant,
+        .permissions = &admin_permission,
+    });
+    defer std.testing.allocator.free(table_admin_catalog);
+    try std.testing.expect(std.mem.indexOf(u8, table_admin_catalog, "Antfly Schema Design") != null);
+
+    const hidden_retrieval = try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .permissions = &.{} }, "antfly-retrieval");
+    try std.testing.expect(hidden_retrieval == null);
+    const visible_retrieval = (try skillMarkdownAlloc(std.testing.allocator, .{ .mode = .tenant, .permissions = &read_permission }, "antfly-retrieval")).?;
+    defer std.testing.allocator.free(visible_retrieval);
+    try std.testing.expect(std.mem.indexOf(u8, visible_retrieval, "# Antfly Retrieval") != null);
 }
 
 test "ARD extension package entries use trust provenance for artifact digests" {

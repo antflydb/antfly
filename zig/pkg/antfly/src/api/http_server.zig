@@ -2158,6 +2158,7 @@ pub const ApiHttpServer = struct {
             .publisher_domain = if (self.cfg.ard_publisher_domain.len > 0) self.cfg.ard_publisher_domain else "antfly.local",
             .display_name = if (self.cfg.ard_display_name.len > 0) self.cfg.ard_display_name else "Antfly",
             .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .profile = parseSimpleQueryParam(query, "profile"),
             .types = parseSimpleQueryParam(query, "types"),
             .include = parseSimpleQueryParam(query, "include"),
@@ -10372,6 +10373,9 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Extensions OpenAPI") == null);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Auth OpenAPI") == null);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Extension Management") == null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Retrieval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Query Builder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Schema Design") == null);
 
     var authorized_well_known = try server.handle(.{
         .method = .GET,
@@ -10398,6 +10402,15 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer hidden_admin_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_admin_skill.status);
 
+    var read_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/antfly-retrieval",
+        .headers = &trusted_principal_headers,
+    });
+    defer read_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), read_skill.status);
+    try std.testing.expect(std.mem.indexOf(u8, read_skill.body, "# Antfly Retrieval") != null);
+
     const admin_auth = try encodeBasicAuthorization(std.testing.allocator, "admin", "admin");
     defer std.testing.allocator.free(admin_auth);
     var admin_catalog = try server.handle(.{
@@ -10410,6 +10423,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Extensions OpenAPI") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Auth OpenAPI") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Extension Management") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Schema Design") != null);
 
     var admin_spec = try server.handle(.{
         .method = .GET,
