@@ -215,6 +215,96 @@ pub fn fillLayerSpecs(
     return output[0..layer_count];
 }
 
+pub fn layerSpecConfigFingerprint(config: gpt_mod.Config, configured_layer_count: usize, include_output_scale: bool) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    std.hash.autoHash(&hasher, config.family);
+    std.hash.autoHash(&hasher, configured_layer_count);
+    std.hash.autoHash(&hasher, include_output_scale);
+    std.hash.autoHash(&hasher, config.hidden_size);
+    std.hash.autoHash(&hasher, config.num_hidden_layers);
+    std.hash.autoHash(&hasher, config.num_attention_heads);
+    std.hash.autoHash(&hasher, config.num_key_value_heads);
+    std.hash.autoHash(&hasher, config.attention_head_dim);
+    std.hash.autoHash(&hasher, config.intermediate_size);
+    std.hash.autoHash(&hasher, config.sliding_window);
+    std.hash.autoHash(&hasher, config.num_kv_shared_layers);
+    std.hash.autoHash(&hasher, config.global_head_dim);
+    std.hash.autoHash(&hasher, config.num_global_key_value_heads);
+    std.hash.autoHash(&hasher, config.shared_layer_intermediate_size);
+    std.hash.autoHash(&hasher, config.ple_hidden_size);
+    std.hash.autoHash(&hasher, config.gemma4_mtp_assistant);
+    std.hash.autoHash(&hasher, config.mtp_kv_sliding_donor_layer);
+    std.hash.autoHash(&hasher, config.mtp_kv_full_donor_layer);
+    std.hash.autoHash(&hasher, @as(u32, @bitCast(config.rope_theta)));
+    std.hash.autoHash(&hasher, @as(u32, @bitCast(config.rope_local_theta)));
+    std.hash.autoHash(&hasher, @as(u32, @bitCast(config.rope_partial_factor)));
+    std.hash.autoHash(&hasher, config.rope_dim_override);
+    std.hash.autoHash(&hasher, config.sliding_window_pattern);
+    return hasher.final();
+}
+
+pub fn fillLayerSpecsCached(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_mod.Config,
+    configured_layer_count: usize,
+    fallback_output: []contracts.DecoderRuntimeLayerSpec,
+    include_output_scale: bool,
+    cache_opt: ?*gpt_arch.Gemma4LayerSpecCache,
+) ![]const contracts.DecoderRuntimeLayerSpec {
+    const layer_count = config.num_hidden_layers;
+    const cache = cache_opt orelse return fillLayerSpecs(
+        cb,
+        allocator,
+        config,
+        configured_layer_count,
+        fallback_output,
+        include_output_scale,
+    );
+    const config_fingerprint = layerSpecConfigFingerprint(config, configured_layer_count, include_output_scale);
+    if (cache.matches(configured_layer_count, layer_count, include_output_scale, config_fingerprint)) {
+        return cache.layers[0..layer_count];
+    }
+    cache.valid = false;
+    if (cache.layers.len < layer_count) {
+        if (cache.layers.len > 0) allocator.free(cache.layers);
+        cache.layers = try allocator.alloc(contracts.DecoderRuntimeLayerSpec, layer_count);
+    }
+    const layers = try fillLayerSpecs(
+        cb,
+        allocator,
+        config,
+        configured_layer_count,
+        cache.layers,
+        include_output_scale,
+    );
+    cache.configured_layer_count = configured_layer_count;
+    cache.num_hidden_layers = layer_count;
+    cache.include_output_scale = include_output_scale;
+    cache.config_fingerprint = config_fingerprint;
+    cache.valid = true;
+    return layers;
+}
+
+test "gemma4 layer spec fingerprint changes with spec shaping fields" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2304,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .intermediate_size = 9216,
+        .sliding_window = 1024,
+        .ple_hidden_size = 256,
+    };
+    const base = layerSpecConfigFingerprint(config, 35, true);
+    config.rope_partial_factor = 0.5;
+    try std.testing.expect(base != layerSpecConfigFingerprint(config, 35, true));
+    config.rope_partial_factor = 1.0;
+    config.num_kv_shared_layers = 5;
+    try std.testing.expect(base != layerSpecConfigFingerprint(config, 35, true));
+}
+
 test "gemma4 runtime slot layout is stable" {
     try std.testing.expectEqual(@as(usize, 7), linearSlot(1, .attn_q));
     try std.testing.expectEqual(@as(usize, 10), linearSlot(1, .attn_out_proj));

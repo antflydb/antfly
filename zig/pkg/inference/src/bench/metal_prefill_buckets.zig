@@ -30,6 +30,19 @@ fn defaultGemma4ModelPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf" });
 }
 
+fn defaultAntflyBin(allocator: std.mem.Allocator) ![]u8 {
+    if (try getEnvVarOwned(allocator, "ANTFLY_BIN")) |value| return value;
+    const candidates = [_][]const u8{
+        "./zig-out/bin/antfly-inference",
+        "./zig-out/bin/antfly",
+    };
+    for (candidates) |candidate| {
+        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), candidate, .{}) catch continue;
+        return try allocator.dupe(u8, candidate);
+    }
+    return try allocator.dupe(u8, candidates[0]);
+}
+
 fn makePrompt(allocator: std.mem.Allocator, words: usize) ![]u8 {
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(allocator, "hi");
@@ -56,20 +69,26 @@ fn runBucket(
 
     std.debug.print("\n== {s} target_prompt_tokens={d} prompt_words={d} decode_count={s} ==\n", .{ label, target_prompt_tokens, words, decode_count });
 
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, antfly_bin);
+    if (std.mem.eql(u8, std.fs.path.basename(antfly_bin), "antfly")) {
+        try argv.append(allocator, "inference");
+    }
+    try argv.appendSlice(allocator, &.{
+        "generate",
+        model,
+        prompt,
+        "--backend",
+        backend,
+        "--max-tokens",
+        decode_count,
+        "--print-token-ids",
+        "--print-timing",
+    });
+
     var child = try std.process.spawn(io, .{
-        .argv = &.{
-            antfly_bin,
-            "inference",
-            "generate",
-            model,
-            prompt,
-            "--backend",
-            backend,
-            "--max-tokens",
-            decode_count,
-            "--print-token-ids",
-            "--print-timing",
-        },
+        .argv = argv.items,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -87,7 +106,8 @@ pub fn main() !void {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    const antfly_bin = try envOrDefault(allocator, "ANTFLY_BIN", "./zig-out/bin/antfly");
+    const antfly_bin = try defaultAntflyBin(allocator);
+    defer allocator.free(antfly_bin);
     const model = try defaultGemma4ModelPath(allocator);
     defer allocator.free(model);
     const backend = try envOrDefault(allocator, "ANTFLY_INFERENCE_BENCH_BACKEND", "metal");

@@ -228,6 +228,13 @@ fn quantOp(format: quant_matmul.Format, rows: usize, in_dim: usize, out_dim: usi
     };
 }
 
+fn q8F16ActivationDispatchSupported(dispatch: QuantMatmulDispatchKind) bool {
+    return switch (dispatch) {
+        .mm, .mmv, .scalar => true,
+        .small_batch => false,
+    };
+}
+
 fn resolveFfnActivationDType(
     requested: ActivationDType,
     formats: LayerQuantFormats,
@@ -236,7 +243,8 @@ fn resolveFfnActivationDType(
 ) ActivationDType {
     if (requested != .f16) return .f32;
     if (formats.gate != .q8_0 or formats.up != .q8_0 or formats.down != .q8_0) return .f32;
-    if (gate_plan.dispatch != .mm or down_plan.dispatch != .mm) return .f32;
+    if (!q8F16ActivationDispatchSupported(gate_plan.dispatch) or
+        !q8F16ActivationDispatchSupported(down_plan.dispatch)) return .f32;
     return .f16;
 }
 
@@ -2707,6 +2715,69 @@ test "metal command planner preserves f16 activation dtypes when appending layer
             try std.testing.expectEqual(ActivationDType.f32, op.output_dtype);
         }
     }
+    try std.testing.expect(found_gate_up_command);
+    try std.testing.expect(found_down_command);
+}
+
+test "metal command planner can size single-row decode FFN intermediates as f16 resident scratch" {
+    var layer_plan = GatedLayerCommandLowerer{};
+
+    try layer_plan.build(.{
+        .shares_kv = false,
+        .has_attention_pre_norm = false,
+        .attention_pre_norm_slot = 0,
+        .q_linear_slot = 21,
+        .k_linear_slot = 22,
+        .v_linear_slot = 23,
+        .q_head_norm_slot = 31,
+        .k_head_norm_slot = 32,
+        .attention_layer_index = 4,
+        .value_norm = true,
+        .activation_dtype = .f16,
+        .attention_linear_slot = 24,
+        .attention_post_norm_slot = 12,
+        .ffn_pre_norm_slot = 13,
+        .gate_linear_slot = 25,
+        .up_linear_slot = 26,
+        .down_linear_slot = 27,
+        .ffn_post_norm_slot = 14,
+        .ple_gate_linear_slot = 28,
+        .ple_proj_linear_slot = 29,
+        .ple_post_norm_slot = 15,
+        .source = 11,
+        .region = 7,
+        .rows = 1,
+        .hidden_size = 2048,
+        .attention_input_size = 2048,
+        .kv_dim = 512,
+        .intermediate_size = 8192,
+        .ple_hidden_size = 1024,
+    });
+
+    const command = layer_plan.commandView();
+    var found_ffn_gated = false;
+    var found_gate_up_command = false;
+    var found_down_command = false;
+    for (command.scratch_slots) |scratch| {
+        if (scratch.slot == @intFromEnum(GatedLayerCommandLowerer.Resource.ffn_gated)) {
+            found_ffn_gated = true;
+            try std.testing.expectEqual(ActivationDType.f16, scratch.dtype);
+            try std.testing.expectEqual(@as(usize, 8192 * @sizeOf(u16)), scratch.bytes);
+        }
+    }
+    for (command.ops) |op| {
+        if (op.kind == .ffn_gate_up_activation) {
+            found_gate_up_command = true;
+            try std.testing.expectEqual(ActivationDType.f32, op.input_dtype);
+            try std.testing.expectEqual(ActivationDType.f16, op.output_dtype);
+        }
+        if (op.kind == .ffn_down_linear) {
+            found_down_command = true;
+            try std.testing.expectEqual(ActivationDType.f16, op.input_dtype);
+            try std.testing.expectEqual(ActivationDType.f32, op.output_dtype);
+        }
+    }
+    try std.testing.expect(found_ffn_gated);
     try std.testing.expect(found_gate_up_command);
     try std.testing.expect(found_down_command);
 }

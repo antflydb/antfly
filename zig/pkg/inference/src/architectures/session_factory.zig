@@ -165,6 +165,19 @@ fn gpuHostedQuantExecutionMode(direct_quant_enabled: bool) GpuHostedQuantExecuti
     return .device_native;
 }
 
+fn parseMetalGemmaKvDTypeOverride(value: []const u8) ?runtime.kv.pool.KvDType {
+    if (std.ascii.eqlIgnoreCase(value, "f16")) return .f16;
+    if (std.ascii.eqlIgnoreCase(value, "f32")) return .f32;
+    return null;
+}
+
+fn metalGemmaKvDTypeOverride() ?runtime.kv.pool.KvDType {
+    const value = platform.env.getenv("TERMITE_METAL_GEMMA_KV_DTYPE") orelse
+        platform.env.getenv("ANTFLY_INFERENCE_METAL_GEMMA_KV_DTYPE") orelse
+        return null;
+    return parseMetalGemmaKvDTypeOverride(value);
+}
+
 fn gpuHostedEagerDenseMaxBytes() u64 {
     const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
@@ -4256,17 +4269,34 @@ pub fn getWeightExportSource(session: Session) ?export_source_mod.Source {
     };
 }
 
-pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
+pub fn recommendedKvDTypeForGptConfig(config: gpt_mod.Config, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
         .cuda => .f16,
-        .metal => blk: {
-            if (getGptConfig(session)) |cfg| {
-                if (cfg.family == .gemma) break :blk .f32;
-            }
-            break :blk .f16;
-        },
+        .metal => if (config.family == .gemma) metalGemmaKvDTypeOverride() orelse .f16 else .f16,
     };
+}
+
+pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
+    if (getGptConfig(session)) |cfg| return recommendedKvDTypeForGptConfig(cfg, backend_kind);
+    return switch (backend_kind) {
+        .native => .f32,
+        .cuda, .metal => .f16,
+    };
+}
+
+test "parseMetalGemmaKvDTypeOverride only accepts staged Gemma Metal dtypes" {
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, parseMetalGemmaKvDTypeOverride("f16").?);
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, parseMetalGemmaKvDTypeOverride("F32").?);
+    try std.testing.expect(parseMetalGemmaKvDTypeOverride("int8") == null);
+}
+
+test "recommendedKvDTypeForGptConfig keeps backend defaults without a session" {
+    const gemma = gpt_mod.Config{ .family = .gemma };
+    const llama = gpt_mod.Config{ .family = .llama };
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .native));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(gemma, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(llama, .metal));
 }
 
 pub fn getClipConfig(session: Session) ?clip_mod.Config {

@@ -354,6 +354,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> attention_f32_pipeline;
     id<MTLComputePipelineState> attention_f32_prefill_pipeline;
     id<MTLComputePipelineState> attention_paged_pipeline;
+    id<MTLComputePipelineState> attention_paged_1x_pipeline;
     id<MTLComputePipelineState> compressed_attention_store_local_pipeline;
     id<MTLComputePipelineState> compressed_attention_store_component_pipeline;
     id<MTLComputePipelineState> compressed_attention_update_component_pipeline;
@@ -4103,6 +4104,14 @@ static NSString *termite_metal_shader_source(void) {
            "    float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;\n"
            "    for (uint d = 0u; d < p.head_dim; ++d) output[out_base + d] *= inv_sum;\n"
            "}\n"
+           "kernel void termite_paged_attention_kv_1x(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    uint h = tg.y; if (tg.x != 0u || h >= p.num_heads || p.q_len != 1u || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n"
+           "    const uint NT = 256u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_base = h * p.head_dim; uint out_base = h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset; threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n"
+           "    float local_best = -3.402823466e+38f;\n"
+           "    for (uint ki = 0u; ki < p.kv_tokens; ++ki) { uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; uint physical_token = allowed ? termite_attention_page_token(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) { const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = tid; d < p.head_dim; d += NT) acc += q[q_base + d] * float(k_half[kv_head_base + d]); } partials[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } float score = allowed ? partials[0] * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (tid == 0u) scores[ki] = score; if (score > local_best) local_best = score; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    if (tid == 0u) { float sum = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) { float e = exp(scores[ki] - local_best); if (isfinite(e)) sum += e; } partials[0] = sum > 0.0f ? 1.0f / sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup); const float inv_sum = partials[0];\n"
+           "    for (uint d = tid; d < p.head_dim; d += NT) { float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) { float e = exp(scores[ki] - local_best) * inv_sum; if (!isfinite(e) || e == 0.0f) continue; uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; if (!allowed) continue; uint physical_token = termite_attention_page_token(block_table, p, ki); if (physical_token == 0xffffffffu) continue; value += e * float(v_half[physical_token * p.v_row_stride + kv_head_base + d]); } output[out_base + d] = value; }\n"
+           "}\n"
            "kernel void termite_polar4_attention_span(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_span_params &p [[buffer(4)]], uint h [[thread_position_in_grid]]) {\n"
            "    if (h >= p.num_heads) return;\n"
            "    uint heads_per_group = p.num_heads / p.num_kv_heads;\n"
@@ -4474,6 +4483,11 @@ static bool termite_metal_planned_compute_barriers_enabled(termite_metal_decode_
     if (disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0) return false;
     if (runtime != NULL && runtime->planned_compute_barrier_suppression_depth != 0) return false;
     return true;
+}
+
+static bool termite_metal_paged_attention_1x_enabled(void) {
+    const char *disabled = getenv("TERMITE_METAL_DISABLE_PAGED_ATTENTION_1X");
+    return disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0;
 }
 
 static void termite_metal_decode_runtime_reset_planned_compute_ranges(termite_metal_decode_runtime *runtime) {
@@ -8488,7 +8502,14 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         return failure_code;
     }
 
-    [encoder setComputePipelineState:runtime->attention_paged_pipeline];
+    const bool use_decode_1x = q_len == 1u &&
+        format == 3u &&
+        sinks == NULL &&
+        softcap == 0.0f &&
+        kv_tokens <= 4096u &&
+        termite_metal_paged_attention_1x_enabled() &&
+        runtime->attention_paged_1x_pipeline != nil;
+    [encoder setComputePipelineState:use_decode_1x ? runtime->attention_paged_1x_pipeline : runtime->attention_paged_pipeline];
     [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
     [encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:0 atIndex:2];
@@ -8510,8 +8531,13 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     }
     [encoder setBuffer:output_buffer offset:output_offset atIndex:5];
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
-    const size_t total = q_len * num_heads;
-    [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->attention_paged_pipeline, total), 1, 1)];
+    if (use_decode_1x) {
+        [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_tokens + 256u) * sizeof(float)) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(1, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    } else {
+        const size_t total = q_len * num_heads;
+        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->attention_paged_pipeline, total), 1, 1)];
+    }
     (void)block_table_buffer;
     (void)sinks_buffer;
     return 0;
@@ -10807,6 +10833,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->attention_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32");
         runtime->attention_f32_prefill_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32_prefill_tiled");
         runtime->attention_paged_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv");
+        runtime->attention_paged_1x_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_1x");
         runtime->compressed_attention_store_local_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_store_local");
         runtime->compressed_attention_store_component_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_store_component");
         runtime->compressed_attention_update_component_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_update_component");
@@ -11207,6 +11234,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_f32_pipeline = nil;
     runtime->attention_f32_prefill_pipeline = nil;
     runtime->attention_paged_pipeline = nil;
+    runtime->attention_paged_1x_pipeline = nil;
     runtime->paged_f32_kv_seed_pipeline = nil;
     runtime->paged_f16_kv_seed_pipeline = nil;
     runtime->paged_f32_v_seed_pipeline = nil;

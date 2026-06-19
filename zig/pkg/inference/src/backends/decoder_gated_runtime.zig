@@ -117,6 +117,7 @@ pub const TimingStats = struct {
     prefill_output_scale_ops: u64 = 0,
     prefill_tail_logits_ops: u64 = 0,
     greedy_calls: u64 = 0,
+    greedy_layer_spec_nanos: u128 = 0,
     greedy_embed_nanos: u128 = 0,
     greedy_block_nanos: u128 = 0,
     greedy_block_attention_nanos: u128 = 0,
@@ -1301,14 +1302,20 @@ fn tryBackendOwnedGreedyToken(
     if (gpt_config.num_hidden_layers > 256) return null;
 
     var layers_buf: [256]contracts.DecoderRuntimeLayerSpec = undefined;
-    const layers = try gemma4_runtime.fillLayerSpecs(
+    const layer_spec_started_at = monotonicNowNs();
+    const layers = try gemma4_runtime.fillLayerSpecsCached(
         cb,
         allocator,
         gpt_config,
         configured_layer_count,
         &layers_buf,
         true,
+        decode_context.gemma4_layer_spec_cache,
     );
+    const layer_spec_finished_at = monotonicNowNs();
+    if (layer_spec_finished_at > layer_spec_started_at) {
+        timing_stats.greedy_layer_spec_nanos += layer_spec_finished_at - layer_spec_started_at;
+    }
     const layer_count = layers.len;
 
     var attention = gpt_arch.attentionContextFromDecode(decode_context);
