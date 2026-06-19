@@ -392,6 +392,13 @@ fn adaptiveFlatCentroidBlockProbeCount(sorted_block_probes: []const FlatCentroid
     return count;
 }
 
+fn flatCentroidBlockProbeCandidateCount(fixed: bool, block_count: usize, base_count: usize) usize {
+    if (block_count == 0) return 0;
+    const bounded_base = @min(@max(base_count, @as(usize, 1)), block_count);
+    if (fixed) return bounded_base;
+    return @min(block_count, @max(bounded_base, bounded_base *| 2));
+}
+
 fn publishedRootNodeSnapshot(self: anytype) u64 {
     const Index = comptime @TypeOf(self.*);
     if (comptime @hasDecl(Index, "publishedRootNode")) return self.publishedRootNode();
@@ -978,23 +985,26 @@ pub fn selectFlatRabitqPostings(
                 profile.centroid_directory_block_centroids_scored += @intCast(directory.blocks.len);
             }
 
-            var block_probes_stack: [flat_centroid_query_probe_stack_capacity]FlatCentroidProbe = undefined;
-            const use_block_probes_stack = directory.blocks.len <= block_probes_stack.len;
-            var block_probes = if (use_block_probes_stack)
-                block_probes_stack[0..directory.blocks.len]
+            const block_probe_candidate_count = flatCentroidBlockProbeCandidateCount(fixed_block_probe_count, directory.blocks.len, block_probe_limit);
+            var block_probe_candidates_stack: [flat_centroid_query_probe_stack_capacity]FlatCentroidProbe = undefined;
+            const use_block_probe_candidates_stack = block_probe_candidate_count <= block_probe_candidates_stack.len;
+            const block_probe_candidates = if (use_block_probe_candidates_stack)
+                block_probe_candidates_stack[0..block_probe_candidate_count]
             else
-                try self.alloc.alloc(FlatCentroidProbe, directory.blocks.len);
-            defer if (!use_block_probes_stack) self.alloc.free(block_probes);
+                try self.alloc.alloc(FlatCentroidProbe, block_probe_candidate_count);
+            defer if (!use_block_probe_candidates_stack) self.alloc.free(block_probe_candidates);
+            var block_probe_collector = FlatProbeCollector.init(block_probe_candidates);
             for (0..directory.blocks.len) |block_index| {
-                block_probes[block_index] = .{
+                block_probe_collector.insert(.{
                     .posting_id = @intCast(block_index),
                     .distance = distances[block_index],
                     .error_bound = error_bounds[block_index],
-                };
+                });
             }
+            const block_probes = block_probe_collector.items();
             std.mem.sort(FlatCentroidProbe, block_probes, {}, centroidBlockProbeLess);
             const selected_block_count = if (fixed_block_probe_count)
-                block_probe_limit
+                block_probes.len
             else
                 adaptiveFlatCentroidBlockProbeCount(block_probes, block_probe_limit);
             for (block_probes[0..selected_block_count], 0..) |block_probe, i| {
@@ -2176,6 +2186,14 @@ test "adaptive flat centroid block probing caps ambiguous expansion" {
     };
 
     try std.testing.expectEqual(@as(usize, 4), adaptiveFlatCentroidBlockProbeCount(&probes, 2));
+}
+
+test "flat centroid block probe candidate buffer follows adaptive expansion cap" {
+    try std.testing.expectEqual(@as(usize, 0), flatCentroidBlockProbeCandidateCount(false, 0, 7));
+    try std.testing.expectEqual(@as(usize, 7), flatCentroidBlockProbeCandidateCount(true, 47, 7));
+    try std.testing.expectEqual(@as(usize, 14), flatCentroidBlockProbeCandidateCount(false, 47, 7));
+    try std.testing.expectEqual(@as(usize, 47), flatCentroidBlockProbeCandidateCount(false, 47, 32));
+    try std.testing.expectEqual(@as(usize, 47), flatCentroidBlockProbeCandidateCount(true, 47, 94));
 }
 
 test "centroid block probe radius expands l2 squared ambiguity" {
