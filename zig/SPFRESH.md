@@ -115,7 +115,9 @@ Current status:
   the all-live append path for every delta value in fully newer segments. Large
   mixed-generation encoded segment delta values now pre-count live records
   before appending, so replay reserves exact output capacity once while small
-  mixed tails stay on the cheaper single-pass path. Segment catalog delta
+  mixed tails stay on the cheaper single-pass path. Catalog delta-value reads
+  after a base generation now also filter mixed segments at value granularity
+  instead of returning stale values from a partially live segment. Segment catalog delta
   collection now reserves from each posting's exact index range before appending
   values, avoiding repeated `DeltaValue` array growth when a posting has many
   sealed delta values. Segment compaction also pre-counts each sorted posting

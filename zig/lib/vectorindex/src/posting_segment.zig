@@ -744,9 +744,12 @@ pub const Catalog = struct {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
             if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= base_generation) continue;
             var reader = try Reader.init(segment.data);
-            try deltas.ensureUnusedCapacity(alloc, try reader.deltaCount(posting_id));
+            const all_segment_records_after_generation = segmentDeltaTailFullyAfterGeneration(segment.meta, base_generation);
+            if (all_segment_records_after_generation) try deltas.ensureUnusedCapacity(alloc, try reader.deltaCount(posting_id));
             var iter = reader.deltas(posting_id);
             while (try iter.next()) |delta| {
+                if (!all_segment_records_after_generation and posting.PostingFormat.deltaSequenceGeneration(delta.sequence) <= base_generation) continue;
+                if (!all_segment_records_after_generation) try deltas.ensureUnusedCapacity(alloc, 1);
                 deltas.appendAssumeCapacity(delta);
             }
         }
@@ -5896,6 +5899,38 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     try std.testing.expectEqualSlices(u8, delta_10, later_deltas[0].value);
 }
 
+pub fn testCatalogDeltasAfterGenerationFiltersMixedSegmentValues() !void {
+    const alloc = std.testing.allocator;
+    const stale_sequence = (@as(u64, 8) << 32) | 1;
+    const live_sequence = (@as(u64, 10) << 32) | 1;
+    const stale_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = stale_sequence, .op = .tombstone, .vector_id = 20 },
+    });
+    defer alloc.free(stale_delta);
+    const live_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = live_sequence, .op = .insert, .vector_id = 40 },
+    });
+    defer alloc.free(live_delta);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendDelta(7, stale_sequence, stale_delta);
+    try writer.appendDelta(7, live_sequence, live_delta);
+    const segment = try writer.build();
+    defer alloc.free(segment);
+
+    const reader = try Reader.init(segment);
+    const meta = try reader.metadata(1);
+    const blobs = [_]SegmentBlob{.{ .meta = meta, .data = segment }};
+    const catalog = Catalog{ .segments = blobs[0..] };
+
+    const later_deltas = try catalog.collectDeltasAfterGeneration(alloc, 7, 8);
+    defer alloc.free(later_deltas);
+    try std.testing.expectEqual(@as(usize, 1), later_deltas.len);
+    try std.testing.expectEqual(live_sequence, later_deltas[0].sequence);
+    try std.testing.expectEqualSlices(u8, live_delta, later_deltas[0].value);
+}
+
 pub fn testSnapshotLoadsTypedPostingValues() !void {
     const alloc = std.testing.allocator;
     const base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -8506,6 +8541,10 @@ test "posting segment validates footer and version" {
 
 test "posting segment catalog looks up newest point records and merged deltas" {
     try testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
+}
+
+test "posting segment catalog filters mixed delta values after generation" {
+    try testCatalogDeltasAfterGenerationFiltersMixedSegmentValues();
 }
 
 test "posting segment snapshot loads typed posting values" {
