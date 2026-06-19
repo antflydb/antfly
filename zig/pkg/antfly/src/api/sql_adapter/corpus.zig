@@ -4090,8 +4090,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_update_joined_source_row_lock_target: bool = false,
     unsupported_merge_mutation_cte: bool = false,
     update_identity_rewrite: bool = false,
-    unsupported_update_non_unique_point_selector: bool = false,
-    unsupported_delete_non_unique_point_selector: bool = false,
     unsupported_delete_multi_output_subquery_selector: bool = false,
     unsupported_update_joined_multi_output_subquery_selector: bool = false,
     unsupported_delete_joined_multi_output_subquery_selector: bool = false,
@@ -5230,14 +5228,11 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
-        } else if (entry.family == .unsupported_update) {
-            self.unsupported_update_non_unique_point_selector = self.unsupported_update_non_unique_point_selector or std.mem.eql(u8, entry.classification_reason, "non_unique_point_selector");
         } else if (entry.family == .unsupported_update_source) {
             self.unsupported_update_source_row_lock_target = self.unsupported_update_source_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
         } else if (entry.family == .unsupported_delete) {
-            self.unsupported_delete_non_unique_point_selector = self.unsupported_delete_non_unique_point_selector or std.mem.eql(u8, entry.classification_reason, "non_unique_point_selector");
             self.unsupported_delete_multi_output_subquery_selector = self.unsupported_delete_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
         } else if (entry.family == .unsupported_update_joined_source) {
             self.unsupported_update_joined_multi_output_subquery_selector = self.unsupported_update_joined_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_update_selector");
@@ -6068,7 +6063,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl);
         try std.testing.expect(self.unsupported_write);
         try std.testing.expect(self.unsupported_insert);
-        try std.testing.expect(self.unsupported_update);
         try std.testing.expect(self.unsupported_update_source);
         try std.testing.expect(self.unsupported_delete);
         try std.testing.expect(self.unsupported_update_joined_source);
@@ -6204,8 +6198,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_update_joined_source_row_lock_target);
         try std.testing.expect(self.unsupported_merge_mutation_cte);
         try std.testing.expect(self.update_identity_rewrite);
-        try std.testing.expect(self.unsupported_update_non_unique_point_selector);
-        try std.testing.expect(self.unsupported_delete_non_unique_point_selector);
         try std.testing.expect(self.unsupported_delete_multi_output_subquery_selector);
         try std.testing.expect(self.unsupported_update_joined_multi_output_subquery_selector);
         try std.testing.expect(self.unsupported_delete_joined_multi_output_subquery_selector);

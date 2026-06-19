@@ -5205,13 +5205,6 @@
       "sql": "UPDATE usage_records SET status = 'archived' RETURNING id"
     },
     {
-      "name": "unsupported non-unique point update selector",
-      "family": "unsupported_update",
-      "plan": "unsupported:update:requires=non_unique_point_selector",
-      "classification_reason": "non_unique_point_selector",
-      "sql": "UPDATE usage_records SET status = 'archived' WHERE organization_id = 'o1' RETURNING id"
-    },
-    {
       "name": "claimed update joined source routes to joined mutation source",
       "family": "update_joined_source",
       "summary": {
@@ -5626,13 +5619,6 @@
         "row_claim_skip_locked": false
       },
       "plan": "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=1:returning_expr=0:returning_all=0",
-      "sql": "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id"
-    },
-    {
-      "name": "unsupported non-unique point delete selector",
-      "family": "unsupported_delete",
-      "plan": "unsupported:delete:requires=non_unique_point_selector",
-      "classification_reason": "non_unique_point_selector",
       "sql": "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id"
     },
     {
