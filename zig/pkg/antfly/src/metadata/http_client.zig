@@ -23,6 +23,28 @@ const raft_routes = @import("../raft/transport/routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const routes = @import("http_routes.zig");
 
+fn isUriUnreserved(ch: u8) bool {
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '-' or ch == '.' or ch == '_' or ch == '~';
+}
+
+fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (value) |ch| {
+        if (isUriUnreserved(ch)) {
+            try out.append(alloc, ch);
+        } else {
+            var buf: [3]u8 = undefined;
+            const encoded = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{ch});
+            try out.appendSlice(alloc, encoded);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 pub const ActiveTransitionsResponse = struct {
     split: []metadata_transition_state.SplitTransitionRecord,
     merge: []metadata_transition_state.MergeTransitionRecord,
@@ -316,11 +338,15 @@ pub const MetadataHttpClient = struct {
         enrichment_name: []const u8,
         enrichment_json: []const u8,
     ) !void {
+        const escaped_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(escaped_table_name);
+        const escaped_enrichment_name = try percentEncodePathComponent(self.alloc, enrichment_name);
+        defer self.alloc.free(escaped_enrichment_name);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
             routes.Routes.internal_tables_prefix,
-            table_name,
+            escaped_table_name,
             routes.Routes.internal_table_enrichments_infix,
-            enrichment_name,
+            escaped_enrichment_name,
         });
         defer self.alloc.free(path);
         try self.requestWithBody(base_uri, .PUT, path, enrichment_json, error.InvalidExtensionEnrichment, error.TableNotFound, null);
@@ -332,11 +358,15 @@ pub const MetadataHttpClient = struct {
         table_name: []const u8,
         enrichment_name: []const u8,
     ) !void {
+        const escaped_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(escaped_table_name);
+        const escaped_enrichment_name = try percentEncodePathComponent(self.alloc, enrichment_name);
+        defer self.alloc.free(escaped_enrichment_name);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
             routes.Routes.internal_tables_prefix,
-            table_name,
+            escaped_table_name,
             routes.Routes.internal_table_enrichments_infix,
-            enrichment_name,
+            escaped_enrichment_name,
         });
         defer self.alloc.free(path);
         try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, error.InvalidExtensionEnrichment);
@@ -598,6 +628,44 @@ test "metadata http client preserves split merge doc identity conflicts" {
     try std.testing.expectEqual(@as(usize, 1), executor.merge_calls);
 }
 
+test "metadata http client percent-encodes artifact enrichment path components" {
+    const EncodingExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            switch (self.calls) {
+                1 => {
+                    try std.testing.expectEqual(http_common.Method.PUT, req.method);
+                    try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
+                    try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", req.body);
+                    return .{ .status = 202 };
+                },
+                2 => {
+                    try std.testing.expectEqual(http_common.Method.DELETE, req.method);
+                    try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
+                    return .{ .status = 204 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+
+    var executor = EncodingExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try client.putArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2", "{\"kind\":\"chunk\"}");
+    try client.deleteArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2");
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
 test "metadata http client round-trips server endpoints" {
     const metadata_http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
@@ -612,6 +680,8 @@ test "metadata http client round-trips server endpoints" {
         update_schema_count: usize = 0,
         create_index_count: usize = 0,
         drop_index_count: usize = 0,
+        put_artifact_enrichment_count: usize = 0,
+        delete_artifact_enrichment_count: usize = 0,
         upsert_node_count: usize = 0,
         upsert_store_count: usize = 0,
         report_store_status_count: usize = 0,
@@ -691,6 +761,8 @@ test "metadata http client round-trips server endpoints" {
                     .update_schema = updateSchema,
                     .create_index = createIndex,
                     .drop_index = dropIndex,
+                    .put_artifact_enrichment = putArtifactEnrichment,
+                    .delete_artifact_enrichment = deleteArtifactEnrichment,
                     .upsert_node = upsertNode,
                     .upsert_store = upsertStore,
                     .report_store_status = reportStoreStatus,
@@ -777,6 +849,21 @@ test "metadata http client round-trips server endpoints" {
             self.drop_index_count += 1;
         }
 
+        fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
+            try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", enrichment_json);
+            self.put_artifact_enrichment_count += 1;
+        }
+
+        fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
+            self.delete_artifact_enrichment_count += 1;
+        }
+
         fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
             defer metadata_table_manager.freeNode(alloc, record);
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -860,6 +947,8 @@ test "metadata http client round-trips server endpoints" {
     try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
     try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");
     try client.dropIndex(base_uri, "docs", "embed_idx");
+    try client.putArtifactEnrichment(base_uri, "docs", "document chunks/v2", "{\"kind\":\"chunk\"}");
+    try client.deleteArtifactEnrichment(base_uri, "docs", "document chunks/v2");
     try client.dropTable(base_uri, "docs");
     try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
     try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
@@ -870,6 +959,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), source.update_schema_count);
     try std.testing.expectEqual(@as(usize, 1), source.create_index_count);
     try std.testing.expectEqual(@as(usize, 1), source.drop_index_count);
+    try std.testing.expectEqual(@as(usize, 1), source.put_artifact_enrichment_count);
+    try std.testing.expectEqual(@as(usize, 1), source.delete_artifact_enrichment_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
     try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);

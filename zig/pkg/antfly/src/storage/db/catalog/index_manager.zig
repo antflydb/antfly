@@ -6623,6 +6623,9 @@ pub const IndexManager = struct {
                         if (std.mem.eql(u8, source.artifact_name, name)) return true;
                     }
                 }
+                for (self.enrichments.items) |entry| {
+                    if (entry.kind == .chunk and std.mem.eql(u8, entry.source_artifact_name, name)) return true;
+                }
             },
         }
         return false;

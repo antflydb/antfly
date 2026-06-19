@@ -25,6 +25,7 @@ const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const backups_api = @import("../api/backups.zig");
+const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
 const foreign_mod = @import("../foreign/mod.zig");
@@ -1317,7 +1318,17 @@ pub const MetadataHttpServer = struct {
                     return try textResponse(self.alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
-                    self.source.putArtifactEnrichment(self.alloc, table_enrichment.table_name, table_enrichment.enrichment_name, req.body) catch |err| switch (err) {
+                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.table_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid table name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(table_name);
+                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid artifact enrichment name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(enrichment_name);
+                    self.source.putArtifactEnrichment(self.alloc, table_name, enrichment_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
@@ -1362,7 +1373,17 @@ pub const MetadataHttpServer = struct {
                     return try textResponse(self.alloc, 204, "");
                 }
                 if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
-                    self.source.deleteArtifactEnrichment(self.alloc, table_enrichment.table_name, table_enrichment.enrichment_name) catch |err| switch (err) {
+                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.table_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid table name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(table_name);
+                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid artifact enrichment name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(enrichment_name);
+                    self.source.deleteArtifactEnrichment(self.alloc, table_name, enrichment_name) catch |err| switch (err) {
                         error.TableNotFound, error.EnrichmentNotFound => return try textResponse(self.alloc, 404, "artifact enrichment not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
