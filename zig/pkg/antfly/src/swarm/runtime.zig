@@ -47,6 +47,10 @@ const CliConfig = struct {
     tick_ms: ?u64 = null,
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
+    ard_base_url: ?[]const u8 = null,
+    ard_publisher_domain: ?[]const u8 = null,
+    ard_display_name: ?[]const u8 = null,
+    ard_public_catalog_enabled: bool = false,
     inference_models_dir: ?[]const u8 = null,
     inference_ml_dir: ?[]const u8 = null,
     inference_host_budget_mb: usize = 0,
@@ -952,6 +956,10 @@ pub fn runFromIterator(
         },
         .api_server_cfg = .{
             .auth_enabled = auth_enabled,
+            .ard_base_url = cli.ard_base_url,
+            .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
+            .ard_display_name = cli.ard_display_name orelse "Antfly",
+            .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
             .swarm_mode = true,
             .secret_store = &secret_store,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
@@ -1941,6 +1949,27 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.auth_enabled = parseBoolFlag(arg["--auth=".len..]) orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ard-publisher-domain")) {
+            cfg.ard_publisher_domain = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-base-url")) {
+            cfg.ard_base_url = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-display-name")) {
+            cfg.ard_display_name = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-public-catalog")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.ard_public_catalog_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--ard-public-catalog=")) {
+            cfg.ard_public_catalog_enabled = parseBoolFlag(arg["--ard-public-catalog=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--models-dir")) {
             cfg.inference_models_dir = args.next() orelse return error.InvalidArguments;
             continue;
@@ -2239,6 +2268,10 @@ fn printUsage() void {
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
+        \\  --ard-base-url <url>                  Absolute public base URL for ARD catalog artifact links
+        \\  --ard-publisher-domain <name>         ARD did:web publisher domain (default: antfly.local)
+        \\  --ard-display-name <name>             ARD catalog host display name (default: Antfly)
+        \\  --ard-public-catalog <bool>           Publish anonymous /.well-known ARD bootstrap when auth is enabled
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
         \\  --models-dir <path>                   Embedded AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <path>                       Embedded Traditional ML directory (default: ~/.antfly/inference/ml)
@@ -2514,6 +2547,25 @@ test "parse cli accepts extension package store path" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const cfg = try parseCli(&iter);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "parse cli accepts ARD identity flags" {
+    var argv = [_][*:0]const u8{
+        "--ard-publisher-domain",
+        "tenant.example.com",
+        "--ard-base-url",
+        "https://tenant.example.com",
+        "--ard-display-name",
+        "Tenant Antfly",
+        "--ard-public-catalog",
+        "true",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const cfg = try parseCli(&iter);
+    try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
+    try std.testing.expectEqualStrings("tenant.example.com", cfg.ard_publisher_domain.?);
+    try std.testing.expectEqualStrings("Tenant Antfly", cfg.ard_display_name.?);
+    try std.testing.expect(cfg.ard_public_catalog_enabled);
 }
 
 test "parse cli accepts canonical host port and models dir flags" {
