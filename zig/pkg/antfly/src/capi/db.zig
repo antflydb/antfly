@@ -5815,7 +5815,6 @@ test "capi lite opens exports imports checks and vacuums aflite" {
 
     var dst_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(dst_path, &dst_handle));
-    defer antfly_db_close(dst_handle);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import_backup(dst_handle, .{
         .ptr = backup.ptr,
         .len = backup.len,
@@ -5828,6 +5827,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, &lookup));
     defer antfly_db_buffer_free(lookup.ptr, lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, lookup.ptr.?[0..lookup.len], "\"second\"") != null);
+
+    antfly_db_close(dst_handle);
+    dst_handle = null;
 
     var readonly_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(dst_path, &readonly_handle));

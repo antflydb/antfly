@@ -25,18 +25,25 @@ pub const CheckReport = native.CheckReport;
 pub const VacuumReport = lsm_backend.AfliteContainerStorage.VacuumReport;
 
 pub const EngineKind = enum {
-    /// Temporary bridge implementation. The public Lite API should depend on
-    /// this module, not directly on the container, so the native backend can
-    /// replace it without changing callers.
+    /// Compatibility bridge for pre-native `.aflite` files and explicit
+    /// storage-engine development.
     bridge_lsm_container,
 
     /// Native v1 `.aflite` file engine. It owns real Lite pages and checkpoint
-    /// roots, but does not yet expose the full Antfly DB storage interface.
+    /// roots and is the public default for newly-created Lite files.
+    native_single_file,
+};
+
+pub const EngineSelection = enum {
+    /// Create new files as native v1 and preserve existing bridge-container
+    /// files by detecting the on-disk magic.
+    auto,
+    bridge_lsm_container,
     native_single_file,
 };
 
 pub const OpenOptions = struct {
-    engine: EngineKind = .bridge_lsm_container,
+    engine: EngineSelection = .auto,
     read_only: bool = false,
 };
 
@@ -53,7 +60,13 @@ pub const Handle = struct {
     native_runtime_store: ?*backend_erased.Store = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
-        return switch (opts.engine) {
+        const engine = switch (opts.engine) {
+            .auto => try detectEngine(allocator, path) orelse .native_single_file,
+            .bridge_lsm_container => EngineKind.bridge_lsm_container,
+            .native_single_file => EngineKind.native_single_file,
+        };
+
+        return switch (engine) {
             .bridge_lsm_container => try openBridgeLsmContainer(allocator, path, opts),
             .native_single_file => try openNativeSingleFile(allocator, path, opts),
         };
@@ -113,7 +126,7 @@ pub const Handle = struct {
     pub fn vacuum(self: *Handle) !VacuumReport {
         return switch (self.engine) {
             .bridge_lsm_container => try self.bridge_storage.?.vacuum(),
-            .native_single_file => error.NativeVacuumNotImplemented,
+            .native_single_file => try nativeVacuumReport(self),
         };
     }
 };
@@ -170,6 +183,27 @@ fn toCheckReport(report: lsm_backend.AfliteContainerStorage.CheckReport) CheckRe
     };
 }
 
+fn detectEngine(allocator: Allocator, path: []const u8) !?EngineKind {
+    if (hasNativeMagic(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    }) return .native_single_file;
+    return .bridge_lsm_container;
+}
+
+fn nativeVacuumReport(handle: *Handle) !VacuumReport {
+    if (handle.native_docstore.?.file.read_only) return error.ReadOnly;
+
+    const report = try handle.native_docstore.?.file.check();
+    return .{
+        .before_size = report.file_size,
+        .after_size = report.file_size,
+        .reclaimed_bytes = 0,
+        .live_file_count = report.live_file_count,
+        .live_bytes = report.live_bytes,
+    };
+}
+
 fn hasNativeMagic(allocator: Allocator, path: []const u8) !bool {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
@@ -209,7 +243,52 @@ test "lite backend native engine creates and checks aflite file" {
     try handle.configureDbOpenOptions(&db_opts);
     try std.testing.expect(db_opts.primary_runtime_store != null);
     try std.testing.expect(db_opts.primary_backend == .mem);
-    try std.testing.expectError(error.NativeVacuumNotImplemented, handle.vacuum());
+
+    const vacuumed = try handle.vacuum();
+    try std.testing.expectEqual(report.file_size, vacuumed.before_size);
+    try std.testing.expectEqual(report.file_size, vacuumed.after_size);
+    try std.testing.expectEqual(@as(u64, 0), vacuumed.reclaimed_bytes);
+}
+
+test "lite backend auto creates new aflite files with native engine" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "auto-native.aflite");
+    defer allocator.free(path);
+
+    var handle = try Handle.open(allocator, path, .{});
+    defer handle.deinit();
+
+    try std.testing.expectEqual(EngineKind.native_single_file, handle.engine);
+    try handle.native_docstore.?.file.putDocument("doc:auto", "native");
+
+    const report = try handle.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.record_count);
+}
+
+test "lite backend auto preserves existing bridge aflite files" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "auto-bridge.aflite");
+    defer allocator.free(path);
+
+    {
+        var handle = try Handle.open(allocator, path, .{ .engine = .bridge_lsm_container });
+        defer handle.deinit();
+        try std.testing.expectEqual(EngineKind.bridge_lsm_container, handle.engine);
+    }
+
+    var reopened = try Handle.open(allocator, path, .{});
+    defer reopened.deinit();
+
+    try std.testing.expectEqual(EngineKind.bridge_lsm_container, reopened.engine);
 }
 
 test "lite backend native engine can back db primary documents" {
