@@ -703,12 +703,7 @@ pub const RuntimeDirectoryStore = struct {
     }
 
     pub fn manifestBytesAlloc(self: RuntimeDirectoryStore, alloc: Allocator) ![]u8 {
-        const entries = try manifestEntryViewAlloc(alloc, self.lazy.manifest.segments);
-        defer alloc.free(entries);
-        return try encodeManifestAlloc(alloc, .{
-            .next_segment_id = self.lazy.manifest.next_segment_id,
-            .segments = entries,
-        });
+        return try encodeManifestEntriesAlloc(alloc, self.lazy.manifest.next_segment_id, self.lazy.manifest.segments);
     }
 };
 
@@ -1469,17 +1464,21 @@ pub const Snapshot = struct {
 };
 
 pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
-    if (manifest.segments.len > std.math.maxInt(u32)) return error.PostingSegmentManifestTooLarge;
-    try validateManifest(manifest);
+    return try encodeManifestEntriesAlloc(alloc, manifest.next_segment_id, manifest.segments);
+}
+
+fn encodeManifestEntriesAlloc(alloc: Allocator, next_segment_id: u64, entries: anytype) ![]u8 {
+    if (entries.len > std.math.maxInt(u32)) return error.PostingSegmentManifestTooLarge;
+    try validateManifestEntries(next_segment_id, entries);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    const encoded_size = try encodedManifestSize(manifest);
+    const encoded_size = try encodedManifestEntriesSize(entries);
     try out.ensureTotalCapacity(alloc, encoded_size);
     out.appendSliceAssumeCapacity(&manifest_magic);
     appendU16AssumeCapacity(&out, version);
-    appendU32AssumeCapacity(&out, @intCast(manifest.segments.len));
-    appendU64AssumeCapacity(&out, manifest.next_segment_id);
-    for (manifest.segments) |entry| {
+    appendU32AssumeCapacity(&out, @intCast(entries.len));
+    appendU64AssumeCapacity(&out, next_segment_id);
+    for (entries) |entry| {
         appendManifestEntryAssumeCapacity(&out, entry);
     }
     appendU32AssumeCapacity(&out, manifestChecksum(out.items));
@@ -1487,15 +1486,15 @@ pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-fn encodedManifestSize(manifest: Manifest) !usize {
+fn encodedManifestEntriesSize(entries: anytype) !usize {
     var total = std.math.add(usize, manifest_header_size, manifest_checksum_size) catch return error.PostingSegmentManifestTooLarge;
-    for (manifest.segments) |entry| {
+    for (entries) |entry| {
         total = std.math.add(usize, total, manifestEntryEncodedSize(entry)) catch return error.PostingSegmentManifestTooLarge;
     }
     return total;
 }
 
-fn manifestEntryEncodedSize(entry: ManifestEntry) usize {
+fn manifestEntryEncodedSize(entry: anytype) usize {
     return 8 * @sizeOf(u64) + 2 * @sizeOf(u32) + entry.path.len;
 }
 
@@ -1549,25 +1548,35 @@ pub fn replaceManifestSegmentsWithStatsAlloc(
     remove_segment_ids: []const u64,
     new_entries: []const ManifestEntry,
 ) !ManifestReplacementResult {
-    try validateManifest(manifest);
+    return try replaceManifestSegmentsEntriesWithStatsAlloc(alloc, manifest.next_segment_id, manifest.segments, remove_segment_ids, new_entries);
+}
+
+fn replaceManifestSegmentsEntriesWithStatsAlloc(
+    alloc: Allocator,
+    next_segment_id: u64,
+    entries: anytype,
+    remove_segment_ids: []const u64,
+    new_entries: []const ManifestEntry,
+) !ManifestReplacementResult {
+    try validateManifestEntries(next_segment_id, entries);
     try rejectDuplicateSegmentIds(remove_segment_ids);
     for (new_entries) |entry| try validateManifestEntry(entry);
 
     var stats = ManifestReplacementStats{
-        .input_segments = manifest.segments.len,
+        .input_segments = entries.len,
         .added_segments = new_entries.len,
     };
     var found_remove_count: usize = 0;
     var output_entries = std.ArrayListUnmanaged(ManifestEntry).empty;
-    errdefer output_entries.deinit(alloc);
-    try output_entries.ensureTotalCapacity(alloc, manifest.segments.len + new_entries.len);
+    defer output_entries.deinit(alloc);
+    try output_entries.ensureTotalCapacity(alloc, entries.len + new_entries.len);
 
-    for (manifest.segments) |entry| {
+    for (entries) |entry| {
         if (segmentIdIn(entry.meta.segment_id, remove_segment_ids)) {
             found_remove_count += 1;
             continue;
         }
-        output_entries.appendAssumeCapacity(entry);
+        output_entries.appendAssumeCapacity(.{ .meta = entry.meta, .path = entry.path });
     }
     if (found_remove_count != remove_segment_ids.len) return error.PostingSegmentManifestReplacementMissingSegment;
     stats.removed_segments = found_remove_count;
@@ -1575,18 +1584,14 @@ pub fn replaceManifestSegmentsWithStatsAlloc(
     for (new_entries) |entry| output_entries.appendAssumeCapacity(entry);
     sortManifestEntriesIfNeeded(output_entries.items);
 
-    var next_segment_id = manifest.next_segment_id;
+    var replacement_next_segment_id = next_segment_id;
     for (new_entries) |entry| {
-        next_segment_id = @max(next_segment_id, std.math.add(u64, entry.meta.segment_id, 1) catch return error.PostingSegmentManifestTooLarge);
+        replacement_next_segment_id = @max(replacement_next_segment_id, std.math.add(u64, entry.meta.segment_id, 1) catch return error.PostingSegmentManifestTooLarge);
     }
     stats.output_segments = output_entries.items.len;
-    stats.next_segment_id = next_segment_id;
+    stats.next_segment_id = replacement_next_segment_id;
 
-    const encoded = try encodeManifestAlloc(alloc, .{
-        .next_segment_id = next_segment_id,
-        .segments = output_entries.items,
-    });
-    output_entries.deinit(alloc);
+    const encoded = try encodeManifestEntriesAlloc(alloc, replacement_next_segment_id, output_entries.items);
     return .{
         .encoded = encoded,
         .stats = stats,
@@ -1896,8 +1901,6 @@ pub fn compactDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
     defer compacted.deinit(alloc);
     if (compacted.segment.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
-    const existing_entries = try manifestEntryViewAlloc(alloc, store.manifest.segments);
-    defer alloc.free(existing_entries);
     const remove_segment_ids = try alloc.alloc(u64, store.manifest.segments.len);
     defer alloc.free(remove_segment_ids);
     for (store.manifest.segments, 0..) |entry, i| remove_segment_ids[i] = entry.meta.segment_id;
@@ -1909,10 +1912,7 @@ pub fn compactDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
         .path = written.path,
     };
 
-    var replacement = try replaceManifestSegmentsWithStatsAlloc(alloc, .{
-        .next_segment_id = store.manifest.next_segment_id,
-        .segments = existing_entries,
-    }, remove_segment_ids, &.{new_entry});
+    var replacement = try replaceManifestSegmentsEntriesWithStatsAlloc(alloc, store.manifest.next_segment_id, store.manifest.segments, remove_segment_ids, &.{new_entry});
     defer replacement.deinit(alloc);
 
     try writeManifestFileAlloc(alloc, io, dir, options.manifest_path, replacement.encoded);
@@ -1944,9 +1944,6 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
         .max_segment_bytes = options.max_segment_bytes,
     });
     defer manifest.deinit(alloc);
-
-    const existing_entries = try manifestEntryViewAlloc(alloc, manifest.segments);
-    defer alloc.free(existing_entries);
 
     const selected = try alloc.alloc(SegmentBlob, segment_ids.len);
     defer alloc.free(selected);
@@ -1986,10 +1983,7 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
         .path = written.path,
     };
 
-    var replacement = try replaceManifestSegmentsWithStatsAlloc(alloc, .{
-        .next_segment_id = manifest.next_segment_id,
-        .segments = existing_entries,
-    }, segment_ids, &.{new_entry});
+    var replacement = try replaceManifestSegmentsEntriesWithStatsAlloc(alloc, manifest.next_segment_id, manifest.segments, segment_ids, &.{new_entry});
     defer replacement.deinit(alloc);
 
     try writeManifestFileAlloc(alloc, io, dir, options.manifest_path, replacement.encoded);
@@ -2318,9 +2312,6 @@ fn commitBuiltSegmentToDirectoryWithManifestAlloc(
 ) !SegmentCommitResult {
     if (segment.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
-    const existing_entries = try manifestEntryViewAlloc(alloc, manifest.segments);
-    defer alloc.free(existing_entries);
-
     const written = try writeSegmentFileAlloc(alloc, io, dir, segment);
     errdefer alloc.free(written.path);
     const new_entry = ManifestEntry{
@@ -2328,10 +2319,7 @@ fn commitBuiltSegmentToDirectoryWithManifestAlloc(
         .path = written.path,
     };
 
-    var replacement = try replaceManifestSegmentsWithStatsAlloc(alloc, .{
-        .next_segment_id = manifest.next_segment_id,
-        .segments = existing_entries,
-    }, &.{}, &.{new_entry});
+    var replacement = try replaceManifestSegmentsEntriesWithStatsAlloc(alloc, manifest.next_segment_id, manifest.segments, &.{}, &.{new_entry});
     defer replacement.deinit(alloc);
 
     try writeManifestFileAlloc(alloc, io, dir, options.manifest_path, replacement.encoded);
@@ -2369,17 +2357,6 @@ fn emptyManifestAlloc(alloc: Allocator, next_segment_id: u64) !OwnedManifest {
         .segments = try alloc.alloc(OwnedManifestEntry, 0),
         .segments_sorted_by_segment_id = true,
     };
-}
-
-fn manifestEntryViewAlloc(alloc: Allocator, entries: []const OwnedManifestEntry) ![]ManifestEntry {
-    const view = try alloc.alloc(ManifestEntry, entries.len);
-    for (entries, 0..) |entry, i| {
-        view[i] = .{
-            .meta = entry.meta,
-            .path = entry.path,
-        };
-    }
-    return view;
 }
 
 pub fn segmentPathAlloc(alloc: Allocator, segment_id: u64) ![]u8 {
@@ -4770,7 +4747,7 @@ fn appendManifestEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry
     try out.appendSlice(alloc, entry.path);
 }
 
-fn appendManifestEntryAssumeCapacity(out: *std.ArrayListUnmanaged(u8), entry: ManifestEntry) void {
+fn appendManifestEntryAssumeCapacity(out: *std.ArrayListUnmanaged(u8), entry: anytype) void {
     appendU64AssumeCapacity(out, entry.meta.segment_id);
     appendU64AssumeCapacity(out, entry.meta.min_posting_id);
     appendU64AssumeCapacity(out, entry.meta.max_posting_id);
