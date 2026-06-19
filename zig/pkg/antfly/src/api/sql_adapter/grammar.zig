@@ -981,6 +981,7 @@ pub const BulkIoSyntax = struct {
     format: ?[]const u8 = null,
     header: bool = false,
     freeze: bool = false,
+    on_error: ddl_plan.BulkIoOnErrorPolicy = .stop,
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
     force_not_null_columns: []const []const u8 = &.{},
@@ -4880,6 +4881,7 @@ pub fn parseBulkIoTailAlloc(
     var format: ?[]const u8 = null;
     var header = false;
     var freeze = false;
+    var on_error: ddl_plan.BulkIoOnErrorPolicy = .stop;
     var force_quote_all = false;
     var force_quote_columns: []const []const u8 = &.{};
     var force_not_null_columns: []const []const u8 = &.{};
@@ -4926,6 +4928,13 @@ pub fn parseBulkIoTailAlloc(
                     freeze = true;
                 } else if (std.ascii.eqlIgnoreCase(value.text, "false")) {
                     freeze = false;
+                } else return error.UnsupportedSqlShape;
+            } else if (cursor.matchKeyword("on_error")) {
+                const value = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+                if (std.ascii.eqlIgnoreCase(value.text, "stop")) {
+                    on_error = .stop;
+                } else if (std.ascii.eqlIgnoreCase(value.text, "ignore")) {
+                    on_error = .ignore;
                 } else return error.UnsupportedSqlShape;
             } else if (cursor.matchKeyword("force_quote")) {
                 if (force_quote_all or force_quote_columns.len != 0) return error.UnsupportedSqlShape;
@@ -4987,6 +4996,7 @@ pub fn parseBulkIoTailAlloc(
         try cursor.expectToken(.rparen);
     }
     if (freeze and direction != .from) return error.UnsupportedSqlShape;
+    if (on_error != .stop and direction != .from) return error.UnsupportedSqlShape;
     if ((force_quote_all or force_quote_columns.len != 0) and direction != .to) return error.UnsupportedSqlShape;
     if (force_not_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
     if (force_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
@@ -5011,6 +5021,7 @@ pub fn parseBulkIoTailAlloc(
         .format = format,
         .header = header,
         .freeze = freeze,
+        .on_error = on_error,
         .force_quote_all = force_quote_all,
         .force_quote_columns = force_quote_columns,
         .force_not_null_columns = force_not_null_columns,
@@ -8692,7 +8703,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
     try std.testing.expect(!copy_from.header);
 
-    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FREEZE true, FORMAT csv, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
+    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FREEZE true, ON_ERROR ignore, FORMAT csv, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
     defer lexer.freeTokens(alloc, &copy_header_tokens);
     var copy_header_pos: usize = 0;
     var copy_header = try parseBulkIoTailAlloc(alloc, copy_header_tokens.items, &copy_header_pos);
@@ -8702,6 +8713,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_header.format.?);
     try std.testing.expect(copy_header.header);
     try std.testing.expect(copy_header.freeze);
+    try std.testing.expectEqual(ddl_plan.BulkIoOnErrorPolicy.ignore, copy_header.on_error);
     try std.testing.expectEqual(@as(usize, 2), copy_header.force_not_null_columns.len);
     try std.testing.expectEqualStrings("id", copy_header.force_not_null_columns[0]);
     try std.testing.expectEqualStrings("status", copy_header.force_not_null_columns[1]);
@@ -8747,7 +8759,12 @@ test "sql adapter grammar parses bulk io tails" {
     var force_null_to_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, force_null_to_tokens.items, &force_null_to_pos));
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (ON_ERROR ignore);");
+    var on_error_to_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDOUT WITH (ON_ERROR ignore);");
+    defer lexer.freeTokens(alloc, &on_error_to_tokens);
+    var on_error_to_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, on_error_to_tokens.items, &on_error_to_pos));
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (REJECT_LIMIT 10);");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

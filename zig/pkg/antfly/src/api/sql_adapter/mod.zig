@@ -88,6 +88,7 @@ pub const AppliedDdlWorkSubject = ddl_plan.AppliedDdlWorkSubject;
 pub const AttachTablePartitionPlan = ddl_plan.AttachTablePartitionPlan;
 pub const AuthorizationCatalogPlan = ddl_plan.AuthorizationCatalogPlan;
 pub const BulkIoDirection = ddl_plan.BulkIoDirection;
+pub const BulkIoOnErrorPolicy = ddl_plan.BulkIoOnErrorPolicy;
 pub const BulkIoDirectionSyntax = grammar.BulkIoDirectionSyntax;
 pub const BulkIoPlan = ddl_plan.BulkIoPlan;
 pub const BulkIoSyntax = grammar.BulkIoSyntax;

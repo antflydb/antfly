@@ -1666,6 +1666,7 @@ pub const BulkIoPlan = struct {
     format: ?[]const u8 = null,
     header: bool = false,
     freeze: bool = false,
+    on_error: BulkIoOnErrorPolicy = .stop,
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
     force_not_null_columns: []const []const u8 = &.{},
@@ -1696,6 +1697,11 @@ pub const BulkIoPlan = struct {
 pub const BulkIoDirection = enum {
     from,
     to,
+};
+
+pub const BulkIoOnErrorPolicy = enum {
+    stop,
+    ignore,
 };
 
 pub const MaterializedViewCatalogPlan = union(enum) {
