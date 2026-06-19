@@ -104,6 +104,7 @@ const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
 const temporal_bound_neg_infinity_tag: u8 = 0xf0;
 const temporal_bound_pos_infinity_tag: u8 = 0xf1;
+const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const relational_store_mod = @import("relational_store.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -6421,6 +6422,134 @@ pub const DB = struct {
         if (options.reload_algebraic_schema_configs) {
             try self.completePendingAlgebraicSchemaRebuilds();
         }
+    }
+
+    pub const SchemaRewriteJobExecutionResult = struct {
+        report: relational_store_mod.RowRewriteReport,
+        progress_row_key: []u8,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.progress_row_key);
+            self.* = undefined;
+        }
+
+        pub fn finishRequest(self: @This(), job: metadata_table_manager.SchemaRewriteJobRecord) metadata_table_manager.SchemaRewriteJobFinishRequest {
+            return .{
+                .job_id = job.job_id,
+                .lease_owner = job.lease_owner,
+                .completed_row_count = self.report.scanned_rows,
+                .progress_row_key = self.progress_row_key,
+            };
+        }
+    };
+
+    pub fn executeClaimedSchemaRewriteJob(
+        self: *DB,
+        alloc: Allocator,
+        job: metadata_table_manager.SchemaRewriteJobRecord,
+    ) !SchemaRewriteJobExecutionResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (!std.mem.eql(u8, job.action, "rewrite") or !std.mem.eql(u8, job.reason, "row_images")) return error.InvalidSchemaRewriteJob;
+        if (!std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
+        if (job.lease_owner.len == 0) return error.SchemaRewriteJobLeaseMismatch;
+        if (job.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
+        const expression = job.expression orelse return error.InvalidSchemaRewriteExpression;
+
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const local_schema_json = self.core.store.get(alloc, local_schema_json_key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidSchemaRewriteGeneration,
+            else => return err,
+        };
+        defer alloc.free(local_schema_json);
+        const current_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(local_schema_json);
+        if (job.schema_generation != current_generation) return error.InvalidSchemaRewriteGeneration;
+
+        const runtime_schema = self.core.schema orelse return error.InvalidSchemaUpdateRequest;
+        if (runtime_schema.storage_mode != .relational or runtime_schema.relational_columns.len == 0) return error.InvalidSchemaUpdateRequest;
+        const target_column = relationalRowsFindColumn(runtime_schema.relational_columns, job.target_column) orelse return error.InvalidSchemaRewriteExpression;
+        try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+
+        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, self.getRange().start, self.getRange().end);
+        defer relational_store_mod.freeRows(alloc, rows);
+
+        var report: relational_store_mod.RowRewriteReport = .{ .scanned_rows = @intCast(rows.len) };
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer writes.deinit(alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_keys.items) |key| alloc.free(key);
+            owned_keys.deinit(alloc);
+        }
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_values.items) |value| alloc.free(value);
+            owned_values.deinit(alloc);
+        }
+        const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromColumns(runtime_schema.relational_columns);
+
+        for (rows) |row| {
+            const rewritten = try self.schemaRewriteRowValueAlloc(alloc, row.row_value, target_column, expression);
+            if (rewritten) |new_row| {
+                var new_row_owned = true;
+                errdefer if (new_row_owned) alloc.free(new_row);
+                try relational_store_mod.appendUpsertWithColumnIndexPolicy(
+                    alloc,
+                    self.core.store,
+                    &writes,
+                    &deletes,
+                    &owned_keys,
+                    &owned_values,
+                    row.doc_key,
+                    new_row,
+                    column_index_policy,
+                );
+                try owned_values.append(alloc, new_row);
+                new_row_owned = false;
+                report.rewritten_rows += 1;
+            } else {
+                report.unchanged_rows += 1;
+            }
+        }
+
+        if (writes.items.len > 0 or deletes.items.len > 0) try self.core.store.putBatch(writes.items, deletes.items);
+        const progress_row_key = try alloc.dupe(u8, self.getRange().end);
+        return .{ .report = report, .progress_row_key = progress_row_key };
+    }
+
+    fn schemaRewriteRowValueAlloc(
+        self: *DB,
+        alloc: Allocator,
+        row_value: []const u8,
+        target_column: schema_mod.RelationalColumn,
+        expression: schema_mod.RelationalRowsExpression,
+    ) !?[]u8 {
+        _ = self;
+        const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row_value) catch return error.InvalidRowsRequest;
+        defer alloc.free(row_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+
+        const value_json = relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression) catch return error.InvalidRowsRequest;
+        defer alloc.free(value_json);
+        var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed_value.deinit();
+
+        if (parsed_value.value == .null) {
+            if (!target_column.nullable) return error.InvalidRowsRequest;
+            return try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row_value, .{ .drops = &.{target_column.path} });
+        }
+
+        const target_row = try relationalDefaultColumnRowValueAlloc(alloc, target_column, value_json);
+        defer alloc.free(target_row);
+        var decoded = try relational_row_codec.deserialize(alloc, target_row);
+        defer decoded.deinit(alloc);
+        if (decoded.cells.len != 1) return error.InvalidRowsRequest;
+        return try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row_value, .{ .sets = &.{.{ .cell = decoded.cells[0] }} });
     }
 
     fn validateTableSchemaCompatibilityLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
@@ -44423,6 +44552,76 @@ test "db direct schema apply appends literal default and generated columns throu
     try std.testing.expectEqual(schema_mod.RelationalGeneratedOp.expression, durable_generated.op);
     const durable_expression = durable_generated.expression orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(types.RelationalRowsExpressionKind.lower, durable_expression.kind);
+}
+
+test "db executes claimed schema rewrite job expressions over relational rows" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const expression = types.RelationalRowsExpression{
+        .kind = .lower,
+        .operands = &.{.{
+            .kind = .field,
+            .field = "status",
+        }},
+    };
+    const job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 44,
+        .table_id = 7,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .state = metadata_table_manager.schema_rewrite_running,
+        .target_column = "status_key",
+        .expression = expression,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 10_000,
+    };
+
+    var result = try db.executeClaimedSchemaRewriteJob(alloc, job);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), result.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.report.rewritten_rows);
+    try std.testing.expectEqualStrings("", result.progress_row_key);
+    const finish = result.finishRequest(job);
+    try std.testing.expectEqual(@as(u64, 1), finish.completed_row_count);
+    try std.testing.expectEqualStrings("worker-a", finish.lease_owner);
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
+
+    const status_key_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status_key", "doc:a");
+    defer alloc.free(status_key_index);
+    const status_key_index_value = try db.core.store.get(alloc, status_key_index);
+    defer alloc.free(status_key_index_value);
+
+    var unclaimed = job;
+    unclaimed.state = metadata_table_manager.schema_rewrite_declared;
+    try std.testing.expectError(error.SchemaRewriteJobNotRunning, db.executeClaimedSchemaRewriteJob(alloc, unclaimed));
+
+    var stale = job;
+    stale.schema_generation = 99;
+    try std.testing.expectError(error.InvalidSchemaRewriteGeneration, db.executeClaimedSchemaRewriteJob(alloc, stale));
 }
 
 test "db direct schema apply rejects generated columns without deterministic backfill sources" {

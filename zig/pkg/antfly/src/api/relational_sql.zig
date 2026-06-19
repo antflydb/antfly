@@ -7356,7 +7356,7 @@ const Parser = struct {
         const op: runtime_schema.UniquePredicateOp = if (tokens[idx].kind == .eq) .eq else if (tokens[idx].kind == .neq) .ne else return error.UnsupportedSqlShape;
         idx += 1;
         if (idx >= tokens.len) return error.UnsupportedSqlShape;
-        const value_json = try self.sqlUntypedValueTokensJsonAlloc(tokens, &idx);
+        const value_json = try sql_adapter.parseSqlUntypedValueJsonAlloc(self.alloc, tokens, &idx);
         var value_transferred = false;
         errdefer if (!value_transferred) self.alloc.free(value_json);
         if (idx != tokens.len) return error.UnsupportedSqlShape;
@@ -7364,26 +7364,6 @@ const Parser = struct {
         field_transferred = true;
         value_transferred = true;
         return .{ .field = field, .op = op, .value_json = value_json };
-    }
-
-    fn sqlUntypedValueTokensJsonAlloc(self: *@This(), tokens: []const Token, idx: *usize) ![]const u8 {
-        if (idx.* >= tokens.len) return error.UnsupportedSqlShape;
-        const token = tokens[idx.*];
-        if (token.kind == .minus) {
-            idx.* += 1;
-            if (idx.* >= tokens.len) return error.UnsupportedSqlShape;
-            const number = tokens[idx.*];
-            if (number.kind != .number) return error.UnsupportedSqlShape;
-            idx.* += 1;
-            return try std.fmt.allocPrint(self.alloc, "-{s}", .{number.text});
-        }
-        idx.* += 1;
-        if (token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, "true")) return try self.alloc.dupe(u8, "true");
-        if (token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, "false")) return try self.alloc.dupe(u8, "false");
-        if (token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, "null")) return try self.alloc.dupe(u8, "null");
-        if (token.kind == .string) return try std.json.Stringify.valueAlloc(self.alloc, token.text, .{});
-        if (token.kind == .number) return try self.alloc.dupe(u8, token.text);
-        return error.UnsupportedSqlShape;
     }
 
     fn installDdlPrimaryKey(
@@ -32971,17 +32951,16 @@ const Parser = struct {
         if (binding.null_input == .returns_null) {
             for (operands.items) |operand| {
                 if (sql_adapter.lower_expr.routineArgumentExpressionIsNullLiteral(operand)) {
-                    const expression = db_mod.types.RelationalRowsExpression{
+                    return .{
                         .kind = .value,
                         .value_json = try self.alloc.dupe(u8, "null"),
                     };
-                    return expression;
                 }
             }
+            return error.UnsupportedSqlShape;
         }
 
-        const expression = try sql_adapter.lower_expr.cloneExpressionSubstitutingRoutineArgsAlloc(self.alloc, binding.expression, operands.items);
-        return expression;
+        return try sql_adapter.lower_expr.cloneExpressionSubstitutingRoutineArgsAlloc(self.alloc, binding.expression, operands.items);
     }
 
     fn peekRoutineExpressionCall(self: *@This()) bool {
@@ -57987,15 +57966,13 @@ test "postgres sql adapter lowers routine expression bindings into row expressio
     const null_expression = null_lowered.plan.query.expressions[0].expression;
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, null_expression.kind);
     try std.testing.expectEqualStrings("null", null_expression.value_json);
-    var strict_non_null = try lowerQueryPlanWithFunctionBindingsAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanWithFunctionBindingsAlloc(
         alloc,
         "SELECT id, strict_normalize_status(status) AS status_key FROM usage_records WHERE id = $1",
         schema,
         &.{.{ .string = "u1" }},
         .{ .routine_expressions = &strict_bindings },
-    );
-    defer strict_non_null.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, strict_non_null.plan.query.expressions[0].expression.kind);
+    ));
 
     const duplicate_bindings = [_]RoutineExpressionBinding{
         .{ .sql_name = "normalize_status", .arity = 1, .expression = normalize_expression },

@@ -1045,8 +1045,10 @@ Ready extension bindings passed into the adapter are typed
 second migration slice keeps parser syntax methods in `relational_sql.zig` but
 moves `SqlFunctionBindings`, routine expression binding metadata, `argN`
 substitution, duplicate/arity lookup, and null-input short-circuit helpers to
-the adapter expression layer; the future larger slice can move the full
-row-expression parser once this contract is stable.
+the adapter expression layer. A follow-on cleanup routes DDL predicate literal
+parsing through `api/sql_adapter/value.zig` instead of carrying a second local
+token-slice parser in `relational_sql.zig`. The future larger slice can move
+the full row-expression parser once this contract is stable.
 
 The internal flow is always:
 
@@ -6566,6 +6568,17 @@ finish/invalidate is accepted only from the current lease owner, and
 table-schema compare-and-swap promotion rejects matching-generation
 rewrite jobs until every one is complete, then consumes those completed job
 records atomically with the promoted table image.
+Owner-local storage execution now consumes claimed `rewrite/table/row_images`
+jobs directly. The executor validates the running lease, schema-generation
+fingerprint, target column, and typed row-expression AST against the current
+local schema JSON, scans only the owner range, evaluates the expression over
+each stored relational row image, rewrites the target cell or nullable-cell
+drop through the relational row store, and refreshes column side indexes in the
+same storage batch. It returns scanned/rewritten counts plus a progress row key
+that can be passed to the metadata `finishSchemaRewriteJob` lifecycle request.
+Stale generations, unclaimed jobs, unsupported actions/reasons, invalid target
+columns, non-nullable null results, and unsupported expression shapes fail
+closed before any batch commit.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from
