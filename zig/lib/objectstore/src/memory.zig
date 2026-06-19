@@ -130,6 +130,10 @@ pub const MemoryClient = struct {
                 .bucket = try alloc.dupe(u8, bucket),
                 .key = try alloc.dupe(u8, key),
                 .etag = try alloc.dupe(u8, object.etag),
+                .checksum = .{
+                    .algorithm = .sha256_hex,
+                    .value = try alloc.dupe(u8, object.etag),
+                },
                 .content_length = @intCast(object.body.len),
                 .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
             },
@@ -161,6 +165,10 @@ pub const MemoryClient = struct {
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
             .etag = try alloc.dupe(u8, object.etag),
+            .checksum = .{
+                .algorithm = .sha256_hex,
+                .value = try alloc.dupe(u8, object.etag),
+            },
             .content_length = @intCast(object.body.len),
             .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
         };

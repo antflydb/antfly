@@ -171,6 +171,10 @@ pub const FilesystemClient = struct {
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
             .etag = try sha256HexAlloc(alloc, body),
+            .checksum = .{
+                .algorithm = .sha256_hex,
+                .value = try sha256HexAlloc(alloc, body),
+            },
             .content_length = @intCast(file_stat.size),
             .content_type = content_type,
             .last_modified_unix_ms = file_stat.mtime.toMilliseconds(),

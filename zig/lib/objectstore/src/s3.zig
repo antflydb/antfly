@@ -84,6 +84,7 @@ pub const TransportResponse = struct {
     content_type: ?[]u8 = null,
     content_length: ?u64 = null,
     version_id: ?[]u8 = null,
+    checksum_sha256: ?[]u8 = null,
     last_modified: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
@@ -91,6 +92,7 @@ pub const TransportResponse = struct {
         if (self.etag) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
         if (self.version_id) |value| alloc.free(value);
+        if (self.checksum_sha256) |value| alloc.free(value);
         if (self.last_modified) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -150,6 +152,7 @@ const HttpxTransport = struct {
             .content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null,
             .content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null,
             .version_id = if (response.headers.get("x-amz-version-id")) |value| try alloc.dupe(u8, value) else null,
+            .checksum_sha256 = if (response.headers.get("x-amz-checksum-sha256")) |value| try alloc.dupe(u8, value) else null,
             .last_modified = if (response.headers.get("Last-Modified")) |value| try alloc.dupe(u8, value) else null,
         };
     }
@@ -311,6 +314,13 @@ pub const Client = struct {
             if (meta.version_id) |current| alloc.free(current);
             meta.version_id = try alloc.dupe(u8, value);
         }
+        if (response.checksum_sha256) |value| {
+            if (meta.checksum) |*current| current.deinit(alloc);
+            meta.checksum = .{
+                .algorithm = .sha256_base64,
+                .value = try alloc.dupe(u8, value),
+            };
+        }
 
         const out_body = response.body;
         response.body = &.{};
@@ -359,6 +369,10 @@ pub const Client = struct {
             .key = try alloc.dupe(u8, key),
             .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
             .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
+            .checksum = if (response.checksum_sha256) |value| .{
+                .algorithm = .sha256_base64,
+                .value = try alloc.dupe(u8, value),
+            } else null,
             .content_length = response.content_length orelse 0,
             .content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null,
             .last_modified_unix_ms = null,

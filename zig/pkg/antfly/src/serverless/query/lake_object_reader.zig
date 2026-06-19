@@ -82,6 +82,7 @@ pub const ObjectStorageRangeReader = struct {
         defer result.deinit(alloc);
         if (result.body.len != len) return error.InvalidLakeRangeRead;
         try validatePlannedObjectMetadata(read, result.metadata);
+        try validatePlannedObjectChecksum(alloc, read, result.metadata, result.body);
         return try alloc.dupe(u8, result.body);
     }
 
@@ -115,6 +116,51 @@ fn validatePlannedObjectMetadata(read: lake_range_io.RangeRead, metadata: object
         const returned_version = metadata.version_id orelse return error.PreconditionFailed;
         if (!std.mem.eql(u8, returned_version, read.object.version.version_id)) return error.PreconditionFailed;
     }
+}
+
+fn validatePlannedObjectChecksum(
+    alloc: Allocator,
+    read: lake_range_io.RangeRead,
+    metadata: object_storage.ObjectMetadata,
+    body: []const u8,
+) !void {
+    const checksum = metadata.checksum orelse return;
+    if (read.range.offset != 0 or read.range.len != read.object.byte_len) return;
+    if (body.len != read.range.len) return error.InvalidLakeRangeRead;
+
+    switch (checksum.algorithm) {
+        .sha256_hex => {
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+            var expected: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+            for (digest, 0..) |byte, idx| {
+                expected[idx * 2] = hexNibble(byte >> 4);
+                expected[idx * 2 + 1] = hexNibble(byte & 0x0f);
+            }
+            if (!std.ascii.eqlIgnoreCase(&expected, checksum.value)) return error.PreconditionFailed;
+        },
+        .sha256_base64 => {
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+            const encoded_len = std.base64.standard.Encoder.calcSize(digest.len);
+            const encoded = try alloc.alloc(u8, encoded_len);
+            defer alloc.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, &digest);
+            if (!std.mem.eql(u8, encoded, checksum.value)) return error.PreconditionFailed;
+        },
+        .md5_base64 => {
+            const digest = std.crypto.hash.Md5.hashResult(body);
+            const encoded_len = std.base64.standard.Encoder.calcSize(digest.len);
+            const encoded = try alloc.alloc(u8, encoded_len);
+            defer alloc.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, &digest);
+            if (!std.mem.eql(u8, encoded, checksum.value)) return error.PreconditionFailed;
+        },
+    }
+}
+
+fn hexNibble(value: u8) u8 {
+    return if (value < 10) '0' + value else 'a' + (value - 10);
 }
 
 fn isRetryableObjectReadError(err: anyerror) bool {
@@ -279,6 +325,118 @@ test "object storage range reader validates returned planned object metadata" {
     const bytes = try matching_reader.parquetReader().readPlannedAlloc(alloc, read);
     defer alloc.free(bytes);
     try std.testing.expectEqualStrings("456789", bytes);
+}
+
+test "object storage range reader validates full object checksums" {
+    const alloc = std.testing.allocator;
+    const ChecksumObjectStorage = struct {
+        checksum: ?struct {
+            algorithm: object_storage.ObjectChecksumAlgorithm,
+            value: []const u8,
+        } = null,
+
+        fn client(self: *@This()) object_storage.ObjectStorage {
+            return .{
+                .allocator = alloc,
+                .ptr = self,
+                .vtable = &.{
+                    .deinit = deinit,
+                    .bucket_exists = bucketExists,
+                    .make_bucket = makeBucket,
+                    .put_object = putObject,
+                    .get_object = getObject,
+                    .get_object_attributes = getObjectAttributes,
+                    .stat_object = statObject,
+                    .delete_object = deleteObject,
+                    .list_objects = listObjects,
+                },
+            };
+        }
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
+            return error.UnsupportedOperation;
+        }
+        fn getObject(ptr: *anyopaque, a: Allocator, bucket: []const u8, key: []const u8, opts: object_storage.GetOptions) !object_storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const full_body = "0123456789";
+            const body = if (opts.range) |range| blk: {
+                const start: usize = @intCast(range.offset);
+                const len: usize = @intCast(range.length orelse return error.InvalidRange);
+                if (start > full_body.len or len > full_body.len - start) return error.InvalidRange;
+                break :blk full_body[start..][0..len];
+            } else full_body;
+            return .{
+                .body = try a.dupe(u8, body),
+                .metadata = .{
+                    .bucket = try a.dupe(u8, bucket),
+                    .key = try a.dupe(u8, key),
+                    .etag = try a.dupe(u8, "etag-a"),
+                    .checksum = if (self.checksum) |checksum| .{
+                        .algorithm = checksum.algorithm,
+                        .value = try a.dupe(u8, checksum.value),
+                    } else null,
+                    .content_length = full_body.len,
+                },
+            };
+        }
+        fn getObjectAttributes(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectAttributes {
+            return error.UnsupportedOperation;
+        }
+        fn statObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectMetadata {
+            return error.UnsupportedOperation;
+        }
+        fn deleteObject(_: *anyopaque, _: []const u8, _: []const u8, _: object_storage.DeleteOptions) !void {
+            return error.UnsupportedOperation;
+        }
+        fn listObjects(_: *anyopaque, a: Allocator, _: []const u8, _: object_storage.ListOptions) !object_storage.ListResult {
+            return .{
+                .entries = try a.alloc(object_storage.ListEntry, 0),
+                .common_prefixes = try a.alloc([]u8, 0),
+            };
+        }
+    };
+
+    const full_read = lake_range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "events/part-a.parquet",
+            .byte_len = 10,
+            .version = .{ .etag = "etag-a" },
+        },
+        .range = .{ .offset = 0, .len = 10 },
+        .purpose = .iceberg_metadata,
+    };
+    const partial_read = lake_range_io.RangeRead{
+        .object = full_read.object,
+        .range = .{ .offset = 2, .len = 4 },
+        .purpose = .parquet_footer,
+    };
+
+    var matching = ChecksumObjectStorage{ .checksum = .{
+        .algorithm = .sha256_hex,
+        .value = "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+    } };
+    var matching_reader = ObjectStorageRangeReader.init(matching.client());
+    const bytes = try matching_reader.parquetReader().readPlannedAlloc(alloc, full_read);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("0123456789", bytes);
+
+    var mismatched = ChecksumObjectStorage{ .checksum = .{
+        .algorithm = .sha256_hex,
+        .value = "0000000000000000000000000000000000000000000000000000000000000000",
+    } };
+    var mismatched_reader = ObjectStorageRangeReader.init(mismatched.client());
+    try std.testing.expectError(error.PreconditionFailed, mismatched_reader.parquetReader().readPlannedAlloc(alloc, full_read));
+
+    var partial_reader = ObjectStorageRangeReader.init(mismatched.client());
+    const partial_bytes = try partial_reader.parquetReader().readPlannedAlloc(alloc, partial_read);
+    defer alloc.free(partial_bytes);
+    try std.testing.expectEqualStrings("2345", partial_bytes);
 }
 
 test "object storage range reader retries transient planned reads only" {

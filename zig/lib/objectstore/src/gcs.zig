@@ -767,6 +767,7 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
         generation: ?[]const u8 = null,
         size: ?[]const u8 = null,
         contentType: ?[]const u8 = null,
+        md5Hash: ?[]const u8 = null,
     };
 
     var parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .ignore_unknown_fields = true });
@@ -777,6 +778,10 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
         .key = try alloc.dupe(u8, parsed.value.name),
         .etag = if (parsed.value.etag) |value| try alloc.dupe(u8, value) else null,
         .version_id = if (parsed.value.generation) |value| try alloc.dupe(u8, value) else null,
+        .checksum = if (parsed.value.md5Hash) |value| .{
+            .algorithm = .md5_base64,
+            .value = try alloc.dupe(u8, value),
+        } else null,
         .content_length = if (parsed.value.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0,
         .content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null,
         .last_modified_unix_ms = null,
