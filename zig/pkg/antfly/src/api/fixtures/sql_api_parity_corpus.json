@@ -6362,92 +6362,6 @@
       "sql": "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)"
     },
     {
-      "name": "create domain catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_domain",
-        "table_name": "positive_amount",
-        "predicates": 1
-      },
-      "plan": "ddl:create_domain:domain=positive_amount:type=numeric:checks=1:not_null=false:default=false",
-      "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)"
-    },
-    {
-      "name": "alter domain catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "alter_domain",
-        "table_name": "positive_amount",
-        "operations": 1
-      },
-      "plan": "ddl:alter_domain:domain=positive_amount:ops=1",
-      "sql": "ALTER DOMAIN positive_amount SET NOT NULL"
-    },
-    {
-      "name": "drop domain catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "drop_domain",
-        "table_name": "positive_amount"
-      },
-      "plan": "ddl:drop_domain:domain=positive_amount:if_exists=false",
-      "sql": "DROP DOMAIN positive_amount"
-    },
-    {
-      "name": "create sequence catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_sequence",
-        "table_name": "usage_records_id_seq",
-        "operations": 4
-      },
-      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=4",
-      "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE"
-    },
-    {
-      "name": "create typed owned sequence catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "create_sequence",
-        "table_name": "usage_records_id_seq",
-        "operations": 3
-      },
-      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=3",
-      "sql": "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id"
-    },
-    {
-      "name": "alter sequence catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "alter_sequence",
-        "table_name": "usage_records_id_seq",
-        "operations": 1
-      },
-      "plan": "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=false:ops=1",
-      "sql": "ALTER SEQUENCE usage_records_id_seq RESTART WITH 1000"
-    },
-    {
-      "name": "alter typed owned sequence catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "alter_sequence",
-        "table_name": "usage_records_id_seq",
-        "operations": 2
-      },
-      "plan": "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=true:ops=2",
-      "sql": "ALTER SEQUENCE IF EXISTS usage_records_id_seq AS integer OWNED BY NONE"
-    },
-    {
-      "name": "drop sequence catalog ddl",
-      "family": "ddl",
-      "summary": {
-        "ddl_tag": "drop_sequence",
-        "table_name": "usage_records_id_seq"
-      },
-      "plan": "ddl:drop_sequence:sequence=usage_records_id_seq:if_exists=false",
-      "sql": "DROP SEQUENCE usage_records_id_seq"
-    },
-    {
       "name": "serial identity allocator catalog ddl",
       "family": "ddl",
       "summary": {
@@ -10781,6 +10695,92 @@
       },
       "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
       "sql": "SELECT id FROM usage_records ORDER BY (amount + quantity) DESC LIMIT 5"
+    },
+    {
+      "name": "create domain catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_domain",
+        "table_name": "positive_amount",
+        "predicates": 1
+      },
+      "plan": "ddl:create_domain:domain=positive_amount:type=numeric:checks=1:not_null=false:default=false",
+      "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)"
+    },
+    {
+      "name": "alter domain catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_domain",
+        "table_name": "positive_amount",
+        "operations": 1
+      },
+      "plan": "ddl:alter_domain:domain=positive_amount:ops=1",
+      "sql": "ALTER DOMAIN positive_amount SET NOT NULL"
+    },
+    {
+      "name": "drop domain catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_domain",
+        "table_name": "positive_amount"
+      },
+      "plan": "ddl:drop_domain:domain=positive_amount:if_exists=false",
+      "sql": "DROP DOMAIN positive_amount"
+    },
+    {
+      "name": "create sequence catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 4
+      },
+      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=4",
+      "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE"
+    },
+    {
+      "name": "create typed owned sequence catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 3
+      },
+      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=3",
+      "sql": "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id"
+    },
+    {
+      "name": "alter sequence catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 1
+      },
+      "plan": "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=false:ops=1",
+      "sql": "ALTER SEQUENCE usage_records_id_seq RESTART WITH 1000"
+    },
+    {
+      "name": "alter typed owned sequence catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 2
+      },
+      "plan": "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=true:ops=2",
+      "sql": "ALTER SEQUENCE IF EXISTS usage_records_id_seq AS integer OWNED BY NONE"
+    },
+    {
+      "name": "drop sequence catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_sequence",
+        "table_name": "usage_records_id_seq"
+      },
+      "plan": "ddl:drop_sequence:sequence=usage_records_id_seq:if_exists=false",
+      "sql": "DROP SEQUENCE usage_records_id_seq"
     }
   ]
 }
