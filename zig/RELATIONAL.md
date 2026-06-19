@@ -5083,10 +5083,13 @@ null-marker, UTF-8 encoding, and `FORCE_QUOTE` semantics. The
 decoder keeps per-field quote metadata, so default CSV `NULL ''` handling
 distinguishes unquoted empty fields from quoted empty strings and
 `FORCE_NULL`/`FORCE_NOT_NULL` follow PostgreSQL CSV semantics before row JSON
-reaches typed schema validation. The remaining production layer is the broader
-streaming executor contract around those paths: chunked protocol backpressure,
-2PC staging, retryable range routing, deterministic reject-limit accounting,
-and snapshot-stable export streaming. PostgreSQL
+reaches typed schema validation. The native bridge validates CSV delimiter,
+quote, and escape options before row import/export execution, including
+rejecting ambiguous delimiter/quote collisions instead of carrying malformed
+CSV settings into typed row planning. The remaining production layer is the
+broader streaming executor contract around those paths: chunked protocol
+backpressure, 2PC staging, retryable range routing, deterministic reject-limit
+accounting, and snapshot-stable export streaming. PostgreSQL
 `COPY` syntax is therefore an adapter frontend for those
 contracts, but it must not bypass row-batch, mutation-source, or routed read
 semantics. Until server-file, `PROGRAM`, alternate stream endpoints, binary

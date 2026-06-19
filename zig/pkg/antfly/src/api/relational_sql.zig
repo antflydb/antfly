@@ -2194,6 +2194,7 @@ pub fn bulkSqlIoImportRowsBatchFromStdinAlloc(
     if (plan.operation != .import_rows or plan.native_route != .rows_batch or plan.stream != .stdin) return error.UnsupportedSqlShape;
     if (plan.codec != .csv) return error.UnsupportedSqlShape;
     if (plan.columns.len == 0) return error.UnsupportedSqlShape;
+    try validateBulkSqlIoCsvOptions(plan);
     if (plan.encoding) |encoding| {
         if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
             return error.UnsupportedSqlShape;
@@ -2246,6 +2247,7 @@ pub fn bulkSqlIoExportRowsCsvToStdoutAlloc(
 ) ![]u8 {
     if (plan.operation != .export_rows or plan.native_route != .rows_query or plan.stream != .stdout) return error.UnsupportedSqlShape;
     if (plan.codec != .csv) return error.UnsupportedSqlShape;
+    try validateBulkSqlIoCsvOptions(plan);
     if (plan.encoding) |encoding| {
         if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
             return error.UnsupportedSqlShape;
@@ -2438,6 +2440,13 @@ fn bulkSqlIoSingleByteOption(option: ?[]const u8, default: u8) !u8 {
         return error.UnsupportedSqlShape;
     }
     return default;
+}
+
+fn validateBulkSqlIoCsvOptions(plan: BulkSqlIoExecutionPlan) !void {
+    const delimiter = try bulkSqlIoSingleByteOption(plan.delimiter, ',');
+    const quote = try bulkSqlIoSingleByteOption(plan.quote, '"');
+    _ = try bulkSqlIoSingleByteOption(plan.escape, quote);
+    if (delimiter == quote) return error.UnsupportedSqlShape;
 }
 
 fn bulkSqlIoRowJsonFromCsvFieldsAlloc(
@@ -47101,6 +47110,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         error.UnsupportedSqlShape,
         bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, malformed_copy_import_plan, "u_bad:ready\n"),
     );
+    var invalid_csv_options_import_plan = copy_import_plan;
+    invalid_csv_options_import_plan.delimiter = "|";
+    invalid_csv_options_import_plan.quote = "|";
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, invalid_csv_options_import_plan, "u_bad|ready|0\n"),
+    );
 
     var copy_import_filtered = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount) FROM STDIN WITH (FORMAT csv, DEFAULT 'DEFAULT') WHERE status = 'active';");
     defer copy_import_filtered.deinit(alloc);
@@ -47158,6 +47174,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(copy_to_execution_fingerprint);
     try std.testing.expectEqualStrings("bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=csv:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_to_execution_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
+    var invalid_csv_options_export_plan = copy_to_execution;
+    invalid_csv_options_export_plan.delimiter = "|";
+    invalid_csv_options_export_plan.quote = "|";
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        bulkSqlIoExportRowsCsvToStdoutAlloc(alloc, copy_runtime_schema, invalid_csv_options_export_plan, .{}),
+    );
 
     var copy_binary = try lowerDdlPlanAlloc(alloc, "COPY usage_records TO STDOUT WITH (FORMAT binary);");
     defer copy_binary.deinit(alloc);
