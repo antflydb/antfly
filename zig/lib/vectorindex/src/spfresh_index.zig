@@ -30,6 +30,7 @@ pub const FlatCentroidBlock = struct {
     parents: []u64,
     levels: []u16,
     states: []types.PostingState,
+    posting_offset: usize = 0,
     centroid: []f32,
     radius: f32 = 0,
     radii: []f32,
@@ -54,6 +55,7 @@ pub const FlatCentroidBlock = struct {
 pub const FlatCentroidDirectory = struct {
     blocks: []FlatCentroidBlock = &.{},
     coarse_quantized: ?proto.RaBitQuantizedVectorSet = null,
+    posting_quantized: ?proto.RaBitQuantizedVectorSet = null,
     ref_count: std.atomic.Value(u32) = .init(1),
     root_node_snapshot: u64 = 0,
     node_count_snapshot: u64 = 0,
@@ -74,6 +76,7 @@ pub const FlatCentroidDirectory = struct {
         for (self.blocks) |*block| block.deinit(alloc);
         alloc.free(self.blocks);
         if (self.coarse_quantized) |*coarse| coarse.deinit(alloc);
+        if (self.posting_quantized) |*posting_q| posting_q.deinit(alloc);
         self.* = .{};
     }
 };
@@ -448,6 +451,7 @@ fn appendFlatCentroidBlock(
     radii: []const f32,
     centroids: []const f32,
     dims: usize,
+    posting_offset: usize,
 ) !void {
     if (posting_ids.len == 0) return;
     std.debug.assert(parents.len == posting_ids.len);
@@ -499,6 +503,7 @@ fn appendFlatCentroidBlock(
         .parents = owned_parents,
         .levels = owned_levels,
         .states = owned_states,
+        .posting_offset = posting_offset,
         .centroid = block_centroid,
         .radius = block_radius,
         .radii = owned_radii,
@@ -632,6 +637,7 @@ fn appendFlatCentroidBlocksFromEntries(
     defer self.alloc.free(centroids);
 
     var block_count: usize = 0;
+    var posting_offset: usize = 0;
     for (entries.items) |entry| {
         posting_ids[block_count] = entry.posting_id;
         parents[block_count] = entry.parent;
@@ -642,12 +648,13 @@ fn appendFlatCentroidBlocksFromEntries(
         block_count += 1;
 
         if (block_count == block_size) {
-            try appendFlatCentroidBlock(self, blocks, posting_ids[0..block_count], parents[0..block_count], levels[0..block_count], states[0..block_count], radii[0..block_count], centroids[0 .. block_count * dims], dims);
+            try appendFlatCentroidBlock(self, blocks, posting_ids[0..block_count], parents[0..block_count], levels[0..block_count], states[0..block_count], radii[0..block_count], centroids[0 .. block_count * dims], dims, posting_offset);
+            posting_offset += block_count;
             block_count = 0;
         }
     }
     if (block_count > 0) {
-        try appendFlatCentroidBlock(self, blocks, posting_ids[0..block_count], parents[0..block_count], levels[0..block_count], states[0..block_count], radii[0..block_count], centroids[0 .. block_count * dims], dims);
+        try appendFlatCentroidBlock(self, blocks, posting_ids[0..block_count], parents[0..block_count], levels[0..block_count], states[0..block_count], radii[0..block_count], centroids[0 .. block_count * dims], dims, posting_offset);
     }
     return entries.items.len;
 }
@@ -668,6 +675,7 @@ fn finalizeFlatCentroidDirectory(
     }
 
     var coarse_quantized: ?proto.RaBitQuantizedVectorSet = null;
+    var posting_quantized: ?proto.RaBitQuantizedVectorSet = null;
     if (owned_blocks.len > 0) {
         const zero = try self.alloc.alloc(f32, dims);
         defer self.alloc.free(zero);
@@ -679,11 +687,23 @@ fn finalizeFlatCentroidDirectory(
             @memcpy(coarse_centroids[i * dims ..][0..dims], block.centroid);
         }
         coarse_quantized = try self.quantizer.quantize(zero, coarse_centroids, owned_blocks.len);
+        errdefer if (coarse_quantized) |*coarse| coarse.deinit(self.alloc);
+
+        if (posting_count > 0) {
+            const posting_centroids = try self.alloc.alloc(f32, posting_count * dims);
+            defer self.alloc.free(posting_centroids);
+            for (owned_blocks) |*block| {
+                const start = block.posting_offset * dims;
+                @memcpy(posting_centroids[start..][0..block.centroids.len], block.centroids);
+            }
+            posting_quantized = try self.quantizer.quantize(zero, posting_centroids, posting_count);
+        }
     }
 
     return .{
         .blocks = owned_blocks,
         .coarse_quantized = coarse_quantized,
+        .posting_quantized = posting_quantized,
         .root_node_snapshot = root_node,
         .node_count_snapshot = node_count,
         .publish_generation_snapshot = publish_generation,
@@ -903,7 +923,11 @@ pub fn selectFlatRabitqPostings(
     var probe_collector = FlatProbeCollector.init(probes[0..probe_limit]);
 
     const max_block_postings = @max(self.config.flat_centroid_block_size, @as(usize, 1));
-    try scratch.ensureDistanceCapacity(self.alloc, @max(directory.blocks.len, max_block_postings));
+    const distance_capacity = if (self.config.use_quantization and directory.posting_quantized != null and directory.posting_count != 0)
+        @max(directory.posting_count, @max(directory.blocks.len, max_block_postings))
+    else
+        @max(directory.blocks.len, max_block_postings);
+    try scratch.ensureDistanceCapacity(self.alloc, distance_capacity);
     var selected_block_storage = scratch.positions[0..directory.blocks.len];
     var selected_blocks: []usize = selected_block_storage[0..0];
     if (self.config.centroid_directory_mode == .two_level_rabitq and directory.blocks.len > 1) {
@@ -987,14 +1011,37 @@ pub fn selectFlatRabitqPostings(
     }
     defer if (quantized_posting_candidate_limit != 0 and !use_quantized_posting_candidates_stack) self.alloc.free(quantized_posting_candidates);
 
+    const global_posting_quantized = global: {
+        if (!self.config.use_quantization or
+            selected_blocks.len != directory.blocks.len or
+            directory.posting_count == 0)
+        {
+            break :global null;
+        }
+        if (directory.posting_quantized) |*posting_q| break :global posting_q;
+        break :global null;
+    };
+    if (global_posting_quantized) |posting_q| {
+        try self.quantizer.estimateDistancesWithScratch(posting_q, query, scratch.distances[0..directory.posting_count], scratch.error_bounds[0..directory.posting_count], &scratch.estimate);
+        profile.centroid_directory_posting_centroid_estimates += @intCast(directory.posting_count);
+    }
+
     for (selected_blocks) |block_index| {
         const block = &directory.blocks[block_index];
         const count = block.posting_ids.len;
-        const distances = scratch.distances[0..count];
-        const error_bounds = scratch.error_bounds[0..count];
         if (self.config.use_quantization) {
-            try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
-            profile.centroid_directory_posting_centroid_estimates += @intCast(count);
+            const distances = if (global_posting_quantized != null)
+                scratch.distances[block.posting_offset..][0..count]
+            else
+                scratch.distances[0..count];
+            const error_bounds = if (global_posting_quantized != null)
+                scratch.error_bounds[block.posting_offset..][0..count]
+            else
+                scratch.error_bounds[0..count];
+            if (global_posting_quantized == null) {
+                try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
+                profile.centroid_directory_posting_centroid_estimates += @intCast(count);
+            }
 
             var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
             for (block.posting_ids, 0..) |posting_id, i| {
@@ -1036,6 +1083,8 @@ pub fn selectFlatRabitqPostings(
             }
             profile.centroid_directory_posting_centroids_scored += @intCast(scored_candidates);
         } else {
+            const distances = scratch.distances[0..count];
+            const error_bounds = scratch.error_bounds[0..count];
             profile.centroid_directory_posting_centroids_scored += @intCast(count);
             for (0..count) |i| {
                 const centroid = block.centroids[i * dims ..][0..dims];
