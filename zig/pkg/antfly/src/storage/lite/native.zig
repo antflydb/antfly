@@ -15,8 +15,7 @@
 //! Native single-file Antfly Lite format primitives.
 //!
 //! This module owns the v1-native `.aflite` on-disk header and checkpoint-slot
-//! layout. The higher-level Lite backend still routes DB traffic through the
-//! bridge implementation until the native page/segment stores exist.
+//! layout plus the first native page stores used by the Lite backend.
 
 const std = @import("std");
 
@@ -44,7 +43,12 @@ pub const PageKind = enum(u8) {
     data = 1,
     catalog = 2,
     document = 3,
+    value = 4,
 };
+
+const document_delete_flag: u8 = 1 << 0;
+const document_external_value_flag: u8 = 1 << 1;
+const value_page_header_size: usize = 8;
 
 pub const CatalogEntry = struct {
     previous_page: u64,
@@ -57,6 +61,13 @@ pub const DocumentEntry = struct {
     key: []const u8,
     value: []const u8 = "",
     is_delete: bool = false,
+    external_value_root_page: u64 = 0,
+    external_value_len: usize = 0,
+};
+
+const ValuePage = struct {
+    next_page: u64,
+    chunk: []const u8,
 };
 
 pub const DocumentMutation = struct {
@@ -184,14 +195,17 @@ pub const NativeFile = struct {
         if (checkpoint.page_count == 0) return invalidCheck(report, "invalid_page_count");
         if (file_size < expected_size) return invalidCheck(report, "truncated_file");
 
-        _ = self.countChainPages(.catalog, checkpoint.catalog_root_page) catch |err| {
+        const catalog_records = self.countChainPages(.catalog, checkpoint.catalog_root_page) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        _ = self.countChainPages(.document, checkpoint.document_root_page) catch |err| {
+        const document_records = self.countChainPages(.document, checkpoint.document_root_page) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         if (report.tail_bytes != 0) return invalidCheck(report, "tail_bytes");
-        return report;
+
+        var valid = report;
+        valid.record_count = catalog_records + document_records;
+        return valid;
     }
 
     pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
@@ -262,13 +276,20 @@ pub const NativeFile = struct {
     pub fn putDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) !void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
+        for (mutations) |mutation| try self.validateDocumentMutation(mutation);
 
         const previous = self.activeCheckpoint();
-        const first_page_id = previous.page_count;
         var next_root_page = previous.document_root_page;
+        var next_page_id = previous.page_count;
 
-        for (mutations, 0..) |mutation, index| {
-            const page_id = first_page_id + @as(u64, @intCast(index));
+        for (mutations) |mutation| {
+            var external_value_root_page: u64 = 0;
+            if (!mutation.is_delete and !self.documentEntryFitsInline(mutation.key, mutation.value)) {
+                external_value_root_page = next_page_id;
+                next_page_id = try self.writeValuePages(next_page_id, mutation.value);
+            }
+
+            const page_id = next_page_id;
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
             try encodeDocumentEntry(self.allocator, &payload, .{
@@ -276,9 +297,11 @@ pub const NativeFile = struct {
                 .key = mutation.key,
                 .value = mutation.value,
                 .is_delete = mutation.is_delete,
+                .external_value_root_page = external_value_root_page,
             });
             try self.writePage(page_id, .document, payload.items);
             next_root_page = page_id;
+            next_page_id += 1;
         }
 
         try self.file.sync(self.io_impl.io());
@@ -286,7 +309,7 @@ pub const NativeFile = struct {
         var next = previous;
         next.commit_sequence += 1;
         next.document_root_page = next_root_page;
-        next.page_count = first_page_id + @as(u64, @intCast(mutations.len));
+        next.page_count = next_page_id;
         try self.publishCheckpoint(next);
     }
 
@@ -298,7 +321,7 @@ pub const NativeFile = struct {
             const entry = try decodeDocumentEntry(payload);
             if (std.mem.eql(u8, entry.key, key)) {
                 if (entry.is_delete) return null;
-                return try allocator.dupe(u8, entry.value);
+                return try self.documentEntryValueAlloc(allocator, entry);
             }
             page_id = entry.previous_page;
         }
@@ -325,7 +348,7 @@ pub const NativeFile = struct {
             if (!map.contains(entry.key)) {
                 const owned_key = try allocator.dupe(u8, entry.key);
                 errdefer allocator.free(owned_key);
-                const owned_value = if (entry.is_delete) null else try allocator.dupe(u8, entry.value);
+                const owned_value = if (entry.is_delete) null else try self.documentEntryValueAlloc(allocator, entry);
                 errdefer if (owned_value) |value| allocator.free(value);
                 try map.put(allocator, owned_key, owned_value);
             }
@@ -371,6 +394,32 @@ pub const NativeFile = struct {
         return @as(usize, @intCast(self.header.page_size)) - page_header_size;
     }
 
+    pub fn maxValuePagePayloadBytes(self: *const NativeFile) usize {
+        return self.maxPagePayloadBytes() - value_page_header_size;
+    }
+
+    fn validateDocumentMutation(self: *const NativeFile, mutation: DocumentMutation) !void {
+        if (mutation.key.len > std.math.maxInt(u32) or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        const fixed_len = 20 + mutation.key.len;
+        if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+        if (mutation.is_delete) return;
+        if (mutation.value.len <= self.maxPagePayloadBytes() - fixed_len) return;
+        if (value_page_header_size > self.maxPagePayloadBytes()) return error.InvalidNativePageLength;
+        if (fixed_len + 8 > self.maxPagePayloadBytes()) return error.PageTooLarge;
+    }
+
+    fn documentEntryFitsInline(self: *const NativeFile, key: []const u8, value: []const u8) bool {
+        const fixed_len = 20 + key.len;
+        return fixed_len <= self.maxPagePayloadBytes() and value.len <= self.maxPagePayloadBytes() - fixed_len;
+    }
+
+    fn documentEntryValueAlloc(self: *NativeFile, allocator: Allocator, entry: DocumentEntry) ![]u8 {
+        if (entry.external_value_root_page != 0) {
+            return try self.readValuePagesAlloc(allocator, entry.external_value_root_page, entry.external_value_len);
+        }
+        return try allocator.dupe(u8, entry.value);
+    }
+
     fn readPagePayloadByKindAlloc(self: *NativeFile, allocator: Allocator, page_id: u64, kind: PageKind) ![]u8 {
         const page = try self.readPageAlloc(allocator, page_id);
         defer allocator.free(page);
@@ -385,8 +434,14 @@ pub const NativeFile = struct {
             defer self.allocator.free(payload);
             page_id = switch (kind) {
                 .catalog => (try decodeCatalogEntry(payload)).previous_page,
-                .document => (try decodeDocumentEntry(payload)).previous_page,
-                .data => return error.UnexpectedNativePageKind,
+                .document => blk: {
+                    const entry = try decodeDocumentEntry(payload);
+                    if (entry.external_value_root_page != 0) {
+                        try self.validateValuePages(entry.external_value_root_page, entry.external_value_len);
+                    }
+                    break :blk entry.previous_page;
+                },
+                .data, .value => return error.UnexpectedNativePageKind,
             };
             count += 1;
             if (count > self.activeCheckpoint().page_count) return error.InvalidNativePageChain;
@@ -405,6 +460,65 @@ pub const NativeFile = struct {
         try self.file.sync(self.io_impl.io());
         try self.publishCheckpoint(checkpoint);
         return page_id;
+    }
+
+    fn writeValuePages(self: *NativeFile, first_page_id: u64, value: []const u8) !u64 {
+        if (value.len == 0) return error.InvalidNativeValueChain;
+        const chunk_size = self.maxValuePagePayloadBytes();
+        if (chunk_size == 0) return error.InvalidNativePageLength;
+        const page_count = std.math.divCeil(usize, value.len, chunk_size) catch unreachable;
+
+        var page_id = first_page_id;
+        var offset: usize = 0;
+        var page_index: usize = 0;
+        while (offset < value.len) : (page_index += 1) {
+            const len = @min(chunk_size, value.len - offset);
+            const next_page = if (page_index + 1 < page_count) page_id + 1 else 0;
+
+            const payload = try self.allocator.alloc(u8, value_page_header_size + len);
+            defer self.allocator.free(payload);
+            std.mem.writeInt(u64, payload[0..8], next_page, .little);
+            @memcpy(payload[value_page_header_size..][0..len], value[offset..][0..len]);
+
+            try self.writePage(page_id, .value, payload);
+            page_id += 1;
+            offset += len;
+        }
+
+        return page_id;
+    }
+
+    fn readValuePagesAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize) ![]u8 {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+
+        const value = try allocator.alloc(u8, value_len);
+        errdefer allocator.free(value);
+
+        var written: usize = 0;
+        var page_id = root_page_id;
+        var pages_seen: u64 = 0;
+        while (page_id != 0) {
+            pages_seen += 1;
+            if (pages_seen > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .value);
+            defer allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > value_len - written) return error.InvalidNativeValueChain;
+            @memcpy(value[written..][0..page.chunk.len], page.chunk);
+            written += page.chunk.len;
+            page_id = page.next_page;
+            if (written == value_len and page_id != 0) return error.InvalidNativeValueChain;
+        }
+
+        if (written != value_len) return error.InvalidNativeValueChain;
+        return value;
+    }
+
+    fn validateValuePages(self: *NativeFile, root_page_id: u64, value_len: usize) !void {
+        const value = try self.readValuePagesAlloc(self.allocator, root_page_id, value_len);
+        self.allocator.free(value);
     }
 
     fn writePage(self: *NativeFile, page_id: u64, kind: PageKind, contents: []const u8) !void {
@@ -620,6 +734,7 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
         @intFromEnum(PageKind.data) => .data,
         @intFromEnum(PageKind.catalog) => .catalog,
         @intFromEnum(PageKind.document) => .document,
+        @intFromEnum(PageKind.value) => .value,
         else => return error.InvalidNativePageKind,
     };
     if (kind != expected_kind) return error.UnexpectedNativePageKind;
@@ -667,35 +782,67 @@ fn decodeCatalogEntry(raw: []const u8) !CatalogEntry {
 
 fn encodeDocumentEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: DocumentEntry) !void {
     if (entry.key.len > std.math.maxInt(u32) or entry.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    if (entry.is_delete and entry.external_value_root_page != 0) return error.InvalidNativeDocumentEntryFlags;
+    const external_value = entry.external_value_root_page != 0;
+    if (external_value and entry.value.len == 0) return error.InvalidNativeValueChain;
+
     const start = out.items.len;
-    try out.resize(allocator, start + 20 + entry.key.len + entry.value.len);
+    const stored_value_len: usize = if (external_value) 8 else entry.value.len;
+    try out.resize(allocator, start + 20 + entry.key.len + stored_value_len);
     const encoded = out.items[start..];
     std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
-    encoded[8] = if (entry.is_delete) 1 else 0;
+    encoded[8] =
+        (if (entry.is_delete) document_delete_flag else 0) |
+        (if (external_value) document_external_value_flag else 0);
     @memset(encoded[9..12], 0);
     std.mem.writeInt(u32, encoded[12..16], @intCast(entry.key.len), .little);
     std.mem.writeInt(u32, encoded[16..20], @intCast(entry.value.len), .little);
     @memcpy(encoded[20..][0..entry.key.len], entry.key);
-    @memcpy(encoded[20 + entry.key.len ..][0..entry.value.len], entry.value);
+    if (external_value) {
+        std.mem.writeInt(u64, encoded[20 + entry.key.len ..][0..8], entry.external_value_root_page, .little);
+    } else {
+        @memcpy(encoded[20 + entry.key.len ..][0..entry.value.len], entry.value);
+    }
 }
 
 fn decodeDocumentEntry(raw: []const u8) !DocumentEntry {
     if (raw.len < 20) return error.TruncatedNativeDocumentEntry;
     const previous_page = std.mem.readInt(u64, raw[0..8], .little);
     const flags = raw[8];
-    if (flags & ~@as(u8, 1) != 0) return error.InvalidNativeDocumentEntryFlags;
+    if (flags & ~(document_delete_flag | document_external_value_flag) != 0) return error.InvalidNativeDocumentEntryFlags;
+    const is_delete = flags & document_delete_flag != 0;
+    const external_value = flags & document_external_value_flag != 0;
+    if (is_delete and external_value) return error.InvalidNativeDocumentEntryFlags;
+
     const key_len = std.mem.readInt(u32, raw[12..16], .little);
     const value_len = std.mem.readInt(u32, raw[16..20], .little);
-    const payload_len = @as(u64, key_len) + @as(u64, value_len);
+    const stored_value_len: u64 = if (external_value) 8 else value_len;
+    const payload_len = @as(u64, key_len) + stored_value_len;
     if (payload_len > raw.len - 20) return error.TruncatedNativeDocumentEntry;
     const key_start: usize = 20;
     const key_end = key_start + @as(usize, @intCast(key_len));
-    const value_end = key_end + @as(usize, @intCast(value_len));
+    const stored_value_end = key_end + @as(usize, @intCast(stored_value_len));
+    const external_value_root_page = if (external_value) blk: {
+        if (value_len == 0) return error.InvalidNativeValueChain;
+        const root = std.mem.readInt(u64, raw[key_end..][0..8], .little);
+        if (root == 0) return error.InvalidNativeValueChain;
+        break :blk root;
+    } else 0;
     return .{
         .previous_page = previous_page,
         .key = raw[key_start..key_end],
-        .value = raw[key_end..value_end],
-        .is_delete = flags & 1 != 0,
+        .value = if (external_value) raw[key_end..key_end] else raw[key_end..stored_value_end],
+        .is_delete = is_delete,
+        .external_value_root_page = external_value_root_page,
+        .external_value_len = if (external_value) @intCast(value_len) else 0,
+    };
+}
+
+fn decodeValuePage(raw: []const u8) !ValuePage {
+    if (raw.len < value_page_header_size) return error.TruncatedNativeValuePage;
+    return .{
+        .next_page = std.mem.readInt(u64, raw[0..8], .little),
+        .chunk = raw[value_page_header_size..],
     };
 }
 
@@ -740,6 +887,8 @@ fn issueForPageCheckError(err: anyerror) []const u8 {
         error.TruncatedNativeDocumentEntry => "truncated_document_entry",
         error.InvalidNativeDocumentEntryFlags => "invalid_document_entry_flags",
         error.InvalidNativePageChain => "invalid_page_chain",
+        error.TruncatedNativeValuePage => "truncated_value_page",
+        error.InvalidNativeValueChain => "invalid_value_chain",
         else => "invalid_page",
     };
 }
@@ -1014,6 +1163,47 @@ test "lite native document store returns newest overwrite" {
     try std.testing.expectEqualStrings("new", value);
 }
 
+test "lite native document store spills large values into value pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-large.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, 9000);
+    defer allocator.free(large);
+    for (large, 0..) |*byte, i| {
+        byte.* = @intCast('a' + (i % 26));
+    }
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        const value_pages = std.math.divCeil(usize, large.len, file.maxValuePagePayloadBytes()) catch unreachable;
+        try file.putDocument("doc:large", large);
+        try std.testing.expectEqual(@as(u64, @intCast(2 + value_pages)), file.activeCheckpoint().page_count);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:large")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualSlices(u8, large, value);
+
+    const docs = try reopened.snapshotDocumentsAlloc(allocator);
+    defer NativeFile.freeSnapshotDocuments(allocator, docs);
+    try std.testing.expectEqual(@as(usize, 1), docs.len);
+    try std.testing.expectEqualStrings("doc:large", docs[0].key);
+    try std.testing.expectEqualSlices(u8, large, docs[0].value);
+
+    const report = try reopened.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.record_count);
+}
+
 test "lite native document tombstone hides older value after reopen" {
     const allocator = std.testing.allocator;
 
@@ -1059,6 +1249,40 @@ test "lite native document store detects corrupted root page" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getDocumentAlloc(allocator, "doc:1"));
+}
+
+test "lite native document store detects corrupted external value page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-large-corrupt.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, 9000);
+    defer allocator.free(large);
+    @memset(large, 'x');
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:large", large);
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getDocumentAlloc(allocator, "doc:large"));
+
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
 }
 
 test "lite native document batch publishes one checkpoint" {
