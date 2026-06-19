@@ -34,9 +34,18 @@ Recommended position:
 Latest review decisions:
 
 - Keep HA string validation shared only at the missing/padded classification
-  layer. Replace `paddedHAString` with a small `classifyHAString` helper, but
-  keep field-specific errors and type-specific validation for paths, node ids,
-  slot names, token environment variables, and URLs.
+  layer. Replace `paddedHAString` with
+  `HAStringValidation = enum { ok, missing, padded }` and
+  `classifyHAString(value: ?[]const u8)`, but keep field-specific errors and
+  type-specific validation for paths, node ids, slot names, token environment
+  variables, and URLs. Do not replace this with one catch-all
+  `validateHAString`.
+- Type-specific validation is part of the HA contract: paths must be absolute,
+  normalized, and bounded to the allowed storage root where appropriate; node
+  ids and slot names must use a restricted charset and bounded length; token
+  environment variables must use the existing environment-variable-name rules;
+  and admin/replication URLs must parse as URLs while rejecting hidden
+  whitespace.
 - Add `test_standby.py` as a real-process Zig e2e once the admin API and
   runtime wiring are usable. The test should cover primary startup, slot
   creation, standby seed/startup, primary writes, standby catch-up, read-only
@@ -52,7 +61,11 @@ Latest review decisions:
   sync commit, fencing, promotion/timeline/former-primary repair, standby
   freshness, WAL retention/reseed, auth, audit, metrics, runbooks,
   compatibility tests, crash/e2e/operator coverage, and optional Postgres-like
-  archive/PITR or relay-replica decisions are explicit.
+  archive/PITR or relay-replica decisions are explicit. The bulk parity gaps
+  after basic streaming are former-primary repair similar to `pg_rewind`,
+  synchronous commit policy depth, WAL archive/PITR options, robust
+  observability, cascading or relay replicas if desired, and operator
+  ergonomics.
 
 The closest design model is Postgres physical standby operation: base backup,
 WAL streaming, replication slots, timelines, synchronous commit modes, and

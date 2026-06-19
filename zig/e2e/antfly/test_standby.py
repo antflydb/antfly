@@ -275,7 +275,7 @@ class HASwarmNode:
 class HACluster:
     def __init__(self, binary: str):
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-ha-standby-e2e-")
-        self.root = Path(self.tempdir.name)
+        self.root = Path(self.tempdir.name).resolve()
         self.admin_token_env = "ANTFLY_HA_E2E_ADMIN_TOKEN"
         self.admin_token = "ha-e2e-secret-token"
         self.primary = HASwarmNode(
