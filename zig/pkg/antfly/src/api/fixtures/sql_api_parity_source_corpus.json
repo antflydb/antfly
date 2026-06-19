@@ -7555,6 +7555,27 @@
       "sql": "ROLLBACK WORK;"
     },
     {
+      "name": "unsupported prepare transaction durable state",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=prepared_transaction_plan",
+      "classification_reason": "prepared_transaction_plan",
+      "sql": "PREPARE TRANSACTION 'usage_batch';"
+    },
+    {
+      "name": "unsupported commit prepared transaction durable state",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=prepared_transaction_plan",
+      "classification_reason": "prepared_transaction_plan",
+      "sql": "COMMIT PREPARED 'usage_batch';"
+    },
+    {
+      "name": "unsupported rollback prepared transaction durable state",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=prepared_transaction_plan",
+      "classification_reason": "prepared_transaction_plan",
+      "sql": "ROLLBACK PREPARED 'usage_batch';"
+    },
+    {
       "name": "adapter-only session setting syntax",
       "family": "adapter_noop_ddl",
       "plan": "adapter_noop:ddl:reason=session_setting",

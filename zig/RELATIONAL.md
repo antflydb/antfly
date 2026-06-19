@@ -4511,9 +4511,12 @@ extra statements. `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO
 to typed savepoint transaction-control intents that capture the savepoint name
 and fail closed at schema/storage application until native nested transaction
 rollback/release semantics exist. Prepared transaction commands are not boundary
-no-ops; they must fail closed until Antfly owns a durable prepared-transaction
-model. This keeps savepoint and prepared-transaction syntax out of storage while
-preserving a stable typed boundary for the future subtransaction model.
+no-ops; the source parity corpus requires `PREPARE TRANSACTION`,
+`COMMIT PREPARED`, and `ROLLBACK PREPARED` to fail closed with the stable
+`prepared_transaction_plan` reason until Antfly owns a durable
+prepared-transaction model. This keeps savepoint and prepared-transaction
+syntax out of storage while preserving a stable typed boundary for the future
+subtransaction model.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
@@ -4595,8 +4598,9 @@ constraint state and request-level isolation/access/retry options. Plain
 TRANSACTION`, `ROLLBACK`, and `ROLLBACK WORK` lower to typed adapter no-op
 records with the stable `transaction_control` reason. Mode-bearing transaction
 starts remain typed transaction-control plans, and non-boundary operations such
-as prepared transaction commit must fail closed until Antfly owns a durable
-prepared-transaction model.
+as prepared transaction prepare/commit/rollback must fail closed with
+`prepared_transaction_plan` until Antfly owns a durable prepared-transaction
+model.
 
 Notification-channel SQL is also adapter grammar over typed native intent, not
 backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in

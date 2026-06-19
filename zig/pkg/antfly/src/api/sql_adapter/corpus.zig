@@ -4004,6 +4004,9 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
     unsupported_ddl_deferrable_unique_constraint: bool = false,
     unsupported_ddl_deferrable_primary_key: bool = false,
+    unsupported_ddl_prepare_transaction_plan: bool = false,
+    unsupported_ddl_commit_prepared_transaction_plan: bool = false,
+    unsupported_ddl_rollback_prepared_transaction_plan: bool = false,
     unsupported_ddl_row_rewrite_expression_plan: bool = false,
     unsupported_ddl_transaction_scoped_search_path: bool = false,
     unsupported_write: bool = false,
@@ -5204,6 +5207,15 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "deferrable_primary_key") and
                     std.mem.indexOf(u8, entry.sql, " PRIMARY KEY ") != null and
                     std.mem.indexOf(u8, entry.sql, " DEFERRABLE") != null);
+            self.unsupported_ddl_prepare_transaction_plan = self.unsupported_ddl_prepare_transaction_plan or
+                (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
+                    std.mem.startsWith(u8, entry.sql, "PREPARE TRANSACTION "));
+            self.unsupported_ddl_commit_prepared_transaction_plan = self.unsupported_ddl_commit_prepared_transaction_plan or
+                (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
+                    std.mem.startsWith(u8, entry.sql, "COMMIT PREPARED "));
+            self.unsupported_ddl_rollback_prepared_transaction_plan = self.unsupported_ddl_rollback_prepared_transaction_plan or
+                (std.mem.eql(u8, entry.classification_reason, "prepared_transaction_plan") and
+                    std.mem.startsWith(u8, entry.sql, "ROLLBACK PREPARED "));
             self.unsupported_ddl_row_rewrite_expression_plan = self.unsupported_ddl_row_rewrite_expression_plan or
                 (std.mem.eql(u8, entry.classification_reason, "row_rewrite_expression_plan") and
                     std.mem.indexOf(u8, entry.sql, " USING ") != null);
@@ -6161,6 +6173,9 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_write_recursive_cte_merge);
         try std.testing.expect(self.unsupported_ddl_deferrable_unique_constraint);
         try std.testing.expect(self.unsupported_ddl_deferrable_primary_key);
+        try std.testing.expect(self.unsupported_ddl_prepare_transaction_plan);
+        try std.testing.expect(self.unsupported_ddl_commit_prepared_transaction_plan);
+        try std.testing.expect(self.unsupported_ddl_rollback_prepared_transaction_plan);
         try std.testing.expect(self.unsupported_ddl_row_rewrite_expression_plan);
         try std.testing.expect(self.unsupported_ddl_transaction_scoped_search_path);
         try std.testing.expect(self.read_row_lock_nowait);
