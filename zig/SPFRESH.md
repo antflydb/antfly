@@ -1208,8 +1208,9 @@ implementations cleanly:
     segment into bounded range reads, so flat/two-level directory probes do not
     turn a selected posting batch into one file read per base value, while
     singleton batch groups read directly into the owned output buffer instead
-    of staging through temporary range scratch. The same
-    newest-first batch scan keeps a
+    of staging through temporary range scratch. Sorted posting-id batches also
+    resolve base point locations with a linear index merge instead of one
+    binary index lookup per posting. The same newest-first batch scan keeps a
     compact unresolved-position list, so older segments only check postings
     still missing from the batch, and its per-segment point-read candidates are
     stack-backed for common probe windows. Lazy centroid-directory bulk loads

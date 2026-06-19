@@ -891,6 +891,7 @@ pub const LazyDirectorySnapshot = struct {
         if (posting_ids.len == 0) return out;
 
         const sorted_by_segment_id = self.manifest.segments_sorted_by_segment_id;
+        const posting_ids_ascending = isAscendingU64(posting_ids);
         var best_segment_ids_stack: [base_data_batch_best_segment_stack_capacity]u64 = undefined;
         const use_best_segment_ids_stack = !sorted_by_segment_id and posting_ids.len <= best_segment_ids_stack.len;
         var best_segment_ids: []u64 = &.{};
@@ -957,15 +958,25 @@ pub const LazyDirectorySnapshot = struct {
             var point_read_count: usize = 0;
 
             if (sorted_by_segment_id) {
-                for (unresolved_positions) |i| {
-                    const posting_id = posting_ids[i];
-                    if (!entry.meta.mayContainPosting(posting_id)) continue;
-                    const found = (try pointIndexEntryFromIndexData(index_data.data, entry.meta.entry_count, posting_id, .base)) orelse continue;
-                    point_reads_storage[point_read_count] = .{
-                        .output_index = i,
-                        .found = found,
-                    };
-                    point_read_count += 1;
+                if (posting_ids_ascending) {
+                    point_read_count = try appendBasePointReadsForSortedPositions(
+                        index_data.data,
+                        entry.meta.entry_count,
+                        posting_ids,
+                        unresolved_positions,
+                        point_reads_storage,
+                    );
+                } else {
+                    for (unresolved_positions) |i| {
+                        const posting_id = posting_ids[i];
+                        if (!entry.meta.mayContainPosting(posting_id)) continue;
+                        const found = (try pointIndexEntryFromIndexData(index_data.data, entry.meta.entry_count, posting_id, .base)) orelse continue;
+                        point_reads_storage[point_read_count] = .{
+                            .output_index = i,
+                            .found = found,
+                        };
+                        point_read_count += 1;
+                    }
                 }
             } else {
                 for (posting_ids, 0..) |posting_id, i| {
@@ -2230,6 +2241,55 @@ fn pointIndexEntryFromIndexData(index_data: []const u8, entry_count: usize, post
     const found = try indexEntryFromBytes(index_data[match_index * index_entry_size ..][0..index_entry_size]);
     if (found.posting_id != posting_id or found.kind != kind or found.sequence != 0) return null;
     return found;
+}
+
+fn appendBasePointReadsForSortedPositions(
+    index_data: []const u8,
+    entry_count: usize,
+    posting_ids: []const PostingId,
+    positions: []const usize,
+    out: []BatchPointValueRead,
+) !usize {
+    if (positions.len == 0) return 0;
+    if (out.len < positions.len) return error.CorruptedPostingSegment;
+    if (positions[0] >= posting_ids.len) return error.CorruptedPostingSegment;
+
+    var index = lowerBoundIndexData(index_data, entry_count, posting_ids[positions[0]], .base, 0);
+    var count: usize = 0;
+    var last_posting_id: PostingId = 0;
+    var last_found: ?IndexEntry = null;
+    var have_last = false;
+
+    for (positions) |position| {
+        if (position >= posting_ids.len) return error.CorruptedPostingSegment;
+        const posting_id = posting_ids[position];
+        if (have_last and posting_id == last_posting_id) {
+            if (last_found) |found| {
+                out[count] = .{ .output_index = position, .found = found };
+                count += 1;
+            }
+            continue;
+        }
+
+        have_last = true;
+        last_posting_id = posting_id;
+        last_found = null;
+
+        while (index < entry_count) : (index += 1) {
+            const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+            if (found.posting_id < posting_id) continue;
+            if (found.posting_id > posting_id) break;
+            if (found.kind == .base and found.sequence == 0) {
+                last_found = found;
+                out[count] = .{ .output_index = position, .found = found };
+                count += 1;
+                index += 1;
+            }
+            break;
+        }
+    }
+
+    return count;
 }
 
 pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId) !?posting.PostingBaseHeader {
@@ -5200,6 +5260,15 @@ fn isStrictlyAscendingU64(values: []const u64) bool {
     return true;
 }
 
+fn isAscendingU64(values: []const u64) bool {
+    if (values.len < 2) return true;
+    var index: usize = 1;
+    while (index < values.len) : (index += 1) {
+        if (values[index - 1] > values[index]) return false;
+    }
+    return true;
+}
+
 fn rejectDuplicateSegmentIds(segment_ids: []const u64) !void {
     _ = try validateSegmentIdsAndReturnStrictlyAscending(segment_ids);
 }
@@ -5551,6 +5620,33 @@ pub fn testSortBatchPointValueReadsIfNeededSkipsOrderedInput() !void {
     try std.testing.expectEqual(@as(usize, 3), unordered[1].output_index);
     try std.testing.expectEqual(@as(usize, 16), unordered[2].found.offset);
     try std.testing.expectEqual(@as(usize, 4), unordered[2].output_index);
+}
+
+pub fn testAppendBasePointReadsForSortedPositionsMergesIndexScan() !void {
+    const alloc = std.testing.allocator;
+    var index_data = std.ArrayListUnmanaged(u8).empty;
+    defer index_data.deinit(alloc);
+
+    try appendIndexEntry(alloc, &index_data, .{ .posting_id = 1, .kind = .base, .sequence = 0, .offset = 8, .len = 2, .value_checksum = 0 });
+    try appendIndexEntry(alloc, &index_data, .{ .posting_id = 1, .kind = .delta, .sequence = 7, .offset = 32, .len = 2, .value_checksum = 0 });
+    try appendIndexEntry(alloc, &index_data, .{ .posting_id = 2, .kind = .centroid_directory, .sequence = 0, .offset = 48, .len = 2, .value_checksum = 0 });
+    try appendIndexEntry(alloc, &index_data, .{ .posting_id = 3, .kind = .base, .sequence = 0, .offset = 64, .len = 2, .value_checksum = 0 });
+    try appendIndexEntry(alloc, &index_data, .{ .posting_id = 5, .kind = .base, .sequence = 0, .offset = 80, .len = 2, .value_checksum = 0 });
+
+    const posting_ids = [_]PostingId{ 1, 2, 3, 3, 4, 5 };
+    const positions = [_]usize{ 0, 1, 2, 3, 4, 5 };
+    var reads: [posting_ids.len]BatchPointValueRead = undefined;
+    const count = try appendBasePointReadsForSortedPositions(index_data.items, 5, &posting_ids, &positions, &reads);
+
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(usize, 0), reads[0].output_index);
+    try std.testing.expectEqual(@as(PostingId, 1), reads[0].found.posting_id);
+    try std.testing.expectEqual(@as(usize, 2), reads[1].output_index);
+    try std.testing.expectEqual(@as(PostingId, 3), reads[1].found.posting_id);
+    try std.testing.expectEqual(@as(usize, 3), reads[2].output_index);
+    try std.testing.expectEqual(@as(PostingId, 3), reads[2].found.posting_id);
+    try std.testing.expectEqual(@as(usize, 5), reads[3].output_index);
+    try std.testing.expectEqual(@as(PostingId, 5), reads[3].found.posting_id);
 }
 
 pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
@@ -8329,6 +8425,10 @@ test "posting segment skips sorting ordered pending entries" {
 
 test "posting segment skips sorting ordered batch point reads" {
     try testSortBatchPointValueReadsIfNeededSkipsOrderedInput();
+}
+
+test "posting segment batch base reads merge sorted index scan" {
+    try testAppendBasePointReadsForSortedPositionsMergesIndexScan();
 }
 
 test "posting segment retained delta candidate count deduplicates sequences" {
