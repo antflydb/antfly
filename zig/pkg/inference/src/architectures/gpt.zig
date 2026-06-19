@@ -365,7 +365,9 @@ pub const DecodeContext = struct {
 };
 
 test "Gemma4LayerSpecCache matches only exact spec shape" {
+    var layers: [35]backend_contracts.DecoderRuntimeLayerSpec = undefined;
     var cache = Gemma4LayerSpecCache{
+        .layers = layers[0..],
         .configured_layer_count = 35,
         .num_hidden_layers = 35,
         .include_output_scale = true,
