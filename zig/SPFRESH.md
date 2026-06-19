@@ -1094,7 +1094,9 @@ implementations cleanly:
     best record proves older values cannot improve the result. Segment batch
     base prefetch now coalesces adjacent posting base point values from the same
     segment into bounded range reads, so flat/two-level directory probes do not
-    turn a selected posting batch into one file read per base value. The same
+    turn a selected posting batch into one file read per base value, while
+    singleton batch groups read directly into the owned output buffer instead
+    of staging through temporary range scratch. The same
     newest-first batch scan keeps a
     compact unresolved-position list, so older segments only check postings
     still missing from the batch, and its per-segment point-read candidates are

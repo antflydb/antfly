@@ -3910,6 +3910,23 @@ fn readSegmentBatchPointValuesAlloc(
         }
 
         const range_len = range_end - range_offset;
+        if (past_index == read_index + 1) {
+            const read = reads[read_index];
+            if (read.output_index >= out.len) return error.CorruptedPostingSegment;
+            const owned = try alloc.alloc(u8, read.found.len);
+            errdefer alloc.free(owned);
+            try reader.seekTo(@intCast(read.found.offset));
+            reader.interface.readSliceAll(owned) catch |err| switch (err) {
+                error.EndOfStream => return error.CorruptedPostingSegment,
+                else => return err,
+            };
+            try read.found.location().verifyValue(owned);
+            if (out[read.output_index]) |previous| alloc.free(previous);
+            out[read.output_index] = owned;
+            read_index = past_index;
+            continue;
+        }
+
         const bytes = if (range_len <= stack_values.len) blk: {
             break :blk stack_values[0..range_len];
         } else blk: {
