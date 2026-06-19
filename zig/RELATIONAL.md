@@ -4988,16 +4988,20 @@ are captured as typed bulk-I/O metadata so import/export validation can
 normalize or transcode before row decoding. Reject limits and non-default log
 verbosity are valid only for `COPY FROM STDIN` with `ON_ERROR ignore`;
 export-side or stop-on-error row-error controls fail before a typed plan is
-accepted, and default replacement is valid only for imports. The production
-shape should stream rows through typed schema validation, defaults, generated
-columns, checks, unique/FK participants, row-policy/authorization checks, 2PC
-staging, retryable range routing, and deterministic error reporting for
-imports, and through typed snapshot/range-read plans for exports. PostgreSQL
-`COPY` syntax can become an adapter frontend for those contracts, but it must
-not bypass row-batch, mutation-source, or routed read semantics. Until
-server-file, `PROGRAM`, alternate stream endpoints, and row-filtered
-`COPY FROM ... WHERE` have native bulk-I/O endpoint and validation contracts,
-the source parity corpus requires them to fail closed under `bulk_io_plan`.
+accepted, and default replacement is valid only for imports. Import-side
+`COPY FROM ... WHERE` admits a conservative scalar `field <op> literal`
+conjunction subset and stores it as shared `RelationalRowsExpressionCondition`
+metadata, so later row decoding can evaluate filters without carrying SQL text.
+The production shape should stream rows through typed schema validation,
+defaults, generated columns, checks, unique/FK participants,
+row-policy/authorization checks, 2PC staging, retryable range routing, and
+deterministic error reporting for imports, and through typed snapshot/range-read
+plans for exports. PostgreSQL `COPY` syntax can become an adapter frontend for
+those contracts, but it must not bypass row-batch, mutation-source, or routed
+read semantics. Until server-file, `PROGRAM`, alternate stream endpoints,
+legacy OID options, and broader row-filtered `COPY FROM ... WHERE` predicate
+families have native bulk-I/O endpoint and validation contracts, the source
+parity corpus requires them to fail closed under `bulk_io_plan`.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,

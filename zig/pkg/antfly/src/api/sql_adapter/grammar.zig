@@ -5030,7 +5030,7 @@ pub fn parseBulkIoTailAlloc(
     if (force_not_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
     if (force_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
 
-    try parseAdapterNoopStatementEnd(cursor);
+    if (!cursor.peekKeyword("where")) try parseAdapterNoopStatementEnd(cursor);
     table_transferred = true;
     endpoint_transferred = true;
     format_transferred = true;
@@ -8833,10 +8833,15 @@ test "sql adapter grammar parses bulk io tails" {
     var default_to_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, default_to_tokens.items, &default_to_pos));
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (FORMAT csv) WHERE status = 'active';");
-    defer lexer.freeTokens(alloc, &unsupported_tokens);
-    var unsupported_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+    var where_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (FORMAT csv) WHERE status = 'active';");
+    defer lexer.freeTokens(alloc, &where_tokens);
+    var where_pos: usize = 0;
+    var where_copy = try parseBulkIoTailAlloc(alloc, where_tokens.items, &where_pos);
+    defer where_copy.deinit(alloc);
+    try std.testing.expect(where_pos < where_tokens.items.len);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.from, where_copy.direction);
+    try std.testing.expectEqualStrings("usage_records", where_copy.table_name);
+    try std.testing.expectEqualStrings("where", where_tokens.items[where_pos].text);
 
     var freeze_to_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDOUT WITH (FREEZE true);");
     defer lexer.freeTokens(alloc, &freeze_to_tokens);

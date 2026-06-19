@@ -1679,6 +1679,7 @@ pub const BulkIoPlan = struct {
     null_marker: ?[]const u8 = null,
     default_marker: ?[]const u8 = null,
     encoding: ?[]const u8 = null,
+    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -1694,6 +1695,8 @@ pub const BulkIoPlan = struct {
         if (self.null_marker) |null_marker| alloc.free(null_marker);
         if (self.default_marker) |default_marker| alloc.free(default_marker);
         if (self.encoding) |encoding| alloc.free(encoding);
+        freeExpressionConditions(alloc, self.where_expressions);
+        if (self.where_expressions.len > 0) alloc.free(self.where_expressions);
         self.* = undefined;
     }
 };

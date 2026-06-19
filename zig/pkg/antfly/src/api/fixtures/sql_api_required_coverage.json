@@ -145,6 +145,7 @@
     "ddl_copy_quote",
     "ddl_copy_reject_limit",
     "ddl_copy_to",
+    "ddl_copy_where_expression",
     "ddl_create_covering_index",
     "ddl_create_index",
     "ddl_create_table",
