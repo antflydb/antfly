@@ -1014,13 +1014,26 @@ pub fn selectFlatRabitqPostings(
         profile.centroid_directory_blocks_selected += @intCast(selected_blocks.len);
     }
 
+    const global_posting_quantized = global: {
+        if (!self.config.use_quantization or
+            selected_blocks.len != directory.blocks.len or
+            directory.posting_count == 0)
+        {
+            break :global null;
+        }
+        if (directory.posting_quantized) |*posting_q| break :global posting_q;
+        break :global null;
+    };
     const quantized_posting_candidate_limit = if (self.config.use_quantization and selected_blocks.len != 0)
         @min(
-            max_block_postings,
-            @max(
-                @as(usize, 1),
-                (std.math.divCeil(usize, probe_limit, selected_blocks.len) catch unreachable) * 2,
-            ),
+            if (global_posting_quantized != null) directory.posting_count else max_block_postings,
+            if (global_posting_quantized != null)
+                @max(@as(usize, 1), @max(probe_limit *| 2, selected_blocks.len))
+            else
+                @max(
+                    @as(usize, 1),
+                    (std.math.divCeil(usize, probe_limit, selected_blocks.len) catch unreachable) * 2,
+                ),
         )
     else
         0;
@@ -1035,39 +1048,15 @@ pub fn selectFlatRabitqPostings(
     }
     defer if (quantized_posting_candidate_limit != 0 and !use_quantized_posting_candidates_stack) self.alloc.free(quantized_posting_candidates);
 
-    const global_posting_quantized = global: {
-        if (!self.config.use_quantization or
-            selected_blocks.len != directory.blocks.len or
-            directory.posting_count == 0)
-        {
-            break :global null;
-        }
-        if (directory.posting_quantized) |*posting_q| break :global posting_q;
-        break :global null;
-    };
     if (global_posting_quantized) |posting_q| {
         try self.quantizer.estimateDistancesWithScratch(posting_q, query, scratch.distances[0..directory.posting_count], scratch.error_bounds[0..directory.posting_count], &scratch.estimate);
         profile.centroid_directory_posting_centroid_estimates += @intCast(directory.posting_count);
-    }
 
-    for (selected_blocks) |block_index| {
-        const block = &directory.blocks[block_index];
-        const count = block.posting_ids.len;
-        if (self.config.use_quantization) {
-            const distances = if (global_posting_quantized != null)
-                scratch.distances[block.posting_offset..][0..count]
-            else
-                scratch.distances[0..count];
-            const error_bounds = if (global_posting_quantized != null)
-                scratch.error_bounds[block.posting_offset..][0..count]
-            else
-                scratch.error_bounds[0..count];
-            if (global_posting_quantized == null) {
-                try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
-                profile.centroid_directory_posting_centroid_estimates += @intCast(count);
-            }
-
-            var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
+        var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
+        for (selected_blocks) |block_index| {
+            const block = &directory.blocks[block_index];
+            const distances = scratch.distances[block.posting_offset..][0..block.posting_ids.len];
+            const error_bounds = scratch.error_bounds[block.posting_offset..][0..block.posting_ids.len];
             for (block.posting_ids, 0..) |posting_id, i| {
                 const posting_error_bound = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
                 candidate_collector.insert(.{
@@ -1081,51 +1070,103 @@ pub fn selectFlatRabitqPostings(
                     .error_bound = error_bounds[i] + posting_error_bound,
                 });
             }
-            const candidates = candidate_collector.items();
-            var scored_candidates: usize = 0;
-            for (candidates) |candidate| {
-                if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
-                const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
-                const distance = vec.distanceToQueryWithCandidateMeasure(
-                    query,
-                    query_measure,
-                    centroid,
-                    block.centroid_measures[candidate.entry_index],
-                    self.config.metric,
-                );
-                scored_candidates += 1;
-                probe_collector.insert(.{
-                    .posting_id = candidate.posting_id,
-                    .parent = candidate.parent,
-                    .level = candidate.level,
-                    .state = candidate.state,
-                    .block_index = block_index,
-                    .entry_index = candidate.entry_index,
-                    .distance = distance,
-                    .error_bound = centroidBlockProbeErrorBound(self.config.metric, distance, block.radii[candidate.entry_index]),
-                });
-            }
-            profile.centroid_directory_posting_centroids_scored += @intCast(scored_candidates);
-        } else {
-            const distances = scratch.distances[0..count];
-            const error_bounds = scratch.error_bounds[0..count];
-            profile.centroid_directory_posting_centroids_scored += @intCast(count);
-            for (0..count) |i| {
-                const centroid = block.centroids[i * dims ..][0..dims];
-                distances[i] = vec.distanceToQueryWithCandidateMeasure(query, query_measure, centroid, block.centroid_measures[i], self.config.metric);
-                error_bounds[i] = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
-            }
-            for (block.posting_ids, 0..) |posting_id, i| {
-                probe_collector.insert(.{
-                    .posting_id = posting_id,
-                    .parent = block.parents[i],
-                    .level = block.levels[i],
-                    .state = block.states[i],
-                    .block_index = block_index,
-                    .entry_index = i,
-                    .distance = distances[i],
-                    .error_bound = error_bounds[i],
-                });
+        }
+        const candidates = candidate_collector.items();
+        var scored_candidates: usize = 0;
+        for (candidates) |candidate| {
+            if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
+            const block = &directory.blocks[candidate.block_index];
+            const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
+            const distance = vec.distanceToQueryWithCandidateMeasure(
+                query,
+                query_measure,
+                centroid,
+                block.centroid_measures[candidate.entry_index],
+                self.config.metric,
+            );
+            scored_candidates += 1;
+            probe_collector.insert(.{
+                .posting_id = candidate.posting_id,
+                .parent = candidate.parent,
+                .level = candidate.level,
+                .state = candidate.state,
+                .block_index = candidate.block_index,
+                .entry_index = candidate.entry_index,
+                .distance = distance,
+                .error_bound = centroidBlockProbeErrorBound(self.config.metric, distance, block.radii[candidate.entry_index]),
+            });
+        }
+        profile.centroid_directory_posting_centroids_scored += @intCast(scored_candidates);
+    } else {
+        for (selected_blocks) |block_index| {
+            const block = &directory.blocks[block_index];
+            const count = block.posting_ids.len;
+            if (self.config.use_quantization) {
+                const distances = scratch.distances[0..count];
+                const error_bounds = scratch.error_bounds[0..count];
+                try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
+                profile.centroid_directory_posting_centroid_estimates += @intCast(count);
+
+                var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
+                for (block.posting_ids, 0..) |posting_id, i| {
+                    const posting_error_bound = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
+                    candidate_collector.insert(.{
+                        .posting_id = posting_id,
+                        .parent = block.parents[i],
+                        .level = block.levels[i],
+                        .state = block.states[i],
+                        .block_index = block_index,
+                        .entry_index = i,
+                        .distance = distances[i],
+                        .error_bound = error_bounds[i] + posting_error_bound,
+                    });
+                }
+                const candidates = candidate_collector.items();
+                var scored_candidates: usize = 0;
+                for (candidates) |candidate| {
+                    if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
+                    const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
+                    const distance = vec.distanceToQueryWithCandidateMeasure(
+                        query,
+                        query_measure,
+                        centroid,
+                        block.centroid_measures[candidate.entry_index],
+                        self.config.metric,
+                    );
+                    scored_candidates += 1;
+                    probe_collector.insert(.{
+                        .posting_id = candidate.posting_id,
+                        .parent = candidate.parent,
+                        .level = candidate.level,
+                        .state = candidate.state,
+                        .block_index = block_index,
+                        .entry_index = candidate.entry_index,
+                        .distance = distance,
+                        .error_bound = centroidBlockProbeErrorBound(self.config.metric, distance, block.radii[candidate.entry_index]),
+                    });
+                }
+                profile.centroid_directory_posting_centroids_scored += @intCast(scored_candidates);
+            } else {
+                const distances = scratch.distances[0..count];
+                const error_bounds = scratch.error_bounds[0..count];
+                profile.centroid_directory_posting_centroids_scored += @intCast(count);
+                for (0..count) |i| {
+                    const centroid = block.centroids[i * dims ..][0..dims];
+                    distances[i] = vec.distanceToQueryWithCandidateMeasure(query, query_measure, centroid, block.centroid_measures[i], self.config.metric);
+                    error_bounds[i] = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
+                }
+                for (block.posting_ids, 0..) |posting_id, i| {
+                    probe_collector.insert(.{
+                        .posting_id = posting_id,
+                        .parent = block.parents[i],
+                        .level = block.levels[i],
+                        .state = block.states[i],
+                        .block_index = block_index,
+                        .entry_index = i,
+                        .distance = distances[i],
+                        .error_bound = error_bounds[i],
+                    });
+                }
             }
         }
     }
