@@ -25,8 +25,9 @@ Antfly Lite.
 - Make upgrade to normal Antfly explicit and reliable through portable backup
   and restore.
 - Keep the embedded API stable enough for language bindings.
-- Make `.aflite` the public v1 database format instead of exposing a temporary
-  directory-backed user format.
+- Make `.aflite` the public v1 database format, backed by a Lite-native
+  single-file engine instead of exposing a temporary directory-backed user
+  format.
 
 ## Non-Goals
 
@@ -56,9 +57,10 @@ The repository already has the main ingredients:
   reads, writes, append, rename, delete, and atomic write hooks.
 
 That means the product work should harden and package the existing embedded
-path while adding a single-file storage container underneath the LSM storage
-abstraction. Directory-backed storage can remain an internal development and
-test profile, but `.aflite` should be the public v1 format.
+path while adding a Lite-native single-file backend that avoids translating the
+embedded profile into many synthetic logical files. Directory-backed and
+LSM-container storage can remain internal development, migration, and test
+profiles, but `.aflite` should be the public v1 format.
 
 ## Product Shape
 
@@ -118,34 +120,32 @@ Python, Node, and Java bindings can layer on top of it.
 Antfly Lite v1 should use `.aflite` as the live database format. Users should
 not need to understand a temporary directory-backed layout.
 
-The single-file database should be implemented as a new storage container below
-the LSM `Storage` abstraction, not by forcing every Antfly subsystem into LMDB.
-The LSM and index layers already think in logical files, manifests, WAL
-segments, table files, and atomic writes. A single-file container can present
-those logical paths from inside one physical file.
+The single-file database should be implemented as a Lite-native backend, not as
+a long-term LSM directory packed into one file. The native backend should keep
+Antfly's document, index, enrichment, query, backup, and restore semantics, but
+map them onto file-local pages or segments directly. That avoids the extra I/O
+and coordination introduced by emulating logical files, manifests, renames, and
+asynchronous cleanup inside another single-file container.
 
-This is intentionally a container/VFS direction, not a separate Lite-native
-database engine for v1. Replacing the LSM path would require reimplementing
-document ordering, range scans, WAL/recovery semantics, manifests, index file
-lifecycles, compaction, backup, and restore semantics that the existing Antfly
-DB and index stack already exercise. The v1 production target should therefore
-be:
+The v1 production target should therefore be:
 
 ```text
 Antfly DB and indexes
-  -> existing LSM Storage interface
-    -> .aflite single-file container
+  -> Lite-native storage engine
+    -> .aflite single-file database
 ```
 
-A future Lite-native backend should stay possible, but should be driven by
-evidence that the container approach cannot meet product requirements: startup
-replay is too expensive, write amplification is unacceptable, logical-file churn
-forces too much vacuuming, page-level random access becomes mandatory, or the
-index stack needs tighter coupling than logical storage objects can provide.
+An LSM-backed `.aflite` container can still be useful as an incremental
+implementation bridge because it exercises the existing storage abstraction and
+lets the CLI, C ABI, backup, restore, and compatibility tests land early. It
+should not define the long-term v1 architecture. If benchmarks show meaningful
+I/O and coordination savings from the Lite-native path, the native backend is
+the v1 target, not a v2 candidate.
 
 Directory-backed LSM storage should remain available as an internal development,
-debug, and conformance-test profile. It should not be the public Lite v1
-contract.
+debug, and conformance-test profile. LSM-container storage should be treated the
+same way unless it is explicitly retained as a compatibility importer. Neither
+should be the public Lite v1 contract.
 
 The extension meanings should stay distinct:
 
@@ -157,62 +157,66 @@ The extension meanings should stay distinct:
 
 ## Storage Design
 
-### Single-File Container
+### Lite-Native Single-File Backend
 
-The `.aflite` single-file format should be a container for logical Antfly
-storage objects:
+The `.aflite` single-file format should be a database file with a native layout
+for embedded Antfly data:
 
-- manifest files
-- WAL segments
-- LSM table files
+- database header and format version
+- checkpoint roots
+- catalog pages
+- document key/value pages or segments
 - text index files
 - dense vector/HBC posting files
 - sparse posting files
 - graph reverse indexes
 - catalog records
-- container metadata
+- enrichment definitions and state
 - free-space map
-- checkpoint and vacuum state
+- integrity metadata
+- optional append journal or commit log
 
-The container should provide the existing storage operations:
+The backend should provide Antfly database operations directly:
 
-- create logical directory
-- read whole logical file
-- read range
-- read trailer
-- write file
-- append file where needed
-- atomic write and publish
-- rename
-- delete
-- delete tree
-- file size
-- current time
+- point lookup
+- ordered scan
+- compare-and-set or transaction commit
+- index definition reads and writes
+- posting-list reads and writes
+- vector/HBC reads and writes
+- graph edge reads and writes
+- enrichment queue/state reads and writes
+- snapshot creation for readers, backup, and restore
+- page or segment allocation and reclamation
 
 Important correctness rules:
 
 - Atomic publish must survive process crash.
-- Readers must not observe a partially published logical file.
-- The container must support integrity checking.
-- The container must support online backup or a consistent checkpoint.
+- Readers must not observe a partially committed transaction.
+- The backend must support integrity checking.
+- The backend must support online backup or a consistent checkpoint.
 - Vacuum/compaction should be explicit.
 
 LMDB may still be useful for an LMDB profile, but it should not be the only
 Antfly Lite story. LMDB gives an mmap data file plus a lock file and fits a
 simple KV shape well. Antfly's richer index stack already has its own LSM and
-posting-file needs, so the container route gives us a more general product.
+posting-file needs, so the native backend gives us a more general product while
+removing the I/O cost of pretending those structures are separate filesystem
+objects.
 
-### Internal Directory Profile
+### Internal LSM Profiles
 
-The durable LSM directory layout should remain useful internally:
+The durable LSM directory and LSM-container layouts should remain useful
+internally:
 
 - exercising existing LSM conformance tests
-- comparing `.aflite` container behavior against the current filesystem storage
+- comparing native `.aflite` behavior against the current filesystem storage
 - debugging corruption or recovery issues
-- measuring container overhead against raw files
+- measuring native backend performance against the bridge implementation
+- providing an importer for pre-native experimental `.aflite` files if needed
 
-This profile should be hidden behind developer flags or build steps. It should
-not appear in the normal user docs as a Lite database format.
+These profiles should be hidden behind developer flags or build steps. They
+should not appear in the normal user docs as Lite database formats.
 
 ## Concurrency Model
 
@@ -491,7 +495,7 @@ Minimum test matrix:
 - open/close/reopen durability
 - crash during write
 - crash during index update
-- crash during container atomic publish
+- crash during commit/checkpoint publish
 - reader/writer concurrency
 - read-only open while writer exists
 - backup from Lite, restore into normal Antfly
@@ -502,7 +506,8 @@ Minimum test matrix:
 - caller-supplied embeddings search
 - remote inference-backed enrichment
 - local inference-backed enrichment where available
-- integrity check detects truncated or corrupted container data
+- integrity check detects truncated or corrupted database pages, segments, or
+  journal data
 
 The most important compatibility test is a round trip:
 
@@ -515,15 +520,18 @@ query-visible results should match within documented index rebuild semantics.
 
 ## Implementation Plan
 
-### Phase 1: Single-File Storage Container
+### Phase 1: Lite-Native Single-File Backend
 
-- Implement a single-file `Storage` backend for the LSM layer.
-- Add container manifest, logical-file table, free-space map, atomic publish,
-  checkpoint, and vacuum.
+- Implement a Lite-native storage backend for embedded Antfly.
+- Add database header, catalog roots, page or segment allocator, free-space map,
+  commit/checkpoint publish, crash recovery, integrity checks, and vacuum.
+- Preserve Antfly's document ordering, range scans, index definitions,
+  enrichment state, vector/HBC artifacts, sparse artifacts, graph artifacts,
+  backup, and restore semantics.
 - Add `.aflite` as the live single-file database format.
-- Run existing backend and DB conformance tests against both filesystem-backed
-  LSM storage and the `.aflite` container.
-- Keep the filesystem-backed directory profile as a developer/test-only path.
+- Run existing DB conformance tests against the native `.aflite` backend.
+- Keep filesystem-backed LSM and LSM-container profiles as developer/test-only
+  bridge paths.
 
 ### Phase 2: Name And CLI Shell
 
@@ -586,10 +594,10 @@ Ship Antfly Lite v1 as `.aflite`, not as a public directory-backed format. This
 keeps the product mental model simple: a Lite database is a file, and a portable
 backup is an `.afb` archive.
 
-This moves more work into v1 because the single-file storage container must
-exist before the public Lite launch. That is the right tradeoff: it keeps the UX
-clean and avoids creating a temporary directory format that users will treat as
-stable.
+This moves more work into v1 because the Lite-native storage engine must exist
+before the public Lite launch. That is the right tradeoff: it keeps the UX clean
+and avoids shipping a synthetic LSM container whose extra logical-file churn,
+vacuum pressure, and coordination become the public architecture.
 
 The naming recommendation is:
 
