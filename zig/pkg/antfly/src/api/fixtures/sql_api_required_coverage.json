@@ -132,6 +132,7 @@
     "ddl_copy_delimiter",
     "ddl_copy_encoding",
     "ddl_copy_escape",
+    "ddl_copy_force_quote",
     "ddl_copy_freeze",
     "ddl_copy_from",
     "ddl_copy_header",

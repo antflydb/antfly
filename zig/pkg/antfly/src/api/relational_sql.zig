@@ -3606,6 +3606,8 @@ const Parser = struct {
         const format = syntax.format;
         const header = syntax.header;
         const freeze = syntax.freeze;
+        const force_quote_all = syntax.force_quote_all;
+        const force_quote_columns = syntax.force_quote_columns;
         const delimiter = syntax.delimiter;
         const quote = syntax.quote;
         const escape = syntax.escape;
@@ -3615,6 +3617,7 @@ const Parser = struct {
         syntax.columns = &.{};
         syntax.endpoint = "";
         syntax.format = null;
+        syntax.force_quote_columns = &.{};
         syntax.delimiter = null;
         syntax.quote = null;
         syntax.escape = null;
@@ -3628,6 +3631,8 @@ const Parser = struct {
             .format = format,
             .header = header,
             .freeze = freeze,
+            .force_quote_all = force_quote_all,
+            .force_quote_columns = force_quote_columns,
             .delimiter = delimiter,
             .quote = quote,
             .escape = escape,
@@ -45192,6 +45197,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("csv", copy_from_plan.format.?);
     try std.testing.expect(!copy_from_plan.header);
     try std.testing.expect(!copy_from_plan.freeze);
+    try std.testing.expect(!copy_from_plan.force_quote_all);
+    try std.testing.expectEqual(@as(usize, 0), copy_from_plan.force_quote_columns.len);
     try std.testing.expect(copy_from_plan.delimiter == null);
     try std.testing.expect(copy_from_plan.quote == null);
     try std.testing.expect(copy_from_plan.escape == null);
@@ -45199,7 +45206,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(copy_from_plan.encoding == null);
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default", copy_from_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:force_quote=none:force_quote_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default", copy_from_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
     var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
@@ -45210,6 +45217,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     };
     try std.testing.expect(copy_from_header_plan.header);
     try std.testing.expect(copy_from_header_plan.freeze);
+    try std.testing.expect(!copy_from_header_plan.force_quote_all);
+    try std.testing.expectEqual(@as(usize, 0), copy_from_header_plan.force_quote_columns.len);
     try std.testing.expectEqualStrings(",", copy_from_header_plan.delimiter.?);
     try std.testing.expectEqualStrings("\"", copy_from_header_plan.quote.?);
     try std.testing.expectEqualStrings("!", copy_from_header_plan.escape.?);
@@ -45217,13 +45226,18 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("UTF8", copy_from_header_plan.encoding.?);
     const copy_from_header_fingerprint = try ddlFingerprintAlloc(alloc, copy_from_header);
     defer alloc.free(copy_from_header_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:encoding_hex=55544638", copy_from_header_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:force_quote=none:force_quote_columns=0:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:encoding_hex=55544638", copy_from_header_fingerprint);
 
-    var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv);");
+    var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *);");
     defer copy_to.deinit(alloc);
+    const copy_to_plan = switch (copy_to) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(copy_to_plan.force_quote_all);
     const copy_to_fingerprint = try ddlFingerprintAlloc(alloc, copy_to);
     defer alloc.free(copy_to_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default", copy_to_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:force_quote=all:force_quote_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default", copy_to_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
@@ -56648,14 +56662,14 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             break :blk if (plan.format) |format|
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:freeze={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:encoding_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, plan.freeze, delimiter_hex, quote_hex, escape_hex, null_marker_hex, encoding_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:freeze={}:force_quote={s}:force_quote_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:encoding_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, plan.freeze, bulkIoForceQuoteName(plan), plan.force_quote_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, encoding_hex },
                 )
             else
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:freeze={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:encoding_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, plan.freeze, delimiter_hex, quote_hex, escape_hex, null_marker_hex, encoding_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:freeze={}:force_quote={s}:force_quote_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:encoding_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, plan.freeze, bulkIoForceQuoteName(plan), plan.force_quote_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, encoding_hex },
                 );
         },
         .table_partition_catalog => |plan| switch (plan) {
@@ -57246,6 +57260,12 @@ fn bulkIoDirectionName(direction: BulkIoDirection) []const u8 {
         .from => "from",
         .to => "to",
     };
+}
+
+fn bulkIoForceQuoteName(plan: BulkIoPlan) []const u8 {
+    if (plan.force_quote_all) return "all";
+    if (plan.force_quote_columns.len != 0) return "columns";
+    return "none";
 }
 
 fn bulkIoByteOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]const u8 {

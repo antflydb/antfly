@@ -981,6 +981,8 @@ pub const BulkIoSyntax = struct {
     format: ?[]const u8 = null,
     header: bool = false,
     freeze: bool = false,
+    force_quote_all: bool = false,
+    force_quote_columns: []const []const u8 = &.{},
     delimiter: ?[]const u8 = null,
     quote: ?[]const u8 = null,
     escape: ?[]const u8 = null,
@@ -990,6 +992,7 @@ pub const BulkIoSyntax = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.table_name));
         freeStringSlice(alloc, self.columns);
+        freeStringSlice(alloc, self.force_quote_columns);
         alloc.free(@constCast(self.endpoint));
         if (self.format) |format| alloc.free(@constCast(format));
         if (self.delimiter) |delimiter| alloc.free(@constCast(delimiter));
@@ -4873,18 +4876,22 @@ pub fn parseBulkIoTailAlloc(
     var format: ?[]const u8 = null;
     var header = false;
     var freeze = false;
+    var force_quote_all = false;
+    var force_quote_columns: []const []const u8 = &.{};
     var delimiter: ?[]const u8 = null;
     var quote: ?[]const u8 = null;
     var escape: ?[]const u8 = null;
     var null_marker: ?[]const u8 = null;
     var encoding: ?[]const u8 = null;
     var format_transferred = false;
+    var force_quote_columns_transferred = false;
     var delimiter_transferred = false;
     var quote_transferred = false;
     var escape_transferred = false;
     var null_marker_transferred = false;
     var encoding_transferred = false;
     errdefer if (!format_transferred) if (format) |value| alloc.free(@constCast(value));
+    errdefer if (!force_quote_columns_transferred) freeStringSlice(alloc, force_quote_columns);
     errdefer if (!delimiter_transferred) if (delimiter) |value| alloc.free(@constCast(value));
     errdefer if (!quote_transferred) if (quote) |value| alloc.free(@constCast(value));
     errdefer if (!escape_transferred) if (escape) |value| alloc.free(@constCast(value));
@@ -4909,6 +4916,14 @@ pub fn parseBulkIoTailAlloc(
                     freeze = true;
                 } else if (std.ascii.eqlIgnoreCase(value.text, "false")) {
                     freeze = false;
+                } else return error.UnsupportedSqlShape;
+            } else if (cursor.matchKeyword("force_quote")) {
+                if (force_quote_all or force_quote_columns.len != 0) return error.UnsupportedSqlShape;
+                if (cursor.matchToken(.star) != null) {
+                    force_quote_all = true;
+                } else if (cursor.matchToken(.lparen) != null) {
+                    force_quote_columns = try parseIdentifierListAlloc(alloc, tokens, pos);
+                    try cursor.expectToken(.rparen);
                 } else return error.UnsupportedSqlShape;
             } else if (cursor.matchKeyword("delimiter")) {
                 if (delimiter != null) return error.UnsupportedSqlShape;
@@ -4952,11 +4967,13 @@ pub fn parseBulkIoTailAlloc(
         try cursor.expectToken(.rparen);
     }
     if (freeze and direction != .from) return error.UnsupportedSqlShape;
+    if ((force_quote_all or force_quote_columns.len != 0) and direction != .to) return error.UnsupportedSqlShape;
 
     try parseAdapterNoopStatementEnd(cursor);
     table_transferred = true;
     endpoint_transferred = true;
     format_transferred = true;
+    force_quote_columns_transferred = true;
     delimiter_transferred = true;
     quote_transferred = true;
     escape_transferred = true;
@@ -4970,6 +4987,8 @@ pub fn parseBulkIoTailAlloc(
         .format = format,
         .header = header,
         .freeze = freeze,
+        .force_quote_all = force_quote_all,
+        .force_quote_columns = force_quote_columns,
         .delimiter = delimiter,
         .quote = quote,
         .escape = escape,
@@ -8663,7 +8682,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("", copy_header.null_marker.?);
     try std.testing.expectEqualStrings("UTF8", copy_header.encoding.?);
 
-    var copy_to_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records TO STDOUT;");
+    var copy_to_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records TO STDOUT WITH (FORCE_QUOTE *);");
     defer lexer.freeTokens(alloc, &copy_to_tokens);
     var copy_to_pos: usize = 0;
     var copy_to = try parseBulkIoTailAlloc(alloc, copy_to_tokens.items, &copy_to_pos);
@@ -8675,8 +8694,19 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("STDOUT", copy_to.endpoint);
     try std.testing.expect(copy_to.format == null);
     try std.testing.expect(!copy_to.header);
+    try std.testing.expect(copy_to.force_quote_all);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (FORCE_QUOTE *);");
+    var force_quote_columns_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDOUT WITH (FORCE_QUOTE (id, status));");
+    defer lexer.freeTokens(alloc, &force_quote_columns_tokens);
+    var force_quote_columns_pos: usize = 0;
+    var force_quote_columns = try parseBulkIoTailAlloc(alloc, force_quote_columns_tokens.items, &force_quote_columns_pos);
+    defer force_quote_columns.deinit(alloc);
+    try std.testing.expect(!force_quote_columns.force_quote_all);
+    try std.testing.expectEqual(@as(usize, 2), force_quote_columns.force_quote_columns.len);
+    try std.testing.expectEqualStrings("id", force_quote_columns.force_quote_columns[0]);
+    try std.testing.expectEqualStrings("status", force_quote_columns.force_quote_columns[1]);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (FORCE_NOT_NULL *);");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

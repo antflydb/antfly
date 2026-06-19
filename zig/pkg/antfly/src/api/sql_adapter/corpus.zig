@@ -3925,6 +3925,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_delimiter: bool = false,
     ddl_copy_escape: bool = false,
     ddl_copy_encoding: bool = false,
+    ddl_copy_force_quote: bool = false,
     ddl_copy_freeze: bool = false,
     ddl_copy_null_marker: bool = false,
     ddl_copy_quote: bool = false,
@@ -5348,7 +5349,7 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_copy_unsupported_options = self.unsupported_ddl_copy_unsupported_options or
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     std.mem.startsWith(u8, entry.sql, "COPY ") and
-                    std.mem.indexOf(u8, entry.sql, "FORCE_QUOTE") != null);
+                    std.mem.indexOf(u8, entry.sql, "FORCE_NOT_NULL") != null);
             self.unsupported_ddl_covering_expression_index_plan = self.unsupported_ddl_covering_expression_index_plan or
                 (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
                     std.mem.indexOf(u8, entry.sql, "lower(") != null and
@@ -5601,7 +5602,10 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_null_marker = self.ddl_copy_null_marker or sql_adapter.planHasExactStringToken(entry.plan, ":null_marker_hex=", "empty");
                     self.ddl_copy_quote = self.ddl_copy_quote or sql_adapter.planHasExactStringToken(entry.plan, ":quote_hex=", "22");
                 },
-                .copy_to => self.ddl_copy_to = true,
+                .copy_to => {
+                    self.ddl_copy_to = true;
+                    self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");
+                },
                 .create_partitioned_table => self.ddl_partition_create_parent = true,
                 .create_table_partition => self.ddl_partition_create_child = true,
                 .attach_table_partition => self.ddl_partition_attach = true,
@@ -6548,6 +6552,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_copy_delimiter);
         try std.testing.expect(self.ddl_copy_escape);
         try std.testing.expect(self.ddl_copy_encoding);
+        try std.testing.expect(self.ddl_copy_force_quote);
         try std.testing.expect(self.ddl_copy_freeze);
         try std.testing.expect(self.ddl_copy_null_marker);
         try std.testing.expect(self.ddl_copy_quote);
