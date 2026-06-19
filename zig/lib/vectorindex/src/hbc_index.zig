@@ -2566,8 +2566,8 @@ fn prefetchFlatProbePostingMembers(
     profile.posting_overlay_ns += elapsed_fn_u64(prefetch_start);
 }
 
-fn resolveFlatCentroidProbeLimit(configured_probe_count: usize, search_width: u32) usize {
-    const dynamic_limit = @max(@as(usize, @intCast(search_width)), @as(usize, 1));
+fn resolveFlatCentroidProbeLimit(configured_probe_count: usize, search_width: u32, candidate_limit: usize) usize {
+    const dynamic_limit = @max(@as(usize, @intCast(search_width)), @max(candidate_limit, @as(usize, 1)));
     if (configured_probe_count == 0) return dynamic_limit;
     return @min(configured_probe_count, dynamic_limit);
 }
@@ -2664,7 +2664,7 @@ pub fn searchProfiledRequest(
     profile.setup_ns += elapsed_fn_u64(setup_start);
 
     if (usesFlatCentroidDirectorySearch(self.config)) {
-        const probe_limit = resolveFlatCentroidProbeLimit(self.config.flat_centroid_probe_count, search_width);
+        const probe_limit = resolveFlatCentroidProbeLimit(self.config.flat_centroid_probe_count, search_width, candidate_limit);
         var probes_stack: [flat_centroid_search_probe_stack_capacity]spfresh_index.FlatCentroidProbe = undefined;
         const use_probes_stack = probe_limit <= probes_stack.len;
         var probes = if (use_probes_stack)
@@ -4332,10 +4332,11 @@ test "boundary rerank threshold ambiguity selects retained approximate set" {
 }
 
 test "flat centroid probe limit follows dynamic search width under configured cap" {
-    try std.testing.expectEqual(@as(usize, 64), resolveFlatCentroidProbeLimit(0, 64));
-    try std.testing.expectEqual(@as(usize, 1), resolveFlatCentroidProbeLimit(0, 0));
-    try std.testing.expectEqual(@as(usize, 16), resolveFlatCentroidProbeLimit(256, 16));
-    try std.testing.expectEqual(@as(usize, 256), resolveFlatCentroidProbeLimit(256, 4096));
+    try std.testing.expectEqual(@as(usize, 64), resolveFlatCentroidProbeLimit(0, 64, 10));
+    try std.testing.expectEqual(@as(usize, 10), resolveFlatCentroidProbeLimit(0, 0, 10));
+    try std.testing.expectEqual(@as(usize, 1), resolveFlatCentroidProbeLimit(0, 0, 0));
+    try std.testing.expectEqual(@as(usize, 32), resolveFlatCentroidProbeLimit(256, 16, 32));
+    try std.testing.expectEqual(@as(usize, 256), resolveFlatCentroidProbeLimit(256, 4096, 32));
 }
 
 test "flat centroid search probe stack covers default 256 probe window" {

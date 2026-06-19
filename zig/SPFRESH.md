@@ -2521,6 +2521,10 @@ rows now also emit the observed effective block-probe limit and selected block
 count, so adaptive two-level rows can prove how many coarse blocks they actually
 probed instead of relying only on the configured
 `flat_centroid_block_probe_count` value.
+Automatic flat/two-level posting-probe effort is now at least the rerank
+candidate budget, while an explicit `flat_centroid_probe_count` remains an
+upper bound. That keeps low `search_width` requests from probing fewer posting
+centroids than the query is prepared to retain/rerank.
 
 Repeatable comparison runner:
 
