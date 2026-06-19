@@ -15,6 +15,7 @@
 const std = @import("std");
 const antfly = @import("antfly-zig");
 const cli = @import("cli/mod.zig");
+const fs_paths = antfly.common.fs_paths;
 
 const Allocator = std.mem.Allocator;
 const max_json_file_bytes: usize = 64 * 1024 * 1024;
@@ -23,6 +24,7 @@ const db_mod = antfly.db;
 const db_types = db_mod.types;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
+const portable_backup = antfly.portable_backup;
 
 const LiteDb = struct {
     allocator: Allocator,
@@ -68,6 +70,8 @@ const LiteDb = struct {
 const ParsedLookupRequest = struct {
     fields: ?[]const []const u8 = null,
 };
+
+const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
 const OwnedLookupRequest = struct {
     fields: [][]const u8 = &.{},
@@ -124,6 +128,9 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "enrichment")) return try enrichmentCommand(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "schema")) return try schemaCommand(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "run-until-idle")) return try runUntilIdle(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "backup") or std.mem.eql(u8, subcommand, "export")) return try backup(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "restore")) return try restore(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "import")) return try importBackup(init.gpa, init.io, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -421,6 +428,88 @@ fn runUntilIdle(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
     writeJsonLine(io, json);
 }
 
+fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    const out_path = parseOutFlag(args);
+    try requireAfbPath(out_path);
+
+    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    defer lite.close();
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try portable_backup.exportPortable(allocator, lite.db.core.store, &out);
+    try writeFileAtomically(allocator, io, out_path, out.items);
+
+    cli.writeStdout(io, "{\"format\":\"afb\",\"path\":");
+    try writeJsonString(allocator, io, out_path);
+    cli.writeStdout(io, "}\n");
+}
+
+fn restore(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const backup_path = args.next() orelse cli.fatal("backup path is required", .{});
+    try requireAfbPath(backup_path);
+    var out_path: ?[]const u8 = null;
+    var replace = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--out") or std.mem.eql(u8, arg, "-o")) {
+            out_path = args.next();
+        } else if (std.mem.eql(u8, arg, "--replace")) {
+            replace = true;
+        } else {
+            cli.fatal("unknown restore argument: {s}", .{arg});
+        }
+    }
+    const resolved_out = out_path orelse cli.fatal("--out is required", .{});
+    try restoreFromBackupFile(allocator, io, backup_path, resolved_out, replace);
+}
+
+fn importBackup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    var from_path: ?[]const u8 = null;
+    var replace = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--from")) {
+            from_path = args.next();
+        } else if (std.mem.eql(u8, arg, "--replace")) {
+            replace = true;
+        } else {
+            cli.fatal("unknown import argument: {s}", .{arg});
+        }
+    }
+    const resolved_from = from_path orelse cli.fatal("--from is required", .{});
+    try restoreFromBackupFile(allocator, io, resolved_from, path, replace);
+}
+
+fn restoreFromBackupFile(
+    allocator: Allocator,
+    io: std.Io,
+    backup_path: []const u8,
+    out_path: []const u8,
+    replace: bool,
+) !void {
+    try requireAfbPath(backup_path);
+    try requireAflitePath(out_path);
+    if (pathExists(io, out_path)) {
+        if (!replace) cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
+        try deleteFilePath(io, out_path);
+    }
+
+    const body = try cli.readFileAlloc(io, allocator, backup_path, max_afb_file_bytes);
+    defer allocator.free(body);
+
+    var lite = try LiteDb.open(allocator, out_path, .writer);
+    defer lite.close();
+
+    try portable_backup.importPortable(allocator, lite.db.core.store, body);
+
+    cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
+    try writeJsonString(allocator, io, out_path);
+    cli.writeStdout(io, "}\n");
+}
+
 fn pinLiteStorage(opts: *db_mod.OpenOptions, storage: antfly.lsm_backend.Storage) void {
     opts.storage = storage;
     opts.index_backends.text_lsm_storage = storage;
@@ -616,6 +705,18 @@ fn parseFileFlag(args: *std.process.Args.Iterator) []const u8 {
     return file_path orelse cli.fatal("--file is required", .{});
 }
 
+fn parseOutFlag(args: *std.process.Args.Iterator) []const u8 {
+    var out_path: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--out") or std.mem.eql(u8, arg, "-o")) {
+            out_path = args.next();
+        } else {
+            cli.fatal("unknown argument: {s}", .{arg});
+        }
+    }
+    return out_path orelse cli.fatal("--out is required", .{});
+}
+
 fn parseNameFlag(args: *std.process.Args.Iterator, flag_name: []const u8) []const u8 {
     var name: ?[]const u8 = null;
     while (args.next()) |arg| {
@@ -646,9 +747,65 @@ fn requireAflitePath(path: []const u8) !void {
     }
 }
 
+fn requireAfbPath(path: []const u8) !void {
+    if (!std.mem.endsWith(u8, path, ".afb")) {
+        std.debug.print("error: Antfly portable backup paths must end in .afb: {s}\n", .{path});
+        return error.InvalidArguments;
+    }
+}
+
 fn writeJsonLine(io: std.Io, json: []const u8) void {
     cli.writeStdout(io, json);
     cli.writeStdout(io, "\n");
+}
+
+fn writeFileAtomically(allocator: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        try fs_paths.createDirPathPortable(io, parent);
+    }
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [8192]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try writer.interface.writeAll(contents);
+        try writer.end();
+        try file.sync(io);
+    }
+
+    renameFilePath(io, tmp_path, path) catch |err| {
+        deleteFilePath(io, tmp_path) catch {};
+        return err;
+    };
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    }
+    return true;
+}
+
+fn renameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(old_path) and std.fs.path.isAbsolute(new_path)) {
+        try std.Io.Dir.renameAbsolute(old_path, new_path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io);
+    }
+}
+
+fn deleteFilePath(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
+    }
 }
 
 fn writeJsonString(allocator: Allocator, io: std.Io, value: []const u8) !void {
@@ -691,6 +848,10 @@ fn printUsage(argv0: []const u8) void {
         \\  schema get <db.aflite>
         \\  schema set <db.aflite> --file schema.json
         \\  run-until-idle <db.aflite>
+        \\  backup <db.aflite> --out backup.afb
+        \\  export <db.aflite> --out backup.afb
+        \\  restore <backup.afb> --out <db.aflite> [--replace]
+        \\  import <db.aflite> --from <backup.afb> [--replace]
         \\
     , .{argv0});
 }
@@ -698,4 +859,35 @@ fn printUsage(argv0: []const u8) void {
 test "lite path validation requires aflite extension" {
     try requireAflitePath("app.aflite");
     try std.testing.expectError(error.InvalidArguments, requireAflitePath("app.afl"));
+}
+
+test "lite backup path validation requires afb extension" {
+    try requireAfbPath("app.afb");
+    try std.testing.expectError(error.InvalidArguments, requireAfbPath("app.aflite"));
+}
+
+test "lite backup writer handles absolute output paths" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}/abs/backup.afb", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(path);
+
+    try writeFileAtomically(allocator, io, path, "portable-backup");
+
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var buf: [64]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    const body = try reader.interface.readAlloc(allocator, 64);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("portable-backup", body);
 }

@@ -75,6 +75,10 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     defer identity_batch.deinit(alloc);
     var identity_batch_bytes: usize = 0;
 
+    var metadata_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer metadata_batch.deinit(alloc);
+    var metadata_batch_bytes: usize = 0;
+
     // Embeddings keyed by index name
     var emb_batches = std.StringHashMapUnmanaged(EmbeddingBatch).empty;
     defer {
@@ -100,6 +104,19 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     var counts = Counts{};
 
     for (pairs) |kv| {
+        if (isPortableMetadataKey(kv.key)) {
+            try metadata_batch.append(alloc, .{
+                .key = try alloc.dupe(u8, kv.key),
+                .value = try alloc.dupe(u8, kv.value),
+            });
+            metadata_batch_bytes += kv.key.len + kv.value.len;
+            if (metadata_batch_bytes >= batch_target_bytes) {
+                try flushMetadataBatch(alloc, out, &metadata_batch);
+                metadata_batch_bytes = 0;
+            }
+            continue;
+        }
+
         if (kv.key.len > 0 and kv.key[0] == internal_keys.identity_namespace) {
             try identity_batch.append(alloc, .{
                 .key = try alloc.dupe(u8, kv.key),
@@ -161,6 +178,9 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     }
     if (identity_batch.items.len > 0) {
         try flushIdentityBatch(alloc, out, &identity_batch);
+    }
+    if (metadata_batch.items.len > 0) {
+        try flushMetadataBatch(alloc, out, &metadata_batch);
     }
 
     // Flush embedding batches
@@ -349,6 +369,31 @@ fn flushIdentityBatch(
     batch.clearRetainingCapacity();
 }
 
+fn flushMetadataBatch(
+    alloc: Allocator,
+    out: *ArrayList(u8),
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+) !void {
+    const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
+    defer alloc.free(encoded);
+    try backup_codec.writeBlock(out, alloc, .metadata_batch, encoded);
+
+    for (batch.items) |e| {
+        alloc.free(e.key);
+        alloc.free(e.value);
+    }
+    batch.clearRetainingCapacity();
+}
+
+fn isPortableMetadataKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
+        std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_v") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:schema_json") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers");
+}
+
 /// Parse an embedding artifact value and collect into the appropriate batch.
 fn collectEmbedding(
     alloc: Allocator,
@@ -471,6 +516,7 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
+            .metadata_batch => try importMetadataBatch(alloc, store, block.payload),
             // Skip: sparse, summary, chunk, transaction (rebuilt by enrichment)
             .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
             else => {},
@@ -557,6 +603,29 @@ fn importIdentityBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
         if (e.key.len == 0 or e.key[0] != internal_keys.identity_namespace) {
             return error.InvalidDocIdentityBatch;
         }
+        try writes.append(alloc, .{ .key = e.key, .value = e.value });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importMetadataBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer {
+        for (entries) |e| {
+            alloc.free(e.key);
+            alloc.free(e.value);
+        }
+        alloc.free(entries);
+    }
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+
+    for (entries) |e| {
+        if (!isPortableMetadataKey(e.key)) return error.InvalidMetadataBatch;
         try writes.append(alloc, .{ .key = e.key, .value = e.value });
     }
 
@@ -928,6 +997,43 @@ test "export and import preserves doc identity metadata" {
     try std.testing.expectEqual(@as(u64, 2), stats.allocated_ordinals);
     try std.testing.expectEqual(@as(u64, 1), stats.live_ordinals);
     try std.testing.expectEqual(@as(u64, 1), stats.tombstone_ordinals);
+}
+
+test "export and import preserves portable schema and catalog metadata" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const portable_entries = [_]KVPair{
+        .{ .key = "\x00\x00__metadata__:schema_json", .value = "{\"version\":1}" },
+        .{ .key = "\x00\x00__metadata__:schema", .value = "runtime-schema" },
+        .{ .key = "\x00\x00__metadata__:schema_v1", .value = "runtime-schema-v1" },
+        .{ .key = "\x00\x00__metadata__:indexes", .value = "[{\"name\":\"ft\",\"kind\":\"full_text\",\"config_json\":\"{}\"}]" },
+        .{ .key = "\x00\x00__metadata__:enrichments", .value = "[]" },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = "[]" },
+    };
+    try src.putBatch(&portable_entries, &.{});
+    try src.putBatch(&.{.{ .key = "\x00\x00__metadata__:text_field_analyzers:ft", .value = "{}" }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    for (portable_entries) |entry| {
+        const restored = try dst.get(alloc, entry.key);
+        defer alloc.free(restored);
+        try std.testing.expectEqualStrings(entry.value, restored);
+    }
+    try std.testing.expectError(error.NotFound, dst.get(alloc, "\x00\x00__metadata__:text_field_analyzers:ft"));
 }
 
 test "import rejects doc identity metadata with invalid canonical ids" {

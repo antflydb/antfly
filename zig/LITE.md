@@ -519,6 +519,8 @@ query-visible results should match within documented index rebuild semantics.
 
 - Add `antfly lite backup`.
 - Add `antfly lite restore`.
+- Treat `antfly lite export` as an alias for backup and `antfly lite import`
+  as the inverse restore shape.
 - Add `antfly lite promote` as a wrapper around portable backup and normal
   restore.
 - Add normal Antfly restore support for `.aflite` input by opening it read-only
