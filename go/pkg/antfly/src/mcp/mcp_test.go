@@ -256,8 +256,10 @@ func TestDropTable(t *testing.T) {
 }
 
 func TestQuery(t *testing.T) {
+	var gotReq QueryRequest
 	handler := &mockHandler{
 		queryFn: func(ctx context.Context, req QueryRequest) (*QueryResult, error) {
+			gotReq = req
 			return &QueryResult{
 				HitCount: 2,
 				Structured: map[string]any{
@@ -277,9 +279,10 @@ func TestQuery(t *testing.T) {
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "query",
 		Arguments: map[string]any{
-			"tableName":      "docs",
-			"fullTextSearch": "test",
-			"limit":          10,
+			"tableName":           "docs",
+			"fullTextSearch":      "test",
+			"fullTextSearchField": "content",
+			"limit":               10,
 		},
 	})
 	require.NoError(t, err)
@@ -288,6 +291,9 @@ func TestQuery(t *testing.T) {
 	tc, ok := result.Content[0].(*mcp.TextContent)
 	require.True(t, ok)
 	assert.Contains(t, tc.Text, "2 results")
+	assert.Equal(t, "docs", gotReq.TableName)
+	assert.Equal(t, "test", gotReq.FullTextSearch)
+	assert.Equal(t, "content", gotReq.FullTextSearchField)
 
 	// Verify structured content is a map (round-tripped query result)
 	if result.StructuredContent != nil {
