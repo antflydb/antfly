@@ -10255,7 +10255,17 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         schema: runtime_schema_mod.TableSchema,
     ) !?RowsAuthFilterPlan {
-        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
+        return try self.rowsAuthFilterPlanForIdentityInDatabase(tables_api.default_database_name, table_name, authenticated_identity, schema);
+    }
+
+    fn rowsAuthFilterPlanForIdentityInDatabase(
+        self: *ApiHttpServer,
+        database_name: []const u8,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+    ) !?RowsAuthFilterPlan {
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, database_name, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const json = row_filter_json orelse return null;
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, json, .{
@@ -10265,6 +10275,20 @@ pub const ApiHttpServer = struct {
         var filter = try self.rowsAuthFilterPlanFromValue(schema, parsed.value);
         errdefer filter.deinit(self.alloc);
         return filter;
+    }
+
+    fn applyRowsQueryRequestRowFilterForDatabase(
+        self: *ApiHttpServer,
+        database_name: []const u8,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        var filter = try self.rowsAuthFilterPlanForIdentityInDatabase(database_name, table_name, authenticated_identity, schema);
+        defer if (filter) |*value| value.deinit(self.alloc);
+        const active = filter orelse return;
+        try self.applyRowsAuthFilterToQuery(schema, active, query);
     }
 
     fn rowsAuthFilterPlanFromValue(
@@ -10688,6 +10712,36 @@ pub const ApiHttpServer = struct {
         try self.appendRowsAuthInPredicatesToQuery(filter.in_predicates, query);
         try self.appendRowsAuthJsonContainsToQuery(filter.json_contains, query);
         try self.appendRowsAuthAccessOrPredicatesToQuery(filter.access_or_predicates, query);
+    }
+
+    fn deinitRowsAuthFilterQueryAdditions(
+        self: *ApiHttpServer,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) void {
+        freeRowsAuthPredicates(self.alloc, query.predicates);
+        if (query.predicates.len > 0) self.alloc.free(@constCast(query.predicates));
+        for (query.array_any) |predicate| {
+            self.alloc.free(@constCast(predicate.field));
+            self.alloc.free(@constCast(predicate.value_json));
+        }
+        if (query.array_any.len > 0) self.alloc.free(@constCast(query.array_any));
+        for (query.in_predicates) |predicate| {
+            self.alloc.free(@constCast(predicate.field));
+            self.alloc.free(@constCast(predicate.values_json));
+        }
+        if (query.in_predicates.len > 0) self.alloc.free(@constCast(query.in_predicates));
+        for (query.json_contains) |predicate| {
+            self.alloc.free(@constCast(predicate.field));
+            self.alloc.free(@constCast(predicate.value_json));
+        }
+        if (query.json_contains.len > 0) self.alloc.free(@constCast(query.json_contains));
+        freeRowsAuthAccessPredicateGroups(self.alloc, query.access_or_predicates);
+        if (query.access_or_predicates.len > 0) self.alloc.free(@constCast(query.access_or_predicates));
+        query.predicates = &.{};
+        query.array_any = &.{};
+        query.in_predicates = &.{};
+        query.json_contains = &.{};
+        query.access_or_predicates = &.{};
     }
 
     fn appendRowsAuthPredicatesToQuery(
@@ -17264,14 +17318,16 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             try std.testing.expectEqual(@as(usize, 2), plan.query.select.len);
             try std.testing.expectEqualStrings("id", plan.query.select[0]);
             try std.testing.expectEqualStrings("status", plan.query.select[1]);
+            try std.testing.expectEqual(@as(usize, 1), plan.query.predicates.len);
+            try std.testing.expectEqualStrings("status", plan.query.predicates[0].field);
+            try std.testing.expectEqual(runtime_schema_mod.RelationalCheckOp.eq, plan.query.predicates[0].op);
+            try std.testing.expectEqualStrings("\"Ready\"", plan.query.predicates[0].value_json orelse return error.TestUnexpectedResult);
             self.calls += 1;
 
-            const rows = try allocator.alloc([]const u8, 2);
+            const rows = try allocator.alloc([]const u8, 1);
             errdefer allocator.free(rows);
             rows[0] = try allocator.dupe(u8, "{\"id\":\"u1\",\"status\":\"Ready\"}");
-            errdefer allocator.free(@constCast(rows[0]));
-            rows[1] = try allocator.dupe(u8, "{\"id\":\"u2\",\"status\":\"Done, \\\"quoted\\\"\"}");
-            return .{ .rows = rows, .total = 2 };
+            return .{ .rows = rows, .total = 1 };
         }
     };
 
@@ -17333,6 +17389,22 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     try std.testing.expectEqualStrings("Ready", first_row.value.object.get("status").?.string);
     try std.testing.expectEqualStrings("ready", first_row.value.object.get("status_key").?.string);
 
+    const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    errdefer alloc.free(row_filters);
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "tenant_ops.analytics.events", "{\"term\":{\"status\":\"Ready\"}}");
+    identity.row_filter = row_filters;
+
+    try std.testing.expectError(
+        error.PermissionDenied,
+        server.executeBulkSqlCopyFromStdinWithSession(
+            "COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);",
+            "id,status\nu1,Ready\nu2,Done\n",
+            session,
+            &identity,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), writes.calls);
+
     const exported = try server.executeBulkSqlCopyToStdoutWithSession(
         "COPY events (id, status) TO STDOUT WITH (FORMAT csv, HEADER true, FORCE_QUOTE *);",
         session,
@@ -17340,7 +17412,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     );
     defer alloc.free(exported);
     try std.testing.expectEqual(@as(usize, 1), reads.calls);
-    try std.testing.expectEqualStrings("id,status\n\"u1\",\"Ready\"\n\"u2\",\"Done, \"\"quoted\"\"\"\n", exported);
+    try std.testing.expectEqualStrings("id,status\n\"u1\",\"Ready\"\n", exported);
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
