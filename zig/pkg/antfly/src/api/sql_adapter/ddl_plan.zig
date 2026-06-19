@@ -722,12 +722,14 @@ pub const CreateRoutinePlan = struct {
     security: ?RoutineSecurity = null,
     parallel_safety: ?RoutineParallelSafety = null,
     leakproof: bool = false,
+    support_function: ?[]const u8 = null,
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.routine_name);
         if (self.returns_type) |returns_type| alloc.free(returns_type);
         if (self.language) |language| alloc.free(language);
+        if (self.support_function) |support_function| alloc.free(support_function);
         if (self.cost) |cost| alloc.free(cost);
         self.* = undefined;
     }

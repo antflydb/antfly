@@ -210,6 +210,7 @@
     "ddl_function_parallel",
     "ddl_function_replace",
     "ddl_function_security",
+    "ddl_function_support",
     "ddl_function_volatility",
     "ddl_identity_allocator_generated",
     "ddl_identity_allocator_generated_options",

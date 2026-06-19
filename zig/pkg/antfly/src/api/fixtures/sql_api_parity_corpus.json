@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "47904c7f7f843a53503f93752c2ebf97158cb7126b09bceb8608f89ff4a45d24",
-  "source_entry_count": 971,
-  "entry_count": 971,
+  "source_sha256": "f4439fec72b871f7fee1cd8822ce48df82df6bbafd3bf99d0fa5bcda2eeb0f9f",
+  "source_entry_count": 972,
+  "entry_count": 972,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3917,6 +3917,17 @@
       "sql": "CREATE FUNCTION leakproof_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF"
     },
     {
+      "name": "create support function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "support_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=support_audit:args=0:replace=false:returns=trigger:language=plpgsql:support=audit_support",
+      "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support"
+    },
+    {
       "name": "unsupported create function body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
@@ -3928,7 +3939,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb"
     },
     {
       "name": "drop function catalog ddl",

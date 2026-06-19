@@ -413,12 +413,14 @@ pub const CreateRoutineSyntax = struct {
     security: ?ddl_plan.RoutineSecurity = null,
     parallel_safety: ?ddl_plan.RoutineParallelSafety = null,
     leakproof: bool = false,
+    support_function: ?[]const u8 = null,
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.routine_name));
         if (self.returns_type) |returns_type| alloc.free(@constCast(returns_type));
         if (self.language) |language| alloc.free(@constCast(language));
+        if (self.support_function) |support_function| alloc.free(@constCast(support_function));
         if (self.cost) |cost| alloc.free(@constCast(cost));
         self.* = undefined;
     }
@@ -2540,6 +2542,8 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     var security: ?ddl_plan.RoutineSecurity = null;
     var parallel_safety: ?ddl_plan.RoutineParallelSafety = null;
     var leakproof = false;
+    var support_function: ?[]const u8 = null;
+    errdefer if (support_function) |value| alloc.free(@constCast(value));
     var cost: ?[]const u8 = null;
     errdefer if (cost) |value| alloc.free(@constCast(value));
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
@@ -2597,6 +2601,11 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             leakproof = true;
             continue;
         }
+        if (cursor.matchKeyword("support")) {
+            if (support_function != null) return error.UnsupportedSqlShape;
+            support_function = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+            continue;
+        }
         if (cursor.matchKeyword("cost")) {
             if (cost != null) return error.UnsupportedSqlShape;
             const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
@@ -2620,10 +2629,12 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .security = security,
         .parallel_safety = parallel_safety,
         .leakproof = leakproof,
+        .support_function = support_function,
         .cost = cost,
     };
     returns_type = null;
     language = null;
+    support_function = null;
     cost = null;
     return out;
 }
@@ -7105,6 +7116,15 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(RoutineKindSyntax.function, leakproof_function.kind);
     try std.testing.expect(leakproof_function.leakproof);
 
+    var support_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SUPPORT audit_support;");
+    defer lexer.freeTokens(alloc, &support_function_tokens);
+    var support_function_pos: usize = 0;
+    var support_function = try parseCreateRoutineCatalogTailAlloc(alloc, support_function_tokens.items, &support_function_pos);
+    defer support_function.deinit(alloc);
+    try std.testing.expectEqual(support_function_tokens.items.len, support_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, support_function.kind);
+    try std.testing.expectEqualStrings("audit_support", support_function.support_function.?);
+
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);
     var create_procedure_pos: usize = 0;
@@ -7158,7 +7178,7 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(security_tokens.items.len, security_pos);
     try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, security.security.?);
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SUPPORT audit_support;");
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql TRANSFORM FOR TYPE jsonb;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));

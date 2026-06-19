@@ -4325,6 +4325,17 @@
       "sql": "CREATE FUNCTION leakproof_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF"
     },
     {
+      "name": "create support function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "support_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=support_audit:args=0:replace=false:returns=trigger:language=plpgsql:support=audit_support",
+      "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support"
+    },
+    {
       "name": "unsupported create function body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
@@ -4336,7 +4347,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb"
     },
     {
       "name": "drop function catalog ddl",
