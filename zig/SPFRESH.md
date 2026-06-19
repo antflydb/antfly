@@ -1242,7 +1242,10 @@ implementations cleanly:
     entry counts. Newly written segment files populate base, delta-value, and
     centroid-directory counts from the segment index, and lazy point, base
     batch, and centroid-directory scans use those counts to skip segment
-    indexes when the requested record family cannot be present.
+    indexes when the requested record family cannot be present. Segment
+    compaction uses the same counts to skip delta-only segments during the
+    point-candidate pass and point-only segments during the delta-retention
+    pass, while preserving the old full scan when kind counts are unknown.
     Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read

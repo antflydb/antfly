@@ -2699,19 +2699,28 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
     for (segments) |segment| {
         stats.input_bytes += segment.data.len;
         stats.input_entries += segment.meta.entry_count;
+        const known_kind_counts = segment.meta.hasKnownKindCounts();
+        if (known_kind_counts) {
+            stats.input_base_records += segment.meta.base_count;
+            stats.input_centroid_records += segment.meta.centroid_directory_count;
+            stats.input_delta_values += segment.meta.delta_value_count;
+            if (!segment.meta.mayContainKind(.base) and !segment.meta.mayContainKind(.centroid_directory)) continue;
+        }
         var reader = try Reader.init(segment.data);
         var iter = reader.entries();
         while (try iter.next()) |entry| {
             switch (entry.kind) {
                 .base => {
-                    stats.input_base_records += 1;
+                    if (!known_kind_counts) stats.input_base_records += 1;
                     try putNewestPoint(alloc, &bases, entry.posting_id, segment.meta.segment_id, entry.value);
                 },
                 .centroid_directory => {
-                    stats.input_centroid_records += 1;
+                    if (!known_kind_counts) stats.input_centroid_records += 1;
                     try putNewestPoint(alloc, &centroids, entry.posting_id, segment.meta.segment_id, entry.value);
                 },
-                .delta => stats.input_delta_values += 1,
+                .delta => {
+                    if (!known_kind_counts) stats.input_delta_values += 1;
+                },
             }
         }
     }
@@ -2725,6 +2734,7 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
     var deltas = std.ArrayListUnmanaged(DeltaCandidate).empty;
     defer deltas.deinit(alloc);
     for (segments) |segment| {
+        if (!segment.meta.mayContainKind(.delta)) continue;
         var reader = try Reader.init(segment.data);
         var iter = reader.entries();
         while (try iter.next()) |entry| {
@@ -6091,6 +6101,38 @@ pub fn testSegmentMayContainDeltaAfterGeneration() !void {
     }, 2));
 }
 
+pub fn testSegmentMetaKindPredicates() !void {
+    const unknown_counts = SegmentMeta{
+        .segment_id = 1,
+        .min_posting_id = 7,
+        .max_posting_id = 9,
+        .byte_len = 1,
+        .entry_count = 3,
+    };
+    try std.testing.expect(!unknown_counts.hasKnownKindCounts());
+    try std.testing.expect(unknown_counts.mayContainKind(.base));
+    try std.testing.expect(unknown_counts.mayContainKind(.delta));
+    try std.testing.expect(unknown_counts.mayContainKind(.centroid_directory));
+
+    const known_counts = SegmentMeta{
+        .segment_id = 2,
+        .min_posting_id = 7,
+        .max_posting_id = 9,
+        .byte_len = 1,
+        .entry_count = 3,
+        .base_count = 2,
+        .delta_value_count = 0,
+        .centroid_directory_count = 1,
+    };
+    try std.testing.expect(known_counts.hasKnownKindCounts());
+    try std.testing.expect(known_counts.mayContainKind(.base));
+    try std.testing.expect(!known_counts.mayContainKind(.delta));
+    try std.testing.expect(known_counts.mayContainKind(.centroid_directory));
+    try std.testing.expect(known_counts.mayContainPointKind(8, .base));
+    try std.testing.expect(!known_counts.mayContainPointKind(8, .delta));
+    try std.testing.expect(!known_counts.mayContainPointKind(99, .base));
+}
+
 pub fn testSegmentDeltaReadersSkipBaseOnlyCorruption() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8971,6 +9013,9 @@ pub fn testCompactsSegmentsToLivePostingEntries() !void {
     defer compacted.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 9), compacted.segment.meta.segment_id);
     try std.testing.expectEqual(@as(usize, 3), compacted.segment.meta.entry_count);
+    try std.testing.expectEqual(@as(usize, 1), compacted.segment.meta.base_count);
+    try std.testing.expectEqual(@as(usize, 1), compacted.segment.meta.delta_value_count);
+    try std.testing.expectEqual(@as(usize, 1), compacted.segment.meta.centroid_directory_count);
     try std.testing.expectEqual(@as(usize, 2), compacted.stats.input_segments);
     try std.testing.expectEqual(segment_1.data.len + segment_2.data.len, compacted.stats.input_bytes);
     try std.testing.expectEqual(segment_1.meta.entry_count + segment_2.meta.entry_count, compacted.stats.input_entries);
@@ -9052,6 +9097,10 @@ test "posting segment sorted batch compaction keeps untouched windows" {
 
 test "posting segment delta paths skip segments without delta metadata" {
     try testSegmentMayContainDeltaAfterGeneration();
+}
+
+test "posting segment kind metadata predicates are conservative when unknown" {
+    try testSegmentMetaKindPredicates();
 }
 
 test "posting segment delta readers skip base-only segment corruption" {
