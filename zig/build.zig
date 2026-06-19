@@ -7276,20 +7276,10 @@ pub fn build(b: *std.Build) void {
         const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
         run_graph_metric_process_harness.addArtifactArg(antfly_main);
         run_graph_metric_process_harness.has_side_effects = true;
-        const graph_metric_release_qualification_distributed_mod = b.createModule(.{
-            .root_source_file = b.path("bench/graph/graph_metric_release_qualification.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        });
-        graph_metric_release_qualification_distributed_mod.addImport("antfly-zig", lib_mod);
-        const graph_metric_release_qualification_distributed = b.addExecutable(.{
-            .name = "graph_metric_release_qualification_distributed",
-            .root_module = graph_metric_release_qualification_distributed_mod,
-        });
-        const run_graph_metric_release_qualification_distributed_smoke_budgeted = b.addRunArtifact(graph_metric_release_qualification_distributed);
+        const run_graph_metric_release_qualification_distributed_smoke_budgeted = b.addRunArtifact(graph_metric_release_qualification);
         run_graph_metric_release_qualification_distributed_smoke_budgeted.addArgs(graph_metric_release_qualification_smoke_budgeted_args);
         run_graph_metric_release_qualification_distributed_smoke_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
-        const run_graph_metric_release_qualification_distributed_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification_distributed);
+        const run_graph_metric_release_qualification_distributed_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification_releasefast);
         run_graph_metric_release_qualification_distributed_promotion_budgeted.addArgs(graph_metric_release_qualification_promotion_budgeted_args);
         run_graph_metric_release_qualification_distributed_promotion_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
         const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run spawned-process graph metric maintenance smoke test");

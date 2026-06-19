@@ -5151,7 +5151,10 @@ than PR unit coverage:
   process-owner gate plus the budgeted smoke release-qualification profile so
   PR and release-prep runs can verify the narrow remote-owner contract, the
   all-family resumable/fan-in release smoke, and the fast budget surface
-  together. The process-owner summary emits a top-level
+  together. The distributed release gate uses the same default-optimized
+  release-qualification smoke artifact as the local smoke target, while the
+  distributed promotion gate uses the ReleaseFast promotion artifact. The
+  process-owner summary emits a top-level
   `remote_owner_release_gate` plus service, direct, and failure/reclaim
   component booleans, with required/observed service cleanup-takeover counts
   for killed degree, PageRank, eigenvector, and paired-HITS cleanup owners,
@@ -5178,8 +5181,9 @@ than PR unit coverage:
   hosted fan-in contract, and the promotion-budgeted release qualification
   floor. That target is deliberately
   separate from PR smoke: it keeps the same sequenced compile/run shape for CI
-  memory stability but uses the promotion profile, deployment-shaped summary
-  requirement, storage and scheduler budgets, split-worker progress floors,
+  memory stability but uses the ReleaseFast promotion profile,
+  deployment-shaped summary requirement, storage and scheduler budgets,
+  split-worker progress floors,
   active-page status coverage, hosted fan-in compatibility coverage, and
   public-read/fan-in latency ceilings. The
   `Zig Tests` workflow now runs the smaller distributed
