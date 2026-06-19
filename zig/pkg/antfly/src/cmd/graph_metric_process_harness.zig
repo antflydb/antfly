@@ -142,7 +142,7 @@ const required_process_harness_release_summary = ProcessHarnessReleaseSummary{
     .service_active_public_read_families = 4,
     .direct_publish_cleanup_families = 4,
     .direct_publish_failure_families = 3,
-    .direct_active_public_read_families = 3,
+    .direct_active_public_read_families = 4,
     .direct_page_reclaim_phase_proofs = 20,
     .direct_reclaimed_attempt_completion_phase_proofs = 20,
     .direct_stale_attempt_rejection_phase_proofs = 20,
@@ -280,6 +280,10 @@ pub fn main(init: std.process.Init) !void {
     const hits_service_multipage_db_path = ".zig-cache/tmp/graph-metric-process-hits-service-multipage-db";
     std.Io.Dir.cwd().deleteTree(init.io, hits_service_multipage_db_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(init.io, hits_service_multipage_db_path) catch {};
+
+    const degree_active_public_read_db_path = ".zig-cache/tmp/graph-metric-process-degree-active-public-read-db";
+    std.Io.Dir.cwd().deleteTree(init.io, degree_active_public_read_db_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(init.io, degree_active_public_read_db_path) catch {};
 
     const pagerank_service_active_public_read_db_path = ".zig-cache/tmp/graph-metric-process-pagerank-service-active-public-read-db";
     std.Io.Dir.cwd().deleteTree(init.io, pagerank_service_active_public_read_db_path) catch {};
@@ -625,6 +629,16 @@ pub fn main(init: std.process.Init) !void {
     release_summary.service_multipage_coordinator_takeover_families += 1;
     release_summary.service_multipage_worker_pool_takeover_families += 1;
     recordServiceMultipagePhaseProofs(&release_summary, 9, 10, 2);
+
+    const degree_active_public_read_initial_generation = try seedDegreeSearchDb(alloc, degree_active_public_read_db_path);
+    try verifyDegreeActiveProcessPublicReadFreshness(
+        alloc,
+        init.io,
+        antfly_exe,
+        degree_active_public_read_db_path,
+        degree_active_public_read_initial_generation,
+    );
+    release_summary.direct_active_public_read_families += 1;
 
     const degree_service_active_public_read_initial_generation = try seedDegreeSearchDb(alloc, degree_service_active_public_read_db_path);
     try verifyDegreeServiceActiveProcessPublicReadFreshness(
@@ -1450,6 +1464,26 @@ fn addPageRankDirtyEdge(alloc: std.mem.Allocator, db_path: []const u8) !u64 {
         .writes = &.{
             .{ .key = "doc:e", .value = "{\"title\":\"epsilon\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
         },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    return graph_entry.index.edge_generation;
+}
+
+fn addDegreeDirtyEdge(alloc: std.mem.Allocator, db_path: []const u8) !u64 {
+    var db = try antfly.db.DB.open(alloc, db_path, .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:new",
+            .value = "{\"title\":\"new source\",\"body\":\"newsource graph\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:hub\",\"weight\":1.0}]}}}",
+        }},
         .sync_level = .write,
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
@@ -6796,6 +6830,65 @@ fn assertOpenDbHitsAfterPairedPublish(
         );
         return error.GraphMetricGenerationMismatch;
     }
+}
+
+fn verifyDegreeActiveProcessPublicReadFreshness(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    antfly_exe: []const u8,
+    db_path: []const u8,
+    initial_generation: u64,
+) !void {
+    try runSupervisorProcess(alloc, io, antfly_exe, db_path);
+    try verifyDegreeFresh(alloc, db_path, initial_generation);
+
+    const rebuild_generation = try addDegreeDirtyEdge(alloc, db_path);
+    if (rebuild_generation <= initial_generation) return error.GraphMetricGenerationMismatch;
+
+    const started = try runCoordinatorRoleProcessAt(
+        alloc,
+        io,
+        antfly_exe,
+        db_path,
+        "degree-active-read-proof-coordinator",
+        "5000",
+        "26500",
+    );
+    if (!started.durable_progressed or !started.stats.has_lease) {
+        std.debug.print("expected coordinator process to start active degree rebuild\n", .{});
+        return error.GraphMetricDegreeProcessProofFailed;
+    }
+
+    var db = try antfly.db.DB.open(alloc, db_path, .{
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state != antfly.graph.GraphIndex.GraphMetricState.building or
+            status.published_generation != initial_generation or
+            status.building_generation != rebuild_generation)
+        {
+            std.debug.print(
+                "expected coordinator process to leave degree rebuilding at generations {d}/{d}, got state {} generations {d}/{d}\n",
+                .{
+                    initial_generation,
+                    rebuild_generation,
+                    status.state,
+                    status.published_generation,
+                    status.building_generation,
+                },
+            );
+            return error.GraphMetricDegreeProcessProofFailed;
+        }
+    }
+
+    try verifyDegreeActivePublicReadSurface(alloc, &db, initial_generation, rebuild_generation);
 }
 
 fn verifyDegreeServiceActiveProcessPublicReadFreshness(
