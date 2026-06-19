@@ -452,6 +452,15 @@ fn shouldStopFlatSelectedBlockByEffort(
     return probe_collector.wouldRejectLowerBound(lower_bound);
 }
 
+fn shouldSkipFlatPostingCandidateByCollector(
+    distance: f32,
+    error_bound: f32,
+    posting_error_bound: f32,
+    probe_collector: *FlatProbeCollector,
+) bool {
+    return probe_collector.wouldRejectLowerBound(distance - error_bound - posting_error_bound);
+}
+
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
     return flatProbeLowerBound(lhs) < flatProbeLowerBound(rhs);
 }
@@ -1391,6 +1400,7 @@ pub fn selectFlatRabitqPostings(
                 var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
                 for (block.posting_ids, 0..) |posting_id, i| {
                     const posting_error_bound = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
+                    if (shouldSkipFlatPostingCandidateByCollector(distances[i], error_bounds[i], posting_error_bound, &probe_collector)) continue;
                     candidate_collector.insert(.{
                         .posting_id = posting_id,
                         .parent = block.parents[i],
@@ -2476,6 +2486,16 @@ test "selected block effort gate stops on epsilon or full collector bound" {
     try std.testing.expect(shouldStopFlatSelectedBlockByEffort(.l2_squared, 2.1, 1.0, 1.0, &collector));
     try std.testing.expect(shouldStopFlatSelectedBlockByEffort(.l2_squared, 2.0, std.math.inf(f32), 1.0, &collector));
     try std.testing.expect(!shouldStopFlatSelectedBlockByEffort(.l2_squared, 1.5, std.math.inf(f32), 1.0, &collector));
+}
+
+test "posting candidate collection skips bounds rejected by final heap" {
+    var storage: [2]FlatCentroidProbe = undefined;
+    var collector = FlatProbeCollector.init(&storage);
+    collector.insert(.{ .posting_id = 1, .distance = 1, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 2, .distance = 2, .error_bound = 0 });
+
+    try std.testing.expect(shouldSkipFlatPostingCandidateByCollector(4.0, 1.0, 1.0, &collector));
+    try std.testing.expect(!shouldSkipFlatPostingCandidateByCollector(3.0, 1.0, 1.0, &collector));
 }
 
 test "flat probe collector rejection is monotonic for sorted lower bounds" {

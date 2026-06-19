@@ -2510,7 +2510,10 @@ instead of recomputing block centroid norms/measures on every query. Adaptive
 two-level selections carry the selected block lower bounds into posting scoring,
 so once the current exact posting heap or epsilon window proves later sorted
 blocks cannot contribute, the query stops before per-block posting estimates
-and exact centroid scoring. Adaptive two-level queries also delay the
+and exact centroid scoring. Per-block quantized posting candidate collection
+also checks the current final posting heap bound before inserting into the
+temporary candidate heap, so clearly rejected candidates no longer participate
+in candidate sorting. Adaptive two-level queries also delay the
 posting-count-sized
 distance/error-bound scratch reservation until the selected block set is known
 to full-scan the directory and use the global posting quantized payload; pruned
