@@ -2131,14 +2131,25 @@ pub const ApiHttpServer = struct {
         }
         if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1)) {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            return try jsonResponse(self.alloc, .{
-                .catalog = routes.Routes.ard_v1_catalog,
-                .search = routes.Routes.ard_v1_search,
-                .explore = routes.Routes.ard_v1_explore,
-                .agents = routes.Routes.ard_v1_agents,
-            });
+            return try self.ardCatalogResponse(200, try self.ardRegistryRootJsonAlloc(), false);
         }
         return null;
+    }
+
+    fn ardRegistryRootJsonAlloc(self: *ApiHttpServer) ![]u8 {
+        var writer: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer writer.deinit();
+
+        try writer.writer.writeAll("{\"catalog\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_catalog);
+        try writer.writer.writeAll(",\"search\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_search);
+        try writer.writer.writeAll(",\"explore\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_explore);
+        try writer.writer.writeAll(",\"agents\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_agents);
+        try writer.writer.writeByte('}');
+        return try writer.toOwnedSlice();
     }
 
     fn ardExtensionCatalogContext(self: *ApiHttpServer, snapshot_opt: ?metadata_api.AdminSnapshot, authenticated_identity: ?AuthenticatedIdentity) ?ard_catalog.ExtensionCatalogContext {
@@ -8092,6 +8103,16 @@ fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpRespo
     return try jsonResponseWithStatus(alloc, 200, value);
 }
 
+fn writeMaybeAbsoluteUrl(writer: *std.Io.Writer, base_url: ?[]const u8, url: []const u8) !void {
+    const base = base_url orelse return try std.json.Stringify.value(url, .{}, writer);
+    if (base.len == 0 or !std.mem.startsWith(u8, url, "/")) return try std.json.Stringify.value(url, .{}, writer);
+    var buf: [1024]u8 = undefined;
+    var end = base.len;
+    while (end > 0 and base[end - 1] == '/') end -= 1;
+    const resolved = try std.fmt.bufPrint(&buf, "{s}{s}", .{ base[0..end], url });
+    try std.json.Stringify.value(resolved, .{}, writer);
+}
+
 fn jsonBodyResponseWithStatus(
     alloc: std.mem.Allocator,
     status: u16,
@@ -10574,6 +10595,15 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
 
+    var registry_root = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1,
+    });
+    defer registry_root.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), registry_root.status);
+    try std.testing.expect(std.mem.indexOf(u8, registry_root.body, "\"catalog\":\"/ard/v1/catalog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, registry_root.body, "\"search\":\"/ard/v1/search\"") != null);
+
     var hosted_server = ApiHttpServer.init(std.testing.allocator, .{ .ard_base_url = "https://tenant.example.com/" }, source.iface(), null, null);
     defer hosted_server.deinit();
     var hosted_mcp_resource = try hosted_server.handle(.{
@@ -10583,6 +10613,16 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer hosted_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), hosted_mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, hosted_mcp_resource.body, "\"endpoint\":\"https://tenant.example.com/mcp/v1\"") != null);
+    var hosted_registry_root = try hosted_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1,
+    });
+    defer hosted_registry_root.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), hosted_registry_root.status);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"catalog\":\"https://tenant.example.com/ard/v1/catalog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"search\":\"https://tenant.example.com/ard/v1/search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"explore\":\"https://tenant.example.com/ard/v1/explore\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"agents\":\"https://tenant.example.com/ard/v1/agents\"") != null);
 
     var search = try server.handle(.{
         .method = .POST,
