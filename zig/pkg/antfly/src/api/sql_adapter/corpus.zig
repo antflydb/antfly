@@ -56,6 +56,7 @@ pub const AppParityCorpusPlanFamily = enum {
     merge_mutation,
     adapter_noop_ddl,
     invalid_insert,
+    invalid_update,
     unsupported,
     unsupported_read,
     unsupported_ddl,
@@ -845,7 +846,10 @@ pub fn expectAppParityCoverageRequirements(
 ) !void {
     if (required.len == 0) return error.TestUnexpectedResult;
     for (required) |name| {
-        try std.testing.expect(try appParityCoverageRequirementSatisfied(coverage, name));
+        if (!try appParityCoverageRequirementSatisfied(coverage, name)) {
+            std.debug.print("missing app parity coverage: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
     }
 }
 
@@ -1247,7 +1251,7 @@ pub fn corpusPlanFamilyIsUnsupported(family: AppParityCorpusPlanFamily) bool {
 }
 
 pub fn corpusPlanFamilyIsInvalid(family: AppParityCorpusPlanFamily) bool {
-    return family == .invalid_insert;
+    return family == .invalid_insert or family == .invalid_update;
 }
 
 pub fn corpusFixtureFamilyNeedsReason(family: AppParityCorpusPlanFamily) bool {
@@ -1260,6 +1264,7 @@ pub fn corpusStableReasonToken(reason: []const u8) bool {
 
 const InvalidPlanFamily = enum {
     insert,
+    update,
 };
 
 fn invalidPlanMatchesReason(
@@ -1269,6 +1274,7 @@ fn invalidPlanMatchesReason(
 ) bool {
     const prefix = switch (family) {
         .insert => "invalid:insert:reason=",
+        .update => "invalid:update:reason=",
     };
     return std.mem.startsWith(u8, plan, prefix) and
         std.mem.eql(u8, plan[prefix.len..], @tagName(reason));
@@ -1283,6 +1289,7 @@ pub fn corpusPlanMatchesReason(
     switch (family) {
         .adapter_noop_ddl => return adapterNoopPlanMatchesReason(plan, "ddl", diagnostic_reason),
         .invalid_insert => return invalidPlanMatchesReason(plan, .insert, diagnostic_reason),
+        .invalid_update => return invalidPlanMatchesReason(plan, .update, diagnostic_reason),
         else => if (corpusUnsupportedPlanFamily(family)) |unsupported_family| {
             return unsupportedPlanMatchesReason(plan, unsupported_family, diagnostic_reason);
         } else return true,
@@ -1316,6 +1323,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         .merge_mutation => "merge_mutation:",
         .adapter_noop_ddl => "adapter_noop:ddl:",
         .invalid_insert => "invalid:insert:",
+        .invalid_update => "invalid:update:",
         .unsupported,
         .unsupported_read,
         .unsupported_ddl,
@@ -1421,6 +1429,7 @@ pub fn corpusFixtureFamilyAllowsResolverHint(family: AppParityCorpusPlanFamily) 
         .update,
         .delete,
         .invalid_insert,
+        .invalid_update,
         .unsupported_insert,
         .unsupported_update,
         .unsupported_delete,
@@ -4264,8 +4273,9 @@ pub const AppParityCorpusCoverage = struct {
     invalid_insert: bool = false,
     invalid_duplicate_row_batch_target: bool = false,
     invalid_duplicate_conflict_update_target: bool = false,
+    invalid_update: bool = false,
+    invalid_duplicate_update_target: bool = false,
     unsupported_insert: bool = false,
-    unsupported_update: bool = false,
     unsupported_update_source: bool = false,
     unsupported_delete: bool = false,
     unsupported_update_joined_source: bool = false,
@@ -5358,12 +5368,16 @@ pub const AppParityCorpusCoverage = struct {
                 self.invalid_duplicate_row_batch_target = self.invalid_duplicate_row_batch_target or std.mem.eql(u8, entry.classification_reason, "duplicate_row_batch_target");
                 self.invalid_duplicate_conflict_update_target = self.invalid_duplicate_conflict_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_conflict_update_target");
             },
+            .invalid_update => {
+                self.invalid_update = true;
+                self.invalid_duplicate_update_target = self.invalid_duplicate_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_update_target");
+            },
             .unsupported => self.unsupported_query = true,
             .unsupported_read => self.unsupported_read = true,
             .unsupported_ddl => self.unsupported_ddl = true,
             .unsupported_write => self.unsupported_write = true,
             .unsupported_insert => self.unsupported_insert = true,
-            .unsupported_update => self.unsupported_update = true,
+            .unsupported_update => {},
             .unsupported_update_source => self.unsupported_update_source = true,
             .unsupported_delete => self.unsupported_delete = true,
             .unsupported_update_joined_source => self.unsupported_update_joined_source = true,

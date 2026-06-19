@@ -6111,9 +6111,10 @@ so prefix-only matches such as `session_setting_extra` cannot satisfy
 
 Invalid typed mutations have their own golden-plan family instead of being
 reported as unsupported model gaps. For example, duplicate proposed row targets
-in multi-row inserts lower far enough to prove the statement is an invalid
-native insert (`invalid:insert:reason=...`) rather than claiming that
-`ON CONFLICT` or row-batch mutation support is missing.
+in multi-row inserts and duplicate point-update target paths lower far enough
+to prove the statement is an invalid native mutation (`invalid:insert:reason=...`
+or `invalid:update:reason=...`) rather than claiming that `ON CONFLICT`,
+row-batch mutation, or update-transform support is missing.
 
 Point-write returning fixtures pin the same deterministic row count in both the
 public summary metadata and the typed-plan fingerprint before row JSON is

@@ -891,6 +891,27 @@ pub fn lowerUpdateAlloc(
     };
 }
 
+pub fn lowerUpdateStrictAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !LoweredMutation {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    var parser = Parser{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return try parser.parseUpdate();
+}
+
 pub fn lowerDeleteAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -17358,7 +17379,7 @@ const Parser = struct {
         }
         for (json_set, 0..) |lhs, i| {
             for (json_set[i + 1 ..]) |rhs| {
-                if (self.sqlJsonSetPathsConflict(lhs, rhs)) return error.UnsupportedSqlShape;
+                if (self.sqlJsonSetPathsConflict(lhs, rhs)) return error.InvalidRowsRequest;
             }
             try self.validateSqlJsonSetDoesNotConflictArrayUpdates(lhs, array_update);
         }
@@ -17388,7 +17409,7 @@ const Parser = struct {
         }
         for (json_set, 0..) |lhs, i| {
             for (json_set[i + 1 ..]) |rhs| {
-                if (self.sqlJsonSetPathsConflict(lhs, rhs)) return error.UnsupportedSqlShape;
+                if (self.sqlJsonSetPathsConflict(lhs, rhs)) return error.InvalidRowsRequest;
             }
         }
     }
@@ -17396,34 +17417,34 @@ const Parser = struct {
     fn validateSqlFieldDoesNotConflictFieldJson(self: *@This(), field: []const u8, values: []const FieldJsonValue) !void {
         const lhs = try self.sqlCanonicalMutationFieldPath(field);
         for (values) |value| {
-            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.UnsupportedSqlShape;
+            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.InvalidRowsRequest;
         }
     }
 
     fn validateSqlFieldDoesNotConflictFieldExpressions(self: *@This(), field: []const u8, values: []const FieldExpressionValue) !void {
         const lhs = try self.sqlCanonicalMutationFieldPath(field);
         for (values) |value| {
-            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.UnsupportedSqlShape;
+            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.InvalidRowsRequest;
         }
     }
 
     fn validateSqlFieldDoesNotConflictJsonSet(self: *@This(), field: []const u8, values: []const JsonSetValue) !void {
         const lhs = try self.sqlCanonicalMutationFieldPath(field);
         for (values) |value| {
-            if (self.sqlDottedPathConflictsJsonSetPath(lhs, value)) return error.UnsupportedSqlShape;
+            if (self.sqlDottedPathConflictsJsonSetPath(lhs, value)) return error.InvalidRowsRequest;
         }
     }
 
     fn validateSqlFieldDoesNotConflictArrayUpdates(self: *@This(), field: []const u8, values: []const ArrayTransformValue) !void {
         const lhs = try self.sqlCanonicalMutationFieldPath(field);
         for (values) |value| {
-            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.UnsupportedSqlShape;
+            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.InvalidRowsRequest;
         }
     }
 
     fn validateSqlJsonSetDoesNotConflictArrayUpdates(self: *@This(), value: JsonSetValue, values: []const ArrayTransformValue) !void {
         for (values) |array_update| {
-            if (self.sqlDottedPathConflictsJsonSetPath(try self.sqlCanonicalMutationFieldPath(array_update.field), value)) return error.UnsupportedSqlShape;
+            if (self.sqlDottedPathConflictsJsonSetPath(try self.sqlCanonicalMutationFieldPath(array_update.field), value)) return error.InvalidRowsRequest;
         }
     }
 
@@ -17434,7 +17455,7 @@ const Parser = struct {
     ) !void {
         const lhs = try self.sqlCanonicalMutationFieldPath(field);
         for (values) |value| {
-            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.UnsupportedSqlShape;
+            if (sqlDottedPathsConflict(lhs, try self.sqlCanonicalMutationFieldPath(value.field))) return error.InvalidRowsRequest;
         }
     }
 
@@ -46566,11 +46587,11 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         .bulk_io => |plan| plan,
         else => return error.TestUnexpectedResult,
     });
-    var copy_import_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, copy_runtime_schema, copy_import_plan,
-        \\id,status,amount,active,metadata
-        \\u1,Ready,42,true,"{""source"":""copy""}"
-        \\.
-        \\
+    var copy_import_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(
+        alloc,
+        copy_runtime_schema,
+        copy_import_plan,
+        "id,status,amount,active,metadata\nu1,Ready,42,true,{\"source\":\"copy\"}\n\\.\n",
     );
     defer copy_import_batch.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), copy_import_batch.writes.len);
@@ -61507,11 +61528,12 @@ fn expectAppParityUnsupportedPlanEntry(
     try expectAppParityPlan(entry.plan, fingerprint);
 }
 
-fn invalidInsertFingerprintAlloc(
+fn invalidPlanFingerprintAlloc(
     alloc: std.mem.Allocator,
+    family: []const u8,
     reason: sql_adapter.SqlAdapterClassificationReason,
 ) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "invalid:insert:reason={s}", .{@tagName(reason)});
+    return try std.fmt.allocPrint(alloc, "invalid:{s}:reason={s}", .{ family, @tagName(reason) });
 }
 
 fn expectTypedInvalid(result: anytype) !void {
@@ -61531,11 +61553,17 @@ fn expectAppParityInvalidPlanEntry(
 ) !void {
     switch (entry.family) {
         .invalid_insert => try expectTypedInvalid(lowerInsertWithResolverStrictAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
+        .invalid_update => try expectTypedInvalid(lowerUpdateStrictAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
         else => return error.TestUnexpectedResult,
     }
 
     const diagnostic_reason = sql_adapter.classificationReasonFromToken(entry.classification_reason) orelse return error.TestUnexpectedResult;
-    const fingerprint = try invalidInsertFingerprintAlloc(alloc, diagnostic_reason);
+    const invalid_family = switch (entry.family) {
+        .invalid_insert => "insert",
+        .invalid_update => "update",
+        else => return error.TestUnexpectedResult,
+    };
+    const fingerprint = try invalidPlanFingerprintAlloc(alloc, invalid_family, diagnostic_reason);
     defer alloc.free(fingerprint);
     try expectAppParityPlan(entry.plan, fingerprint);
 }
@@ -61661,7 +61689,9 @@ fn expectAppParityCorpusEntry(
                 try expectAppParityPlan(entry.plan, fingerprint);
             }
         },
-        .invalid_insert => return error.TestUnexpectedResult,
+        .invalid_insert,
+        .invalid_update,
+        => return error.TestUnexpectedResult,
         .unsupported,
         .unsupported_read,
         .unsupported_ddl,

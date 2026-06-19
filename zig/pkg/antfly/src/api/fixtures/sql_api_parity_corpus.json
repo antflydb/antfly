@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "6e1253d11c0ce5340a0d8efd8259de85021f8c65b95e74968449b81e812a7d27",
+  "source_sha256": "f69845f8beeb05a861dc881afb3ef71b0188644136d82a365523a91523c24f4d",
   "source_entry_count": 981,
   "entry_count": 981,
   "skipped_entries": [
@@ -5650,9 +5650,9 @@
       "sql": "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR NO KEY UPDATE NOWAIT RETURNING id"
     },
     {
-      "name": "unsupported duplicate point update target",
-      "family": "unsupported_update",
-      "plan": "unsupported:update:requires=duplicate_update_target",
+      "name": "invalid duplicate point update target",
+      "family": "invalid_update",
+      "plan": "invalid:update:reason=duplicate_update_target",
       "classification_reason": "duplicate_update_target",
       "sql": "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'"
     },
