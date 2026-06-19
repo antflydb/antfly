@@ -1701,7 +1701,7 @@ test "extension package names are path-safe and versions sort deterministically"
     try std.testing.expect(!packageVersionLess("1.10.0", "1.2.0"));
 }
 
-test "extension package manifest validates data shape and mcp objects" {
+test "extension package manifest validates data shape, mcp, and skill objects" {
     const json =
         \\{
         \\  "manifest_api_version": "extensions/v1",
@@ -1750,6 +1750,11 @@ test "extension package manifest validates data shape and mcp objects" {
         \\        "name": "recall",
         \\        "shape": "recall_request",
         \\        "config_json": "{\"handler\":\"antfly_api_template\"}"
+        \\      },
+        \\      {
+        \\        "kind": "skill",
+        \\        "name": "memory",
+        \\        "config_json": "{\"displayName\":\"Memoryaf\",\"description\":\"Use Memoryaf for long-term memory.\",\"profile\":\"copilot\",\"capabilities\":[\"memory-search\"],\"body\":\"# Memoryaf\\n\\nUse this skill when long-term memory is installed and visible.\"}"
         \\      }
         \\    ],
         \\    "runtimes": [
@@ -1785,7 +1790,7 @@ test "extension package manifest validates data shape and mcp objects" {
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("memoryaf", plan.installed.name);
     try std.testing.expectEqualStrings("sha256:abc", plan.installed.package_digest);
-    try std.testing.expectEqual(@as(usize, 5), plan.members.len);
+    try std.testing.expectEqual(@as(usize, 6), plan.members.len);
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
     try std.testing.expectEqual(DataShapeKind.document, plan.members[0].shape_kind.?);
     try std.testing.expectEqualStrings("{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}", plan.members[0].owner_metadata_json);
@@ -1801,6 +1806,11 @@ test "extension package manifest validates data shape and mcp objects" {
     try std.testing.expectEqualStrings("recall_request", plan.members[4].shape_name);
     try std.testing.expectEqualStrings("1", plan.members[4].shape_version);
     try std.testing.expectEqualStrings("memories", plan.members[4].table_name);
+    try std.testing.expectEqual(.skill, plan.members[5].object_kind);
+    try std.testing.expectEqualStrings("memory", plan.members[5].object_name);
+    try std.testing.expectEqualStrings("memories", plan.members[5].table_name);
+    try std.testing.expect(std.mem.indexOf(u8, plan.members[5].owner_metadata_json, "\"displayName\":\"Memoryaf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.members[5].owner_metadata_json, "\"profile\":\"copilot\"") != null);
 }
 
 test "extension catalog resolves unversioned installs to deterministic latest package" {
