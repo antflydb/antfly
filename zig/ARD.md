@@ -149,6 +149,15 @@ Antfly should emit ARD-compatible `ai-catalog.json`:
 
 Host identity should be configurable. For hosted Colony deployments, the host identity should be tenant/deployment aware. For local dev, a domain identity may be absent.
 
+Antfly exposes host identity through API server config and the data/swarm runtime flags:
+
+```text
+--ard-publisher-domain <domain>
+--ard-display-name <name>
+```
+
+These values drive the catalog `host.identifier`, host trust identity, publisher segment in `urn:ai:<publisher-domain>:...` identifiers, publisher facets, and publisher filters.
+
 Federated ARD identifiers still require the `urn:ai:<publisher-domain>:...` publisher segment to be a verifiable domain. Local development deployments without a configured publisher domain should either use a configured development domain or mark the catalog as non-federated/local-only so it is not advertised to external registries.
 
 Entry identifiers should use ARD domain-anchored URNs:

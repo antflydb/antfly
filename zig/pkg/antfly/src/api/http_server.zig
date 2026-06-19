@@ -277,6 +277,8 @@ test "public API request body limit matches Go linear merge contract" {
 
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
+    ard_publisher_domain: []const u8 = "antfly.local",
+    ard_display_name: []const u8 = "Antfly",
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
     swarm_mode: bool = false,
@@ -2127,6 +2129,8 @@ pub const ApiHttpServer = struct {
     fn ardCatalogOptions(self: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) ard_catalog.CatalogOptions {
         return .{
             .mode = mode,
+            .publisher_domain = if (self.cfg.ard_publisher_domain.len > 0) self.cfg.ard_publisher_domain else "antfly.local",
+            .display_name = if (self.cfg.ard_display_name.len > 0) self.cfg.ard_display_name else "Antfly",
             .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),
             .profile = parseSimpleQueryParam(query, "profile"),
             .types = parseSimpleQueryParam(query, "types"),
@@ -10215,7 +10219,10 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .ard_publisher_domain = "tenant.example.com",
+        .ard_display_name = "Tenant Antfly",
+    }, source.iface(), null, null);
     defer server.deinit();
 
     var public_catalog = try server.handle(.{
@@ -10238,6 +10245,9 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     defer tenant_catalog.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tenant_catalog.status);
     try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"displayName\":\"Tenant Antfly\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"identifier\":\"did:web:tenant.example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "urn:ai:tenant.example.com:antfly:mcp") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tenant_catalog.body, .{});
     defer parsed.deinit();
