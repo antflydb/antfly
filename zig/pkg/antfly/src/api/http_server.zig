@@ -10505,6 +10505,10 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     });
     defer public_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_well_known.status);
+    try std.testing.expectEqualStrings("application/json", public_well_known.content_type.?);
+    try std.testing.expectEqual(@as(usize, 1), public_well_known.headers.len);
+    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_well_known.headers[0].name);
+    try std.testing.expectEqualStrings("*", public_well_known.headers[0].value);
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/ai-registry+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/mcp-server+json\"") == null);
 
