@@ -45216,6 +45216,21 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=secure_audit:args=0:replace=false:returns=trigger:language=plpgsql:security=definer", security_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, security_function));
 
+    var external_security_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION external_secure_audit() RETURNS trigger LANGUAGE plpgsql EXTERNAL SECURITY DEFINER;");
+    defer external_security_function.deinit(alloc);
+    const external_security_function_plan = switch (external_security_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineSecurity.definer, external_security_function_plan.security.?);
+    const external_security_function_fingerprint = try ddlFingerprintAlloc(alloc, external_security_function);
+    defer alloc.free(external_security_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=external_secure_audit:args=0:replace=false:returns=trigger:language=plpgsql:security=definer", external_security_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, external_security_function));
+
     var called_null_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION called_null_audit() RETURNS trigger LANGUAGE plpgsql CALLED ON NULL INPUT;");
     defer called_null_function.deinit(alloc);
     const called_null_function_plan = switch (called_null_function) {
@@ -45373,7 +45388,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, setting_function));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql EXTERNAL SECURITY DEFINER;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);

@@ -5016,18 +5016,19 @@ parity corpus requires them to fail closed under `bulk_io_plan`.
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,
 language, optional volatility (`IMMUTABLE`, `STABLE`, or `VOLATILE`), optional
-security mode (`SECURITY INVOKER` or `SECURITY DEFINER`), optional planner
-`COST`, optional planner row-count metadata (`ROWS`), optional null-input
-behavior (`CALLED ON NULL INPUT`, `RETURNS NULL ON NULL INPUT`, or `STRICT`
-normalized to returns-null semantics), optional parallel-safety metadata
-(`PARALLEL SAFE`, `PARALLEL RESTRICTED`, or `PARALLEL UNSAFE`), optional
-`LEAKPROOF` metadata, optional `WINDOW` function metadata, optional planner
-support-function identity (`SUPPORT function_name`), optional transform type
-metadata (`TRANSFORM FOR TYPE type_name[, ...]`), optional routine-local setting
-metadata (`SET setting TO value[, ...]`, `SET setting = value[, ...]`, or `SET
-setting FROM CURRENT`) as ordered name/value or `FROM CURRENT` declarations, and
-drop dependency metadata such as `CASCADE`, then fails closed when applied to
-table schema or runtime storage. Routine lifecycle tails parse in
+security mode (`SECURITY INVOKER`, `SECURITY DEFINER`, and `EXTERNAL SECURITY`
+synonyms), optional planner `COST`, optional planner row-count metadata (`ROWS`),
+optional null-input behavior (`CALLED ON NULL INPUT`, `RETURNS NULL ON NULL
+INPUT`, or `STRICT` normalized to returns-null semantics), optional
+parallel-safety metadata (`PARALLEL SAFE`, `PARALLEL RESTRICTED`, or `PARALLEL
+UNSAFE`), optional `LEAKPROOF` metadata, optional `WINDOW` function metadata,
+optional planner support-function identity (`SUPPORT function_name`), optional
+transform type metadata (`TRANSFORM FOR TYPE type_name[, ...]`), optional
+routine-local setting metadata (`SET setting TO value[, ...]`, `SET setting =
+value[, ...]`, or `SET setting FROM CURRENT`) as ordered name/value or `FROM
+CURRENT` declarations, and drop dependency metadata such as `CASCADE`, then
+fails closed when applied to table schema or runtime storage. Routine lifecycle
+tails parse in
 `api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper

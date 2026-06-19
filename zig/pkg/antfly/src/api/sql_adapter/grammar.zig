@@ -2610,6 +2610,18 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             }
             continue;
         }
+        if (cursor.matchKeyword("external")) {
+            try cursor.expectKeyword("security");
+            if (security != null) return error.UnsupportedSqlShape;
+            if (cursor.matchKeyword("definer")) {
+                security = .definer;
+            } else if (cursor.matchKeyword("invoker")) {
+                security = .invoker;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+            continue;
+        }
         if (cursor.matchKeyword("called")) {
             if (null_input != null) return error.UnsupportedSqlShape;
             try cursor.expectKeyword("on");
@@ -7391,7 +7403,15 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(security_tokens.items.len, security_pos);
     try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, security.security.?);
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql EXTERNAL SECURITY DEFINER;");
+    var external_security_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql EXTERNAL SECURITY DEFINER;");
+    defer lexer.freeTokens(alloc, &external_security_tokens);
+    var external_security_pos: usize = 0;
+    var external_security = try parseCreateRoutineCatalogTailAlloc(alloc, external_security_tokens.items, &external_security_pos);
+    defer external_security.deinit(alloc);
+    try std.testing.expectEqual(external_security_tokens.items.len, external_security_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, external_security.security.?);
+
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SUPPORT audit_support SUPPORT audit_support;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));
