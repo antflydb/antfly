@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "710d69f3b4ed546f812c174685a839c978d57230d0eb72db3970b3e7f6c9af30",
-  "source_entry_count": 963,
-  "entry_count": 963,
+  "source_sha256": "7ee8a5cac643eb49916e5c7899caa50f4937c56ec5f7314dc43b3f410e8dce79",
+  "source_entry_count": 964,
+  "entry_count": 964,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3501,8 +3501,19 @@
         "table_name": "app_writer",
         "operations": 1
       },
-      "plan": "ddl:alter_role:role=app_writer:setting=app.tenant_id",
+      "plan": "ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id",
       "sql": "ALTER ROLE app_writer SET app.tenant_id = 'acme'"
+    },
+    {
+      "name": "alter role reset catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:operation=reset:setting=app.tenant_id",
+      "sql": "ALTER ROLE app_writer RESET app.tenant_id"
     },
     {
       "name": "unsupported role runtime setting",
@@ -3523,7 +3534,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=role_setting_plan",
       "classification_reason": "role_setting_plan",
-      "sql": "ALTER ROLE app_writer RESET app.tenant_id"
+      "sql": "ALTER ROLE app_writer RESET statement_timeout"
     },
     {
       "name": "unsupported role setting expression value",

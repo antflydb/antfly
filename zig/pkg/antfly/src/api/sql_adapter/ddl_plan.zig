@@ -752,14 +752,20 @@ pub const CreateRolePlan = struct {
 };
 
 pub const AlterRolePlan = struct {
+    pub const Operation = enum {
+        set,
+        reset,
+    };
+
     role_name: []const u8,
+    operation: Operation = .set,
     setting_name: []const u8,
-    setting_value: []const u8,
+    setting_value: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.role_name);
         alloc.free(self.setting_name);
-        alloc.free(self.setting_value);
+        if (self.setting_value) |setting_value| alloc.free(setting_value);
         self.* = undefined;
     }
 };

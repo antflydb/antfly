@@ -84,7 +84,13 @@ fn executeAlterRole(
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const subject = try principalSubjectAlloc(manager, alloc, plan.role_name);
     defer alloc.free(subject);
-    try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value);
+    switch (plan.operation) {
+        .set => try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value orelse return error.UnsupportedSqlShape),
+        .reset => manager.removeRoleSetting(subject, plan.setting_name) catch |err| switch (err) {
+            error.RoleSettingNotFound => {},
+            else => return err,
+        },
+    }
     return try changedRecordAlloc(alloc);
 }
 
@@ -594,6 +600,14 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expectEqual(@as(usize, 1), effective_settings.len);
     try std.testing.expectEqualStrings("app.tenant_id", effective_settings[0].name);
     try std.testing.expectEqualStrings("acme", effective_settings[0].value);
+    var reset = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET app.tenant_id;")).?;
+    defer reset.deinit(alloc);
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "app.tenant_id"));
+    var reset_missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET app.tenant_id;")).?;
+    defer reset_missing.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedRoleSetting, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer RESET statement_timeout;"));
+    var altered_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';")).?;
+    defer altered_again.deinit(alloc);
     try manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped_with_setting = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
     defer dropped_with_setting.deinit(alloc);

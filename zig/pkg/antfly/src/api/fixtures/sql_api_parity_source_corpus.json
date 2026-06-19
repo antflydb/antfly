@@ -3910,8 +3910,19 @@
         "table_name": "app_writer",
         "operations": 1
       },
-      "plan": "ddl:alter_role:role=app_writer:setting=app.tenant_id",
+      "plan": "ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id",
       "sql": "ALTER ROLE app_writer SET app.tenant_id = 'acme'"
+    },
+    {
+      "name": "alter role reset catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:operation=reset:setting=app.tenant_id",
+      "sql": "ALTER ROLE app_writer RESET app.tenant_id"
     },
     {
       "name": "unsupported role runtime setting",
@@ -3932,7 +3943,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=role_setting_plan",
       "classification_reason": "role_setting_plan",
-      "sql": "ALTER ROLE app_writer RESET app.tenant_id"
+      "sql": "ALTER ROLE app_writer RESET statement_timeout"
     },
     {
       "name": "unsupported role setting expression value",

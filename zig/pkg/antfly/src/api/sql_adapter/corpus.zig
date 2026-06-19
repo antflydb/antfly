@@ -3917,6 +3917,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_procedure_drop_cascade: bool = false,
     ddl_role_create: bool = false,
     ddl_role_alter: bool = false,
+    ddl_role_alter_reset: bool = false,
     ddl_role_drop: bool = false,
     ddl_privilege_grant: bool = false,
     ddl_privilege_revoke: bool = false,
@@ -5595,7 +5596,10 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_procedure_drop_cascade = self.ddl_procedure_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
                 },
                 .create_role => self.ddl_role_create = true,
-                .alter_role => self.ddl_role_alter = true,
+                .alter_role => {
+                    self.ddl_role_alter = true;
+                    self.ddl_role_alter_reset = self.ddl_role_alter_reset or std.mem.indexOf(u8, entry.plan, ":operation=reset:") != null;
+                },
                 .drop_role => self.ddl_role_drop = true,
                 .grant_privilege => self.ddl_privilege_grant = true,
                 .revoke_privilege => self.ddl_privilege_revoke = true,
@@ -6558,6 +6562,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_procedure_drop_cascade);
         try std.testing.expect(self.ddl_role_create);
         try std.testing.expect(self.ddl_role_alter);
+        try std.testing.expect(self.ddl_role_alter_reset);
         try std.testing.expect(self.ddl_role_drop);
         try std.testing.expect(self.ddl_privilege_grant);
         try std.testing.expect(self.ddl_privilege_revoke);

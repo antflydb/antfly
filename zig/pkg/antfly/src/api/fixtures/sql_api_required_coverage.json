@@ -265,6 +265,7 @@
     "ddl_rename_constraint",
     "ddl_replace_table",
     "ddl_role_alter",
+    "ddl_role_alter_reset",
     "ddl_role_create",
     "ddl_role_drop",
     "ddl_rollback_to_savepoint",

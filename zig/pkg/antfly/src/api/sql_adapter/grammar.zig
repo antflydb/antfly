@@ -932,13 +932,14 @@ pub const CreateRoleSyntax = struct {
 
 pub const AlterRoleSyntax = struct {
     role_name: []const u8,
+    operation: ddl_plan.AlterRolePlan.Operation = .set,
     setting_name: []const u8,
-    setting_value: []const u8,
+    setting_value: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.role_name));
         alloc.free(@constCast(self.setting_name));
-        alloc.free(@constCast(self.setting_value));
+        if (self.setting_value) |setting_value| alloc.free(@constCast(setting_value));
         self.* = undefined;
     }
 };
@@ -4753,23 +4754,34 @@ pub fn parseAlterRoleCatalogTailAlloc(
     const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var role_transferred = false;
     errdefer if (!role_transferred) alloc.free(role_name);
-    try cursor.expectKeyword("set");
+    if (cursor.matchKeyword("in")) return error.UnsupportedSqlShape;
+    const operation: ddl_plan.AlterRolePlan.Operation = if (cursor.matchKeyword("set"))
+        .set
+    else if (cursor.matchKeyword("reset"))
+        .reset
+    else
+        return error.UnsupportedSqlShape;
     const setting_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var setting_transferred = false;
     errdefer if (!setting_transferred) alloc.free(setting_name);
     if (!std.mem.startsWith(u8, setting_name, "app.")) return error.UnsupportedSqlShape;
-    try cursor.expectToken(.eq);
-    if (cursor.atEnd() or cursor.peekKind(.semicolon) or !cursor.peekKind(.string)) return error.UnsupportedSqlShape;
-    const setting_value = try alloc.dupe(u8, tokens[pos.*].text);
-    var value_transferred = false;
-    errdefer if (!value_transferred) alloc.free(setting_value);
-    pos.* += 1;
+    var setting_value: ?[]const u8 = null;
+    var value_transferred = true;
+    if (operation == .set) {
+        try cursor.expectToken(.eq);
+        if (cursor.atEnd() or cursor.peekKind(.semicolon) or !cursor.peekKind(.string)) return error.UnsupportedSqlShape;
+        setting_value = try alloc.dupe(u8, tokens[pos.*].text);
+        value_transferred = false;
+        errdefer if (!value_transferred) if (setting_value) |value| alloc.free(value);
+        pos.* += 1;
+    }
     try parseAdapterNoopStatementEnd(cursor);
     role_transferred = true;
     setting_transferred = true;
     value_transferred = true;
     return .{
         .role_name = role_name,
+        .operation = operation,
         .setting_name = setting_name,
         .setting_value = setting_value,
     };
@@ -8474,8 +8486,20 @@ test "sql adapter grammar parses authorization catalog tails" {
     defer alter_role.deinit(alloc);
     try std.testing.expectEqual(alter_role_tokens.items.len, alter_role_pos);
     try std.testing.expectEqualStrings("app_writer", alter_role.role_name);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, alter_role.operation);
     try std.testing.expectEqualStrings("app.tenant_id", alter_role.setting_name);
-    try std.testing.expectEqualStrings("acme", alter_role.setting_value);
+    try std.testing.expectEqualStrings("acme", alter_role.setting_value orelse return error.TestUnexpectedResult);
+
+    var reset_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer RESET app.tenant_id;");
+    defer lexer.freeTokens(alloc, &reset_role_tokens);
+    var reset_role_pos: usize = 0;
+    var reset_role = try parseAlterRoleCatalogTailAlloc(alloc, reset_role_tokens.items, &reset_role_pos);
+    defer reset_role.deinit(alloc);
+    try std.testing.expectEqual(reset_role_tokens.items.len, reset_role_pos);
+    try std.testing.expectEqualStrings("app_writer", reset_role.role_name);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, reset_role.operation);
+    try std.testing.expectEqualStrings("app.tenant_id", reset_role.setting_name);
+    try std.testing.expect(reset_role.setting_value == null);
 
     var unsupported_role_setting_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET statement_timeout = '1ms';");
     defer lexer.freeTokens(alloc, &unsupported_role_setting_tokens);
