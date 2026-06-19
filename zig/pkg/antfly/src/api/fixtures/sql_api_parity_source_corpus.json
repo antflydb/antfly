@@ -4347,6 +4347,17 @@
       "sql": "CREATE FUNCTION transform_audit() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore"
     },
     {
+      "name": "create setting function catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "setting_audit",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=setting_audit:args=0:replace=false:returns=trigger:language=plpgsql:settings=1:setting=search_path:values=1:value=public",
+      "sql": "CREATE FUNCTION setting_audit() RETURNS trigger LANGUAGE plpgsql SET search_path TO public"
+    },
+    {
       "name": "unsupported create function body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
@@ -4358,7 +4369,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_option_plan",
       "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SET search_path TO public"
+      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql ROWS 10"
     },
     {
       "name": "drop function catalog ddl",

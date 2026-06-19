@@ -3919,6 +3919,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_leakproof: bool = false,
     ddl_function_support: bool = false,
     ddl_function_transform: bool = false,
+    ddl_function_setting: bool = false,
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
@@ -5423,7 +5424,7 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_routine_option = self.unsupported_ddl_routine_option or
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
-                    std.mem.indexOf(u8, entry.sql, " SET ") != null);
+                    std.mem.indexOf(u8, entry.sql, " ROWS ") != null);
             self.unsupported_ddl_row_security_policy_expression = self.unsupported_ddl_row_security_policy_expression or
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
@@ -5591,6 +5592,7 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_leakproof = self.ddl_function_leakproof or std.mem.indexOf(u8, entry.plan, ":leakproof=") != null;
                     self.ddl_function_support = self.ddl_function_support or std.mem.indexOf(u8, entry.plan, ":support=") != null;
                     self.ddl_function_transform = self.ddl_function_transform or std.mem.indexOf(u8, entry.plan, ":transforms=") != null;
+                    self.ddl_function_setting = self.ddl_function_setting or std.mem.indexOf(u8, entry.plan, ":settings=") != null;
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;
@@ -6574,6 +6576,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_function_leakproof);
         try std.testing.expect(self.ddl_function_support);
         try std.testing.expect(self.ddl_function_transform);
+        try std.testing.expect(self.ddl_function_setting);
         try std.testing.expect(self.ddl_function_drop);
         try std.testing.expect(self.ddl_function_drop_cascade);
         try std.testing.expect(self.ddl_procedure_create);

@@ -711,6 +711,18 @@ pub const RoutineParallelSafety = enum {
     unsafe,
 };
 
+pub const RoutineSetting = struct {
+    name: []const u8,
+    values: []const []const u8 = &.{},
+    from_current: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        freeStringSlice(alloc, self.values);
+        self.* = undefined;
+    }
+};
+
 pub const CreateRoutinePlan = struct {
     kind: RoutineKind,
     routine_name: []const u8,
@@ -724,6 +736,7 @@ pub const CreateRoutinePlan = struct {
     leakproof: bool = false,
     support_function: ?[]const u8 = null,
     transform_types: []const []const u8 = &.{},
+    settings: []const RoutineSetting = &.{},
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -732,6 +745,11 @@ pub const CreateRoutinePlan = struct {
         if (self.language) |language| alloc.free(language);
         if (self.support_function) |support_function| alloc.free(support_function);
         freeStringSlice(alloc, self.transform_types);
+        for (self.settings) |*setting_const| {
+            var setting = setting_const.*;
+            setting.deinit(alloc);
+        }
+        if (self.settings.len > 0) alloc.free(@constCast(self.settings));
         if (self.cost) |cost| alloc.free(cost);
         self.* = undefined;
     }

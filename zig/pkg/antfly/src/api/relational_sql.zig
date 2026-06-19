@@ -176,6 +176,7 @@ pub const DropRoutinePlan = sql_adapter.DropRoutinePlan;
 pub const RoutineKind = sql_adapter.RoutineKind;
 pub const RoutineParallelSafety = sql_adapter.RoutineParallelSafety;
 pub const RoutineSecurity = sql_adapter.RoutineSecurity;
+pub const RoutineSetting = sql_adapter.RoutineSetting;
 pub const RoutineVolatility = sql_adapter.RoutineVolatility;
 pub const AuthorizationCatalogPlan = sql_adapter.AuthorizationCatalogPlan;
 pub const CreateRolePlan = sql_adapter.CreateRolePlan;
@@ -3528,12 +3529,14 @@ const Parser = struct {
         const leakproof = syntax.leakproof;
         const support_function = syntax.support_function;
         const transform_types = syntax.transform_types;
+        const settings = syntax.settings;
         const cost = syntax.cost;
         syntax.routine_name = "";
         syntax.returns_type = null;
         syntax.language = null;
         syntax.support_function = null;
         syntax.transform_types = &.{};
+        syntax.settings = &.{};
         syntax.cost = null;
         return .{
             .kind = routineKindFromSyntax(syntax.kind),
@@ -3548,6 +3551,7 @@ const Parser = struct {
             .leakproof = leakproof,
             .support_function = support_function,
             .transform_types = transform_types,
+            .settings = settings,
             .cost = cost,
         };
     }
@@ -45281,8 +45285,27 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=transform_audit:args=0:replace=false:returns=trigger:language=plpgsql:transforms=2:transform=jsonb:transform=hstore", transform_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, transform_function));
 
+    var setting_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION setting_audit() RETURNS trigger LANGUAGE plpgsql SET search_path TO public;");
+    defer setting_function.deinit(alloc);
+    const setting_function_plan = switch (setting_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), setting_function_plan.settings.len);
+    try std.testing.expectEqualStrings("search_path", setting_function_plan.settings[0].name);
+    try std.testing.expectEqual(@as(usize, 1), setting_function_plan.settings[0].values.len);
+    try std.testing.expectEqualStrings("public", setting_function_plan.settings[0].values[0]);
+    try std.testing.expect(!setting_function_plan.settings[0].from_current);
+    const setting_function_fingerprint = try ddlFingerprintAlloc(alloc, setting_function);
+    defer alloc.free(setting_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=setting_audit:args=0:replace=false:returns=trigger:language=plpgsql:settings=1:setting=search_path:values=1:value=public", setting_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, setting_function));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SET search_path TO public;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql ROWS 10;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -57759,6 +57782,43 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             );
             alloc.free(next);
             next = appended;
+        }
+        base = next;
+    }
+    if (create.settings.len != 0) {
+        var next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:settings={d}",
+            .{ base, create.settings.len },
+        );
+        alloc.free(base);
+        errdefer alloc.free(next);
+        for (create.settings) |setting| {
+            const setting_base = if (setting.from_current)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "{s}:setting={s}:from_current=true",
+                    .{ next, setting.name },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "{s}:setting={s}:values={d}",
+                    .{ next, setting.name, setting.values.len },
+                );
+            alloc.free(next);
+            next = setting_base;
+            if (!setting.from_current) {
+                for (setting.values) |value| {
+                    const appended = try std.fmt.allocPrint(
+                        alloc,
+                        "{s}:value={s}",
+                        .{ next, value },
+                    );
+                    alloc.free(next);
+                    next = appended;
+                }
+            }
         }
         base = next;
     }
