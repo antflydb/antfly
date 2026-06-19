@@ -3525,6 +3525,7 @@ const Parser = struct {
         const volatility = syntax.volatility;
         const security = syntax.security;
         const parallel_safety = syntax.parallel_safety;
+        const leakproof = syntax.leakproof;
         const cost = syntax.cost;
         syntax.routine_name = "";
         syntax.returns_type = null;
@@ -3540,6 +3541,7 @@ const Parser = struct {
             .volatility = volatility,
             .security = security,
             .parallel_safety = parallel_safety,
+            .leakproof = leakproof,
             .cost = cost,
         };
     }
@@ -45226,8 +45228,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=parallel_audit:args=0:replace=false:returns=trigger:language=plpgsql:parallel=safe", parallel_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, parallel_function));
 
+    var leakproof_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION leakproof_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF;");
+    defer leakproof_function.deinit(alloc);
+    const leakproof_function_plan = switch (leakproof_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(leakproof_function_plan.leakproof);
+    const leakproof_function_fingerprint = try ddlFingerprintAlloc(alloc, leakproof_function);
+    defer alloc.free(leakproof_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=leakproof_audit:args=0:replace=false:returns=trigger:language=plpgsql:leakproof=true", leakproof_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, leakproof_function));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -57671,6 +57688,11 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             "{s}:parallel={s}",
             .{ base, routineParallelSafetyName(parallel_safety) },
         );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.leakproof) {
+        const next = try std.fmt.allocPrint(alloc, "{s}:leakproof=true", .{base});
         alloc.free(base);
         base = next;
     }

@@ -412,6 +412,7 @@ pub const CreateRoutineSyntax = struct {
     volatility: ?ddl_plan.RoutineVolatility = null,
     security: ?ddl_plan.RoutineSecurity = null,
     parallel_safety: ?ddl_plan.RoutineParallelSafety = null,
+    leakproof: bool = false,
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -2538,6 +2539,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     var volatility: ?ddl_plan.RoutineVolatility = null;
     var security: ?ddl_plan.RoutineSecurity = null;
     var parallel_safety: ?ddl_plan.RoutineParallelSafety = null;
+    var leakproof = false;
     var cost: ?[]const u8 = null;
     errdefer if (cost) |value| alloc.free(@constCast(value));
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
@@ -2590,6 +2592,11 @@ pub fn parseCreateRoutineCatalogTailAlloc(
             }
             continue;
         }
+        if (cursor.matchKeyword("leakproof")) {
+            if (leakproof) return error.UnsupportedSqlShape;
+            leakproof = true;
+            continue;
+        }
         if (cursor.matchKeyword("cost")) {
             if (cost != null) return error.UnsupportedSqlShape;
             const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
@@ -2612,6 +2619,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .volatility = volatility,
         .security = security,
         .parallel_safety = parallel_safety,
+        .leakproof = leakproof,
         .cost = cost,
     };
     returns_type = null;
@@ -7088,6 +7096,15 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(RoutineKindSyntax.function, parallel_function.kind);
     try std.testing.expectEqual(ddl_plan.RoutineParallelSafety.safe, parallel_function.parallel_safety.?);
 
+    var leakproof_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql LEAKPROOF;");
+    defer lexer.freeTokens(alloc, &leakproof_function_tokens);
+    var leakproof_function_pos: usize = 0;
+    var leakproof_function = try parseCreateRoutineCatalogTailAlloc(alloc, leakproof_function_tokens.items, &leakproof_function_pos);
+    defer leakproof_function.deinit(alloc);
+    try std.testing.expectEqual(leakproof_function_tokens.items.len, leakproof_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, leakproof_function.kind);
+    try std.testing.expect(leakproof_function.leakproof);
+
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);
     var create_procedure_pos: usize = 0;
@@ -7141,7 +7158,7 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(security_tokens.items.len, security_pos);
     try std.testing.expectEqual(ddl_plan.RoutineSecurity.definer, security.security.?);
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql LEAKPROOF;");
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SUPPORT audit_support;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));

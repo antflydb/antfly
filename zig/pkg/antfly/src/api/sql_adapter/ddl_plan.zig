@@ -721,6 +721,7 @@ pub const CreateRoutinePlan = struct {
     volatility: ?RoutineVolatility = null,
     security: ?RoutineSecurity = null,
     parallel_safety: ?RoutineParallelSafety = null,
+    leakproof: bool = false,
     cost: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
