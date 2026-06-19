@@ -307,47 +307,6 @@ fn postingStateFromCentroidDirectoryRecord(record: *const posting.OwnedCentroidD
     };
 }
 
-fn postingStateForCentroidDirectoryRecord(self: anytype, txn: anytype, record: *const posting.OwnedCentroidDirectoryRecord) !types.PostingState {
-    return posting.PostingStore.loadState(self, txn, record.posting_id, isNotFoundGeneric) catch |err| {
-        if (isNotFoundGeneric(err)) return postingStateFromCentroidDirectoryRecord(record);
-        return err;
-    };
-}
-
-const PostingStateLookup = struct {
-    states: std.AutoHashMapUnmanaged(u64, types.PostingState) = .empty,
-    loaded_by_scan: bool = false,
-
-    fn init(self: anytype, txn: anytype) !PostingStateLookup {
-        var lookup = PostingStateLookup{};
-        if (comptime posting.PostingStore.canLoadStatesByScan(@TypeOf(self), @TypeOf(txn))) {
-            const records = posting.PostingStore.loadStatesByScan(self, txn) catch |err| switch (err) {
-                error.Unsupported => return lookup,
-                else => return err,
-            };
-            defer self.alloc.free(records);
-            lookup.loaded_by_scan = true;
-            try lookup.states.ensureTotalCapacity(self.alloc, @intCast(records.len));
-            for (records) |record| lookup.states.putAssumeCapacity(record.posting_id, record.state);
-        }
-        return lookup;
-    }
-
-    fn deinit(self: *PostingStateLookup, alloc: std.mem.Allocator) void {
-        self.states.deinit(alloc);
-    }
-
-    fn stateForRecord(
-        self: *const PostingStateLookup,
-        index: anytype,
-        txn: anytype,
-        record: *const posting.OwnedCentroidDirectoryRecord,
-    ) !types.PostingState {
-        if (self.loaded_by_scan) return self.states.get(record.posting_id) orelse .{};
-        return try postingStateForCentroidDirectoryRecord(index, txn, record);
-    }
-};
-
 fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !void {
     const header = hbc.NodeHeader{
         .is_leaf = node.is_leaf,
@@ -1036,13 +995,11 @@ fn buildFlatCentroidDirectoryFromRecords(self: anytype, txn: anytype, root_node:
         for (records) |*record| record.deinit(self.alloc);
         self.alloc.free(records);
     }
-    var state_lookup = try PostingStateLookup.init(self, txn);
-    defer state_lookup.deinit(self.alloc);
     try entries.ensureTotalCapacity(self.alloc, records.len);
 
     for (records) |*record| {
         if (record.member_count == 0 or record.centroid.len != dims) continue;
-        const state = try state_lookup.stateForRecord(self, txn, record);
+        const state = postingStateFromCentroidDirectoryRecord(record);
         appendFlatCentroidEntryOwnedAssumeCapacity(&entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
         record.centroid = &.{};
     }
@@ -1061,9 +1018,6 @@ fn buildFlatCentroidDirectoryFromRecordProbes(self: anytype, txn: anytype, root_
     }
     var entries = std.ArrayListUnmanaged(FlatCentroidEntry).empty;
     defer deinitFlatCentroidEntries(self.alloc, &entries);
-    var state_lookup = try PostingStateLookup.init(self, txn);
-    defer state_lookup.deinit(self.alloc);
-
     var posting_id: u64 = 1;
     while (posting_id <= node_count) : (posting_id += 1) {
         var record = posting.PostingStore.loadCentroidDirectoryRecord(self, txn, posting_id, isNotFoundGeneric) catch |err| {
@@ -1072,7 +1026,7 @@ fn buildFlatCentroidDirectoryFromRecordProbes(self: anytype, txn: anytype, root_
         };
         defer record.deinit(self.alloc);
         if (record.member_count == 0 or record.centroid.len != dims) continue;
-        const state = try state_lookup.stateForRecord(self, txn, &record);
+        const state = postingStateFromCentroidDirectoryRecord(&record);
         try appendFlatCentroidEntryOwned(self, &entries, record.posting_id, record.parent, record.level, state, record.bounds_radius, record.centroid);
         record.centroid = &.{};
     }
@@ -2330,7 +2284,7 @@ pub fn repairDirtyPostingsTxnWithOptions(
             }
             if ((self.config.posting_storage_mode == .shadow_base_delta or
                 self.config.posting_storage_mode == .base_delta) and
-                refreshed_centroid)
+                (refreshed_centroid or refreshed_payload))
             {
                 try posting.PostingStore.saveCentroidDirectoryRecord(self, txn, .{
                     .posting_id = node.id,

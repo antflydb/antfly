@@ -1118,20 +1118,24 @@ fn centroidDirectoryFlagsFromPostingState(state: types.PostingState) u8 {
     return flags;
 }
 
-fn saveCentroidDirectoryForLeafWithRadius(self: anytype, txn: anytype, node: *const types.Node, bounds_radius: f32) !void {
+fn saveCentroidDirectoryForLeafWithStateAndRadius(self: anytype, txn: anytype, node: *const types.Node, state: types.PostingState, bounds_radius: f32) !void {
     if (!node.is_leaf or !shouldWritePostingBaseDelta(self)) return;
     try posting.PostingStore.saveCentroidDirectoryRecord(self, txn, .{
         .posting_id = node.id,
-        .generation = node.posting_state.centroid_version,
-        .mutation_version = node.posting_state.mutation_version,
-        .payload_version = node.posting_state.payload_version,
-        .flags = centroidDirectoryFlagsFromPostingState(node.posting_state),
+        .generation = state.centroid_version,
+        .mutation_version = state.mutation_version,
+        .payload_version = state.payload_version,
+        .flags = centroidDirectoryFlagsFromPostingState(state),
         .parent = node.parent,
         .level = node.level,
         .member_count = node.members.len,
         .bounds_radius = bounds_radius,
         .centroid = node.centroid,
     });
+}
+
+fn saveCentroidDirectoryForLeafWithRadius(self: anytype, txn: anytype, node: *const types.Node, bounds_radius: f32) !void {
+    try saveCentroidDirectoryForLeafWithStateAndRadius(self, txn, node, node.posting_state, bounds_radius);
 }
 
 fn shadowSavePostingBaseWithRadiusOptions(
@@ -1446,11 +1450,16 @@ fn saveLeafNodeBodyWithKnownVectors(
         self.write_profile.save_node_calls += 1;
     }
 
+    var centroid_directory_bounds_radius: f32 = 0;
+    var centroid_directory_published = false;
     if (node.is_leaf and shouldUseBaseDeltaAsCanonicalPosting(self)) {
         const bounds_radius = try leafBoundsRadiusFromKnownVectors(self, node, vectors);
+        centroid_directory_bounds_radius = bounds_radius;
+        centroid_directory_published = publish_centroid_directory;
         try savePackedNodeValueWithLeafMembers(self, txn, node, false);
         try shadowSavePostingBaseWithRadiusOptions(self, txn, node, bounds_radius, publish_centroid_directory);
     } else {
+        centroid_directory_published = node.is_leaf and shouldWritePostingBaseDelta(self);
         try saveDeltaBackedLeafNodeValue(self, txn, node);
     }
     try refreshQuantizedWithKnownVectors(self, txn, node, vectors, vectors_owned, nowNsU64Fixed, elapsedSinceU64Fixed);
@@ -1458,6 +1467,9 @@ fn saveLeafNodeBodyWithKnownVectors(
     var posting_state_to_save = node.posting_state;
     if (node.is_leaf) {
         posting_state_to_save.notePayloadRefreshed();
+        if (centroid_directory_published) {
+            try saveCentroidDirectoryForLeafWithStateAndRadius(self, txn, node, posting_state_to_save, centroid_directory_bounds_radius);
+        }
         try posting.PostingStore.saveState(self, txn, node.id, posting_state_to_save);
         var node_for_cache = node.*;
         node_for_cache.posting_state = posting_state_to_save;
@@ -1755,7 +1767,10 @@ pub fn saveExistingNodeBodyWithAddedVectorsOptions(
         }
     }
     if (node.is_leaf) {
-        if (posting_payload_refreshed) posting_state_to_save.notePayloadRefreshed();
+        if (posting_payload_refreshed) {
+            posting_state_to_save.notePayloadRefreshed();
+            try saveCentroidDirectoryForLeafWithStateAndRadius(self, txn, node, posting_state_to_save, 0);
+        }
         try posting.PostingStore.saveState(self, txn, node.id, posting_state_to_save);
         var node_for_cache = node.*;
         node_for_cache.posting_state = posting_state_to_save;
@@ -1807,7 +1822,10 @@ fn saveExistingNodeBodyWithAddedVectorSourceOptions(
         }
     }
     if (node.is_leaf) {
-        if (posting_payload_refreshed) posting_state_to_save.notePayloadRefreshed();
+        if (posting_payload_refreshed) {
+            posting_state_to_save.notePayloadRefreshed();
+            try saveCentroidDirectoryForLeafWithStateAndRadius(self, txn, node, posting_state_to_save, 0);
+        }
         try posting.PostingStore.saveState(self, txn, node.id, posting_state_to_save);
         var node_for_cache = node.*;
         node_for_cache.posting_state = posting_state_to_save;
@@ -1883,7 +1901,10 @@ pub fn saveNodeBodyInternal(
         }
     }
     if (node.is_leaf) {
-        if (posting_payload_refreshed) posting_state_to_save.notePayloadRefreshed();
+        if (posting_payload_refreshed) {
+            posting_state_to_save.notePayloadRefreshed();
+            try saveCentroidDirectoryForLeafWithStateAndRadius(self, txn, node, posting_state_to_save, 0);
+        }
         try posting.PostingStore.saveState(self, txn, node.id, posting_state_to_save);
         var node_for_cache = node.*;
         node_for_cache.posting_state = posting_state_to_save;

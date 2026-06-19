@@ -2667,7 +2667,13 @@ centroid-directory record and into flat/two-level probes, maintenance must also
 republish the centroid-directory record when it only refreshes the posting
 payload. Otherwise the directory can keep a stale `payload_dirty` flag and
 queries will exact-score every selected posting member even though a fresh
-RaBitQ payload exists. With payload refresh now updating the directory record,
+RaBitQ payload exists. Record-backed flat/two-level directory rebuilds now
+trust that record state directly instead of scanning or probing the separate
+posting-state key family during directory construction. Incremental and
+known-vector payload refresh paths now republish the centroid-directory record
+as well, so the strict record remains the query-time source of posting
+freshness outside background maintenance too. With payload refresh updating the
+directory record,
 the same focused 4096-vector run uses the posting RaBitQ path again:
 warm no-metadata packed HBC is `12678` QPS at `50us` p95 with `0.275` recall;
 repaired `base_delta + flat_rabitq` is `2732` QPS at `358us` p95 with `0.5875`
