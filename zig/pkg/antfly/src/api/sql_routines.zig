@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const extension_domain = @import("../extensions/mod.zig");
 const relational_rows = @import("relational_rows.zig");
 const relational_sql = @import("relational_sql.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -30,6 +31,7 @@ const SpinMutex = struct {
 };
 
 pub const RoutineRecord = struct {
+    origin: RoutineOrigin = .catalog,
     kind: relational_sql.RoutineKind,
     name: []u8,
     argument_count: usize,
@@ -63,6 +65,11 @@ pub const RoutineRecord = struct {
     }
 };
 
+pub const RoutineOrigin = enum {
+    catalog,
+    extension_query_function,
+};
+
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
     mutex: SpinMutex = .{},
@@ -92,6 +99,18 @@ pub const Runtime = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.routines.items.len;
+    }
+
+    pub fn replaceNativeQueryFunctionBindings(
+        self: *@This(),
+        bindings: []const extension_domain.QueryFunctionBinding,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.removeExtensionQueryFunctionsLocked();
+        for (bindings) |binding| {
+            try self.createNativeQueryFunctionLocked(binding);
+        }
     }
 
     pub fn executeExpressionRoutineAlloc(
@@ -137,6 +156,18 @@ pub const Runtime = struct {
         try self.routines.append(self.alloc, record);
     }
 
+    fn createNativeQueryFunctionLocked(
+        self: *@This(),
+        binding: extension_domain.QueryFunctionBinding,
+    ) !void {
+        const expression_kind = extension_domain.queryFunctionNativeExpressionKind(binding.native_expression) orelse return error.InvalidExtensionQueryFunction;
+        try extension_domain.validateQueryFunctionNativeExpressionArity(expression_kind, binding.arity);
+        if (self.findRoutineIndexLocked(.function, binding.sql_name, binding.arity)) |_| return error.RoutineAlreadyExists;
+        var record = try nativeQueryFunctionRecordAlloc(self.alloc, binding, expression_kind);
+        errdefer record.deinit(self.alloc);
+        try self.routines.append(self.alloc, record);
+    }
+
     fn dropLocked(self: *@This(), plan: relational_sql.DropRoutinePlan) !void {
         if (plan.cascade) return error.UnsupportedSqlShape;
         if (self.findRoutineIndexLocked(plan.kind, plan.routine_name, plan.argument_count)) |existing| {
@@ -145,6 +176,18 @@ pub const Runtime = struct {
             return;
         }
         if (!plan.if_exists) return error.RoutineNotFound;
+    }
+
+    fn removeExtensionQueryFunctionsLocked(self: *@This()) void {
+        var i: usize = 0;
+        while (i < self.routines.items.len) {
+            if (self.routines.items[i].origin != .extension_query_function) {
+                i += 1;
+                continue;
+            }
+            var removed = self.routines.orderedRemove(i);
+            removed.deinit(self.alloc);
+        }
     }
 
     fn findRoutineLocked(
@@ -169,6 +212,52 @@ pub const Runtime = struct {
         return null;
     }
 };
+
+fn nativeQueryFunctionRecordAlloc(
+    alloc: std.mem.Allocator,
+    binding: extension_domain.QueryFunctionBinding,
+    expression_kind: runtime_schema.RelationalRowsExpressionKind,
+) !RoutineRecord {
+    const name = try alloc.dupe(u8, binding.sql_name);
+    errdefer alloc.free(name);
+    const language = try alloc.dupe(u8, "native");
+    errdefer alloc.free(language);
+    const expression = try nativeQueryFunctionExpressionAlloc(alloc, expression_kind, binding.arity);
+    errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    return .{
+        .origin = .extension_query_function,
+        .kind = .function,
+        .name = name,
+        .argument_count = binding.arity,
+        .language = language,
+        .body = .{
+            .kind = .sql_expression,
+            .hook = .expression,
+            .expression = expression,
+        },
+    };
+}
+
+fn nativeQueryFunctionExpressionAlloc(
+    alloc: std.mem.Allocator,
+    expression_kind: runtime_schema.RelationalRowsExpressionKind,
+    arity: u16,
+) !runtime_schema.RelationalRowsExpression {
+    if (arity == 0) return .{ .kind = expression_kind };
+    const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, arity);
+    var initialized: usize = 0;
+    errdefer {
+        for (operands[0..initialized]) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        alloc.free(operands);
+    }
+    for (operands, 0..) |*operand, i| {
+        const field = try std.fmt.allocPrint(alloc, "arg{d}", .{i + 1});
+        errdefer alloc.free(field);
+        operand.* = .{ .kind = .field, .field = field };
+        initialized += 1;
+    }
+    return .{ .kind = expression_kind, .operands = operands };
+}
 
 fn routineArgumentObjectJsonAlloc(
     alloc: std.mem.Allocator,
@@ -378,6 +467,35 @@ test "sql routine runtime executes nested safe expression bodies" {
     const clamped = try runtime.executeExpressionRoutineArgsAlloc(alloc, "clamp_amount", &.{ "5", "10", "8" });
     defer alloc.free(clamped);
     try std.testing.expectEqualStrings("8", clamped);
+}
+
+test "sql routine runtime replaces ready extension query function bindings" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    const bindings = [_]extension_domain.QueryFunctionBinding{.{
+        .extension_name = "pgcrypto",
+        .object_name = "gen_random_uuid",
+        .sql_name = "gen_random_uuid",
+        .native_expression = "uuid_v4",
+        .arity = 0,
+    }};
+
+    try runtime.replaceNativeQueryFunctionBindings(&bindings);
+    try std.testing.expectEqual(@as(usize, 1), runtime.routineCountForTest());
+    const generated = try runtime.executeExpressionRoutineArgsAlloc(alloc, "gen_random_uuid", &.{});
+    defer alloc.free(generated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, generated, .{});
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .string => |value| try std.testing.expect(value.len > 0),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try runtime.replaceNativeQueryFunctionBindings(&.{});
+    try std.testing.expectEqual(@as(usize, 0), runtime.routineCountForTest());
+    try std.testing.expectError(error.RoutineNotFound, runtime.executeExpressionRoutineArgsAlloc(alloc, "gen_random_uuid", &.{}));
 }
 
 test "sql routine runtime applies returns-null null-input policy before execution" {

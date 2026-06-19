@@ -2551,6 +2551,12 @@ pub const ApiHttpServer = struct {
                 try self.sql_routine_runtime.apply(function_plan);
                 return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
             },
+            .extension_catalog => {
+                var applied = try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
+                errdefer applied.deinit(self.alloc);
+                try self.refreshSqlExtensionQueryFunctions();
+                return applied;
+            },
             else => {},
         }
 
@@ -2562,6 +2568,17 @@ pub const ApiHttpServer = struct {
             }
         }
         return try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
+    }
+
+    fn refreshSqlExtensionQueryFunctions(self: *ApiHttpServer) !void {
+        var snapshot = (try self.source.adminSnapshot()) orelse {
+            try self.sql_routine_runtime.replaceNativeQueryFunctionBindings(&.{});
+            return;
+        };
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const bindings = try extension_domain.listReadyNativeQueryFunctionBindingsAlloc(self.alloc, snapshot.installed_extensions, snapshot.extension_members);
+        defer extension_domain.freeQueryFunctionBindings(self.alloc, bindings);
+        try self.sql_routine_runtime.replaceNativeQueryFunctionBindings(bindings);
     }
 
     pub fn executeBulkSqlCopyFromStdinWithSession(
@@ -19191,6 +19208,117 @@ test "api http server applies SQL routine catalog plans through native runtime" 
     var dropped = try server.applyRelationalSqlDdlWithSession("DROP FUNCTION normalize_status(text);", &session);
     defer dropped.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), server.sql_routine_runtime.routineCountForTest());
+}
+
+test "api http server refreshes SQL routine hooks from ready extension query functions" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        installed_ready: bool = false,
+        installed_record: extension_domain.InstalledExtension = .{
+            .name = "pgcrypto",
+            .package_name = "pgcrypto",
+            .package_version = "1.0.0",
+            .package_digest = "sha256:pgcrypto",
+            .scope = .{ .kind = .cluster },
+            .status = .ready,
+        },
+        member_record: extension_domain.ExtensionMember = .{
+            .extension_name = "pgcrypto",
+            .scope = .{ .kind = .cluster },
+            .object_kind = .query_function,
+            .object_name = "gen_random_uuid",
+            .owner_metadata_json = "{\"native_expression\":\"uuid_v4\",\"arity\":0,\"sql_names\":[\"gen_random_uuid\"]}",
+        },
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .apply_relational_sql_ddl_with_session = applyRelationalSqlDdlWithSession,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+                .projected_installed_extensions = 1,
+                .projected_extension_members = 1,
+            };
+        }
+
+        fn installedSlice(self: *@This()) []extension_domain.InstalledExtension {
+            if (!self.installed_ready) return &.{};
+            return @as([*]extension_domain.InstalledExtension, @ptrCast(&self.installed_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            if (!self.installed_ready) return &.{};
+            return @as([*]extension_domain.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .installed_extensions = self.installedSlice(),
+                .extension_members = self.memberSlice(),
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn applyRelationalSqlDdlWithSession(
+            ptr: *anyopaque,
+            alloc_arg: std.mem.Allocator,
+            sql: []const u8,
+            _: catalog_resources.SqlCatalogSession,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.startsWith(u8, sql, "CREATE EXTENSION")) {
+                self.installed_ready = true;
+            } else if (std.mem.startsWith(u8, sql, "DROP EXTENSION")) {
+                self.installed_ready = false;
+            } else {
+                return error.TestUnexpectedResult;
+            }
+            return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc_arg);
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var created = try server.applyRelationalSqlDdlWithSession("CREATE EXTENSION pgcrypto;", &session);
+    defer created.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.routineCountForTest());
+    const generated = try server.sql_routine_runtime.executeExpressionRoutineArgsAlloc(alloc, "gen_random_uuid", &.{});
+    defer alloc.free(generated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, generated, .{});
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .string => |value| try std.testing.expect(value.len > 0),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var dropped = try server.applyRelationalSqlDdlWithSession("DROP EXTENSION pgcrypto;", &session);
+    defer dropped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.routineCountForTest());
+    try std.testing.expectError(error.RoutineNotFound, server.sql_routine_runtime.executeExpressionRoutineArgsAlloc(alloc, "gen_random_uuid", &.{}));
 }
 
 test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {

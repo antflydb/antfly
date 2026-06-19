@@ -33,6 +33,11 @@ const usermgr = @import("../usermgr/mod.zig");
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const SqlValue = sql_adapter.SqlValue;
+pub const ExtensionFunctionBinding = struct {
+    sql_name: []const u8,
+    native_expression: []const u8,
+    arity: u16,
+};
 const SqlIntervalLiteral = sql_adapter.SqlIntervalLiteral;
 const SelectOutputKind = sql_adapter.SelectOutputKind;
 const SelectOutputRef = sql_adapter.SelectOutputRef;
@@ -474,6 +479,16 @@ pub fn lowerQueryPlanAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredQueryPlan {
+    return try lowerQueryPlanWithExtensionFunctionsAlloc(alloc, sql, schema, params, &.{});
+}
+
+pub fn lowerQueryPlanWithExtensionFunctionsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    extension_function_bindings: []const ExtensionFunctionBinding,
+) !LoweredQueryPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
@@ -484,6 +499,7 @@ pub fn lowerQueryPlanAlloc(
         .tokens = tokens.items,
         .schema = schema,
         .params = params,
+        .extension_function_bindings = extension_function_bindings,
     };
     var lowered = parser.parseQueryPlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -505,7 +521,17 @@ pub fn lowerReadPlanAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredReadPlan {
-    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params);
+    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params, &.{});
+}
+
+pub fn lowerReadPlanWithExtensionFunctionsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    extension_function_bindings: []const ExtensionFunctionBinding,
+) !LoweredReadPlan {
+    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params, extension_function_bindings);
 }
 
 pub fn lowerReadPlanWithSchemasAlloc(
@@ -515,7 +541,18 @@ pub fn lowerReadPlanWithSchemasAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredReadPlan {
-    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params);
+    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params, &.{});
+}
+
+pub fn lowerReadPlanWithSchemasAndExtensionFunctionsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    extension_function_bindings: []const ExtensionFunctionBinding,
+) !LoweredReadPlan {
+    return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params, extension_function_bindings);
 }
 
 fn lowerReadPlanWithOptionalSourceSchemaAlloc(
@@ -524,6 +561,7 @@ fn lowerReadPlanWithOptionalSourceSchemaAlloc(
     schema: runtime_schema.TableSchema,
     source_schema: ?runtime_schema.TableSchema,
     params: []const SqlValue,
+    extension_function_bindings: []const ExtensionFunctionBinding,
 ) !LoweredReadPlan {
     var saw_invalid_catalog = false;
     const joined_source_schema = source_schema orelse schema;
@@ -560,7 +598,7 @@ fn lowerReadPlanWithOptionalSourceSchemaAlloc(
         else => return err,
     }
 
-    if (lowerQueryPlanAlloc(alloc, sql, schema, params)) |lowered| {
+    if (lowerQueryPlanWithExtensionFunctionsAlloc(alloc, sql, schema, params, extension_function_bindings)) |lowered| {
         return .{ .query = lowered };
     } else |err| switch (err) {
         error.UnsupportedSqlShape => {},
@@ -626,16 +664,27 @@ pub fn lowerReadPlanWithCatalogAlloc(
     params: []const SqlValue,
     catalog: table_catalog.CatalogSource,
 ) !LoweredReadPlan {
+    return try lowerReadPlanWithCatalogAndExtensionFunctionsAlloc(alloc, sql, schema, params, catalog, &.{});
+}
+
+pub fn lowerReadPlanWithCatalogAndExtensionFunctionsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    catalog: table_catalog.CatalogSource,
+    extension_function_bindings: []const ExtensionFunctionBinding,
+) !LoweredReadPlan {
     if (try sql_adapter.readSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
         var tables = resolved_tables;
         defer tables.deinit(alloc);
         if (!std.mem.eql(u8, tables.left, tables.source)) {
             const source_schema = try sql_adapter.runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
             defer runtime_schema.freeSchema(alloc, source_schema);
-            return try lowerReadPlanWithSchemasAlloc(alloc, sql, schema, source_schema, params);
+            return try lowerReadPlanWithSchemasAndExtensionFunctionsAlloc(alloc, sql, schema, source_schema, params, extension_function_bindings);
         }
     }
-    return try lowerReadPlanAlloc(alloc, sql, schema, params);
+    return try lowerReadPlanWithExtensionFunctionsAlloc(alloc, sql, schema, params, extension_function_bindings);
 }
 
 pub fn lowerExplainPlanAlloc(
@@ -4131,6 +4180,7 @@ const Parser = struct {
     schema: runtime_schema.TableSchema = .{},
     joined_source_schema: ?runtime_schema.TableSchema = null,
     params: []const SqlValue = &.{},
+    extension_function_bindings: []const ExtensionFunctionBinding = &.{},
     unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
     mutation_claim: ?db_mod.types.RowClaimRequest = null,
@@ -7442,6 +7492,7 @@ const Parser = struct {
                 .tokens = self.tokens[self.pos..close_index],
                 .schema = self.schema,
                 .params = self.params,
+                .extension_function_bindings = self.extension_function_bindings,
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = ctes.items,
             };
@@ -7619,6 +7670,7 @@ const Parser = struct {
                 .tokens = self.tokens[self.pos..close_index],
                 .schema = self.schema,
                 .params = self.params,
+                .extension_function_bindings = self.extension_function_bindings,
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = ctes.items,
             };
@@ -8363,6 +8415,7 @@ const Parser = struct {
                 .tokens = self.tokens[self.pos..close_index],
                 .schema = self.schema,
                 .params = self.params,
+                .extension_function_bindings = self.extension_function_bindings,
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = ctes.items,
             };
@@ -8443,6 +8496,7 @@ const Parser = struct {
                 .tokens = self.tokens[self.pos..close_index],
                 .schema = self.schema,
                 .params = self.params,
+                .extension_function_bindings = self.extension_function_bindings,
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = ctes.items,
             };
@@ -9117,6 +9171,7 @@ const Parser = struct {
                     .schema = self.schema,
                     .joined_source_schema = self.joined_source_schema,
                     .params = self.params,
+                    .extension_function_bindings = self.extension_function_bindings,
                     .unique_resolver = self.unique_resolver,
                     .field_expression_qualifiers = self.field_expression_qualifiers,
                 };
@@ -9799,6 +9854,7 @@ const Parser = struct {
             .schema = left_source_schema,
             .joined_source_schema = right_source_schema,
             .params = self.params,
+            .extension_function_bindings = self.extension_function_bindings,
             .unique_resolver = self.unique_resolver,
             .available_ctes = self.available_ctes,
         };
@@ -10541,6 +10597,7 @@ const Parser = struct {
             .tokens = self.tokens[start..end],
             .schema = parse_schema,
             .params = self.params,
+            .extension_function_bindings = self.extension_function_bindings,
             .unique_resolver = self.unique_resolver,
         };
         var lowered = try sub.parseSelect();
@@ -13866,6 +13923,7 @@ const Parser = struct {
             .schema = self.schema,
             .joined_source_schema = self.joined_source_schema,
             .params = self.params,
+            .extension_function_bindings = self.extension_function_bindings,
             .unique_resolver = self.unique_resolver,
             .field_expression_qualifiers = self.field_expression_qualifiers,
         };
@@ -29897,6 +29955,7 @@ const Parser = struct {
         if (self.peekKeyword("greatest") or self.peekKeyword("least")) return .{ .expression = try self.parseGreatestLeastExpressionProjectionAlloc() };
         if (self.peekKeyword("case")) return .{ .expression = try self.parseCaseExpressionProjectionAlloc() };
         if (self.peekKeyword("cast")) return .{ .expression = try self.parseCastExpressionProjectionAlloc() };
+        if (self.peekExtensionFunctionCall()) return .{ .expression = try self.parseExtensionFunctionExpressionProjectionAlloc() };
         if (self.peekKind(.lparen)) {
             if (self.peekParenthesizedNullTestProjection()) {
                 return .{ .expression = try self.parseParenthesizedNullTestExpressionProjectionAlloc() };
@@ -32410,6 +32469,25 @@ const Parser = struct {
         };
     }
 
+    fn parseExtensionFunctionExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
+        const expression = (try self.parseExtensionFunctionRowExpressionAlloc()) orelse return error.UnsupportedSqlShape;
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+        const output = if (self.matchKeyword("as"))
+            try self.parseIdentifierOwned()
+        else
+            try self.alloc.dupe(u8, rowExpressionOpName(expression.kind));
+        var output_transferred = false;
+        errdefer if (!output_transferred) self.alloc.free(output);
+
+        expression_transferred = true;
+        output_transferred = true;
+        return .{
+            .output = output,
+            .expression = expression,
+        };
+    }
+
     fn parseRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
         var expression = try self.parseRowExpressionOperandAlloc();
         var expression_owned = true;
@@ -32695,17 +32773,20 @@ const Parser = struct {
         if (self.peekKeyword("string_to_array")) {
             return try self.parseStringToArrayRowExpressionAlloc();
         }
+        if (try self.parseExtensionFunctionRowExpressionAlloc()) |expression| {
+            return expression;
+        }
         if (self.peekKind(.identifier) and
             !self.peekKeyword("null") and
             !self.peekKeyword("true") and
             !self.peekKeyword("false"))
         {
+            if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) return error.UnsupportedSqlShape;
             const parsed_field = try self.parseFieldExpressionOwned();
             defer self.alloc.free(parsed_field);
             const resolved = try self.resolveRowExpressionFieldAlloc(parsed_field);
             var field_transferred = false;
             errdefer if (!field_transferred) self.alloc.free(resolved.field);
-            if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
             if (self.matchJsonExtractOperator()) |operator| {
                 const as_text = tokenKindIsJsonExtractTextOperator(operator);
                 if (!self.defer_row_expression_field_validation and relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
@@ -32760,6 +32841,69 @@ const Parser = struct {
         const value_json = try self.parseJsonValueAlloc();
         errdefer self.alloc.free(value_json);
         return .{ .kind = .value, .value_json = value_json };
+    }
+
+    fn parseExtensionFunctionRowExpressionAlloc(self: *@This()) !?db_mod.types.RelationalRowsExpression {
+        if (!self.peekExtensionFunctionCall()) return null;
+        const name = self.tokens[self.pos].text;
+        const binding = try self.extensionFunctionBinding(name) orelse return null;
+        const kind = extensionFunctionNativeExpressionKind(binding.native_expression) orelse return error.UnsupportedSqlShape;
+        _ = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        try self.expect(.lparen);
+        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+        errdefer {
+            for (operands.items) |operand| freeExpression(self.alloc, operand);
+            operands.deinit(self.alloc);
+        }
+        if (self.match(.rparen) == null) {
+            while (true) {
+                const operand = try self.parseRowExpressionAlloc();
+                var operand_transferred = false;
+                errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
+                try operands.append(self.alloc, operand);
+                operand_transferred = true;
+                if (self.match(.comma) == null) break;
+            }
+            try self.expect(.rparen);
+        }
+        if (operands.items.len != @as(usize, binding.arity)) return error.UnsupportedSqlShape;
+        if (kind == .uuid_v4 and operands.items.len != 0) return error.UnsupportedSqlShape;
+        if (kind == .uuid_v4) return .{ .kind = .uuid_v4 };
+        if ((kind == .lower or kind == .upper or kind == .md5) and operands.items.len != 1) return error.UnsupportedSqlShape;
+        if ((kind == .concat or kind == .concat_ws) and operands.items.len == 0) return error.UnsupportedSqlShape;
+        return .{
+            .kind = kind,
+            .operands = try operands.toOwnedSlice(self.alloc),
+        };
+    }
+
+    fn peekExtensionFunctionCall(self: *@This()) bool {
+        if (self.extension_function_bindings.len == 0) return false;
+        if (!(self.peekKind(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen)) return false;
+        for (self.extension_function_bindings) |binding| {
+            if (std.ascii.eqlIgnoreCase(binding.sql_name, self.tokens[self.pos].text)) return true;
+        }
+        return false;
+    }
+
+    fn extensionFunctionBinding(self: *@This(), name: []const u8) !?ExtensionFunctionBinding {
+        var found: ?ExtensionFunctionBinding = null;
+        for (self.extension_function_bindings) |binding| {
+            if (!std.ascii.eqlIgnoreCase(binding.sql_name, name)) continue;
+            if (found != null) return error.UnsupportedSqlShape;
+            found = binding;
+        }
+        return found;
+    }
+
+    fn extensionFunctionNativeExpressionKind(name: []const u8) ?db_mod.types.RelationalRowsExpressionKind {
+        if (std.mem.eql(u8, name, "uuid_v4")) return .uuid_v4;
+        if (std.mem.eql(u8, name, "md5")) return .md5;
+        if (std.mem.eql(u8, name, "lower")) return .lower;
+        if (std.mem.eql(u8, name, "upper")) return .upper;
+        if (std.mem.eql(u8, name, "concat")) return .concat;
+        if (std.mem.eql(u8, name, "concat_ws")) return .concat_ws;
+        return null;
     }
 
     fn parseBooleanNotRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -57576,6 +57720,100 @@ test "postgres sql adapter lowers uuid generation values and projections" {
     try std.testing.expectEqual(@as(usize, 1), projected.plan.query.expressions.len);
     try std.testing.expectEqualStrings("request_id", projected.plan.query.expressions[0].output);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.uuid_v4, projected.plan.query.expressions[0].expression.kind);
+
+    if (lowerQueryPlanAlloc(
+        alloc,
+        "SELECT id, extension_uuid() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
+    var projected_extension = try lowerQueryPlanWithExtensionFunctionsAlloc(
+        alloc,
+        "SELECT id, extension_uuid() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        &.{.{
+            .sql_name = "extension_uuid",
+            .native_expression = "uuid_v4",
+            .arity = 0,
+        }},
+    );
+    defer projected_extension.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), projected_extension.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("request_id", projected_extension.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.uuid_v4, projected_extension.plan.query.expressions[0].expression.kind);
+
+    var read_extension = try lowerReadPlanWithExtensionFunctionsAlloc(
+        alloc,
+        "SELECT id, extension_uuid() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        &.{.{
+            .sql_name = "extension_uuid",
+            .native_expression = "uuid_v4",
+            .arity = 0,
+        }},
+    );
+    defer read_extension.deinit(alloc);
+    switch (read_extension) {
+        .query => |read_query| {
+            try std.testing.expectEqual(@as(usize, 1), read_query.plan.query.expressions.len);
+            try std.testing.expectEqualStrings("request_id", read_query.plan.query.expressions[0].output);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.uuid_v4, read_query.plan.query.expressions[0].expression.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    if (lowerReadPlanWithExtensionFunctionsAlloc(
+        alloc,
+        "SELECT id, extension_uuid() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        &.{
+            .{
+                .sql_name = "extension_uuid",
+                .native_expression = "uuid_v4",
+                .arity = 0,
+            },
+            .{
+                .sql_name = "extension_uuid",
+                .native_expression = "uuid_v4",
+                .arity = 0,
+            },
+        },
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
+    if (lowerReadPlanWithExtensionFunctionsAlloc(
+        alloc,
+        "SELECT id, extension_uuid('unexpected') AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        &.{.{
+            .sql_name = "extension_uuid",
+            .native_expression = "uuid_v4",
+            .arity = 0,
+        }},
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
 }
 
 test "postgres sql adapter lowers uuid generation update values and conflict actions" {

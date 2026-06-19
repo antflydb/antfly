@@ -5662,8 +5662,11 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    instead of mutating relational schema JSON. Manifest-only extension packages
    can now publish validated `query_function` members carrying bounded
    `native_expression` metadata and optional SQL aliases; the extension catalog
-   exposes ready-only native function bindings so SQL-visible extension
-   functions have a typed Antfly hook instead of opaque package metadata. PL/pgSQL
+   exposes ready-only native function bindings, and extension DDL refreshes the
+   SQL routine runtime from the projected metadata snapshot. Binding-aware SQL
+   read-plan lowering can project those ready extension functions as typed
+   native expression nodes, so SQL-visible extension functions execute through
+   Antfly hooks instead of opaque package metadata. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended

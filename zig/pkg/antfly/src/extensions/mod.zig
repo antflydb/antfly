@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const schema_mod = @import("../schema/mod.zig");
+const runtime_schema = @import("../storage/schema.zig");
 
 pub const lifecycle = @import("lifecycle.zig");
 pub const sql_adapter = @import("sql_adapter.zig");
@@ -1228,6 +1229,8 @@ fn appendQueryFunctionBindingsForMember(
     if (parsed.value != .object) return error.InvalidExtensionQueryFunction;
     const native_expression = queryFunctionNativeExpression(parsed.value) orelse return error.InvalidExtensionQueryFunction;
     const arity = try queryFunctionArity(parsed.value);
+    const expression_kind = queryFunctionNativeExpressionKind(native_expression) orelse return error.InvalidExtensionQueryFunction;
+    try validateQueryFunctionNativeExpressionArity(expression_kind, arity);
     if (parsed.value.object.get("sql_names")) |sql_names| {
         if (sql_names != .array or sql_names.array.items.len == 0) return error.InvalidExtensionQueryFunction;
         for (sql_names.array.items) |sql_name_value| {
@@ -1268,7 +1271,7 @@ fn appendQueryFunctionBinding(
 fn queryFunctionNativeExpression(root: std.json.Value) ?[]const u8 {
     const value = root.object.get("native_expression") orelse return null;
     if (value != .string) return null;
-    if (!queryFunctionNativeExpressionSupported(value.string)) return null;
+    if (queryFunctionNativeExpressionKind(value.string) == null) return null;
     return value.string;
 }
 
@@ -1278,13 +1281,27 @@ fn queryFunctionArity(root: std.json.Value) !u16 {
     return @intCast(value.integer);
 }
 
-fn queryFunctionNativeExpressionSupported(name: []const u8) bool {
-    return std.mem.eql(u8, name, "uuid_v4") or
-        std.mem.eql(u8, name, "md5") or
-        std.mem.eql(u8, name, "lower") or
-        std.mem.eql(u8, name, "upper") or
-        std.mem.eql(u8, name, "concat") or
-        std.mem.eql(u8, name, "concat_ws");
+pub fn queryFunctionNativeExpressionKind(name: []const u8) ?runtime_schema.RelationalRowsExpressionKind {
+    if (std.mem.eql(u8, name, "uuid_v4")) return .uuid_v4;
+    if (std.mem.eql(u8, name, "md5")) return .md5;
+    if (std.mem.eql(u8, name, "lower")) return .lower;
+    if (std.mem.eql(u8, name, "upper")) return .upper;
+    if (std.mem.eql(u8, name, "concat")) return .concat;
+    if (std.mem.eql(u8, name, "concat_ws")) return .concat_ws;
+    return null;
+}
+
+pub fn validateQueryFunctionNativeExpressionArity(
+    kind: runtime_schema.RelationalRowsExpressionKind,
+    arity: u16,
+) !void {
+    switch (kind) {
+        .uuid_v4 => if (arity != 0) return error.InvalidExtensionQueryFunction,
+        .md5, .lower, .upper => if (arity != 1) return error.InvalidExtensionQueryFunction,
+        .concat => if (arity < 1) return error.InvalidExtensionQueryFunction,
+        .concat_ws => if (arity < 2) return error.InvalidExtensionQueryFunction,
+        else => return error.InvalidExtensionQueryFunction,
+    }
 }
 
 fn memberFromShapeAlloc(
@@ -1832,8 +1849,10 @@ fn validateQueryFunctionConfig(value: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), value, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidExtensionQueryFunction;
-    _ = queryFunctionNativeExpression(parsed.value) orelse return error.InvalidExtensionQueryFunction;
-    _ = try queryFunctionArity(parsed.value);
+    const native_expression = queryFunctionNativeExpression(parsed.value) orelse return error.InvalidExtensionQueryFunction;
+    const expression_kind = queryFunctionNativeExpressionKind(native_expression) orelse return error.InvalidExtensionQueryFunction;
+    const arity = try queryFunctionArity(parsed.value);
+    try validateQueryFunctionNativeExpressionArity(expression_kind, arity);
     if (parsed.value.object.get("sql_names")) |sql_names| {
         if (sql_names != .array or sql_names.array.items.len == 0) return error.InvalidExtensionQueryFunction;
         for (sql_names.array.items) |sql_name| {
@@ -2258,6 +2277,11 @@ test "manifest-only query functions validate and expose ready native bindings" {
         .kind = .query_function,
         .name = "unsafe",
         .config_json = "{\"native_expression\":\"shell_exec\",\"arity\":1}",
+    }).validate());
+    try std.testing.expectError(error.InvalidExtensionQueryFunction, (ExtensionObjectDecl{
+        .kind = .query_function,
+        .name = "wrong_arity",
+        .config_json = "{\"native_expression\":\"uuid_v4\",\"arity\":1}",
     }).validate());
 }
 
