@@ -1328,9 +1328,8 @@ pub fn selectFlatRabitqPostings(
     }
 
     const global_posting_quantized = global: {
-        if (!self.config.use_quantization or
-            selected_blocks.len != directory.blocks.len or
-            directory.posting_count == 0)
+        if (selected_blocks.len != directory.blocks.len or
+            !shouldBuildGlobalPostingQuantized(self, directory.blocks.len, directory.posting_count))
         {
             break :global null;
         }

@@ -977,6 +977,11 @@ implementations cleanly:
    traversal queue from the published node count and append through the
    assume-capacity path in the normal bounded case, avoiding geometric growth
    churn and repeated append checks while scanning the HBC tree.
+   Large two-level centroid-directory queries also avoid the global posting
+   quantized payload path unless the configured block probing is a deterministic
+   full-directory scan, so adaptive/full-small-directory boundaries do not grow
+   distance scratch to every posting centroid or estimate centroids outside the
+   selected block work.
    Directory block construction also reuses one zero-centroid quantization
    vector across all blocks in a rebuild instead of allocating/clearing it per
    block.
