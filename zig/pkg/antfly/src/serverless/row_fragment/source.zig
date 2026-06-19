@@ -135,6 +135,7 @@ fn materializeColumnAlloc(alloc: Allocator, column: row_fragment.Column) !rowsou
         .i64 => rowsource.ColumnValues{ .i64 = try materializeI64Alloc(alloc, column.values) },
         .f64 => rowsource.ColumnValues{ .f64 = try materializeF64Alloc(alloc, column.values) },
         .bool => rowsource.ColumnValues{ .bool = try materializeBoolAlloc(alloc, column.values) },
+        .vector_f32 => rowsource.ColumnValues{ .vector_f32 = try materializeVectorF32Alloc(alloc, column.values) },
     };
     errdefer freeColumnValuesOnly(alloc, values);
 
@@ -219,6 +220,19 @@ fn materializeBoolAlloc(alloc: Allocator, values: []const row_fragment.CellValue
     return out;
 }
 
+fn materializeVectorF32Alloc(alloc: Allocator, values: []const row_fragment.CellValue) ![]const []const f32 {
+    const out = try alloc.alloc([]const f32, values.len);
+    errdefer alloc.free(out);
+    for (values, out) |value, *slot| {
+        slot.* = switch (value) {
+            .null => &.{},
+            .vector_f32 => |vector| vector,
+            else => return error.InvalidRowFragment,
+        };
+    }
+    return out;
+}
+
 fn freeColumnValues(alloc: Allocator, column: rowsource.ColumnVector) void {
     if (column.nulls.bytes.len != 0) alloc.free(column.nulls.bytes);
     freeColumnValuesOnly(alloc, column.values);
@@ -240,7 +254,7 @@ test "serverless fragment source produces one typed row batch" {
     var fragment = row_fragment.Fragment{
         .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
         .row_refs = try alloc.alloc(row_fragment.RowRef, 2),
-        .columns = try alloc.alloc(row_fragment.Column, 2),
+        .columns = try alloc.alloc(row_fragment.Column, 3),
     };
     defer fragment.deinit(alloc);
 
@@ -263,6 +277,14 @@ test "serverless fragment source produces one typed row batch" {
     fragment.columns[1].values[0] = .{ .json = try alloc.dupe(u8, "{\"tier\":\"pro\"}") };
     fragment.columns[1].values[1] = .null;
 
+    fragment.columns[2] = .{
+        .name = try alloc.dupe(u8, "embedding"),
+        .kind = .vector_f32,
+        .values = try alloc.alloc(row_fragment.CellValue, 2),
+    };
+    fragment.columns[2].values[0] = .{ .vector_f32 = try alloc.dupe(f32, &.{ 1.0, 0.0 }) };
+    fragment.columns[2].values[1] = .{ .vector_f32 = try alloc.dupe(f32, &.{ 0.5, 0.5 }) };
+
     var source = FragmentSource.init(
         .{ .table_id = "orders", .snapshot_id = "manifest-1" },
         "frag-1",
@@ -277,5 +299,7 @@ test "serverless fragment source produces one typed row batch" {
     try std.testing.expectEqual(@as(u64, 8), batch.row_refs[1].serverless.row_ordinal);
     try std.testing.expectEqual(@as(i64, 20), batch.columns[0].values.i64[1]);
     try std.testing.expect(batch.columns[1].nulls.isNull(1));
+    try std.testing.expectEqual(@as(f32, 0.5), batch.columns[2].values.vector_f32[1][0]);
+    try std.testing.expectEqual(@as(f32, 0.5), batch.columns[2].values.vector_f32[1][1]);
     try std.testing.expect((try row_source.next(alloc)) == null);
 }

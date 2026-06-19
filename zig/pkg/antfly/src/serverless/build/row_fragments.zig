@@ -108,7 +108,7 @@ fn fragmentColumnKind(kind: rowsource.ColumnKind) !row_fragment.ColumnKind {
         .i64 => .i64,
         .f64 => .f64,
         .bool => .bool,
-        .vector_f32 => error.UnsupportedRowFragmentColumnKind,
+        .vector_f32 => .vector_f32,
     };
 }
 
@@ -119,7 +119,7 @@ fn cellFromColumnValue(values: rowsource.ColumnValues, idx: usize) !row_fragment
         .i64 => |items| .{ .i64 = items[idx] },
         .f64 => |items| .{ .f64 = items[idx] },
         .bool => |items| .{ .bool = items[idx] },
-        .vector_f32 => error.UnsupportedRowFragmentColumnKind,
+        .vector_f32 => |items| .{ .vector_f32 = @constCast(items[idx]) },
     };
 }
 
@@ -153,9 +153,13 @@ test "row fragment publisher builds projected fragment from column batch" {
     };
     const amounts = [_]i64{ 10, 20 };
     const tenants = [_][]const u8{ "t1", "t2" };
+    const embedding_a = [_]f32{ 1.0, 0.0 };
+    const embedding_b = [_]f32{ 0.5, 0.5 };
+    const embeddings = [_][]const f32{ &embedding_a, &embedding_b };
     const columns = [_]rowsource.ColumnVector{
         .{ .name = "tenant", .values = .{ .bytes = &tenants } },
         .{ .name = "amount", .values = .{ .i64 = &amounts } },
+        .{ .name = "embedding", .values = .{ .vector_f32 = &embeddings } },
     };
     const batch = rowsource.ColumnBatch{
         .snapshot = .{ .table_id = "orders", .snapshot_id = "snap-1" },
@@ -163,7 +167,7 @@ test "row fragment publisher builds projected fragment from column batch" {
         .columns = &columns,
     };
 
-    const projection = [_][]const u8{"amount"};
+    const projection = [_][]const u8{ "amount", "embedding" };
     var fragment = try buildFragmentFromBatchAlloc(alloc, batch, .{
         .schema_fingerprint = "schema-v1",
         .projected_columns = &projection,
@@ -172,9 +176,12 @@ test "row fragment publisher builds projected fragment from column batch" {
 
     try std.testing.expectEqualStrings("schema-v1", fragment.schema_fingerprint);
     try std.testing.expectEqual(@as(usize, 2), fragment.rowCount());
-    try std.testing.expectEqual(@as(usize, 1), fragment.columns.len);
+    try std.testing.expectEqual(@as(usize, 2), fragment.columns.len);
     try std.testing.expectEqualStrings("amount", fragment.columns[0].name);
     try std.testing.expectEqual(@as(i64, 20), fragment.columns[0].values[1].i64);
+    try std.testing.expectEqualStrings("embedding", fragment.columns[1].name);
+    try std.testing.expectEqual(@as(f32, 0.5), fragment.columns[1].values[1].vector_f32[0]);
+    try std.testing.expectEqual(@as(f32, 0.5), fragment.columns[1].values[1].vector_f32[1]);
 }
 
 test "row fragment publisher builds stats for projected columns" {

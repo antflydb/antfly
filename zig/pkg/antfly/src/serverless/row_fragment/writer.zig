@@ -128,6 +128,7 @@ fn cloneCell(alloc: Allocator, value: row_fragment.CellValue) !row_fragment.Cell
         .i64 => |int| .{ .i64 = int },
         .f64 => |float| .{ .f64 = float },
         .bool => |boolean| .{ .bool = boolean },
+        .vector_f32 => |vector| .{ .vector_f32 = try alloc.dupe(f32, vector) },
     };
 }
 

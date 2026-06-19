@@ -157,6 +157,12 @@ fn encodeCell(
             try out.append(alloc, cell_present);
             try out.append(alloc, @intFromBool(boolean));
         },
+        .vector_f32 => |vector| {
+            if (kind != .vector_f32) return error.InvalidRowFragment;
+            try out.append(alloc, cell_present);
+            try appendU32(alloc, out, @intCast(vector.len));
+            for (vector) |item| try appendU32(alloc, out, @bitCast(item));
+        },
     }
 }
 
@@ -186,6 +192,13 @@ fn decodeCellAlloc(
                 else => error.InvalidRowFragment,
             };
         },
+        .vector_f32 => blk: {
+            const len = try readU32(bytes, cursor);
+            const vector = try alloc.alloc(f32, len);
+            errdefer alloc.free(vector);
+            for (vector) |*value| value.* = @bitCast(try readU32(bytes, cursor));
+            break :blk .{ .vector_f32 = vector };
+        },
     };
 }
 
@@ -196,6 +209,7 @@ fn decodeColumnKind(raw: u8) !row_fragment.ColumnKind {
         3 => .i64,
         4 => .f64,
         5 => .bool,
+        6 => .vector_f32,
         else => error.InvalidRowFragment,
     };
 }
@@ -252,7 +266,7 @@ test "row fragment codec round-trips typed columns" {
     var fragment = row_fragment.Fragment{
         .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
         .row_refs = try alloc.alloc(row_fragment.RowRef, 2),
-        .columns = try alloc.alloc(row_fragment.Column, 3),
+        .columns = try alloc.alloc(row_fragment.Column, 4),
     };
     defer fragment.deinit(alloc);
 
@@ -283,6 +297,14 @@ test "row fragment codec round-trips typed columns" {
     fragment.columns[2].values[0] = .{ .json = try alloc.dupe(u8, "{\"plan\":\"pro\"}") };
     fragment.columns[2].values[1] = .null;
 
+    fragment.columns[3] = .{
+        .name = try alloc.dupe(u8, "embedding"),
+        .kind = .vector_f32,
+        .values = try alloc.alloc(row_fragment.CellValue, 2),
+    };
+    fragment.columns[3].values[0] = .{ .vector_f32 = try alloc.dupe(f32, &.{ 1.0, 0.0 }) };
+    fragment.columns[3].values[1] = .{ .vector_f32 = try alloc.dupe(f32, &.{ 0.5, 0.5 }) };
+
     const encoded = try encodeAlloc(alloc, fragment);
     defer alloc.free(encoded);
 
@@ -295,4 +317,6 @@ test "row fragment codec round-trips typed columns" {
     try std.testing.expectEqualStrings("amount", decoded.columns[1].name);
     try std.testing.expectEqual(@as(i64, 20), decoded.columns[1].values[1].i64);
     try std.testing.expect(decoded.columns[2].values[1] == .null);
+    try std.testing.expectEqual(@as(f32, 0.5), decoded.columns[3].values[1].vector_f32[0]);
+    try std.testing.expectEqual(@as(f32, 0.5), decoded.columns[3].values[1].vector_f32[1]);
 }

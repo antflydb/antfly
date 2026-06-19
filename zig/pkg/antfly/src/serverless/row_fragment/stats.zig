@@ -26,11 +26,13 @@ pub const ScalarValue = union(row_fragment.ColumnKind) {
     i64: i64,
     f64: f64,
     bool: bool,
+    vector_f32: []f32,
 
     pub fn deinit(self: *ScalarValue, alloc: Allocator) void {
         switch (self.*) {
             .bytes => |value| alloc.free(value),
             .json => |value| alloc.free(value),
+            .vector_f32 => |value| alloc.free(value),
             else => {},
         }
         self.* = undefined;
@@ -139,6 +141,9 @@ fn buildColumnStatsAlloc(
     for (column.values) |value| {
         switch (value) {
             .null => stats.null_count += 1,
+            .vector_f32 => {
+                stats.present_count += 1;
+            },
             else => {
                 stats.present_count += 1;
                 try observeValue(alloc, &stats, value);
@@ -195,6 +200,7 @@ fn scalarFromCellAlloc(alloc: Allocator, value: row_fragment.CellValue) !ScalarV
         .i64 => |int| .{ .i64 = int },
         .f64 => |float| .{ .f64 = float },
         .bool => |boolean| .{ .bool = boolean },
+        .vector_f32 => error.InvalidRowFragmentStats,
     };
 }
 
@@ -205,6 +211,7 @@ fn compareScalar(a: ScalarValue, b: ScalarValue) i8 {
         .i64 => |value| compareOrder(value, b.i64),
         .f64 => |value| compareOrder(value, b.f64),
         .bool => |value| compareOrder(@intFromBool(value), @intFromBool(b.bool)),
+        .vector_f32 => |value| compareOrder(value.len, b.vector_f32.len),
     };
 }
 
@@ -281,6 +288,14 @@ fn encodeScalar(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: Scala
         .i64 => |int| try appendSignedInt(alloc, out, int),
         .f64 => |float| try appendFormatted(alloc, out, "{d}", .{float}),
         .bool => |boolean| try out.appendSlice(alloc, if (boolean) "true" else "false"),
+        .vector_f32 => |vector| {
+            try out.append(alloc, '[');
+            for (vector, 0..) |item, idx| {
+                if (idx != 0) try out.append(alloc, ',');
+                try appendFormatted(alloc, out, "{d}", .{item});
+            }
+            try out.append(alloc, ']');
+        },
     }
 }
 
@@ -321,7 +336,7 @@ test "row fragment stats capture nulls min max and dictionary samples" {
     var fragment = row_fragment.Fragment{
         .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
         .row_refs = try alloc.alloc(row_fragment.RowRef, 3),
-        .columns = try alloc.alloc(row_fragment.Column, 2),
+        .columns = try alloc.alloc(row_fragment.Column, 3),
     };
     defer fragment.deinit(alloc);
     fragment.row_refs[0] = .{ .key = try alloc.dupe(u8, "row:a"), .ordinal = 0 };
@@ -343,6 +358,14 @@ test "row fragment stats capture nulls min max and dictionary samples" {
     fragment.columns[1].values[0] = .{ .i64 = 30 };
     fragment.columns[1].values[1] = .null;
     fragment.columns[1].values[2] = .{ .i64 = 10 };
+    fragment.columns[2] = .{
+        .name = try alloc.dupe(u8, "embedding"),
+        .kind = .vector_f32,
+        .values = try alloc.alloc(row_fragment.CellValue, 3),
+    };
+    fragment.columns[2].values[0] = .{ .vector_f32 = try alloc.dupe(f32, &.{ 1.0, 0.0 }) };
+    fragment.columns[2].values[1] = .null;
+    fragment.columns[2].values[2] = .{ .vector_f32 = try alloc.dupe(f32, &.{ 0.5, 0.5 }) };
 
     var stats = try buildAlloc(alloc, fragment, 2);
     defer stats.deinit(alloc);
@@ -357,6 +380,11 @@ test "row fragment stats capture nulls min max and dictionary samples" {
     try std.testing.expectEqual(@as(u64, 1), amount.null_count);
     try std.testing.expectEqual(@as(i64, 10), amount.min.?.i64);
     try std.testing.expectEqual(@as(i64, 30), amount.max.?.i64);
+    const embedding = stats.findColumn("embedding").?;
+    try std.testing.expectEqual(@as(u64, 1), embedding.null_count);
+    try std.testing.expectEqual(@as(u64, 2), embedding.present_count);
+    try std.testing.expect(embedding.min == null);
+    try std.testing.expect(embedding.max == null);
 
     const encoded = try encodeAlloc(alloc, stats);
     defer alloc.free(encoded);

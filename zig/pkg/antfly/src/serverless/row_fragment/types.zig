@@ -23,6 +23,7 @@ pub const ColumnKind = enum(u8) {
     i64 = 3,
     f64 = 4,
     bool = 5,
+    vector_f32 = 6,
 };
 
 pub const CellValue = union(enum) {
@@ -32,11 +33,13 @@ pub const CellValue = union(enum) {
     i64: i64,
     f64: f64,
     bool: bool,
+    vector_f32: []f32,
 
     pub fn deinit(self: *CellValue, alloc: Allocator) void {
         switch (self.*) {
             .bytes => |value| alloc.free(value),
             .json => |value| alloc.free(value),
+            .vector_f32 => |value| alloc.free(value),
             else => {},
         }
         self.* = undefined;
@@ -67,6 +70,7 @@ pub const Column = struct {
                 .i64 => if (self.kind != .i64) return error.InvalidRowFragment,
                 .f64 => if (self.kind != .f64) return error.InvalidRowFragment,
                 .bool => if (self.kind != .bool) return error.InvalidRowFragment,
+                .vector_f32 => if (self.kind != .vector_f32) return error.InvalidRowFragment,
             }
         }
     }

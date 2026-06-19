@@ -415,8 +415,8 @@ The 10-step Antfly-owned implementation plan:
    versioned artifact codec with a header, schema fingerprint, row count, row-ref
    directory, column directory, column chunks, and optional min/max/null and
    bounded dictionary stats. Optimize for stable row refs, range reads,
-   projection, point hydration, JSON subtree facts, vector payload colocation,
-   and algebraic fold inputs.
+   projection, point hydration, JSON subtree facts, first-class vector payload
+   colocation, and algebraic fold inputs.
 
 3. Extend serverless manifest types.
 
@@ -508,12 +508,12 @@ Antfly's storage design.
 ## Implementation Tracker
 
 The current branch has the Antfly-owned scaffold in place: shared `RowSource`
-types, local/external batch adapters, serverless row fragments and stats,
-manifest base-source/artifact kinds, row-fragment publication, a
-`ServerlessFragmentRowSource`, algebraic group/expression materializations,
-sidecar source declarations with pinned base-source validation, adaptive
-promotion recommendations, and scaffold operations for compatibility, GC,
-explain, rebuild, and cache accounting.
+types, local/external batch adapters, serverless row fragments and stats with
+`vector_f32` payload colocation, manifest base-source/artifact kinds,
+row-fragment publication, a `ServerlessFragmentRowSource`, algebraic
+group/expression materializations, sidecar source declarations with pinned
+base-source validation, adaptive promotion recommendations, and scaffold
+operations for compatibility, GC, explain, rebuild, and cache accounting.
 
 That scaffold is intentionally not yet the real lake query engine. The
 remaining work is the production path that turns the scaffold into efficient
