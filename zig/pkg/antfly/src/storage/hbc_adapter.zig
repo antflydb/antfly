@@ -1380,6 +1380,7 @@ pub const HBCIndex = struct {
     external_vector_metadata_required: bool = true,
 
     const EnvOwner = hbc_backend.OpenedBackend;
+    const external_vector_batch_stack_capacity = 1024;
     pub const ExternalVectorLoader = *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32;
     pub const ExternalVectorScratchLoader = *const fn (ctx: *anyopaque, vector_id: u64, metadata: []const u8, scratch: []f32) anyerror![]const f32;
     pub const ExternalVectorBatchScratchLoader = *const fn (ctx: *anyopaque, vector_ids: []const u64, metadata: []const ?[]const u8, vector_views: [][]const f32, batch_scratch: []f32, dims: usize) anyerror!void;
@@ -5672,8 +5673,13 @@ pub const HBCIndex = struct {
         if (vector_views.len < vector_ids.len) return error.InvalidArgument;
         if (vector_ids.len == 0) return true;
 
-        const metadata = try self.alloc.alloc(?[]const u8, vector_ids.len);
-        defer self.alloc.free(metadata);
+        var metadata_stack: [external_vector_batch_stack_capacity]?[]const u8 = undefined;
+        const use_metadata_stack = vector_ids.len <= metadata_stack.len;
+        const metadata = if (use_metadata_stack)
+            metadata_stack[0..vector_ids.len]
+        else
+            try self.alloc.alloc(?[]const u8, vector_ids.len);
+        defer if (!use_metadata_stack) self.alloc.free(metadata);
         if (self.external_vector_metadata_required) {
             try self.getMetadataManySortedInTxnWithScratch(
                 txn,
@@ -5757,8 +5763,13 @@ pub const HBCIndex = struct {
         if (vector_ids.len != matrix_positions.len) return error.InvalidArgument;
         if (vector_ids.len == 0) return true;
 
-        const metadata = try self.alloc.alloc(?[]const u8, vector_ids.len);
-        defer self.alloc.free(metadata);
+        var metadata_stack: [external_vector_batch_stack_capacity]?[]const u8 = undefined;
+        const use_metadata_stack = vector_ids.len <= metadata_stack.len;
+        const metadata = if (use_metadata_stack)
+            metadata_stack[0..vector_ids.len]
+        else
+            try self.alloc.alloc(?[]const u8, vector_ids.len);
+        defer if (!use_metadata_stack) self.alloc.free(metadata);
         if (self.external_vector_metadata_required) {
             try self.getMetadataManySortedInTxnWithScratch(
                 txn,
@@ -5803,10 +5814,9 @@ pub const HBCIndex = struct {
         if (vector_ids.len != matrix_positions.len) return error.InvalidArgument;
         if (vector_ids.len == 0) return true;
 
-        const missing_stack_capacity = 1024;
-        var missing_ids_stack: [missing_stack_capacity]u64 = undefined;
-        var missing_positions_stack: [missing_stack_capacity]usize = undefined;
-        const use_missing_stack = vector_ids.len <= missing_stack_capacity;
+        var missing_ids_stack: [external_vector_batch_stack_capacity]u64 = undefined;
+        var missing_positions_stack: [external_vector_batch_stack_capacity]usize = undefined;
+        const use_missing_stack = vector_ids.len <= external_vector_batch_stack_capacity;
         const missing_ids = if (use_missing_stack)
             missing_ids_stack[0..vector_ids.len]
         else
