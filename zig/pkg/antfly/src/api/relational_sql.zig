@@ -523,6 +523,11 @@ fn lowerExplainPlanWithOptionsAndCatalogAlloc(
                 .format = parsed.format,
                 .verbose = parsed.verbose,
                 .costs = parsed.costs,
+                .buffers = parsed.buffers,
+                .timing = parsed.timing,
+                .summary = parsed.summary,
+                .settings = parsed.settings,
+                .wal = parsed.wal,
                 .subject = .{ .read = read },
             };
         } else |err| {
@@ -535,6 +540,11 @@ fn lowerExplainPlanWithOptionsAndCatalogAlloc(
                 .format = parsed.format,
                 .verbose = parsed.verbose,
                 .costs = parsed.costs,
+                .buffers = parsed.buffers,
+                .timing = parsed.timing,
+                .summary = parsed.summary,
+                .settings = parsed.settings,
+                .wal = parsed.wal,
                 .subject = .{ .write = write },
             };
         } else |write_err| {
@@ -547,6 +557,11 @@ fn lowerExplainPlanWithOptionsAndCatalogAlloc(
             .format = parsed.format,
             .verbose = parsed.verbose,
             .costs = parsed.costs,
+            .buffers = parsed.buffers,
+            .timing = parsed.timing,
+            .summary = parsed.summary,
+            .settings = parsed.settings,
+            .wal = parsed.wal,
             .subject = .{ .read = read },
         };
     } else |err| {
@@ -559,6 +574,11 @@ fn lowerExplainPlanWithOptionsAndCatalogAlloc(
             .format = parsed.format,
             .verbose = parsed.verbose,
             .costs = parsed.costs,
+            .buffers = parsed.buffers,
+            .timing = parsed.timing,
+            .summary = parsed.summary,
+            .settings = parsed.settings,
+            .wal = parsed.wal,
             .subject = .{ .write = write },
         };
     } else |write_err| {
@@ -58678,6 +58698,21 @@ fn explainPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredExplain
     }
     if (!lowered.costs) {
         fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "costs", lowered.costs);
+    }
+    if (lowered.buffers) {
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "buffers", lowered.buffers);
+    }
+    if (!lowered.timing) {
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "timing", lowered.timing);
+    }
+    if (!lowered.summary) {
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "summary", lowered.summary);
+    }
+    if (lowered.settings) {
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "settings", lowered.settings);
+    }
+    if (lowered.wal) {
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "wal", lowered.wal);
     }
     return fingerprint;
 }

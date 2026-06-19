@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "590b35669459faa2e957c760d7071e021536efe77c9a1624c077da10b05e30f6",
-  "source_entry_count": 946,
-  "entry_count": 946,
+  "source_sha256": "bd5f19c74d066f9ea0e7795f4ceacddccd01d1aca5880bf0b1ebfdde3d5bf995",
+  "source_entry_count": 947,
+  "entry_count": 947,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -386,6 +386,17 @@
       },
       "plan": "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "EXPLAIN ANALYZE SELECT id FROM usage_records WHERE status = 'open'"
+    },
+    {
+      "name": "explain runtime option metadata read plan",
+      "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:format=json:buffers=1:timing=0:summary=0:settings=1:wal=1",
+      "sql": "EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records WHERE status = 'open'"
     },
     {
       "name": "vacuum maintenance job",

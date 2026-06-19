@@ -1311,6 +1311,16 @@ fn parseExplainOptions(sql: []const u8, index: *usize, prefix: *SqlExplainPrefix
             prefix.costs = try parseOptionalExplainBool(sql, index, true);
         } else if (consumeSqlKeyword(sql, index, "analyze")) {
             prefix.analyze = try parseOptionalExplainBool(sql, index, true);
+        } else if (consumeSqlKeyword(sql, index, "buffers")) {
+            prefix.buffers = try parseOptionalExplainBool(sql, index, true);
+        } else if (consumeSqlKeyword(sql, index, "timing")) {
+            prefix.timing = try parseOptionalExplainBool(sql, index, true);
+        } else if (consumeSqlKeyword(sql, index, "summary")) {
+            prefix.summary = try parseOptionalExplainBool(sql, index, true);
+        } else if (consumeSqlKeyword(sql, index, "settings")) {
+            prefix.settings = try parseOptionalExplainBool(sql, index, true);
+        } else if (consumeSqlKeyword(sql, index, "wal")) {
+            prefix.wal = try parseOptionalExplainBool(sql, index, true);
         } else {
             return error.UnsupportedSqlShape;
         }
@@ -8777,6 +8787,15 @@ test "sql adapter grammar parses explain prefixes and options" {
     try std.testing.expect(options.verbose);
     try std.testing.expect(!options.costs);
     try std.testing.expectEqualStrings("SELECT id FROM usage_records", options.inner_sql);
+
+    const runtime_options = try parseExplainPrefix("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records");
+    try std.testing.expect(runtime_options.analyze);
+    try std.testing.expect(runtime_options.buffers);
+    try std.testing.expect(!runtime_options.timing);
+    try std.testing.expect(!runtime_options.summary);
+    try std.testing.expect(runtime_options.settings);
+    try std.testing.expect(runtime_options.wal);
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records", runtime_options.inner_sql);
 
     const analyze = try parseExplainPrefix("EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')");
     try std.testing.expect(analyze.analyze);

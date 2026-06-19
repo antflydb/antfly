@@ -382,6 +382,17 @@
       "sql": "EXPLAIN ANALYZE SELECT id FROM usage_records WHERE status = 'open'"
     },
     {
+      "name": "explain runtime option metadata read plan",
+      "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:format=json:buffers=1:timing=0:summary=0:settings=1:wal=1",
+      "sql": "EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records WHERE status = 'open'"
+    },
+    {
       "name": "vacuum maintenance job",
       "family": "ddl",
       "summary": {

@@ -45,6 +45,11 @@ pub const SqlExplainPrefix = struct {
     format: SqlExplainFormat = .text,
     verbose: bool = false,
     costs: bool = true,
+    buffers: bool = false,
+    timing: bool = true,
+    summary: bool = true,
+    settings: bool = false,
+    wal: bool = false,
     inner_sql: []const u8,
 };
 

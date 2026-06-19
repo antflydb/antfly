@@ -4050,6 +4050,11 @@ pub const AppParityCorpusCoverage = struct {
     explain: bool = false,
     explain_options: bool = false,
     explain_analyze: bool = false,
+    explain_buffers: bool = false,
+    explain_timing_disabled: bool = false,
+    explain_summary_disabled: bool = false,
+    explain_settings: bool = false,
+    explain_wal: bool = false,
     explain_write: bool = false,
     relation_population_select_into: bool = false,
     relation_population_create_table_as: bool = false,
@@ -5144,6 +5149,11 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planUsizeTokenValue(entry.plan, ":verbose=") != null or
                     sql_adapter.planUsizeTokenValue(entry.plan, ":costs=") != null;
                 self.explain_analyze = self.explain_analyze or sql_adapter.planHasExactBoolToken(entry.plan, ":analyze=", true);
+                self.explain_buffers = self.explain_buffers or (sql_adapter.planUsizeTokenValue(entry.plan, ":buffers=") orelse 0) == 1;
+                self.explain_timing_disabled = self.explain_timing_disabled or (sql_adapter.planUsizeTokenValue(entry.plan, ":timing=") orelse 1) == 0;
+                self.explain_summary_disabled = self.explain_summary_disabled or (sql_adapter.planUsizeTokenValue(entry.plan, ":summary=") orelse 1) == 0;
+                self.explain_settings = self.explain_settings or (sql_adapter.planUsizeTokenValue(entry.plan, ":settings=") orelse 0) == 1;
+                self.explain_wal = self.explain_wal or (sql_adapter.planUsizeTokenValue(entry.plan, ":wal=") orelse 0) == 1;
             },
             .relation_population => {
                 self.relation_population_select_into = self.relation_population_select_into or
@@ -6360,6 +6370,11 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.explain);
         try std.testing.expect(self.explain_options);
         try std.testing.expect(self.explain_analyze);
+        try std.testing.expect(self.explain_buffers);
+        try std.testing.expect(self.explain_timing_disabled);
+        try std.testing.expect(self.explain_summary_disabled);
+        try std.testing.expect(self.explain_settings);
+        try std.testing.expect(self.explain_wal);
         try std.testing.expect(self.explain_write);
         try std.testing.expect(self.relation_population_select_into);
         try std.testing.expect(self.relation_population_create_table_as);

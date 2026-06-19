@@ -4582,12 +4582,13 @@ instead of adapter text. Read statements explain as read subjects; supported
 table-emptying write shapes explain as write subjects without staging intents or
 touching storage. Non-executing PostgreSQL options that only shape diagnostic
 metadata, including `FORMAT TEXT`, `FORMAT JSON`, `VERBOSE`, `COSTS`, and
-`ANALYZE`, lower into that wrapper as typed explain-plan fields. Unsupported
-explain options fail closed rather than being carried as raw SQL. Analyzed
-explain plans are diagnostic intent at the adapter boundary: execution-time
-runtime counters, row counts, range-routing traces, and cost metadata still need
-native REST/SDK diagnostic result structs before `ANALYZE` can report executed
-work instead of just the typed plan it would execute.
+`ANALYZE`, plus runtime-reporting option flags `BUFFERS`, `TIMING`, `SUMMARY`,
+`SETTINGS`, and `WAL`, lower into that wrapper as typed explain-plan fields.
+Unsupported explain options fail closed rather than being carried as raw SQL.
+Analyzed explain plans are diagnostic intent at the adapter boundary:
+execution-time runtime counters, row counts, range-routing traces, and cost
+metadata still need native REST/SDK diagnostic result structs before `ANALYZE`
+can report executed work instead of just the typed plan it would execute.
 
 Maintenance and transaction-mode SQL also stays out of storage until it maps to
 native typed work. Table-targeted `VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER`

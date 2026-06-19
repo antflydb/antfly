@@ -367,6 +367,11 @@ pub const LoweredExplainPlan = struct {
     format: ExplainFormat = .text,
     verbose: bool = false,
     costs: bool = true,
+    buffers: bool = false,
+    timing: bool = true,
+    summary: bool = true,
+    settings: bool = false,
+    wal: bool = false,
     subject: LoweredExplainSubject,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
