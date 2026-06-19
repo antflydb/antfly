@@ -405,10 +405,12 @@ fn cloneRelationalGeneratedValue(
             .md5 => .md5,
             .concat => .concat,
             .concat_ws => .concat_ws,
+            .expression => .expression,
         },
         .field = if (value.field) |field| try alloc.dupe(u8, field) else null,
         .fields = try cloneStringSlice(alloc, value.fields),
         .separator = try alloc.dupe(u8, value.separator),
+        .expression = if (value.expression) |expression| try cloneRelationalRowsExpressionAlloc(alloc, expression) else null,
     };
 }
 
@@ -417,6 +419,7 @@ fn freeRuntimeRelationalGeneratedValue(alloc: std.mem.Allocator, value: storage_
     for (value.fields) |field| alloc.free(field);
     if (value.fields.len > 0) alloc.free(value.fields);
     alloc.free(value.separator);
+    if (value.expression) |expression| freeRelationalRowsExpression(alloc, expression);
 }
 
 fn deriveRuntimePrimaryKey(alloc: std.mem.Allocator, schema: ParsedTableSchema) !?storage_schema.PrimaryKey {

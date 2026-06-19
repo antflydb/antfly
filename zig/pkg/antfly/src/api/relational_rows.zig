@@ -15437,6 +15437,7 @@ fn generatedColumnValueJsonAlloc(
                 .md5 => try md5HexTextAlloc(alloc, source),
                 .concat => unreachable,
                 .concat_ws => unreachable,
+                .expression => unreachable,
             };
             defer alloc.free(folded);
             break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(folded, .{})});
@@ -15465,7 +15466,38 @@ fn generatedColumnValueJsonAlloc(
             }
             break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(joined.items, .{})});
         },
+        .expression => blk: {
+            const expression = generated.expression orelse return error.InvalidRowsRequest;
+            const source_json = try generatedExpressionSourceRowJsonAlloc(alloc, schema, row_value, resolved_defaults);
+            defer alloc.free(source_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, source_json, .{}) catch return error.InvalidRowsRequest;
+            defer parsed.deinit();
+            break :blk try expressionValueJsonAlloc(alloc, parsed.value, expression);
+        },
     };
+}
+
+fn generatedExpressionSourceRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_value: std.json.Value,
+    resolved_defaults: []const ?[]u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+    for (schema.relational_columns, 0..) |column, column_index| {
+        if (column.generated != null) continue;
+        if (jsonValueAtPath(row_value, column.path)) |selected| {
+            try appendJsonFieldValue(alloc, writer, &first, column.path, selected.*);
+        } else if (resolved_defaults[column_index]) |default_json| {
+            try appendRawJsonFieldValue(alloc, writer, &first, column.path, default_json);
+        }
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
 }
 
 fn plannedStringFieldValueAlloc(
@@ -20349,7 +20381,7 @@ test "relational rows batch rejects duplicate physical row targets" {
 
 test "relational rows batch returning materializes defaults generated columns and checks" {
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"email_upper_key":{"type":"keyword","generated":{"op":"upper","field":"email"}},"email_md5_key":{"type":"keyword","generated":{"op":"md5","field":"email"}},"status":{"type":"keyword","default":"active"},"amount":{"type":"numeric","default":1}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"checks":[{"name":"amount_positive","field":"amount","op":"gte","value":0},{"name":"status_present","field":"status","op":"is_not_null"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"email_upper_key":{"type":"keyword","generated":{"op":"upper","field":"email"}},"email_md5_key":{"type":"keyword","generated":{"op":"md5","field":"email"}},"status":{"type":"keyword","default":"active"},"status_expr_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}},"amount":{"type":"numeric","default":1}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"checks":[{"name":"amount_positive","field":"amount","op":"gte","value":0},{"name":"status_present","field":"status","op":"is_not_null"}]}
     ;
     var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
     defer parsed.deinit(std.testing.allocator);
@@ -20358,14 +20390,14 @@ test "relational rows batch returning materializes defaults generated columns an
 
     var batch = try parseRowsBatchRequest(
         std.testing.allocator,
-        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\",\"email\":\"Ada@Example.Test\"},\"returning\":[\"id\",\"email_key\",\"email_upper_key\",\"email_md5_key\",\"status\",\"amount\"]}]}",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\",\"email\":\"Ada@Example.Test\"},\"returning\":[\"id\",\"email_key\",\"email_upper_key\",\"email_md5_key\",\"status\",\"status_expr_key\",\"amount\"]}]}",
         schema,
     );
     defer batch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), batch.writes.len);
-    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"email\":\"Ada@Example.Test\",\"status\":\"active\",\"amount\":1,\"email_key\":\"ada@example.test\",\"email_upper_key\":\"ADA@EXAMPLE.TEST\",\"email_md5_key\":\"19e13d5b2308069994532ba25ca5567a\"}", batch.writes[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"email\":\"Ada@Example.Test\",\"status\":\"active\",\"amount\":1,\"email_key\":\"ada@example.test\",\"email_upper_key\":\"ADA@EXAMPLE.TEST\",\"email_md5_key\":\"19e13d5b2308069994532ba25ca5567a\",\"status_expr_key\":\"active\"}", batch.writes[0].value);
     try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"email_key\":\"ada@example.test\",\"email_upper_key\":\"ADA@EXAMPLE.TEST\",\"email_md5_key\":\"19e13d5b2308069994532ba25ca5567a\",\"status\":\"active\",\"amount\":1}", batch.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"email_key\":\"ada@example.test\",\"email_upper_key\":\"ADA@EXAMPLE.TEST\",\"email_md5_key\":\"19e13d5b2308069994532ba25ca5567a\",\"status\":\"active\",\"status_expr_key\":\"active\",\"amount\":1}", batch.returning_rows[0]);
 
     const Resolver = struct {
         fn iface(self: *@This()) UniqueSelectorResolver {

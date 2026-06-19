@@ -33297,7 +33297,7 @@ fn generatedUnaryTextColumnForField(
 ) ?runtime_schema.RelationalColumn {
     switch (op) {
         .lower, .upper, .md5 => {},
-        .concat, .concat_ws => return null,
+        .concat, .concat_ws, .expression => return null,
     }
     for (schema.relational_columns) |column| {
         const generated = column.generated orelse continue;
@@ -33861,7 +33861,33 @@ fn generatedColumnReferencesAny(column: runtime_schema.RelationalColumn, fields:
     if (generated.field) |field| {
         if (stringSlicesContains(fields, field)) return true;
     }
+    if (generated.expression) |expression| {
+        if (expressionReferencesAny(expression, fields)) return true;
+    }
     return stringSlicesIntersect(generated.fields, fields);
+}
+
+fn expressionReferencesAny(expression: db_mod.types.RelationalRowsExpression, fields: []const []const u8) bool {
+    if (expression.kind == .field and stringSlicesContains(fields, expression.field)) return true;
+    for (expression.operands) |operand| {
+        if (expressionReferencesAny(operand, fields)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (expressionConditionReferencesAny(branch.when, fields)) return true;
+        if (expressionReferencesAny(branch.then, fields)) return true;
+    }
+    for (expression.case_else) |case_else| {
+        if (expressionReferencesAny(case_else, fields)) return true;
+    }
+    return false;
+}
+
+fn expressionConditionReferencesAny(condition: db_mod.types.RelationalRowsExpressionCondition, fields: []const []const u8) bool {
+    if (expressionReferencesAny(condition.lhs, fields)) return true;
+    for (condition.rhs) |rhs| {
+        if (expressionReferencesAny(rhs, fields)) return true;
+    }
+    return false;
 }
 
 fn uniqueConstraintReferencesAny(
@@ -35037,6 +35063,7 @@ fn renameGeneratedJsonFields(
     if (generated.* != .object) return error.InvalidSqlCatalog;
     try renameStringFieldInJsonObject(alloc, &generated.object, "field", old_name, new_name);
     try renameStringInJsonArray(alloc, generated.object.getPtr("fields"), old_name, new_name);
+    if (generated.object.getPtr("expression")) |expression| try renameExpressionJsonFields(alloc, expression, old_name, new_name);
 }
 
 fn renameConstraintArrayFields(
@@ -35250,7 +35277,44 @@ fn validateGeneratedExpressionForSchemaJsonProperties(
                 try validateGeneratedExpressionSourceForSchemaJsonProperties(properties, index_name, field);
             }
         },
+        .expression => {
+            const expression = generated.expression orelse return error.InvalidSqlCatalog;
+            try validateGeneratedExpressionJsonExpressionForSchemaJsonProperties(properties, index_name, expression);
+        },
     }
+}
+
+fn validateGeneratedExpressionJsonExpressionForSchemaJsonProperties(
+    properties: *std.json.ObjectMap,
+    index_name: []const u8,
+    expression: db_mod.types.RelationalRowsExpression,
+) error{InvalidSqlCatalog}!void {
+    if (expression.kind == .field) try validateGeneratedExpressionFieldExistsForSchemaJsonProperties(properties, index_name, expression.field);
+    for (expression.operands) |operand| try validateGeneratedExpressionJsonExpressionForSchemaJsonProperties(properties, index_name, operand);
+    for (expression.case_branches) |branch| {
+        try validateGeneratedExpressionJsonConditionForSchemaJsonProperties(properties, index_name, branch.when);
+        try validateGeneratedExpressionJsonExpressionForSchemaJsonProperties(properties, index_name, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateGeneratedExpressionJsonExpressionForSchemaJsonProperties(properties, index_name, case_else);
+}
+
+fn validateGeneratedExpressionJsonConditionForSchemaJsonProperties(
+    properties: *std.json.ObjectMap,
+    index_name: []const u8,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) error{InvalidSqlCatalog}!void {
+    try validateGeneratedExpressionJsonExpressionForSchemaJsonProperties(properties, index_name, condition.lhs);
+    for (condition.rhs) |rhs| try validateGeneratedExpressionJsonExpressionForSchemaJsonProperties(properties, index_name, rhs);
+}
+
+fn validateGeneratedExpressionFieldExistsForSchemaJsonProperties(
+    properties: *std.json.ObjectMap,
+    index_name: []const u8,
+    field: []const u8,
+) !void {
+    if (std.mem.eql(u8, field, index_name)) return error.InvalidSqlCatalog;
+    const property = properties.get(field) orelse return error.InvalidSqlCatalog;
+    if (property != .object) return error.InvalidSqlCatalog;
 }
 
 fn validateGeneratedExpressionSourceForSchemaJsonProperties(
@@ -35319,6 +35383,9 @@ fn propertyGeneratedReferencesAny(property: std.json.Value, fields: []const []co
     }
     if (generated.object.get("fields")) |fields_value| {
         if (jsonStringArrayReferencesAny(fields_value, fields)) return true;
+    }
+    if (generated.object.get("expression")) |expression| {
+        if (jsonExpressionReferencesAny(expression, fields)) return true;
     }
     return false;
 }
@@ -35510,6 +35577,7 @@ fn schemaJsonGeneratedValueAlloc(alloc: std.mem.Allocator, generated: runtime_sc
         .md5 => "md5",
         .concat => "concat",
         .concat_ws => "concat_ws",
+        .expression => "expression",
     });
     switch (generated.op) {
         .lower, .upper, .md5 => try putJsonString(alloc, &object, "field", generated.field orelse return error.InvalidSqlCatalog),
@@ -35517,6 +35585,7 @@ fn schemaJsonGeneratedValueAlloc(alloc: std.mem.Allocator, generated: runtime_sc
             try object.put(alloc, try alloc.dupe(u8, "fields"), try schemaJsonStringArrayAlloc(alloc, generated.fields));
             try putJsonString(alloc, &object, "separator", generated.separator);
         },
+        .expression => try object.put(alloc, try alloc.dupe(u8, "expression"), try schemaJsonExpressionAlloc(alloc, generated.expression orelse return error.InvalidSqlCatalog)),
     }
     return .{ .object = object };
 }
@@ -35612,6 +35681,21 @@ fn schemaJsonExpressionConditionsAlloc(
         try Parser.writeRowExpressionConditionJson(writer, condition);
     }
     try writer.writeByte(']');
+    const json = try out.toOwnedSlice();
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    return try json_helpers.cloneJsonValue(alloc, parsed.value);
+}
+
+fn schemaJsonExpressionAlloc(
+    alloc: std.mem.Allocator,
+    expression: db_mod.types.RelationalRowsExpression,
+) !std.json.Value {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try Parser.writeRowExpressionJson(writer, expression);
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
@@ -36917,6 +37001,12 @@ fn stableSecondaryIndexGeneration(plan: CreateIndexPlan) u64 {
         hashPlanU64(&hasher, @intCast(generated.fields.len));
         for (generated.fields) |field| hashPlanField(&hasher, field);
         hashPlanField(&hasher, generated.separator);
+        if (generated.expression) |expression| {
+            hasher.update(&.{1});
+            hashPlanExpression(&hasher, expression);
+        } else {
+            hasher.update(&.{0});
+        }
     } else {
         hasher.update(&.{0});
     }
@@ -37538,7 +37628,37 @@ fn validateGeneratedColumnForColumns(columns: []const runtime_schema.RelationalC
                 if (!checkExpressionTypeTextLike(.{ .type = source.field_type })) return error.InvalidSqlCatalog;
             }
         },
+        .expression => {
+            const expression = generated.expression orelse return error.InvalidSqlCatalog;
+            try validateGeneratedColumnExpressionForColumns(columns, column.name, expression);
+        },
     }
+}
+
+fn validateGeneratedColumnExpressionForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    generated_column_name: []const u8,
+    expression: db_mod.types.RelationalRowsExpression,
+) error{InvalidSqlCatalog}!void {
+    if (expression.kind == .field) {
+        if (std.mem.eql(u8, expression.field, generated_column_name)) return error.InvalidSqlCatalog;
+        _ = relationalColumnForDdl(columns, expression.field) orelse return error.InvalidSqlCatalog;
+    }
+    for (expression.operands) |operand| try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, operand);
+    for (expression.case_branches) |branch| {
+        try validateGeneratedColumnExpressionConditionForColumns(columns, generated_column_name, branch.when);
+        try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, case_else);
+}
+
+fn validateGeneratedColumnExpressionConditionForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    generated_column_name: []const u8,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) error{InvalidSqlCatalog}!void {
+    try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, condition.lhs);
+    for (condition.rhs) |rhs| try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, rhs);
 }
 
 fn validateCreateIndexIncludeColumns(

@@ -393,6 +393,7 @@ pub const RelationalGeneratedOp = enum {
     md5,
     concat,
     concat_ws,
+    expression,
 };
 
 pub const RelationalDefaultKind = enum {
@@ -417,12 +418,14 @@ pub const RelationalGeneratedValue = struct {
     field: ?[]const u8 = null,
     fields: [][]const u8 = &.{},
     separator: []const u8 = "",
+    expression: ?storage_schema.RelationalRowsExpression = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.field) |field| alloc.free(field);
         for (self.fields) |field| alloc.free(field);
         if (self.fields.len > 0) alloc.free(self.fields);
         alloc.free(self.separator);
+        if (self.expression) |expression| freeRelationalRowsExpression(alloc, expression);
         self.* = undefined;
     }
 };
@@ -3016,7 +3019,42 @@ fn validateRelationalGeneratedProperty(schema: TableSchema, document_schema: Doc
                 if (!isRelationalTextLikeProperty(source)) return error.InvalidSchemaUpdateRequest;
             }
         },
+        .expression => {
+            const expression = generated.expression orelse return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionDeterministic(expression)) return error.InvalidSchemaUpdateRequest;
+            if (relationalRowsExpressionReferencesField(expression, property.name)) return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionAgainstSchema(schema, expression);
+            if (!relationalGeneratedExpressionTypeMatchesProperty(try relationalRowsExpressionType(schema, expression), property)) return error.InvalidSchemaUpdateRequest;
+        },
     }
+}
+
+fn relationalRowsExpressionReferencesField(expression: storage_schema.RelationalRowsExpression, field: []const u8) bool {
+    if (expression.kind == .field and std.mem.eql(u8, expression.field, field)) return true;
+    for (expression.operands) |operand| {
+        if (relationalRowsExpressionReferencesField(operand, field)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (relationalRowsExpressionConditionReferencesField(branch.when, field)) return true;
+        if (relationalRowsExpressionReferencesField(branch.then, field)) return true;
+    }
+    for (expression.case_else) |case_else| {
+        if (relationalRowsExpressionReferencesField(case_else, field)) return true;
+    }
+    return false;
+}
+
+fn relationalRowsExpressionConditionReferencesField(condition: storage_schema.RelationalRowsExpressionCondition, field: []const u8) bool {
+    if (relationalRowsExpressionReferencesField(condition.lhs, field)) return true;
+    for (condition.rhs) |rhs| {
+        if (relationalRowsExpressionReferencesField(rhs, field)) return true;
+    }
+    return false;
+}
+
+fn relationalGeneratedExpressionTypeMatchesProperty(expression_type: RelationalRowsExpressionType, property: DocumentProperty) bool {
+    const property_type = relationalRowsExpressionTypeForProperty(property) catch return false;
+    return relationalRowsExpressionTypesComparable(property_type, expression_type);
 }
 
 fn validateRelationalPartialIndexProperty(schema: TableSchema, property: DocumentProperty) !void {
@@ -4547,9 +4585,27 @@ fn parseRelationalGeneratedValue(alloc: std.mem.Allocator, value: std.json.Value
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
     };
-    const op_value = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
-    if (op_value != .string) return error.InvalidSchemaUpdateRequest;
-    const op_text = op_value.string;
+    const op_value = object.get("op");
+    if (op_value) |actual| {
+        if (actual != .string) return error.InvalidSchemaUpdateRequest;
+    }
+    const op_text = if (op_value) |actual| actual.string else "";
+    if ((op_value == null or enumTokenEql(op_text, "expression")) and object.get("expression") != null) {
+        const expression = try parseRelationalRowsExpressionAlloc(alloc, object.get("expression").?);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeRelationalRowsExpression(alloc, expression);
+        const separator = try alloc.dupe(u8, "");
+        var separator_transferred = false;
+        errdefer if (!separator_transferred) alloc.free(separator);
+        expression_transferred = true;
+        separator_transferred = true;
+        return .{
+            .op = .expression,
+            .separator = separator,
+            .expression = expression,
+        };
+    }
+    if (op_value == null) return error.InvalidSchemaUpdateRequest;
     if (enumTokenEql(op_text, "lower") or enumTokenEql(op_text, "upper") or enumTokenEql(op_text, "md5")) {
         const field_value = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
         if (field_value != .string or field_value.string.len == 0) return error.InvalidSchemaUpdateRequest;

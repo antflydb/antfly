@@ -6402,7 +6402,36 @@ pub const DB = struct {
                     try validateGeneratedColumnBackfillSource(current_columns, next_columns, field);
                 }
             },
+            .expression => {
+                const expression = generated.expression orelse return error.InvalidSchemaUpdateRequest;
+                try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, expression);
+            },
         }
+    }
+
+    fn validateGeneratedColumnExpressionBackfillSources(
+        current_columns: []const schema_mod.RelationalColumn,
+        next_columns: []const schema_mod.RelationalColumn,
+        expression: schema_mod.RelationalRowsExpression,
+    ) error{InvalidSchemaUpdateRequest}!void {
+        if (expression.kind == .field) {
+            try validateGeneratedColumnBackfillSource(current_columns, next_columns, expression.field);
+        }
+        for (expression.operands) |operand| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, operand);
+        for (expression.case_branches) |branch| {
+            try validateGeneratedColumnExpressionConditionBackfillSources(current_columns, next_columns, branch.when);
+            try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, branch.then);
+        }
+        for (expression.case_else) |case_else| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, case_else);
+    }
+
+    fn validateGeneratedColumnExpressionConditionBackfillSources(
+        current_columns: []const schema_mod.RelationalColumn,
+        next_columns: []const schema_mod.RelationalColumn,
+        condition: schema_mod.RelationalRowsExpressionCondition,
+    ) error{InvalidSchemaUpdateRequest}!void {
+        try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, condition.lhs);
+        for (condition.rhs) |rhs| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, rhs);
     }
 
     fn validateGeneratedColumnBackfillSource(
@@ -21920,6 +21949,7 @@ pub const DB = struct {
                     .md5 => try relationalRowsMd5HexTextAlloc(alloc, selected.string),
                     .concat => unreachable,
                     .concat_ws => unreachable,
+                    .expression => unreachable,
                 };
                 defer alloc.free(folded);
                 break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = folded }, .{});
@@ -21950,6 +21980,7 @@ pub const DB = struct {
                 }
                 break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
             },
+            .expression => try relationalRowsExpressionValueJsonAlloc(alloc, row, generated.expression orelse return error.InvalidQueryRequest),
         };
     }
 
@@ -42632,7 +42663,7 @@ test "db direct schema apply appends literal default and generated columns throu
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
     ;
     const schema_v2 =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","default":"ACTIVE"},"note":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}},"status_lc":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","default":"ACTIVE"},"note":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}},"status_lc":{"type":"keyword","generated":{"op":"lower","field":"status"}},"status_expr_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["title"],"additionalProperties":false}}}}
     ;
 
     try db.applyTableSchemaJson(alloc, schema_v1, .{});
@@ -42644,7 +42675,7 @@ test "db direct schema apply appends literal default and generated columns throu
 
     const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
     defer alloc.free(materialized);
-    try std.testing.expectEqualStrings("{\"title\":\"one\",\"amount\":3,\"status\":\"ACTIVE\",\"title_lc\":\"one\",\"status_lc\":\"active\"}", materialized);
+    try std.testing.expectEqualStrings("{\"title\":\"one\",\"amount\":3,\"status\":\"ACTIVE\",\"title_lc\":\"one\",\"status_lc\":\"active\",\"status_expr_lc\":\"active\"}", materialized);
 
     const status_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "status");
     defer alloc.free(status_column);
@@ -42665,9 +42696,18 @@ test "db direct schema apply appends literal default and generated columns throu
     const title_lc_index_value = try db.core.store.get(alloc, title_lc_index);
     defer alloc.free(title_lc_index_value);
 
+    const status_expr_lc_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status_expr_lc", "doc:a");
+    defer alloc.free(status_expr_lc_index);
+    const status_expr_lc_index_value = try db.core.store.get(alloc, status_expr_lc_index);
+    defer alloc.free(status_expr_lc_index_value);
+
     const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
     defer schema_mod.freeSchema(alloc, durable_schema);
-    try std.testing.expectEqual(@as(usize, 6), durable_schema.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 7), durable_schema.relational_columns.len);
+    const durable_generated = durable_schema.relational_columns[6].generated orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.RelationalGeneratedOp.expression, durable_generated.op);
+    const durable_expression = durable_generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.RelationalRowsExpressionKind.lower, durable_expression.kind);
 }
 
 test "db direct schema apply rejects generated columns without deterministic backfill sources" {

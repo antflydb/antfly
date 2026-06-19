@@ -206,6 +206,7 @@ pub const RelationalGeneratedOp = enum(u8) {
     upper = 2,
     md5 = 3,
     concat_ws = 4,
+    expression = 5,
 };
 
 pub const RelationalGeneratedValue = struct {
@@ -213,6 +214,7 @@ pub const RelationalGeneratedValue = struct {
     field: ?[]const u8 = null,
     fields: []const []const u8 = &.{},
     separator: []const u8 = "",
+    expression: ?RelationalRowsExpression = null,
 };
 
 pub const RelationalCheckOp = enum(u8) {
@@ -542,7 +544,10 @@ fn relationalGeneratedValuesEqual(a: ?RelationalGeneratedValue, b: ?RelationalGe
     if (a.?.op != b.?.op) return false;
     if (!optionalStringsEqual(a.?.field, b.?.field)) return false;
     if (!stringSlicesEqual(a.?.fields, b.?.fields)) return false;
-    return std.mem.eql(u8, a.?.separator, b.?.separator);
+    if (!std.mem.eql(u8, a.?.separator, b.?.separator)) return false;
+    if (a.?.expression == null and b.?.expression == null) return true;
+    if (a.?.expression == null or b.?.expression == null) return false;
+    return relationalRowsExpressionsEqual(a.?.expression.?, b.?.expression.?);
 }
 
 pub fn relationalCheckCatalogsEqual(current: []const RelationalCheck, next: []const RelationalCheck) bool {
@@ -734,7 +739,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 39); // format version
+    try appendU32(&buf, alloc, 40); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -827,6 +832,12 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try appendU32(&buf, alloc, @intCast(generated.fields.len));
             for (generated.fields) |field| try appendStr(&buf, alloc, field);
             try appendStr(&buf, alloc, generated.separator);
+            if (generated.expression) |expression| {
+                try buf.append(alloc, 1);
+                try appendRelationalRowsExpression(&buf, alloc, expression);
+            } else {
+                try buf.append(alloc, 0);
+            }
         } else {
             try buf.append(alloc, 0);
         }
@@ -967,7 +978,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 39) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 40) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1305,7 +1316,15 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 errdefer freeStringSlice(alloc, fields);
                 const separator = try alloc.dupe(u8, readStr(data, &pos));
                 errdefer alloc.free(separator);
-                break :generated_blk .{ .op = op, .field = field, .fields = fields, .separator = separator };
+                const expression: ?RelationalRowsExpression = if (fmt_version >= 40 and data[pos] == 1) expression_blk: {
+                    pos += 1;
+                    break :expression_blk try readRelationalRowsExpressionAlloc(alloc, data, &pos);
+                } else expression_blk: {
+                    if (fmt_version >= 40) pos += 1;
+                    break :expression_blk null;
+                };
+                errdefer if (expression) |value| freeRelationalRowsExpression(alloc, value);
+                break :generated_blk .{ .op = op, .field = field, .fields = fields, .separator = separator, .expression = expression };
             } else generated_blk: {
                 if (fmt_version >= 20) pos += 1;
                 break :generated_blk null;
@@ -1615,6 +1634,7 @@ fn freeRelationalGeneratedValue(alloc: Allocator, generated: RelationalGenerated
     if (generated.field) |field| alloc.free(field);
     freeStringSlice(alloc, generated.fields);
     alloc.free(generated.separator);
+    if (generated.expression) |expression| freeRelationalRowsExpression(alloc, expression);
 }
 
 fn freeForeignKeysSlice(alloc: Allocator, foreign_keys: []const ForeignKey) void {
