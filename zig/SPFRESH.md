@@ -1090,10 +1090,12 @@ implementations cleanly:
     sequence space through latest-record helpers instead of loading full tails
     for the one-vector case. Segment latest-member scans also coalesce matching
     delta values into one contiguous range read per segment before checking the
-    target vector. Segment batch base prefetch now coalesces adjacent posting
-    base point values from the same segment into bounded range reads, so
-    flat/two-level directory probes do not turn a selected posting batch into
-    one file read per base value. The same newest-first batch scan keeps a
+    target vector, then stop walking that sequence-sorted range once the current
+    best record proves older values cannot improve the result. Segment batch
+    base prefetch now coalesces adjacent posting base point values from the same
+    segment into bounded range reads, so flat/two-level directory probes do not
+    turn a selected posting batch into one file read per base value. The same
+    newest-first batch scan keeps a
     compact unresolved-position list, so older segments only check postings
     still missing from the batch, and its per-segment point-read candidates are
     stack-backed for common probe windows. Lazy centroid-directory bulk loads
