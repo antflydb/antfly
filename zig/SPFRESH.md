@@ -1135,11 +1135,12 @@ implementations cleanly:
     materialization streams sorted delta records directly against the encoded
     base instead of first copying them into compact id/op scratch. Direct
     delta-record merge replay also skips its stable vector-ordering pass when
-    grouped records are already in vector-id order, and segment materialization
-    calls a sequence-sorted replay helper after its own segment ordering pass
-    so it does not rescan sequence order. Buffered segment replay now uses the
-    same direct delta-record merge for small sorted tails instead of copying
-    records into temporary compact id/op arrays. When a sorted
+    grouped records are already in vector-id order, and compact id/op fallback
+    replay now does the same before using its stable sort. Segment
+    materialization calls a sequence-sorted replay helper after its own segment
+    ordering pass so it does not rescan sequence order. Buffered segment replay
+    now uses the same direct delta-record merge for small sorted tails instead
+    of copying records into temporary compact id/op arrays. When a sorted
     committed manifest has a newer base segment, lazy replay also starts delta
     scanning at that base segment instead of visiting older manifest entries
     only to skip them. Fold replay for committed

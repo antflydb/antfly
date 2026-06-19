@@ -888,7 +888,7 @@ pub const PostingFormat = struct {
         ops: []PostingDeltaOp,
     ) !usize {
         if (ids.len == 0) return base_member_count;
-        stableSortCompactOpsByVector(ids, ops);
+        sortCompactOpsByVectorIfNeeded(ids, ops);
         return try applySortedCompactOpsToSortedScratchAssumeSorted(alloc, scratch, base_member_count, ids, ops);
     }
 
@@ -1341,6 +1341,16 @@ pub const PostingFormat = struct {
             }
             ids[j] = id;
             ops[j] = op;
+        }
+    }
+
+    fn sortCompactOpsByVectorIfNeeded(ids: []VectorId, ops: []PostingDeltaOp) void {
+        var i: usize = 1;
+        while (i < ids.len) : (i += 1) {
+            if (ids[i] < ids[i - 1]) {
+                stableSortCompactOpsByVector(ids, ops);
+                return;
+            }
         }
     }
 
@@ -7949,6 +7959,33 @@ test "posting sorted compact op replay assume-sorted skips resort" {
     try std.testing.expectEqual(@as(VectorId, 15), ids[0]);
     try std.testing.expectEqual(@as(VectorId, 20), ids[1]);
     try std.testing.expectEqual(@as(VectorId, 40), ids[2]);
+}
+
+test "posting compact op vector sort skips already ordered ops" {
+    var ids = [_]VectorId{ 10, 10, 20 };
+    var ops = [_]PostingDeltaOp{ .insert, .tombstone, .insert };
+
+    PostingFormat.sortCompactOpsByVectorIfNeeded(ids[0..], ops[0..]);
+
+    try std.testing.expectEqual(@as(VectorId, 10), ids[0]);
+    try std.testing.expectEqual(PostingDeltaOp.insert, ops[0]);
+    try std.testing.expectEqual(@as(VectorId, 10), ids[1]);
+    try std.testing.expectEqual(PostingDeltaOp.tombstone, ops[1]);
+    try std.testing.expectEqual(@as(VectorId, 20), ids[2]);
+}
+
+test "posting compact op vector sort preserves duplicate op order" {
+    var ids = [_]VectorId{ 20, 10, 10 };
+    var ops = [_]PostingDeltaOp{ .insert, .insert, .tombstone };
+
+    PostingFormat.sortCompactOpsByVectorIfNeeded(ids[0..], ops[0..]);
+
+    try std.testing.expectEqual(@as(VectorId, 10), ids[0]);
+    try std.testing.expectEqual(PostingDeltaOp.insert, ops[0]);
+    try std.testing.expectEqual(@as(VectorId, 10), ids[1]);
+    try std.testing.expectEqual(PostingDeltaOp.tombstone, ops[1]);
+    try std.testing.expectEqual(@as(VectorId, 20), ids[2]);
+    try std.testing.expectEqual(PostingDeltaOp.insert, ops[2]);
 }
 
 test "posting sorted compact op replay skips empty tails without touching scratch capacity" {
