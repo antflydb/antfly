@@ -54722,6 +54722,30 @@ fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityE
     };
 }
 
+const AppParityCoverageRequirements = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: sql_adapter.AppParityCoverageRequirementsRoot,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        sql_adapter.freeCoverageRequirementsRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+fn parseAppParityCoverageRequirementsAlloc(alloc: std.mem.Allocator) !AppParityCoverageRequirements {
+    const coverage_json = @embedFile("fixtures/sql_api_required_coverage.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try sql_adapter.parseCoverageRequirementsRootAlloc(alloc, parsed.value);
+    errdefer sql_adapter.freeCoverageRequirementsRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
 fn expectOptionalUsize(expected: ?usize, actual: usize) !void {
     if (expected) |value| try std.testing.expectEqual(value, actual);
 }
@@ -60226,6 +60250,8 @@ test "postgres sql adapter classifies application parity corpus" {
     var external_source = try parseAppParityExternalSourceCorpusAlloc(alloc);
     defer external_source.deinit(alloc);
     const corpus = external_source.root.entries;
+    var required_coverage = try parseAppParityCoverageRequirementsAlloc(alloc);
+    defer required_coverage.deinit(alloc);
 
     try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, corpus);
 
@@ -60235,29 +60261,7 @@ test "postgres sql adapter classifies application parity corpus" {
         try coverage.observe(alloc, entry);
         try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
-    try coverage.expectWindowAggregateFilter();
-    try coverage.expectComputedPatternCoverage();
-    try coverage.expectModuloCoverage();
-    try coverage.expectRegexpCoverage();
-    try coverage.expectArrayCoverage();
-    try coverage.expectRowAssignmentCoverage();
-    try coverage.expectBooleanAssignmentCoverage();
-    try coverage.expectJsonSetCoverage();
-    try coverage.expectJsonExpressionCoverage();
-    try coverage.expectConflictBooleanGuardCoverage();
-    try coverage.expectMixedIntervalExpression();
-    try coverage.expectCurrentTimestampPrecision();
-    try coverage.expectCurrentDateExpression();
-    try coverage.expectTemporalRangeColumnDmlCoverage();
-    try std.testing.expect(coverage.schema_mixed_expression_unique_conflict_target);
-    try std.testing.expect(coverage.query_md5_expression);
-    try std.testing.expect(coverage.query_concat_ws_expression);
-    try std.testing.expect(coverage.query_nullable_pagination);
-    try std.testing.expect(coverage.query_json_build_object_expression);
-    try std.testing.expect(coverage.query_overlay_expression);
-    try std.testing.expect(coverage.query_translate_expression);
-    try std.testing.expect(coverage.query_ends_with_expression);
-    try std.testing.expect(coverage.query_ascii_chr_expression);
+    try sql_adapter.expectAppParityCoverageRequirements(coverage, required_coverage.root.required);
 }
 
 test "postgres sql adapter classifies fixture-backed application parity corpus" {
@@ -60291,6 +60295,8 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     defer seen_names.deinit(alloc);
     var seen_skipped_names = std.StringHashMapUnmanaged(void){};
     defer seen_skipped_names.deinit(alloc);
+    var required_coverage = try parseAppParityCoverageRequirementsAlloc(alloc);
+    defer required_coverage.deinit(alloc);
     for (skipped_entries) |name| {
         if (name.len == 0 or seen_skipped_names.contains(name)) return error.TestUnexpectedResult;
         try seen_skipped_names.put(alloc, name, {});
@@ -60306,7 +60312,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
         try coverage.observe(alloc, entry);
         try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
-    try coverage.expectComplete();
+    try sql_adapter.expectAppParityCoverageRequirements(coverage, required_coverage.root.required);
 }
 
 test "postgres sql adapter lowers joined mutation source with separate target and source schemas" {

@@ -323,6 +323,11 @@ pub const AppParitySourceCorpusRoot = struct {
     entries: []const AppParityCorpusEntry,
 };
 
+pub const AppParityCoverageRequirementsRoot = struct {
+    coverage_format: u64,
+    required: []const []const u8,
+};
+
 pub const AppParityFixtureEncodedEntry = struct {
     entry: AppParityCorpusEntry,
     applied_plan: []const u8 = "",
@@ -739,6 +744,70 @@ fn appParityCoverageFlag(coverage: AppParityCorpusCoverage, name: []const u8) !b
         }
     }
     return error.TestUnexpectedResult;
+}
+
+fn appParityCoverageRequirementKnown(name: []const u8) bool {
+    inline for (std.meta.fields(AppParityCorpusCoverage)) |field| {
+        if (std.mem.eql(u8, name, field.name)) {
+            return field.type == bool or field.type == usize;
+        }
+    }
+    return false;
+}
+
+pub fn appParityCoverageRequirementSatisfied(coverage: AppParityCorpusCoverage, name: []const u8) !bool {
+    inline for (std.meta.fields(AppParityCorpusCoverage)) |field| {
+        if (std.mem.eql(u8, name, field.name)) {
+            if (field.type == bool) return @field(coverage, field.name);
+            if (field.type == usize) return @field(coverage, field.name) > 0;
+            return error.TestUnexpectedResult;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+pub fn parseCoverageRequirementsRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !AppParityCoverageRequirementsRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "coverage_format", "required" });
+    const coverage_format = try fixtureJsonOptionalU64(root, "coverage_format", 0);
+    if (coverage_format != app_parity_coverage_fixture_format) return error.TestUnexpectedResult;
+    const required = try parseFixtureStringListAlloc(alloc, root, "required");
+    errdefer if (required.len > 0) alloc.free(required);
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    for (required) |name| {
+        if (name.len == 0 or seen.contains(name) or !appParityCoverageRequirementKnown(name)) {
+            return error.TestUnexpectedResult;
+        }
+        try seen.put(alloc, name, {});
+    }
+
+    return .{
+        .coverage_format = coverage_format,
+        .required = required,
+    };
+}
+
+pub fn freeCoverageRequirementsRoot(
+    alloc: std.mem.Allocator,
+    root: AppParityCoverageRequirementsRoot,
+) void {
+    if (root.required.len > 0) alloc.free(root.required);
+}
+
+pub fn expectAppParityCoverageRequirements(
+    coverage: AppParityCorpusCoverage,
+    required: []const []const u8,
+) !void {
+    if (required.len == 0) return error.TestUnexpectedResult;
+    for (required) |name| {
+        try std.testing.expect(try appParityCoverageRequirementSatisfied(coverage, name));
+    }
 }
 
 fn checkCoverageRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) !void {
@@ -3573,6 +3642,37 @@ test "sql adapter corpus data-driven coverage regressions" {
     for (cases) |regression_case| {
         try checkCoverageRegressionCase(alloc, regression_case);
     }
+}
+
+test "sql adapter corpus parses data-driven coverage requirements" {
+    const alloc = std.testing.allocator;
+    const fixture_json = @embedFile("../fixtures/sql_api_required_coverage.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
+    defer parsed.deinit();
+
+    const root = try parseCoverageRequirementsRootAlloc(alloc, parsed.value);
+    defer freeCoverageRequirementsRoot(alloc, root);
+    try std.testing.expectEqual(app_parity_coverage_fixture_format, root.coverage_format);
+    try std.testing.expect(root.required.len > 0);
+
+    var coverage = AppParityCorpusCoverage{
+        .query = true,
+        .deterministic_returning_rows = 1,
+    };
+    try std.testing.expect(try appParityCoverageRequirementSatisfied(coverage, "query"));
+    try std.testing.expect(try appParityCoverageRequirementSatisfied(coverage, "deterministic_returning_rows"));
+    coverage.deterministic_returning_rows = 0;
+    try std.testing.expect(!try appParityCoverageRequirementSatisfied(coverage, "deterministic_returning_rows"));
+
+    const invalid_json =
+        \\{
+        \\  "coverage_format": 1,
+        \\  "required": ["query", "not_a_real_coverage_flag"]
+        \\}
+    ;
+    var parsed_invalid = try std.json.parseFromSlice(std.json.Value, alloc, invalid_json, .{});
+    defer parsed_invalid.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRequirementsRootAlloc(alloc, parsed_invalid.value));
 }
 
 test "sql adapter corpus validates fixture mutation and aggregate summaries" {
