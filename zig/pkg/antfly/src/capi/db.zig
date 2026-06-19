@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const antfly = @import("antfly-zig");
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
@@ -33,6 +34,21 @@ const schema_mod = antfly.schema;
 const lite_backend = antfly.lite.backend;
 const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
+
+const LiteCapabilities = struct {
+    freestanding_build: bool = builtin.os.tag == .freestanding,
+    hosted_profile: bool = false,
+    manual_maintenance: bool = false,
+    background_enrichment_runtime: bool = builtin.os.tag != .freestanding,
+    ttl_cleanup_runtime: bool = builtin.os.tag != .freestanding,
+    transaction_recovery_runtime: bool = builtin.os.tag != .freestanding,
+    local_template_rendering: bool = true,
+    remote_template_rendering: bool = builtin.os.tag != .freestanding,
+    remote_template_host_callbacks: bool = builtin.os.tag == .freestanding,
+    generated_enrichment_planning: bool = true,
+    dense_vector_search: bool = true,
+    sparse_vector_search: bool = true,
+};
 
 fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
@@ -1598,6 +1614,13 @@ pub export fn antfly_lite_open(path: [*:0]const u8, out_handle: *?*anyopaque) ca
 
 pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
     return openLiteHandle(std.mem.span(path), .query_readonly, out_handle);
+}
+
+pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    out_buf.* = stringifyJson(LiteCapabilities{}) catch return .internal;
+    return .ok;
 }
 
 pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
@@ -5757,18 +5780,37 @@ test "capi batch and lookup json" {
 
 test "capi lite opens exports imports checks and vacuums aflite" {
     const alloc = std.testing.allocator;
+    const plain_path = try tempTestPath(alloc, "capi-lite-plain");
+    defer alloc.free(plain_path);
     const src_path = try tempTestPath(alloc, "capi-lite-src");
     defer alloc.free(src_path);
     const dst_path = try tempTestPath(alloc, "capi-lite-dst");
     defer alloc.free(dst_path);
+    cleanupTestDir(plain_path);
     cleanupTestFile(src_path);
     cleanupTestFile(dst_path);
+    defer cleanupTestDir(plain_path);
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(dst_path);
+
+    var plain_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(plain_path, &plain_handle));
+    defer antfly_db_close(plain_handle);
+    var invalid_caps: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(plain_handle, &invalid_caps));
 
     var src_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
     defer antfly_db_close(src_handle);
+
+    var capabilities: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(src_handle, &capabilities));
+    defer antfly_db_buffer_free(capabilities.ptr, capabilities.len);
+    const capabilities_json = capabilities.ptr.?[0..capabilities.len];
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"hosted_profile\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"manual_maintenance\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"dense_vector_search\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sparse_vector_search\":true") != null);
 
     const writes_a = [_]capi.WriteIntent{
         .{
