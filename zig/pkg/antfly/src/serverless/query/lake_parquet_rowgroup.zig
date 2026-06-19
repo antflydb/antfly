@@ -624,7 +624,7 @@ pub const RowGroupSource = struct {
 
     pub fn init(inventory: external_source.Inventory, row_groups: []const RowGroupInput) !RowGroupSource {
         try inventory.validate();
-        if (inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+        if (inventory.format != .parquet and inventory.format != .iceberg) return error.InvalidParquetRowGroupBatch;
         if (row_groups.len == 0) return error.InvalidParquetRowGroupBatch;
         for (row_groups) |row_group| try row_group.validate();
         return .{
@@ -692,7 +692,7 @@ pub const ObjectRangeRowGroupSource = struct {
         row_groups: []const ObjectRangeRowGroupInput,
     ) !ObjectRangeRowGroupSource {
         try inventory.validate();
-        if (inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+        if (inventory.format != .parquet and inventory.format != .iceberg) return error.InvalidParquetRowGroupBatch;
         if (row_groups.len == 0) return error.InvalidParquetRowGroupBatch;
         for (row_groups) |row_group| try row_group.validate();
         return .{
@@ -2631,6 +2631,7 @@ fn appendOptionalDictionaryI64DataPageV2(
 pub const TestPlainI64Column = struct {
     column_id: []const u8,
     values: []const i64,
+    field_id: ?i32 = null,
 };
 
 pub const TestPlainByteArrayColumn = struct {
@@ -2842,6 +2843,7 @@ pub fn buildTestPlainI64ParquetObjectAlloc(alloc: Allocator, columns: []const Te
             .column_offset = object.items.len,
             .compressed_len = chunk.items.len,
             .uncompressed_len = chunk.items.len,
+            .field_id = column.field_id,
         };
         try object.appendSlice(alloc, chunk.items);
     }
@@ -2897,6 +2899,7 @@ pub fn buildTestPlainI64AndByteArrayParquetObjectAlloc(
             .compressed_len = chunk.items.len,
             .uncompressed_len = chunk.items.len,
             .physical_type = 2,
+            .field_id = column.field_id,
         };
         try object.appendSlice(alloc, chunk.items);
     }

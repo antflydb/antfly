@@ -563,7 +563,10 @@ The concrete work left for the data-lake path is therefore:
    equality column names, and the object-storage delete reader can scan
    equality-delete Parquet files plus pinned data files, apply data-sequence
    applicability, and pass matched deleted row refs through the common
-   `lake_rows` delete filter for the supported flat scalar cell types. The
+   `lake_rows` delete filter for the supported flat scalar cell types. Equality
+   delete matching now also lazily discovers data-file footers when the Iceberg
+   manifest inventory has no row-group metadata yet, then rebinds matched row
+   refs back to the caller-owned pinned inventory before returning them. The
    Iceberg schema planning now also fails closed when the pinned schema carries
    top-level `struct`, `list`, or `map` fields, because Antfly's current scan
    contract still resolves Parquet columns by flat names rather than Iceberg
