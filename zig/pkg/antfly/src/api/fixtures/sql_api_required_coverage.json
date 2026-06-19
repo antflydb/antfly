@@ -129,6 +129,7 @@
     "ddl_constraint_mode_deferred",
     "ddl_constraint_mode_immediate",
     "ddl_constraint_mode_named",
+    "ddl_copy_default_marker",
     "ddl_copy_delimiter",
     "ddl_copy_encoding",
     "ddl_copy_escape",

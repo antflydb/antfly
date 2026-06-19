@@ -3619,6 +3619,7 @@ const Parser = struct {
         const quote = syntax.quote;
         const escape = syntax.escape;
         const null_marker = syntax.null_marker;
+        const default_marker = syntax.default_marker;
         const encoding = syntax.encoding;
         syntax.table_name = "";
         syntax.columns = &.{};
@@ -3631,6 +3632,7 @@ const Parser = struct {
         syntax.quote = null;
         syntax.escape = null;
         syntax.null_marker = null;
+        syntax.default_marker = null;
         syntax.encoding = null;
         return .{
             .direction = bulkIoDirectionFromSyntax(syntax.direction),
@@ -3651,6 +3653,7 @@ const Parser = struct {
             .quote = quote,
             .escape = escape,
             .null_marker = null_marker,
+            .default_marker = default_marker,
             .encoding = encoding,
         };
     }
@@ -45222,13 +45225,14 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(copy_from_plan.quote == null);
     try std.testing.expect(copy_from_plan.escape == null);
     try std.testing.expect(copy_from_plan.null_marker == null);
+    try std.testing.expect(copy_from_plan.default_marker == null);
     try std.testing.expect(copy_from_plan.encoding == null);
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default", copy_from_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default", copy_from_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
-    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', ENCODING 'UTF8');");
+    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');");
     defer copy_from_header.deinit(alloc);
     const copy_from_header_plan = switch (copy_from_header) {
         .bulk_io => |plan| plan,
@@ -45250,10 +45254,11 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("\"", copy_from_header_plan.quote.?);
     try std.testing.expectEqualStrings("!", copy_from_header_plan.escape.?);
     try std.testing.expectEqualStrings("", copy_from_header_plan.null_marker.?);
+    try std.testing.expectEqualStrings("n/a", copy_from_header_plan.default_marker.?);
     try std.testing.expectEqualStrings("UTF8", copy_from_header_plan.encoding.?);
     const copy_from_header_fingerprint = try ddlFingerprintAlloc(alloc, copy_from_header);
     defer alloc.free(copy_from_header_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:on_error=ignore:reject_limit=10:log_verbosity=verbose:force_quote=none:force_quote_columns=0:force_not_null_columns=2:force_null_columns=1:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:encoding_hex=55544638", copy_from_header_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:on_error=ignore:reject_limit=10:log_verbosity=verbose:force_quote=none:force_quote_columns=0:force_not_null_columns=2:force_null_columns=1:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:default_marker_hex=6e2f61:encoding_hex=55544638", copy_from_header_fingerprint);
 
     var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *);");
     defer copy_to.deinit(alloc);
@@ -45264,7 +45269,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(copy_to_plan.force_quote_all);
     const copy_to_fingerprint = try ddlFingerprintAlloc(alloc, copy_to);
     defer alloc.free(copy_to_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:encoding_hex=default", copy_to_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default", copy_to_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
@@ -56684,6 +56689,8 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             defer alloc.free(escape_hex);
             const null_marker_hex = try bulkIoStringOptionHexAlloc(alloc, plan.null_marker);
             defer alloc.free(null_marker_hex);
+            const default_marker_hex = try bulkIoStringOptionHexAlloc(alloc, plan.default_marker);
+            defer alloc.free(default_marker_hex);
             const encoding_hex = try bulkIoStringOptionHexAlloc(alloc, plan.encoding);
             defer alloc.free(encoding_hex);
             const reject_limit = if (plan.reject_limit) |limit|
@@ -56694,14 +56701,14 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             break :blk if (plan.format) |format|
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:freeze={}:on_error={s}:reject_limit={s}:log_verbosity={s}:force_quote={s}:force_quote_columns={d}:force_not_null_columns={d}:force_null_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:encoding_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, plan.freeze, bulkIoOnErrorName(plan.on_error), reject_limit, bulkIoLogVerbosityName(plan.log_verbosity), bulkIoForceQuoteName(plan), plan.force_quote_columns.len, plan.force_not_null_columns.len, plan.force_null_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, encoding_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:freeze={}:on_error={s}:reject_limit={s}:log_verbosity={s}:force_quote={s}:force_quote_columns={d}:force_not_null_columns={d}:force_null_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:default_marker_hex={s}:encoding_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, plan.freeze, bulkIoOnErrorName(plan.on_error), reject_limit, bulkIoLogVerbosityName(plan.log_verbosity), bulkIoForceQuoteName(plan), plan.force_quote_columns.len, plan.force_not_null_columns.len, plan.force_null_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, default_marker_hex, encoding_hex },
                 )
             else
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:freeze={}:on_error={s}:reject_limit={s}:log_verbosity={s}:force_quote={s}:force_quote_columns={d}:force_not_null_columns={d}:force_null_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:encoding_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, plan.freeze, bulkIoOnErrorName(plan.on_error), reject_limit, bulkIoLogVerbosityName(plan.log_verbosity), bulkIoForceQuoteName(plan), plan.force_quote_columns.len, plan.force_not_null_columns.len, plan.force_null_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, encoding_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:freeze={}:on_error={s}:reject_limit={s}:log_verbosity={s}:force_quote={s}:force_quote_columns={d}:force_not_null_columns={d}:force_null_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:default_marker_hex={s}:encoding_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, plan.freeze, bulkIoOnErrorName(plan.on_error), reject_limit, bulkIoLogVerbosityName(plan.log_verbosity), bulkIoForceQuoteName(plan), plan.force_quote_columns.len, plan.force_not_null_columns.len, plan.force_null_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, default_marker_hex, encoding_hex },
                 );
         },
         .table_partition_catalog => |plan| switch (plan) {

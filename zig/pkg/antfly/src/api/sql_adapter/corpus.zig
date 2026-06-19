@@ -3921,6 +3921,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_privilege_grant: bool = false,
     ddl_privilege_revoke: bool = false,
     ddl_copy_from: bool = false,
+    ddl_copy_default_marker: bool = false,
     ddl_copy_header: bool = false,
     ddl_copy_delimiter: bool = false,
     ddl_copy_escape: bool = false,
@@ -5354,7 +5355,7 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_copy_unsupported_options = self.unsupported_ddl_copy_unsupported_options or
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     std.mem.startsWith(u8, entry.sql, "COPY ") and
-                    std.mem.indexOf(u8, entry.sql, "DEFAULT") != null);
+                    std.mem.indexOf(u8, entry.sql, " WHERE ") != null);
             self.unsupported_ddl_covering_expression_index_plan = self.unsupported_ddl_covering_expression_index_plan or
                 (std.mem.eql(u8, entry.classification_reason, "covering_derived_index_plan") and
                     std.mem.indexOf(u8, entry.sql, "lower(") != null and
@@ -5599,6 +5600,7 @@ pub const AppParityCorpusCoverage = struct {
                 .revoke_privilege => self.ddl_privilege_revoke = true,
                 .copy_from => {
                     self.ddl_copy_from = true;
+                    self.ddl_copy_default_marker = self.ddl_copy_default_marker or sql_adapter.planHasExactStringToken(entry.plan, ":default_marker_hex=", "6e2f61");
                     self.ddl_copy_header = self.ddl_copy_header or sql_adapter.planHasExactBoolToken(entry.plan, ":header=", true);
                     self.ddl_copy_delimiter = self.ddl_copy_delimiter or sql_adapter.planHasExactStringToken(entry.plan, ":delimiter_hex=", "2c");
                     self.ddl_copy_escape = self.ddl_copy_escape or sql_adapter.planHasExactStringToken(entry.plan, ":escape_hex=", "21");
@@ -6558,6 +6560,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_privilege_grant);
         try std.testing.expect(self.ddl_privilege_revoke);
         try std.testing.expect(self.ddl_copy_from);
+        try std.testing.expect(self.ddl_copy_default_marker);
         try std.testing.expect(self.ddl_copy_header);
         try std.testing.expect(self.ddl_copy_delimiter);
         try std.testing.expect(self.ddl_copy_escape);

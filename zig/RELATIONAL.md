@@ -4982,20 +4982,21 @@ columns, stream endpoint, direction, format, CSV header intent, import-freeze
 intent, export force-quote column policy, import force-null/not-null column
 policies, row-error policy, import-side reject limit for ignored row errors,
 log verbosity for ignored row errors, delimiter byte, quote byte, escape byte,
-and null-marker string, then fails closed when applied to table schema or
-runtime storage. Stream encoding names are captured as typed bulk-I/O metadata
-so import/export validation can normalize or transcode before row decoding.
-Reject limits and non-default log verbosity are valid only for `COPY FROM STDIN`
-with `ON_ERROR ignore`; export-side or stop-on-error row-error controls fail
-before a typed plan is accepted. The production shape should stream rows
-through typed schema validation, defaults, generated columns, checks, unique/FK
-participants, row-policy/authorization checks, 2PC staging, retryable range
-routing, and deterministic error reporting for imports, and through typed
-snapshot/range-read plans for exports. PostgreSQL `COPY` syntax can become an
-adapter frontend for those contracts, but it must not bypass row-batch,
-mutation-source, or routed read semantics. Until server-file, `PROGRAM`,
-alternate stream endpoints, and richer COPY row-decoding options such as
-`DEFAULT` replacement have native bulk-I/O endpoint and validation contracts,
+null-marker string, and import-side default replacement marker, then fails
+closed when applied to table schema or runtime storage. Stream encoding names
+are captured as typed bulk-I/O metadata so import/export validation can
+normalize or transcode before row decoding. Reject limits and non-default log
+verbosity are valid only for `COPY FROM STDIN` with `ON_ERROR ignore`;
+export-side or stop-on-error row-error controls fail before a typed plan is
+accepted, and default replacement is valid only for imports. The production
+shape should stream rows through typed schema validation, defaults, generated
+columns, checks, unique/FK participants, row-policy/authorization checks, 2PC
+staging, retryable range routing, and deterministic error reporting for
+imports, and through typed snapshot/range-read plans for exports. PostgreSQL
+`COPY` syntax can become an adapter frontend for those contracts, but it must
+not bypass row-batch, mutation-source, or routed read semantics. Until
+server-file, `PROGRAM`, alternate stream endpoints, and row-filtered
+`COPY FROM ... WHERE` have native bulk-I/O endpoint and validation contracts,
 the source parity corpus requires them to fail closed under `bulk_io_plan`.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
