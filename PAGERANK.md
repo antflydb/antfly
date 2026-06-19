@@ -4955,6 +4955,9 @@ than PR unit coverage:
   finishes without build start, active-build observation, worker page,
   coordinator, phase-advance, publish, zero-failure evidence, and
   budget-exhaustion evidence whenever a family needed multiple ticks to finish.
+  Page-claim, executed-round, worker-step, and coordinator-step evidence now
+  also emits min/max per-family bounds and requires nonzero minima, so the final
+  row cannot hide a family that did no scheduler work behind aggregate totals.
   Page-completion totals must cover phase advances, and aggregate coordinator
   decisions must fit inside the observed coordinator step count, so the summary
   row cannot claim publish/phase/failure decisions that were not accounted for

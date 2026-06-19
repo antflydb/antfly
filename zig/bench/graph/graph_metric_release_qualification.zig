@@ -581,11 +581,15 @@ const ReleaseSummary = struct {
     max_observed_storage_failure_records: usize = 0,
     min_observed_storage_event_records: usize = 0,
     max_observed_storage_event_records: usize = 0,
+    min_observed_page_claims: usize = 0,
     max_observed_page_claims: usize = 0,
     max_observed_cleanup_ticks: usize = 0,
+    min_observed_rounds_executed: usize = 0,
     max_observed_rounds_executed: usize = 0,
     max_observed_failure_retry_count: u64 = 0,
+    min_observed_worker_steps: usize = 0,
     max_observed_worker_steps: usize = 0,
+    min_observed_coordinator_steps: usize = 0,
     max_observed_coordinator_steps: usize = 0,
     max_observed_pre_drain_metrics_scanned: usize = 0,
     total_worker_identities_configured: usize = 0,
@@ -951,11 +955,27 @@ const ReleaseSummary = struct {
         else
             @min(self.min_observed_storage_event_records, result.failed_storage_event_records);
         self.max_observed_storage_event_records = @max(self.max_observed_storage_event_records, result.failed_storage_event_records);
+        self.min_observed_page_claims = if (first)
+            result.scheduler.pages_claimed
+        else
+            @min(self.min_observed_page_claims, result.scheduler.pages_claimed);
         self.max_observed_page_claims = @max(self.max_observed_page_claims, result.scheduler.pages_claimed);
         self.max_observed_cleanup_ticks = @max(self.max_observed_cleanup_ticks, result.cleanup_ticks);
+        self.min_observed_rounds_executed = if (first)
+            result.scheduler.rounds_executed
+        else
+            @min(self.min_observed_rounds_executed, result.scheduler.rounds_executed);
         self.max_observed_rounds_executed = @max(self.max_observed_rounds_executed, result.scheduler.rounds_executed);
         self.max_observed_failure_retry_count = @max(self.max_observed_failure_retry_count, result.failure_retry_count);
+        self.min_observed_worker_steps = if (first)
+            result.scheduler.worker_steps
+        else
+            @min(self.min_observed_worker_steps, result.scheduler.worker_steps);
         self.max_observed_worker_steps = @max(self.max_observed_worker_steps, result.scheduler.worker_steps);
+        self.min_observed_coordinator_steps = if (first)
+            result.scheduler.coordinator_steps
+        else
+            @min(self.min_observed_coordinator_steps, result.scheduler.coordinator_steps);
         self.max_observed_coordinator_steps = @max(self.max_observed_coordinator_steps, result.scheduler.coordinator_steps);
         self.max_observed_pre_drain_metrics_scanned = @max(self.max_observed_pre_drain_metrics_scanned, result.pre_drain_metrics_scanned);
         self.total_worker_identities_configured += result.worker_identities_configured;
@@ -2336,6 +2356,18 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
             summary.max_observed_storage_event_records < summary.min_observed_storage_event_records))
     {
         return error.GraphMetricReleaseQualificationStorageFootprintMismatch;
+    }
+    if (summary.families_run != 0 and
+        (summary.min_observed_page_claims == 0 or
+            summary.max_observed_page_claims < summary.min_observed_page_claims or
+            summary.min_observed_rounds_executed == 0 or
+            summary.max_observed_rounds_executed < summary.min_observed_rounds_executed or
+            summary.min_observed_worker_steps == 0 or
+            summary.max_observed_worker_steps < summary.min_observed_worker_steps or
+            summary.min_observed_coordinator_steps == 0 or
+            summary.max_observed_coordinator_steps < summary.min_observed_coordinator_steps))
+    {
+        return error.GraphMetricReleaseQualificationSchedulerEvidenceMismatch;
     }
     if (cfg.max_page_claims != 0 and summary.max_observed_page_claims > cfg.max_page_claims) {
         return error.GraphMetricReleaseQualificationPageClaimsBudgetExceeded;
@@ -7762,12 +7794,20 @@ fn observedCleanupLatencyBudget(cfg: Config, summary: ReleaseSummary) bool {
 fn observedPromotionSchedulerBudget(cfg: Config, summary: ReleaseSummary) bool {
     return hasPromotionSchedulerBudgets(cfg) and
         summary.families_run != 0 and
+        summary.min_observed_page_claims != 0 and
         summary.max_observed_page_claims <= cfg.max_page_claims and
         summary.max_observed_cleanup_ticks <= cfg.max_cleanup_ticks and
+        summary.min_observed_rounds_executed != 0 and
         summary.max_observed_rounds_executed <= cfg.max_rounds_executed and
         summary.max_observed_failure_retry_count <= cfg.max_failure_retry_count and
+        summary.min_observed_worker_steps != 0 and
         summary.max_observed_worker_steps <= cfg.max_worker_steps and
+        summary.min_observed_coordinator_steps != 0 and
         summary.max_observed_coordinator_steps <= cfg.max_coordinator_steps and
+        summary.max_observed_page_claims >= summary.min_observed_page_claims and
+        summary.max_observed_rounds_executed >= summary.min_observed_rounds_executed and
+        summary.max_observed_worker_steps >= summary.min_observed_worker_steps and
+        summary.max_observed_coordinator_steps >= summary.min_observed_coordinator_steps and
         summary.total_scheduler_builds_started == summary.families_run + summary.total_successful_generation_repeats and
         summary.total_scheduler_published == summary.families_run + summary.total_successful_generation_repeats and
         summary.total_scheduler_failed_builds == 0 and
@@ -8023,8 +8063,8 @@ fn emitReleaseSummary(out: anytype, cfg: Config, summary: ReleaseSummary) !void 
         .{ cfg.max_storage_score_records, summary.min_observed_storage_score_records, summary.max_observed_storage_score_records, cfg.max_storage_metric_records, summary.min_observed_storage_metric_records, summary.max_observed_storage_metric_records, cfg.max_storage_control_records, summary.min_observed_storage_control_records, summary.max_observed_storage_control_records, cfg.max_storage_attempt_records, summary.min_observed_storage_attempt_records, summary.max_observed_storage_attempt_records, cfg.max_storage_failure_records, summary.min_observed_storage_failure_records, summary.max_observed_storage_failure_records, cfg.max_storage_event_records, summary.min_observed_storage_event_records, summary.max_observed_storage_event_records },
     );
     try out.print(
-        ",\"max_page_claims\":{d},\"max_observed_page_claims\":{d},\"max_cleanup_ticks\":{d},\"max_observed_cleanup_ticks\":{d},\"max_rounds_executed\":{d},\"max_observed_rounds_executed\":{d},\"max_failure_retry_count\":{d},\"max_observed_failure_retry_count\":{d},\"max_worker_steps\":{d},\"max_observed_worker_steps\":{d},\"max_coordinator_steps\":{d},\"max_observed_coordinator_steps\":{d},\"min_families_run\":{d},\"min_split_worker_identities_with_progress\":{d},\"min_split_worker_identities_with_page_progress\":{d}",
-        .{ cfg.max_page_claims, summary.max_observed_page_claims, cfg.max_cleanup_ticks, summary.max_observed_cleanup_ticks, cfg.max_rounds_executed, summary.max_observed_rounds_executed, cfg.max_failure_retry_count, summary.max_observed_failure_retry_count, cfg.max_worker_steps, summary.max_observed_worker_steps, cfg.max_coordinator_steps, summary.max_observed_coordinator_steps, cfg.min_families_run, cfg.min_split_worker_identities_with_progress, cfg.min_split_worker_identities_with_page_progress },
+        ",\"max_page_claims\":{d},\"min_observed_page_claims\":{d},\"max_observed_page_claims\":{d},\"max_cleanup_ticks\":{d},\"max_observed_cleanup_ticks\":{d},\"max_rounds_executed\":{d},\"min_observed_rounds_executed\":{d},\"max_observed_rounds_executed\":{d},\"max_failure_retry_count\":{d},\"max_observed_failure_retry_count\":{d},\"max_worker_steps\":{d},\"min_observed_worker_steps\":{d},\"max_observed_worker_steps\":{d},\"max_coordinator_steps\":{d},\"min_observed_coordinator_steps\":{d},\"max_observed_coordinator_steps\":{d},\"min_families_run\":{d},\"min_split_worker_identities_with_progress\":{d},\"min_split_worker_identities_with_page_progress\":{d}",
+        .{ cfg.max_page_claims, summary.min_observed_page_claims, summary.max_observed_page_claims, cfg.max_cleanup_ticks, summary.max_observed_cleanup_ticks, cfg.max_rounds_executed, summary.min_observed_rounds_executed, summary.max_observed_rounds_executed, cfg.max_failure_retry_count, summary.max_observed_failure_retry_count, cfg.max_worker_steps, summary.min_observed_worker_steps, summary.max_observed_worker_steps, cfg.max_coordinator_steps, summary.min_observed_coordinator_steps, summary.max_observed_coordinator_steps, cfg.min_families_run, cfg.min_split_worker_identities_with_progress, cfg.min_split_worker_identities_with_page_progress },
     );
     try out.print(
         ",\"max_allowed_pre_drain_metrics_scanned\":{d},\"total_pre_drain_metrics_scanned\":{d},\"min_observed_pre_drain_metrics_scanned\":{d},\"max_observed_pre_drain_metrics_scanned\":{d},\"total_pre_drain_queued_builds\":{d},\"min_observed_pre_drain_queued_builds\":{d},\"total_pre_drain_paused_metrics\":{d},\"total_fresh_terminal_pending_work\":{d},\"total_fresh_active_builds\":{d},\"total_fresh_active_pages\":{d},\"total_fresh_failed_pages\":{d},\"total_fresh_paused_metrics\":{d},\"total_fresh_truncated_pages\":{d},\"total_fresh_status_pages\":{d},\"total_fresh_status_pages_truncated\":{d},\"total_active_work_active_builds\":{d},\"total_active_work_active_pages\":{d},\"min_observed_active_work_active_pages\":{d},\"max_observed_active_work_active_pages\":{d},\"total_active_work_failed_pages\":{d},\"total_active_work_paused_metrics\":{d},\"total_active_work_truncated_pages\":{d}",
