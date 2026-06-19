@@ -10708,6 +10708,33 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+
+    var profile_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?profile=copilot",
+    });
+    defer profile_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+
+    var mcp_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?include=mcp",
+    });
+    defer mcp_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), mcp_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+
+    var skill_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?types=application/ai-skill+md",
+    });
+    defer skill_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), skill_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"agents\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"count\":0") != null);
 }
 
 test "api http server lists extension-owned mcp tools" {
