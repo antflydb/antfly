@@ -30,6 +30,11 @@ const object_store_support = @import("../object_store_support.zig");
 const object_storage = @import("../../storage/object_storage.zig");
 const resolver_api = @import("external_source_plan_resolver_api.zig");
 const lake_iceberg_snapshot = @import("../query/lake_iceberg_snapshot.zig");
+const lake_object_reader = @import("../query/lake_object_reader.zig");
+const lake_parquet_footer = @import("../query/lake_parquet_footer.zig");
+const lake_parquet_metadata = @import("../query/lake_parquet_metadata.zig");
+const lake_parquet_rowgroup = @import("../query/lake_parquet_rowgroup.zig");
+const lake_range_io = @import("../query/lake_range_io.zig");
 
 pub const OpenedObjectStoreResolver = struct {
     ptr: *anyopaque,
@@ -89,6 +94,7 @@ pub const RemoteUriObjectStoreResolver = struct {
 pub const ResolverOptions = struct {
     file_bucket: []const u8 = "antfly",
     object_uri_base: ?[]const u8 = null,
+    footer_probe_bytes: u64 = 64 * 1024,
 };
 
 pub const Resolver = struct {
@@ -162,15 +168,26 @@ fn inventoryForBindingAlloc(
     }
 
     return switch (binding.format) {
-        .parquet => try external_source.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
-            .client = opened_store.client,
-            .bucket = opened_store.bucket,
-            .prefix = opened_store.prefix,
-            .source_id = binding.table_id,
-            .source_uri = binding.source_uri,
-            .object_uri_base = source_options.object_uri_base,
-            .schema_fingerprint = binding.schema_fingerprint,
-        }),
+        .parquet => blk: {
+            var inventory = try external_source.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
+                .client = opened_store.client,
+                .bucket = opened_store.bucket,
+                .prefix = opened_store.prefix,
+                .source_id = binding.table_id,
+                .source_uri = binding.source_uri,
+                .object_uri_base = source_options.object_uri_base,
+                .schema_fingerprint = binding.schema_fingerprint,
+            });
+            errdefer inventory.deinit(alloc);
+            const enriched = try enrichInventoryWithObjectFootersAlloc(
+                alloc,
+                opened_store.client,
+                inventory,
+                source_options.footer_probe_bytes,
+            );
+            inventory.deinit(alloc);
+            break :blk enriched;
+        },
         .iceberg => blk: {
             const metadata_uri = try icebergMetadataUriForOpenedStoreAlloc(
                 alloc,
@@ -193,10 +210,65 @@ fn inventoryForBindingAlloc(
                 opened_store.client,
                 &inventory,
             );
-            break :blk inventory;
+            const enriched = try enrichInventoryWithObjectFootersAlloc(
+                alloc,
+                opened_store.client,
+                inventory,
+                source_options.footer_probe_bytes,
+            );
+            inventory.deinit(alloc);
+            break :blk enriched;
         },
         .lance => error.UnsupportedRowsQuery,
     };
+}
+
+fn enrichInventoryWithObjectFootersAlloc(
+    alloc: Allocator,
+    source_client: object_storage.ObjectStorage,
+    inventory: external_source.Inventory,
+    footer_probe_bytes: u64,
+) !external_source.Inventory {
+    try inventory.validate();
+    if (inventory.format != .parquet and inventory.format != .iceberg) return error.InvalidParquetMetadata;
+    if (footer_probe_bytes == 0) return error.InvalidLakeRangeRead;
+
+    var object_range_reader = lake_object_reader.ObjectStorageRangeReader.init(source_client);
+    const range_reader = object_range_reader.parquetReader();
+    const footers = try alloc.alloc(lake_parquet_metadata.FileFooter, inventory.files.len);
+    errdefer alloc.free(footers);
+    var initialized: usize = 0;
+    errdefer {
+        for (footers[0..initialized]) |*entry| entry.footer.deinit(alloc);
+    }
+
+    for (inventory.files, 0..) |file, idx| {
+        const object = try lake_range_io.objectRefForExternalFileUri(file);
+        const tail_read = try lake_range_io.planParquetFooterRead(object, footer_probe_bytes);
+        const tail = try range_reader.readPlannedAlloc(alloc, tail_read);
+        defer alloc.free(tail);
+
+        const preflight = try lake_parquet_footer.parseFooterPreflight(object.byte_len, tail_read.range.offset, tail);
+        var owned_metadata: ?[]u8 = null;
+        defer if (owned_metadata) |bytes| alloc.free(bytes);
+        const metadata_bytes = preflight.metadataSlice(tail) orelse blk: {
+            const metadata_read = try lake_parquet_footer.planFooterMetadataRead(object, tail_read.range.offset, tail);
+            owned_metadata = try range_reader.readPlannedAlloc(alloc, metadata_read);
+            break :blk owned_metadata.?;
+        };
+
+        footers[idx] = .{
+            .file_id = file.file_id,
+            .footer = try lake_parquet_metadata.parseFooterMetadataAlloc(alloc, metadata_bytes, file.byte_len),
+        };
+        initialized += 1;
+    }
+
+    var enriched = try lake_parquet_metadata.enrichInventoryFilesWithFootersAlloc(alloc, inventory, footers);
+    errdefer enriched.deinit(alloc);
+    for (footers[0..initialized]) |*entry| entry.footer.deinit(alloc);
+    alloc.free(footers);
+    return enriched;
 }
 
 fn icebergMetadataUriForOpenedStoreAlloc(
@@ -323,7 +395,13 @@ test "remote uri publication resolver pins parquet inventory into artifact store
     defer fs.deinit();
     var client = fs.client();
     if (!(try client.bucketExists("antfly"))) try client.makeBucket("antfly");
-    var put = try client.putObject("antfly", "events/data-0001.parquet", "not-parquet", .{});
+    const parquet_object = try lake_parquet_rowgroup.buildTestSingleColumnPlainI64ParquetObjectAlloc(
+        alloc,
+        "amount",
+        &[_]i64{ 10, 20, 30 },
+    );
+    defer alloc.free(parquet_object);
+    var put = try client.putObject("antfly", "events/data-0001.parquet", parquet_object, .{});
     defer put.deinit(alloc);
 
     var opened_store = try object_store_support.OpenedObjectStore.initWithClient(alloc, client, "antfly", "events");
@@ -335,7 +413,9 @@ test "remote uri publication resolver pins parquet inventory into artifact store
     var artifacts = artifact_impl.artifactStore();
     defer artifacts.deinit();
 
-    var publication = Resolver.init(&artifacts, object_resolver.resolver(), .{});
+    var publication = Resolver.init(&artifacts, object_resolver.resolver(), .{
+        .object_uri_base = "object://antfly/events",
+    });
     var plan = (try publication.planResolver().resolveAlloc(alloc, .{
         .namespace = "events",
         .table_name = "events",
@@ -353,6 +433,15 @@ test "remote uri publication resolver pins parquet inventory into artifact store
     try std.testing.expectEqualStrings("events.external-files", plan.artifacts[0].name);
     try std.testing.expectEqualStrings(plan.artifacts[0].artifact_id, plan.base_source.external_parquet.file_inventory_artifact.?);
     try std.testing.expectEqualStrings("schema-v1", plan.base_source.external_parquet.schema_fingerprint);
+
+    const artifact_bytes = artifact_impl.bytes orelse return error.ArtifactNotFound;
+    var decoded = try external_source.decodeInventoryAlloc(alloc, artifact_bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(external_source.Format.parquet, decoded.format);
+    try std.testing.expectEqual(@as(usize, 1), decoded.files.len);
+    try std.testing.expectEqual(@as(u64, 3), decoded.files[0].row_count);
+    try std.testing.expectEqual(@as(usize, 1), decoded.files[0].row_groups.len);
+    try std.testing.expectEqualStrings("amount", decoded.files[0].row_groups[0].column_chunks[0].column_id);
 }
 
 test "remote uri publication resolver pins iceberg data object identity into artifact store" {
@@ -366,7 +455,16 @@ test "remote uri publication resolver pins iceberg data object identity into art
     defer version_hint.deinit(alloc);
     var metadata_file = try client.putObject("bucket", "events/metadata/v1.metadata.json", resolverIcebergMetadataJson(), .{});
     defer metadata_file.deinit(alloc);
-    var data_manifest = try buildResolverIcebergDataManifestFixture(alloc);
+    const data_a = try lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(
+        alloc,
+        &[_]lake_parquet_rowgroup.TestPlainI64Column{.{
+            .column_id = "amount",
+            .values = &[_]i64{ 10, 20, 30 },
+            .field_id = 7,
+        }},
+    );
+    defer alloc.free(data_a);
+    var data_manifest = try buildResolverIcebergDataManifestFixture(alloc, data_a.len);
     defer data_manifest.deinit(alloc);
     var manifest_list = try buildResolverIcebergManifestListFixture(alloc, data_manifest.items.len);
     defer manifest_list.deinit(alloc);
@@ -374,9 +472,6 @@ test "remote uri publication resolver pins iceberg data object identity into art
     defer manifest_list_put.deinit(alloc);
     var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
     defer data_manifest_put.deinit(alloc);
-    const data_a = try alloc.alloc(u8, 4096);
-    defer alloc.free(data_a);
-    @memset(data_a, 0);
     var data_a_put = try client.putObject("bucket", "events/data/a.parquet", data_a, .{});
     defer data_a_put.deinit(alloc);
 
@@ -416,6 +511,10 @@ test "remote uri publication resolver pins iceberg data object identity into art
     try std.testing.expect(decoded.files[0].etag.len != 0);
     try std.testing.expectEqual(@as(usize, 0), decoded.files[0].version_id.len);
     try std.testing.expectEqual(@as(?i64, 42), decoded.files[0].data_sequence_number);
+    try std.testing.expectEqual(@as(u64, 3), decoded.files[0].row_count);
+    try std.testing.expectEqual(@as(usize, 1), decoded.files[0].row_groups.len);
+    try std.testing.expectEqualStrings("amount", decoded.files[0].row_groups[0].column_chunks[0].column_id);
+    try std.testing.expectEqual(@as(?i32, 7), decoded.files[0].row_groups[0].column_chunks[0].field_id);
 }
 
 fn resolverIcebergMetadataJson() []const u8 {
@@ -461,7 +560,7 @@ fn buildResolverIcebergManifestListFixture(alloc: Allocator, manifest_length: us
     return out;
 }
 
-fn buildResolverIcebergDataManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
+fn buildResolverIcebergDataManifestFixture(alloc: Allocator, file_size_in_bytes: usize) !std.ArrayListUnmanaged(u8) {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendResolverIcebergAvroHeader(alloc, &out, resolverIcebergDataManifestSchema(), "fedcba9876543210");
@@ -479,7 +578,7 @@ fn buildResolverIcebergDataManifestFixture(alloc: Allocator) !std.ArrayListUnman
     try appendResolverIcebergString(alloc, &block, "s3://bucket/events/data/a.parquet");
     try appendResolverIcebergString(alloc, &block, "PARQUET");
     try appendResolverIcebergLong(alloc, &block, 3);
-    try appendResolverIcebergLong(alloc, &block, 4096);
+    try appendResolverIcebergLong(alloc, &block, @intCast(file_size_in_bytes));
 
     try appendResolverIcebergAvroBlock(alloc, &out, block.items, 1, "fedcba9876543210");
     return out;

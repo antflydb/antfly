@@ -489,7 +489,13 @@ test "runtime bootstrap external source resolver pins credentialed parquet inven
     defer lake_fs.deinit();
     var lake_client = lake_fs.client();
     if (!(try lake_client.bucketExists("antfly"))) try lake_client.makeBucket("antfly");
-    var put = try lake_client.putObject("antfly", "data-0001.parquet", "not-parquet", .{});
+    const parquet_object = try query_mod.buildLakeParquetTestSingleColumnPlainI64ObjectAlloc(
+        alloc,
+        "amount",
+        &[_]i64{ 10, 20, 30 },
+    );
+    defer alloc.free(parquet_object);
+    var put = try lake_client.putObject("antfly", "data-0001.parquet", parquet_object, .{});
     defer put.deinit(alloc);
 
     var fs_artifacts = try artifacts_mod.FsStore.init(alloc, artifact_path);

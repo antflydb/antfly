@@ -151,9 +151,9 @@ The incremental serverless path is:
    manifest builders. It can also apply a resolved external-source inventory
    publication plan to the manifest before publish. The publication resolver can
    now discover `.current` raw Parquet and Iceberg bindings, encode the pinned
-   inventory, and pass that resolved plan into the live builder; Iceberg data
-   files are stat-pinned to provider ETag/version identity before the inventory
-   artifact is written.
+   inventory with footer-derived row-group metadata, and pass that resolved plan
+   into the live builder; Iceberg data files are stat-pinned to provider
+   ETag/version identity before the inventory artifact is written.
 3. Add file inventory and row-group metadata artifacts.
 4. Add a Parquet footer scanner over existing object-store range reads.
 5. Add `ExternalParquetRowSource` behind the relational row-plan executor.
@@ -537,6 +537,11 @@ complete." The scaffold proves Antfly's owned shape; the engine is complete
 only when external Parquet/Iceberg/Lance tables can be queried through the
 public relational APIs with snapshot correctness, object-store-efficient reads,
 sidecar acceleration, cache isolation, and operational rebuild/GC behavior.
+
+Freshly published Parquet and Iceberg inventories are expected to be
+footer-enriched before their inventory artifact is written. Scan-time footer
+discovery remains as compatibility and explain behavior for older or manually
+constructed inventories that contain file identities but no row-group metadata.
 
 The concrete work left for the data-lake path is therefore:
 
