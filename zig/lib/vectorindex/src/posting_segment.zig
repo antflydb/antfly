@@ -947,10 +947,12 @@ pub const LazyDirectorySnapshot = struct {
 
             var has_candidate = false;
             var sorted_candidate_positions: []const usize = &.{};
+            var sorted_candidate_range = PostingPositionRange{};
             if (sorted_by_segment_id) {
                 if (unresolved_positions.len == 0) break;
                 if (posting_ids_ascending) {
-                    sorted_candidate_positions = try sortedPostingPositionsOverlappingSegment(posting_ids, unresolved_positions, entry.meta);
+                    sorted_candidate_range = try sortedPostingPositionRangeOverlappingSegment(posting_ids, unresolved_positions, entry.meta);
+                    sorted_candidate_positions = unresolved_positions[sorted_candidate_range.first..sorted_candidate_range.past];
                     has_candidate = sorted_candidate_positions.len != 0;
                 } else {
                     for (unresolved_positions) |i| {
@@ -1013,13 +1015,19 @@ pub const LazyDirectorySnapshot = struct {
             const point_reads = point_reads_storage[0..point_read_count];
             try readSegmentBatchPointValuesAlloc(alloc, self.io, self.dir, manifest_entry, point_reads, out);
             if (sorted_by_segment_id) {
-                var write_index: usize = 0;
-                for (unresolved_positions) |i| {
-                    if (out[i] != null) continue;
-                    unresolved_positions[write_index] = i;
-                    write_index += 1;
+                if (point_read_count != 0) {
+                    if (posting_ids_ascending) {
+                        unresolved_positions = try compactResolvedSortedPositionRange(unresolved_positions, sorted_candidate_range, out);
+                    } else {
+                        var write_index: usize = 0;
+                        for (unresolved_positions) |i| {
+                            if (out[i] != null) continue;
+                            unresolved_positions[write_index] = i;
+                            write_index += 1;
+                        }
+                        unresolved_positions = unresolved_positions[0..write_index];
+                    }
                 }
-                unresolved_positions = unresolved_positions[0..write_index];
             } else {
                 for (point_reads) |read| best_segment_ids[read.output_index] = entry.meta.segment_id;
             }
@@ -2329,8 +2337,18 @@ fn appendBasePointReadsForSortedPositions(
     return count;
 }
 
+const PostingPositionRange = struct {
+    first: usize = 0,
+    past: usize = 0,
+};
+
 fn sortedPostingPositionsOverlappingSegment(posting_ids: []const PostingId, positions: []const usize, meta: SegmentMeta) ![]const usize {
-    if (positions.len == 0 or meta.entry_count == 0) return &.{};
+    const range = try sortedPostingPositionRangeOverlappingSegment(posting_ids, positions, meta);
+    return positions[range.first..range.past];
+}
+
+fn sortedPostingPositionRangeOverlappingSegment(posting_ids: []const PostingId, positions: []const usize, meta: SegmentMeta) !PostingPositionRange {
+    if (positions.len == 0 or meta.entry_count == 0) return .{};
 
     var lo: usize = 0;
     var hi: usize = positions.len;
@@ -2356,7 +2374,25 @@ fn sortedPostingPositionsOverlappingSegment(posting_ids: []const PostingId, posi
         }
     }
 
-    return positions[first..lo];
+    return .{ .first = first, .past = lo };
+}
+
+fn compactResolvedSortedPositionRange(positions: []usize, range: PostingPositionRange, out: []const ?[]u8) ![]usize {
+    if (range.first > range.past or range.past > positions.len) return error.CorruptedPostingSegment;
+    if (range.first == range.past) return positions;
+
+    var write_index = range.first;
+    for (positions[range.first..range.past]) |position| {
+        if (position >= out.len) return error.CorruptedPostingSegment;
+        if (out[position] != null) continue;
+        positions[write_index] = position;
+        write_index += 1;
+    }
+    for (positions[range.past..]) |position| {
+        positions[write_index] = position;
+        write_index += 1;
+    }
+    return positions[0..write_index];
 }
 
 fn postingIdAtSortedPosition(posting_ids: []const PostingId, position: usize) !PostingId {
@@ -5958,6 +5994,19 @@ pub fn testSortedPostingPositionsOverlappingSegment() !void {
     try std.testing.expectError(error.CorruptedPostingSegment, sortedPostingPositionsOverlappingSegment(&posting_ids, &.{99}, meta));
 }
 
+pub fn testCompactResolvedSortedPositionRange() !void {
+    var positions = [_]usize{ 0, 1, 2, 3, 4 };
+    var one = [_]u8{1};
+    var two = [_]u8{2};
+    const out = [_]?[]u8{ null, null, one[0..], two[0..], null };
+
+    const compacted = try compactResolvedSortedPositionRange(&positions, .{ .first = 1, .past = 4 }, &out);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4 }, compacted);
+    try std.testing.expectEqual(@as(usize, 0), positions[0]);
+    try std.testing.expectEqual(@as(usize, 4), positions[2]);
+    try std.testing.expectError(error.CorruptedPostingSegment, compactResolvedSortedPositionRange(&positions, .{ .first = 1, .past = 99 }, &out));
+}
+
 pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
     const candidates = [_]DeltaCandidate{
         .{ .posting_id = 7, .segment_id = 1, .record = .{ .sequence = 10, .op = .insert, .vector_id = 100 } },
@@ -8774,6 +8823,10 @@ test "posting segment batch base reads merge sorted index scan" {
 
 test "posting segment sorted batch windows skip disjoint segments" {
     try testSortedPostingPositionsOverlappingSegment();
+}
+
+test "posting segment sorted batch compaction keeps untouched windows" {
+    try testCompactResolvedSortedPositionRange();
 }
 
 test "posting segment retained delta candidate count deduplicates sequences" {

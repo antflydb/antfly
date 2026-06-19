@@ -1235,8 +1235,10 @@ implementations cleanly:
     the unresolved positions still form a sorted posting-id window, the scan
     narrows that list to the segment's min/max posting range before reading
     the index, skipping disjoint segments entirely and feeding only overlapping
-    positions into the per-segment index merge. Its per-segment point-read
-    candidates are stack-backed for common probe windows.
+    positions into the per-segment index merge. After reading that segment, the
+    unresolved list compacts only that overlapping window instead of rescanning
+    the whole batch. Its per-segment point-read candidates are stack-backed for
+    common probe windows.
     Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read
