@@ -691,6 +691,7 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         errdefer freeFixtureEntry(alloc, entry);
         if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
         try validateSourceCorpusEntryMetadata(entry);
+        try validateSourceCorpusEntryJsonPayloads(alloc, entry);
         try seen_names.put(alloc, entry.name, {});
         try entries.append(alloc, entry);
     }
@@ -1585,6 +1586,21 @@ pub fn validateSourceCorpusEntryMetadata(entry: AppParityCorpusEntry) !void {
 
 pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
     return validateCorpusMetadataCore(entry, .generated_fixture);
+}
+
+fn validateSourceCorpusEntryJsonPayloads(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
+    for (entry.returning_rows) |row_json| {
+        if (!(try fixtureJsonTextIsObjectAlloc(alloc, row_json))) return error.TestUnexpectedResult;
+    }
+    if (entry.resolver_row_json.len > 0 and !(try fixtureJsonTextIsObjectAlloc(alloc, entry.resolver_row_json))) {
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn fixtureJsonTextIsObjectAlloc(alloc: std.mem.Allocator, text: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
 }
 
 pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
@@ -3122,6 +3138,49 @@ test "sql adapter source corpus validates entry metadata while allowing derived 
     var parsed_invalid = try std.json.parseFromSlice(std.json.Value, alloc, invalid_source_json, .{});
     defer parsed_invalid.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_invalid.value));
+}
+
+test "sql adapter source corpus validates deterministic json payloads" {
+    const alloc = std.testing.allocator;
+    const invalid_returning_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "array returning row",
+        \\      "family": "insert",
+        \\      "summary": {"table_name": "usage_records", "returning": 1},
+        \\      "plan": "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
+        \\      "returning_rows": ["[\"u1\"]"],
+        \\      "sql": "INSERT INTO usage_records (id) VALUES ('u1') RETURNING id"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_returning = try std.json.parseFromSlice(std.json.Value, alloc, invalid_returning_json, .{});
+    defer parsed_returning.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_returning.value));
+
+    const invalid_resolver_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "array resolver row",
+        \\      "family": "insert",
+        \\      "summary": {"table_name": "usage_records"},
+        \\      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=0:returning_expr=0:op_set=1",
+        \\      "resolver_row_json": "[\"u1\"]",
+        \\      "resolver_version": 7,
+        \\      "resolver_exists": true,
+        \\      "sql": "INSERT INTO usage_records (id, status) VALUES ('u1', 'new') ON CONFLICT (id) DO UPDATE SET status = 'new'"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_resolver = try std.json.parseFromSlice(std.json.Value, alloc, invalid_resolver_json, .{});
+    defer parsed_resolver.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_resolver.value));
 }
 
 test "sql adapter corpus encodes fixture roots and entries" {
