@@ -4890,172 +4890,6 @@
       "sql": "SELECT id FROM usage_records WHERE name ILIKE $1"
     },
     {
-      "name": "merge mutation plan",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 2,
-        "operations": 1,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status)"
-    },
-    {
-      "name": "catalog-backed cross-table merge mutation plan",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 3,
-        "operations": 1,
-        "returning": 2,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=archived_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=3:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archive_id\":{\"type\":\"keyword\"},\"archive_status\":{\"type\":\"keyword\"},\"archive_amount\":{\"type\":\"numeric\"}},\"required\":[\"archive_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"archive_id\"]}}",
-      "sql": "MERGE INTO usage_records AS target USING archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = source.archive_status WHEN NOT MATCHED THEN INSERT (id, status, amount) VALUES (source.archive_id, source.archive_status, source.archive_amount) RETURNING target.id, target.status"
-    },
-    {
-      "name": "merge mutation plan with arm predicates",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 2,
-        "operations": 1,
-        "join_on": 1,
-        "matched_predicates": 1,
-        "not_matched_predicates": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'open' THEN UPDATE SET status = source.status WHEN NOT MATCHED AND source.status = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
-    },
-    {
-      "name": "merge mutation plan with matched delete",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "join_on": 1,
-        "matched_predicates": 1,
-        "matched_delete": true
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND source.status = 'deleted' THEN DELETE"
-    },
-    {
-      "name": "merge mutation plan with no-op actions",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "join_on": 1,
-        "matched_predicates": 1,
-        "matched_do_nothing": true,
-        "not_matched_predicates": 1,
-        "not_matched_do_nothing": true
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'locked' THEN DO NOTHING WHEN NOT MATCHED AND source.status = 'ignored' THEN DO NOTHING"
-    },
-    {
-      "name": "merge mutation plan with returning",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "operations": 1,
-        "returning": 1,
-        "returning_all": false,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.id, lower(target.status) AS status_key"
-    },
-    {
-      "name": "merge mutation plan with expression assignments",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, upper(source.status))"
-    },
-    {
-      "name": "merge mutation plan with default expressions",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 1,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = DEFAULT WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, DEFAULT)"
-    },
-    {
-      "name": "merge mutation plan with expression arm predicates",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 2,
-        "operations": 1,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_pred=1:not_matched_expr_pred=1",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND lower(target.status) = lower(source.status) THEN UPDATE SET status = source.status WHEN NOT MATCHED AND lower(source.status) = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
-    },
-    {
-      "name": "merge mutation plan with expression arm predicate groups",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 2,
-        "operations": 1,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_or=2:not_matched_expr_not=1",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND (lower(target.status) = lower(source.status) OR upper(source.status) = 'READY') THEN UPDATE SET status = source.status WHEN NOT MATCHED AND NOT (lower(source.status) = 'blocked') THEN INSERT (id, status) VALUES (source.id, source.status)"
-    },
-    {
-      "name": "merge mutation plan with ordered arms",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 2,
-        "join_on": 1,
-        "matched_predicates": 1,
-        "matched_do_nothing": true,
-        "not_matched_predicates": 1,
-        "not_matched_do_nothing": true
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=2:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:matched_expr_pred=1:not_matched_expr_pred=1:matched_arms=2:not_matched_arms=2",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'locked' THEN DO NOTHING WHEN MATCHED AND lower(source.status) != lower(target.status) THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED AND source.status = 'ignored' THEN DO NOTHING WHEN NOT MATCHED AND lower(source.status) = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
-    },
-    {
-      "name": "merge mutation plan with insert returning expression",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "usage_records",
-        "select": 2,
-        "operations": 0,
-        "returning": 1,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
-      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN NOT MATCHED AND source.status = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status) RETURNING target.id, lower(target.status) AS status_key"
-    },
-    {
-      "name": "temporal merge mutation plan with matched update",
-      "family": "merge_mutation",
-      "summary": {
-        "table_name": "prices",
-        "operations": 1,
-        "returning": 2,
-        "join_on": 1
-      },
-      "plan": "merge_mutation:target=prices:source=prices:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
-      "apply_setup_sql": ["CREATE TABLE prices (sku text NOT NULL, source_id text, valid_from numeric NOT NULL, valid_to numeric NOT NULL, status text, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS))"],
-      "sql": "MERGE INTO prices AS target USING prices AS source ON target.sku = source.source_id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.sku, target.status"
-    },
-    {
       "name": "fixed interval query",
       "family": "query",
       "summary": {
@@ -10781,6 +10615,172 @@
       "plan": "unsupported:update_source:requires=row_lock_mode_plan",
       "classification_reason": "row_lock_mode_plan",
       "sql": "UPDATE usage_records AS u SET status = 'processing' WHERE u.status = 'queued' FOR UPDATE OF archived_records RETURNING u.id"
+    },
+    {
+      "name": "merge mutation plan",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 2,
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status)"
+    },
+    {
+      "name": "catalog-backed cross-table merge mutation plan",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 3,
+        "operations": 1,
+        "returning": 2,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=archived_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=3:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archive_id\":{\"type\":\"keyword\"},\"archive_status\":{\"type\":\"keyword\"},\"archive_amount\":{\"type\":\"numeric\"}},\"required\":[\"archive_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"archive_id\"]}}",
+      "sql": "MERGE INTO usage_records AS target USING archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = source.archive_status WHEN NOT MATCHED THEN INSERT (id, status, amount) VALUES (source.archive_id, source.archive_status, source.archive_amount) RETURNING target.id, target.status"
+    },
+    {
+      "name": "merge mutation plan with arm predicates",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 2,
+        "operations": 1,
+        "join_on": 1,
+        "matched_predicates": 1,
+        "not_matched_predicates": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'open' THEN UPDATE SET status = source.status WHEN NOT MATCHED AND source.status = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
+    },
+    {
+      "name": "merge mutation plan with matched delete",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "join_on": 1,
+        "matched_predicates": 1,
+        "matched_delete": true
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND source.status = 'deleted' THEN DELETE"
+    },
+    {
+      "name": "merge mutation plan with no-op actions",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "join_on": 1,
+        "matched_predicates": 1,
+        "matched_do_nothing": true,
+        "not_matched_predicates": 1,
+        "not_matched_do_nothing": true
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'locked' THEN DO NOTHING WHEN NOT MATCHED AND source.status = 'ignored' THEN DO NOTHING"
+    },
+    {
+      "name": "merge mutation plan with returning",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "returning": 1,
+        "returning_all": false,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.id, lower(target.status) AS status_key"
+    },
+    {
+      "name": "merge mutation plan with expression assignments",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, upper(source.status))"
+    },
+    {
+      "name": "merge mutation plan with default expressions",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = DEFAULT WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, DEFAULT)"
+    },
+    {
+      "name": "merge mutation plan with expression arm predicates",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 2,
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_pred=1:not_matched_expr_pred=1",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND lower(target.status) = lower(source.status) THEN UPDATE SET status = source.status WHEN NOT MATCHED AND lower(source.status) = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
+    },
+    {
+      "name": "merge mutation plan with expression arm predicate groups",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 2,
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_expr_or=2:not_matched_expr_not=1",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND (lower(target.status) = lower(source.status) OR upper(source.status) = 'READY') THEN UPDATE SET status = source.status WHEN NOT MATCHED AND NOT (lower(source.status) = 'blocked') THEN INSERT (id, status) VALUES (source.id, source.status)"
+    },
+    {
+      "name": "merge mutation plan with ordered arms",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 2,
+        "join_on": 1,
+        "matched_predicates": 1,
+        "matched_do_nothing": true,
+        "not_matched_predicates": 1,
+        "not_matched_do_nothing": true
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=1:matched_update=0:matched_delete=0:matched_noop=1:not_matched_pred=1:not_matched_insert=2:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:matched_expr_pred=1:not_matched_expr_pred=1:matched_arms=2:not_matched_arms=2",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'locked' THEN DO NOTHING WHEN MATCHED AND lower(source.status) != lower(target.status) THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED AND source.status = 'ignored' THEN DO NOTHING WHEN NOT MATCHED AND lower(source.status) = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status)"
+    },
+    {
+      "name": "merge mutation plan with insert returning expression",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 2,
+        "operations": 0,
+        "returning": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=1:not_matched_insert=2:not_matched_noop=0:returning=1:returning_expr=1:returning_all=0",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN NOT MATCHED AND source.status = 'ready' THEN INSERT (id, status) VALUES (source.id, source.status) RETURNING target.id, lower(target.status) AS status_key"
+    },
+    {
+      "name": "temporal merge mutation plan with matched update",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "prices",
+        "operations": 1,
+        "returning": 2,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=prices:source=prices:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
+      "apply_setup_sql": ["CREATE TABLE prices (sku text NOT NULL, source_id text, valid_from numeric NOT NULL, valid_to numeric NOT NULL, status text, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS))"],
+      "sql": "MERGE INTO prices AS target USING prices AS source ON target.sku = source.source_id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.sku, target.status"
     }
   ]
 }
