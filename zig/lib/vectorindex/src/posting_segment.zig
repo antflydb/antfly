@@ -871,7 +871,7 @@ pub const Catalog = struct {
             segment_index -= 1;
             const segment = self.segments[segment_index];
             if (best != null and segment.meta.segment_id <= best_segment_id) continue;
-            if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (!segment.meta.mayContainPointKind(posting_id, kind)) continue;
             var reader = try Reader.init(segment.data);
             const value = switch (kind) {
                 .base => try reader.getBase(posting_id),
@@ -6420,6 +6420,35 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     try std.testing.expectEqualSlices(u8, delta_10, later_deltas[0].value);
 }
 
+pub fn testCatalogPointLookupSkipsAbsentKindBeforeReaderInit() !void {
+    const alloc = std.testing.allocator;
+    const sequence = (@as(u64, 2) << 32) | 1;
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = sequence, .op = .insert, .vector_id = 40 },
+    });
+    defer alloc.free(delta);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendDelta(7, sequence, delta);
+    const segment = try writer.build();
+    defer alloc.free(segment);
+
+    const reader = try Reader.init(segment);
+    const meta = try reader.metadata(1);
+    try std.testing.expectEqual(@as(usize, 0), meta.base_count);
+    try std.testing.expectEqual(@as(usize, 1), meta.delta_value_count);
+
+    var corrupt = try alloc.dupe(u8, segment);
+    defer alloc.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 0xff;
+
+    const blobs = [_]SegmentBlob{.{ .meta = meta, .data = corrupt }};
+    const catalog = Catalog{ .segments = blobs[0..] };
+    try std.testing.expect(try catalog.getBase(7) == null);
+    try std.testing.expect(try catalog.getCentroidDirectory(7) == null);
+}
+
 pub fn testCatalogDeltasAfterGenerationFiltersMixedSegmentValues() !void {
     const alloc = std.testing.allocator;
     const stale_sequence = (@as(u64, 8) << 32) | 1;
@@ -9129,6 +9158,10 @@ test "posting segment validates footer and version" {
 
 test "posting segment catalog looks up newest point records and merged deltas" {
     try testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
+}
+
+test "posting segment catalog skips absent point kind before reader init" {
+    try testCatalogPointLookupSkipsAbsentKindBeforeReaderInit();
 }
 
 test "posting segment catalog filters mixed delta values after generation" {

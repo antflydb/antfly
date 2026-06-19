@@ -1240,8 +1240,8 @@ implementations cleanly:
     the whole batch. Its per-segment point-read candidates are stack-backed for
     common probe windows. Segment manifests now also carry optional per-kind
     entry counts. Newly written segment files populate base, delta-value, and
-    centroid-directory counts from the segment index, and lazy point, base
-    batch, and centroid-directory scans use those counts to skip segment
+    centroid-directory counts from the segment index, and eager/lazy point,
+    base batch, and centroid-directory scans use those counts to skip segment
     indexes when the requested record family cannot be present. Segment
     compaction uses the same counts to skip delta-only segments during the
     point-candidate pass and point-only segments during the delta-retention
