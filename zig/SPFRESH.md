@@ -1286,6 +1286,9 @@ implementations cleanly:
     manifest metadata before opening or reading their indexes; lazy snapshot
     delta wrappers apply the same skip before segment byte-limit checks, so an
     irrelevant oversized base-only segment cannot fail a delta-only operation.
+    The same lower-level delta helpers now combine posting-id range, delta-kind,
+    and generation metadata before opening segment indexes, so out-of-range
+    delta-bearing segments are skipped as cheaply as base-only segments.
     Allocation-returning delta loads, stats reads, and scratch replay now all
     skip segment bytes entirely when
     manifest max-sequence metadata proves the requested base generation already

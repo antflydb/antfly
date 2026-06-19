@@ -745,8 +745,7 @@ pub const Catalog = struct {
         var deltas = std.ArrayListUnmanaged(DeltaValue).empty;
         errdefer deltas.deinit(alloc);
         for (self.segments) |segment| {
-            if (!segment.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(segment.meta, null)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(segment.meta, posting_id, null)) continue;
             var reader = try Reader.init(segment.data);
             const range = try reader.deltasWithCount(posting_id);
             try deltas.ensureUnusedCapacity(alloc, range.count);
@@ -763,8 +762,7 @@ pub const Catalog = struct {
         var deltas = std.ArrayListUnmanaged(DeltaValue).empty;
         errdefer deltas.deinit(alloc);
         for (self.segments) |segment| {
-            if (!segment.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(segment.meta, base_generation)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(segment.meta, posting_id, base_generation)) continue;
             var reader = try Reader.init(segment.data);
             const all_segment_records_after_generation = segmentDeltaTailFullyAfterGeneration(segment.meta, base_generation);
             const range = try reader.deltasWithCount(posting_id);
@@ -788,8 +786,7 @@ pub const Catalog = struct {
         records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
     ) !void {
         for (self.segments) |segment| {
-            if (!segment.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(segment.meta, min_generation)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(segment.meta, posting_id, min_generation)) continue;
             const all_segment_records_after_generation = if (min_generation) |generation|
                 segment.meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.min_delta_sequence) > generation
             else
@@ -829,8 +826,7 @@ pub const Catalog = struct {
         scratch: anytype,
     ) !void {
         for (self.segments) |segment| {
-            if (!segment.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(segment.meta, min_generation)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(segment.meta, posting_id, min_generation)) continue;
             const all_segment_records_after_generation = if (min_generation) |generation|
                 segment.meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.min_delta_sequence) > generation
             else
@@ -1106,8 +1102,7 @@ pub const LazyDirectorySnapshot = struct {
             0;
         for (self.manifest.segments[start_index..]) |entry| {
             if (entry.meta.segment_id < min_segment_id) continue;
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(entry.meta, generation)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, generation)) continue;
             try self.readDeltaRecordsIntoScratchWithStatsAlloc(alloc, entry, posting_id, generation, scratch, &stats);
         }
         return stats;
@@ -1161,8 +1156,7 @@ pub const LazyDirectorySnapshot = struct {
     pub fn deltaTailStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
         var out = posting.PostingDeltaTailStats{};
         for (self.manifest.segments) |entry| {
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) continue;
 
             const stats = try self.readDeltaTailStatsAlloc(alloc, entry, posting_id, base_generation);
             out.records += stats.records;
@@ -1198,8 +1192,7 @@ pub const LazyDirectorySnapshot = struct {
         while (segment_index > 0) {
             segment_index -= 1;
             const entry = self.manifest.segments[segment_index];
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) continue;
             if (best_record != null and entry.meta.max_delta_sequence <= best_sequence) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
             const all_records_after_generation = segmentDeltaTailFullyAfterGeneration(entry.meta, base_generation);
@@ -1307,8 +1300,7 @@ pub const LazyDirectorySnapshot = struct {
         var stats = posting.PostingDeltaTailStats{};
 
         for (self.manifest.segments) |entry| {
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) continue;
+            if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, min_generation)) continue;
 
             try self.readDeltaRecordsWithStatsAlloc(alloc, entry, posting_id, min_generation, &records, &stats);
         }
@@ -1407,7 +1399,7 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readDeltaRecordsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
-        if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) return try alloc.alloc(posting.PostingDeltaRecord, 0);
+        if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, min_generation)) return try alloc.alloc(posting.PostingDeltaRecord, 0);
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         return try readSegmentDeltaRecordsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -1424,7 +1416,7 @@ pub const LazyDirectorySnapshot = struct {
         records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
         stats: *posting.PostingDeltaTailStats,
     ) !void {
-        if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) return;
+        if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, min_generation)) return;
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         try readSegmentDeltaRecordsWithStatsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -1441,7 +1433,7 @@ pub const LazyDirectorySnapshot = struct {
         scratch: anytype,
         stats: *posting.PostingDeltaTailStats,
     ) !void {
-        if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) return;
+        if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) return;
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         try readSegmentDeltaRecordsIntoScratchWithStatsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -1450,7 +1442,7 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readDeltaTailStatsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
-        if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) return .{};
+        if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) return .{};
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         return try readSegmentDeltaTailStatsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
@@ -2435,7 +2427,7 @@ pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entr
 }
 
 pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
-    if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) return try alloc.alloc(posting.PostingDeltaRecord, 0);
+    if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, min_generation)) return try alloc.alloc(posting.PostingDeltaRecord, 0);
     const all_records_after_generation = if (min_generation) |generation|
         segmentDeltaTailFullyAfterGeneration(entry.meta, generation)
     else
@@ -2484,7 +2476,7 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
     records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
     stats: *posting.PostingDeltaTailStats,
 ) !void {
-    if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) return;
+    if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, min_generation)) return;
     const all_records_after_generation = if (min_generation) |generation|
         segmentDeltaTailFullyAfterGeneration(entry.meta, generation)
     else
@@ -2526,7 +2518,7 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
     scratch: anytype,
     stats: *posting.PostingDeltaTailStats,
 ) !void {
-    if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) return;
+    if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) return;
     const all_records_after_generation = segmentDeltaTailFullyAfterGeneration(entry.meta, base_generation);
 
     var stack_index: [stack_index_max_bytes]u8 = undefined;
@@ -2555,7 +2547,7 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
 }
 
 pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
-    if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) return .{};
+    if (!segmentMayContainPostingDeltaAfterGeneration(entry.meta, posting_id, base_generation)) return .{};
     const all_records_after_generation = segmentDeltaTailFullyAfterGeneration(entry.meta, base_generation);
 
     var stack_index: [stack_index_max_bytes]u8 = undefined;
@@ -4702,6 +4694,10 @@ fn segmentMayContainDeltaAfterGeneration(meta: SegmentMeta, min_generation: ?u64
     return true;
 }
 
+fn segmentMayContainPostingDeltaAfterGeneration(meta: SegmentMeta, posting_id: PostingId, min_generation: ?u64) bool {
+    return meta.mayContainPointKind(posting_id, .delta) and segmentMayContainDeltaAfterGeneration(meta, min_generation);
+}
+
 fn segmentDeltaTailFullyAfterGeneration(meta: SegmentMeta, generation: u64) bool {
     return meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(meta.min_delta_sequence) > generation;
 }
@@ -6131,6 +6127,7 @@ pub fn testSegmentMetaKindPredicates() !void {
     try std.testing.expect(known_counts.mayContainPointKind(8, .base));
     try std.testing.expect(!known_counts.mayContainPointKind(8, .delta));
     try std.testing.expect(!known_counts.mayContainPointKind(99, .base));
+    try std.testing.expect(!segmentMayContainPostingDeltaAfterGeneration(known_counts, 8, null));
 }
 
 pub fn testSegmentDeltaReadersSkipBaseOnlyCorruption() !void {
@@ -6178,6 +6175,54 @@ pub fn testSegmentDeltaReadersSkipBaseOnlyCorruption() !void {
     try std.testing.expectEqual(@as(usize, 0), scratch_stats.records);
 
     const tail_stats = try readSegmentDeltaTailStatsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 0);
+    try std.testing.expectEqual(@as(usize, 0), tail_stats.records);
+}
+
+pub fn testSegmentDeltaReadersSkipOutOfRangeCorruption() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const sequence = (@as(u64, 2) << 32) | 1;
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = sequence, .op = .insert, .vector_id = 40 },
+    });
+    defer alloc.free(delta);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendDelta(7, sequence, delta);
+    var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
+    defer committed.deinit(alloc);
+
+    const original = try tmp.dir.readFileAlloc(std.testing.io, committed.entry.path, alloc, .limited(committed.entry.meta.byte_len + 1));
+    defer alloc.free(original);
+    var corrupt_index = try alloc.dupe(u8, original);
+    defer alloc.free(corrupt_index);
+    corrupt_index[committed.entry.meta.index_offset] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = committed.entry.path, .data = corrupt_index });
+
+    const entry = ManifestEntry{ .meta = committed.entry.meta, .path = committed.entry.path };
+    const missing_posting_id: PostingId = 99;
+    const records = try readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, missing_posting_id, null);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 0), records.len);
+
+    var records_with_stats = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+    defer records_with_stats.deinit(alloc);
+    var stats = posting.PostingDeltaTailStats{};
+    try readSegmentDeltaRecordsWithStatsAlloc(alloc, std.testing.io, tmp.dir, entry, missing_posting_id, null, &records_with_stats, &stats);
+    try std.testing.expectEqual(@as(usize, 0), records_with_stats.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stats.records);
+
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+    var scratch_stats = posting.PostingDeltaTailStats{};
+    try readSegmentDeltaRecordsIntoScratchWithStatsAlloc(alloc, std.testing.io, tmp.dir, entry, missing_posting_id, 0, &scratch, &scratch_stats);
+    try std.testing.expectEqual(@as(usize, 0), scratch.deltaRecords().len);
+    try std.testing.expectEqual(@as(usize, 0), scratch_stats.records);
+
+    const tail_stats = try readSegmentDeltaTailStatsAlloc(alloc, std.testing.io, tmp.dir, entry, missing_posting_id, 0);
     try std.testing.expectEqual(@as(usize, 0), tail_stats.records);
 }
 
@@ -9134,6 +9179,10 @@ test "posting segment kind metadata predicates are conservative when unknown" {
 
 test "posting segment delta readers skip base-only segment corruption" {
     try testSegmentDeltaReadersSkipBaseOnlyCorruption();
+}
+
+test "posting segment delta readers skip out-of-range segment corruption" {
+    try testSegmentDeltaReadersSkipOutOfRangeCorruption();
 }
 
 test "posting segment lazy delta readers skip base-only segment before byte limit" {
