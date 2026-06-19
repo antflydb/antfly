@@ -10446,7 +10446,10 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     });
     defer explore.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), explore.status);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"resultType\":\"facets\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"facets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"buckets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"value\":\"retrieval\"") != null);
 
     var agents = try server.handle(.{
         .method = .GET,

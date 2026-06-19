@@ -355,6 +355,7 @@ pub fn searchJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     const request = try parseSearchRequest(alloc, body);
     defer request.deinit();
     if (!explore and (request.text == null or std.mem.trim(u8, request.text.?, " \t\r\n").len == 0)) return error.InvalidArdSearchRequest;
+    if (explore) return try exploreJsonWithExtensionsAlloc(alloc, options, request, extension_context);
 
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
@@ -368,9 +369,44 @@ pub fn searchJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogO
     }
     try writer.writer.writeAll("],\"federation\":\"none\",\"count\":");
     try writer.writer.print("{d}", .{matched});
-    if (explore) {
-        try writer.writer.writeAll(",\"facets\":{\"type\":[\"application/a2a-agent-card+json\",\"application/mcp-server+json\",\"application/openapi+yaml\",\"application/ai-skill+md\"]}");
+    try writer.writer.writeByte('}');
+    return try writer.toOwnedSlice();
+}
+
+fn exploreJsonWithExtensionsAlloc(
+    alloc: std.mem.Allocator,
+    options: CatalogOptions,
+    request: SearchRequest,
+    extension_context: ?ExtensionCatalogContext,
+) ![]u8 {
+    var facets = try initFacetAccumulators(request);
+    defer deinitFacetAccumulators(alloc, facets.slice());
+
+    var matched: usize = 0;
+    try collectStaticFacets(alloc, facets.slice(), options, request.text, request.filter, &matched);
+    if (options.mode == .tenant) {
+        if (extension_context) |ctx| try collectExtensionFacets(alloc, facets.slice(), options, ctx, request.text, request.filter, &matched);
     }
+
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("{\"resultType\":\"facets\",\"facets\":{");
+    for (facets.slice(), 0..) |facet, index| {
+        if (index > 0) try writer.writer.writeByte(',');
+        try std.json.Stringify.value(facet.field, .{}, &writer.writer);
+        try writer.writer.writeAll(":{\"buckets\":[");
+        for (facet.buckets.items, 0..) |bucket, bucket_index| {
+            if (bucket_index > 0) try writer.writer.writeByte(',');
+            try writer.writer.writeAll("{\"value\":");
+            try std.json.Stringify.value(bucket.value, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"count\":");
+            try writer.writer.print("{d}", .{bucket.count});
+            try writer.writer.writeByte('}');
+        }
+        try writer.writer.writeAll("],\"otherCount\":0}");
+    }
+    try writer.writer.writeAll("},\"count\":");
+    try writer.writer.print("{d}", .{matched});
     try writer.writer.writeByte('}');
     return try writer.toOwnedSlice();
 }
@@ -414,12 +450,56 @@ pub fn mcpDescriptorJsonAlloc(alloc: std.mem.Allocator, name: []const u8) !?[]u8
 }
 
 const SearchRequest = struct {
+    const max_facets = 8;
+
     parsed: ?std.json.Parsed(std.json.Value) = null,
     text: ?[]const u8 = null,
     filter: ?std.json.Value = null,
+    facet_fields: [max_facets][]const u8 = undefined,
+    facet_field_count: usize = 0,
 
     fn deinit(self: SearchRequest) void {
         if (self.parsed) |parsed| parsed.deinit();
+    }
+
+    fn facetFields(self: SearchRequest) []const []const u8 {
+        return self.facet_fields[0..self.facet_field_count];
+    }
+};
+
+const default_facet_fields = [_][]const u8{ "type", "capabilities", "tags", "publisher" };
+
+const FacetBucket = struct {
+    value: []const u8,
+    count: usize,
+};
+
+const FacetAccumulator = struct {
+    field: []const u8,
+    buckets: std.ArrayListUnmanaged(FacetBucket) = .empty,
+
+    fn increment(self: *FacetAccumulator, alloc: std.mem.Allocator, value: []const u8) !void {
+        if (value.len == 0) return;
+        for (self.buckets.items) |*bucket| {
+            if (std.mem.eql(u8, bucket.value, value)) {
+                bucket.count += 1;
+                return;
+            }
+        }
+        try self.buckets.append(alloc, .{ .value = value, .count = 1 });
+    }
+
+    fn deinit(self: *FacetAccumulator, alloc: std.mem.Allocator) void {
+        self.buckets.deinit(alloc);
+    }
+};
+
+const FacetSet = struct {
+    items: [SearchRequest.max_facets]FacetAccumulator = undefined,
+    count: usize = 0,
+
+    fn slice(self: *FacetSet) []FacetAccumulator {
+        return self.items[0..self.count];
     }
 };
 
@@ -428,22 +508,58 @@ fn parseSearchRequest(alloc: std.mem.Allocator, body: []const u8) !SearchRequest
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidArdSearchRequest;
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArdSearchRequest;
-    const query = parsed.value.object.get("query") orelse return .{ .parsed = parsed };
+    var request: SearchRequest = .{ .parsed = parsed };
+    try parseFacetFields(&request, parsed.value);
+    const query = parsed.value.object.get("query") orelse return request;
     if (query != .object) return error.InvalidArdSearchRequest;
-    const text: ?[]const u8 = if (query.object.get("text")) |value| switch (value) {
+    request.text = if (query.object.get("text")) |value| switch (value) {
         .string => |text_value| text_value,
         .null => null,
         else => return error.InvalidArdSearchRequest,
     } else null;
-    const filter = query.object.get("filter");
-    if (filter) |value| {
+    request.filter = query.object.get("filter");
+    if (request.filter) |value| {
         if (value != .object) return error.InvalidArdSearchRequest;
     }
-    return .{
-        .parsed = parsed,
-        .text = text,
-        .filter = filter,
-    };
+    return request;
+}
+
+fn parseFacetFields(request: *SearchRequest, root: std.json.Value) !void {
+    const result_type = root.object.get("resultType") orelse return;
+    if (result_type != .object) return error.InvalidArdSearchRequest;
+    const facets = result_type.object.get("facets") orelse return;
+    if (facets != .array) return error.InvalidArdSearchRequest;
+    for (facets.array.items) |facet| {
+        if (request.facet_field_count >= SearchRequest.max_facets) break;
+        switch (facet) {
+            .string => |field| {
+                request.facet_fields[request.facet_field_count] = field;
+                request.facet_field_count += 1;
+            },
+            .object => |object| {
+                const field = object.get("field") orelse return error.InvalidArdSearchRequest;
+                if (field != .string) return error.InvalidArdSearchRequest;
+                request.facet_fields[request.facet_field_count] = field.string;
+                request.facet_field_count += 1;
+            },
+            else => return error.InvalidArdSearchRequest,
+        }
+    }
+}
+
+fn initFacetAccumulators(request: SearchRequest) !FacetSet {
+    var set: FacetSet = .{};
+    const fields = if (request.facet_field_count > 0) request.facetFields() else default_facet_fields[0..];
+    for (fields) |field| {
+        if (set.count >= SearchRequest.max_facets) break;
+        set.items[set.count] = .{ .field = field };
+        set.count += 1;
+    }
+    return set;
+}
+
+fn deinitFacetAccumulators(alloc: std.mem.Allocator, facets: []FacetAccumulator) void {
+    for (facets) |*facet| facet.deinit(alloc);
 }
 
 fn writeCatalogPrefix(writer: *std.Io.Writer, options: CatalogOptions) !void {
@@ -452,6 +568,119 @@ fn writeCatalogPrefix(writer: *std.Io.Writer, options: CatalogOptions) !void {
     try writer.writeAll(",\"identifier\":");
     try writeStringFmt(writer, "did:web:{s}", .{options.publisher_domain});
     try writer.writeAll("},\"entries\":[");
+}
+
+fn collectStaticFacets(
+    alloc: std.mem.Allocator,
+    facets: []FacetAccumulator,
+    options: CatalogOptions,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    matched: *usize,
+) !void {
+    for (static_entries) |entry| {
+        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) {
+            matched.* += 1;
+            try addEntryFacets(alloc, facets, options.publisher_domain, entry);
+        }
+    }
+    if (options.mode == .tenant) {
+        for (tenant_entries) |entry| {
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) {
+                matched.* += 1;
+                try addEntryFacets(alloc, facets, options.publisher_domain, entry);
+            }
+        }
+        for (skills) |skill| {
+            const entry = skillEntry(skill);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) {
+                matched.* += 1;
+                try addEntryFacets(alloc, facets, options.publisher_domain, entry);
+            }
+        }
+    }
+}
+
+fn collectExtensionFacets(
+    alloc: std.mem.Allocator,
+    facets: []FacetAccumulator,
+    options: CatalogOptions,
+    ctx: ExtensionCatalogContext,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    matched: *usize,
+) !void {
+    for (ctx.installed_extensions, 0..) |installed, index| {
+        const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        const installed_capabilities = try capabilityNamesAlloc(alloc, installed.granted_capabilities);
+        defer alloc.free(installed_capabilities);
+
+        if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
+            if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
+                const package_capabilities = try capabilityNamesAlloc(alloc, package.capabilities_requested);
+                defer alloc.free(package_capabilities);
+                if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
+                    catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
+                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, package_capabilities, text, filter, options.publisher_domain))
+                {
+                    matched.* += 1;
+                    try addDynamicFacets(alloc, facets, options.publisher_domain, "application/antfly-extension-package+json", &.{ "extension", "package" }, package_capabilities);
+                }
+            }
+        }
+        if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
+            catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
+            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
+        {
+            matched.* += 1;
+            try addDynamicFacets(alloc, facets, options.publisher_domain, "application/antfly-installed-extension+json", &.{ "extension", "installed" }, installed_capabilities);
+        }
+        if (has_visible_mcp) {
+            if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
+                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, installed_capabilities, text, filter, options.publisher_domain))
+            {
+                matched.* += 1;
+                try addDynamicFacets(alloc, facets, options.publisher_domain, "application/mcp-server+json", &.{ "mcp", "extension" }, installed_capabilities);
+            }
+        }
+    }
+}
+
+fn addEntryFacets(alloc: std.mem.Allocator, facets: []FacetAccumulator, publisher_domain: []const u8, entry: Entry) !void {
+    for (facets) |*facet| {
+        if (std.mem.eql(u8, facet.field, "type")) {
+            try facet.increment(alloc, entry.media_type);
+        } else if (std.mem.eql(u8, facet.field, "publisher") or std.mem.eql(u8, facet.field, "publisherId")) {
+            try facet.increment(alloc, publisher_domain);
+        } else if (std.mem.eql(u8, facet.field, "tags")) {
+            for (entry.tags) |tag| try facet.increment(alloc, tag);
+        } else if (std.mem.eql(u8, facet.field, "capabilities")) {
+            for (entry.capabilities) |capability| try facet.increment(alloc, capability);
+        } else if (std.mem.eql(u8, facet.field, "displayName")) {
+            try facet.increment(alloc, entry.display_name);
+        }
+    }
+}
+
+fn addDynamicFacets(
+    alloc: std.mem.Allocator,
+    facets: []FacetAccumulator,
+    publisher_domain: []const u8,
+    media_type: []const u8,
+    tags: []const []const u8,
+    capabilities: []const []const u8,
+) !void {
+    for (facets) |*facet| {
+        if (std.mem.eql(u8, facet.field, "type")) {
+            try facet.increment(alloc, media_type);
+        } else if (std.mem.eql(u8, facet.field, "publisher") or std.mem.eql(u8, facet.field, "publisherId")) {
+            try facet.increment(alloc, publisher_domain);
+        } else if (std.mem.eql(u8, facet.field, "tags")) {
+            for (tags) |tag| try facet.increment(alloc, tag);
+        } else if (std.mem.eql(u8, facet.field, "capabilities")) {
+            for (capabilities) |capability| try facet.increment(alloc, capability);
+        }
+    }
 }
 
 fn writeScopedEntries(
@@ -525,11 +754,15 @@ fn writeExtensionEntries(
 ) !void {
     for (ctx.installed_extensions, 0..) |installed, index| {
         const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        const installed_capabilities = try capabilityNamesAlloc(alloc, installed.granted_capabilities);
+        defer alloc.free(installed_capabilities);
         if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
             if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
+                const package_capabilities = try capabilityNamesAlloc(alloc, package.capabilities_requested);
+                defer alloc.free(package_capabilities);
                 if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
-                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, text, filter, options.publisher_domain))
+                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, package_capabilities, text, filter, options.publisher_domain))
                 {
                     try writeExtensionPackageEntry(writer, options.publisher_domain, first, package.*);
                 }
@@ -537,13 +770,13 @@ fn writeExtensionEntries(
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
-            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, text, filter, options.publisher_domain))
+            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
         {
             try writeInstalledExtensionEntry(writer, options.publisher_domain, first, installed);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
-                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, text, filter, options.publisher_domain))
+                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, installed_capabilities, text, filter, options.publisher_domain))
             {
                 try writeExtensionMcpEntry(writer, options.publisher_domain, first, installed);
             }
@@ -563,11 +796,15 @@ fn writeMatchedExtensionEntries(
 ) !void {
     for (ctx.installed_extensions, 0..) |installed, index| {
         const has_visible_mcp = try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions);
+        const installed_capabilities = try capabilityNamesAlloc(alloc, installed.granted_capabilities);
+        defer alloc.free(installed_capabilities);
         if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
             if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
+                const package_capabilities = try capabilityNamesAlloc(alloc, package.capabilities_requested);
+                defer alloc.free(package_capabilities);
                 if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
                     catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
-                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, text, filter, options.publisher_domain))
+                    dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, package_capabilities, text, filter, options.publisher_domain))
                 {
                     try writeSearchExtensionPackageEntry(writer, options.publisher_domain, first, package.*, matched, text);
                 }
@@ -575,13 +812,13 @@ fn writeMatchedExtensionEntries(
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
             catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
-            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, text, filter, options.publisher_domain))
+            dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, installed_capabilities, text, filter, options.publisher_domain))
         {
             try writeSearchInstalledExtensionEntry(writer, options.publisher_domain, first, installed, matched, text);
         }
         if (has_visible_mcp) {
             if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
-                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, text, filter, options.publisher_domain))
+                dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, installed_capabilities, text, filter, options.publisher_domain))
             {
                 try writeSearchExtensionMcpEntry(writer, options.publisher_domain, first, installed, matched, text);
             }
@@ -788,6 +1025,12 @@ fn writeCapabilitiesFromGrants(writer: *std.Io.Writer, capabilities: []const ext
     try writer.writeByte(']');
 }
 
+fn capabilityNamesAlloc(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) ![][]const u8 {
+    const names = try alloc.alloc([]const u8, capabilities.len);
+    for (capabilities, 0..) |capability, index| names[index] = capability.name;
+    return names;
+}
+
 fn installedExtensionVisible(installed: extension_domain.InstalledExtension, permissions: ?[]const usermgr.Permission) bool {
     if (installed.status != .ready) return false;
     const perms = permissions orelse return true;
@@ -945,13 +1188,23 @@ fn freeParsedCapabilityValues(alloc: std.mem.Allocator, capabilities: []const ex
     }
 }
 
-fn dynamicEntryMatches(name: []const u8, media_type: []const u8, description: []const u8, tags: []const []const u8, text: ?[]const u8, filter: ?std.json.Value, publisher_domain: []const u8) bool {
+fn dynamicEntryMatches(
+    name: []const u8,
+    media_type: []const u8,
+    description: []const u8,
+    tags: []const []const u8,
+    capabilities: []const []const u8,
+    text: ?[]const u8,
+    filter: ?std.json.Value,
+    publisher_domain: []const u8,
+) bool {
     if (text) |query| {
         if (std.mem.trim(u8, query, " \t\r\n").len > 0 and
             !containsIgnoreCase(name, query) and
             !containsIgnoreCase(media_type, query) and
             !containsIgnoreCase(description, query) and
-            !anyContainsIgnoreCase(tags, query)) return false;
+            !anyContainsIgnoreCase(tags, query) and
+            !anyContainsIgnoreCase(capabilities, query)) return false;
     }
     if (filter) |filter_value| {
         var iterator = filter_value.object.iterator();
@@ -962,6 +1215,8 @@ fn dynamicEntryMatches(name: []const u8, media_type: []const u8, description: []
                 if (!jsonValueMatchesString(value, media_type)) return false;
             } else if (std.mem.eql(u8, key, "tags")) {
                 if (!jsonValueMatchesAnyString(value, tags)) return false;
+            } else if (std.mem.eql(u8, key, "capabilities")) {
+                if (!jsonValueMatchesAnyString(value, capabilities)) return false;
             } else if (std.mem.eql(u8, key, "publisher") or std.mem.eql(u8, key, "publisherId")) {
                 if (!jsonValueMatchesString(value, publisher_domain)) return false;
             } else {
@@ -1105,7 +1360,7 @@ fn entryMatchesFilter(entry: Entry, publisher_domain: []const u8, key: []const u
     if (std.mem.eql(u8, key, "tags")) return jsonValueMatchesAnyString(value, entry.tags);
     if (std.mem.eql(u8, key, "capabilities")) return jsonValueMatchesAnyString(value, entry.capabilities);
     if (std.mem.eql(u8, key, "publisher") or std.mem.eql(u8, key, "publisherId")) return jsonValueMatchesString(value, publisher_domain);
-    if (std.mem.eql(u8, key, "metadata.endpoint")) return entry.metadata != null and containsJsonStringField(entry.metadata.?, "endpoint", value);
+    if (std.mem.startsWith(u8, key, "metadata.")) return entry.metadata != null and containsJsonStringField(entry.metadata.?, key["metadata.".len..], value);
     return false;
 }
 
@@ -1209,4 +1464,38 @@ test "ARD search filters scoped catalog entries" {
     for (results) |result| {
         try std.testing.expectEqualStrings("application/ai-skill+md", result.object.get("type").?.string);
     }
+}
+
+test "ARD search supports publisher and metadata filters" {
+    const body = try searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"text\":\"OpenAPI\",\"filter\":{\"publisher\":[\"antfly.local\"],\"metadata.sourceSpec\":[\"openapi.yaml\"]}},\"federation\":\"none\"}", false);
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const results = parsed.value.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("Antfly Public OpenAPI", results[0].object.get("displayName").?.string);
+}
+
+test "ARD explore returns requested facet buckets over scoped entries" {
+    const body = try searchJsonAlloc(std.testing.allocator, .{ .mode = .tenant }, "{\"query\":{\"filter\":{\"capabilities\":[\"retrieval\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"},{\"field\":\"capabilities\"},{\"field\":\"publisher\"}]}}", true);
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("facets", parsed.value.object.get("resultType").?.string);
+    const facets = parsed.value.object.get("facets").?.object;
+    try expectFacetBucket(facets.get("type").?, "application/mcp-server+json");
+    try expectFacetBucket(facets.get("capabilities").?, "retrieval");
+    try expectFacetBucket(facets.get("publisher").?, "antfly.local");
+}
+
+fn expectFacetBucket(facet: std.json.Value, expected: []const u8) !void {
+    const buckets = facet.object.get("buckets").?.array.items;
+    for (buckets) |bucket| {
+        if (std.mem.eql(u8, bucket.object.get("value").?.string, expected)) return;
+    }
+    return error.MissingFacetBucket;
 }
