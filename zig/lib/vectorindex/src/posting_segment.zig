@@ -1196,7 +1196,7 @@ pub const LazyDirectorySnapshot = struct {
         }
 
         sortPostingDeltaRecordsIfNeeded(records);
-        return try posting.PostingFormat.materializeSortedBaseWithDeltaRecordsIntoScratch(alloc, scratch, found_base.data, records);
+        return try posting.PostingFormat.materializeSortedBaseWithSequenceSortedDeltaRecordsIntoScratch(alloc, scratch, found_base.data, records);
     }
 
     fn loadDeltaTailFilteredAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {

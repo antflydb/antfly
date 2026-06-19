@@ -803,6 +803,19 @@ pub const PostingFormat = struct {
             return try materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, base_data, header);
         }
         sortDeltaRecordsBySequenceIfNeeded(records);
+        return try materializeSortedBaseWithSequenceSortedDeltaRecordsIntoScratch(alloc, scratch, base_data, records);
+    }
+
+    pub fn materializeSortedBaseWithSequenceSortedDeltaRecordsIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_data: []const u8,
+        records: []PostingDeltaRecord,
+    ) !usize {
+        if (records.len == 0) {
+            const header = try decodeBaseHeader(base_data);
+            return try materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, base_data, header);
+        }
         sortDeltaRecordsByVectorIfNeeded(records);
         return try materializeSortedBaseWithDeltaRecordsIntoScratchAssumeSorted(alloc, scratch, base_data, records);
     }
@@ -7982,6 +7995,33 @@ test "posting materializes sorted base with delta records without compact copy" 
     try std.testing.expectEqual(@as(usize, expected.len), out_count);
     try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
     try std.testing.expectEqual(@as(usize, 0), scratch.compactDeltaRecordCount());
+}
+
+test "posting materializes sequence-sorted delta records without sequence resort" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_data = try PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(base_data);
+
+    var records = [_]PostingDeltaRecord{
+        .{ .sequence = 1, .op = .insert, .vector_id = 15 },
+        .{ .sequence = 2, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = 3, .op = .insert, .vector_id = 20 },
+        .{ .sequence = 4, .op = .insert, .vector_id = 40 },
+    };
+
+    const out_count = try PostingFormat.materializeSortedBaseWithSequenceSortedDeltaRecordsIntoScratch(alloc, &scratch, base_data, records[0..]);
+
+    const expected = [_]VectorId{ 10, 15, 20, 30, 40 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+    try std.testing.expectEqual(@as(u64, 1), records[0].sequence);
 }
 
 test "posting sorted compact op replay sizes output scratch by deduped live ops" {
