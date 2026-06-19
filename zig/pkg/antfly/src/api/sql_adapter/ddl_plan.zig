@@ -1669,6 +1669,7 @@ pub const BulkIoPlan = struct {
     force_quote_all: bool = false,
     force_quote_columns: []const []const u8 = &.{},
     force_not_null_columns: []const []const u8 = &.{},
+    force_null_columns: []const []const u8 = &.{},
     delimiter: ?[]const u8 = null,
     quote: ?[]const u8 = null,
     escape: ?[]const u8 = null,
@@ -1680,6 +1681,7 @@ pub const BulkIoPlan = struct {
         freeStringSlice(alloc, self.columns);
         freeStringSlice(alloc, self.force_quote_columns);
         freeStringSlice(alloc, self.force_not_null_columns);
+        freeStringSlice(alloc, self.force_null_columns);
         alloc.free(self.endpoint);
         if (self.format) |format| alloc.free(format);
         if (self.delimiter) |delimiter| alloc.free(delimiter);
