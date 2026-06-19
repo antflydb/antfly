@@ -2422,6 +2422,10 @@ pub const ApiHttpServer = struct {
                 _ = try self.sql_notification_runtime.apply(notification_plan, session_id, sqlDdlTimestampNs());
                 return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
             },
+            .function_catalog => |function_plan| {
+                try self.sql_routine_runtime.apply(function_plan);
+                return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+            },
             else => {},
         }
 
@@ -18964,6 +18968,64 @@ test "api http server executes SQL notification channel plans through native run
         @as(usize, 0),
         server.sql_notification_runtime.subscriptionCountForTest(session_a.notification_session_id, "usage_events"),
     );
+}
+
+test "api http server applies SQL routine catalog plans through native runtime" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl = applyRelationalSqlDdl,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdl(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var created = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
+        &session,
+    );
+    defer created.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.routineCountForTest());
+
+    const normalized = try server.sql_routine_runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"ACTIVE\"");
+    defer alloc.free(normalized);
+    try std.testing.expectEqualStrings("\"active\"", normalized);
+
+    var replaced = try server.applyRelationalSqlDdlWithSession(
+        "CREATE OR REPLACE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT upper($1)';",
+        &session,
+    );
+    defer replaced.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.routineCountForTest());
+    const uppered = try server.sql_routine_runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"active\"");
+    defer alloc.free(uppered);
+    try std.testing.expectEqualStrings("\"ACTIVE\"", uppered);
+
+    var dropped = try server.applyRelationalSqlDdlWithSession("DROP FUNCTION normalize_status(text);", &session);
+    defer dropped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.routineCountForTest());
 }
 
 test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {

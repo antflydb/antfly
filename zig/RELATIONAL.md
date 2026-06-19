@@ -1233,7 +1233,15 @@ type-system catalog grammar for collation, operator, aggregate, and cast
 create/drop/rename forms, including option counts, operator/aggregate
 signatures, cast function/assignment metadata, and idempotent collation drops,
 routine catalog grammar for `CREATE FUNCTION`, `CREATE PROCEDURE`,
-`DROP FUNCTION`, and `DROP PROCEDURE`,
+`DROP FUNCTION`, and `DROP PROCEDURE`, plus native routine-catalog application
+for the fail-closed subset of SQL-language expression functions. Routine
+catalog records must preserve the full typed plan metadata, including
+overload arity, return type, language, volatility, security, null-input policy,
+parallel safety, leakproof/window flags, support/transform metadata, settings,
+cost/rows hints, and the shared expression AST for executable safe bodies. The
+runtime path may execute only typed expression-body plans; procedural bodies,
+PL bodies, cascaded routine drops, and unsupported expression forms fail closed
+until they have native typed execution contracts.
 sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`, including idempotent create, `IF EXISTS` alter, owned-by/type
 metadata, and drop dependency metadata,
@@ -5098,26 +5106,33 @@ optional planner support-function identity (`SUPPORT function_name`), optional
 transform type metadata (`TRANSFORM FOR TYPE type_name[, ...]`), optional
 routine-local setting metadata (`SET setting TO value[, ...]`, `SET setting =
 value[, ...]`, or `SET setting FROM CURRENT`) as ordered name/value or `FROM
-CURRENT` declarations, and drop dependency metadata such as `CASCADE`, then
-fails closed when applied to table schema or runtime storage. Routine lifecycle
+CURRENT` declarations, and drop dependency metadata such as `CASCADE`. Routine lifecycle
 tails parse in
 `api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper
 definition uses that same typed routine-catalog boundary; the native behavior
 still lives in table-owned update-policy metadata created by `CREATE TRIGGER`.
-Safe `LANGUAGE sql AS $$SELECT ...$$` expression bodies lower only when they map
-to a typed routine body hook carrying the same row-expression AST used by
-generated columns, row rewrites, checks, expression indexes, predicates, update
+`ApiHttpServer` applies routine catalog DDL through `api/sql_routines.zig`,
+which stores routine records in a native runtime catalog. Safe
+`LANGUAGE sql AS 'SELECT ...'` expression bodies lower only when they map to a
+typed routine body hook carrying the same row-expression AST used by generated
+columns, row rewrites, checks, expression indexes, predicates, update
 transforms, and `RETURNING`; routine argument references normalize to
-`field[source:arg1]` inside that AST. Routine bodies and routine options that do
-not yet have typed metadata remain unsupported and are pinned in the source
-parity corpus under `routine_body_plan` and `routine_option_plan` until there
-is a native mutation-hook/catalog contract: deterministic hook identity,
-declared row inputs and outputs, allowed side effects, dependency
-tracking, schema promotion, authorization hooks, replay behavior, and
-repair/rebuild semantics. Storage should never execute or persist opaque
-PL/pgSQL bodies as part of the relational model.
+`field[source:arg1]` inside that AST. The routine runtime clones those typed
+body expressions and can execute expression hooks through the shared
+`relational_rows.expressionValueJsonAlloc` evaluator, so supported functions
+such as single-argument `lower`, `upper`, `md5`, identity, and simple numeric
+addition are not opaque SQL strings. Table-schema and table-storage application
+still reject routine-catalog plans because routines are catalog/runtime objects,
+not schema JSON mutations. Routine bodies and routine options that do not yet
+have typed metadata remain unsupported and are pinned in the source parity
+corpus under `routine_body_plan` and `routine_option_plan` until there is a
+broader native mutation-hook/catalog contract: deterministic hook identity,
+declared row inputs and outputs, allowed side effects, dependency tracking,
+schema promotion, authorization hooks, replay behavior, and repair/rebuild
+semantics. Storage should never execute or persist opaque PL/pgSQL bodies as
+part of the relational model.
 
 | 0a. SQL table-reference normalization | Keep SQL table-reference sugar out of storage and typed request contracts. | Golden corpus entries now pin `ONLY` as an adapter-only no-op for index targets, single-table reads, inserts, point deletes, claimed mutation sources, truncate, and joined mutation sources, including `public.`-qualified table names. | Table-reference spelling changes produce the same Antfly typed plan or fail closed before storage. |
 | 1. Shared expression spine | Replace shape-specific predicate/projection/update/index cases with one bound expression AST over fields, literals, parameters, casts, deterministic functions, boolean ops, arithmetic, null semantics, JSON, and arrays. | Existing row queries, JSONB/array predicates, order keys, aggregate filters, conflict updates, and `RETURNING` use typed expression nodes, and those nodes now live in the shared storage schema layer instead of the db request module so schema/catalog features can adopt the same type without depending on row execution internals. Generated columns and checks still have narrower typed metadata today. | The same AST is used for `WHERE`, projections, checks, generated columns, expression indexes, partial predicates, `ON CONFLICT` actions, update transforms, aggregate filters, order keys, and `RETURNING`; pushdown is derived from the AST rather than hand-coded parser cases. |

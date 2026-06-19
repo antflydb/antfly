@@ -289,6 +289,7 @@ pub const RoutineKindSyntax = grammar.RoutineKindSyntax;
 pub const RoutineNullInput = ddl_plan.RoutineNullInput;
 pub const RoutineParallelSafety = ddl_plan.RoutineParallelSafety;
 pub const RoutineSecurity = ddl_plan.RoutineSecurity;
+pub const RoutineSetting = ddl_plan.RoutineSetting;
 pub const RoutineVolatility = ddl_plan.RoutineVolatility;
 pub const RowSecurityCatalogPlan = ddl_plan.RowSecurityCatalogPlan;
 pub const RowSecurityConjunctionPredicate = ddl_plan.RowSecurityConjunctionPredicate;
