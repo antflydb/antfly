@@ -5011,19 +5011,20 @@ parity corpus requires them to fail closed under `bulk_io_plan`.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,
-language, optional volatility (`IMMUTABLE`, `STABLE`, or `VOLATILE`), and drop
-dependency metadata such as `CASCADE`, then fails closed when applied to table
-schema or runtime storage. Routine lifecycle tails parse in
+language, optional volatility (`IMMUTABLE`, `STABLE`, or `VOLATILE`), optional
+security mode (`SECURITY INVOKER` or `SECURITY DEFINER`), and drop dependency
+metadata such as `CASCADE`, then fails closed when applied to table schema or
+runtime storage. Routine lifecycle tails parse in
 `api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper
 definition uses that same typed routine-catalog boundary; the native behavior
 still lives in table-owned update-policy metadata created by `CREATE TRIGGER`.
-Routine bodies and non-volatility routine options remain unsupported and are
-pinned in the source parity corpus under `routine_body_plan` and
-`routine_option_plan` until there is a native mutation-hook/catalog contract:
-deterministic hook identity, declared row inputs and outputs, allowed side
-effects, dependency tracking, schema promotion, authorization hooks, replay
+Routine bodies and routine options that do not yet have typed metadata remain
+unsupported and are pinned in the source parity corpus under `routine_body_plan`
+and `routine_option_plan` until there is a native mutation-hook/catalog
+contract: deterministic hook identity, declared row inputs and outputs, allowed
+side effects, dependency tracking, schema promotion, authorization hooks, replay
 behavior, and repair/rebuild semantics. Storage should never execute or persist
 opaque PL/pgSQL bodies as part of the relational model.
 

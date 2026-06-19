@@ -206,6 +206,7 @@
     "ddl_function_drop",
     "ddl_function_drop_cascade",
     "ddl_function_replace",
+    "ddl_function_security",
     "ddl_function_volatility",
     "ddl_identity_allocator_generated",
     "ddl_identity_allocator_generated_options",

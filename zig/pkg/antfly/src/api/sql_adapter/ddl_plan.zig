@@ -700,6 +700,11 @@ pub const RoutineVolatility = enum {
     @"volatile",
 };
 
+pub const RoutineSecurity = enum {
+    invoker,
+    definer,
+};
+
 pub const CreateRoutinePlan = struct {
     kind: RoutineKind,
     routine_name: []const u8,
@@ -708,6 +713,7 @@ pub const CreateRoutinePlan = struct {
     returns_type: ?[]const u8 = null,
     language: ?[]const u8 = null,
     volatility: ?RoutineVolatility = null,
+    security: ?RoutineSecurity = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.routine_name);
