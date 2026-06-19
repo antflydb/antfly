@@ -675,7 +675,7 @@ fn collectDesiredEnrichments(
 fn validateDesiredEnrichments(desired: []const db_mod.types.EnrichmentConfig) !void {
     for (desired, 0..) |cfg, i| {
         for (desired[0..i]) |prior| {
-            if (prior.kind != cfg.kind or !std.mem.eql(u8, prior.name, cfg.name)) continue;
+            if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
             if (!enrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
         }
     }
@@ -690,7 +690,7 @@ fn dedupeDesiredEnrichments(
         const cfg = desired.items[i];
         var duplicate = false;
         for (desired.items[0..i]) |prior| {
-            if (prior.kind == cfg.kind and std.mem.eql(u8, prior.name, cfg.name)) {
+            if (std.mem.eql(u8, prior.name, cfg.name)) {
                 duplicate = true;
                 break;
             }
@@ -713,7 +713,9 @@ fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: [
     while (i > 0) {
         i -= 1;
         const cfg = existing[i];
-        if (findEnrichment(desired, cfg.kind, cfg.name) != null) continue;
+        if (findEnrichmentByName(desired, cfg.name)) |desired_cfg| {
+            if (enrichmentConfigsEqual(cfg, desired_cfg)) continue;
+        }
         if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
             if (deleted) removed += 1;
         } else |err| switch (err) {
@@ -722,6 +724,16 @@ fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: [
         }
     }
     return removed;
+}
+
+fn findEnrichmentByName(
+    configs: []const db_mod.types.EnrichmentConfig,
+    name: []const u8,
+) ?db_mod.types.EnrichmentConfig {
+    for (configs) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return cfg;
+    }
+    return null;
 }
 
 fn findEnrichment(
@@ -1422,6 +1434,41 @@ test "table provisioner rejects conflicting inline enrichment definitions" {
     ));
 }
 
+test "table provisioner rejects conflicting enrichment kinds under the same artifact name" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-conflicting-enrichment-kinds";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_artifact_v1","kind":"asset","field":"url","content_type":"application/json"},
+        \\    {"name":"document_artifact_v1","kind":"chunk","field":"text","chunk_size":512}
+        \\  ]}
+    ;
+
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 16,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 16,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    ));
+}
+
 test "table provisioner updates changed enrichment config under the same name" {
     const alloc = std.heap.c_allocator;
     const path = "/tmp/antfly-metadata-table-provisioner-changed-enrichment";
@@ -1493,6 +1540,80 @@ test "table provisioner updates changed enrichment config under the same name" {
     try std.testing.expectEqual(@as(u32, 256), cfg.chunk_size);
     try std.testing.expectEqual(@as(u32, 25), cfg.chunk_overlap);
     try std.testing.expect(cfg.full_text_index);
+}
+
+test "table provisioner replaces enrichment kind under the same artifact name" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-replace-enrichment-kind";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const first_indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_artifact_v1","kind":"asset","field":"url","content_type":"application/json"}
+        \\  ]}
+    ;
+    const second_indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_artifact_v1","kind":"chunk","field":"body","chunk_size":256,"chunk_overlap":25}
+        \\  ]}
+    ;
+
+    const first_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 17,
+            .name = "docs",
+            .indexes_json = first_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 17,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), first_summary.enrichments_added);
+
+    const second_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 17,
+            .name = "docs",
+            .indexes_json = second_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 17,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 0), second_summary.enrichments_added);
+    try std.testing.expectEqual(@as(usize, 1), second_summary.enrichments_updated);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+    try std.testing.expectEqual(.chunk, enrichments[0].kind);
+    try std.testing.expectEqualStrings("document_artifact_v1", enrichments[0].name);
+    try std.testing.expectEqualStrings("body", enrichments[0].field);
+    try std.testing.expectEqual(@as(u32, 256), enrichments[0].chunk_size);
 }
 
 test "table provisioner compares full text index configs semantically" {

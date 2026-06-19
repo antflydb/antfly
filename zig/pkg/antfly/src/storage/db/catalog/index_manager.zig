@@ -2796,7 +2796,7 @@ pub const IndexManager = struct {
         try validateEnrichmentConfig(self, internal);
 
         for (self.enrichments.items) |*entry| {
-            if (entry.kind != internal.kind or !std.mem.eql(u8, entry.name, internal.name)) continue;
+            if (!std.mem.eql(u8, entry.name, internal.name)) continue;
             if (internalEnrichmentConfigsEqual(entry.*, internal)) return .unchanged;
 
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
