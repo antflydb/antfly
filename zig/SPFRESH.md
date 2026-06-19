@@ -948,9 +948,11 @@ implementations cleanly:
    block, and directory construction fills those slabs directly from sorted
    entries instead of first copying through block-sized scratch arrays. The
    record-backed build path also pre-sizes entry and block lists from exact
-   record/posting counts, avoiding geometric growth churn on rebuild. Coarse
-   block quantization now reads block centroids through a source view instead
-   of copying them into a temporary dense centroid array.
+   record/posting counts and appends owned centroid entries through the
+   assume-capacity path, avoiding geometric growth churn and repeated capacity
+   checks on rebuild. Coarse block quantization now reads block centroids
+   through a source view instead of copying them into a temporary dense
+   centroid array.
    Packed-node fallback directory rebuilds also pre-size the pending node
    traversal queue from the published node count and append through the
    assume-capacity path in the normal bounded case, avoiding geometric growth
