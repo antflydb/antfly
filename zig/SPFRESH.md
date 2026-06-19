@@ -2647,12 +2647,15 @@ enough loses recall while proving little about 1M behavior. The comparison
 runner now leaves two-level block probing adaptive by default. Posting probe
 count follows `SEARCH_WIDTH`, block size is derived from the estimated posting
 count with a 128-posting maximum, and the internal default block probe count is
-based on the block count and the minimum blocks needed to cover the requested
-posting probes. This keeps small smokes from degenerating to one centroid
+based on the block count, the minimum blocks needed to cover the requested
+posting probes, and a floor at the final posting-probe effort capped by the
+available block count. This keeps small smokes from degenerating to one centroid
 block, keeps VDBB-style 1M runs near 128 postings per block, and avoids a fixed
 block-probe cap that can under-select after foreground split-full repair. In
-the current VDBB-like 1M shape (`leaf_size=168`), the effective policy sees
-about `47` coarse blocks and probes `7` before adaptive expansion.
+the current VDBB-like 1M shape
+(`leaf_size=168`), the effective policy sees about `47` coarse blocks and
+probes `32` before adaptive expansion, preserving directory pruning while
+avoiding an overly narrow coarse pass.
 
 A focused 4096-vector directory smoke with `SEARCH_WIDTH=32` demonstrates the
 current tradeoff. Centroid ranking at 32 posting probes lifts repaired warm

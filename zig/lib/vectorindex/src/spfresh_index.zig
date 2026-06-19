@@ -595,7 +595,7 @@ fn defaultFlatCentroidBlockProbeCount(block_count: usize, block_size: usize, pos
     const sqrt_blocks = integerSqrtCeil(block_count);
     const effective_block_size = @max(block_size, @as(usize, 1));
     const blocks_for_posting_probe_limit = std.math.divCeil(usize, posting_probe_limit, effective_block_size) catch unreachable;
-    return @max(sqrt_blocks, blocks_for_posting_probe_limit);
+    return @min(block_count, @max(@max(sqrt_blocks, blocks_for_posting_probe_limit), posting_probe_limit));
 }
 
 const small_two_level_full_scan_blocks: usize = 32;
@@ -2725,8 +2725,8 @@ test "effective centroid block probing full-scans small directories and prunes 1
     const posting_count = 5953; // roughly 1M vectors at the VDBB leaf_size=168 shape.
     const block_count = std.math.divCeil(usize, posting_count, 128) catch unreachable;
     try std.testing.expectEqual(@as(usize, 47), block_count);
-    try std.testing.expectEqual(@as(usize, 7), defaultFlatCentroidBlockProbeCount(block_count, 128, 32));
-    try std.testing.expectEqual(@as(usize, 7), effectiveFlatCentroidBlockProbeCount(false, 0, block_count, 128, 32));
+    try std.testing.expectEqual(@as(usize, 32), defaultFlatCentroidBlockProbeCount(block_count, 128, 32));
+    try std.testing.expectEqual(@as(usize, 32), effectiveFlatCentroidBlockProbeCount(false, 0, block_count, 128, 32));
 }
 
 test "global posting quantized payload is only built for deterministic full block scans" {
