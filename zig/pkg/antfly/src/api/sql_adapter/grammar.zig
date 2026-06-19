@@ -979,6 +979,7 @@ pub const BulkIoSyntax = struct {
     columns: []const []const u8 = &.{},
     endpoint: []const u8,
     format: ?[]const u8 = null,
+    header: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.table_name));
@@ -4859,12 +4860,26 @@ pub fn parseBulkIoTailAlloc(
     }
 
     var format: ?[]const u8 = null;
+    var header = false;
     var format_transferred = false;
     errdefer if (!format_transferred) if (format) |value| alloc.free(@constCast(value));
     if (cursor.matchKeyword("with")) {
         try cursor.expectToken(.lparen);
-        try cursor.expectKeyword("format");
-        format = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        while (true) {
+            if (cursor.matchKeyword("format")) {
+                if (format != null) return error.UnsupportedSqlShape;
+                format = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            } else if (cursor.matchKeyword("header")) {
+                const value = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+                if (std.ascii.eqlIgnoreCase(value.text, "true")) {
+                    header = true;
+                } else if (std.ascii.eqlIgnoreCase(value.text, "false")) {
+                    header = false;
+                } else return error.UnsupportedSqlShape;
+            } else return error.UnsupportedSqlShape;
+            if (cursor.matchToken(.comma) != null) continue;
+            break;
+        }
         try cursor.expectToken(.rparen);
     }
 
@@ -4878,6 +4893,7 @@ pub fn parseBulkIoTailAlloc(
         .columns = try columns.toOwnedSlice(alloc),
         .endpoint = endpoint,
         .format = format,
+        .header = header,
     };
 }
 
@@ -8548,6 +8564,17 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("status", copy_from.columns[1]);
     try std.testing.expectEqualStrings("STDIN", copy_from.endpoint);
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
+    try std.testing.expect(!copy_from.header);
+
+    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FORMAT csv);");
+    defer lexer.freeTokens(alloc, &copy_header_tokens);
+    var copy_header_pos: usize = 0;
+    var copy_header = try parseBulkIoTailAlloc(alloc, copy_header_tokens.items, &copy_header_pos);
+    defer copy_header.deinit(alloc);
+    try std.testing.expectEqual(copy_header_tokens.items.len, copy_header_pos);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.from, copy_header.direction);
+    try std.testing.expectEqualStrings("csv", copy_header.format.?);
+    try std.testing.expect(copy_header.header);
 
     var copy_to_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records TO STDOUT;");
     defer lexer.freeTokens(alloc, &copy_to_tokens);
@@ -8560,8 +8587,9 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqual(@as(usize, 0), copy_to.columns.len);
     try std.testing.expectEqualStrings("STDOUT", copy_to.endpoint);
     try std.testing.expect(copy_to.format == null);
+    try std.testing.expect(!copy_to.header);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (HEADER true);");
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (DELIMITER ',');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

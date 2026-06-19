@@ -3604,6 +3604,7 @@ const Parser = struct {
         const columns = syntax.columns;
         const endpoint = syntax.endpoint;
         const format = syntax.format;
+        const header = syntax.header;
         syntax.table_name = "";
         syntax.columns = &.{};
         syntax.endpoint = "";
@@ -3614,6 +3615,7 @@ const Parser = struct {
             .columns = columns,
             .endpoint = endpoint,
             .format = format,
+            .header = header,
         };
     }
 
@@ -45171,16 +45173,28 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("status", copy_from_plan.columns[1]);
     try std.testing.expectEqualStrings("STDIN", copy_from_plan.endpoint);
     try std.testing.expectEqualStrings("csv", copy_from_plan.format.?);
+    try std.testing.expect(!copy_from_plan.header);
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv", copy_from_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false", copy_from_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
+
+    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);");
+    defer copy_from_header.deinit(alloc);
+    const copy_from_header_plan = switch (copy_from_header) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(copy_from_header_plan.header);
+    const copy_from_header_fingerprint = try ddlFingerprintAlloc(alloc, copy_from_header);
+    defer alloc.free(copy_from_header_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true", copy_from_header_fingerprint);
 
     var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv);");
     defer copy_to.deinit(alloc);
     const copy_to_fingerprint = try ddlFingerprintAlloc(alloc, copy_to);
     defer alloc.free(copy_to_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv", copy_to_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false", copy_to_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
@@ -56594,14 +56608,14 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
         .bulk_io => |plan| if (plan.format) |format|
             try std.fmt.allocPrint(
                 alloc,
-                "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}",
-                .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format },
+                "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}",
+                .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header },
             )
         else
             try std.fmt.allocPrint(
                 alloc,
-                "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}",
-                .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint },
+                "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}",
+                .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header },
             ),
         .table_partition_catalog => |plan| switch (plan) {
             .create_partitioned => |create| try std.fmt.allocPrint(

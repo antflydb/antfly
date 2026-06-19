@@ -1664,6 +1664,7 @@ pub const BulkIoPlan = struct {
     columns: []const []const u8 = &.{},
     endpoint: []const u8,
     format: ?[]const u8 = null,
+    header: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);

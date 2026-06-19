@@ -130,6 +130,7 @@
     "ddl_constraint_mode_immediate",
     "ddl_constraint_mode_named",
     "ddl_copy_from",
+    "ddl_copy_header",
     "ddl_copy_to",
     "ddl_create_covering_index",
     "ddl_create_index",

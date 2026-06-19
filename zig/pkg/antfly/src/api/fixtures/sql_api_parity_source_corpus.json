@@ -4153,8 +4153,19 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv",
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
+    },
+    {
+      "name": "copy from header bulk import ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true)"
     },
     {
       "name": "copy to bulk export ddl",
@@ -4164,7 +4175,7 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv",
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv)"
     },
     {
@@ -4189,11 +4200,11 @@
       "sql": "COPY usage_records (id, status) TO STDIN"
     },
     {
-      "name": "unsupported copy header option",
+      "name": "unsupported copy delimiter option",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=bulk_io_plan",
       "classification_reason": "bulk_io_plan",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (HEADER true)"
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (DELIMITER ',')"
     },
     {
       "name": "create function catalog ddl",
