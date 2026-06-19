@@ -958,45 +958,50 @@ pub fn selectFlatRabitqPostings(
             self.config.flat_centroid_block_size,
             probe_limit,
         );
-        const distances = scratch.distances[0..directory.blocks.len];
-        const error_bounds = scratch.error_bounds[0..directory.blocks.len];
-        if (directory.coarse_quantized) |*coarse| {
-            try self.quantizer.estimateDistancesWithScratch(coarse, query, distances, error_bounds, &scratch.estimate);
-            profile.centroid_directory_block_centroid_estimates += @intCast(directory.blocks.len);
-            for (directory.blocks, 0..) |*block, block_index| {
-                error_bounds[block_index] += centroidBlockProbeErrorBound(self.config.metric, distances[block_index], block.radius);
-            }
+        if (block_probe_limit >= directory.blocks.len) {
+            for (directory.blocks, 0..) |_, block_index| selected_block_storage[block_index] = block_index;
+            selected_blocks = selected_block_storage[0..directory.blocks.len];
         } else {
-            for (directory.blocks, 0..) |*block, block_index| {
-                distances[block_index] = vec.distanceToQuery(query, query_measure, block.centroid, self.config.metric);
-                error_bounds[block_index] = centroidBlockProbeErrorBound(self.config.metric, distances[block_index], block.radius);
+            const distances = scratch.distances[0..directory.blocks.len];
+            const error_bounds = scratch.error_bounds[0..directory.blocks.len];
+            if (directory.coarse_quantized) |*coarse| {
+                try self.quantizer.estimateDistancesWithScratch(coarse, query, distances, error_bounds, &scratch.estimate);
+                profile.centroid_directory_block_centroid_estimates += @intCast(directory.blocks.len);
+                for (directory.blocks, 0..) |*block, block_index| {
+                    error_bounds[block_index] += centroidBlockProbeErrorBound(self.config.metric, distances[block_index], block.radius);
+                }
+            } else {
+                for (directory.blocks, 0..) |*block, block_index| {
+                    distances[block_index] = vec.distanceToQuery(query, query_measure, block.centroid, self.config.metric);
+                    error_bounds[block_index] = centroidBlockProbeErrorBound(self.config.metric, distances[block_index], block.radius);
+                }
+                profile.centroid_directory_block_centroids_scored += @intCast(directory.blocks.len);
             }
-            profile.centroid_directory_block_centroids_scored += @intCast(directory.blocks.len);
-        }
 
-        var block_probes_stack: [flat_centroid_query_probe_stack_capacity]FlatCentroidProbe = undefined;
-        const use_block_probes_stack = directory.blocks.len <= block_probes_stack.len;
-        var block_probes = if (use_block_probes_stack)
-            block_probes_stack[0..directory.blocks.len]
-        else
-            try self.alloc.alloc(FlatCentroidProbe, directory.blocks.len);
-        defer if (!use_block_probes_stack) self.alloc.free(block_probes);
-        for (0..directory.blocks.len) |block_index| {
-            block_probes[block_index] = .{
-                .posting_id = @intCast(block_index),
-                .distance = distances[block_index],
-                .error_bound = error_bounds[block_index],
-            };
+            var block_probes_stack: [flat_centroid_query_probe_stack_capacity]FlatCentroidProbe = undefined;
+            const use_block_probes_stack = directory.blocks.len <= block_probes_stack.len;
+            var block_probes = if (use_block_probes_stack)
+                block_probes_stack[0..directory.blocks.len]
+            else
+                try self.alloc.alloc(FlatCentroidProbe, directory.blocks.len);
+            defer if (!use_block_probes_stack) self.alloc.free(block_probes);
+            for (0..directory.blocks.len) |block_index| {
+                block_probes[block_index] = .{
+                    .posting_id = @intCast(block_index),
+                    .distance = distances[block_index],
+                    .error_bound = error_bounds[block_index],
+                };
+            }
+            std.mem.sort(FlatCentroidProbe, block_probes, {}, centroidBlockProbeLess);
+            const selected_block_count = if (fixed_block_probe_count)
+                block_probe_limit
+            else
+                adaptiveFlatCentroidBlockProbeCount(block_probes, block_probe_limit);
+            for (block_probes[0..selected_block_count], 0..) |block_probe, i| {
+                selected_block_storage[i] = @intCast(block_probe.posting_id);
+            }
+            selected_blocks = selected_block_storage[0..selected_block_count];
         }
-        std.mem.sort(FlatCentroidProbe, block_probes, {}, centroidBlockProbeLess);
-        const selected_block_count = if (fixed_block_probe_count)
-            block_probe_limit
-        else
-            adaptiveFlatCentroidBlockProbeCount(block_probes, block_probe_limit);
-        for (block_probes[0..selected_block_count], 0..) |block_probe, i| {
-            selected_block_storage[i] = @intCast(block_probe.posting_id);
-        }
-        selected_blocks = selected_block_storage[0..selected_block_count];
         profile.approx_nodes_expanded += @intCast(directory.blocks.len);
         profile.centroid_directory_blocks_scanned += @intCast(directory.blocks.len);
         profile.centroid_directory_blocks_selected += @intCast(selected_blocks.len);
