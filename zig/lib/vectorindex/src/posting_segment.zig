@@ -2510,6 +2510,7 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
         while (posting_end < deltas.items.len and deltas.items[posting_end].posting_id == posting_id) : (posting_end += 1) {}
 
         retained_delta_records.clearRetainingCapacity();
+        try retained_delta_records.ensureUnusedCapacity(alloc, retainedDeltaCandidateCount(deltas.items[posting_start..posting_end]));
         var i = posting_start;
         while (i < posting_end) {
             var chosen = deltas.items[i];
@@ -2518,7 +2519,7 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
                 chosen = deltas.items[j];
             }
             stats.dropped_duplicate_delta_records += j - i - 1;
-            try retained_delta_records.append(alloc, chosen.record);
+            retained_delta_records.appendAssumeCapacity(chosen.record);
             stats.retained_delta_records += 1;
             i = j;
         }
@@ -4977,6 +4978,16 @@ fn sortDeltaCandidatesIfNeeded(candidates: []DeltaCandidate) void {
     }
 }
 
+fn retainedDeltaCandidateCount(candidates: []const DeltaCandidate) usize {
+    if (candidates.len == 0) return 0;
+    var count: usize = 1;
+    var index: usize = 1;
+    while (index < candidates.len) : (index += 1) {
+        if (candidates[index].record.sequence != candidates[index - 1].record.sequence) count += 1;
+    }
+    return count;
+}
+
 fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence: u64, rhs_posting_id: PostingId, rhs_kind: EntryKind, rhs_sequence: u64) std.math.Order {
     if (lhs_posting_id < rhs_posting_id) return .lt;
     if (lhs_posting_id > rhs_posting_id) return .gt;
@@ -5314,6 +5325,18 @@ pub fn testSortBatchPointValueReadsIfNeededSkipsOrderedInput() !void {
     try std.testing.expectEqual(@as(usize, 3), unordered[1].output_index);
     try std.testing.expectEqual(@as(usize, 16), unordered[2].found.offset);
     try std.testing.expectEqual(@as(usize, 4), unordered[2].output_index);
+}
+
+pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
+    const candidates = [_]DeltaCandidate{
+        .{ .posting_id = 7, .segment_id = 1, .record = .{ .sequence = 10, .op = .insert, .vector_id = 100 } },
+        .{ .posting_id = 7, .segment_id = 2, .record = .{ .sequence = 10, .op = .tombstone, .vector_id = 100 } },
+        .{ .posting_id = 7, .segment_id = 1, .record = .{ .sequence = 11, .op = .insert, .vector_id = 101 } },
+        .{ .posting_id = 7, .segment_id = 2, .record = .{ .sequence = 13, .op = .insert, .vector_id = 103 } },
+        .{ .posting_id = 7, .segment_id = 3, .record = .{ .sequence = 13, .op = .tombstone, .vector_id = 103 } },
+    };
+    try std.testing.expectEqual(@as(usize, 0), retainedDeltaCandidateCount(&.{}));
+    try std.testing.expectEqual(@as(usize, 3), retainedDeltaCandidateCount(&candidates));
 }
 
 pub fn testValidatesFooterAndVersion() !void {
@@ -7986,6 +8009,10 @@ test "posting segment skips sorting ordered pending entries" {
 
 test "posting segment skips sorting ordered batch point reads" {
     try testSortBatchPointValueReadsIfNeededSkipsOrderedInput();
+}
+
+test "posting segment retained delta candidate count deduplicates sequences" {
+    try testRetainedDeltaCandidateCountDeduplicatesSequences();
 }
 
 test "posting segment validates footer and version" {

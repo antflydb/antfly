@@ -118,7 +118,10 @@ Current status:
   mixed tails stay on the cheaper single-pass path. Segment catalog delta
   collection now reserves from each posting's exact index range before appending
   values, avoiding repeated `DeltaValue` array growth when a posting has many
-  sealed delta values.
+  sealed delta values. Segment compaction also pre-counts each sorted posting
+  group's retained unique delta sequences before building the replacement delta
+  tail, so duplicate-heavy compactions do not grow retained-record scratch one
+  winner at a time.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
