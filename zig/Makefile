@@ -25,7 +25,7 @@ ONNXRUNTIME_VERSION ?= 1.24.3
 GENAI_VERSION ?= 0.12.1
 ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
 
-.PHONY: build test unit-test sql-api-parity-test db-temporal-test graph-metric-lifecycle-test graph-metric-cleanup-test graph-metric-degree-canary-test graph-metric-default-gate-test graph-metric-fan-in-test graph-metric-operations-test public-api-graph-metric-e2e-test download-onnx force-download-onnx clean-onnx
+.PHONY: build test unit-test sql-api-parity-test db-temporal-test download-onnx force-download-onnx clean-onnx
 
 $(ONNXRUNTIME_STAMP): $(INFERENCE_DIR)/scripts/download-onnxruntime.sh
 	@test -d $(INFERENCE_DIR) || (echo "ERROR: inference package not found at $(INFERENCE_DIR)" && exit 1)
@@ -53,27 +53,6 @@ sql-api-parity-test: ## Run SQL/API typed-plan parity corpus tests.
 
 db-temporal-test: ## Run focused application-time temporal table storage tests.
 	$(ZIG) build db-temporal-test
-
-graph-metric-lifecycle-test: ## Run focused graph metric planned lifecycle tests.
-	$(ZIG) build graph-metric-lifecycle-test
-
-graph-metric-cleanup-test: ## Run focused graph metric cleanup and retention tests.
-	$(ZIG) build graph-metric-cleanup-test
-
-graph-metric-degree-canary-test: ## Run focused graph metric degree canary qualification tests.
-	$(ZIG) build graph-metric-degree-canary-test
-
-graph-metric-default-gate-test: ## Run focused graph metric default auto-gate tests.
-	$(ZIG) build graph-metric-default-gate-test
-
-graph-metric-fan-in-test: ## Run focused graph metric hosted fan-in tests.
-	$(ZIG) build graph-metric-fan-in-test
-
-graph-metric-operations-test: ## Run focused graph metric operations and status contract tests.
-	$(ZIG) build graph-metric-operations-test
-
-public-api-graph-metric-e2e-test: ## Run focused public API graph metric e2e tests.
-	$(ZIG) build public-api-graph-metric-e2e-test
 
 clean-onnx: ## Remove downloaded ONNX Runtime files.
 	rm -rf $(ONNXRUNTIME_ROOT)

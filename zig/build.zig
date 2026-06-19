@@ -2936,10 +2936,6 @@ pub fn build(b: *std.Build) void {
         run_graph_metric_lifecycle_tests.addArgs(&.{ "--skip-test-filter", filter });
         run_graph_metric_operations_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
-    const graph_metric_lifecycle_test_step = b.step("graph-metric-lifecycle-test", "Run focused graph metric planned lifecycle tests");
-    graph_metric_lifecycle_test_step.dependOn(&run_graph_metric_lifecycle_tests.step);
-    graph_metric_lifecycle_test_step.dependOn(&run_graph_metric_query_fan_in_tests.step);
-
     const graph_metric_cleanup_default_filters = [_][]const u8{
         "db graph metric runtime releases durable owner lease on deinit",
         "db graph metric runtime stale deinit preserves replacement owner lease",
@@ -2966,9 +2962,6 @@ pub fn build(b: *std.Build) void {
     for (root_test_skip_filters) |filter| {
         run_graph_metric_cleanup_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
-    const graph_metric_cleanup_test_step = b.step("graph-metric-cleanup-test", "Run focused graph metric cleanup and retention tests");
-    graph_metric_cleanup_test_step.dependOn(&run_graph_metric_cleanup_tests.step);
-
     const graph_metric_degree_canary_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &.{"degree canary"}),
@@ -2981,9 +2974,6 @@ pub fn build(b: *std.Build) void {
     for (root_test_skip_filters) |filter| {
         run_graph_metric_degree_canary_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
-    const graph_metric_degree_canary_test_step = b.step("graph-metric-degree-canary-test", "Run focused graph metric degree canary qualification tests");
-    graph_metric_degree_canary_test_step.dependOn(&run_graph_metric_degree_canary_tests.step);
-
     const graph_metric_default_gate_default_filters = [_][]const u8{
         "db runUntilIdle can use planned graph metric maintenance when enabled",
         "db runUntilIdle planned graph metric maintenance reports budget exhaustion and resumes",
@@ -3021,9 +3011,6 @@ pub fn build(b: *std.Build) void {
     for (root_test_skip_filters) |filter| {
         run_graph_metric_default_gate_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
-    const graph_metric_default_gate_test_step = b.step("graph-metric-default-gate-test", "Run focused graph metric default auto-gate tests");
-    graph_metric_default_gate_test_step.dependOn(&run_graph_metric_default_gate_tests.step);
-
     const lib_recall_default_filters = [_][]const u8{
         "HBC recall",
     };
@@ -3756,8 +3743,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_public_api_graph_metric_e2e_tests = b.addRunArtifact(public_api_graph_metric_e2e_tests);
     run_public_api_graph_metric_e2e_tests.step.dependOn(&openapi_root_check.step);
-    const public_api_graph_metric_e2e_test_step = b.step("public-api-graph-metric-e2e-test", "Run focused public API graph metric e2e test");
-    public_api_graph_metric_e2e_test_step.dependOn(&run_public_api_graph_metric_e2e_tests.step);
 
     const lib_resolution_source_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4366,13 +4351,6 @@ pub fn build(b: *std.Build) void {
 
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read DOCID tests");
     api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-
-    const api_table_reads_graph_metric_test_step = b.step("api-table-reads-graph-metric-test", "Run focused API table read graph metric tests");
-    api_table_reads_graph_metric_test_step.dependOn(&run_api_table_reads_graph_metric_tests.step);
-
-    const graph_metric_fan_in_test_step = b.step("graph-metric-fan-in-test", "Run focused graph metric hosted fan-in tests");
-    graph_metric_fan_in_test_step.dependOn(&run_graph_metric_query_fan_in_tests.step);
-    graph_metric_fan_in_test_step.dependOn(&run_api_table_reads_graph_metric_tests.step);
 
     const api_internal_group_write_routes_test_step = b.step("api-internal-group-write-routes-test", "Run focused internal group write route tests");
     api_internal_group_write_routes_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
@@ -5447,6 +5425,13 @@ pub fn build(b: *std.Build) void {
         &run_db_unit_tests.step,
         &run_sparse_unit_tests.step,
         &run_derived_log_unit_tests.step,
+        &run_graph_metric_lifecycle_tests.step,
+        &run_graph_metric_query_fan_in_tests.step,
+        &run_graph_metric_cleanup_tests.step,
+        &run_graph_metric_degree_canary_tests.step,
+        &run_graph_metric_default_gate_tests.step,
+        &run_api_table_reads_graph_metric_tests.step,
+        &run_public_api_graph_metric_e2e_tests.step,
     });
 
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
@@ -7119,9 +7104,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_graph_metric_operations_command_tests = b.addRunArtifact(graph_metric_operations_command_tests);
-    const graph_metric_operations_test_step = b.step("graph-metric-operations-test", "Run focused graph metric operations and status contract tests");
-    graph_metric_operations_test_step.dependOn(&run_graph_metric_operations_tests.step);
-    graph_metric_operations_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_operations_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
 
     if (edition == .full) {
         const graph_metric_process_harness_mod = b.createModule(.{

@@ -136,7 +136,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-go build-docs generate generated-check go-generated-check ts-generated-check py-generated-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
-.PHONY: zig-build zig-test zig-unit-test zig-sql-api-parity-test zig-db-temporal-test zig-graph-metric-lifecycle-test zig-graph-metric-cleanup-test zig-graph-metric-degree-canary-test zig-graph-metric-default-gate-test zig-graph-metric-fan-in-test zig-graph-metric-operations-test zig-public-api-graph-metric-e2e-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
+.PHONY: zig-build zig-test zig-unit-test zig-sql-api-parity-test zig-db-temporal-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
 
@@ -220,27 +220,6 @@ zig-sql-api-parity-test:
 
 zig-db-temporal-test:
 	$(ZIG_MAKE) db-temporal-test
-
-zig-graph-metric-lifecycle-test:
-	$(ZIG_MAKE) graph-metric-lifecycle-test
-
-zig-graph-metric-cleanup-test:
-	$(ZIG_MAKE) graph-metric-cleanup-test
-
-zig-graph-metric-degree-canary-test:
-	$(ZIG_MAKE) graph-metric-degree-canary-test
-
-zig-graph-metric-default-gate-test:
-	$(ZIG_MAKE) graph-metric-default-gate-test
-
-zig-graph-metric-fan-in-test:
-	$(ZIG_MAKE) graph-metric-fan-in-test
-
-zig-graph-metric-operations-test:
-	$(ZIG_MAKE) graph-metric-operations-test
-
-zig-public-api-graph-metric-e2e-test:
-	$(ZIG_MAKE) public-api-graph-metric-e2e-test
 
 zig-generate:
 	$(ZIG_MAKE) generate
