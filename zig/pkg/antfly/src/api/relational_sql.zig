@@ -3607,12 +3607,14 @@ const Parser = struct {
         const header = syntax.header;
         const delimiter = syntax.delimiter;
         const quote = syntax.quote;
+        const escape = syntax.escape;
         syntax.table_name = "";
         syntax.columns = &.{};
         syntax.endpoint = "";
         syntax.format = null;
         syntax.delimiter = null;
         syntax.quote = null;
+        syntax.escape = null;
         return .{
             .direction = bulkIoDirectionFromSyntax(syntax.direction),
             .table_name = table_name,
@@ -3622,6 +3624,7 @@ const Parser = struct {
             .header = header,
             .delimiter = delimiter,
             .quote = quote,
+            .escape = escape,
         };
     }
 
@@ -45182,12 +45185,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(!copy_from_plan.header);
     try std.testing.expect(copy_from_plan.delimiter == null);
     try std.testing.expect(copy_from_plan.quote == null);
+    try std.testing.expect(copy_from_plan.escape == null);
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default:quote_hex=default", copy_from_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default", copy_from_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
-    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"');");
+    var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '!');");
     defer copy_from_header.deinit(alloc);
     const copy_from_header_plan = switch (copy_from_header) {
         .bulk_io => |plan| plan,
@@ -45196,15 +45200,16 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(copy_from_header_plan.header);
     try std.testing.expectEqualStrings(",", copy_from_header_plan.delimiter.?);
     try std.testing.expectEqualStrings("\"", copy_from_header_plan.quote.?);
+    try std.testing.expectEqualStrings("!", copy_from_header_plan.escape.?);
     const copy_from_header_fingerprint = try ddlFingerprintAlloc(alloc, copy_from_header);
     defer alloc.free(copy_from_header_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c:quote_hex=22", copy_from_header_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c:quote_hex=22:escape_hex=21", copy_from_header_fingerprint);
 
     var copy_to = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv);");
     defer copy_to.deinit(alloc);
     const copy_to_fingerprint = try ddlFingerprintAlloc(alloc, copy_to);
     defer alloc.free(copy_to_fingerprint);
-    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default:quote_hex=default", copy_to_fingerprint);
+    try std.testing.expectEqualStrings("ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default", copy_to_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
@@ -56620,17 +56625,19 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             defer alloc.free(delimiter_hex);
             const quote_hex = try bulkIoByteOptionHexAlloc(alloc, plan.quote);
             defer alloc.free(quote_hex);
+            const escape_hex = try bulkIoByteOptionHexAlloc(alloc, plan.escape);
+            defer alloc.free(escape_hex);
             break :blk if (plan.format) |format|
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:delimiter_hex={s}:quote_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, delimiter_hex, quote_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, delimiter_hex, quote_hex, escape_hex },
                 )
             else
                 try std.fmt.allocPrint(
                     alloc,
-                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:delimiter_hex={s}:quote_hex={s}",
-                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, delimiter_hex, quote_hex },
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, delimiter_hex, quote_hex, escape_hex },
                 );
         },
         .table_partition_catalog => |plan| switch (plan) {

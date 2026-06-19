@@ -982,6 +982,7 @@ pub const BulkIoSyntax = struct {
     header: bool = false,
     delimiter: ?[]const u8 = null,
     quote: ?[]const u8 = null,
+    escape: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.table_name));
@@ -990,6 +991,7 @@ pub const BulkIoSyntax = struct {
         if (self.format) |format| alloc.free(@constCast(format));
         if (self.delimiter) |delimiter| alloc.free(@constCast(delimiter));
         if (self.quote) |quote| alloc.free(@constCast(quote));
+        if (self.escape) |escape| alloc.free(@constCast(escape));
         self.* = undefined;
     }
 };
@@ -4867,12 +4869,15 @@ pub fn parseBulkIoTailAlloc(
     var header = false;
     var delimiter: ?[]const u8 = null;
     var quote: ?[]const u8 = null;
+    var escape: ?[]const u8 = null;
     var format_transferred = false;
     var delimiter_transferred = false;
     var quote_transferred = false;
+    var escape_transferred = false;
     errdefer if (!format_transferred) if (format) |value| alloc.free(@constCast(value));
     errdefer if (!delimiter_transferred) if (delimiter) |value| alloc.free(@constCast(value));
     errdefer if (!quote_transferred) if (quote) |value| alloc.free(@constCast(value));
+    errdefer if (!escape_transferred) if (escape) |value| alloc.free(@constCast(value));
     if (cursor.matchKeyword("with")) {
         try cursor.expectToken(.lparen);
         while (true) {
@@ -4902,6 +4907,14 @@ pub fn parseBulkIoTailAlloc(
                     return error.UnsupportedSqlShape;
                 }
                 quote = value;
+            } else if (cursor.matchKeyword("escape")) {
+                if (escape != null) return error.UnsupportedSqlShape;
+                const value = try parseSqlStringLiteralValueAlloc(alloc, cursor);
+                if (value.len != 1) {
+                    alloc.free(value);
+                    return error.UnsupportedSqlShape;
+                }
+                escape = value;
             } else return error.UnsupportedSqlShape;
             if (cursor.matchToken(.comma) != null) continue;
             break;
@@ -4915,6 +4928,7 @@ pub fn parseBulkIoTailAlloc(
     format_transferred = true;
     delimiter_transferred = true;
     quote_transferred = true;
+    escape_transferred = true;
     return .{
         .direction = direction,
         .table_name = table_name,
@@ -4924,6 +4938,7 @@ pub fn parseBulkIoTailAlloc(
         .header = header,
         .delimiter = delimiter,
         .quote = quote,
+        .escape = escape,
     };
 }
 
@@ -8596,7 +8611,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
     try std.testing.expect(!copy_from.header);
 
-    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FORMAT csv, DELIMITER ',', QUOTE '\"');");
+    var copy_header_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (HEADER true, FORMAT csv, DELIMITER ',', QUOTE '\"', ESCAPE '!');");
     defer lexer.freeTokens(alloc, &copy_header_tokens);
     var copy_header_pos: usize = 0;
     var copy_header = try parseBulkIoTailAlloc(alloc, copy_header_tokens.items, &copy_header_pos);
@@ -8607,6 +8622,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expect(copy_header.header);
     try std.testing.expectEqualStrings(",", copy_header.delimiter.?);
     try std.testing.expectEqualStrings("\"", copy_header.quote.?);
+    try std.testing.expectEqualStrings("!", copy_header.escape.?);
 
     var copy_to_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records TO STDOUT;");
     defer lexer.freeTokens(alloc, &copy_to_tokens);
@@ -8621,7 +8637,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expect(copy_to.format == null);
     try std.testing.expect(!copy_to.header);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (ESCAPE '\"');");
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM STDIN WITH (NULL '');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

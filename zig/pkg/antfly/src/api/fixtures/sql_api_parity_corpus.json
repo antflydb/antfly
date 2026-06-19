@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "c225a27ed304effb1fac082ff33c91631553a6bbfd06216520067c07314b4a1a",
+  "source_sha256": "477cc8523fdbc86ad39290c9a50a476bf2fb69eb0ded93f06b2db500a442d6d0",
   "source_entry_count": 962,
   "entry_count": 962,
   "skipped_entries": [
@@ -3745,19 +3745,19 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default:quote_hex=default",
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
     },
     {
-      "name": "copy from header delimiter quote bulk import ddl",
+      "name": "copy from header delimiter quote escape bulk import ddl",
       "family": "ddl",
       "summary": {
         "ddl_tag": "copy_from",
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c:quote_hex=22",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"')"
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:delimiter_hex=2c:quote_hex=22:escape_hex=21",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '!')"
     },
     {
       "name": "copy to bulk export ddl",
@@ -3767,7 +3767,7 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default:quote_hex=default",
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:delimiter_hex=default:quote_hex=default:escape_hex=default",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv)"
     },
     {
@@ -3792,11 +3792,11 @@
       "sql": "COPY usage_records (id, status) TO STDIN"
     },
     {
-      "name": "unsupported copy escape option",
+      "name": "unsupported copy null option",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=bulk_io_plan",
       "classification_reason": "bulk_io_plan",
-      "sql": "COPY usage_records (id, status) FROM STDIN WITH (ESCAPE '\"')"
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (NULL '')"
     },
     {
       "name": "create function catalog ddl",
