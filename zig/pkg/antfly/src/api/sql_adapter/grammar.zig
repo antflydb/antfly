@@ -947,12 +947,14 @@ pub const CreateRoleSyntax = struct {
 
 pub const AlterRoleSyntax = struct {
     role_name: []const u8,
+    database_name: ?[]const u8 = null,
     operation: ddl_plan.AlterRolePlan.Operation = .set,
     setting_name: []const u8,
     setting_value: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.role_name));
+        if (self.database_name) |database_name| alloc.free(@constCast(database_name));
         alloc.free(@constCast(self.setting_name));
         if (self.setting_value) |setting_value| alloc.free(@constCast(setting_value));
         self.* = undefined;
@@ -4842,7 +4844,14 @@ pub fn parseAlterRoleCatalogTailAlloc(
     const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var role_transferred = false;
     errdefer if (!role_transferred) alloc.free(role_name);
-    if (cursor.matchKeyword("in")) return error.UnsupportedSqlShape;
+    var database_name: ?[]const u8 = null;
+    var database_transferred = true;
+    if (cursor.matchKeyword("in")) {
+        try cursor.expectKeyword("database");
+        database_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        database_transferred = false;
+    }
+    errdefer if (!database_transferred) if (database_name) |value| alloc.free(value);
     const operation: ddl_plan.AlterRolePlan.Operation = if (cursor.matchKeyword("set"))
         .set
     else if (cursor.matchKeyword("reset"))
@@ -4865,10 +4874,12 @@ pub fn parseAlterRoleCatalogTailAlloc(
     }
     try parseAdapterNoopStatementEnd(cursor);
     role_transferred = true;
+    database_transferred = true;
     setting_transferred = true;
     value_transferred = true;
     return .{
         .role_name = role_name,
+        .database_name = database_name,
         .operation = operation,
         .setting_name = setting_name,
         .setting_value = setting_value,
@@ -8623,6 +8634,18 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqualStrings("app.tenant_id", alter_role.setting_name);
     try std.testing.expectEqualStrings("acme", alter_role.setting_value orelse return error.TestUnexpectedResult);
 
+    var scoped_alter_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme';");
+    defer lexer.freeTokens(alloc, &scoped_alter_role_tokens);
+    var scoped_alter_role_pos: usize = 0;
+    var scoped_alter_role = try parseAlterRoleCatalogTailAlloc(alloc, scoped_alter_role_tokens.items, &scoped_alter_role_pos);
+    defer scoped_alter_role.deinit(alloc);
+    try std.testing.expectEqual(scoped_alter_role_tokens.items.len, scoped_alter_role_pos);
+    try std.testing.expectEqualStrings("app_writer", scoped_alter_role.role_name);
+    try std.testing.expectEqualStrings("appdb", scoped_alter_role.database_name.?);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.set, scoped_alter_role.operation);
+    try std.testing.expectEqualStrings("app.tenant_id", scoped_alter_role.setting_name);
+    try std.testing.expectEqualStrings("acme", scoped_alter_role.setting_value orelse return error.TestUnexpectedResult);
+
     var reset_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer RESET app.tenant_id;");
     defer lexer.freeTokens(alloc, &reset_role_tokens);
     var reset_role_pos: usize = 0;
@@ -8633,6 +8656,18 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, reset_role.operation);
     try std.testing.expectEqualStrings("app.tenant_id", reset_role.setting_name);
     try std.testing.expect(reset_role.setting_value == null);
+
+    var scoped_reset_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer IN DATABASE appdb RESET app.tenant_id;");
+    defer lexer.freeTokens(alloc, &scoped_reset_role_tokens);
+    var scoped_reset_role_pos: usize = 0;
+    var scoped_reset_role = try parseAlterRoleCatalogTailAlloc(alloc, scoped_reset_role_tokens.items, &scoped_reset_role_pos);
+    defer scoped_reset_role.deinit(alloc);
+    try std.testing.expectEqual(scoped_reset_role_tokens.items.len, scoped_reset_role_pos);
+    try std.testing.expectEqualStrings("app_writer", scoped_reset_role.role_name);
+    try std.testing.expectEqualStrings("appdb", scoped_reset_role.database_name.?);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, scoped_reset_role.operation);
+    try std.testing.expectEqualStrings("app.tenant_id", scoped_reset_role.setting_name);
+    try std.testing.expect(scoped_reset_role.setting_value == null);
 
     var unsupported_role_setting_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET statement_timeout = '1ms';");
     defer lexer.freeTokens(alloc, &unsupported_role_setting_tokens);

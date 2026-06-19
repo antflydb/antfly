@@ -4966,21 +4966,22 @@ principals must resolve to a SQL-created `role:<name>` subject instead of being
 created implicitly by `GRANT`. `ALTER ROLE ... SET app.<key> = 'value'`
 persists the setting through the native auth policy store as role-owned
 metadata, `ALTER ROLE ... RESET app.<key>` removes that metadata idempotently,
-and dropping the role removes any remaining owned settings. Authentication
-exposes merged effective role settings after role inheritance plus direct user
-settings. This is the first native SQL role-setting model because `app.*`
-settings are consumed by row-security `current_setting('app.*')` policies.
+`ALTER ROLE ... IN DATABASE <db> SET/RESET app.<key>` stores the same typed
+metadata with an explicit database scope, and dropping the role removes any
+remaining owned settings. Authentication exposes merged effective role settings
+after role inheritance plus direct user settings. This is the first native SQL
+role-setting model because `app.*` settings are consumed by row-security
+`current_setting('app.*')` policies.
 Unsupported role setting names, including PostgreSQL runtime settings such as
 `statement_timeout`, fail closed until Antfly has a native runtime setting owner
 for them. Resetting those unsupported runtime settings also fails closed because
 it must not imply ownership by the native application-setting catalog. If
 inherited roles define the same setting with different values, effective-setting
 resolution fails closed; a direct user setting for the same key is an explicit
-override. Unsupported role-setting forms such as database-scoped settings and
-multi-token expressions still fail closed until they have explicit native
+override. Unsupported role-setting forms such as non-`app.*` runtime settings
+and multi-token expressions still fail closed until they have explicit native
 semantics; the source parity corpus pins unsupported runtime setting names,
-scoped forms, runtime-setting reset, and expression values under
-`role_setting_plan`.
+runtime-setting reset, and expression values under `role_setting_plan`.
 
 `COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
 to typed bulk import/export intent that captures table identity, selected

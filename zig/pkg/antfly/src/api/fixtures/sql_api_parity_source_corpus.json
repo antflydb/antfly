@@ -3929,6 +3929,17 @@
       "sql": "ALTER ROLE app_writer SET app.tenant_id = 'acme'"
     },
     {
+      "name": "alter role database scoped catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=app.tenant_id",
+      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme'"
+    },
+    {
       "name": "alter role reset catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3947,11 +3958,11 @@
       "sql": "ALTER ROLE app_writer SET statement_timeout = '1ms'"
     },
     {
-      "name": "unsupported role scoped setting",
+      "name": "unsupported role database scoped runtime setting",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=role_setting_plan",
       "classification_reason": "role_setting_plan",
-      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme'"
+      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET statement_timeout = '1ms'"
     },
     {
       "name": "unsupported role setting reset",

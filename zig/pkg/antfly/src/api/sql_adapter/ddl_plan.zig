@@ -771,12 +771,14 @@ pub const AlterRolePlan = struct {
     };
 
     role_name: []const u8,
+    database_name: ?[]const u8 = null,
     operation: Operation = .set,
     setting_name: []const u8,
     setting_value: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.role_name);
+        if (self.database_name) |database_name| alloc.free(database_name);
         alloc.free(self.setting_name);
         if (self.setting_value) |setting_value| alloc.free(setting_value);
         self.* = undefined;

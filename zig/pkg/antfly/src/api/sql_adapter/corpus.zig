@@ -3921,6 +3921,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_procedure_drop_cascade: bool = false,
     ddl_role_create: bool = false,
     ddl_role_alter: bool = false,
+    ddl_role_alter_database_scope: bool = false,
     ddl_role_alter_reset: bool = false,
     ddl_role_drop: bool = false,
     ddl_privilege_grant: bool = false,
@@ -4139,7 +4140,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_commit_prepared_transaction_plan: bool = false,
     unsupported_ddl_rollback_prepared_transaction_plan: bool = false,
     unsupported_ddl_role_setting_name: bool = false,
-    unsupported_ddl_role_setting_database_scope: bool = false,
     unsupported_ddl_role_setting_reset: bool = false,
     unsupported_ddl_role_setting_expression: bool = false,
     unsupported_ddl_routine_function_body: bool = false,
@@ -5399,10 +5399,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
                     std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
                     std.mem.indexOf(u8, entry.sql, " statement_timeout ") != null);
-            self.unsupported_ddl_role_setting_database_scope = self.unsupported_ddl_role_setting_database_scope or
-                (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
-                    std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
-                    std.mem.indexOf(u8, entry.sql, " IN DATABASE ") != null);
             self.unsupported_ddl_role_setting_reset = self.unsupported_ddl_role_setting_reset or
                 (std.mem.eql(u8, entry.classification_reason, "role_setting_plan") and
                     std.mem.startsWith(u8, entry.sql, "ALTER ROLE ") and
@@ -5602,6 +5598,7 @@ pub const AppParityCorpusCoverage = struct {
                 .create_role => self.ddl_role_create = true,
                 .alter_role => {
                     self.ddl_role_alter = true;
+                    self.ddl_role_alter_database_scope = self.ddl_role_alter_database_scope or std.mem.indexOf(u8, entry.plan, ":database=") != null;
                     self.ddl_role_alter_reset = self.ddl_role_alter_reset or std.mem.indexOf(u8, entry.plan, ":operation=reset:") != null;
                 },
                 .drop_role => self.ddl_role_drop = true,
@@ -6572,6 +6569,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_procedure_drop_cascade);
         try std.testing.expect(self.ddl_role_create);
         try std.testing.expect(self.ddl_role_alter);
+        try std.testing.expect(self.ddl_role_alter_database_scope);
         try std.testing.expect(self.ddl_role_alter_reset);
         try std.testing.expect(self.ddl_role_drop);
         try std.testing.expect(self.ddl_privilege_grant);
@@ -6747,7 +6745,6 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_ddl_commit_prepared_transaction_plan);
         try std.testing.expect(self.unsupported_ddl_rollback_prepared_transaction_plan);
         try std.testing.expect(self.unsupported_ddl_role_setting_name);
-        try std.testing.expect(self.unsupported_ddl_role_setting_database_scope);
         try std.testing.expect(self.unsupported_ddl_role_setting_reset);
         try std.testing.expect(self.unsupported_ddl_role_setting_expression);
         try std.testing.expect(self.unsupported_ddl_routine_function_body);

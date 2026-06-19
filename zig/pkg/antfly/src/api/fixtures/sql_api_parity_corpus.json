@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "df76e8a4530a0790ff92b0393007f9331792666b42ecffc8d10a52366f7209e6",
-  "source_entry_count": 967,
-  "entry_count": 967,
+  "source_sha256": "8dff82bc5c7596d837d3b3a6d3fcdbd0a3138c2f9bf6953f7c5cef1e9d1a91a7",
+  "source_entry_count": 968,
+  "entry_count": 968,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3520,6 +3520,17 @@
       "sql": "ALTER ROLE app_writer SET app.tenant_id = 'acme'"
     },
     {
+      "name": "alter role database scoped catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_role",
+        "table_name": "app_writer",
+        "operations": 1
+      },
+      "plan": "ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=app.tenant_id",
+      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme'"
+    },
+    {
       "name": "alter role reset catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3538,11 +3549,11 @@
       "sql": "ALTER ROLE app_writer SET statement_timeout = '1ms'"
     },
     {
-      "name": "unsupported role scoped setting",
+      "name": "unsupported role database scoped runtime setting",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=role_setting_plan",
       "classification_reason": "role_setting_plan",
-      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme'"
+      "sql": "ALTER ROLE app_writer IN DATABASE appdb SET statement_timeout = '1ms'"
     },
     {
       "name": "unsupported role setting reset",

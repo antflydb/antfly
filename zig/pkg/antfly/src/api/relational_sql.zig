@@ -3564,14 +3564,17 @@ const Parser = struct {
         var syntax = try sql_adapter.parseAlterRoleCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
         const role_name = syntax.role_name;
+        const database_name = syntax.database_name;
         const operation = syntax.operation;
         const setting_name = syntax.setting_name;
         const setting_value = syntax.setting_value;
         syntax.role_name = "";
+        syntax.database_name = null;
         syntax.setting_name = "";
         syntax.setting_value = null;
         return .{
             .role_name = role_name,
+            .database_name = database_name,
             .operation = operation,
             .setting_name = setting_name,
             .setting_value = setting_value,
@@ -45308,6 +45311,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id", alter_role_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, alter_role));
 
+    var scoped_alter_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme';");
+    defer scoped_alter_role.deinit(alloc);
+    const scoped_alter_role_plan = switch (scoped_alter_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter_plan| alter_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("app_writer", scoped_alter_role_plan.role_name);
+    try std.testing.expectEqualStrings("appdb", scoped_alter_role_plan.database_name.?);
+    try std.testing.expectEqual(AlterRolePlan.Operation.set, scoped_alter_role_plan.operation);
+    try std.testing.expectEqualStrings("app.tenant_id", scoped_alter_role_plan.setting_name);
+    try std.testing.expectEqualStrings("acme", scoped_alter_role_plan.setting_value orelse return error.TestUnexpectedResult);
+    const scoped_alter_role_fingerprint = try ddlFingerprintAlloc(alloc, scoped_alter_role);
+    defer alloc.free(scoped_alter_role_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=app.tenant_id", scoped_alter_role_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, scoped_alter_role));
+
     var reset_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer RESET app.tenant_id;");
     defer reset_role.deinit(alloc);
     const reset_role_plan = switch (reset_role) {
@@ -45325,6 +45347,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(reset_role_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:operation=reset:setting=app.tenant_id", reset_role_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, reset_role));
+
+    var scoped_reset_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb RESET app.tenant_id;");
+    defer scoped_reset_role.deinit(alloc);
+    const scoped_reset_role_plan = switch (scoped_reset_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |reset_plan| reset_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("app_writer", scoped_reset_role_plan.role_name);
+    try std.testing.expectEqualStrings("appdb", scoped_reset_role_plan.database_name.?);
+    try std.testing.expectEqual(AlterRolePlan.Operation.reset, scoped_reset_role_plan.operation);
+    try std.testing.expectEqualStrings("app.tenant_id", scoped_reset_role_plan.setting_name);
+    try std.testing.expect(scoped_reset_role_plan.setting_value == null);
+    const scoped_reset_role_fingerprint = try ddlFingerprintAlloc(alloc, scoped_reset_role);
+    defer alloc.free(scoped_reset_role_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:database=appdb:operation=reset:setting=app.tenant_id", scoped_reset_role_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, scoped_reset_role));
 
     var drop_role = try lowerDdlPlanAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
     defer drop_role.deinit(alloc);
@@ -56826,11 +56867,18 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 "ddl:create_role:role={s}",
                 .{create.role_name},
             ),
-            .alter_role => |alter| try std.fmt.allocPrint(
-                alloc,
-                "ddl:alter_role:role={s}:operation={s}:setting={s}",
-                .{ alter.role_name, @tagName(alter.operation), alter.setting_name },
-            ),
+            .alter_role => |alter| if (alter.database_name) |database_name|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_role:role={s}:database={s}:operation={s}:setting={s}",
+                    .{ alter.role_name, database_name, @tagName(alter.operation), alter.setting_name },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_role:role={s}:operation={s}:setting={s}",
+                    .{ alter.role_name, @tagName(alter.operation), alter.setting_name },
+                ),
             .drop_role => |drop| try std.fmt.allocPrint(
                 alloc,
                 "ddl:drop_role:role={s}:if_exists={}",
