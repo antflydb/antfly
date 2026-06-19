@@ -229,10 +229,17 @@ pub const NativeFile = struct {
         const document_records = self.countChainPages(.document, checkpoint.document_root_page) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        if (report.tail_bytes != 0) return invalidCheck(report, "tail_bytes");
+        const live = self.liveStats() catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
 
         var valid = report;
         valid.record_count = catalog_records + document_records;
+        valid.live_file_count = live.record_count;
+        valid.live_bytes = live.bytes;
+        valid.compact_size = live.compact_size;
+        valid.reclaimable_bytes = if (file_size > live.compact_size) file_size - live.compact_size else 0;
+        if (valid.tail_bytes != 0) return invalidCheck(valid, "tail_bytes");
         return valid;
     }
 
@@ -761,6 +768,50 @@ pub const NativeFile = struct {
     fn validateValuePages(self: *NativeFile, root_page_id: u64, value_len: usize) !void {
         const value = try self.readValuePagesAlloc(self.allocator, root_page_id, value_len);
         self.allocator.free(value);
+    }
+
+    const LiveStats = struct {
+        record_count: u64,
+        bytes: u64,
+        compact_size: u64,
+    };
+
+    fn liveStats(self: *NativeFile) !LiveStats {
+        const catalog_records = try self.snapshotCatalogRecordsAlloc(self.allocator);
+        defer freeSnapshotCatalogRecords(self.allocator, catalog_records);
+
+        const docs = try self.snapshotDocumentsAlloc(self.allocator);
+        defer freeSnapshotDocuments(self.allocator, docs);
+
+        var live_bytes: u64 = 0;
+        var compact_pages: u64 = 1;
+
+        for (catalog_records) |record| {
+            live_bytes +|= record.key.len + record.value.len;
+            compact_pages += 1;
+            if (record.value.len != 0 and !self.catalogEntryFitsInline(record.key, record.value)) {
+                compact_pages += self.valuePageCount(record.value.len);
+            }
+        }
+
+        for (docs) |doc| {
+            live_bytes +|= doc.key.len + doc.value.len;
+            compact_pages += 1;
+            if (!self.documentEntryFitsInline(doc.key, doc.value)) {
+                compact_pages += self.valuePageCount(doc.value.len);
+            }
+        }
+
+        return .{
+            .record_count = @intCast(catalog_records.len + docs.len),
+            .bytes = live_bytes,
+            .compact_size = compact_pages * @as(u64, self.header.page_size),
+        };
+    }
+
+    fn valuePageCount(self: *const NativeFile, value_len: usize) u64 {
+        std.debug.assert(value_len > 0);
+        return @intCast(std.math.divCeil(usize, value_len, self.maxValuePagePayloadBytes()) catch unreachable);
     }
 
     fn writePage(self: *NativeFile, page_id: u64, kind: PageKind, contents: []const u8) !void {
@@ -1819,8 +1870,12 @@ test "lite native check validates committed root chains" {
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(?[]const u8, null), report.issue);
     try std.testing.expectEqual(@as(u64, 2), report.record_count);
+    try std.testing.expectEqual(@as(u64, 2), report.live_file_count);
+    try std.testing.expect(report.live_bytes > 0);
     try std.testing.expectEqual(@as(u64, default_page_size * 3), report.file_size);
+    try std.testing.expectEqual(report.file_size, report.compact_size);
     try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
+    try std.testing.expectEqual(@as(u64, 0), report.reclaimable_bytes);
 }
 
 test "lite native vacuum rewrites live catalog and document records" {
@@ -1849,6 +1904,10 @@ test "lite native vacuum rewrites live catalog and document records" {
 
         const before = try file.check();
         try std.testing.expect(before.record_count > 2);
+        try std.testing.expectEqual(@as(u64, 2), before.live_file_count);
+        try std.testing.expect(before.live_bytes > 0);
+        try std.testing.expect(before.compact_size < before.file_size);
+        try std.testing.expect(before.reclaimable_bytes > 0);
 
         const vacuumed = try file.vacuum();
         try std.testing.expect(vacuumed.before_size > vacuumed.after_size);
@@ -1858,6 +1917,9 @@ test "lite native vacuum rewrites live catalog and document records" {
         try std.testing.expect(after.valid);
         try std.testing.expectEqual(vacuumed.after_size, after.file_size);
         try std.testing.expectEqual(@as(u64, 2), after.record_count);
+        try std.testing.expectEqual(@as(u64, 2), after.live_file_count);
+        try std.testing.expectEqual(after.file_size, after.compact_size);
+        try std.testing.expectEqual(@as(u64, 0), after.reclaimable_bytes);
 
         const schema = (try file.getCatalogRecordAlloc(allocator, "schema")).?;
         defer allocator.free(schema);
