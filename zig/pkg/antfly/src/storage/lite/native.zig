@@ -28,6 +28,8 @@ pub const default_page_size: u32 = 4096;
 pub const header_size: usize = 4096;
 pub const checkpoint_slot_count = 2;
 pub const checkpoint_slot_size: usize = 64;
+pub const page_magic = "AFLP";
+pub const page_header_size: usize = 16;
 
 const magic_offset: usize = 0;
 const version_offset: usize = 8;
@@ -36,6 +38,11 @@ const header_size_offset: usize = 16;
 const active_checkpoint_offset: usize = 20;
 const checkpoint_slots_offset: usize = 64;
 const header_checksum_offset: usize = header_size - 4;
+const page_crc_offset: usize = 12;
+
+pub const PageKind = enum(u8) {
+    data = 1,
+};
 
 pub const CheckpointSlot = struct {
     commit_sequence: u64 = 0,
@@ -119,17 +126,16 @@ pub const NativeFile = struct {
 
     pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
         if (self.read_only) return error.ReadOnly;
-        if (contents.len > self.header.page_size) return error.PageTooLarge;
+        if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
 
         const previous = self.activeCheckpoint();
         const page_id = previous.page_count;
         const page_size: usize = @intCast(self.header.page_size);
         const page_offset = page_id * @as(u64, self.header.page_size);
 
-        var page = try self.allocator.alloc(u8, page_size);
+        const page = try self.allocator.alloc(u8, page_size);
         defer self.allocator.free(page);
-        @memset(page, 0);
-        @memcpy(page[0..contents.len], contents);
+        encodePage(page, .data, contents);
 
         try self.file.setLength(self.io_impl.io(), page_offset + self.header.page_size);
         try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
@@ -152,6 +158,16 @@ pub const NativeFile = struct {
 
         try readExactAt(self.file, self.io_impl.io(), page, page_id * @as(u64, self.header.page_size));
         return page;
+    }
+
+    pub fn readPagePayloadAlloc(self: *NativeFile, allocator: Allocator, page_id: u64) ![]u8 {
+        const page = try self.readPageAlloc(allocator, page_id);
+        defer allocator.free(page);
+        return try decodePagePayloadAlloc(allocator, page, .data);
+    }
+
+    pub fn maxPagePayloadBytes(self: *const NativeFile) usize {
+        return @as(usize, @intCast(self.header.page_size)) - page_header_size;
     }
 
     fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
@@ -287,6 +303,43 @@ fn decodeCheckpointSlot(raw: []const u8) CheckpointSlot {
     };
 }
 
+fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
+    std.debug.assert(out.len >= page_header_size);
+    std.debug.assert(payload.len <= out.len - page_header_size);
+    @memset(out, 0);
+    @memcpy(out[0..page_magic.len], page_magic);
+    out[4] = @intFromEnum(kind);
+    std.mem.writeInt(u32, out[8..12], @intCast(payload.len), .little);
+    @memcpy(out[page_header_size..][0..payload.len], payload);
+
+    var crc = std.hash.Crc32.init();
+    crc.update(out[0..page_crc_offset]);
+    crc.update(out[page_header_size..][0..payload.len]);
+    std.mem.writeInt(u32, out[page_crc_offset..][0..4], crc.final(), .little);
+}
+
+fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: PageKind) ![]u8 {
+    if (raw.len < page_header_size) return error.TruncatedNativePage;
+    if (!std.mem.eql(u8, raw[0..page_magic.len], page_magic)) return error.InvalidNativePageMagic;
+    const kind_raw = raw[4];
+    const kind: PageKind = switch (kind_raw) {
+        @intFromEnum(PageKind.data) => .data,
+        else => return error.InvalidNativePageKind,
+    };
+    if (kind != expected_kind) return error.UnexpectedNativePageKind;
+
+    const payload_len = std.mem.readInt(u32, raw[8..12], .little);
+    if (payload_len > raw.len - page_header_size) return error.InvalidNativePageLength;
+
+    var crc = std.hash.Crc32.init();
+    crc.update(raw[0..page_crc_offset]);
+    crc.update(raw[page_header_size..][0..payload_len]);
+    const expected_crc = std.mem.readInt(u32, raw[page_crc_offset..][0..4], .little);
+    if (crc.final() != expected_crc) return error.NativePageChecksumMismatch;
+
+    return try allocator.dupe(u8, raw[page_header_size..][0..payload_len]);
+}
+
 fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
     const read = try file.readPositionalAll(io, out, offset);
     if (read != out.len) return error.EndOfStream;
@@ -406,9 +459,9 @@ test "lite native file appends page and publishes checkpoint" {
     try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
     try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().page_count);
 
-    const page = try file.readPageAlloc(allocator, page_id);
+    const page = try file.readPagePayloadAlloc(allocator, page_id);
     defer allocator.free(page);
-    try std.testing.expectEqualStrings("hello native page", page[0.."hello native page".len]);
+    try std.testing.expectEqualStrings("hello native page", page);
 
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
@@ -435,8 +488,34 @@ test "lite native file reopens allocated pages" {
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
     try std.testing.expectEqual(@as(u64, 2), reopened.activeCheckpoint().page_count);
-    const page = try reopened.readPageAlloc(allocator, 1);
+    const page = try reopened.readPagePayloadAlloc(allocator, 1);
     defer allocator.free(page);
-    try std.testing.expectEqualStrings("persisted", page[0.."persisted".len]);
+    try std.testing.expectEqualStrings("persisted", page);
     try std.testing.expectError(error.ReadOnly, reopened.allocatePage("nope"));
+}
+
+test "lite native file detects corrupted page payload" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-corrupt-page.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        _ = try file.allocatePage("checksum");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.readPagePayloadAlloc(allocator, 1));
 }
