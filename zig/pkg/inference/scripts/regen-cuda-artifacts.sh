@@ -94,6 +94,7 @@ required_symbols=(
   termite_embedding_lookup_bf16_weight_f32
   termite_attention_f32_block
   termite_deberta_attention_f32
+  termite_gliner_gather_concat_relu_f32
   termite_split_last_dim3_f32
   termite_rope_per_item_f32
   termite_rms_norm_heads_rope_decode_scalars_f32
@@ -105,6 +106,43 @@ required_symbols=(
   termite_linear_q4_0_argmax_rows_stage1_tile4
   termite_linear_q4_k_argmax_rows_stage1_tile4
   termite_argmax_reduce_rows_pairs_f32
+  termite_linear_q8_0_f32_tile4_r2
+  termite_linear_q8_0_bias_f32_tile4_r2
+  termite_linear_q8_0_bias_gelu_f32_tile4_r2
+  termite_linear_q8_0_bias_add_f32_tile4_r2
+  termite_linear_q8_0_f32_fast_r2c8
+  termite_linear_q8_0_bias_f32_fast_r2c8
+  termite_linear_q8_0_bias_gelu_f32_fast_r2c8
+  termite_linear_q8_0_bias_add_f32_fast_r2c8
+  termite_linear_q8_0_f32_fast_r4c4
+  termite_linear_q8_0_bias_f32_fast_r4c4
+  termite_linear_q8_0_bias_gelu_f32_fast_r4c4
+  termite_linear_q8_0_bias_add_f32_fast_r4c4
+  termite_linear_q8_0_f32_tc_hmma
+  termite_linear_q8_0_bias_f32_tc_hmma
+  termite_linear_q8_0_bias_gelu_f32_tc_hmma
+  termite_linear_q8_0_bias_add_f32_tc_hmma
+  termite_linear_q4_k_bias_gelu_f32_tile4_r2
+  termite_linear_q4_k_bias_add_f32_tile4_r2
+  termite_linear_q4_k_bias_f32_fast_r2c8
+  termite_linear_q4_k_bias_gelu_f32_fast_r2c8
+  termite_linear_q4_k_bias_add_f32_fast_r2c8
+  termite_linear_q4_k_bias_f32_fast_r4c4
+  termite_linear_q4_k_bias_gelu_f32_fast_r4c4
+  termite_linear_q4_k_bias_add_f32_fast_r4c4
+  termite_linear_q4_k_f32_tc_hmma
+  termite_linear_q4_k_bias_f32_tc_hmma
+  termite_linear_q4_k_bias_gelu_f32_tc_hmma
+  termite_linear_q4_k_bias_add_f32_tc_hmma
+  termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma
+  termite_linear_q4_k_bias_relu_f32_tc_hmma
+  termite_linear_q4_k_span_bias_f32_tile8_r2
+  termite_linear_q4_k_span_bias_relu_f32_tile8_r2
+  termite_linear_q4_k_span_bias_f32_tile4_r8
+  termite_linear_q4_k_span_bias_relu_f32_tile4_r8
+  termite_linear_q4_k_span_pair_bias_f32_tile8_r2
+  termite_linear_q4_k_span_pair_bias_relu_f32_tile8_r2
+  termite_linear_q4_k_span_pair2_bias_f32_tile8_r2
   termite_linear_bf16_weight_f32_qkv_nobias_tiled
   termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled
   termite_embedding_lookup_i32_q4_k_f32
