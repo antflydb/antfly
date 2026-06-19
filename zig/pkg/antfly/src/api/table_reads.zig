@@ -55,6 +55,7 @@ const relational_sql_api = @import("relational_sql.zig");
 const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
 const external_source_api = @import("../serverless/external_source/mod.zig");
 const artifact_ref_api = @import("../serverless/manifest/artifact_ref.zig");
+const serverless_algebraic_segment = @import("../serverless/algebraic_segment/mod.zig");
 const sidecar_manifest_api = @import("../serverless/segment/sidecar_manifest.zig");
 const source_binding_api = @import("../serverless/segment/source_binding.zig");
 const object_store_support = @import("../serverless/object_store_support.zig");
@@ -4956,6 +4957,41 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
         return try self.scanInventoryAlloc(alloc, runtime_schema, discovered.inventory, request);
     }
 
+    pub fn expressionAggregatesAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        request: serverless_query.LakeRowsExpressionAggregateRequest,
+    ) !serverless_query.LakeRowsExpressionAggregateResult {
+        if (inventoryHasRowGroupMetadata(self.inventory)) {
+            return try self.expressionAggregatesInventoryAlloc(alloc, runtime_schema, self.inventory, request);
+        }
+
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        const projected_columns = try lakeExpressionAggregateProjectedColumnsAlloc(alloc, request.expressions);
+        defer alloc.free(projected_columns);
+        if (projected_columns.len == 0) return error.UnsupportedLakeRowsExpressionAggregate;
+
+        var validation = try serverless_query.planProjectedLakeScanAlloc(alloc, .{
+            .binding = binding,
+            .inventory = self.inventory,
+            .projected_columns = projected_columns,
+        });
+        defer validation.deinit(alloc);
+
+        var discovered = serverless_query.discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+            alloc,
+            self.object_reader.parquetReader(),
+            self.inventory,
+            projected_columns,
+            64 * 1024,
+        ) catch |err| return normalizedFooterDiscoveryError(err);
+        defer discovered.deinit(alloc);
+
+        return try self.expressionAggregatesInventoryAlloc(alloc, runtime_schema, discovered.inventory, request);
+    }
+
     fn scanInventoryAlloc(
         self: *@This(),
         alloc: std.mem.Allocator,
@@ -4998,6 +5034,64 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
         return try scanner.scanAlloc(alloc, runtime_schema, local_request);
     }
 
+    fn expressionAggregatesInventoryAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        inventory: external_source_api.Inventory,
+        request: serverless_query.LakeRowsExpressionAggregateRequest,
+    ) !serverless_query.LakeRowsExpressionAggregateResult {
+        if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
+
+        var local_request = request;
+        var iceberg_deleted_refs: []rowsource_api.RowRef = &.{};
+        defer if (iceberg_deleted_refs.len > 0) alloc.free(iceberg_deleted_refs);
+        var combined_deleted_refs: []rowsource_api.RowRef = &.{};
+        defer if (combined_deleted_refs.len > 0) alloc.free(combined_deleted_refs);
+
+        if (self.iceberg_delete_plan) |delete_plan| {
+            iceberg_deleted_refs = try serverless_query.readLakeIcebergDeleteRowRefsAlloc(alloc, .{
+                .reader = self.object_reader.parquetReader(),
+                .client = self.object_reader.client,
+                .cache = self.cache,
+                .data_inventory = inventory,
+                .delete_plan = delete_plan,
+                .coalesce_options = self.coalesce_options,
+            });
+            if (request.deleted_row_refs.len == 0) {
+                local_request.deleted_row_refs = iceberg_deleted_refs;
+            } else if (iceberg_deleted_refs.len != 0) {
+                combined_deleted_refs = try alloc.alloc(rowsource_api.RowRef, request.deleted_row_refs.len + iceberg_deleted_refs.len);
+                @memcpy(combined_deleted_refs[0..request.deleted_row_refs.len], request.deleted_row_refs);
+                @memcpy(combined_deleted_refs[request.deleted_row_refs.len..], iceberg_deleted_refs);
+                local_request.deleted_row_refs = combined_deleted_refs;
+            }
+        }
+
+        local_request.materialized_source = .{
+            .kind = switch (binding.format) {
+                .parquet => .external_parquet,
+                .iceberg => .external_iceberg,
+                .lance => .external_lance,
+            },
+            .source_id = inventory.source_id,
+            .snapshot_id = inventory.snapshot_id,
+            .schema_fingerprint = inventory.schema_fingerprint,
+        };
+
+        return try serverless_query.executeLakeParquetSupportedI64ObjectRangeExpressionAggregatesAlloc(alloc, .{
+            .binding = binding,
+            .reader = self.object_reader.parquetReader(),
+            .cache = self.cache,
+            .inventory = inventory,
+            .aggregate = local_request,
+            .coalesce_options = self.coalesce_options,
+        });
+    }
+
     fn inventoryHasRowGroupMetadata(inventory: external_source_api.Inventory) bool {
         for (inventory.files) |file| {
             if (file.row_groups.len != 0) return true;
@@ -5022,6 +5116,29 @@ fn normalizeLakeFooterDiscoveryError(err: anyerror) anyerror {
     };
 }
 
+fn lakeExpressionAggregateProjectedColumnsAlloc(
+    alloc: std.mem.Allocator,
+    expressions: []const serverless_algebraic_segment.ExpressionSpec,
+) ![]const []const u8 {
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer columns.deinit(alloc);
+    for (expressions) |expression| {
+        if (expression.op == .count) continue;
+        if (expression.value_column.len == 0) return error.InvalidLakeRowsQuery;
+        if (!stringSliceContains(columns.items, expression.value_column)) {
+            try columns.append(alloc, expression.value_column);
+        }
+    }
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
 pub const PinnedExternalObjectStorageLakeRowsSource = struct {
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
 
@@ -5044,6 +5161,7 @@ pub const PinnedExternalObjectStorageLakeRowsSource = struct {
                 .rows_query_plan = rowsQueryPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .lake_rows_scan = lakeRowsScan,
+                .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
             },
         };
     }
@@ -5115,6 +5233,18 @@ pub const PinnedExternalObjectStorageLakeRowsSource = struct {
     ) !?serverless_query.LakeRowsScanResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.scanner.scanAlloc(alloc, runtime_schema, request);
+    }
+
+    fn lakeRowsExpressionAggregates(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        request: serverless_query.LakeRowsExpressionAggregateRequest,
+        _: raft_mod.ReadConsistency,
+    ) !?serverless_query.LakeRowsExpressionAggregateResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.scanner.expressionAggregatesAlloc(alloc, runtime_schema, request);
     }
 };
 
@@ -5738,6 +5868,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .rows_query_plan = rowsQueryPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .lake_rows_scan = lakeRowsScan,
+                .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
                 .rows_lateral_plan = rowsLateralPlan,
@@ -5860,6 +5991,14 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
         return try lake_source.source().lakeRowsScan(alloc, table_name, runtime_schema, request, consistency);
+    }
+
+    fn lakeRowsExpressionAggregates(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, request: serverless_query.LakeRowsExpressionAggregateRequest, consistency: raft_mod.ReadConsistency) !?serverless_query.LakeRowsExpressionAggregateResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source == null) return try self.base.lakeRowsExpressionAggregates(alloc, table_name, runtime_schema, request, consistency);
+        var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
+        defer lake_source.deinit();
+        return try lake_source.source().lakeRowsExpressionAggregates(alloc, table_name, runtime_schema, request, consistency);
     }
 
     fn rowsWindowPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsWindowPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsWindowResult {
@@ -17368,6 +17507,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
 
     const FakeLakeSource = struct {
         lake_scan_calls: usize = 0,
+        lake_expression_aggregate_calls: usize = 0,
         routed_scan_calls: usize = 0,
         last_scan_limit: ?usize = null,
 
@@ -17381,6 +17521,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
                     .rows_query_plan = rowsQueryPlan,
                     .rows_aggregate_plan = rowsAggregatePlan,
                     .lake_rows_scan = lakeRowsScan,
+                    .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
                 },
             };
         }
@@ -17468,6 +17609,42 @@ test "external lake rows query and aggregate plans route through lake scan hook"
             self.lake_scan_calls += 1;
             self.last_scan_limit = request.limit;
             return try buildRows(scan_alloc, request.projected_columns);
+        }
+
+        fn lakeRowsExpressionAggregates(
+            ptr: *anyopaque,
+            expression_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            request: serverless_query.LakeRowsExpressionAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?serverless_query.LakeRowsExpressionAggregateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("events", table_name);
+            try std.testing.expect(runtime_schema.external_base_source != null);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            self.lake_expression_aggregate_calls += 1;
+
+            const expressions = try expression_alloc.alloc(serverless_query.lake_rows.ExpressionResult, request.expressions.len);
+            errdefer expression_alloc.free(expressions);
+            var initialized: usize = 0;
+            errdefer {
+                for (expressions[0..initialized]) |*expression| expression.deinit(expression_alloc);
+            }
+            for (request.expressions, expressions) |spec, *out| {
+                out.* = .{
+                    .name = try expression_alloc.dupe(u8, spec.name),
+                    .value = switch (spec.op) {
+                        .count => .{ .count = 2 },
+                        .sum_i64 => .{ .sum_i64 = 50 },
+                        .min_i64 => .{ .min_i64 = 20 },
+                        .max_i64 => .{ .max_i64 = 30 },
+                        .avg_i64 => .{ .avg_i64 = .{ .sum_i64 = 50, .count = 2 } },
+                    },
+                };
+                initialized += 1;
+            }
+            return .{ .expressions = expressions, .source = .rowsource_scan };
         }
 
         fn buildRows(
@@ -17881,6 +18058,23 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 1), distinct_expression_query_result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":30}", distinct_expression_query_result.rows[0]);
 
+    const fast_aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "count_all", .op = .count },
+        .{ .name = "sum_amount", .op = .sum, .field = "amount" },
+        .{ .name = "max_amount", .op = .max, .field = "amount" },
+    };
+    var fast_aggregate_result = (try source.rowsAggregatePlan(alloc, "events", schema, .{
+        .aggregate = .{
+            .aggregations = fast_aggregations[0..],
+        },
+    }, .read_index)).?;
+    defer fast_aggregate_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 16), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), fast_aggregate_result.total_groups);
+    try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50,\"max_amount\":30}", fast_aggregate_result.rows[0]);
+
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },
         .{ .name = "sum_amount", .op = .sum, .field = "amount" },
@@ -17893,6 +18087,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 17), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);

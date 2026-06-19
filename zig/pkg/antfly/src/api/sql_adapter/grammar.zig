@@ -1577,6 +1577,49 @@ fn parseRowSecurityPolicyPredicateAlloc(
     pos: *usize,
 ) !ddl_plan.RowSecurityPolicyPredicate {
     try cursor.expectToken(.lparen);
+    var predicates = std.ArrayList(ddl_plan.RowSecurityPolicyPredicate).empty;
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) {
+        for (predicates.items) |*predicate| predicate.deinit(alloc);
+        predicates.deinit(alloc);
+    };
+
+    try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
+    while (cursor.matchKeyword("and")) {
+        try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
+    }
+    try cursor.expectToken(.rparen);
+
+    if (predicates.items.len == 1) {
+        const single = predicates.items[0];
+        predicates_transferred = true;
+        predicates.deinit(alloc);
+        return single;
+    }
+
+    const owned = try predicates.toOwnedSlice(alloc);
+    predicates_transferred = true;
+    return .{ .conjunction = .{ .predicates = owned } };
+}
+
+fn appendRowSecurityPolicyPredicateAtomAlloc(
+    alloc: std.mem.Allocator,
+    predicates: *std.ArrayList(ddl_plan.RowSecurityPolicyPredicate),
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !void {
+    var predicate = try parseRowSecurityPolicyPredicateAtomAlloc(alloc, cursor, tokens, pos);
+    errdefer predicate.deinit(alloc);
+    try predicates.append(alloc, predicate);
+}
+
+fn parseRowSecurityPolicyPredicateAtomAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.RowSecurityPolicyPredicate {
     const field = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var field_transferred = false;
     errdefer if (!field_transferred) alloc.free(field);
@@ -1588,7 +1631,6 @@ fn parseRowSecurityPolicyPredicateAlloc(
         const setting_name = try alloc.dupe(u8, setting_token.text);
         var setting_transferred = false;
         errdefer if (!setting_transferred) alloc.free(setting_name);
-        try cursor.expectToken(.rparen);
         try cursor.expectToken(.rparen);
 
         field_transferred = true;
@@ -1602,7 +1644,6 @@ fn parseRowSecurityPolicyPredicateAlloc(
     const value_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
     var value_transferred = false;
     errdefer if (!value_transferred) alloc.free(value_json);
-    try cursor.expectToken(.rparen);
 
     field_transferred = true;
     value_transferred = true;
@@ -3564,13 +3605,23 @@ pub fn parseOptionalDdlConstraintTiming(tokens: []const Token, pos: *usize) !Ddl
             if (saw_deferrability) return error.UnsupportedSqlShape;
             saw_deferrability = true;
             timing.deferrable = true;
-        } else if (cursor.matchKeyword("not")) {
-            try cursor.expectKeyword("deferrable");
+            continue;
+        }
+        if (cursor.peekKeyword("not")) {
+            const checkpoint = cursor.checkpoint();
+            _ = cursor.matchKeyword("not");
+            if (!cursor.matchKeyword("deferrable")) {
+                cursor.restore(checkpoint);
+                break;
+            }
             if (saw_deferrability) return error.UnsupportedSqlShape;
             if (timing.timing == .deferred) return error.UnsupportedSqlShape;
             saw_deferrability = true;
             timing.deferrable = false;
-        } else if (cursor.matchKeyword("initially")) {
+            continue;
+        }
+        if (!cursor.matchKeyword("initially")) break;
+        {
             if (saw_initially) return error.UnsupportedSqlShape;
             saw_initially = true;
             if (cursor.matchKeyword("deferred")) {
@@ -3581,8 +3632,7 @@ pub fn parseOptionalDdlConstraintTiming(tokens: []const Token, pos: *usize) !Ddl
                 try cursor.expectKeyword("immediate");
                 timing.timing = .immediate;
             }
-        } else {
-            break;
+            continue;
         }
     }
     return timing;
@@ -6728,6 +6778,7 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqualStrings("usage_records", create.table_name);
     const predicate = switch (create.predicate) {
         .current_setting_equals => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings("tenant_id", predicate.field);
     try std.testing.expectEqualStrings("app.tenant_id", predicate.setting_name);
@@ -6771,10 +6822,29 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqualStrings("status", alter_predicate.field);
     try std.testing.expectEqualStrings("\"active\"", alter_predicate.value_json);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');");
-    defer lexer.freeTokens(alloc, &unsupported_tokens);
-    var unsupported_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+    var compound_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');");
+    defer lexer.freeTokens(alloc, &compound_tokens);
+    var compound_pos: usize = 0;
+    var compound = try parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, compound_tokens.items, &compound_pos);
+    defer compound.deinit(alloc);
+    try std.testing.expectEqual(compound_tokens.items.len, compound_pos);
+    const compound_predicate = switch (compound.predicate) {
+        .conjunction => |conjunction| conjunction,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), compound_predicate.predicates.len);
+    const compound_first = switch (compound_predicate.predicates[0]) {
+        .literal_equals => |predicate_value| predicate_value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("tenant_id", compound_first.field);
+    try std.testing.expectEqualStrings("\"tenant-a\"", compound_first.value_json);
+    const compound_second = switch (compound_predicate.predicates[1]) {
+        .literal_equals => |predicate_value| predicate_value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", compound_second.field);
+    try std.testing.expectEqualStrings("\"active\"", compound_second.value_json);
 
     var drop_tokens = try lexer.tokenizeAlloc(alloc, "POLICY IF EXISTS tenant_policy ON public.usage_records CASCADE;");
     defer lexer.freeTokens(alloc, &drop_tokens);

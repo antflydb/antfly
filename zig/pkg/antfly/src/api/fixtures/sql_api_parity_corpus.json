@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "adf119c4bc4f712161a43091935c469df726e878dc521353a8907be66edc019b",
+  "source_sha256": "b5328a4bc6b47e7a9cccd297c5c2c66ee724b488838f893734c526f2a655f4b1",
   "source_entry_count": 978,
   "entry_count": 978,
   "skipped_entries": [
@@ -236,17 +236,21 @@
       "sql": "SET SESSION search_path TO tenant_schema, public;"
     },
     {
-      "name": "adapter-only local public search path session syntax",
-      "family": "adapter_noop_ddl",
-      "plan": "adapter_noop:ddl:reason=session_setting",
-      "classification_reason": "session_setting",
+      "name": "local public search path session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_search_path"
+      },
+      "plan": "ddl:session:set_search_path:namespaces=1:local=true",
       "sql": "SET LOCAL search_path TO public;"
     },
     {
-      "name": "unsupported local non-public search path session catalog syntax",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=transaction_scoped_search_path",
-      "classification_reason": "transaction_scoped_search_path",
+      "name": "local tenant search path session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_search_path"
+      },
+      "plan": "ddl:session:set_search_path:namespaces=2:local=true",
       "sql": "SET LOCAL search_path TO tenant_schema, public;"
     },
     {
@@ -3431,10 +3435,14 @@
       "sql": "CREATE POLICY usage_records_literal_policy ON usage_records USING (tenant_id = 'tenant-a')"
     },
     {
-      "name": "unsupported row security compound policy expression",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=row_security_policy_plan",
-      "classification_reason": "row_security_policy_plan",
+      "name": "row security compound policy catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_row_policy",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:create_row_policy:policy=usage_records_compound_policy:table=usage_records:kind=and:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=literal_eq:field=status:value_json_hex=2261637469766522",
       "sql": "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active')"
     },
     {

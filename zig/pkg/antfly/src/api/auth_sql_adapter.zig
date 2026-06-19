@@ -338,10 +338,11 @@ fn sqlPrivilegeMappingCount(privilege_name: []const u8) usize {
 fn rowSecurityFilterJsonAlloc(
     alloc: std.mem.Allocator,
     predicate: relational_sql.RowSecurityPolicyPredicate,
-) ![]u8 {
+) anyerror![]u8 {
     return switch (predicate) {
         .current_setting_equals => |current_setting| try currentSettingRowFilterJsonAlloc(alloc, current_setting),
         .literal_equals => |literal| try literalRowFilterJsonAlloc(alloc, literal),
+        .conjunction => |conjunction| try conjunctionRowFilterJsonAlloc(alloc, conjunction),
     };
 }
 
@@ -366,6 +367,23 @@ fn literalRowFilterJsonAlloc(
     const field_json = try std.json.Stringify.valueAlloc(alloc, predicate.field, .{});
     defer alloc.free(field_json);
     return try std.fmt.allocPrint(alloc, "{{\"term\":{{{s}:{s}}}}}", .{ field_json, predicate.value_json });
+}
+
+fn conjunctionRowFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    predicate: relational_sql.RowSecurityConjunctionPredicate,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"conjuncts\":[");
+    for (predicate.predicates, 0..) |term, i| {
+        const term_json = try rowSecurityFilterJsonAlloc(alloc, term);
+        defer alloc.free(term_json);
+        if (i != 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, term_json);
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
 }
 
 fn appendPermissionChange(
@@ -784,6 +802,12 @@ test "sql auth adapter applies row security policies through user manager" {
     const stored_literal = try manager.getSqlRowSecurityPolicy("usage_records_literal_policy", "usage_records");
     defer alloc.free(stored_literal);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", stored_literal);
+
+    var compound_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');")).?;
+    defer compound_policy.deinit(alloc);
+    const stored_compound = try manager.getSqlRowSecurityPolicy("usage_records_compound_policy", "usage_records");
+    defer alloc.free(stored_compound);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_compound);
 
     var altered_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_literal_policy ON usage_records USING (status = 'archived');")).?;
     defer altered_policy.deinit(alloc);

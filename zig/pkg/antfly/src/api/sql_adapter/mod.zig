@@ -281,6 +281,7 @@ pub const RoutineParallelSafety = ddl_plan.RoutineParallelSafety;
 pub const RoutineSecurity = ddl_plan.RoutineSecurity;
 pub const RoutineVolatility = ddl_plan.RoutineVolatility;
 pub const RowSecurityCatalogPlan = ddl_plan.RowSecurityCatalogPlan;
+pub const RowSecurityConjunctionPredicate = ddl_plan.RowSecurityConjunctionPredicate;
 pub const RowSecurityCurrentSettingPredicate = ddl_plan.RowSecurityCurrentSettingPredicate;
 pub const RowSecurityLiteralPredicate = ddl_plan.RowSecurityLiteralPredicate;
 pub const RowSecurityPolicyPredicate = ddl_plan.RowSecurityPolicyPredicate;

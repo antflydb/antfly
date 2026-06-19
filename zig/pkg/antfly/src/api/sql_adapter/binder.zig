@@ -138,69 +138,79 @@ pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
     if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return null;
+    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "with")) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens.items);
 
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "update")) {
-        var target_index: usize = 1;
-        _ = consumeKeyword(tokens.items, &target_index, "only");
-        if (target_index >= tokens.items.len or tokens.items[target_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[target_index].text);
+    return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens.items, 0);
+}
+
+fn joinedWriteSourceTableNamesFromStatementAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    statement_index: usize,
+) !?InsertSourceTableNames {
+    if (statement_index >= tokens.len or tokens[statement_index].kind != .identifier) return null;
+    if (std.ascii.eqlIgnoreCase(tokens[statement_index].text, "update")) {
+        var target_index: usize = statement_index + 1;
+        _ = consumeKeyword(tokens, &target_index, "only");
+        if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
+        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
         var target_transferred = false;
         errdefer if (!target_transferred) alloc.free(target);
 
-        const from_index = findTopLevelKeyword(tokens.items[target_index + 1 ..], "from") orelse {
+        const from_index = findTopLevelKeyword(tokens[target_index + 1 ..], "from") orelse {
             alloc.free(target);
             return null;
         };
         var source_index = target_index + 1 + from_index + 1;
-        _ = consumeKeyword(tokens.items, &source_index, "only");
-        if (source_index >= tokens.items.len or tokens.items[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[source_index].text);
+        _ = consumeKeyword(tokens, &source_index, "only");
+        if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
+        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
         errdefer alloc.free(source);
 
         target_transferred = true;
         return .{ .target = target, .source = source };
     }
 
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "delete")) {
-        var target_index: usize = 1;
-        if (!consumeKeyword(tokens.items, &target_index, "from")) return null;
-        _ = consumeKeyword(tokens.items, &target_index, "only");
-        if (target_index >= tokens.items.len or tokens.items[target_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[target_index].text);
+    if (std.ascii.eqlIgnoreCase(tokens[statement_index].text, "delete")) {
+        var target_index: usize = statement_index + 1;
+        if (!consumeKeyword(tokens, &target_index, "from")) return null;
+        _ = consumeKeyword(tokens, &target_index, "only");
+        if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
+        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
         var target_transferred = false;
         errdefer if (!target_transferred) alloc.free(target);
 
-        const using_index = findTopLevelKeyword(tokens.items[target_index + 1 ..], "using") orelse {
+        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], "using") orelse {
             alloc.free(target);
             return null;
         };
         var source_index = target_index + 1 + using_index + 1;
-        _ = consumeKeyword(tokens.items, &source_index, "only");
-        if (source_index >= tokens.items.len or tokens.items[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[source_index].text);
+        _ = consumeKeyword(tokens, &source_index, "only");
+        if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
+        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
         errdefer alloc.free(source);
 
         target_transferred = true;
         return .{ .target = target, .source = source };
     }
 
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "merge")) {
-        var target_index: usize = 1;
-        if (!consumeKeyword(tokens.items, &target_index, "into")) return null;
-        _ = consumeKeyword(tokens.items, &target_index, "only");
-        if (target_index >= tokens.items.len or tokens.items[target_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[target_index].text);
+    if (std.ascii.eqlIgnoreCase(tokens[statement_index].text, "merge")) {
+        var target_index: usize = statement_index + 1;
+        if (!consumeKeyword(tokens, &target_index, "into")) return null;
+        _ = consumeKeyword(tokens, &target_index, "only");
+        if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
+        const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
         var target_transferred = false;
         errdefer if (!target_transferred) alloc.free(target);
 
-        const using_index = findTopLevelKeyword(tokens.items[target_index + 1 ..], "using") orelse {
+        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], "using") orelse {
             alloc.free(target);
             return null;
         };
         var source_index = target_index + 1 + using_index + 1;
-        _ = consumeKeyword(tokens.items, &source_index, "only");
-        if (source_index >= tokens.items.len or tokens.items[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[source_index].text);
+        _ = consumeKeyword(tokens, &source_index, "only");
+        if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
+        const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
         errdefer alloc.free(source);
 
         target_transferred = true;
@@ -208,6 +218,64 @@ pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u
     }
 
     return null;
+}
+
+fn joinedWriteSourceTableNamesFromWithAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !?InsertSourceTableNames {
+    var index: usize = 1;
+    if (consumeKeyword(tokens, &index, "recursive")) return error.UnsupportedSqlShape;
+
+    var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
+    defer {
+        for (cte_bindings.items) |*binding| binding.deinit(alloc);
+        cte_bindings.deinit(alloc);
+    }
+
+    while (true) {
+        if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
+        const cte_name = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
+        var cte_name_transferred = false;
+        errdefer if (!cte_name_transferred) alloc.free(cte_name);
+        if (cteBindingIndex(cte_bindings.items, cte_name) != null) return error.UnsupportedSqlShape;
+        index += 1;
+
+        if (index < tokens.len and tokens[index].kind == .lparen) {
+            index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
+        }
+        if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+        try parser.consumeCteMaterializationHint(tokens, &index);
+        if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+        const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
+        if (index + 1 >= close_index) return error.UnsupportedSqlShape;
+
+        var cte_tables = (try selectReadTableNamesAlloc(alloc, tokens[index + 1 .. close_index], 0)) orelse return error.UnsupportedSqlShape;
+        defer cte_tables.deinit(alloc);
+        try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, &cte_tables);
+        if (cte_tables.source) |source| {
+            if (!std.mem.eql(u8, cte_tables.left, source)) return error.UnsupportedSqlShape;
+        }
+
+        try cte_bindings.append(alloc, .{
+            .name = cte_name,
+            .source = try alloc.dupe(u8, cte_tables.left),
+        });
+        cte_name_transferred = true;
+
+        index = close_index + 1;
+        if (index < tokens.len and tokens[index].kind == .comma) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    var final = (try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens, index)) orelse return null;
+    errdefer final.deinit(alloc);
+    final.target = try resolveTableNameAgainstCtesAlloc(alloc, cte_bindings.items, final.target);
+    final.source = try resolveTableNameAgainstCtesAlloc(alloc, cte_bindings.items, final.source);
+    return final;
 }
 
 pub fn readSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?ReadSourceTableNames {
@@ -430,7 +498,11 @@ fn insertSourceTableNamesFromWithAlloc(
         break;
     }
 
-    var final = (try insertSourceTableNamesFromInsertAlloc(alloc, tokens, index)) orelse return null;
+    var final = (try insertSourceTableNamesFromInsertAlloc(alloc, tokens, index)) orelse {
+        if (base_source) |source| alloc.free(source);
+        base_source = null;
+        return null;
+    };
     errdefer final.deinit(alloc);
     if (sqlStringSliceContains(cte_names.items, final.source)) {
         const resolved_source = base_source orelse return error.UnsupportedSqlShape;

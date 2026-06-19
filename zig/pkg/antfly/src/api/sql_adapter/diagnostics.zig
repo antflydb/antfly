@@ -43,7 +43,6 @@ pub const SqlAdapterClassificationReason = enum {
     system_time_temporal_table,
     temporal_fk_action,
     transaction_control,
-    transaction_scoped_search_path,
 };
 
 pub fn classificationReasonFromToken(token: []const u8) ?SqlAdapterClassificationReason {
@@ -88,7 +87,6 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonIsAdapterNoop(.session_setting));
     try std.testing.expect(!classificationReasonIsAdapterNoop(.set_operation_plan));
     try std.testing.expect(classificationReasonIsUnsupportedRequirement(.set_operation_plan));
-    try std.testing.expect(classificationReasonIsUnsupportedRequirement(.transaction_scoped_search_path));
     try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.session_setting));
     try std.testing.expect(!classificationReasonTokenIsKnown("set operation plan"));
     try std.testing.expect(!classificationReasonTokenIsKnown("future_reason"));

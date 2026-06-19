@@ -3960,6 +3960,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_enable: bool = false,
     ddl_row_security_disable: bool = false,
     ddl_row_security_create_policy: bool = false,
+    ddl_row_security_conjunction_policy: bool = false,
     ddl_row_security_literal_policy: bool = false,
     ddl_row_security_targeted_policy: bool = false,
     ddl_row_security_alter_policy: bool = false,
@@ -4152,9 +4153,7 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
-    unsupported_ddl_row_security_policy_expression: bool = false,
     unsupported_ddl_row_rewrite_expression_plan: bool = false,
-    unsupported_ddl_transaction_scoped_search_path: bool = false,
     unsupported_write: bool = false,
     unsupported_write_recursive_cte_insert: bool = false,
     unsupported_write_recursive_cte_update: bool = false,
@@ -4486,10 +4485,10 @@ pub const AppParityCorpusCoverage = struct {
     adapter_noop_transaction_rollback: bool = false,
     adapter_noop_session: bool = false,
     adapter_noop_session_probe: bool = false,
-    adapter_noop_local_public_search_path: bool = false,
     adapter_noop_schema_namespace: bool = false,
     adapter_noop_extension: bool = false,
     session_set_search_path: bool = false,
+    session_set_search_path_local: bool = false,
     session_set_search_path_multi_namespace: bool = false,
     session_reset_search_path: bool = false,
     session_show_search_path: bool = false,
@@ -5413,16 +5412,9 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
                     std.mem.indexOf(u8, entry.sql, " SUPPORT ") != null);
-            self.unsupported_ddl_row_security_policy_expression = self.unsupported_ddl_row_security_policy_expression or
-                (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
-                    std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
-                    std.mem.indexOf(u8, entry.sql, "current_setting") == null);
             self.unsupported_ddl_row_rewrite_expression_plan = self.unsupported_ddl_row_rewrite_expression_plan or
                 (std.mem.eql(u8, entry.classification_reason, "row_rewrite_expression_plan") and
                     std.mem.indexOf(u8, entry.sql, " USING ") != null);
-            self.unsupported_ddl_transaction_scoped_search_path = self.unsupported_ddl_transaction_scoped_search_path or
-                (std.mem.eql(u8, entry.classification_reason, "transaction_scoped_search_path") and
-                    std.mem.indexOf(u8, entry.sql, "SET LOCAL search_path") != null);
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
@@ -5634,6 +5626,7 @@ pub const AppParityCorpusCoverage = struct {
                 .disable_row_security => self.ddl_row_security_disable = true,
                 .create_row_policy => {
                     self.ddl_row_security_create_policy = true;
+                    self.ddl_row_security_conjunction_policy = self.ddl_row_security_conjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=and:") != null;
                     self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
                     self.ddl_row_security_targeted_policy = self.ddl_row_security_targeted_policy or std.mem.indexOf(u8, entry.plan, ":roles=") != null;
                 },
@@ -5831,6 +5824,8 @@ pub const AppParityCorpusCoverage = struct {
                 },
                 .set_search_path => {
                     self.session_set_search_path = true;
+                    self.session_set_search_path_local = self.session_set_search_path_local or
+                        std.mem.indexOf(u8, entry.plan, ":local=true") != null;
                     self.session_set_search_path_multi_namespace = self.session_set_search_path_multi_namespace or
                         (sql_adapter.planUsizeTokenValue(entry.plan, ":namespaces=") orelse 0) > 1;
                 },
@@ -5903,9 +5898,6 @@ pub const AppParityCorpusCoverage = struct {
             self.adapter_noop_session_probe = self.adapter_noop_session_probe or
                 std.mem.eql(u8, entry.classification_reason, "session_setting") and
                     (std.ascii.startsWithIgnoreCase(entry.sql, "RESET") or std.ascii.startsWithIgnoreCase(entry.sql, "SHOW"));
-            self.adapter_noop_local_public_search_path = self.adapter_noop_local_public_search_path or
-                std.mem.eql(u8, entry.classification_reason, "session_setting") and
-                    std.mem.indexOf(u8, entry.sql, "SET LOCAL search_path TO public") != null;
             self.adapter_noop_schema_namespace = self.adapter_noop_schema_namespace or std.mem.eql(u8, entry.classification_reason, "schema_namespace");
             self.adapter_noop_extension = self.adapter_noop_extension or std.mem.eql(u8, entry.classification_reason, "extension");
             self.session_discard = self.session_discard or

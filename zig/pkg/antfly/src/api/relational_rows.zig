@@ -3397,6 +3397,7 @@ fn lakeRowsExpressionAggregateFastPathSupported(request: OwnedRowsAggregateReque
     if (!lakeRowsExpressionAggregateSourceFastPathSupported(request.source)) return false;
     if (request.aggregations.len == 0) return false;
 
+    var has_value_aggregate = false;
     for (request.aggregations) |aggregation| {
         if (aggregation.name.len == 0) return false;
         if (aggregation.distinct) return false;
@@ -3417,11 +3418,14 @@ fn lakeRowsExpressionAggregateFastPathSupported(request: OwnedRowsAggregateReque
             aggregation.filter_not.len != 0) return false;
         switch (aggregation.op) {
             .count => if (aggregation.field != null) return false,
-            .sum, .min, .max, .avg => if (aggregation.field == null) return false,
+            .sum, .min, .max, .avg => {
+                if (aggregation.field == null) return false;
+                has_value_aggregate = true;
+            },
             else => return false,
         }
     }
-    return true;
+    return has_value_aggregate;
 }
 
 fn lakeRowsExpressionAggregateSourceFastPathSupported(source: db_mod.types.RelationalRowsQueryRequest) bool {

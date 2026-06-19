@@ -280,6 +280,7 @@ pub const DropRowSecurityPolicyPlan = sql_adapter.DropRowSecurityPolicyPlan;
 pub const RowSecurityPolicyPredicate = sql_adapter.RowSecurityPolicyPredicate;
 pub const RowSecurityCurrentSettingPredicate = sql_adapter.RowSecurityCurrentSettingPredicate;
 pub const RowSecurityLiteralPredicate = sql_adapter.RowSecurityLiteralPredicate;
+pub const RowSecurityConjunctionPredicate = sql_adapter.RowSecurityConjunctionPredicate;
 pub const DomainCatalogPlan = sql_adapter.DomainCatalogPlan;
 pub const CreateDomainPlan = sql_adapter.CreateDomainPlan;
 pub const AlterDomainPlan = sql_adapter.AlterDomainPlan;
@@ -1911,6 +1912,7 @@ pub fn lowerDdlPlanAlloc(
 pub const OwnedSqlCatalogSession = struct {
     current_database_name: []u8,
     search_path: []const []const u8,
+    transaction_local_search_path: bool = false,
 
     pub fn fromSessionAlloc(alloc: std.mem.Allocator, source_session: catalog_resources.SqlCatalogSession) !OwnedSqlCatalogSession {
         const current_database_name = try alloc.dupe(u8, source_session.currentDatabase());
@@ -1927,7 +1929,11 @@ pub const OwnedSqlCatalogSession = struct {
             search_path[i] = try alloc.dupe(u8, name);
             initialized += 1;
         }
-        return .{ .current_database_name = current_database_name, .search_path = search_path };
+        return .{
+            .current_database_name = current_database_name,
+            .search_path = search_path,
+            .transaction_local_search_path = false,
+        };
     }
 
     pub fn session(self: OwnedSqlCatalogSession) catalog_resources.SqlCatalogSession {
@@ -1952,7 +1958,6 @@ pub fn applySessionCatalogPlanAlloc(
 ) !OwnedSqlCatalogSession {
     switch (plan) {
         .set_search_path => |set| {
-            if (set.local) return error.UnsupportedSqlShape;
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
             errdefer updated.deinit(alloc);
             for (updated.search_path) |name| alloc.free(@constCast(name));
@@ -1968,6 +1973,7 @@ pub fn applySessionCatalogPlanAlloc(
                 initialized += 1;
             }
             updated.search_path = search_path;
+            updated.transaction_local_search_path = set.local;
             return updated;
         },
         .reset_search_path, .discard_all => {
@@ -3361,7 +3367,6 @@ const Parser = struct {
     fn parseSetSearchPathDdl(self: *@This()) !SetSearchPathPlan {
         var syntax = try sql_adapter.parseSetSearchPathTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        if (syntax.local) return error.UnsupportedSqlShape;
         const namespaces = syntax.namespaces;
         syntax.namespaces = &.{};
         return .{ .namespaces = namespaces, .local = syntax.local };
@@ -42607,14 +42612,41 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         alloc,
         "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (email);",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var covering_gin = try lowerDdlPlanAlloc(
         alloc,
         "CREATE INDEX usage_records_metadata_gin_cover ON usage_records USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);",
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    );
+    defer covering_gin.deinit(alloc);
+    switch (covering_gin) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqual(.gin, plan.method);
+            try std.testing.expectEqual(.jsonb_path_ops, plan.opclass);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("metadata", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var covering_lower = try lowerDdlPlanAlloc(
         alloc,
         "CREATE INDEX usage_records_lower_email_cover ON usage_records (lower(email)) INCLUDE (tenant_id);",
-    ));
+    );
+    defer covering_lower.deinit(alloc);
+    switch (covering_lower) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_lower_email_cover", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expect(plan.generated_expression != null);
+            try std.testing.expectEqualStrings("email", plan.generated_expression.?.field.?);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.generated_expression.?.op);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var casted_not_null = try lowerDdlPlanAlloc(
         alloc,
@@ -45870,6 +45902,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("usage_records", create_row_policy_plan.table_name);
     const create_row_policy_predicate = switch (create_row_policy_plan.predicate) {
         .current_setting_equals => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings("tenant_id", create_row_policy_predicate.field);
     try std.testing.expectEqualStrings("app.tenant_id", create_row_policy_predicate.setting_name);
@@ -45914,6 +45947,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(create_literal_row_policy_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_active_policy:table=usage_records:kind=literal_eq:field=status:value_json_hex=2261637469766522", create_literal_row_policy_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_literal_row_policy));
+
+    var create_compound_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');");
+    defer create_compound_row_policy.deinit(alloc);
+    const create_compound_row_policy_plan = switch (create_compound_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .create_policy => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const create_compound_row_policy_predicate = switch (create_compound_row_policy_plan.predicate) {
+        .conjunction => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), create_compound_row_policy_predicate.predicates.len);
+    const create_compound_row_policy_fingerprint = try ddlFingerprintAlloc(alloc, create_compound_row_policy);
+    defer alloc.free(create_compound_row_policy_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_compound_policy:table=usage_records:kind=and:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=literal_eq:field=status:value_json_hex=2261637469766522", create_compound_row_policy_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_compound_row_policy));
 
     var alter_row_policy = try lowerDdlPlanAlloc(alloc, "ALTER POLICY usage_records_tenant_policy ON usage_records USING (status = 'active');");
     defer alter_row_policy.deinit(alloc);
@@ -46478,8 +46530,29 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer set_local_public_search_path.deinit(alloc);
     const set_local_public_search_path_fingerprint = try ddlFingerprintAlloc(alloc, set_local_public_search_path);
     defer alloc.free(set_local_public_search_path_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", set_local_public_search_path_fingerprint);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;"));
+    try std.testing.expectEqualStrings("ddl:session:set_search_path:namespaces=1:local=true", set_local_public_search_path_fingerprint);
+    const set_local_public_search_path_plan = switch (set_local_public_search_path) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var local_public_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_local_public_search_path_plan);
+    defer local_public_session.deinit(alloc);
+    try std.testing.expect(local_public_session.transaction_local_search_path);
+    try std.testing.expectEqualStrings("public", local_public_session.session().primarySearchPathNamespace());
+
+    var set_local_tenant_search_path = try lowerDdlPlanAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
+    defer set_local_tenant_search_path.deinit(alloc);
+    const set_local_tenant_search_path_fingerprint = try ddlFingerprintAlloc(alloc, set_local_tenant_search_path);
+    defer alloc.free(set_local_tenant_search_path_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:set_search_path:namespaces=2:local=true", set_local_tenant_search_path_fingerprint);
+    const set_local_tenant_search_path_plan = switch (set_local_tenant_search_path) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var local_tenant_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_local_tenant_search_path_plan);
+    defer local_tenant_session.deinit(alloc);
+    try std.testing.expect(local_tenant_session.transaction_local_search_path);
+    try std.testing.expectEqualStrings("tenant_schema", local_tenant_session.session().primarySearchPathNamespace());
 
     var empty_path_session = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
         .current_database_name = "tenant_ops",
@@ -57326,45 +57399,25 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 "ddl:{s}_row_security:table={s}",
                 .{ if (alter.enabled) "enable" else "disable", alter.table_name },
             ),
-            .create_policy => |create| switch (create.predicate) {
-                .current_setting_equals => |predicate| blk: {
-                    const base = try std.fmt.allocPrint(
-                        alloc,
-                        "ddl:create_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
-                        .{ create.policy_name, create.table_name, predicate.field, predicate.setting_name },
-                    );
-                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
-                },
-                .literal_equals => |predicate| blk: {
-                    const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, predicate.value_json);
-                    defer alloc.free(value_json_hex);
-                    const base = try std.fmt.allocPrint(
-                        alloc,
-                        "ddl:create_row_policy:policy={s}:table={s}:kind=literal_eq:field={s}:value_json_hex={s}",
-                        .{ create.policy_name, create.table_name, predicate.field, value_json_hex },
-                    );
-                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
-                },
+            .create_policy => |create| blk: {
+                const predicate_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, create.predicate);
+                defer alloc.free(predicate_suffix);
+                const base = try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_row_policy:policy={s}:table={s}:{s}",
+                    .{ create.policy_name, create.table_name, predicate_suffix },
+                );
+                break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
             },
-            .alter_policy => |alter| switch (alter.predicate) {
-                .current_setting_equals => |predicate| blk: {
-                    const base = try std.fmt.allocPrint(
-                        alloc,
-                        "ddl:alter_row_policy:policy={s}:table={s}:kind=current_setting_eq:field={s}:setting={s}",
-                        .{ alter.policy_name, alter.table_name, predicate.field, predicate.setting_name },
-                    );
-                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, alter.role_targets);
-                },
-                .literal_equals => |predicate| blk: {
-                    const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, predicate.value_json);
-                    defer alloc.free(value_json_hex);
-                    const base = try std.fmt.allocPrint(
-                        alloc,
-                        "ddl:alter_row_policy:policy={s}:table={s}:kind=literal_eq:field={s}:value_json_hex={s}",
-                        .{ alter.policy_name, alter.table_name, predicate.field, value_json_hex },
-                    );
-                    break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, alter.role_targets);
-                },
+            .alter_policy => |alter| blk: {
+                const predicate_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, alter.predicate);
+                defer alloc.free(predicate_suffix);
+                const base = try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_row_policy:policy={s}:table={s}:{s}",
+                    .{ alter.policy_name, alter.table_name, predicate_suffix },
+                );
+                break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, alter.role_targets);
             },
             .drop_policy => |drop| try std.fmt.allocPrint(
                 alloc,
@@ -58131,6 +58184,40 @@ fn bulkIoByteOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]co
     const value = option orelse return try alloc.dupe(u8, "default");
     if (value.len != 1) return error.UnsupportedSqlShape;
     return try std.fmt.allocPrint(alloc, "{x:0>2}", .{value[0]});
+}
+
+fn rowSecurityPredicateFingerprintSuffixAlloc(
+    alloc: std.mem.Allocator,
+    predicate: RowSecurityPolicyPredicate,
+) ![]u8 {
+    return switch (predicate) {
+        .current_setting_equals => |current_setting| try std.fmt.allocPrint(
+            alloc,
+            "kind=current_setting_eq:field={s}:setting={s}",
+            .{ current_setting.field, current_setting.setting_name },
+        ),
+        .literal_equals => |literal| blk: {
+            const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, literal.value_json);
+            defer alloc.free(value_json_hex);
+            break :blk try std.fmt.allocPrint(
+                alloc,
+                "kind=literal_eq:field={s}:value_json_hex={s}",
+                .{ literal.field, value_json_hex },
+            );
+        },
+        .conjunction => |conjunction| blk: {
+            var out = try std.fmt.allocPrint(alloc, "kind=and:terms={d}", .{conjunction.predicates.len});
+            errdefer alloc.free(out);
+            for (conjunction.predicates) |term| {
+                const term_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, term);
+                defer alloc.free(term_suffix);
+                const next = try std.fmt.allocPrint(alloc, "{s}:term={s}", .{ out, term_suffix });
+                alloc.free(out);
+                out = next;
+            }
+            break :blk out;
+        },
+    };
 }
 
 fn appendRowSecurityRoleTargetsAlloc(

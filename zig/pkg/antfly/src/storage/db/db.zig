@@ -17151,7 +17151,7 @@ pub const DB = struct {
         const target_query = relationalRowsJoinedMutationTargetQuery(req);
         const source_query = relationalRowsJoinedMutationSourceQuery(req);
         if (target_query.doc_key_range != null or source_query.doc_key_range != null) return error.InvalidQueryRequest;
-        _ = try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(target_schema, source_schema, req);
+        _ = try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(alloc, target_schema, source_schema, req);
         try validateRelationalRowsDocKeyRanges(target_ranges);
         try validateRelationalRowsDocKeyRanges(source_ranges);
 
@@ -17314,7 +17314,7 @@ pub const DB = struct {
         req: types.RelationalRowsJoinedMutationSourceRequest,
         source_doc_key_range: ?types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsQueryResult {
-        _ = try validateRelationalRowsJoinedMutationSourceRequest(runtime_schema, req);
+        _ = try validateRelationalRowsJoinedMutationSourceRequest(alloc, runtime_schema, req);
         return try self.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(alloc, runtime_schema, req, source_doc_key_range);
     }
 
@@ -17414,6 +17414,20 @@ pub const DB = struct {
                 .right => predicate.right_field,
             };
             _ = relationalRowsFindColumn(runtime_schema.relational_columns, field) orelse return error.InvalidQueryRequest;
+        }
+    }
+
+    fn validateRelationalRowsJoinedMutationJoinFieldsForOutputFields(
+        output_fields: []const []const u8,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        side: RelationalRowsJoinSide,
+    ) !void {
+        for (req.join.on) |predicate| {
+            const field = switch (side) {
+                .left => predicate.left_field,
+                .right => predicate.right_field,
+            };
+            try validateRelationalRowsCteOutputField(output_fields, field);
         }
     }
 
@@ -17543,7 +17557,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsJoinedMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
-        const claim = try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(target_schema, source_schema, req);
+        const claim = try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(alloc, target_schema, source_schema, req);
         const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
 
         var selected_indexes = std.ArrayListUnmanaged(usize).empty;
@@ -18309,13 +18323,15 @@ pub const DB = struct {
     }
 
     fn validateRelationalRowsJoinedMutationSourceRequest(
+        alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
     ) !types.RowClaimRequest {
-        return try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(runtime_schema, runtime_schema, req);
+        return try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(alloc, runtime_schema, runtime_schema, req);
     }
 
     fn validateRelationalRowsJoinedMutationSourceRequestWithSchemas(
+        alloc: Allocator,
         target_schema: schema_mod.TableSchema,
         source_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
@@ -18332,13 +18348,31 @@ pub const DB = struct {
         if (claim.txn_id == null) return error.InvalidQueryRequest;
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
         if (source.row_claim != null) return error.InvalidQueryRequest;
-        if (target.source_cte.len != 0 or source.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        try validateRelationalRowsJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
         if (relationalRowsQueryHasDistinctOn(target) or relationalRowsQueryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
+
+        var planned_ctes: []RelationalRowsPlannedCte = &.{};
+        defer if (planned_ctes.len != 0) deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        const source_output_fields: ?[]const []const u8 = if (req.ctes.len != 0) blk: {
+            planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, source_schema, req.ctes);
+            try validateRelationalRowsJoinAgainstPlannedCteOutput(planned_ctes, req.join);
+            break :blk relationalRowsPlannedSourceCteOutputFields(planned_ctes, source) orelse return error.InvalidQueryRequest;
+        } else null;
+
         try validateRelationalRowsBaseQueryRequestAgainstSchema(target_schema, target);
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(source_schema, source);
+        if (source_output_fields) |fields| {
+            try validateRelationalRowsQueryAgainstCteOutput(source, fields);
+            try validateRelationalRowsBaseQueryRequestAgainstOutputFields(fields, source);
+        } else {
+            try validateRelationalRowsBaseQueryRequestAgainstSchema(source_schema, source);
+        }
         try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
-        try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
+        if (source_output_fields) |fields| {
+            try validateRelationalRowsJoinedMutationJoinFieldsForOutputFields(fields, req, relationalRowsJoinedMutationSourceJoinSide(req));
+        } else {
+            try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
+        }
         if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
         try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
@@ -18360,8 +18394,12 @@ pub const DB = struct {
         for (req.source_assignments) |assignment| {
             if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
             const target_column = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
-            const source_column = relationalRowsFindColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
-            if (target_column.field_type != source_column.field_type) return error.InvalidQueryRequest;
+            if (source_output_fields) |fields| {
+                try validateRelationalRowsCteOutputField(fields, assignment.source_field);
+            } else {
+                const source_column = relationalRowsFindColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
+                if (target_column.field_type != source_column.field_type) return error.InvalidQueryRequest;
+            }
         }
         return claim;
     }

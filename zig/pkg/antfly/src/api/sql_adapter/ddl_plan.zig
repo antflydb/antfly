@@ -2033,12 +2033,24 @@ pub const DropRowSecurityPolicyPlan = struct {
 pub const RowSecurityPolicyPredicate = union(enum) {
     current_setting_equals: RowSecurityCurrentSettingPredicate,
     literal_equals: RowSecurityLiteralPredicate,
+    conjunction: RowSecurityConjunctionPredicate,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .current_setting_equals => |*predicate| predicate.deinit(alloc),
             .literal_equals => |*predicate| predicate.deinit(alloc),
+            .conjunction => |*predicate| predicate.deinit(alloc),
         }
+        self.* = undefined;
+    }
+};
+
+pub const RowSecurityConjunctionPredicate = struct {
+    predicates: []RowSecurityPolicyPredicate,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.predicates) |*predicate| predicate.deinit(alloc);
+        alloc.free(self.predicates);
         self.* = undefined;
     }
 };
@@ -2901,6 +2913,22 @@ test "SQL adapter DDL row security plans own nested fields" {
         } },
     } };
     literal_policy.deinit(alloc);
+
+    var conjunction_terms = try alloc.alloc(RowSecurityPolicyPredicate, 2);
+    conjunction_terms[0] = .{ .literal_equals = .{
+        .field = try alloc.dupe(u8, "tenant_id"),
+        .value_json = try alloc.dupe(u8, "\"tenant-a\""),
+    } };
+    conjunction_terms[1] = .{ .literal_equals = .{
+        .field = try alloc.dupe(u8, "status"),
+        .value_json = try alloc.dupe(u8, "\"active\""),
+    } };
+    var conjunction_policy: RowSecurityCatalogPlan = .{ .create_policy = .{
+        .policy_name = try alloc.dupe(u8, "tenant_conjunction"),
+        .table_name = try alloc.dupe(u8, "tenant_events"),
+        .predicate = .{ .conjunction = .{ .predicates = conjunction_terms } },
+    } };
+    conjunction_policy.deinit(alloc);
 
     var alter_policy: RowSecurityCatalogPlan = .{ .alter_policy = .{
         .policy_name = try alloc.dupe(u8, "tenant_isolation"),
