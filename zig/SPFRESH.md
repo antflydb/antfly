@@ -994,7 +994,9 @@ implementations cleanly:
    paths are separate. Canonical base/delta membership checks now use the sorted
    base stream plus a focused latest-delta-op scan for one vector, so fallback
    delete scans can avoid materializing whole postings when looking for a single
-   member. LSM delta-tail stats also use an all-record decoder when the
+   member. Large leaf-member removal sets also insert through an
+   assume-capacity hash path after reserving from the removal-list size. LSM
+   delta-tail stats also use an all-record decoder when the
    posting-delta key sequence proves the whole value is newer than the base
    generation, avoiding a per-record generation branch without weakening value
    validation. LSM replay paths use the same all-live key boundary for fold and

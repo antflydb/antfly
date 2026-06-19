@@ -3055,7 +3055,7 @@ pub const PostingStore = struct {
             var set = std.AutoHashMapUnmanaged(VectorId, void).empty;
             errdefer set.deinit(alloc);
             try set.ensureTotalCapacity(alloc, @intCast(vector_ids.len));
-            for (vector_ids) |vector_id| try set.put(alloc, vector_id, {});
+            for (vector_ids) |vector_id| set.putAssumeCapacity(vector_id, {});
             break :blk set;
         } else null;
         defer if (removed_set) |*set| set.deinit(alloc);
