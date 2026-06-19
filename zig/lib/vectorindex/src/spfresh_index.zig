@@ -100,6 +100,7 @@ const FlatCentroidEntry = struct {
     bounds_radius: f32 = 0,
     centroid: []f32,
     sort_key: []u8 = &.{},
+    sort_key_storage: []u8 = &.{},
 };
 
 const FlatCentroidEntrySortContext = struct {
@@ -613,7 +614,7 @@ fn appendFlatCentroidEntry(
 fn deinitFlatCentroidEntries(alloc: std.mem.Allocator, entries: *std.ArrayListUnmanaged(FlatCentroidEntry)) void {
     for (entries.items) |entry| {
         alloc.free(entry.centroid);
-        if (entry.sort_key.len != 0) alloc.free(entry.sort_key);
+        if (entry.sort_key_storage.len != 0) alloc.free(entry.sort_key_storage);
     }
     entries.deinit(alloc);
 }
@@ -660,6 +661,12 @@ fn populateFlatCentroidHilbertSortKeys(self: anytype, entries: []FlatCentroidEnt
     if (hilbert.dimension != dims) return false;
     const embedding_len = hilbert.byteLen();
     if (embedding_len == 0) return false;
+    const sort_key_storage_len = try std.math.mul(usize, entries.len, embedding_len);
+    const sort_key_storage = try self.alloc.alloc(u8, sort_key_storage_len);
+    var storage_owned_by_entries = false;
+    errdefer if (!storage_owned_by_entries) self.alloc.free(sort_key_storage);
+    entries[0].sort_key_storage = sort_key_storage;
+    storage_owned_by_entries = true;
 
     var coords_stack: [hilbert_coord_stack_capacity]u32 = undefined;
     const use_coords_stack = hilbert.dimension <= coords_stack.len;
@@ -668,10 +675,9 @@ fn populateFlatCentroidHilbertSortKeys(self: anytype, entries: []FlatCentroidEnt
     else
         try self.alloc.alloc(u32, hilbert.dimension);
     defer if (!use_coords_stack) self.alloc.free(coords);
-    for (entries) |*entry| {
+    for (entries, 0..) |*entry, i| {
         if (entry.centroid.len != dims) return error.DimensionMismatch;
-        const key = try self.alloc.alloc(u8, embedding_len);
-        errdefer self.alloc.free(key);
+        const key = sort_key_storage[i * embedding_len ..][0..embedding_len];
         try hilbert.encodeVecBytesInto(entry.centroid, coords, key);
         entry.sort_key = key;
     }
@@ -2360,6 +2366,45 @@ test "flat centroid block ordering uses widest centroid dimension" {
     try std.testing.expectEqual(@as(u64, 3), entries[0].posting_id);
     try std.testing.expectEqual(@as(u64, 1), entries[1].posting_id);
     try std.testing.expectEqual(@as(u64, 2), entries[2].posting_id);
+}
+
+test "flat centroid entry sort keys can share one backing allocation" {
+    const alloc = std.testing.allocator;
+    var entries = std.ArrayListUnmanaged(FlatCentroidEntry).empty;
+    defer deinitFlatCentroidEntries(alloc, &entries);
+
+    const key_storage = try alloc.alloc(u8, 6);
+    @memcpy(key_storage, &[_]u8{ 2, 0, 1, 0, 3, 0 });
+    try entries.append(alloc, .{
+        .posting_id = 1,
+        .parent = 0,
+        .level = 0,
+        .state = .{},
+        .centroid = try alloc.dupe(f32, &[_]f32{0}),
+        .sort_key = key_storage[0..2],
+        .sort_key_storage = key_storage,
+    });
+    try entries.append(alloc, .{
+        .posting_id = 2,
+        .parent = 0,
+        .level = 0,
+        .state = .{},
+        .centroid = try alloc.dupe(f32, &[_]f32{0}),
+        .sort_key = key_storage[2..4],
+    });
+    try entries.append(alloc, .{
+        .posting_id = 3,
+        .parent = 0,
+        .level = 0,
+        .state = .{},
+        .centroid = try alloc.dupe(f32, &[_]f32{0}),
+        .sort_key = key_storage[4..6],
+    });
+
+    std.mem.sort(FlatCentroidEntry, entries.items, FlatCentroidEntrySortContext{ .dim = 0 }, flatCentroidEntryLess);
+    try std.testing.expectEqual(@as(u64, 2), entries.items[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 1), entries.items[1].posting_id);
+    try std.testing.expectEqual(@as(u64, 3), entries.items[2].posting_id);
 }
 
 test "planned boundary reassignment enforces overfull debt limits" {
