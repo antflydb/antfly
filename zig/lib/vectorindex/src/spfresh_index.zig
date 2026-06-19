@@ -23,7 +23,7 @@ const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_block_metadata_stack_capacity = 256;
-const flat_centroid_query_probe_stack_capacity = 128;
+const flat_centroid_query_probe_stack_capacity = 512;
 
 pub const FlatCentroidBlock = struct {
     posting_ids: []u64,
@@ -2299,6 +2299,10 @@ test "flat centroid block probe candidate buffer follows adaptive expansion cap"
     try std.testing.expectEqual(@as(usize, 14), flatCentroidBlockProbeCandidateCount(false, 47, 7));
     try std.testing.expectEqual(@as(usize, 47), flatCentroidBlockProbeCandidateCount(false, 47, 32));
     try std.testing.expectEqual(@as(usize, 47), flatCentroidBlockProbeCandidateCount(true, 47, 94));
+}
+
+test "flat centroid query stack covers default 2x posting candidate window" {
+    try std.testing.expect(flat_centroid_query_probe_stack_capacity >= 512);
 }
 
 test "centroid block probe radius expands l2 squared ambiguity" {

@@ -32,7 +32,7 @@ const rabitq = @import("antfly_vector").rabitq;
 const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
-const flat_centroid_search_probe_stack_capacity = 128;
+const flat_centroid_search_probe_stack_capacity = 512;
 const flat_centroid_posting_prefetch_stack_capacity = 512;
 const bulk_parent_child_ids_stack_capacity = 256;
 
@@ -4335,6 +4335,10 @@ test "flat centroid probe limit follows dynamic search width under configured ca
     try std.testing.expectEqual(@as(usize, 1), resolveFlatCentroidProbeLimit(0, 0));
     try std.testing.expectEqual(@as(usize, 16), resolveFlatCentroidProbeLimit(256, 16));
     try std.testing.expectEqual(@as(usize, 256), resolveFlatCentroidProbeLimit(256, 4096));
+}
+
+test "flat centroid search probe stack covers default 256 probe window" {
+    try std.testing.expect(flat_centroid_search_probe_stack_capacity >= 256);
 }
 
 test "flat centroid directory search predicate requires non-hbc quantized mode" {
