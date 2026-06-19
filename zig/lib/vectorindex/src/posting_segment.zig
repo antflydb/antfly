@@ -604,7 +604,8 @@ pub const RuntimeDirectoryStore = struct {
 
         const lazy_hint = try centroidDirectoryCandidateCapacityHint(self.lazy.snapshot().manifest.segments);
         const pending_hint = self.batch.pendingCentroidDirectoryEntries();
-        const capacity_hint = std.math.add(usize, lazy_hint, pending_hint) catch return error.PostingSegmentTooLarge;
+        if (pending_hint == 0 and lazy_hint.provesEmpty()) return try alloc.alloc(posting.OwnedCentroidDirectoryRecord, 0);
+        const capacity_hint = std.math.add(usize, lazy_hint.count, pending_hint) catch return error.PostingSegmentTooLarge;
         if (capacity_hint != 0) try candidates.ensureTotalCapacity(alloc, try hashMapCapacitySize(capacity_hint));
 
         try self.lazy.snapshot().appendCentroidDirectoryRecordCandidates(alloc, &candidates);
@@ -1068,7 +1069,8 @@ pub const LazyDirectorySnapshot = struct {
         errdefer deinitCentroidRecordCandidates(alloc, &candidates);
 
         const capacity_hint = try centroidDirectoryCandidateCapacityHint(self.manifest.segments);
-        if (capacity_hint != 0) try candidates.ensureTotalCapacity(alloc, try hashMapCapacitySize(capacity_hint));
+        if (capacity_hint.provesEmpty()) return try alloc.alloc(posting.OwnedCentroidDirectoryRecord, 0);
+        if (capacity_hint.count != 0) try candidates.ensureTotalCapacity(alloc, try hashMapCapacitySize(capacity_hint.count));
 
         try self.appendCentroidDirectoryRecordCandidates(alloc, &candidates);
         return try centroidRecordCandidatesToOwnedSlice(alloc, &candidates);
@@ -5107,12 +5109,25 @@ fn addKnownSegmentKindCount(accum: *usize, meta: SegmentMeta, kind: EntryKind) !
     accum.* = std.math.add(usize, accum.*, count) catch return error.PostingSegmentTooLarge;
 }
 
-fn centroidDirectoryCandidateCapacityHint(entries: []const OwnedManifestEntry) !usize {
-    var count: usize = 0;
-    for (entries) |entry| {
-        try addKnownSegmentKindCount(&count, entry.meta, .centroid_directory);
+const CentroidDirectoryCandidateCapacityHint = struct {
+    count: usize = 0,
+    all_kind_counts_known: bool = true,
+
+    fn provesEmpty(self: CentroidDirectoryCandidateCapacityHint) bool {
+        return self.all_kind_counts_known and self.count == 0;
     }
-    return count;
+};
+
+fn centroidDirectoryCandidateCapacityHint(entries: []const OwnedManifestEntry) !CentroidDirectoryCandidateCapacityHint {
+    var hint = CentroidDirectoryCandidateCapacityHint{};
+    for (entries) |entry| {
+        if (!entry.meta.hasKnownKindCounts()) {
+            hint.all_kind_counts_known = false;
+            continue;
+        }
+        try addKnownSegmentKindCount(&hint.count, entry.meta, .centroid_directory);
+    }
+    return hint;
 }
 
 const PointCandidateCapacityHints = struct {
@@ -6223,7 +6238,28 @@ pub fn testSegmentKindCapacityHintsUseKnownCounts() !void {
             .path = path_b[0..],
         },
     };
-    try std.testing.expectEqual(@as(usize, 2), try centroidDirectoryCandidateCapacityHint(manifest_entries[0..]));
+    const mixed_hint = try centroidDirectoryCandidateCapacityHint(manifest_entries[0..]);
+    try std.testing.expectEqual(@as(usize, 2), mixed_hint.count);
+    try std.testing.expect(!mixed_hint.all_kind_counts_known);
+    try std.testing.expect(!mixed_hint.provesEmpty());
+
+    const known_base_only_entries = [_]OwnedManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 3,
+                .min_posting_id = 13,
+                .max_posting_id = 17,
+                .byte_len = 1,
+                .entry_count = 4,
+                .base_count = 4,
+            },
+            .path = path_a[0..],
+        },
+    };
+    const known_base_only_hint = try centroidDirectoryCandidateCapacityHint(known_base_only_entries[0..]);
+    try std.testing.expectEqual(@as(usize, 0), known_base_only_hint.count);
+    try std.testing.expect(known_base_only_hint.all_kind_counts_known);
+    try std.testing.expect(known_base_only_hint.provesEmpty());
 
     const segments = [_]SegmentBlob{
         .{

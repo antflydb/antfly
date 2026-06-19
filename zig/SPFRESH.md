@@ -1255,7 +1255,11 @@ implementations cleanly:
     kind counts instead of growing those maps one entry at a time. Lazy and
     runtime centroid-directory bulk loads use the same known counts to reserve
     their newest-record candidate maps before scanning segment ranges, while
-    preserving the old growth path when kind counts are unknown.
+    preserving the old growth path when kind counts are unknown. When all
+    committed segment kind counts are known and prove that no centroid-directory
+    records exist, and the runtime batch has no pending centroid records,
+    centroid-directory bulk loads now return an empty owned result without
+    allocating a candidate map or scanning segment indexes.
     Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read
