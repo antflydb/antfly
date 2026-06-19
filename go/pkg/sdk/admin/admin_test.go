@@ -1876,6 +1876,10 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("missing node id error = %v, want receipt error", err)
 	}
+	response.Action.NodeId = "primary a"
+	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("invalid node id error = %v, want receipt error", err)
+	}
 	response.Action.NodeId = "primary-a"
 
 	response.SlotAction = HAReplicationSlotAction("invalid")
@@ -2021,6 +2025,11 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	wrongActionNode.Action.NodeId = "standby-b"
 	if err := ValidateHAFenceResponse(wrongActionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
 		t.Fatalf("wrong fence action node error = %v, want action node mismatch", err)
+	}
+	invalidReceiptNode := response
+	invalidReceiptNode.Receipt.PromotedNodeId = "standby a"
+	if err := ValidateHAFenceResponse(invalidReceiptNode); err == nil || !strings.Contains(err.Error(), "receipt fields") {
+		t.Fatalf("invalid fence receipt node error = %v, want receipt fields", err)
 	}
 	wrongIdentity := response
 	wrongIdentity.Receipt.Identity.TimelineId = 5

@@ -555,8 +555,8 @@ func ValidateHAPrimaryStatusResponse(response HAPrimaryStatusResponse) error {
 	if snapshot.Role != HAPrimarySnapshotRolePrimary {
 		return fmt.Errorf("invalid primary status role %q", snapshot.Role)
 	}
-	if strings.TrimSpace(snapshot.NodeId) == "" {
-		return fmt.Errorf("missing primary status node_id")
+	if !validHAIdentifier(snapshot.NodeId) {
+		return fmt.Errorf("invalid primary status node_id %q", snapshot.NodeId)
 	}
 	if !HAIdentityComplete(snapshot.Identity) {
 		return fmt.Errorf("missing primary status identity fields")
@@ -585,8 +585,8 @@ func ValidateHAStandbyStatusResponse(response HAStandbyStatusResponse) error {
 	if snapshot.Role != HAStandbySnapshotRoleStandby {
 		return fmt.Errorf("invalid standby status role %q", snapshot.Role)
 	}
-	if strings.TrimSpace(snapshot.NodeId) == "" {
-		return fmt.Errorf("missing standby status node_id")
+	if !validHAIdentifier(snapshot.NodeId) {
+		return fmt.Errorf("invalid standby status node_id %q", snapshot.NodeId)
 	}
 	if !HAIdentityComplete(snapshot.Identity) {
 		return fmt.Errorf("missing standby status identity fields")
@@ -1258,7 +1258,7 @@ func haRejoinReseedEvidenceComplete(reseed haRejoinReseedEvidence) bool {
 func HARejoinAssessmentComplete(assessment HARejoinAssessment) bool {
 	return HARejoinAssessmentActionValid(assessment.Action) &&
 		HARejoinAssessmentReasonValid(assessment.Reason) &&
-		strings.TrimSpace(assessment.FormerNodeId) != "" &&
+		validHAIdentifier(assessment.FormerNodeId) &&
 		assessment.TargetTimelineId > 0 &&
 		assessment.TargetEpoch > 0 &&
 		assessment.ParentClusterId > 0 &&
@@ -1294,15 +1294,15 @@ func HARejoinAssessmentReasonValid(reason HARejoinAssessmentReason) bool {
 }
 
 func HARejoinRewindComplete(rewind HARejoinRewindResult) bool {
-	return strings.TrimSpace(rewind.NodeId) != "" &&
+	return validHAIdentifier(rewind.NodeId) &&
 		rewind.TargetTimelineId > 0 &&
 		rewind.TargetEpoch > 0 &&
 		rewind.NextLsn > 0
 }
 
 func HARejoinReseedComplete(reseed HARejoinReseedResult) bool {
-	return strings.TrimSpace(reseed.NodeId) != "" &&
-		strings.TrimSpace(reseed.SlotName) != "" &&
+	return validHAIdentifier(reseed.NodeId) &&
+		validHAIdentifier(reseed.SlotName) &&
 		reseed.TargetTimelineId > 0 &&
 		reseed.TargetEpoch > 0 &&
 		reseed.ReseedRequired &&
@@ -1731,7 +1731,7 @@ func HAPromotionAssessmentComplete(assessment HAPromotionAssessment) bool {
 }
 
 func HAPromotionResultComplete(result HAPromotionResult) bool {
-	return strings.TrimSpace(result.NodeId) != "" &&
+	return validHAIdentifier(result.NodeId) &&
 		result.SwitchLsn > 0 &&
 		HAIdentityComplete(result.OldIdentity) &&
 		HAIdentityComplete(result.NewIdentity)
@@ -1739,8 +1739,8 @@ func HAPromotionResultComplete(result HAPromotionResult) bool {
 
 func HAFenceReceiptComplete(receipt HAFenceReceipt) bool {
 	return HAIdentityComplete(receipt.Identity) &&
-		strings.TrimSpace(receipt.OldPrimaryId) != "" &&
-		strings.TrimSpace(receipt.PromotedNodeId) != "" &&
+		validHAIdentifier(receipt.OldPrimaryId) &&
+		validHAIdentifier(receipt.PromotedNodeId) &&
 		receipt.ParentTimelineId > 0 &&
 		receipt.ParentEpoch > 0 &&
 		receipt.NewTimelineId > 0 &&
@@ -1777,7 +1777,7 @@ func HAActionReceiptPresent(receipt HAActionReceipt) bool {
 		strings.TrimSpace(string(receipt.ActionKind)) != "" &&
 		strings.TrimSpace(receipt.Target) != "" &&
 		strings.TrimSpace(string(receipt.State)) != "" &&
-		strings.TrimSpace(receipt.NodeId) != ""
+		validHAIdentifier(receipt.NodeId)
 }
 
 func HAReplicationSlotComplete(slot HAReplicationSlot) bool {

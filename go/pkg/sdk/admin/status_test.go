@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -357,6 +358,28 @@ func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), "caught_up_to_received") {
 		t.Fatalf("error = %q, want caught_up_to_received invariant", err.Error())
+	}
+}
+
+func TestValidateHAStatusResponsesRejectInvalidNodeIDs(t *testing.T) {
+	t.Parallel()
+
+	var primary HAPrimaryStatusResponse
+	if err := json.Unmarshal([]byte(haGeneratedPrimaryStatusJSON()), &primary); err != nil {
+		t.Fatalf("unmarshal primary status: %v", err)
+	}
+	primary.Snapshot.NodeId = "primary a"
+	if err := ValidateHAPrimaryStatusResponse(primary); err == nil || !strings.Contains(err.Error(), "invalid primary status node_id") {
+		t.Fatalf("primary status node_id error = %v, want invalid node_id", err)
+	}
+
+	var standby HAStandbyStatusResponse
+	if err := json.Unmarshal([]byte(haGeneratedStandbyStatusJSON()), &standby); err != nil {
+		t.Fatalf("unmarshal standby status: %v", err)
+	}
+	standby.Snapshot.NodeId = "standby/a"
+	if err := ValidateHAStandbyStatusResponse(standby); err == nil || !strings.Contains(err.Error(), "invalid standby status node_id") {
+		t.Fatalf("standby status node_id error = %v, want invalid node_id", err)
 	}
 }
 
