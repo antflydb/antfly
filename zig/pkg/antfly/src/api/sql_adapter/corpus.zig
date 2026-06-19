@@ -3898,6 +3898,14 @@ pub const AppParityCorpusCoverage = struct {
     ddl_schema_namespace_rename: bool = false,
     ddl_schema_namespace_drop: bool = false,
     ddl_extension_create: bool = false,
+    ddl_extension_create_if_not_exists: bool = false,
+    ddl_extension_create_quoted_sql_name: bool = false,
+    ddl_extension_create_version: bool = false,
+    ddl_extension_update: bool = false,
+    ddl_extension_update_latest: bool = false,
+    ddl_extension_update_version: bool = false,
+    ddl_extension_drop: bool = false,
+    ddl_extension_drop_cascade: bool = false,
     ddl_function_create: bool = false,
     ddl_function_replace: bool = false,
     ddl_function_drop: bool = false,
@@ -5445,8 +5453,23 @@ pub const AppParityCorpusCoverage = struct {
                 .create_schema_namespace => self.ddl_schema_namespace_create = true,
                 .rename_schema_namespace => self.ddl_schema_namespace_rename = true,
                 .drop_schema_namespace => self.ddl_schema_namespace_drop = true,
-                .create_extension => self.ddl_extension_create = true,
-                .alter_extension_update, .drop_extension => {},
+                .create_extension => {
+                    self.ddl_extension_create = true;
+                    self.ddl_extension_create_if_not_exists = self.ddl_extension_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
+                    self.ddl_extension_create_quoted_sql_name = self.ddl_extension_create_quoted_sql_name or sql_adapter.planHasExactStringToken(entry.plan, ":extension=", "uuid-ossp");
+                    self.ddl_extension_create_version = self.ddl_extension_create_version or std.mem.indexOf(u8, entry.plan, ":version=") != null;
+                },
+                .alter_extension_update => {
+                    self.ddl_extension_update = true;
+                    self.ddl_extension_update_latest = self.ddl_extension_update_latest or sql_adapter.planHasExactStringToken(entry.plan, ":version=", "latest");
+                    self.ddl_extension_update_version = self.ddl_extension_update_version or
+                        (std.mem.indexOf(u8, entry.plan, ":version=") != null and
+                            !sql_adapter.planHasExactStringToken(entry.plan, ":version=", "latest"));
+                },
+                .drop_extension => {
+                    self.ddl_extension_drop = true;
+                    self.ddl_extension_drop_cascade = self.ddl_extension_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
                 .create_function => {
                     self.ddl_function_create = true;
                     self.ddl_function_replace = self.ddl_function_replace or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
@@ -6246,6 +6269,14 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_schema_namespace_rename);
         try std.testing.expect(self.ddl_schema_namespace_drop);
         try std.testing.expect(self.ddl_extension_create);
+        try std.testing.expect(self.ddl_extension_create_if_not_exists);
+        try std.testing.expect(self.ddl_extension_create_quoted_sql_name);
+        try std.testing.expect(self.ddl_extension_create_version);
+        try std.testing.expect(self.ddl_extension_update);
+        try std.testing.expect(self.ddl_extension_update_latest);
+        try std.testing.expect(self.ddl_extension_update_version);
+        try std.testing.expect(self.ddl_extension_drop);
+        try std.testing.expect(self.ddl_extension_drop_cascade);
         try std.testing.expect(self.ddl_function_create);
         try std.testing.expect(self.ddl_function_replace);
         try std.testing.expect(self.ddl_function_drop);

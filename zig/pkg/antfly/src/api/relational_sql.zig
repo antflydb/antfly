@@ -44922,6 +44922,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(create_extension_versioned_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_extension:extension=postgis:if_not_exists=false:version=3.4.0", create_extension_versioned_fingerprint);
 
+    var create_extension_if_not_exists = try lowerDdlPlanAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS postgis VERSION '3.4.0';");
+    defer create_extension_if_not_exists.deinit(alloc);
+    const create_extension_if_not_exists_fingerprint = try ddlFingerprintAlloc(alloc, create_extension_if_not_exists);
+    defer alloc.free(create_extension_if_not_exists_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_extension:extension=postgis:if_not_exists=true:version=3.4.0", create_extension_if_not_exists_fingerprint);
+
     var update_extension = try lowerDdlPlanAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
     defer update_extension.deinit(alloc);
     const update_extension_plan = switch (update_extension) {

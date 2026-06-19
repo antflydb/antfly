@@ -7682,6 +7682,16 @@
       "sql": "CREATE EXTENSION postgis VERSION '3.4.0';"
     },
     {
+      "name": "create idempotent versioned extension catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_extension",
+        "table_name": "postgis"
+      },
+      "plan": "ddl:create_extension:extension=postgis:if_not_exists=true:version=3.4.0",
+      "sql": "CREATE EXTENSION IF NOT EXISTS postgis VERSION '3.4.0';"
+    },
+    {
       "name": "create quoted sql-name extension catalog ddl",
       "family": "ddl",
       "summary": {

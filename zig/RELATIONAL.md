@@ -1200,6 +1200,8 @@ RENAME TO`, and `DROP TABLESPACE`, bulk I/O grammar for `COPY ... FROM` and
 `COPY ... TO`, schema-namespace catalog grammar for `CREATE SCHEMA`, `ALTER
 SCHEMA ... RENAME TO`, and `DROP SCHEMA`, extension catalog grammar for
 `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`,
+including idempotent/versioned create, targeted/latest update, and drop
+dependency metadata,
 authorization catalog grammar for `CREATE ROLE`, `ALTER ROLE ... SET`,
 `DROP ROLE`, `GRANT`, and `REVOKE`,
 logical-replication catalog grammar for `CREATE PUBLICATION`,
@@ -5474,7 +5476,8 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    adapter-only no-op with a stable `extension` reason. Other supported
    `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`
    tails parse in `api/sql_adapter/grammar.zig`, lower to typed extension
-   catalog intent, and execute through the
+   catalog intent with version, idempotence, update-target, and dependency
+   metadata, and execute through the
    canonical extension lifecycle described in `EXTENSIONS.md`. The SQL
    compatibility adapter routes those plans to `extensions.lifecycle`
    install/update/drop operations rather than implementing a second extension
