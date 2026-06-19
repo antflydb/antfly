@@ -4517,6 +4517,17 @@
       "sql": "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS $$SELECT concat_ws(' ', $1, $2)$$"
     },
     {
+      "name": "create sql expression function nested body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "status_label_nested",
+        "operations": 2
+      },
+      "plan": "ddl:create_function:name=status_label_nested:args=2:replace=false:returns=text:language=sql:body=sql_expression:hook=expression:expr=concat_ws[value[223a22]+lower[field[source:arg1]]+coalesce[field[source:arg2]+value[226d697373696e6722]]]",
+      "sql": "CREATE FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS $$SELECT concat_ws(':', lower($1), coalesce($2, 'missing'))$$"
+    },
+    {
       "name": "create sql expression function multi argument add body catalog ddl",
       "family": "ddl",
       "summary": {

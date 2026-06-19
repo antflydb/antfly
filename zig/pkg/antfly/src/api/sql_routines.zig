@@ -342,6 +342,30 @@ test "sql routine runtime executes bounded multi argument expression bodies" {
     try std.testing.expectEqualStrings("\"tenant active\"", label);
 }
 
+test "sql routine runtime executes nested safe expression bodies" {
+    const alloc = std.testing.allocator;
+    var plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('':'', lower($1), coalesce($2, ''missing''))';",
+    );
+    defer plan.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try runtime.apply(switch (plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const missing = try runtime.executeExpressionRoutineArgsAlloc(alloc, "status_label_nested", &.{ "\"TENANT\"", "null" });
+    defer alloc.free(missing);
+    try std.testing.expectEqualStrings("\"tenant:missing\"", missing);
+
+    const active = try runtime.executeExpressionRoutineArgsAlloc(alloc, "status_label_nested", &.{ "\"TENANT\"", "\"active\"" });
+    defer alloc.free(active);
+    try std.testing.expectEqualStrings("\"tenant:active\"", active);
+}
+
 test "sql routine runtime applies returns-null null-input policy before execution" {
     const alloc = std.testing.allocator;
     var plan = try relational_sql.lowerDdlPlanAlloc(

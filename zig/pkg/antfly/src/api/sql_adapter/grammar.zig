@@ -2830,27 +2830,30 @@ fn parseSqlRoutineBodyPlanAlloc(
     }
     var expression_tokens = try lexer.tokenizeAlloc(alloc, expression);
     defer lexer.freeTokens(alloc, &expression_tokens);
-    if (expression_tokens.items.len == 1) {
-        if (routineArgumentIndex(expression_tokens.items[0].text)) |argument_index| {
-            return .{
-                .kind = .sql_expression,
-                .hook = .expression,
-                .expression = try routineArgumentExpressionAlloc(alloc, argument_index),
-            };
-        }
-    }
-    if (try routineFunctionExpressionAlloc(alloc, expression_tokens.items)) |function_expression| {
-        return .{
-            .kind = .sql_expression,
-            .hook = .expression,
-            .expression = function_expression,
-        };
-    }
-    if (expression_tokens.items.len == 3 and expression_tokens.items[1].kind == .plus) {
-        const lhs = try routineAddOperandExpressionAlloc(alloc, expression_tokens.items[0]);
+    return .{
+        .kind = .sql_expression,
+        .hook = .expression,
+        .expression = try routineExpressionAlloc(alloc, expression_tokens.items, 0),
+    };
+}
+
+const routine_expression_max_depth = 8;
+
+fn routineExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    depth: usize,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    if (tokens.len == 0 or depth > routine_expression_max_depth) return error.UnsupportedSqlShape;
+
+    if (tokens.len == 1) return try routineExpressionOperandAlloc(alloc, tokens[0]);
+
+    if (try routineTopLevelPlusIndex(tokens)) |plus_index| {
+        if (plus_index == 0 or plus_index + 1 >= tokens.len) return error.UnsupportedSqlShape;
+        const lhs = try routineExpressionAlloc(alloc, tokens[0..plus_index], depth + 1);
         var lhs_transferred = false;
         errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
-        const rhs = try routineAddOperandExpressionAlloc(alloc, expression_tokens.items[2]);
+        const rhs = try routineExpressionAlloc(alloc, tokens[plus_index + 1 ..], depth + 1);
         var rhs_transferred = false;
         errdefer if (!rhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs);
         const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 2);
@@ -2858,19 +2861,36 @@ fn parseSqlRoutineBodyPlanAlloc(
         operands[1] = rhs;
         lhs_transferred = true;
         rhs_transferred = true;
-        return .{
-            .kind = .sql_expression,
-            .hook = .expression,
-            .expression = try ddlGeneratedOperationExpressionAlloc(alloc, .add, operands),
-        };
+        return try ddlGeneratedOperationExpressionAlloc(alloc, .add, operands);
     }
+
+    if (try routineFunctionExpressionAlloc(alloc, tokens, depth)) |function_expression| return function_expression;
+
     return error.UnsupportedSqlShape;
+}
+
+fn routineTopLevelPlusIndex(tokens: []const Token) !?usize {
+    var depth: usize = 0;
+    for (tokens, 0..) |token, i| {
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return error.UnsupportedSqlShape;
+                depth -= 1;
+            },
+            .plus => if (depth == 0) return i,
+            else => {},
+        }
+    }
+    if (depth != 0) return error.UnsupportedSqlShape;
+    return null;
 }
 
 fn routineFunctionExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
-) !?runtime_schema.RelationalRowsExpression {
+    depth: usize,
+) anyerror!?runtime_schema.RelationalRowsExpression {
     if (tokens.len < 4 or tokens[0].kind != .identifier or tokens[1].kind != .lparen or tokens[tokens.len - 1].kind != .rparen) return null;
     const kind = routineFunctionExpressionKind(tokens[0].text) orelse return null;
     var operands_list = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpression).empty;
@@ -2878,19 +2898,38 @@ fn routineFunctionExpressionAlloc(
         for (operands_list.items) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
         operands_list.deinit(alloc);
     }
-    var i: usize = 2;
-    while (i < tokens.len - 1) {
-        const operand = try routineExpressionOperandAlloc(alloc, tokens[i]);
+    var start: usize = 2;
+    var i: usize = start;
+    var paren_depth: usize = 0;
+    while (i < tokens.len - 1) : (i += 1) {
+        const at_arg_boundary = switch (tokens[i].kind) {
+            .lparen => blk: {
+                paren_depth += 1;
+                break :blk false;
+            },
+            .rparen => blk: {
+                if (paren_depth == 0) return error.UnsupportedSqlShape;
+                paren_depth -= 1;
+                break :blk false;
+            },
+            .comma => paren_depth == 0,
+            else => false,
+        };
+        if (!at_arg_boundary) continue;
+        if (start == i) return error.UnsupportedSqlShape;
+        const operand = try routineExpressionAlloc(alloc, tokens[start..i], depth + 1);
         var operand_transferred = false;
         errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
         try operands_list.append(alloc, operand);
         operand_transferred = true;
-        i += 1;
-        if (i == tokens.len - 1) break;
-        if (tokens[i].kind != .comma) return error.UnsupportedSqlShape;
-        i += 1;
-        if (i >= tokens.len - 1) return error.UnsupportedSqlShape;
+        start = i + 1;
     }
+    if (paren_depth != 0 or start >= tokens.len - 1) return error.UnsupportedSqlShape;
+    const operand = try routineExpressionAlloc(alloc, tokens[start .. tokens.len - 1], depth + 1);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
+    try operands_list.append(alloc, operand);
+    operand_transferred = true;
 
     switch (kind) {
         .lower, .upper, .md5 => if (operands_list.items.len != 1) return error.UnsupportedSqlShape,
@@ -7775,6 +7814,20 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.coalesce, coalesce_body.body.?.expression.kind);
     try std.testing.expectEqualStrings("arg1", coalesce_body.body.?.expression.operands[0].field);
     try std.testing.expectEqualStrings("\"missing\"", coalesce_body.body.?.expression.operands[1].value_json);
+
+    var nested_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('':'', lower($1), coalesce($2, ''missing''))';");
+    defer lexer.freeTokens(alloc, &nested_body_tokens);
+    var nested_body_pos: usize = 0;
+    var nested_body = try parseCreateRoutineCatalogTailAlloc(alloc, nested_body_tokens.items, &nested_body_pos);
+    defer nested_body.deinit(alloc);
+    try std.testing.expectEqual(nested_body_tokens.items.len, nested_body_pos);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, nested_body.body.?.expression.kind);
+    try std.testing.expectEqualStrings("\":\"", nested_body.body.?.expression.operands[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, nested_body.body.?.expression.operands[1].kind);
+    try std.testing.expectEqualStrings("arg1", nested_body.body.?.expression.operands[1].operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.coalesce, nested_body.body.?.expression.operands[2].kind);
+    try std.testing.expectEqualStrings("arg2", nested_body.body.?.expression.operands[2].operands[0].field);
+    try std.testing.expectEqualStrings("\"missing\"", nested_body.body.?.expression.operands[2].operands[1].value_json);
 
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);

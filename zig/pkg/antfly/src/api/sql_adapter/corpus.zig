@@ -4075,6 +4075,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_sql_expression_concat_body: bool = false,
     ddl_function_sql_expression_body: bool = false,
     ddl_function_sql_expression_multi_arg_body: bool = false,
+    ddl_function_sql_expression_nested_body: bool = false,
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
@@ -5772,6 +5773,11 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_sql_expression_multi_arg_body = self.ddl_function_sql_expression_multi_arg_body or
                         (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
                             std.mem.indexOf(u8, entry.plan, "arg2") != null);
+                    self.ddl_function_sql_expression_nested_body = self.ddl_function_sql_expression_nested_body or
+                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                            std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null and
+                            std.mem.indexOf(u8, entry.plan, "lower[field[source:arg1]]") != null and
+                            std.mem.indexOf(u8, entry.plan, "coalesce[field[source:arg2]+") != null);
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;

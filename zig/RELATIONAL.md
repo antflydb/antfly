@@ -5139,8 +5139,9 @@ transforms, and `RETURNING`; routine argument references normalize to
 uses. The routine runtime clones those typed body expressions and can execute
 expression hooks through the shared `relational_rows.expressionValueJsonAlloc`
 evaluator, so supported functions such as ordinal identity, `lower`, `upper`,
-`md5`, `concat`, `concat_ws`, `coalesce`, `nullif`, and simple bounded numeric
-addition over argument or literal operands are not opaque SQL strings.
+`md5`, `concat`, `concat_ws`, `coalesce`, `nullif`, nested allowlisted
+function calls, and simple bounded numeric addition over argument or literal
+operands are not opaque SQL strings.
 Table-schema and table-storage application still reject routine-catalog plans
 because routines are catalog/runtime objects, not schema JSON mutations.
 Routine bodies and routine options that do not yet have typed metadata remain
