@@ -2649,7 +2649,7 @@ pub const AlgebraicIndexStats = struct {
     active_progress_target_rows: ?i64 = null,
 };
 
-/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_connection or websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
+/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_connection or websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
 pub const ChatToolName = enum {
     add_filter,
     ask_clarification,
@@ -2660,6 +2660,7 @@ pub const ChatToolName = enum {
     full_text_search,
     tree_search,
     graph_search,
+    aggregate,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -2672,6 +2673,7 @@ pub const ChatToolName = enum {
             .full_text_search => "full_text_search",
             .tree_search => "tree_search",
             .graph_search => "graph_search",
+            .aggregate => "aggregate",
         };
         try jw.write(s);
     }
@@ -2691,6 +2693,7 @@ pub const ChatToolName = enum {
             .{ "full_text_search", .full_text_search },
             .{ "tree_search", .tree_search },
             .{ "graph_search", .graph_search },
+            .{ "aggregate", .aggregate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
