@@ -1653,8 +1653,12 @@ fn extensionSkillAllowedAndMatches(
                 if (!jsonValueMatchesString(value, installed.name)) return false;
             } else if (std.mem.eql(u8, key, "metadata.skill")) {
                 if (!jsonValueMatchesString(value, member.object_name)) return false;
+            } else if (std.mem.eql(u8, key, "metadata.objectKind")) {
+                if (!jsonValueMatchesString(value, "skill")) return false;
             } else if (std.mem.eql(u8, key, "metadata.profile")) {
                 if (skill.profile == null or !jsonValueMatchesString(value, skill.profile.?)) return false;
+            } else {
+                return false;
             }
         }
     }
@@ -2758,14 +2762,24 @@ test "ARD search supports extension metadata filters" {
         .granted_capabilities = &.{.{ .name = "db:read", .scope = "docsaf" }},
         .status = .ready,
     }};
-    const members = [_]extension_domain.ExtensionMember{.{
-        .extension_name = "docsaf",
-        .scope = .{ .kind = .table, .table_name = "docs" },
-        .object_kind = .mcp_tool,
-        .object_name = "search_docs",
-        .table_name = "docs",
-        .owner_metadata_json = "{\"description\":\"Search docs\",\"input_schema\":{\"type\":\"object\"}}",
-    }};
+    const members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "docsaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .mcp_tool,
+            .object_name = "search_docs",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"description\":\"Search docs\",\"input_schema\":{\"type\":\"object\"}}",
+        },
+        .{
+            .extension_name = "docsaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .skill,
+            .object_name = "docs",
+            .table_name = "docs",
+            .owner_metadata_json = "{\"displayName\":\"Docsaf Skill\",\"description\":\"Use Docsaf from ARD.\",\"profile\":\"copilot\",\"tags\":[\"docs\"],\"capabilities\":[\"docs-search\"],\"body\":\"# Docsaf\"}",
+        },
+    };
     const ctx: ExtensionCatalogContext = .{
         .extension_packages = &packages,
         .installed_extensions = &installed,
@@ -2813,6 +2827,32 @@ test "ARD search supports extension metadata filters" {
     const mcp_results = mcp_parsed.value.object.get("results").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), mcp_results.len);
     try std.testing.expect(std.mem.indexOf(u8, mcp_results[0].object.get("identifier").?.string, ":extension:docsaf:mcp") != null);
+
+    const skill_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/ai-skill+md\"],\"metadata.scope\":[\"extension\"],\"metadata.extension\":[\"docsaf\"],\"metadata.skill\":[\"docs\"],\"metadata.objectKind\":[\"skill\"],\"metadata.profile\":[\"copilot\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(skill_body);
+    var skill_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, skill_body, .{});
+    defer skill_parsed.deinit();
+    const skill_results = skill_parsed.value.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), skill_results.len);
+    try std.testing.expect(std.mem.indexOf(u8, skill_results[0].object.get("identifier").?.string, ":extension:docsaf:skill:docs") != null);
+
+    const unknown_skill_filter_body = try searchJsonWithExtensionsAlloc(
+        std.testing.allocator,
+        .{ .mode = .tenant },
+        "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/ai-skill+md\"],\"metadata.unknown\":[\"docsaf\"]}},\"federation\":\"none\"}",
+        false,
+        ctx,
+    );
+    defer std.testing.allocator.free(unknown_skill_filter_body);
+    var unknown_skill_filter_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, unknown_skill_filter_body, .{});
+    defer unknown_skill_filter_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), unknown_skill_filter_parsed.value.object.get("results").?.array.items.len);
 
     const package_trust_body = try searchJsonWithExtensionsAlloc(
         std.testing.allocator,
