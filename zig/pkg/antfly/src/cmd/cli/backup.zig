@@ -15,6 +15,7 @@
 const std = @import("std");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const lite_restore_staging = @import("../lite_restore_staging.zig");
 
 pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
@@ -105,6 +106,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     var format: ?[]const u8 = null;
     var restore_mode: ?[]const u8 = null;
     var url: ?[]const u8 = null;
+    var input_path: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -119,12 +121,41 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
             format = args.next();
         } else if (std.mem.eql(u8, arg, "--mode")) {
             restore_mode = args.next();
+        } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+            input_path = args.next();
         } else if (std.mem.eql(u8, arg, "--url")) {
             url = args.next();
         }
     }
 
     if (url) |value| try client.setBaseUrl(value);
+
+    if (input_path) |input| {
+        if (tables_str != null) cli.fatal("--input restore supports exactly one --table", .{});
+        const tbl = table_name orelse cli.fatal("--table is required with --input", .{});
+        if (format) |value| {
+            if (!std.mem.eql(u8, value, "portable")) {
+                cli.fatal("--input restore is portable; omit --format or use --format portable", .{});
+            }
+        }
+
+        var owned_backup_id: ?[]u8 = null;
+        defer if (owned_backup_id) |value| allocator.free(value);
+        const bid = backup_id orelse blk: {
+            owned_backup_id = try lite_restore_staging.defaultBackupIdAlloc(allocator, input);
+            break :blk owned_backup_id.?;
+        };
+
+        var staged = try lite_restore_staging.stageInputRestoreBackup(allocator, input, tbl, bid, location);
+        defer staged.deinit(allocator);
+        try client.restoreTable(tbl, .{
+            .backup_id = staged.backup_id,
+            .location = staged.location,
+            .format = "portable",
+        });
+        std.debug.print("Restore command successfully initiated.\n", .{});
+        return;
+    }
 
     const bid = backup_id orelse cli.fatal("--backup-id is required", .{});
 
