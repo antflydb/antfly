@@ -5766,6 +5766,11 @@ test "sql adapter grammar accepts allowlisted adapter session cleanup" {
     try parseAdapterNoopSetStatementTail(search_path_tokens.items, &search_path_pos);
     try std.testing.expectEqual(search_path_tokens.items.len, search_path_pos);
 
+    var local_search_path_tokens = try lexer.tokenizeAlloc(alloc, "LOCAL search_path TO public;");
+    defer lexer.freeTokens(alloc, &local_search_path_tokens);
+    var local_search_path_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopSetStatementTail(local_search_path_tokens.items, &local_search_path_pos));
+
     var reset_tokens = try lexer.tokenizeAlloc(alloc, "client_min_messages;");
     defer lexer.freeTokens(alloc, &reset_tokens);
     var reset_pos: usize = 0;
