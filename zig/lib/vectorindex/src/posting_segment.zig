@@ -726,6 +726,7 @@ pub const Catalog = struct {
         errdefer deltas.deinit(alloc);
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (!segmentMayContainDeltaAfterGeneration(segment.meta, null)) continue;
             var reader = try Reader.init(segment.data);
             const range = try reader.deltasWithCount(posting_id);
             try deltas.ensureUnusedCapacity(alloc, range.count);
@@ -743,7 +744,7 @@ pub const Catalog = struct {
         errdefer deltas.deinit(alloc);
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
-            if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= base_generation) continue;
+            if (!segmentMayContainDeltaAfterGeneration(segment.meta, base_generation)) continue;
             var reader = try Reader.init(segment.data);
             const all_segment_records_after_generation = segmentDeltaTailFullyAfterGeneration(segment.meta, base_generation);
             const range = try reader.deltasWithCount(posting_id);
@@ -768,13 +769,11 @@ pub const Catalog = struct {
     ) !void {
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (!segmentMayContainDeltaAfterGeneration(segment.meta, min_generation)) continue;
             const all_segment_records_after_generation = if (min_generation) |generation|
                 segment.meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.min_delta_sequence) > generation
             else
                 true;
-            if (min_generation) |generation| {
-                if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= generation) continue;
-            }
 
             var reader = try Reader.init(segment.data);
             const range = try reader.deltasWithCount(posting_id);
@@ -811,13 +810,11 @@ pub const Catalog = struct {
     ) !void {
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (!segmentMayContainDeltaAfterGeneration(segment.meta, min_generation)) continue;
             const all_segment_records_after_generation = if (min_generation) |generation|
                 segment.meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.min_delta_sequence) > generation
             else
                 true;
-            if (min_generation) |generation| {
-                if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= generation) continue;
-            }
 
             var reader = try Reader.init(segment.data);
             const range = try reader.deltasWithCount(posting_id);
@@ -1089,7 +1086,7 @@ pub const LazyDirectorySnapshot = struct {
         for (self.manifest.segments[start_index..]) |entry| {
             if (entry.meta.segment_id < min_segment_id) continue;
             if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
+            if (!segmentMayContainDeltaAfterGeneration(entry.meta, generation)) continue;
             try self.readDeltaRecordsIntoScratchWithStatsAlloc(alloc, entry, posting_id, generation, scratch, &stats);
         }
         return stats;
@@ -1144,7 +1141,7 @@ pub const LazyDirectorySnapshot = struct {
         var out = posting.PostingDeltaTailStats{};
         for (self.manifest.segments) |entry| {
             if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
+            if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) continue;
 
             const stats = try self.readDeltaTailStatsAlloc(alloc, entry, posting_id, base_generation);
             out.records += stats.records;
@@ -1181,7 +1178,7 @@ pub const LazyDirectorySnapshot = struct {
             segment_index -= 1;
             const entry = self.manifest.segments[segment_index];
             if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
+            if (!segmentMayContainDeltaAfterGeneration(entry.meta, base_generation)) continue;
             if (best_record != null and entry.meta.max_delta_sequence <= best_sequence) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
             const all_records_after_generation = segmentDeltaTailFullyAfterGeneration(entry.meta, base_generation);
@@ -1290,9 +1287,7 @@ pub const LazyDirectorySnapshot = struct {
 
         for (self.manifest.segments) |entry| {
             if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (min_generation) |generation| {
-                if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
-            }
+            if (!segmentMayContainDeltaAfterGeneration(entry.meta, min_generation)) continue;
 
             try self.readDeltaRecordsWithStatsAlloc(alloc, entry, posting_id, min_generation, &records, &stats);
         }
@@ -4657,6 +4652,12 @@ fn segmentDeltaTailFullyAtOrBeforeGeneration(meta: SegmentMeta, generation: u64)
     return meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(meta.max_delta_sequence) <= generation;
 }
 
+fn segmentMayContainDeltaAfterGeneration(meta: SegmentMeta, min_generation: ?u64) bool {
+    if (meta.max_delta_sequence == 0) return false;
+    if (min_generation) |generation| return !segmentDeltaTailFullyAtOrBeforeGeneration(meta, generation);
+    return true;
+}
+
 fn segmentDeltaTailFullyAfterGeneration(meta: SegmentMeta, generation: u64) bool {
     return meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(meta.min_delta_sequence) > generation;
 }
@@ -6005,6 +6006,37 @@ pub fn testCompactResolvedSortedPositionRange() !void {
     try std.testing.expectEqual(@as(usize, 0), positions[0]);
     try std.testing.expectEqual(@as(usize, 4), positions[2]);
     try std.testing.expectError(error.CorruptedPostingSegment, compactResolvedSortedPositionRange(&positions, .{ .first = 1, .past = 99 }, &out));
+}
+
+pub fn testSegmentMayContainDeltaAfterGeneration() !void {
+    try std.testing.expect(!segmentMayContainDeltaAfterGeneration(.{
+        .segment_id = 1,
+        .min_posting_id = 7,
+        .max_posting_id = 7,
+        .byte_len = 1,
+        .entry_count = 1,
+        .index_offset = 0,
+    }, null));
+    try std.testing.expect(!segmentMayContainDeltaAfterGeneration(.{
+        .segment_id = 1,
+        .min_posting_id = 7,
+        .max_posting_id = 7,
+        .min_delta_sequence = (@as(u64, 2) << 32) | 1,
+        .max_delta_sequence = (@as(u64, 2) << 32) | 2,
+        .byte_len = 1,
+        .entry_count = 1,
+        .index_offset = 0,
+    }, 2));
+    try std.testing.expect(segmentMayContainDeltaAfterGeneration(.{
+        .segment_id = 1,
+        .min_posting_id = 7,
+        .max_posting_id = 7,
+        .min_delta_sequence = (@as(u64, 2) << 32) | 1,
+        .max_delta_sequence = (@as(u64, 3) << 32) | 1,
+        .byte_len = 1,
+        .entry_count = 1,
+        .index_offset = 0,
+    }, 2));
 }
 
 pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
@@ -8827,6 +8859,10 @@ test "posting segment sorted batch windows skip disjoint segments" {
 
 test "posting segment sorted batch compaction keeps untouched windows" {
     try testCompactResolvedSortedPositionRange();
+}
+
+test "posting segment delta paths skip segments without delta metadata" {
+    try testSegmentMayContainDeltaAfterGeneration();
 }
 
 test "posting segment retained delta candidate count deduplicates sequences" {
