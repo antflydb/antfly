@@ -921,8 +921,25 @@ pub fn buildMergeMutationBatchFromDbsAcrossRangesAlloc(
 
     const target_preimages = try target_db.collectRelationalRowsPreimagesAcrossRangesAlloc(alloc, target_schema, target_query, target_ranges);
     defer db_mod.types.freeRelationalRowsCollectedRows(alloc, target_preimages);
-    const source_preimages = try source_db.collectRelationalRowsPreimagesAcrossRangesAlloc(alloc, source_schema, source_query, source_ranges);
-    defer db_mod.types.freeRelationalRowsCollectedRows(alloc, source_preimages);
+
+    var source_preimages: []const db_mod.types.RelationalRowsCollectedRow = &.{};
+    var source_result: ?db_mod.types.RelationalRowsQueryResult = null;
+    defer if (source_preimages.len > 0) db_mod.types.freeRelationalRowsCollectedRows(alloc, source_preimages);
+    defer if (source_result) |*result| result.deinit(alloc);
+
+    const source_rows = if (plan.source.source_cte.len != 0) blk: {
+        if (!mergeSourceQueryIsDefault(source_query)) return error.InvalidQueryRequest;
+        source_result = try source_db.queryRelationalRowsPlan(alloc, source_schema, .{
+            .ctes = plan.ctes,
+            .ranges = source_ranges,
+            .query = plan.source,
+        });
+        break :blk source_result.?.rows;
+    } else blk: {
+        source_preimages = try source_db.collectRelationalRowsPreimagesAcrossRangesAlloc(alloc, source_schema, source_query, source_ranges);
+        break :blk try mergeSourceRowsFromPreimagesAlloc(alloc, source_preimages);
+    };
+    defer if (source_preimages.len > 0) alloc.free(source_rows);
 
     const target_rows = try alloc.alloc(MergeExecutionTargetRow, target_preimages.len);
     defer alloc.free(target_rows);
@@ -934,11 +951,53 @@ pub fn buildMergeMutationBatchFromDbsAcrossRangesAlloc(
         };
     }
 
-    const source_rows = try alloc.alloc([]const u8, source_preimages.len);
-    defer alloc.free(source_rows);
-    for (source_preimages, 0..) |row, i| source_rows[i] = row.json;
-
     return try buildMergeMutationBatchAlloc(alloc, target_schema, source_schema, plan, target_rows, source_rows);
+}
+
+fn mergeSourceRowsFromPreimagesAlloc(
+    alloc: std.mem.Allocator,
+    source_preimages: []const db_mod.types.RelationalRowsCollectedRow,
+) ![]const []const u8 {
+    if (source_preimages.len == 0) return &.{};
+    const source_rows = try alloc.alloc([]const u8, source_preimages.len);
+    errdefer alloc.free(source_rows);
+    for (source_preimages, 0..) |row, i| source_rows[i] = row.json;
+    return source_rows;
+}
+
+fn mergeSourceQueryIsDefault(req: db_mod.types.RelationalRowsQueryRequest) bool {
+    return req.source_cte.len == 0 and
+        req.predicates.len == 0 and
+        req.array_any.len == 0 and
+        req.array_contains.len == 0 and
+        req.array_eq.len == 0 and
+        req.in_predicates.len == 0 and
+        req.json_contains.len == 0 and
+        req.json_path_eq.len == 0 and
+        req.json_path_exists.len == 0 and
+        req.text_patterns.len == 0 and
+        req.or_predicates.len == 0 and
+        req.not_predicates.len == 0 and
+        req.access_or_predicates.len == 0 and
+        req.access_not_predicates.len == 0 and
+        req.expression_predicates.len == 0 and
+        req.expression_or_predicates.len == 0 and
+        req.expression_not_predicates.len == 0 and
+        req.expression_array_contains.len == 0 and
+        req.select.len == 0 and
+        req.json_extract.len == 0 and
+        req.array_length.len == 0 and
+        req.coalesce.len == 0 and
+        req.field_aliases.len == 0 and
+        req.expressions.len == 0 and
+        req.select_all and
+        req.distinct_on.len == 0 and
+        req.distinct_on_expressions.len == 0 and
+        req.order_by.len == 0 and
+        req.row_claim == null and
+        req.doc_key_range == null and
+        req.limit == null and
+        req.offset == 0;
 }
 
 pub fn buildMergeMutationBatchAlloc(
@@ -65127,6 +65186,91 @@ test "postgres sql adapter merge mutation batch collects local relational preima
     try std.testing.expectEqualStrings("{\"id\":\"new1\",\"status\":\"INSERTED\",\"organization_id\":\"org:2\",\"kind\":\"target\"}", rows.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"updated\",\"organization_id\":\"org:1\",\"kind\":\"target\"}", rows.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"t_skip\",\"status\":\"closed\",\"organization_id\":\"org:1\",\"kind\":\"target\"}", rows.rows[2]);
+}
+
+test "postgres sql adapter merge mutation batch collects CTE source preimages" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"kind":{"type":"keyword"}},"required":["id","kind"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-merge-cte-source-preimages", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    const row_jsons = [_][]const u8{
+        "{\"id\":\"t1\",\"kind\":\"target\",\"status\":\"open\",\"organization_id\":\"org:1\"}",
+        "{\"id\":\"s1\",\"kind\":\"source\",\"source_id\":\"t1\",\"status\":\"UPDATED\",\"organization_id\":\"org:1\"}",
+        "{\"id\":\"s2\",\"kind\":\"source\",\"source_id\":\"new1\",\"status\":\"inserted\",\"organization_id\":\"org:2\"}",
+    };
+    var row_keys: [row_jsons.len][]u8 = undefined;
+    for (row_jsons, 0..) |row_json, i| row_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+    defer {
+        for (row_keys) |key| alloc.free(key);
+    }
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = row_keys[0], .value = row_jsons[0] },
+            .{ .key = row_keys[1], .value = row_jsons[1] },
+            .{ .key = row_keys[2], .value = row_jsons[2] },
+        },
+        .sync_level = .write,
+    });
+
+    var write_plan = try lowerWritePlanAlloc(
+        alloc,
+        "WITH ready_sources AS (SELECT source_id, status, organization_id FROM usage_records WHERE kind = 'source') MERGE INTO usage_records AS target USING ready_sources AS source ON target.id = source.source_id WHEN MATCHED THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED THEN INSERT (id, status, organization_id, kind) VALUES (source.source_id, upper(source.status), source.organization_id, 'target') RETURNING id, status, lower(status) AS status_key",
+        schema,
+        &.{},
+        .{},
+    );
+    defer write_plan.deinit(alloc);
+
+    const target_predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "kind",
+        .op = .eq,
+        .value_json = "\"target\"",
+    }};
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    const target_query: db_mod.types.RelationalRowsQueryRequest = .{
+        .predicates = target_predicates[0..],
+        .order_by = order_by[0..],
+    };
+    const source_ranges = [_]db_mod.types.RelationalRowsDocKeyRange{.{
+        .start = row_keys[1],
+        .end = "",
+    }};
+
+    switch (write_plan) {
+        .merge_mutation => |merge| {
+            try std.testing.expectEqual(@as(usize, 1), merge.ctes.len);
+            try std.testing.expectEqualStrings("ready_sources", merge.source.source_cte);
+            var batch = try buildMergeMutationBatchFromDbAcrossRangesAlloc(alloc, &db, schema, schema, merge, target_query, &.{}, .{}, source_ranges[0..]);
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 0), batch.deleted);
+            try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"updated\",\"status_key\":\"updated\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"new1\",\"status\":\"INSERTED\",\"status_key\":\"inserted\"}", batch.returning_rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "postgres sql adapter merge mutation batch collects cross-schema local preimages" {
