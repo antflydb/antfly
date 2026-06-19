@@ -22,6 +22,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const text_segment = @import("../text_segment/mod.zig");
 const sparse_segment = @import("../sparse_segment/mod.zig");
+const vector_segment = @import("../vector_segment/mod.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
@@ -53,6 +54,20 @@ pub const SparseCandidateRequest = struct {
 
 pub const SparseCandidatePlan = struct {
     request: SparseCandidateRequest,
+    sidecar_names: ?[]const []const u8 = null,
+};
+
+pub const VectorCandidateRequest = struct {
+    vector: []const f32,
+    offset: usize = 0,
+    limit: usize = std.math.maxInt(usize),
+    min_score: u32 = 0,
+    num_probes: u32 = 2,
+    search_effort: ?f32 = null,
+};
+
+pub const VectorCandidatePlan = struct {
+    request: VectorCandidateRequest,
     sidecar_names: ?[]const []const u8 = null,
 };
 
@@ -215,6 +230,73 @@ pub fn sparseCandidateSetsFromArtifactStoreAlloc(
     return .{ .sets = try sets.toOwnedSlice(alloc) };
 }
 
+pub fn vectorCandidateSetFromPayloadAlloc(
+    alloc: Allocator,
+    declaration: sidecar_manifest.DeclaredArtifact,
+    payload: []const u8,
+    request: VectorCandidateRequest,
+    stats: *indexed_reader.SearchExecutionStats,
+) !OwnedCandidateSet {
+    try declaration.validate();
+    if (declaration.binding.sidecar_kind != .vector) return error.UnsupportedLakeSidecarCandidateSource;
+    if (declaration.artifact.kind != artifact_ref.ArtifactKind.vector_segment) return error.UnsupportedLakeSidecarCandidateSource;
+
+    var segment = try vector_segment.decodeAlloc(alloc, payload);
+    defer vector_segment.freeSegment(alloc, &segment);
+
+    const hits = try indexed_reader.searchVectorSegmentDocIdsAlloc(
+        alloc,
+        segment,
+        request.vector,
+        request.offset,
+        request.limit,
+        request.min_score,
+        request.num_probes,
+        request.search_effort,
+        stats,
+    );
+    defer indexed_reader.freeScoredDocs(alloc, hits);
+
+    const keys = try alloc.alloc([]const u8, hits.len);
+    defer alloc.free(keys);
+    for (hits, 0..) |hit, idx| keys[idx] = hit.doc_id;
+
+    const refs = try source_binding.rowRefsFromKeysAlloc(alloc, declaration.binding, keys);
+    errdefer source_binding.freeOwnedRowRefs(alloc, refs);
+    return .{
+        .sidecar_name = try alloc.dupe(u8, declaration.name),
+        .row_refs = refs,
+    };
+}
+
+pub fn vectorCandidateSetsFromArtifactStoreAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    plan: VectorCandidatePlan,
+    stats: *indexed_reader.SearchExecutionStats,
+) !OwnedCandidateSets {
+    if (plan.request.vector.len == 0) return .{ .sets = try alloc.alloc(OwnedCandidateSet, 0) };
+
+    const selected = try selectedVectorDeclarationsAlloc(alloc, declarations, plan.sidecar_names);
+    defer if (selected.len > 0) alloc.free(selected);
+
+    var sets = std.ArrayListUnmanaged(OwnedCandidateSet).empty;
+    errdefer {
+        for (sets.items) |*set| set.deinit(alloc);
+        sets.deinit(alloc);
+    }
+    try sets.ensureUnusedCapacity(alloc, selected.len);
+
+    for (selected) |declaration| {
+        const payload = try artifacts.getAlloc(declaration.artifact.artifact_id);
+        defer artifacts.allocator.free(payload);
+        sets.appendAssumeCapacity(try vectorCandidateSetFromPayloadAlloc(alloc, declaration, payload, plan.request, stats));
+    }
+
+    return .{ .sets = try sets.toOwnedSlice(alloc) };
+}
+
 fn selectedTextDeclarationsAlloc(
     alloc: Allocator,
     declarations: []const sidecar_manifest.DeclaredArtifact,
@@ -234,6 +316,31 @@ fn selectedTextDeclarationsAlloc(
 
     for (declarations) |declaration| {
         if (!isTextDeclaration(declaration)) continue;
+        if (selected.items.len != 0) return error.AmbiguousLakeSidecarCandidateSource;
+        try selected.append(alloc, declaration);
+    }
+    return try selected.toOwnedSlice(alloc);
+}
+
+fn selectedVectorDeclarationsAlloc(
+    alloc: Allocator,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    maybe_names: ?[]const []const u8,
+) ![]sidecar_manifest.DeclaredArtifact {
+    var selected = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
+    errdefer selected.deinit(alloc);
+
+    if (maybe_names) |names| {
+        for (names) |name| {
+            if (name.len == 0) return error.InvalidLakeSidecarCandidateRequest;
+            const declaration = findVectorDeclaration(declarations, name) orelse return error.MissingLakeSidecarCandidateSource;
+            try selected.append(alloc, declaration);
+        }
+        return try selected.toOwnedSlice(alloc);
+    }
+
+    for (declarations) |declaration| {
+        if (!isVectorDeclaration(declaration)) continue;
         if (selected.items.len != 0) return error.AmbiguousLakeSidecarCandidateSource;
         try selected.append(alloc, declaration);
     }
@@ -276,6 +383,17 @@ fn findTextDeclaration(
     return null;
 }
 
+fn findVectorDeclaration(
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    name: []const u8,
+) ?sidecar_manifest.DeclaredArtifact {
+    for (declarations) |declaration| {
+        if (!isVectorDeclaration(declaration)) continue;
+        if (std.mem.eql(u8, declaration.name, name)) return declaration;
+    }
+    return null;
+}
+
 fn findSparseDeclaration(
     declarations: []const sidecar_manifest.DeclaredArtifact,
     name: []const u8,
@@ -289,6 +407,10 @@ fn findSparseDeclaration(
 
 fn isTextDeclaration(declaration: sidecar_manifest.DeclaredArtifact) bool {
     return declaration.binding.sidecar_kind == .text and declaration.artifact.kind == artifact_ref.ArtifactKind.text_segment;
+}
+
+fn isVectorDeclaration(declaration: sidecar_manifest.DeclaredArtifact) bool {
+    return declaration.binding.sidecar_kind == .vector and declaration.artifact.kind == artifact_ref.ArtifactKind.vector_segment;
 }
 
 fn isSparseDeclaration(declaration: sidecar_manifest.DeclaredArtifact) bool {
@@ -723,5 +845,188 @@ test "lake sparse sidecar candidate producer rejects stale sidecar doc ids" {
                 .checksum = "sha256:sparse",
             },
         }, payload, .{ .terms = &terms_query }),
+    );
+}
+
+test "lake vector sidecar candidate producer loads payloads from artifact store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const artifact_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifacts", .{tmp.sub_path});
+    defer alloc.free(artifact_path);
+    var fs = try artifacts_mod.FsStore.init(alloc, artifact_path);
+    var store = fs.artifactStore();
+    defer store.deinit();
+
+    const binding = source_binding.Binding{
+        .sidecar_kind = .vector,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"embedding"},
+        .index_config_hash = "sha256:vector",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 0,
+        } },
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 1,
+        } },
+    };
+    const key_a = try source_binding.rowRefKeyAlloc(alloc, row_refs[0]);
+    defer alloc.free(key_a);
+    const key_b = try source_binding.rowRefKeyAlloc(alloc, row_refs[1]);
+    defer alloc.free(key_b);
+    var exact_entries = [_]vector_segment.Entry{
+        .{ .doc_id = key_a, .vector = @constCast(&[_]f32{ 1.0, 0.0 }) },
+        .{ .doc_id = key_b, .vector = @constCast(&[_]f32{ 0.0, 1.0 }) },
+    };
+    const exact_block = try vector_segment.encodeExactEntriesAlloc(alloc, &exact_entries);
+    defer alloc.free(exact_block);
+    var segment = vector_segment.Segment{
+        .dims = 2,
+        .base_probe_count = 1,
+        .shortlist_multiplier = 2,
+        .clusters = try alloc.alloc(vector_segment.Cluster, 1),
+        .entries = try alloc.alloc(vector_segment.Entry, 2),
+    };
+    defer vector_segment.freeSegment(alloc, &segment);
+    segment.clusters[0] = .{
+        .centroid = try alloc.dupe(f32, &.{ 0.0, 1.0 }),
+        .start_index = 0,
+        .entry_count = 2,
+        .routing_distance_min = 0,
+        .routing_distance_max = 1,
+        .routing_distance_avg = 0.5,
+        .quantized_set = try alloc.alloc(u8, 0),
+        .exact_entries = try alloc.dupe(u8, exact_block),
+    };
+    segment.entries[0] = .{
+        .doc_id = try alloc.dupe(u8, key_a),
+        .vector = try alloc.dupe(f32, &.{ 1.0, 0.0 }),
+    };
+    segment.entries[1] = .{
+        .doc_id = try alloc.dupe(u8, key_b),
+        .vector = try alloc.dupe(f32, &.{ 0.0, 1.0 }),
+    };
+    const payload = try vector_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(payload);
+    var meta = try store.put(payload);
+    defer meta.deinit(alloc);
+
+    const declaration = sidecar_manifest.DeclaredArtifact{
+        .name = "events.embedding.vector",
+        .binding = binding,
+        .artifact = .{
+            .kind = .vector_segment,
+            .name = "events.embedding.vector",
+            .artifact_id = meta.artifact_id,
+            .byte_len = meta.byte_len,
+            .checksum = meta.checksum,
+        },
+    };
+    const sidecar_names = [_][]const u8{"events.embedding.vector"};
+    var stats = indexed_reader.SearchExecutionStats{};
+    var candidates = try vectorCandidateSetsFromArtifactStoreAlloc(alloc, &store, &[_]sidecar_manifest.DeclaredArtifact{declaration}, .{
+        .request = .{
+            .vector = &[_]f32{ 0.0, 1.0 },
+            .limit = 1,
+            .num_probes = 1,
+        },
+        .sidecar_names = &sidecar_names,
+    }, &stats);
+    defer candidates.deinit(alloc);
+    const lake_candidate_sets = try candidates.asLakeRowsCandidateSetsAlloc(alloc);
+    defer alloc.free(lake_candidate_sets);
+
+    try std.testing.expectEqual(@as(usize, 1), lake_candidate_sets.len);
+    try std.testing.expectEqualStrings("events.embedding.vector", lake_candidate_sets[0].sidecar_name);
+    try std.testing.expectEqual(@as(usize, 1), lake_candidate_sets[0].row_refs.len);
+    try std.testing.expectEqualStrings("file-a.parquet", lake_candidate_sets[0].row_refs[0].external.file_id);
+    try std.testing.expectEqual(@as(u64, 1), lake_candidate_sets[0].row_refs[0].external.row_ordinal);
+    try std.testing.expectEqual(@as(usize, 1), stats.actual_probe_count);
+}
+
+test "lake vector sidecar candidate producer rejects stale sidecar doc ids" {
+    const alloc = std.testing.allocator;
+    const binding = source_binding.Binding{
+        .sidecar_kind = .vector,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"embedding"},
+        .index_config_hash = "sha256:vector",
+    };
+    const stale_ref = rowsource.RowRef{ .external = .{
+        .source_id = "events",
+        .snapshot_id = "iceberg-8",
+        .file_id = "file-a.parquet",
+        .row_group_ordinal = 0,
+        .row_ordinal = 0,
+    } };
+    const stale_key = try source_binding.rowRefKeyAlloc(alloc, stale_ref);
+    defer alloc.free(stale_key);
+    var exact_entries = [_]vector_segment.Entry{
+        .{ .doc_id = stale_key, .vector = @constCast(&[_]f32{ 1.0, 0.0 }) },
+    };
+    const exact_block = try vector_segment.encodeExactEntriesAlloc(alloc, &exact_entries);
+    defer alloc.free(exact_block);
+    var segment = vector_segment.Segment{
+        .dims = 2,
+        .base_probe_count = 1,
+        .shortlist_multiplier = 2,
+        .clusters = try alloc.alloc(vector_segment.Cluster, 1),
+        .entries = try alloc.alloc(vector_segment.Entry, 1),
+    };
+    defer vector_segment.freeSegment(alloc, &segment);
+    segment.clusters[0] = .{
+        .centroid = try alloc.dupe(f32, &.{ 1.0, 0.0 }),
+        .start_index = 0,
+        .entry_count = 1,
+        .routing_distance_min = 0,
+        .routing_distance_max = 1,
+        .routing_distance_avg = 0.5,
+        .quantized_set = try alloc.alloc(u8, 0),
+        .exact_entries = try alloc.dupe(u8, exact_block),
+    };
+    segment.entries[0] = .{
+        .doc_id = try alloc.dupe(u8, stale_key),
+        .vector = try alloc.dupe(f32, &.{ 1.0, 0.0 }),
+    };
+    const payload = try vector_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(payload);
+    var stats = indexed_reader.SearchExecutionStats{};
+
+    try std.testing.expectError(
+        error.SidecarSourceBindingMismatch,
+        vectorCandidateSetFromPayloadAlloc(alloc, .{
+            .name = "events.embedding.vector",
+            .binding = binding,
+            .artifact = .{
+                .kind = .vector_segment,
+                .name = "events.embedding.vector",
+                .artifact_id = "artifact:vector",
+                .byte_len = payload.len,
+                .checksum = "sha256:vector",
+            },
+        }, payload, .{
+            .vector = &[_]f32{ 1.0, 0.0 },
+            .limit = 1,
+            .num_probes = 1,
+        }, &stats),
     );
 }

@@ -763,6 +763,29 @@ fn searchVectorSegmentAlloc(
     return try clipScoredDocsAlloc(alloc, scored.items, req.offset, req.limit, req.min_score);
 }
 
+pub fn searchVectorSegmentDocIdsAlloc(
+    alloc: Allocator,
+    vector_segment: vector_segment_mod.Segment,
+    query_vector: []const f32,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+    num_probes: u32,
+    search_effort: ?f32,
+    stats: *SearchExecutionStats,
+) ![]ScoredDoc {
+    const req = query_request.QueryRequest{
+        .text = @constCast(""),
+        .vector = @constCast(query_vector),
+        .offset = offset,
+        .limit = limit,
+        .min_score = min_score,
+        .num_probes = num_probes,
+        .search_effort = search_effort,
+    };
+    return try searchVectorSegmentAlloc(alloc, vector_segment, req, query_vector, stats);
+}
+
 fn searchVectorArtifactAlloc(
     alloc: Allocator,
     session: *runtime_mod.QuerySession,
