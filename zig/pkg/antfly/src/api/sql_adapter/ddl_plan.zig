@@ -808,6 +808,7 @@ pub const PrepareStatementPlan = struct {
     statement_name: []const u8,
     parameter_count: usize = 0,
     statement_kind: PreparedStatementSubjectKind,
+    statement_family: PreparedStatementStatementKind,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.statement_name);
@@ -818,6 +819,17 @@ pub const PrepareStatementPlan = struct {
 pub const PreparedStatementSubjectKind = enum {
     read,
     write,
+    ddl,
+};
+
+pub const PreparedStatementStatementKind = enum {
+    read,
+    insert,
+    insert_source,
+    update,
+    delete,
+    truncate,
+    merge,
     ddl,
 };
 
@@ -2335,6 +2347,7 @@ test "SQL adapter DDL prepared statement and cursor plans own strings" {
         .statement_name = try alloc.dupe(u8, "usage_plan"),
         .parameter_count = 2,
         .statement_kind = .write,
+        .statement_family = .update,
     } };
     prepare.deinit(alloc);
 

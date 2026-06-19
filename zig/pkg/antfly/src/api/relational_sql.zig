@@ -182,6 +182,7 @@ pub const PrivilegeChangePlan = sql_adapter.PrivilegeChangePlan;
 pub const PreparedStatementPlan = sql_adapter.PreparedStatementPlan;
 pub const PrepareStatementPlan = sql_adapter.PrepareStatementPlan;
 pub const PreparedStatementSubjectKind = sql_adapter.PreparedStatementSubjectKind;
+pub const PreparedStatementStatementKind = sql_adapter.PreparedStatementStatementKind;
 pub const ExecutePreparedStatementPlan = sql_adapter.ExecutePreparedStatementPlan;
 pub const DeallocatePreparedStatementPlan = sql_adapter.DeallocatePreparedStatementPlan;
 pub const CursorPortalPlan = sql_adapter.CursorPortalPlan;
@@ -2899,6 +2900,19 @@ fn preparedStatementSubjectKindFromSyntax(syntax: sql_adapter.PreparedStatementS
     };
 }
 
+fn preparedStatementStatementKindFromSyntax(syntax: sql_adapter.PreparedStatementStatementSyntax) PreparedStatementStatementKind {
+    return switch (syntax) {
+        .read => .read,
+        .insert => .insert,
+        .insert_source => .insert_source,
+        .update => .update,
+        .delete => .delete,
+        .truncate => .truncate,
+        .merge => .merge,
+        .ddl => .ddl,
+    };
+}
+
 fn tableLockModeFromSyntax(syntax: sql_adapter.TableLockModeSyntax) TableLockMode {
     return switch (syntax) {
         .access_share => .access_share,
@@ -3809,6 +3823,7 @@ const Parser = struct {
             .statement_name = statement_name,
             .parameter_count = syntax.parameter_count,
             .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind),
+            .statement_family = preparedStatementStatementKindFromSyntax(syntax.statement_family),
         };
     }
 
@@ -45902,23 +45917,24 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("usage_plan", prepare_statement_plan.statement_name);
     try std.testing.expectEqual(@as(usize, 1), prepare_statement_plan.parameter_count);
     try std.testing.expectEqual(PreparedStatementSubjectKind.read, prepare_statement_plan.statement_kind);
+    try std.testing.expectEqual(PreparedStatementStatementKind.read, prepare_statement_plan.statement_family);
     const prepare_statement_fingerprint = try ddlFingerprintAlloc(alloc, prepare_statement);
     defer alloc.free(prepare_statement_fingerprint);
-    try std.testing.expectEqualStrings("ddl:prepare_statement:name=usage_plan:params=1:subject=read", prepare_statement_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepare_statement:name=usage_plan:params=1:subject=read:statement=read", prepare_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_statement));
 
     var prepare_merge_statement = try lowerDdlPlanAlloc(alloc, "PREPARE merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
     defer prepare_merge_statement.deinit(alloc);
     const prepare_merge_statement_fingerprint = try ddlFingerprintAlloc(alloc, prepare_merge_statement);
     defer alloc.free(prepare_merge_statement_fingerprint);
-    try std.testing.expectEqualStrings("ddl:prepare_statement:name=merge_plan:params=0:subject=write", prepare_merge_statement_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepare_statement:name=merge_plan:params=0:subject=write:statement=merge", prepare_merge_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_merge_statement));
 
     var prepare_cte_write_statement = try lowerDdlPlanAlloc(alloc, "PREPARE cte_write_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);");
     defer prepare_cte_write_statement.deinit(alloc);
     const prepare_cte_write_statement_fingerprint = try ddlFingerprintAlloc(alloc, prepare_cte_write_statement);
     defer alloc.free(prepare_cte_write_statement_fingerprint);
-    try std.testing.expectEqualStrings("ddl:prepare_statement:name=cte_write_plan:params=0:subject=write", prepare_cte_write_statement_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepare_statement:name=cte_write_plan:params=0:subject=write:statement=update", prepare_cte_write_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_cte_write_statement));
 
     var execute_statement = try lowerDdlPlanAlloc(alloc, "EXECUTE usage_plan('open');");
@@ -56815,8 +56831,8 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
         .prepared_statement => |plan| switch (plan) {
             .prepare => |prepare| try std.fmt.allocPrint(
                 alloc,
-                "ddl:prepare_statement:name={s}:params={d}:subject={s}",
-                .{ prepare.statement_name, prepare.parameter_count, @tagName(prepare.statement_kind) },
+                "ddl:prepare_statement:name={s}:params={d}:subject={s}:statement={s}",
+                .{ prepare.statement_name, prepare.parameter_count, @tagName(prepare.statement_kind), @tagName(prepare.statement_family) },
             ),
             .execute => |execute| try std.fmt.allocPrint(
                 alloc,
@@ -60819,7 +60835,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = 'open'",
         .family = .ddl,
         .summary = .{ .ddl_tag = .prepare_statement, .table_name = "usage_plan", .operations = 1 },
-        .plan = "ddl:prepare_statement:name=usage_plan:params=1:subject=read",
+        .plan = "ddl:prepare_statement:name=usage_plan:params=1:subject=read:statement=read",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{

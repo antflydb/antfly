@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "de09f067f8fc0de51a86e059f834e4f1c31b3d6f383801715325614e57b0fc65",
+  "source_sha256": "13e682d63b239f8803126611717f73e6438a6a6809a891d0673b16b6193f6c7b",
   "source_entry_count": 954,
   "entry_count": 954,
   "skipped_entries": [
@@ -15,7 +15,7 @@
         "table_name": "usage_plan",
         "operations": 1
       },
-      "plan": "ddl:prepare_statement:name=usage_plan:params=1:subject=read",
+      "plan": "ddl:prepare_statement:name=usage_plan:params=1:subject=read:statement=read",
       "sql": "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1"
     },
     {
@@ -26,7 +26,7 @@
         "table_name": "cte_insert_plan",
         "operations": 0
       },
-      "plan": "ddl:prepare_statement:name=cte_insert_plan:params=0:subject=write",
+      "plan": "ddl:prepare_statement:name=cte_insert_plan:params=0:subject=write:statement=insert_source",
       "sql": "PREPARE cte_insert_plan AS WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archived_records(id) SELECT id FROM source_rows"
     },
     {
@@ -37,7 +37,7 @@
         "table_name": "cte_write_plan",
         "operations": 0
       },
-      "plan": "ddl:prepare_statement:name=cte_write_plan:params=0:subject=write",
+      "plan": "ddl:prepare_statement:name=cte_write_plan:params=0:subject=write:statement=update",
       "sql": "PREPARE cte_write_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
     },
     {
@@ -48,7 +48,7 @@
         "table_name": "cte_delete_plan",
         "operations": 0
       },
-      "plan": "ddl:prepare_statement:name=cte_delete_plan:params=0:subject=write",
+      "plan": "ddl:prepare_statement:name=cte_delete_plan:params=0:subject=write:statement=delete",
       "sql": "PREPARE cte_delete_plan AS WITH source_rows AS (SELECT id FROM usage_records) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)"
     },
     {
@@ -59,7 +59,7 @@
         "table_name": "cte_merge_plan",
         "operations": 0
       },
-      "plan": "ddl:prepare_statement:name=cte_merge_plan:params=0:subject=write",
+      "plan": "ddl:prepare_statement:name=cte_merge_plan:params=0:subject=write:statement=merge",
       "sql": "PREPARE cte_merge_plan AS WITH source_rows AS (SELECT id, status FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
     },
     {

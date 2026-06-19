@@ -104,11 +104,13 @@ pub const SavepointNameSyntax = struct {
 };
 
 pub const PreparedStatementSubjectSyntax = classifier.SqlPreparedStatementSubjectKind;
+pub const PreparedStatementStatementSyntax = classifier.SqlPreparedStatementStatementKind;
 
 pub const PrepareStatementSyntax = struct {
     statement_name: []const u8,
     parameter_count: usize = 0,
     statement_kind: PreparedStatementSubjectSyntax,
+    statement_family: PreparedStatementStatementSyntax,
 };
 
 pub const ExecutePreparedStatementSyntax = struct {
@@ -1755,12 +1757,14 @@ pub fn parsePrepareStatementTail(tokens: []const Token, pos: *usize) !PrepareSta
     const statement_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     const parameter_count = if (cursor.peekKind(.lparen)) try countParenthesizedTypeList(cursor) else 0;
     try cursor.expectKeyword("as");
-    const statement_kind = classifier.classifyPreparedStatementSubjectKind(tokens, cursor.checkpoint()) orelse return error.UnsupportedSqlShape;
+    const statement_family = classifier.classifyPreparedStatementStatementKind(tokens, cursor.checkpoint()) orelse return error.UnsupportedSqlShape;
+    const statement_kind = classifier.preparedStatementSubjectKindFromStatementKind(statement_family);
     try consumePreparedStatementSubjectTail(cursor);
     return .{
         .statement_name = statement_token.text,
         .parameter_count = parameter_count,
         .statement_kind = statement_kind,
+        .statement_family = statement_family,
     };
 }
 
@@ -8685,6 +8689,7 @@ test "sql adapter grammar parses prepared statement syntax" {
     try std.testing.expectEqualStrings("usage_plan", prepare.statement_name);
     try std.testing.expectEqual(@as(usize, 2), prepare.parameter_count);
     try std.testing.expectEqual(PreparedStatementSubjectSyntax.read, prepare.statement_kind);
+    try std.testing.expectEqual(PreparedStatementStatementSyntax.read, prepare.statement_family);
     try std.testing.expectEqual(prepare_tokens.items.len, prepare_pos);
 
     var prepare_merge_tokens = try lexer.tokenizeAlloc(alloc, "merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
@@ -8694,6 +8699,7 @@ test "sql adapter grammar parses prepared statement syntax" {
     try std.testing.expectEqualStrings("merge_plan", prepare_merge.statement_name);
     try std.testing.expectEqual(@as(usize, 0), prepare_merge.parameter_count);
     try std.testing.expectEqual(PreparedStatementSubjectSyntax.write, prepare_merge.statement_kind);
+    try std.testing.expectEqual(PreparedStatementStatementSyntax.merge, prepare_merge.statement_family);
     try std.testing.expectEqual(prepare_merge_tokens.items.len, prepare_merge_pos);
 
     var prepare_cte_write_tokens = try lexer.tokenizeAlloc(alloc, "usage_cte_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);");
@@ -8703,6 +8709,7 @@ test "sql adapter grammar parses prepared statement syntax" {
     try std.testing.expectEqualStrings("usage_cte_plan", prepare_cte_write.statement_name);
     try std.testing.expectEqual(@as(usize, 0), prepare_cte_write.parameter_count);
     try std.testing.expectEqual(PreparedStatementSubjectSyntax.write, prepare_cte_write.statement_kind);
+    try std.testing.expectEqual(PreparedStatementStatementSyntax.update, prepare_cte_write.statement_family);
     try std.testing.expectEqual(prepare_cte_write_tokens.items.len, prepare_cte_write_pos);
 
     var execute_tokens = try lexer.tokenizeAlloc(alloc, "usage_plan('open', -3, true, null);");

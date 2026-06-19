@@ -46,6 +46,17 @@ pub const SqlPreparedStatementSubjectKind = enum {
     ddl,
 };
 
+pub const SqlPreparedStatementStatementKind = enum {
+    read,
+    insert,
+    insert_source,
+    update,
+    delete,
+    truncate,
+    merge,
+    ddl,
+};
+
 pub fn classifyStatementFamily(tokens: []const Token) ?SqlStatementFamily {
     const first = firstIdentifier(tokens) orelse return null;
     if (std.ascii.eqlIgnoreCase(first, "select")) return .select;
@@ -71,21 +82,22 @@ pub fn classifyWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
 }
 
 pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize) ?SqlPreparedStatementSubjectKind {
+    return preparedStatementSubjectKindFromStatementKind(classifyPreparedStatementStatementKind(tokens, start) orelse return null);
+}
+
+pub fn classifyPreparedStatementStatementKind(tokens: []const Token, start: usize) ?SqlPreparedStatementStatementKind {
     if (statementStartsAt(tokens, start, "select")) return .read;
     if (statementStartsAt(tokens, start, "with")) {
         const final_index = withFinalStatementIndex(tokens[start..]) orelse return null;
         if (std.ascii.eqlIgnoreCase(tokens[start + final_index].text, "select")) return .read;
-        if (withFinalStatementWriteKind(tokens[start + final_index].text) != null) return .write;
+        if (withFinalStatementWriteKind(tokens[start + final_index].text)) |kind| return preparedStatementKindFromWriteKind(kind);
         return null;
     }
-    if (statementStartsAt(tokens, start, "insert") or
-        statementStartsAt(tokens, start, "update") or
-        statementStartsAt(tokens, start, "delete") or
-        statementStartsAt(tokens, start, "truncate") or
-        statementStartsAt(tokens, start, "merge"))
-    {
-        return .write;
-    }
+    if (statementStartsAt(tokens, start, "insert")) return .insert;
+    if (statementStartsAt(tokens, start, "update")) return .update;
+    if (statementStartsAt(tokens, start, "delete")) return .delete;
+    if (statementStartsAt(tokens, start, "truncate")) return .truncate;
+    if (statementStartsAt(tokens, start, "merge")) return .merge;
     if (statementStartsAt(tokens, start, "create") or
         statementStartsAt(tokens, start, "alter") or
         statementStartsAt(tokens, start, "drop"))
@@ -93,6 +105,31 @@ pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize)
         return .ddl;
     }
     return null;
+}
+
+pub fn preparedStatementSubjectKindFromStatementKind(kind: SqlPreparedStatementStatementKind) SqlPreparedStatementSubjectKind {
+    return switch (kind) {
+        .read => .read,
+        .insert,
+        .insert_source,
+        .update,
+        .delete,
+        .truncate,
+        .merge,
+        => .write,
+        .ddl => .ddl,
+    };
+}
+
+fn preparedStatementKindFromWriteKind(kind: SqlWriteStatementKind) SqlPreparedStatementStatementKind {
+    return switch (kind) {
+        .insert => .insert,
+        .insert_source => .insert_source,
+        .update => .update,
+        .delete => .delete,
+        .truncate => .truncate,
+        .merge => .merge,
+    };
 }
 
 fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
