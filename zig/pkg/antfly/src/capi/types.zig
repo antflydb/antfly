@@ -152,7 +152,9 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.UnsupportedQueryRequest,
         error.InvalidAggregation,
         error.UnsupportedAggregation,
+        error.ReadOnly,
         => .invalid_argument,
+        error.FileNotFound => .not_found,
         else => .internal,
     };
 }

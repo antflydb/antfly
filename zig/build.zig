@@ -2029,6 +2029,7 @@ pub fn build(b: *std.Build) void {
     capi_step.dependOn(&install_capi_lib.step);
 
     const capi_default_filters = [_][]const u8{
+        "capi lite opens exports imports checks and vacuums aflite",
         "capi execute graph queries honors identity read generation",
         "capi search rejects stale identity generation before readable lease hook",
         "capi search json returns stamped identity generation",

@@ -30,6 +30,8 @@ const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
 const schema_mod = antfly.schema;
+const lsm_backend = antfly.lsm_backend;
+const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
 
 fn monotonicNowNs() u64 {
@@ -53,6 +55,7 @@ const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     readable_lease_hook: ?ReadableLeaseHook = null,
+    owned_lite_storage: ?*lsm_backend.AfliteContainerStorage = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -94,6 +97,15 @@ const Handle = struct {
         try hook.featureReads().prepareScan(hook.group_id, from_key, to_key, opts);
     }
 };
+
+fn closeHandle(handle: *Handle) void {
+    handle.db.close();
+    if (handle.owned_lite_storage) |storage| {
+        storage.deinit();
+        handle.alloc.destroy(storage);
+    }
+    handle.alloc.destroy(handle);
+}
 
 fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64 {
     return try handle.db.currentIdentityReadGenerationForRequest(requested);
@@ -157,6 +169,12 @@ fn cleanupTestDir(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+fn cleanupTestFile(path: []const u8) void {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch {};
 }
 
 fn beginWithIdAndParticipants(
@@ -1546,8 +1564,84 @@ pub export fn antfly_db_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi
 
 pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
     const handle = asHandle(handle_ptr) orelse return;
-    handle.db.close();
-    handle.alloc.destroy(handle);
+    closeHandle(handle);
+}
+
+fn pinLiteStorage(opts: *db_mod.OpenOptions, storage: lsm_backend.Storage) void {
+    opts.storage = storage;
+    opts.index_backends.text_lsm_storage = storage;
+    opts.index_backends.dense_lsm_storage = storage;
+    opts.index_backends.sparse_lsm_storage = storage;
+    opts.index_backends.graph_lsm_storage = storage;
+}
+
+fn openLiteHandle(path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, out_handle: *?*anyopaque) capi.ErrorCode {
+    const alloc = std.heap.c_allocator;
+    const handle = alloc.create(Handle) catch return .internal;
+    errdefer alloc.destroy(handle);
+
+    var storage = alloc.create(lsm_backend.AfliteContainerStorage) catch return .internal;
+    errdefer alloc.destroy(storage);
+    storage.* = lsm_backend.AfliteContainerStorage.openWithOptions(alloc, path, .{
+        .read_only = open_mode == .query_readonly or open_mode == .status_only,
+    }) catch |err| return capi.mapError(err);
+    errdefer storage.deinit();
+
+    var opts = db_mod.OpenOptions{
+        .open_mode = open_mode,
+        .external_derived_checkpoints = false,
+    };
+    pinLiteStorage(&opts, storage.storage());
+
+    const db = db_mod.DB.open(alloc, path, opts) catch |err| return capi.mapError(err);
+    handle.* = .{
+        .alloc = alloc,
+        .db = db,
+        .owned_lite_storage = storage,
+    };
+    out_handle.* = handle;
+    return .ok;
+}
+
+pub export fn antfly_lite_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+    return openLiteHandle(std.mem.span(path), .writer, out_handle);
+}
+
+pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+    return openLiteHandle(std.mem.span(path), .query_readonly, out_handle);
+}
+
+pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_storage == null) return .invalid_argument;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(handle.alloc);
+    portable_backup.exportPortable(handle.alloc, handle.db.core.store, &out) catch |err| return capi.mapError(err);
+    const bytes = out.toOwnedSlice(handle.alloc) catch return .internal;
+    out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_storage == null) return .invalid_argument;
+    portable_backup.importPortable(handle.alloc, handle.db.core.store, backup.bytes()) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const storage = handle.owned_lite_storage orelse return .invalid_argument;
+    out_buf.* = stringifyJson(storage.check() catch |err| return capi.mapError(err)) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const storage = handle.owned_lite_storage orelse return .invalid_argument;
+    out_buf.* = stringifyJson(storage.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
+    return .ok;
 }
 
 pub export fn antfly_db_set_readable_lease_hook(
@@ -5666,6 +5760,86 @@ test "capi batch and lookup json" {
     }, &out));
     defer antfly_db_buffer_free(out.ptr, out.len);
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"title\":\"ok\"") != null);
+}
+
+test "capi lite opens exports imports checks and vacuums aflite" {
+    const alloc = std.testing.allocator;
+    const src_path = try tempTestPath(alloc, "capi-lite-src");
+    defer alloc.free(src_path);
+    const dst_path = try tempTestPath(alloc, "capi-lite-dst");
+    defer alloc.free(dst_path);
+    cleanupTestFile(src_path);
+    cleanupTestFile(dst_path);
+    defer cleanupTestFile(src_path);
+    defer cleanupTestFile(dst_path);
+
+    var src_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
+    defer antfly_db_close(src_handle);
+
+    const writes_a = [_]capi.WriteIntent{
+        .{
+            .key = .{ .ptr = "doc:capi-lite", .len = "doc:capi-lite".len },
+            .value = .{ .ptr = "{\"title\":\"first\"}", .len = "{\"title\":\"first\"}".len },
+            .is_delete = false,
+        },
+        .{
+            .key = .{ .ptr = "doc:gone", .len = "doc:gone".len },
+            .value = .{ .ptr = "{\"title\":\"remove\"}", .len = "{\"title\":\"remove\"}".len },
+            .is_delete = false,
+        },
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &writes_a, writes_a.len, null, 0, 1_000, 0));
+
+    const writes_b = [_]capi.WriteIntent{
+        .{
+            .key = .{ .ptr = "doc:capi-lite", .len = "doc:capi-lite".len },
+            .value = .{ .ptr = "{\"title\":\"second\"}", .len = "{\"title\":\"second\"}".len },
+            .is_delete = false,
+        },
+        .{
+            .key = .{ .ptr = "doc:gone", .len = "doc:gone".len },
+            .value = .{},
+            .is_delete = true,
+        },
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &writes_b, writes_b.len, null, 0, 2_000, 0));
+
+    var check_before: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(src_handle, &check_before));
+    defer antfly_db_buffer_free(check_before.ptr, check_before.len);
+    try std.testing.expect(std.mem.indexOf(u8, check_before.ptr.?[0..check_before.len], "\"valid\":true") != null);
+
+    var vacuumed: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &vacuumed));
+    defer antfly_db_buffer_free(vacuumed.ptr, vacuumed.len);
+    try std.testing.expect(std.mem.indexOf(u8, vacuumed.ptr.?[0..vacuumed.len], "\"reclaimed_bytes\":") != null);
+
+    var backup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_backup(src_handle, &backup));
+    defer antfly_db_buffer_free(backup.ptr, backup.len);
+    try std.testing.expect(backup.len > 0);
+
+    var dst_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(dst_path, &dst_handle));
+    defer antfly_db_close(dst_handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import_backup(dst_handle, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }));
+
+    var lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(dst_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &lookup));
+    defer antfly_db_buffer_free(lookup.ptr, lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.ptr.?[0..lookup.len], "\"second\"") != null);
+
+    var readonly_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(dst_path, &readonly_handle));
+    defer antfly_db_close(readonly_handle);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(readonly_handle, &writes_a, 1, null, 0, 3_000, 0));
 }
 
 test "capi execute graph queries honors identity read generation" {
