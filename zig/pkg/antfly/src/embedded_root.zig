@@ -16,6 +16,7 @@ pub const backend_adapter = @import("storage/backend_adapter.zig");
 pub const backend_types = @import("storage/backend_types.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const lsm_storage = lsm_backend.storage_io;
+pub const lite_backend = @import("storage/lite_backend.zig");
 pub const host_environment = @import("storage/host_environment.zig");
 pub const object_storage = @import("storage/object_storage.zig");
 pub const db = @import("storage/db/db.zig");
@@ -37,6 +38,7 @@ test {
     _ = backend_adapter;
     _ = backend_types;
     _ = lsm_backend;
+    _ = lite_backend;
     _ = host_environment;
     _ = object_storage;
     _ = db;

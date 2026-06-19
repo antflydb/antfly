@@ -29,8 +29,8 @@ const IndexBackendOptions = @TypeOf((db_mod.OpenOptions{}).index_backends);
 pub const types = support.db_types;
 pub const RemoteTemplateRenderConfig = template_remote_host.RenderConfig;
 pub const RemoteTemplateRenderer = template_remote_host.HostRenderer;
-pub const LiteCheckReport = support.lsm_backend.AfliteContainerStorage.CheckReport;
-pub const LiteVacuumReport = support.lsm_backend.AfliteContainerStorage.VacuumReport;
+pub const LiteCheckReport = support.lite_backend.CheckReport;
+pub const LiteVacuumReport = support.lite_backend.VacuumReport;
 
 pub const OpenOptions = struct {
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -66,7 +66,7 @@ pub const DB = struct {
     allocator: Allocator,
     inner: db_mod.DB,
     profile: Profile,
-    owned_lite_storage: ?*support.lsm_backend.AfliteContainerStorage = null,
+    owned_lite_backend: ?support.lite_backend.Handle = null,
 
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return try openWithProfile(alloc, path, opts, .native);
@@ -93,23 +93,15 @@ pub const DB = struct {
     }
 
     pub fn openLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
-        var lite_storage = try alloc.create(support.lsm_backend.AfliteContainerStorage);
-        errdefer alloc.destroy(lite_storage);
-
-        lite_storage.* = try support.lsm_backend.AfliteContainerStorage.openWithOptions(alloc, path, .{
+        var lite_backend = try support.lite_backend.Handle.open(alloc, path, .{
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
         });
-        errdefer lite_storage.deinit();
+        errdefer lite_backend.deinit();
 
-        var lite_opts = opts;
-        pinLiteStorage(&lite_opts, lite_storage.storage());
-
-        var db_opts = toDbOpenOptions(lite_opts, profile);
-        db_opts.external_derived_checkpoints = false;
+        var db_opts = toDbOpenOptions(opts, profile);
+        lite_backend.configureDbOpenOptions(&db_opts);
 
         const inner = db_mod.DB.open(alloc, path, db_opts) catch |err| {
-            lite_storage.deinit();
-            alloc.destroy(lite_storage);
             return err;
         };
 
@@ -117,15 +109,14 @@ pub const DB = struct {
             .allocator = alloc,
             .inner = inner,
             .profile = profile,
-            .owned_lite_storage = lite_storage,
+            .owned_lite_backend = lite_backend,
         };
     }
 
     pub fn close(self: *DB) void {
         self.inner.close();
-        if (self.owned_lite_storage) |lite_storage| {
-            lite_storage.deinit();
-            self.allocator.destroy(lite_storage);
+        if (self.owned_lite_backend) |*lite_backend| {
+            lite_backend.deinit();
         }
         self.* = undefined;
     }
@@ -235,13 +226,13 @@ pub const DB = struct {
     }
 
     pub fn checkLite(self: *DB) !LiteCheckReport {
-        const lite_storage = self.owned_lite_storage orelse return error.NotLiteDatabase;
-        return try lite_storage.check();
+        if (self.owned_lite_backend) |*lite_backend| return try lite_backend.check();
+        return error.NotLiteDatabase;
     }
 
     pub fn vacuumLite(self: *DB) !LiteVacuumReport {
-        const lite_storage = self.owned_lite_storage orelse return error.NotLiteDatabase;
-        return try lite_storage.vacuum();
+        if (self.owned_lite_backend) |*lite_backend| return try lite_backend.vacuum();
+        return error.NotLiteDatabase;
     }
 };
 
@@ -295,14 +286,6 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
 
 fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
     return open_mode == .query_readonly or open_mode == .status_only;
-}
-
-fn pinLiteStorage(opts: *OpenOptions, storage: support.lsm_storage.Storage) void {
-    opts.storage = storage;
-    opts.index_backends.text_lsm_storage = storage;
-    opts.index_backends.dense_lsm_storage = storage;
-    opts.index_backends.sparse_lsm_storage = storage;
-    opts.index_backends.graph_lsm_storage = storage;
 }
 
 fn testLitePath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {

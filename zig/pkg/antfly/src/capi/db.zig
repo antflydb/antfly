@@ -30,7 +30,7 @@ const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
 const schema_mod = antfly.schema;
-const lsm_backend = antfly.lsm_backend;
+const lite_backend = antfly.lite_backend;
 const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
 
@@ -55,7 +55,7 @@ const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     readable_lease_hook: ?ReadableLeaseHook = null,
-    owned_lite_storage: ?*lsm_backend.AfliteContainerStorage = null,
+    owned_lite_backend: ?lite_backend.Handle = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -100,9 +100,8 @@ const Handle = struct {
 
 fn closeHandle(handle: *Handle) void {
     handle.db.close();
-    if (handle.owned_lite_storage) |storage| {
-        storage.deinit();
-        handle.alloc.destroy(storage);
+    if (handle.owned_lite_backend) |*backend| {
+        backend.deinit();
     }
     handle.alloc.destroy(handle);
 }
@@ -1567,37 +1566,27 @@ pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
     closeHandle(handle);
 }
 
-fn pinLiteStorage(opts: *db_mod.OpenOptions, storage: lsm_backend.Storage) void {
-    opts.storage = storage;
-    opts.index_backends.text_lsm_storage = storage;
-    opts.index_backends.dense_lsm_storage = storage;
-    opts.index_backends.sparse_lsm_storage = storage;
-    opts.index_backends.graph_lsm_storage = storage;
-}
-
 fn openLiteHandle(path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, out_handle: *?*anyopaque) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     const handle = alloc.create(Handle) catch return .internal;
     errdefer alloc.destroy(handle);
 
-    var storage = alloc.create(lsm_backend.AfliteContainerStorage) catch return .internal;
-    errdefer alloc.destroy(storage);
-    storage.* = lsm_backend.AfliteContainerStorage.openWithOptions(alloc, path, .{
+    var backend = lite_backend.Handle.open(alloc, path, .{
         .read_only = open_mode == .query_readonly or open_mode == .status_only,
     }) catch |err| return capi.mapError(err);
-    errdefer storage.deinit();
+    errdefer backend.deinit();
 
     var opts = db_mod.OpenOptions{
         .open_mode = open_mode,
         .external_derived_checkpoints = false,
     };
-    pinLiteStorage(&opts, storage.storage());
+    backend.configureDbOpenOptions(&opts);
 
     const db = db_mod.DB.open(alloc, path, opts) catch |err| return capi.mapError(err);
     handle.* = .{
         .alloc = alloc,
         .db = db,
-        .owned_lite_storage = storage,
+        .owned_lite_backend = backend,
     };
     out_handle.* = handle;
     return .ok;
@@ -1613,7 +1602,7 @@ pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: *?*anyo
 
 pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    if (handle.owned_lite_storage == null) return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(handle.alloc);
@@ -1625,23 +1614,27 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer)
 
 pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    if (handle.owned_lite_storage == null) return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
     portable_backup.importPortable(handle.alloc, handle.db.core.store, backup.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const storage = handle.owned_lite_storage orelse return .invalid_argument;
-    out_buf.* = stringifyJson(storage.check() catch |err| return capi.mapError(err)) catch return .internal;
-    return .ok;
+    if (handle.owned_lite_backend) |*backend| {
+        out_buf.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
+        return .ok;
+    }
+    return .invalid_argument;
 }
 
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const storage = handle.owned_lite_storage orelse return .invalid_argument;
-    out_buf.* = stringifyJson(storage.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
-    return .ok;
+    if (handle.owned_lite_backend) |*backend| {
+        out_buf.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
+        return .ok;
+    }
+    return .invalid_argument;
 }
 
 pub export fn antfly_db_set_readable_lease_hook(
