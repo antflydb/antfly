@@ -5040,6 +5040,7 @@ pub const ExternalObjectStorageLakeRowsSourceOptions = struct {
     cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
     serving_cache_max_bytes: ?usize = null,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
+    sidecar_context: PinnedExternalLakeSidecarContext = .{},
     file_bucket: []const u8 = "external-lake",
     object_uri_base: ?[]const u8 = null,
 };
@@ -5139,6 +5140,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         var pinned_source = PinnedExternalObjectStorageLakeRowsSource.init(inventory, client);
         pinned_source.scanner.cache = source_options.cache;
         pinned_source.scanner.coalesce_options = source_options.coalesce_options;
+        pinned_source.scanner.sidecar_context = source_options.sidecar_context;
         return .{
             .alloc = alloc,
             .inventory = inventory,
@@ -5173,6 +5175,10 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     pub fn rangeCacheStats(self: *const @This()) ?serverless_query.LakeParquetObjectRangeCacheStats {
         const cache = self.owned_cache orelse return null;
         return cache.statsSnapshot();
+    }
+
+    pub fn sidecarContext(self: *const @This()) PinnedExternalLakeSidecarContext {
+        return self.pinned_source.scanner.sidecar_context;
     }
 
     pub fn planProjectedScanAlloc(
@@ -5463,6 +5469,10 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
 
     pub fn rangeCacheStats(self: *const @This()) ?serverless_query.LakeParquetObjectRangeCacheStats {
         return self.owned_source.rangeCacheStats();
+    }
+
+    pub fn sidecarContext(self: *const @This()) PinnedExternalLakeSidecarContext {
+        return self.owned_source.sidecarContext();
     }
 
     pub fn planProjectedScanAlloc(
@@ -18178,11 +18188,38 @@ test "opened object storage lake source can own serving object range cache" {
         "bucket",
         "events",
     );
+    const sidecars = [_]sidecar_manifest_api.DeclaredArtifact{.{
+        .name = "events.amount.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_parquet,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "sha256:expected",
+            .schema_fingerprint = "schema-v1",
+            .column_bindings = &[_][]const u8{"amount"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = artifact_ref_api.ArtifactKind.vector_segment,
+            .name = "events.amount.vector",
+            .artifact_id = "artifact:vector:expected",
+            .byte_len = 1,
+            .checksum = "sha256:artifact",
+        },
+    }};
+    const desired = [_]serverless_query.LakeSidecarDesired{.{ .kind = source_binding_api.SidecarKind.vector }};
     var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
         alloc,
         schema,
         opened_store,
-        .{ .serving_cache_max_bytes = 1024 },
+        .{
+            .serving_cache_max_bytes = 1024,
+            .sidecar_context = .{
+                .sidecars = sidecars[0..],
+                .desired_sidecars = desired[0..],
+            },
+        },
     );
     defer opened_source.deinit();
 
@@ -18192,6 +18229,10 @@ test "opened object storage lake source can own serving object range cache" {
     try std.testing.expect(owned_cache.policy.isProtected(.metadata));
     try std.testing.expect(owned_cache.policy.isProtected(.serving_sidecar));
     try std.testing.expectEqual(@as(?usize, 128), owned_cache.policy.laneLimit(.broad_scan_scratch));
+    const sidecar_context = opened_source.sidecarContext();
+    try std.testing.expectEqual(@as(usize, 1), sidecar_context.sidecars.len);
+    try std.testing.expectEqual(@as(usize, 1), sidecar_context.desired_sidecars.len);
+    try std.testing.expectEqualStrings("events.amount.vector", sidecar_context.sidecars[0].name);
 
     var external_cache = serverless_query.initLakeParquetServingObjectRangeCache(2048);
     defer external_cache.deinit(alloc);

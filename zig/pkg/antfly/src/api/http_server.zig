@@ -51,6 +51,8 @@ const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
 const lake_base_source = @import("../serverless/manifest/base_source.zig");
+const lake_artifact_ref = @import("../serverless/manifest/artifact_ref.zig");
+const lake_sidecar_manifest = @import("../serverless/segment/sidecar_manifest.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -260,6 +262,10 @@ pub const ApiHttpServerConfig = struct {
     /// When set, opened external lake sources own an object-range cache with the
     /// named lake-serving policy.
     external_lake_serving_cache_max_bytes: ?usize = null,
+    /// Optional sidecar declarations/candidates for external lake routing.
+    /// Operator/query layers can install this while concrete sidecar query
+    /// operators are being wired into public requests.
+    external_lake_sidecar_context: table_reads.PinnedExternalLakeSidecarContext = .{},
 };
 
 const RowsUniqueSelectorResolverContext = struct {
@@ -1543,6 +1549,7 @@ pub const ApiHttpServer = struct {
     fn externalLakeRowsSourceOptions(self: *const ApiHttpServer) table_reads.ExternalObjectStorageLakeRowsSourceOptions {
         return .{
             .serving_cache_max_bytes = self.cfg.external_lake_serving_cache_max_bytes,
+            .sidecar_context = self.cfg.external_lake_sidecar_context,
         };
     }
 
@@ -8629,9 +8636,16 @@ pub const ApiHttpServer = struct {
             error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
             else => return err,
         };
+        const sidecar_context = lake_source.sidecarContext();
+        const sidecar_artifacts = try lakeSidecarArtifactsAlloc(self.alloc, sidecar_context.sidecars);
+        defer if (sidecar_artifacts.len > 0) self.alloc.free(sidecar_artifacts);
         const plan = try serverless_query.explainLakeQuery(.{
             .base_source = externalLakeBaseSourceDescriptor(state),
-            .artifacts = &.{},
+            .artifacts = sidecar_artifacts,
+            .sidecars = sidecar_context.sidecars,
+            .desired_sidecars = sidecar_context.desired_sidecars,
+            .sidecar_policy = sidecar_context.sidecar_policy,
+            .candidate_sets = sidecar_context.candidates,
             .operation = explained.operation,
             .projected_column_count = explained.projected_column_count,
             .range_cache_stats = lake_source.rangeCacheStats(),
@@ -8777,6 +8791,18 @@ pub const ApiHttpServer = struct {
             initialized += 1;
         }
         return out;
+    }
+
+    fn lakeSidecarArtifactsAlloc(
+        alloc: std.mem.Allocator,
+        sidecars: []const lake_sidecar_manifest.DeclaredArtifact,
+    ) ![]lake_artifact_ref.ArtifactRef {
+        if (sidecars.len == 0) return &.{};
+        const artifacts = try alloc.alloc(lake_artifact_ref.ArtifactRef, sidecars.len);
+        for (sidecars, 0..) |sidecar, idx| {
+            artifacts[idx] = sidecar.artifact;
+        }
+        return artifacts;
     }
 
     fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
@@ -19099,6 +19125,7 @@ test "api http server routes public external lake row queries through configured
     const FakeLakeResolver = struct {
         memory: *object_storage_api.MemoryObjectStorage,
         expected_serving_cache_max_bytes: ?usize = null,
+        expected_sidecar_count: usize = 0,
         open_count: u32 = 0,
 
         fn resolver(self: *@This()) table_reads.ExternalLakeObjectStoreResolver {
@@ -19121,6 +19148,7 @@ test "api http server routes public external lake row queries through configured
             try std.testing.expectEqual(external_source_api.Format.parquet, binding.format);
             try std.testing.expectEqualStrings("s3://bucket/events", binding.source_uri);
             try std.testing.expectEqual(self.expected_serving_cache_max_bytes, options.serving_cache_max_bytes);
+            try std.testing.expectEqual(self.expected_sidecar_count, options.sidecar_context.sidecars.len);
             return try object_store_support.OpenedObjectStore.initWithClient(inner_alloc, self.memory.client(), "bucket", "events");
         }
     };
@@ -19147,15 +19175,39 @@ test "api http server routes public external lake row queries through configured
         .desired_replica_count = 1,
     }} };
     var base_reads = FakeBaseReads{};
+    const sidecars = [_]lake_sidecar_manifest.DeclaredArtifact{.{
+        .name = "events.amount.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_parquet,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "sha256:configured",
+            .schema_fingerprint = "schema-v1",
+            .column_bindings = &[_][]const u8{"amount"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = lake_artifact_ref.ArtifactKind.vector_segment,
+            .name = "events.amount.vector",
+            .artifact_id = "artifact:vector:configured",
+            .byte_len = 1,
+            .checksum = "sha256:artifact",
+        },
+    }};
     var resolver = FakeLakeResolver{
         .memory = &memory,
         .expected_serving_cache_max_bytes = 4096,
+        .expected_sidecar_count = 1,
     };
     var server = ApiHttpServer.init(
         alloc,
         .{
             .external_lake_object_store_resolver = resolver.resolver(),
             .external_lake_serving_cache_max_bytes = 4096,
+            .external_lake_sidecar_context = .{
+                .sidecars = sidecars[0..],
+            },
         },
         source.iface(),
         base_reads.source(),
@@ -19270,6 +19322,10 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 0), explain_plan.get("projected_column_count").?.integer);
     try std.testing.expect(std.mem.startsWith(u8, explain_plan.get("snapshot_id").?.string, "sha256:"));
     try std.testing.expectEqualStrings("schema-v1", explain_plan.get("schema_fingerprint").?.string);
+    const sidecar_selection = explain_plan.get("sidecar_selection").?.object;
+    try std.testing.expectEqual(@as(i64, 1), sidecar_selection.get("declared_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), sidecar_selection.get("selected_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), sidecar_selection.get("not_requested_count").?.integer);
     const range_cache = explain_plan.get("range_cache_accounting").?.object;
     const total_range_cache = range_cache.get("total").?.object;
     try std.testing.expectEqual(@as(i64, 0), total_range_cache.get("stored_bytes").?.integer);
