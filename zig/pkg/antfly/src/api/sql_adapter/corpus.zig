@@ -4383,6 +4383,13 @@ pub const AppParityCorpusCoverage = struct {
     schema_temporal_portion_delete: bool = false,
     schema_temporal_range_column_portion_update: bool = false,
     schema_temporal_range_column_portion_delete: bool = false,
+    migration_equivalent_data_backfill_delete: bool = false,
+    migration_equivalent_data_backfill_insert: bool = false,
+    migration_equivalent_data_backfill_update: bool = false,
+    migration_equivalent_schema_metadata: bool = false,
+    migration_equivalent_schema_rebuild: bool = false,
+    migration_equivalent_schema_rewrite: bool = false,
+    migration_equivalent_schema_validation: bool = false,
     unsupported_ddl_system_time_temporal_table: bool = false,
     unsupported_duplicate_row_batch_target: bool = false,
     unsupported_duplicate_conflict_update_target: bool = false,
@@ -4568,6 +4575,9 @@ pub const AppParityCorpusCoverage = struct {
         const is_update_joined_source = entry.family == .update_joined_source;
         const is_delete_joined_source = entry.family == .delete_joined_source;
         const is_joined_source = is_update_joined_source or is_delete_joined_source;
+        const applied_rebuild = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true);
+        const applied_validation = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true);
+        const applied_rewrite = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
         if (entry.params.len > 0) {
             switch (entry.family) {
                 .query => self.parameterized_query = true,
@@ -4980,12 +4990,21 @@ pub const AppParityCorpusCoverage = struct {
         self.update_source_regexp_substr_expression = self.update_source_regexp_substr_expression or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
+        self.migration_equivalent_data_backfill_insert = self.migration_equivalent_data_backfill_insert or entry.family == .insert_source;
+        self.migration_equivalent_data_backfill_update = self.migration_equivalent_data_backfill_update or entry.family == .update_source or entry.family == .update_joined_source;
+        self.migration_equivalent_data_backfill_delete = self.migration_equivalent_data_backfill_delete or entry.family == .delete_source or entry.family == .delete_joined_source;
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
         if (entry.applied_plan.len > 0) {
             self.applied_catalog_plan = true;
-            self.applied_catalog_rebuild = self.applied_catalog_rebuild or sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true);
-            self.applied_catalog_validation = self.applied_catalog_validation or sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true);
-            self.applied_catalog_rewrite = self.applied_catalog_rewrite or sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
+            self.applied_catalog_rebuild = self.applied_catalog_rebuild or applied_rebuild;
+            self.applied_catalog_validation = self.applied_catalog_validation or applied_validation;
+            self.applied_catalog_rewrite = self.applied_catalog_rewrite or applied_rewrite;
+            if (entry.family == .ddl) {
+                self.migration_equivalent_schema_metadata = self.migration_equivalent_schema_metadata or (!applied_rebuild and !applied_validation and !applied_rewrite);
+                self.migration_equivalent_schema_rebuild = self.migration_equivalent_schema_rebuild or applied_rebuild;
+                self.migration_equivalent_schema_validation = self.migration_equivalent_schema_validation or applied_validation;
+                self.migration_equivalent_schema_rewrite = self.migration_equivalent_schema_rewrite or applied_rewrite;
+            }
         }
         switch (entry.family) {
             .ddl => self.ddl = true,

@@ -1091,7 +1091,14 @@ coverage accumulator by exact field name, so strengthening or relaxing a require
 coverage bucket is a fixture review instead of a Zig assertion edit. The parser
 requires that fixture to enumerate every boolean and counter accumulator field,
 which makes newly added coverage dimensions fail closed until they become
-explicit review policy. SQL adapter
+explicit review policy. Migration-equivalence coverage is explicit in that
+fixture: source-based insert/update/delete rewrites must stay represented as
+data-backfill buckets, and schema changes must retain separate buckets for
+metadata-only catalog updates, derived-artifact rebuild work, constraint
+validation work, and row-image rewrite/backfill work. Those buckets are derived
+from typed plan families and exact `applied_plan` lifecycle tokens, not fixture
+names or raw SQL substrings, so a stale corpus entry cannot accidentally satisfy
+the migration contract. SQL adapter
 edge cases that are not golden typed-plan entries, such as comment preservation,
 malformed placeholder suffixes, statement-kind classification, and fail-closed
 point-lowerer boundaries, live in
@@ -1956,7 +1963,11 @@ remain catalog workflow concerns.
 Plain nullable `ADD COLUMN` is rebuild-only for derived artifacts. Constraint
 additions, `SET NOT NULL`, and `VALIDATE CONSTRAINT` carry validation work, and
 generated/default/non-null additions plus drop/rename/type replacement carry
-base-row rewrite/backfill work.
+base-row rewrite/backfill work. Migration-equivalent data changes use ordinary
+typed source mutation plans (`insert_source`, `update_source`,
+`delete_source`, and joined update/delete sources); the parity gate requires
+those families independently from point DML so data backfill support cannot be
+mistaken for single-row write coverage.
 
 The source fixture also includes read-classifier entries for row-query,
 aggregate, join, lateral, and window statements, proving that the
