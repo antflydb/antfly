@@ -1201,14 +1201,14 @@ fn writeExtensionPackageFields(writer: *std.Io.Writer, options: CatalogOptions, 
     try writer.writeAll(",\"capabilitiesRequestedCount\":");
     try writer.print("{d}", .{package.capabilities_requested.len});
     try writer.writeAll("},\"trustManifest\":");
-    try writePackageTrustManifest(writer, options.publisher_domain, package);
+    try writePackageTrustManifest(writer, options, package);
 }
 
-fn writePackageTrustManifest(writer: *std.Io.Writer, publisher_domain: []const u8, package: extension_domain.PackageManifest) !void {
-    try writeTrustManifestPrefix(writer, publisher_domain);
+fn writePackageTrustManifest(writer: *std.Io.Writer, options: CatalogOptions, package: extension_domain.PackageManifest) !void {
+    try writeTrustManifestPrefix(writer, options.publisher_domain);
     try writer.writeAll(",\"provenance\":[");
     try writer.writeAll("{\"relation\":\"publishedFrom\",\"sourceId\":");
-    try writeStringFmt(writer, "/extensions/v1/packages/{s}/versions/{s}", .{ package.name, package.version });
+    try writeUrlFmt(writer, options.base_url, "/extensions/v1/packages/{s}/versions/{s}", .{ package.name, package.version });
     try writer.writeAll(",\"sourceDigest\":");
     try std.json.Stringify.value(package.digest, .{}, writer);
     try writer.writeByte('}');
@@ -1257,13 +1257,13 @@ fn writeInstalledExtensionFields(writer: *std.Io.Writer, options: CatalogOptions
     try writer.writeAll(",\"grantedCapabilitiesCount\":");
     try writer.print("{d}", .{installed.granted_capabilities.len});
     try writer.writeAll("},\"trustManifest\":");
-    try writeInstalledExtensionTrustManifest(writer, options.publisher_domain, installed);
+    try writeInstalledExtensionTrustManifest(writer, options, installed);
 }
 
-fn writeInstalledExtensionTrustManifest(writer: *std.Io.Writer, publisher_domain: []const u8, installed: extension_domain.InstalledExtension) !void {
-    try writeTrustManifestPrefix(writer, publisher_domain);
+fn writeInstalledExtensionTrustManifest(writer: *std.Io.Writer, options: CatalogOptions, installed: extension_domain.InstalledExtension) !void {
+    try writeTrustManifestPrefix(writer, options.publisher_domain);
     try writer.writeAll(",\"provenance\":[{\"relation\":\"derivedFrom\",\"sourceId\":");
-    try writeStringFmt(writer, "/extensions/v1/packages/{s}/versions/{s}", .{ installed.package_name, installed.package_version });
+    try writeUrlFmt(writer, options.base_url, "/extensions/v1/packages/{s}/versions/{s}", .{ installed.package_name, installed.package_version });
     if (installed.package_digest.len > 0) {
         try writer.writeAll(",\"sourceDigest\":");
         try std.json.Stringify.value(installed.package_digest, .{}, writer);
@@ -2547,7 +2547,7 @@ test "ARD extension package entries use trust provenance for artifact digests" {
         .installed_extensions = &installed,
     };
 
-    const body = try catalogJsonWithExtensionsAlloc(std.testing.allocator, .{ .mode = .tenant }, ctx);
+    const body = try catalogJsonWithExtensionsAlloc(std.testing.allocator, .{ .mode = .tenant, .base_url = "https://tenant.example.com/" }, ctx);
     defer std.testing.allocator.free(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -2563,12 +2563,16 @@ test "ARD extension package entries use trust provenance for artifact digests" {
     try std.testing.expectEqualStrings("did:web:antfly.local", trust_manifest.object.get("identity").?.string);
     const provenance = trust_manifest.object.get("provenance").?.array.items;
     try std.testing.expect(provenance.len >= 3);
+    try std.testing.expectEqualStrings("https://tenant.example.com/extensions/v1/packages/docsaf/versions/1.0.0", provenance[0].object.get("sourceId").?.string);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"sourceDigest\":\"sha256:docs-wasm\"") != null);
 
     const installed_entry = try findCatalogEntryByIdentifierSuffix(parsed.value, ":extension:docsaf:installed");
     try expectMetadataValuesAreScalars(installed_entry.object.get("metadata").?);
     try std.testing.expectEqualStrings("table:docs", installed_entry.object.get("metadata").?.object.get("scope").?.string);
-    try std.testing.expect(installed_entry.object.get("trustManifest") != null);
+    const installed_trust_manifest = installed_entry.object.get("trustManifest").?;
+    const installed_provenance = installed_trust_manifest.object.get("provenance").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), installed_provenance.len);
+    try std.testing.expectEqualStrings("https://tenant.example.com/extensions/v1/packages/docsaf/versions/1.0.0", installed_provenance[0].object.get("sourceId").?.string);
 }
 
 test "ARD search supports extension metadata filters" {
