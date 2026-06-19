@@ -501,7 +501,35 @@ fn resolveSparseArtifactIndex(
 }
 
 fn searchSparseSegmentAlloc(alloc: Allocator, sparse_segment: sparse_segment_mod.Segment, req: query_request.QueryRequest) ![]ScoredDoc {
-    const sparse_query = req.sparse orelse return error.SparseQueryRequired;
+    return try searchSparseSegmentSpecAlloc(
+        alloc,
+        sparse_segment,
+        req.sparse orelse return error.SparseQueryRequired,
+        req.offset,
+        req.limit,
+        req.min_score,
+    );
+}
+
+pub fn searchSparseSegmentDocIdsAlloc(
+    alloc: Allocator,
+    sparse_segment: sparse_segment_mod.Segment,
+    sparse_query: []const query_request.SparseTermWeight,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+) ![]ScoredDoc {
+    return try searchSparseSegmentSpecAlloc(alloc, sparse_segment, sparse_query, offset, limit, min_score);
+}
+
+fn searchSparseSegmentSpecAlloc(
+    alloc: Allocator,
+    sparse_segment: sparse_segment_mod.Segment,
+    sparse_query: []const query_request.SparseTermWeight,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+) ![]ScoredDoc {
     if (sparse_query.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
     const scores = try alloc.alloc(f32, sparse_segment.docs.len);
@@ -529,7 +557,7 @@ fn searchSparseSegmentAlloc(alloc: Allocator, sparse_segment: sparse_segment_mod
         });
     }
     std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
-    return try clipScoredDocsAlloc(alloc, scored.items, req.offset, req.limit, req.min_score);
+    return try clipScoredDocsAlloc(alloc, scored.items, offset, limit, min_score);
 }
 
 fn searchSparseArtifactAlloc(
