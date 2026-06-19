@@ -92,6 +92,14 @@ pub const GraphCandidatePlan = struct {
     sidecar_names: ?[]const []const u8 = null,
 };
 
+pub const CandidatePlanSet = struct {
+    text_plans: []const TextCandidatePlan = &.{},
+    sparse_plans: []const SparseCandidatePlan = &.{},
+    vector_plans: []const VectorCandidatePlan = &.{},
+    graph_plans: []const GraphCandidatePlan = &.{},
+    vector_stats: ?*indexed_reader.SearchExecutionStats = null,
+};
+
 pub const OwnedCandidateSet = struct {
     sidecar_name: []u8,
     row_refs: []rowsource.RowRef,
@@ -379,6 +387,41 @@ pub fn graphCandidateSetsFromArtifactStoreAlloc(
     return .{ .sets = try sets.toOwnedSlice(alloc) };
 }
 
+pub fn candidateSetsFromArtifactStoreAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    plans: CandidatePlanSet,
+) !OwnedCandidateSets {
+    var sets = std.ArrayListUnmanaged(OwnedCandidateSet).empty;
+    errdefer deinitOwnedCandidateSetList(alloc, &sets);
+
+    for (plans.text_plans) |plan| {
+        var produced = try textCandidateSetsFromArtifactStoreAlloc(alloc, artifacts, declarations, plan);
+        defer produced.deinit(alloc);
+        try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.sets);
+    }
+    for (plans.sparse_plans) |plan| {
+        var produced = try sparseCandidateSetsFromArtifactStoreAlloc(alloc, artifacts, declarations, plan);
+        defer produced.deinit(alloc);
+        try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.sets);
+    }
+    var local_vector_stats = indexed_reader.SearchExecutionStats{};
+    const vector_stats = plans.vector_stats orelse &local_vector_stats;
+    for (plans.vector_plans) |plan| {
+        var produced = try vectorCandidateSetsFromArtifactStoreAlloc(alloc, artifacts, declarations, plan, vector_stats);
+        defer produced.deinit(alloc);
+        try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.sets);
+    }
+    for (plans.graph_plans) |plan| {
+        var produced = try graphCandidateSetsFromArtifactStoreAlloc(alloc, artifacts, declarations, plan);
+        defer produced.deinit(alloc);
+        try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.sets);
+    }
+
+    return .{ .sets = try sets.toOwnedSlice(alloc) };
+}
+
 fn selectedTextDeclarationsAlloc(
     alloc: Allocator,
     declarations: []const sidecar_manifest.DeclaredArtifact,
@@ -653,6 +696,115 @@ fn graphEdgeTypeMatches(edge_types: ?[]const []const u8, candidate: []const u8) 
     return false;
 }
 
+fn appendOwnedCandidateSetsIntersectingDuplicatesAlloc(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(OwnedCandidateSet),
+    incoming: []const OwnedCandidateSet,
+) !void {
+    for (incoming) |candidate_set| {
+        if (ownedCandidateSetIndexByName(out.items, candidate_set.sidecar_name)) |existing_idx| {
+            const intersected = try intersectOwnedRowRefsAlloc(
+                alloc,
+                out.items[existing_idx].row_refs,
+                candidate_set.row_refs,
+            );
+            source_binding.freeOwnedRowRefs(alloc, out.items[existing_idx].row_refs);
+            out.items[existing_idx].row_refs = intersected;
+            continue;
+        }
+        var cloned = try cloneOwnedCandidateSetAlloc(alloc, candidate_set);
+        errdefer cloned.deinit(alloc);
+        try out.append(alloc, cloned);
+    }
+}
+
+fn deinitOwnedCandidateSetList(
+    alloc: Allocator,
+    list: *std.ArrayListUnmanaged(OwnedCandidateSet),
+) void {
+    for (list.items) |*set| set.deinit(alloc);
+    list.deinit(alloc);
+    list.* = .empty;
+}
+
+fn ownedCandidateSetIndexByName(values: []const OwnedCandidateSet, name: []const u8) ?usize {
+    for (values, 0..) |value, idx| {
+        if (std.mem.eql(u8, value.sidecar_name, name)) return idx;
+    }
+    return null;
+}
+
+fn cloneOwnedCandidateSetAlloc(
+    alloc: Allocator,
+    source: OwnedCandidateSet,
+) !OwnedCandidateSet {
+    const sidecar_name = try alloc.dupe(u8, source.sidecar_name);
+    errdefer alloc.free(sidecar_name);
+    return .{
+        .sidecar_name = sidecar_name,
+        .row_refs = try cloneRowRefsAlloc(alloc, source.row_refs),
+    };
+}
+
+fn cloneRowRefsAlloc(alloc: Allocator, row_refs: []const rowsource.RowRef) ![]rowsource.RowRef {
+    const out = try alloc.alloc(rowsource.RowRef, row_refs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |row_ref| source_binding.freeOwnedRowRef(alloc, row_ref);
+        alloc.free(out);
+    }
+    for (row_refs, 0..) |row_ref, idx| {
+        out[idx] = try cloneRowRefAlloc(alloc, row_ref);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn intersectOwnedRowRefsAlloc(
+    alloc: Allocator,
+    lhs: []const rowsource.RowRef,
+    rhs: []const rowsource.RowRef,
+) ![]rowsource.RowRef {
+    var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
+    errdefer {
+        for (out.items) |row_ref| source_binding.freeOwnedRowRef(alloc, row_ref);
+        out.deinit(alloc);
+    }
+    for (lhs) |row_ref| {
+        if (!rowRefSliceContains(rhs, row_ref)) continue;
+        if (rowRefSliceContains(out.items, row_ref)) continue;
+        try out.append(alloc, try cloneRowRefAlloc(alloc, row_ref));
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn cloneRowRefAlloc(alloc: Allocator, row_ref: rowsource.RowRef) !rowsource.RowRef {
+    const key = try source_binding.rowRefKeyAlloc(alloc, row_ref);
+    defer alloc.free(key);
+    return try source_binding.rowRefFromKeyAlloc(alloc, key);
+}
+
+fn rowRefSliceContains(values: []const rowsource.RowRef, needle: rowsource.RowRef) bool {
+    for (values) |value| {
+        if (rowRefsEqual(value, needle)) return true;
+    }
+    return false;
+}
+
+fn rowRefsEqual(lhs: rowsource.RowRef, rhs: rowsource.RowRef) bool {
+    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+    return switch (lhs) {
+        .relational_key => |lhs_key| std.mem.eql(u8, lhs_key, rhs.relational_key),
+        .serverless => |lhs_ref| std.mem.eql(u8, lhs_ref.fragment_id, rhs.serverless.fragment_id) and
+            lhs_ref.row_ordinal == rhs.serverless.row_ordinal,
+        .external => |lhs_ref| std.mem.eql(u8, lhs_ref.source_id, rhs.external.source_id) and
+            std.mem.eql(u8, lhs_ref.snapshot_id, rhs.external.snapshot_id) and
+            std.mem.eql(u8, lhs_ref.file_id, rhs.external.file_id) and
+            lhs_ref.row_group_ordinal == rhs.external.row_group_ordinal and
+            lhs_ref.row_ordinal == rhs.external.row_ordinal,
+    };
+}
+
 test "lake text sidecar candidate producer decodes external row refs from hits" {
     const alloc = std.testing.allocator;
     const binding = source_binding.Binding{
@@ -882,6 +1034,156 @@ test "lake text sidecar candidate producer loads payloads from artifact store" {
     try std.testing.expectEqual(@as(usize, 1), lake_candidate_sets[0].row_refs.len);
     try std.testing.expectEqualStrings("file-a.parquet", lake_candidate_sets[0].row_refs[0].external.file_id);
     try std.testing.expectEqual(@as(u64, 1), lake_candidate_sets[0].row_refs[0].external.row_ordinal);
+}
+
+test "lake sidecar candidate planner combines text and sparse plans" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const artifact_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifacts", .{tmp.sub_path});
+    defer alloc.free(artifact_path);
+    var fs = try artifacts_mod.FsStore.init(alloc, artifact_path);
+    var store = fs.artifactStore();
+    defer store.deinit();
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 0,
+        } },
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 0,
+            .row_ordinal = 1,
+        } },
+    };
+    const key_a = try source_binding.rowRefKeyAlloc(alloc, row_refs[0]);
+    defer alloc.free(key_a);
+    const key_b = try source_binding.rowRefKeyAlloc(alloc, row_refs[1]);
+    defer alloc.free(key_b);
+
+    const text_docs = [_]text_segment.DocumentEntry{
+        .{ .doc_id = key_a, .normalized_text = @constCast("alpha beta"), .token_count = 2 },
+        .{ .doc_id = key_b, .normalized_text = @constCast("beta gamma"), .token_count = 2 },
+    };
+    const text_beta_postings = [_]text_segment.Posting{
+        .{ .doc_index = 0, .term_freq = 1 },
+        .{ .doc_index = 1, .term_freq = 1 },
+    };
+    const text_gamma_postings = [_]text_segment.Posting{.{ .doc_index = 1, .term_freq = 1 }};
+    const text_terms = [_]text_segment.TermEntry{
+        .{ .term = @constCast("beta"), .postings = @constCast(text_beta_postings[0..]) },
+        .{ .term = @constCast("gamma"), .postings = @constCast(text_gamma_postings[0..]) },
+    };
+    const text_payload = try text_segment.encodeAlloc(alloc, .{
+        .index_name = @constCast("events.body.text"),
+        .source_name = @constCast("body"),
+        .config_json = @constCast("{}"),
+        .docs = @constCast(text_docs[0..]),
+        .terms = @constCast(text_terms[0..]),
+    });
+    defer alloc.free(text_payload);
+    var text_meta = try store.put(text_payload);
+    defer text_meta.deinit(alloc);
+
+    const sparse_docs = [_]sparse_segment.DocumentEntry{
+        .{ .doc_id = key_a, .feature_count = 1 },
+        .{ .doc_id = key_b, .feature_count = 1 },
+    };
+    const sparse_gamma_postings = [_]sparse_segment.Posting{.{ .doc_index = 1, .weight = 1.0 }};
+    const sparse_terms = [_]sparse_segment.TermEntry{.{
+        .term = @constCast("gamma"),
+        .postings = @constCast(sparse_gamma_postings[0..]),
+    }};
+    const sparse_payload = try sparse_segment.encodeAlloc(alloc, .{
+        .docs = @constCast(sparse_docs[0..]),
+        .terms = @constCast(sparse_terms[0..]),
+    });
+    defer alloc.free(sparse_payload);
+    var sparse_meta = try store.put(sparse_payload);
+    defer sparse_meta.deinit(alloc);
+
+    const declarations = [_]sidecar_manifest.DeclaredArtifact{
+        .{
+            .name = "events.body.text",
+            .binding = .{
+                .sidecar_kind = .text,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-7",
+                .schema_fingerprint = "schema-v1",
+                .column_bindings = &[_][]const u8{"body"},
+                .index_config_hash = "sha256:text",
+            },
+            .artifact = .{
+                .kind = .text_segment,
+                .name = "events.body.text",
+                .artifact_id = text_meta.artifact_id,
+                .byte_len = text_meta.byte_len,
+                .checksum = text_meta.checksum,
+            },
+        },
+        .{
+            .name = "events.features.sparse",
+            .binding = .{
+                .sidecar_kind = .sparse,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-7",
+                .schema_fingerprint = "schema-v1",
+                .column_bindings = &[_][]const u8{"features"},
+                .index_config_hash = "sha256:sparse",
+            },
+            .artifact = .{
+                .kind = .sparse_segment,
+                .name = "events.features.sparse",
+                .artifact_id = sparse_meta.artifact_id,
+                .byte_len = sparse_meta.byte_len,
+                .checksum = sparse_meta.checksum,
+            },
+        },
+    };
+    const text_sidecar_names = [_][]const u8{"events.body.text"};
+    const sparse_sidecar_names = [_][]const u8{"events.features.sparse"};
+    const text_plans = [_]TextCandidatePlan{
+        .{
+            .request = .{ .text = "beta", .limit = 10 },
+            .sidecar_names = &text_sidecar_names,
+        },
+        .{
+            .request = .{ .text = "gamma", .limit = 10 },
+            .sidecar_names = &text_sidecar_names,
+        },
+    };
+    const sparse_terms_query = [_]query_request.SparseTermWeight{.{ .term = @constCast("gamma"), .weight = 1.0 }};
+    const sparse_plans = [_]SparseCandidatePlan{.{
+        .request = .{ .terms = &sparse_terms_query, .limit = 10 },
+        .sidecar_names = &sparse_sidecar_names,
+    }};
+
+    var candidates = try candidateSetsFromArtifactStoreAlloc(alloc, &store, &declarations, .{
+        .text_plans = &text_plans,
+        .sparse_plans = &sparse_plans,
+    });
+    defer candidates.deinit(alloc);
+    const lake_candidate_sets = try candidates.asLakeRowsCandidateSetsAlloc(alloc);
+    defer alloc.free(lake_candidate_sets);
+
+    try std.testing.expectEqual(@as(usize, 2), lake_candidate_sets.len);
+    try std.testing.expectEqualStrings("events.body.text", lake_candidate_sets[0].sidecar_name);
+    try std.testing.expectEqual(@as(usize, 1), lake_candidate_sets[0].row_refs.len);
+    try std.testing.expectEqual(@as(u64, 1), lake_candidate_sets[0].row_refs[0].external.row_ordinal);
+    try std.testing.expectEqualStrings("events.features.sparse", lake_candidate_sets[1].sidecar_name);
+    try std.testing.expectEqual(@as(usize, 1), lake_candidate_sets[1].row_refs.len);
+    try std.testing.expectEqual(@as(u64, 1), lake_candidate_sets[1].row_refs[0].external.row_ordinal);
 }
 
 test "lake text sidecar candidate producer rejects ambiguous implicit sidecars" {
