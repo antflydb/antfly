@@ -41,6 +41,7 @@ const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
 const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const base_data_batch_bulk_read_max_bytes: usize = 1024 * 1024;
 const base_data_batch_bulk_read_max_gap_bytes: usize = 16 * 1024;
+const base_data_batch_unresolved_stack_capacity: usize = 512;
 const stack_index_max_bytes: usize = 64 * 1024;
 const stack_base_value_range_max_bytes: usize = 64 * 1024;
 const stack_delta_value_range_max_bytes: usize = 64 * 1024;
@@ -880,6 +881,20 @@ pub const LazyDirectorySnapshot = struct {
         }
         defer if (!sorted_by_segment_id) alloc.free(best_segment_ids);
 
+        var unresolved_stack: [base_data_batch_unresolved_stack_capacity]usize = undefined;
+        const use_unresolved_stack = sorted_by_segment_id and posting_ids.len <= unresolved_stack.len;
+        const unresolved_storage: []usize = if (!sorted_by_segment_id)
+            &.{}
+        else if (use_unresolved_stack)
+            unresolved_stack[0..posting_ids.len]
+        else
+            try alloc.alloc(usize, posting_ids.len);
+        defer if (sorted_by_segment_id and !use_unresolved_stack) alloc.free(unresolved_storage);
+        if (sorted_by_segment_id) {
+            for (unresolved_storage, 0..) |*slot, i| slot.* = i;
+        }
+        var unresolved_positions = unresolved_storage;
+
         var point_reads = std.ArrayListUnmanaged(BatchPointValueRead).empty;
         defer point_reads.deinit(alloc);
 
@@ -890,12 +905,20 @@ pub const LazyDirectorySnapshot = struct {
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             var has_candidate = false;
-            for (posting_ids, 0..) |posting_id, i| {
-                if (sorted_by_segment_id and out[i] != null) continue;
-                if (!sorted_by_segment_id and best_segment_ids[i] >= entry.meta.segment_id) continue;
-                if (!entry.meta.mayContainPosting(posting_id)) continue;
-                has_candidate = true;
-                break;
+            if (sorted_by_segment_id) {
+                if (unresolved_positions.len == 0) break;
+                for (unresolved_positions) |i| {
+                    if (!entry.meta.mayContainPosting(posting_ids[i])) continue;
+                    has_candidate = true;
+                    break;
+                }
+            } else {
+                for (posting_ids, 0..) |posting_id, i| {
+                    if (best_segment_ids[i] >= entry.meta.segment_id) continue;
+                    if (!entry.meta.mayContainPosting(posting_id)) continue;
+                    has_candidate = true;
+                    break;
+                }
             }
             if (!has_candidate) continue;
 
@@ -906,19 +929,38 @@ pub const LazyDirectorySnapshot = struct {
 
             point_reads.clearRetainingCapacity();
 
-            for (posting_ids, 0..) |posting_id, i| {
-                if (sorted_by_segment_id and out[i] != null) continue;
-                if (!sorted_by_segment_id and best_segment_ids[i] >= entry.meta.segment_id) continue;
-                if (!entry.meta.mayContainPosting(posting_id)) continue;
-                const found = (try pointIndexEntryFromIndexData(index_data.data, entry.meta.entry_count, posting_id, .base)) orelse continue;
-                try point_reads.append(alloc, .{
-                    .output_index = i,
-                    .found = found,
-                });
+            if (sorted_by_segment_id) {
+                for (unresolved_positions) |i| {
+                    const posting_id = posting_ids[i];
+                    if (!entry.meta.mayContainPosting(posting_id)) continue;
+                    const found = (try pointIndexEntryFromIndexData(index_data.data, entry.meta.entry_count, posting_id, .base)) orelse continue;
+                    try point_reads.append(alloc, .{
+                        .output_index = i,
+                        .found = found,
+                    });
+                }
+            } else {
+                for (posting_ids, 0..) |posting_id, i| {
+                    if (best_segment_ids[i] >= entry.meta.segment_id) continue;
+                    if (!entry.meta.mayContainPosting(posting_id)) continue;
+                    const found = (try pointIndexEntryFromIndexData(index_data.data, entry.meta.entry_count, posting_id, .base)) orelse continue;
+                    try point_reads.append(alloc, .{
+                        .output_index = i,
+                        .found = found,
+                    });
+                }
             }
 
             try readSegmentBatchPointValuesAlloc(alloc, self.io, self.dir, manifest_entry, point_reads.items, out);
-            if (!sorted_by_segment_id) {
+            if (sorted_by_segment_id) {
+                var write_index: usize = 0;
+                for (unresolved_positions) |i| {
+                    if (out[i] != null) continue;
+                    unresolved_positions[write_index] = i;
+                    write_index += 1;
+                }
+                unresolved_positions = unresolved_positions[0..write_index];
+            } else {
                 for (point_reads.items) |read| best_segment_ids[read.output_index] = entry.meta.segment_id;
             }
         }

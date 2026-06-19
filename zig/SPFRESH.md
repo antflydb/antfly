@@ -1093,7 +1093,9 @@ implementations cleanly:
     target vector. Segment batch base prefetch now coalesces adjacent posting
     base point values from the same segment into bounded range reads, so
     flat/two-level directory probes do not turn a selected posting batch into
-    one file read per base value. That preserves the format's sequence contract
+    one file read per base value. The same newest-first batch scan keeps a
+    compact unresolved-position list, so older segments only check postings
+    still missing from the batch. That preserves the format's sequence contract
     across the file/runtime boundary. Query scratch replay applies that combined stream
     directly into retained member scratch, using sorted merge for canonical bases
     and avoiding a second owned materialized member buffer on pending-overlay
