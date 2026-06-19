@@ -317,13 +317,12 @@ func (e HAReceiptExpectation) Strings() (string, string) {
 // HAReceiptMatches verifies that a node-local HA admin receipt matches the
 // expected operation and acted-on target.
 func HAReceiptMatches(receipt HAActionReceipt, expectation HAReceiptExpectation, expectedTarget string) bool {
-	actionID := strings.TrimSpace(receipt.ActionId)
-	actionKind := strings.TrimSpace(string(receipt.ActionKind))
-	actionTarget := strings.TrimSpace(receipt.Target)
-	actionState := strings.TrimSpace(string(receipt.State))
-	expectedKind := strings.TrimSpace(string(expectation.ActionKind))
-	expectedTarget = strings.TrimSpace(expectedTarget)
-	expectedState := strings.TrimSpace(string(expectation.State))
+	actionID := receipt.ActionId
+	actionKind := string(receipt.ActionKind)
+	actionTarget := receipt.Target
+	actionState := string(receipt.State)
+	expectedKind := string(expectation.ActionKind)
+	expectedState := string(expectation.State)
 	if actionID == "" ||
 		actionKind == "" ||
 		actionTarget == "" ||
@@ -345,15 +344,14 @@ func HAReceiptMatches(receipt HAActionReceipt, expectation HAReceiptExpectation,
 // receipt is the intended endpoint. Some compatibility paths can tolerate an
 // unset expected node id, but typed direct admin execution should require it.
 func HAReceiptNodeMatches(receipt HAActionReceipt, expectedNodeID string, requireExpectedNode bool) bool {
-	nodeID := strings.TrimSpace(receipt.NodeId)
-	if nodeID == "" {
+	nodeID := receipt.NodeId
+	if !validHAIdentifier(nodeID) {
 		return false
 	}
-	expectedNodeID = strings.TrimSpace(expectedNodeID)
 	if expectedNodeID == "" {
 		return !requireExpectedNode
 	}
-	return nodeID == expectedNodeID
+	return validHAIdentifier(expectedNodeID) && nodeID == expectedNodeID
 }
 
 func HAReceiptMatchesNode(receipt HAActionReceipt, expectation HAReceiptExpectation, expectedTarget string, expectedNodeID string, requireExpectedNode bool) bool {

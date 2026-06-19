@@ -1851,6 +1851,16 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 	if err := ValidateHAReplicationSlotActionResponse(wrongSlotTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("wrong slot target error = %v, want receipt mismatch", err)
 	}
+	paddedSlotTarget := response
+	paddedSlotTarget.Action.Target = " standby-a"
+	if err := ValidateHAReplicationSlotActionResponse(paddedSlotTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("padded slot target error = %v, want receipt mismatch", err)
+	}
+	paddedActionID := response
+	paddedActionID.Action.ActionId = "replication_slot_create:standby-a "
+	if err := ValidateHAReplicationSlotActionResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("padded action id error = %v, want receipt mismatch", err)
+	}
 	wrongSlotKind := response
 	wrongSlotKind.Action.ActionKind = HAActionKindReplicationSlotPause
 	wrongSlotKind.Action.ActionId = "replication_slot_pause:standby-a"
