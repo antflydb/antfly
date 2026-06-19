@@ -5701,6 +5701,24 @@
       "sql": "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'"
     },
     {
+      "name": "select into temporary relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_session_archive"
+      },
+      "plan": "relation_population:mode=select_into:target=usage_session_archive:lifetime=temporary:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT id, status INTO TEMP TABLE usage_session_archive FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "select into unlogged relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_ingest_archive"
+      },
+      "plan": "relation_population:mode=select_into:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT id, status INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE status = 'closed'"
+    },
+    {
       "name": "point update joined source routes to claimed joined mutation source",
       "family": "update_joined_source",
       "summary": {

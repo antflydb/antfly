@@ -4072,6 +4072,8 @@ pub const AppParityCorpusCoverage = struct {
     explain_wal: bool = false,
     explain_write: bool = false,
     relation_population_select_into: bool = false,
+    relation_population_select_into_temporary: bool = false,
+    relation_population_select_into_unlogged: bool = false,
     relation_population_create_table_as: bool = false,
     insert: bool = false,
     insert_source: bool = false,
@@ -5174,6 +5176,12 @@ pub const AppParityCorpusCoverage = struct {
             .relation_population => {
                 self.relation_population_select_into = self.relation_population_select_into or
                     sql_adapter.planHasExactStringToken(entry.plan, "relation_population:mode=", "select_into");
+                self.relation_population_select_into_temporary = self.relation_population_select_into_temporary or
+                    (sql_adapter.planHasExactStringToken(entry.plan, "relation_population:mode=", "select_into") and
+                        sql_adapter.planHasExactStringToken(entry.plan, ":lifetime=", "temporary"));
+                self.relation_population_select_into_unlogged = self.relation_population_select_into_unlogged or
+                    (sql_adapter.planHasExactStringToken(entry.plan, "relation_population:mode=", "select_into") and
+                        sql_adapter.planHasExactStringToken(entry.plan, ":lifetime=", "unlogged"));
                 self.relation_population_create_table_as = self.relation_population_create_table_as or
                     sql_adapter.planHasExactStringToken(entry.plan, "relation_population:mode=", "create_table_as");
             },
@@ -6412,6 +6420,8 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.explain_wal);
         try std.testing.expect(self.explain_write);
         try std.testing.expect(self.relation_population_select_into);
+        try std.testing.expect(self.relation_population_select_into_temporary);
+        try std.testing.expect(self.relation_population_select_into_unlogged);
         try std.testing.expect(self.relation_population_create_table_as);
         try std.testing.expect(self.insert);
         try std.testing.expect(self.insert_source);

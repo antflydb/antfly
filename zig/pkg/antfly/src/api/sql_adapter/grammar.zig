@@ -5924,10 +5924,19 @@ fn parseSelectIntoPopulationSqlAlloc(
 ) !RelationPopulationSyntax {
     const into_relative = parser.findTopLevelKeyword(tokens[1..], "into") orelse return error.UnsupportedSqlShape;
     const into_index = 1 + into_relative;
-    const from_relative = parser.findTopLevelKeyword(tokens[into_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
-    const from_index = into_index + 1 + from_relative;
-    if (from_index != into_index + 2) return error.UnsupportedSqlShape;
-    if (tokens[into_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
+    var target_index = into_index + 1;
+    const target_lifetime: ?RelationLifetimeKind = if (parser.matchKeyword(tokens, &target_index, "temporary") or parser.matchKeyword(tokens, &target_index, "temp"))
+        .temporary
+    else if (parser.matchKeyword(tokens, &target_index, "unlogged"))
+        .unlogged
+    else
+        null;
+    _ = parser.matchKeyword(tokens, &target_index, "table");
+    if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
+
+    const from_relative = parser.findTopLevelKeyword(tokens[target_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
+    const from_index = target_index + 1 + from_relative;
+    if (from_index != target_index + 1) return error.UnsupportedSqlShape;
 
     const into_start = try tokenStartOffset(sql, tokens[into_index]);
     const from_start = try tokenStartOffset(sql, tokens[from_index]);
@@ -5938,8 +5947,8 @@ fn parseSelectIntoPopulationSqlAlloc(
     );
     return .{
         .mode = .select_into,
-        .target_identifier = tokens[into_index + 1].text,
-        .target_lifetime = null,
+        .target_identifier = tokens[target_index].text,
+        .target_lifetime = target_lifetime,
         .if_not_exists = false,
         .source_sql = source_sql,
     };
@@ -8897,6 +8906,28 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expect(select_into.target_lifetime == null);
     try std.testing.expect(!select_into.if_not_exists);
     try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into.source_sql);
+
+    var select_into_temp = try parseRelationPopulationSqlAlloc(
+        alloc,
+        "SELECT account_id, total INTO TEMP TABLE usage_session_archive FROM usage_records WHERE total > 10",
+    );
+    defer select_into_temp.deinit(alloc);
+    try std.testing.expectEqual(RelationPopulationMode.select_into, select_into_temp.mode);
+    try std.testing.expectEqualStrings("usage_session_archive", select_into_temp.target_identifier);
+    try std.testing.expectEqual(RelationLifetimeKind.temporary, select_into_temp.target_lifetime.?);
+    try std.testing.expect(!select_into_temp.if_not_exists);
+    try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into_temp.source_sql);
+
+    var select_into_unlogged = try parseRelationPopulationSqlAlloc(
+        alloc,
+        "SELECT account_id INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE total > 10",
+    );
+    defer select_into_unlogged.deinit(alloc);
+    try std.testing.expectEqual(RelationPopulationMode.select_into, select_into_unlogged.mode);
+    try std.testing.expectEqualStrings("usage_ingest_archive", select_into_unlogged.target_identifier);
+    try std.testing.expectEqual(RelationLifetimeKind.unlogged, select_into_unlogged.target_lifetime.?);
+    try std.testing.expect(!select_into_unlogged.if_not_exists);
+    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records WHERE total > 10", select_into_unlogged.source_sql);
 
     var create_as = try parseRelationPopulationSqlAlloc(
         alloc,

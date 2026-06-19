@@ -4810,7 +4810,8 @@ not lower to ordinary durable relational tables.
 Table-population syntax lowers to a native population intent before execution.
 `CREATE TABLE ... AS SELECT ...`, `CREATE TABLE IF NOT EXISTS ... AS SELECT
 ...`, `CREATE TEMP[TEMPORARY] TABLE ... AS SELECT ...`, `CREATE UNLOGGED TABLE
-... AS SELECT ...`, and read-path `SELECT ... INTO new_table ...` produce a
+... AS SELECT ...`, and read-path `SELECT ... INTO
+[TEMP|TEMPORARY|UNLOGGED] [TABLE] new_table ...` produce a
 `relation_population` plan with an explicit mode, target table, target lifetime
 (`durable`, `temporary`, or `unlogged`), idempotent-creation flag, and source
 `LoweredReadPlan`; the source query is therefore pinned by the same typed

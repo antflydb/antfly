@@ -504,6 +504,8 @@
     "read_window",
     "relation_population_create_table_as",
     "relation_population_select_into",
+    "relation_population_select_into_temporary",
+    "relation_population_select_into_unlogged",
     "returning_all_delete",
     "returning_all_delete_joined_source",
     "returning_all_delete_source",
