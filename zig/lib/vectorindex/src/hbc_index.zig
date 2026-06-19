@@ -2543,7 +2543,9 @@ fn prefetchFlatProbePostingMembers(
     if (comptime !@hasDecl(Index, "loadPostingBackendBaseDataBatch")) return;
     if (comptime !@hasDecl(Scratch, "cachedCurrentPostingMembers") or
         !@hasDecl(Scratch, "notePostingMemberCacheMiss") or
-        !@hasDecl(Scratch, "cachePostingMembers"))
+        !@hasDecl(Scratch, "cachePostingMembers") or
+        !@hasDecl(Scratch, "canCachePostingMemberCount") or
+        !@hasDecl(Scratch, "postingMemberCacheAdmissionSkip"))
     {
         return;
     }
@@ -2589,6 +2591,12 @@ fn prefetchFlatProbePostingMembers(
         const header = try posting.PostingFormat.decodeBaseHeader(base_data);
         if (header.posting_id != probe.posting_id) return error.Corrupted;
         if (header.generation < probe.state.mutation_version) continue;
+        if (!scratch.canCachePostingMemberCount(header.member_count)) {
+            const result = scratch.postingMemberCacheAdmissionSkip();
+            profile.posting_overlay_cache_admission_skips += result.admission_skips;
+            profile.posting_overlay_cache_member_bytes = result.member_bytes;
+            continue;
+        }
 
         const decode_start = now_fn_u64();
         _ = try posting.PostingFormat.decodeBaseIntoScratch(self.alloc, scratch, base_data);

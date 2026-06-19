@@ -903,8 +903,11 @@ implementations cleanly:
    skipped without building throwaway decoded arrays, and once a prefetched
    posting is over the cache cap the rest of that posting's tail values are
    skipped without header decode. Query/fold overlay append IDs plus live flags
-   share one backing allocation. Fold compact delta IDs plus ops are likewise
-   slabbed.
+   share one backing allocation. Segment-backed flat/two-level posting prefetch
+   also checks base member counts against the posting-member cache entry cap
+   before decoding full base members, so oversized bases do not inflate query
+   scratch just to be rejected by cache admission. Fold compact delta IDs plus
+   ops are likewise slabbed.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.

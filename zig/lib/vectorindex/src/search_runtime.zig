@@ -608,6 +608,19 @@ pub const SearchScratch = struct {
         return result;
     }
 
+    pub fn canCachePostingMemberCount(self: *const SearchScratch, member_count: usize) bool {
+        if (!self.posting_member_cache_admission_enabled or self.max_posting_member_cache_bytes == 0 or self.max_posting_member_cache_entry_bytes == 0) return false;
+        const member_bytes = std.math.mul(usize, member_count, @sizeOf(u64)) catch return false;
+        return member_bytes <= self.max_posting_member_cache_entry_bytes and member_bytes <= self.max_posting_member_cache_bytes;
+    }
+
+    pub fn postingMemberCacheAdmissionSkip(self: *const SearchScratch) PostingMemberCacheResult {
+        return .{
+            .admission_skips = 1,
+            .member_bytes = self.posting_member_cache_bytes,
+        };
+    }
+
     fn evictPostingMemberCacheEntry(self: *SearchScratch, alloc: Allocator, index: usize) void {
         const entry = self.posting_member_cache.items[index];
         self.posting_member_cache_bytes -|= byteLen(entry.members);
@@ -1243,11 +1256,13 @@ test "SearchScratch skips entries above per posting member cache cap" {
     defer scratch.deinit(alloc);
 
     const small = [_]u64{ 1, 2 };
+    try std.testing.expect(scratch.canCachePostingMemberCount(small.len));
     const small_result = try scratch.cachePostingMembers(alloc, 1, 10, 1, 0, small[0..]);
     try std.testing.expect(small_result.inserted);
     try std.testing.expectEqual(@as(u64, 2 * @sizeOf(u64)), small_result.member_bytes);
 
     const large = [_]u64{ 3, 4, 5 };
+    try std.testing.expect(!scratch.canCachePostingMemberCount(large.len));
     const large_result = try scratch.cachePostingMembers(alloc, 2, 10, 1, 0, large[0..]);
     try std.testing.expect(!large_result.inserted);
     try std.testing.expectEqual(@as(u64, 1), large_result.admission_skips);
