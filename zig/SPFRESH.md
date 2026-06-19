@@ -1248,7 +1248,11 @@ implementations cleanly:
     posting. Segment
     compaction uses the same counts to skip delta-only segments during the
     point-candidate pass and point-only segments during the delta-retention
-    pass, while preserving the old full scan when kind counts are unknown.
+    pass, and it pre-reserves base/centroid candidate maps from exact known
+    kind counts instead of growing those maps one entry at a time. Lazy and
+    runtime centroid-directory bulk loads use the same known counts to reserve
+    their newest-record candidate maps before scanning segment ranges, while
+    preserving the old growth path when kind counts are unknown.
     Lazy centroid-directory bulk loads
     also scan sorted manifests newest-first and skip older centroid value ranges
     whose postings already have newer candidates, avoiding decode and range-read

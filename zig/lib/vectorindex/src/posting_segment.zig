@@ -602,6 +602,11 @@ pub const RuntimeDirectoryStore = struct {
         defer candidates.deinit(alloc);
         errdefer deinitCentroidRecordCandidates(alloc, &candidates);
 
+        const lazy_hint = try centroidDirectoryCandidateCapacityHint(self.lazy.snapshot().manifest.segments);
+        const pending_hint = self.batch.pendingCentroidDirectoryEntries();
+        const capacity_hint = std.math.add(usize, lazy_hint, pending_hint) catch return error.PostingSegmentTooLarge;
+        if (capacity_hint != 0) try candidates.ensureTotalCapacity(alloc, try hashMapCapacitySize(capacity_hint));
+
         try self.lazy.snapshot().appendCentroidDirectoryRecordCandidates(alloc, &candidates);
         if (self.batch.pendingPointEntries() != 0) {
             try self.batch.appendCentroidDirectoryRecordCandidates(alloc, &candidates);
@@ -1061,6 +1066,9 @@ pub const LazyDirectorySnapshot = struct {
         var candidates = std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate).empty;
         defer candidates.deinit(alloc);
         errdefer deinitCentroidRecordCandidates(alloc, &candidates);
+
+        const capacity_hint = try centroidDirectoryCandidateCapacityHint(self.manifest.segments);
+        if (capacity_hint != 0) try candidates.ensureTotalCapacity(alloc, try hashMapCapacitySize(capacity_hint));
 
         try self.appendCentroidDirectoryRecordCandidates(alloc, &candidates);
         return try centroidRecordCandidatesToOwnedSlice(alloc, &candidates);
@@ -2693,6 +2701,10 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
     var centroids = std.AutoHashMapUnmanaged(PostingId, PointCandidate).empty;
     defer centroids.deinit(alloc);
 
+    const point_capacity_hints = try pointCandidateCapacityHints(segments);
+    if (point_capacity_hints.bases != 0) try bases.ensureTotalCapacity(alloc, try hashMapCapacitySize(point_capacity_hints.bases));
+    if (point_capacity_hints.centroids != 0) try centroids.ensureTotalCapacity(alloc, try hashMapCapacitySize(point_capacity_hints.centroids));
+
     for (segments) |segment| {
         stats.input_bytes += segment.data.len;
         stats.input_entries += segment.meta.entry_count;
@@ -3344,6 +3356,14 @@ pub const DirectoryBatchWriter = struct {
 
     pub fn pendingPointEntries(self: DirectoryBatchWriter) usize {
         return self.writer.entries.items.len;
+    }
+
+    pub fn pendingCentroidDirectoryEntries(self: DirectoryBatchWriter) usize {
+        var count: usize = 0;
+        for (self.writer.entries.items) |entry| {
+            if (entry.kind == .centroid_directory) count += 1;
+        }
+        return count;
     }
 
     pub fn pendingDeltaRecords(self: DirectoryBatchWriter) usize {
@@ -5069,6 +5089,46 @@ fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
         lhs.index_checksum == rhs.index_checksum;
 }
 
+fn knownSegmentKindCount(meta: SegmentMeta, kind: EntryKind) ?usize {
+    if (!meta.hasKnownKindCounts()) return null;
+    return switch (kind) {
+        .base => meta.base_count,
+        .delta => meta.delta_value_count,
+        .centroid_directory => meta.centroid_directory_count,
+    };
+}
+
+fn hashMapCapacitySize(count: usize) !u32 {
+    return std.math.cast(u32, count) orelse error.PostingSegmentTooLarge;
+}
+
+fn addKnownSegmentKindCount(accum: *usize, meta: SegmentMeta, kind: EntryKind) !void {
+    const count = knownSegmentKindCount(meta, kind) orelse return;
+    accum.* = std.math.add(usize, accum.*, count) catch return error.PostingSegmentTooLarge;
+}
+
+fn centroidDirectoryCandidateCapacityHint(entries: []const OwnedManifestEntry) !usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        try addKnownSegmentKindCount(&count, entry.meta, .centroid_directory);
+    }
+    return count;
+}
+
+const PointCandidateCapacityHints = struct {
+    bases: usize = 0,
+    centroids: usize = 0,
+};
+
+fn pointCandidateCapacityHints(segments: []const SegmentBlob) !PointCandidateCapacityHints {
+    var hints = PointCandidateCapacityHints{};
+    for (segments) |segment| {
+        try addKnownSegmentKindCount(&hints.bases, segment.meta, .base);
+        try addKnownSegmentKindCount(&hints.centroids, segment.meta, .centroid_directory);
+    }
+    return hints;
+}
+
 fn putNewestPoint(
     alloc: Allocator,
     map: *std.AutoHashMapUnmanaged(PostingId, PointCandidate),
@@ -6133,6 +6193,51 @@ pub fn testSegmentMetaKindPredicates() !void {
     try std.testing.expect(!known_counts.mayContainPointKind(8, .delta));
     try std.testing.expect(!known_counts.mayContainPointKind(99, .base));
     try std.testing.expect(!segmentMayContainPostingDeltaAfterGeneration(known_counts, 8, null));
+}
+
+pub fn testSegmentKindCapacityHintsUseKnownCounts() !void {
+    var path_a = [_]u8{'a'};
+    var path_b = [_]u8{'b'};
+    const manifest_entries = [_]OwnedManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 1,
+                .min_posting_id = 7,
+                .max_posting_id = 9,
+                .byte_len = 1,
+                .entry_count = 5,
+                .base_count = 2,
+                .delta_value_count = 1,
+                .centroid_directory_count = 2,
+            },
+            .path = path_a[0..],
+        },
+        .{
+            .meta = .{
+                .segment_id = 2,
+                .min_posting_id = 10,
+                .max_posting_id = 12,
+                .byte_len = 1,
+                .entry_count = 3,
+            },
+            .path = path_b[0..],
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 2), try centroidDirectoryCandidateCapacityHint(manifest_entries[0..]));
+
+    const segments = [_]SegmentBlob{
+        .{
+            .meta = manifest_entries[0].meta,
+            .data = &.{},
+        },
+        .{
+            .meta = manifest_entries[1].meta,
+            .data = &.{},
+        },
+    };
+    const hints = try pointCandidateCapacityHints(segments[0..]);
+    try std.testing.expectEqual(@as(usize, 2), hints.bases);
+    try std.testing.expectEqual(@as(usize, 2), hints.centroids);
 }
 
 pub fn testSegmentDeltaReadersSkipBaseOnlyCorruption() !void {
@@ -9180,6 +9285,10 @@ test "posting segment delta paths skip segments without delta metadata" {
 
 test "posting segment kind metadata predicates are conservative when unknown" {
     try testSegmentMetaKindPredicates();
+}
+
+test "posting segment kind capacity hints use known counts" {
+    try testSegmentKindCapacityHintsUseKnownCounts();
 }
 
 test "posting segment delta readers skip base-only segment corruption" {
