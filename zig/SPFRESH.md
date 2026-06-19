@@ -887,9 +887,11 @@ implementations cleanly:
    sequence/id/op arrays and discard oversized opportunistic prefetch entries
    instead of retaining large decoded tails in query scratch; prefetch also
    checks value record counts before record decode so oversized tails are
-   skipped without building throwaway decoded arrays. Query/fold overlay append
-   IDs plus live flags share one backing allocation. Fold compact delta IDs
-   plus ops are likewise slabbed.
+   skipped without building throwaway decoded arrays, and once a prefetched
+   posting is over the cache cap the rest of that posting's tail values are
+   skipped without header decode. Query/fold overlay append IDs plus live flags
+   share one backing allocation. Fold compact delta IDs plus ops are likewise
+   slabbed.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.

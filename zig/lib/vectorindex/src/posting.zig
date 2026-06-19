@@ -4064,6 +4064,7 @@ pub const PostingStore = struct {
         var maybe_entry = first_entry;
         var cached_postings: usize = 0;
         var active_posting_id: ?PostingId = null;
+        var skipped_posting_id: ?PostingId = null;
         const prefetch_limit = if (comptime @hasDecl(std.meta.Child(@TypeOf(scratch)), "postingDeltaTailPrefetchLimit"))
             scratch.postingDeltaTailPrefetchLimit()
         else
@@ -4072,16 +4073,22 @@ pub const PostingStore = struct {
         while (maybe_entry) |entry| {
             const next_posting_id = postingDeltaKeyPostingId(entry.key) orelse break;
             if (next_posting_id <= current_posting_id) break;
+            if (skipped_posting_id != null and skipped_posting_id.? == next_posting_id) {
+                maybe_entry = try cursor.next();
+                continue;
+            }
             if (active_posting_id == null or active_posting_id.? != next_posting_id) {
                 if (cached_postings >= prefetch_limit) break;
                 scratch.beginPostingDeltaTailCache(next_posting_id);
                 errdefer scratch.invalidatePostingDeltaTailCache();
                 active_posting_id = next_posting_id;
+                skipped_posting_id = null;
                 cached_postings += 1;
             }
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             if (!canAppendPostingDeltaTailValueToCache(scratch, iterator.recordCount())) {
                 invalidatePostingDeltaTailCacheIfSupported(scratch);
+                skipped_posting_id = next_posting_id;
                 maybe_entry = try cursor.next();
                 continue;
             }
