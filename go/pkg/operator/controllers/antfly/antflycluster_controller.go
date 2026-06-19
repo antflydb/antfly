@@ -4287,6 +4287,18 @@ type haFenceReceiptJSON struct {
 	Reason           *string                    `json:"reason"`
 }
 
+type haReplicationSlotJSON struct {
+	SlotName       string  `json:"slot_name"`
+	TimelineID     *uint64 `json:"timeline_id"`
+	RestartLSN     *uint64 `json:"restart_lsn"`
+	ReceivedLSN    *uint64 `json:"received_lsn"`
+	AppliedLSN     *uint64 `json:"applied_lsn"`
+	SafeReadLSN    *uint64 `json:"safe_read_lsn"`
+	Active         *bool   `json:"active"`
+	ReseedRequired *bool   `json:"reseed_required"`
+	CurrentLSN     *uint64 `json:"current_lsn"`
+}
+
 type haDirectAdminActionResultJSON struct {
 	SchemaVersion  uint32                    `json:"schema_version"`
 	Action         haAdminActionReceiptJSON  `json:"action"`
@@ -4302,18 +4314,6 @@ type haDirectAdminActionResultJSON struct {
 	Receipt        haFenceReceiptJSON        `json:"receipt"`
 }
 
-type haReplicationSlotJSON struct {
-	SlotName       string  `json:"slot_name"`
-	TimelineID     *uint64 `json:"timeline_id"`
-	RestartLSN     *uint64 `json:"restart_lsn"`
-	ReceivedLSN    *uint64 `json:"received_lsn"`
-	AppliedLSN     *uint64 `json:"applied_lsn"`
-	SafeReadLSN    *uint64 `json:"safe_read_lsn"`
-	Active         *bool   `json:"active"`
-	ReseedRequired *bool   `json:"reseed_required"`
-	CurrentLSN     *uint64 `json:"current_lsn"`
-}
-
 type haDirectAdminActionResultEnvelope struct {
 	Result struct {
 		Slot          *haDirectAdminActionResultJSON `json:"slot,omitempty"`
@@ -4322,19 +4322,6 @@ type haDirectAdminActionResultEnvelope struct {
 		SeedBootstrap *haDirectAdminActionResultJSON `json:"seed_bootstrap,omitempty"`
 		FenceAcquire  *haDirectAdminActionResultJSON `json:"fence_acquire,omitempty"`
 	} `json:"result"`
-}
-
-func requireHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, raw []byte) error {
-	if action == nil || !haActionRequiresAdminResult(haActionKind(action.Kind)) {
-		return nil
-	}
-	if applyHADirectAdminActionResult(action, raw) &&
-		haActionHasRequiredAdminResult(*action) &&
-		haDirectAdminActionReceiptMatches(*action) {
-		return nil
-	}
-	action.AdminResult = nil
-	return fmt.Errorf("HA admin action %s succeeded without typed result evidence", action.Kind)
 }
 
 func requireHADirectAdminActionResultStatus(action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
@@ -4347,18 +4334,6 @@ func requireHADirectAdminActionResultStatus(action *antflyv1.HAPlannedActionStat
 	}
 	action.AdminResult = nil
 	return fmt.Errorf("HA admin action %s succeeded without typed result evidence", action.Kind)
-}
-
-func applyHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, raw []byte) bool {
-	if action == nil {
-		return false
-	}
-	result, ok := parseHADirectAdminActionResult(raw)
-	if !ok {
-		return false
-	}
-	action.AdminResult = result
-	return true
 }
 
 func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultStatus, bool) {
@@ -4604,20 +4579,6 @@ func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionRes
 		result.Receipt.Reason != nil
 }
 
-func requireHADirectFenceAcquireResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, raw []byte) error {
-	if action == nil {
-		return nil
-	}
-	if applyHADirectAdminActionResult(action, raw) &&
-		haActionHasRequiredAdminResult(*action) &&
-		haDirectAdminActionReceiptMatches(*action) &&
-		haFenceAcquireResultMatchesAction(cluster, action, action.AdminResult) {
-		return nil
-	}
-	action.AdminResult = nil
-	return fmt.Errorf("HA admin action %s succeeded without matching typed fence receipt", action.Kind)
-}
-
 func requireHADirectFenceAcquireResultStatus(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
 	if action == nil {
 		return nil
@@ -4630,19 +4591,6 @@ func requireHADirectFenceAcquireResultStatus(cluster *antflyv1.AntflyCluster, ac
 	}
 	action.AdminResult = nil
 	return fmt.Errorf("HA admin action %s succeeded without matching typed fence receipt", action.Kind)
-}
-
-func requireHADirectPromotionAssessmentResult(action *antflyv1.HAPlannedActionStatus, raw []byte) error {
-	if action == nil {
-		return nil
-	}
-	if applyHADirectAdminActionResult(action, raw) &&
-		haDirectAdminActionReceiptMatches(*action) &&
-		haPromotionAssessmentResultMatchesAction(*action, action.AdminResult) {
-		return nil
-	}
-	action.AdminResult = nil
-	return fmt.Errorf("HA admin action %s succeeded without safe typed promotion assessment", action.Kind)
 }
 
 func requireHADirectPromotionAssessmentResultStatus(action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
@@ -4791,17 +4739,6 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 		return nil, false
 	}
 	return result, true
-}
-
-func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, raw []byte) bool {
-	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
-		return false
-	}
-	result, ok := parseHAPromotionAPIResult(raw)
-	if !ok {
-		return false
-	}
-	return r.applyHADirectPromotionJobResult(cluster, action, result)
 }
 
 func (r *AntflyClusterReconciler) applyHADirectPromotionResultFromSDK(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, response adminsdk.HAPromotionResponse) bool {
@@ -5046,17 +4983,6 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 		r.updateHAPromotionStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.LastPromotion)
 		return
 	}
-}
-
-func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, raw []byte) bool {
-	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
-		return false
-	}
-	result, ok := parseHARejoinAPIResult(raw)
-	if !ok {
-		return false
-	}
-	return r.applyHADirectRejoinJobResult(cluster, action, result)
 }
 
 func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResultFromSDK(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, response adminsdk.HARejoinAssessResponse) bool {
@@ -6702,10 +6628,6 @@ func haAdminIdentityJSONComplete(identity haAdminIdentityJSON) bool {
 		haUint64JSONValue(identity.TimelineID) > 0 &&
 		identity.Epoch != nil &&
 		haUint64JSONValue(identity.Epoch) > 0
-}
-
-func haUint64JSONValueToInt32(value *uint64) int32 {
-	return haUint64ToInt32(haUint64JSONValue(value))
 }
 
 func haUint64ToInt32(raw uint64) int32 {

@@ -1280,7 +1280,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			if selection == HAStandbySelectionAll && sync.Required != 0 {
 				errors = append(errors, "spec.highAvailability.syncPolicy.required must be omitted when selection is All")
 			}
-			if selection != HAStandbySelectionAll && required > int32(len(sync.StandbyNames)) {
+			if selection != HAStandbySelectionAll && int64(required) > int64(len(sync.StandbyNames)) {
 				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.required (%d) cannot exceed standbyNames length (%d) for %s selection", required, len(sync.StandbyNames), selection))
 			}
 			seenSyncNames := map[string]int{}

@@ -449,7 +449,7 @@ func haLeaseFenceReady(lease *coordinationv1.Lease, generation uint64, now time.
 	if lease.Spec.RenewTime == nil || lease.Spec.LeaseDurationSeconds == nil || *lease.Spec.LeaseDurationSeconds <= 0 {
 		return false, "LeaseTimingMissing"
 	}
-	expiresAt := lease.Spec.RenewTime.Time.Add(time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second)
+	expiresAt := lease.Spec.RenewTime.Add(time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second)
 	if !now.Before(expiresAt) {
 		return false, "LeaseExpired"
 	}
@@ -1927,7 +1927,7 @@ func haEvaluateSyncPolicy(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HA
 			evaluation.Degraded = true
 			break
 		}
-		evaluation.Required = int32(len(policy.StandbyNames))
+		evaluation.Required = haLenToInt32(len(policy.StandbyNames))
 		for _, name := range policy.StandbyNames {
 			standby, ok := standbys[name]
 			if !ok || !standbySyncEligible(standby) {
@@ -2024,12 +2024,19 @@ func haSyncPolicyRequired(policy *antflyv1.HASyncPolicy) int32 {
 		selection = antflyv1.HAStandbySelectionAny
 	}
 	if selection == antflyv1.HAStandbySelectionAll {
-		return int32(len(policy.StandbyNames))
+		return haLenToInt32(len(policy.StandbyNames))
 	}
 	if policy.Required > 0 {
 		return policy.Required
 	}
 	return 1
+}
+
+func haLenToInt32(n int) int32 {
+	if n > int(^uint32(0)>>1) {
+		return int32(^uint32(0) >> 1)
+	}
+	return int32(n) //nolint:gosec // n is bounded to MaxInt32 above.
 }
 
 func haSyncFailureAction(policy antflyv1.HAFailurePolicy) string {

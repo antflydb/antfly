@@ -50,6 +50,7 @@ func TestUpdateHAStatusDisabledClearsStatusAndPublishesConditions(t *testing.T) 
 	available := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAvailable)
 	if available == nil {
 		t.Fatalf("expected %s condition", antflyv1.TypeHAAvailable)
+		return
 	}
 	if available.Status != metav1.ConditionTrue || available.Reason != antflyv1.ReasonHADisabled {
 		t.Fatalf("expected disabled available condition, got status=%s reason=%s", available.Status, available.Reason)
@@ -71,6 +72,7 @@ func TestHAReplicationIdentityAllowsWholeInstanceScope(t *testing.T) {
 	identity := haReplicationIdentity(ha)
 	if identity == nil {
 		t.Fatal("expected whole-instance HA identity to be accepted")
+		return
 	}
 	if identity.ShardID != 0 || identity.TableID != 0 {
 		t.Fatalf("expected zero shard/table identity to be preserved, got %#v", identity)
@@ -1123,7 +1125,7 @@ func TestHAAdminOpenAPIContractIsNotDuplicatedInOtherSpecs(t *testing.T) {
 				if adminOperationIDs[operationID] {
 					t.Errorf("%s duplicates admin OpenAPI operationId %q at %s %s", specPath, operationID, strings.ToUpper(method), path)
 				}
-				if strings.HasPrefix(path, "/ha/") && !(name == "internal.yaml" && strings.HasPrefix(path, "/ha/replication/")) {
+				if strings.HasPrefix(path, "/ha/") && (name != "internal.yaml" || !strings.HasPrefix(path, "/ha/replication/")) {
 					t.Errorf("%s defines HA operator/control-plane path %s %s outside specs/openapi/antfly/admin.yaml", specPath, strings.ToUpper(method), path)
 				}
 			}
@@ -3134,6 +3136,7 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	former := cluster.Status.HAStatus.FormerPrimary
 	if former == nil {
 		t.Fatal("expected former-primary status")
+		return
 	}
 	if former.NodeID != "old-primary" ||
 		!former.Fenced ||

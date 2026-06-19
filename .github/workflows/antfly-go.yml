@@ -104,6 +104,7 @@ jobs:
           status="$(git status --porcelain -- \
             openapi.yaml \
             go/pkg/sdk/oapi/client.gen.go \
+            go/pkg/sdk/admin/oapi/client.gen.go \
             go/pkg/sdk/oapi/validate.go \
             go/pkg/sdk/query/query.gen.go)"
           if [ -n "$status" ]; then
@@ -111,6 +112,7 @@ jobs:
             git diff -- \
               openapi.yaml \
               go/pkg/sdk/oapi/client.gen.go \
+              go/pkg/sdk/admin/oapi/client.gen.go \
               go/pkg/sdk/oapi/validate.go \
               go/pkg/sdk/query/query.gen.go
             exit 1
