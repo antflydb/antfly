@@ -15,9 +15,16 @@
 const std = @import("std");
 
 const parser = @import("parser.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
+
+pub const ExtensionFunctionBinding = struct {
+    sql_name: []const u8,
+    native_expression_kind: runtime_schema.RelationalRowsExpressionKind,
+    arity: u16,
+};
 
 pub fn sqlKeywordIsAnyOrSome(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "any") or std.ascii.eqlIgnoreCase(text, "some");
@@ -33,6 +40,40 @@ pub fn sqlKeywordStartsScalarPredicate(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "notnull") or
         sqlKeywordIsAnyOrSome(text) or
         std.ascii.eqlIgnoreCase(text, "all");
+}
+
+pub fn peekExtensionFunctionCall(tokens: []const Token, pos: usize, bindings: []const ExtensionFunctionBinding) bool {
+    if (bindings.len == 0) return false;
+    if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier or tokens[pos + 1].kind != .lparen) return false;
+    for (bindings) |binding| {
+        if (std.ascii.eqlIgnoreCase(binding.sql_name, tokens[pos].text)) return true;
+    }
+    return false;
+}
+
+pub fn extensionFunctionBinding(bindings: []const ExtensionFunctionBinding, name: []const u8) !?ExtensionFunctionBinding {
+    var found: ?ExtensionFunctionBinding = null;
+    for (bindings) |binding| {
+        if (!std.ascii.eqlIgnoreCase(binding.sql_name, name)) continue;
+        if (found != null) return error.UnsupportedSqlShape;
+        found = binding;
+    }
+    return found;
+}
+
+pub fn validateExtensionFunctionArity(
+    kind: runtime_schema.RelationalRowsExpressionKind,
+    declared_arity: u16,
+    operand_count: usize,
+) !void {
+    if (operand_count != @as(usize, declared_arity)) return error.UnsupportedSqlShape;
+    switch (kind) {
+        .uuid_v4 => if (operand_count != 0) return error.UnsupportedSqlShape,
+        .lower, .upper, .md5 => if (operand_count != 1) return error.UnsupportedSqlShape,
+        .concat => if (operand_count == 0) return error.UnsupportedSqlShape,
+        .concat_ws => if (operand_count < 2) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 pub fn sqlJoinedSourceAliasTerminator(text: []const u8) bool {

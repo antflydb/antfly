@@ -485,6 +485,7 @@ pub const QueryFunctionBinding = struct {
     object_name: []const u8,
     sql_name: []const u8,
     native_expression: []const u8,
+    native_expression_kind: runtime_schema.RelationalRowsExpressionKind,
     arity: u16,
 };
 
@@ -1236,10 +1237,10 @@ fn appendQueryFunctionBindingsForMember(
         for (sql_names.array.items) |sql_name_value| {
             if (sql_name_value != .string) return error.InvalidExtensionQueryFunction;
             try requireObjectName(sql_name_value.string);
-            try appendQueryFunctionBinding(alloc, out, member, sql_name_value.string, native_expression, arity);
+            try appendQueryFunctionBinding(alloc, out, member, sql_name_value.string, native_expression, expression_kind, arity);
         }
     } else {
-        try appendQueryFunctionBinding(alloc, out, member, member.object_name, native_expression, arity);
+        try appendQueryFunctionBinding(alloc, out, member, member.object_name, native_expression, expression_kind, arity);
     }
 }
 
@@ -1249,6 +1250,7 @@ fn appendQueryFunctionBinding(
     member: ExtensionMember,
     sql_name: []const u8,
     native_expression: []const u8,
+    native_expression_kind: runtime_schema.RelationalRowsExpressionKind,
     arity: u16,
 ) !void {
     const extension_name = try alloc.dupe(u8, member.extension_name);
@@ -1264,6 +1266,7 @@ fn appendQueryFunctionBinding(
         .object_name = object_name,
         .sql_name = owned_sql_name,
         .native_expression = owned_native_expression,
+        .native_expression_kind = native_expression_kind,
         .arity = arity,
     });
 }
@@ -2265,6 +2268,7 @@ test "manifest-only query functions validate and expose ready native bindings" {
     try std.testing.expectEqualStrings("pgcrypto", bindings[0].extension_name);
     try std.testing.expectEqualStrings("gen_random_uuid", bindings[0].sql_name);
     try std.testing.expectEqualStrings("uuid_v4", bindings[0].native_expression);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.uuid_v4, bindings[0].native_expression_kind);
     try std.testing.expectEqual(@as(u16, 0), bindings[0].arity);
 
     var disabled = plan.installed;

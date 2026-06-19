@@ -141,6 +141,44 @@ pub const Runtime = struct {
         return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, body.expression);
     }
 
+    pub fn listExpressionRoutineBindingsAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+    ) ![]relational_sql.RoutineExpressionBinding {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var bindings = std.ArrayListUnmanaged(relational_sql.RoutineExpressionBinding).empty;
+        errdefer {
+            for (bindings.items) |binding| {
+                alloc.free(@constCast(binding.sql_name));
+                runtime_schema.freeRelationalRowsExpression(alloc, binding.expression);
+            }
+            bindings.deinit(alloc);
+        }
+
+        for (self.routines.items) |routine| {
+            if (routine.kind != .function) continue;
+            const body = routine.body orelse continue;
+            if (body.kind != .sql_expression or body.hook != .expression) continue;
+            if (routine.argument_count > std.math.maxInt(u16)) return error.UnsupportedSqlShape;
+
+            const sql_name = try alloc.dupe(u8, routine.name);
+            errdefer alloc.free(sql_name);
+            const expression = try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, body.expression);
+            errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
+
+            try bindings.append(alloc, .{
+                .sql_name = sql_name,
+                .arity = @intCast(routine.argument_count),
+                .expression = expression,
+                .null_input = routine.null_input,
+            });
+        }
+
+        return try bindings.toOwnedSlice(alloc);
+    }
+
     fn createLocked(self: *@This(), plan: relational_sql.CreateRoutinePlan) !void {
         if (plan.kind == .procedure and plan.body != null) return error.UnsupportedSqlShape;
         if (plan.body) |body| {
@@ -160,7 +198,7 @@ pub const Runtime = struct {
         self: *@This(),
         binding: extension_domain.QueryFunctionBinding,
     ) !void {
-        const expression_kind = extension_domain.queryFunctionNativeExpressionKind(binding.native_expression) orelse return error.InvalidExtensionQueryFunction;
+        const expression_kind = binding.native_expression_kind;
         try extension_domain.validateQueryFunctionNativeExpressionArity(expression_kind, binding.arity);
         if (self.findRoutineIndexLocked(.function, binding.sql_name, binding.arity)) |_| return error.RoutineAlreadyExists;
         var record = try nativeQueryFunctionRecordAlloc(self.alloc, binding, expression_kind);
@@ -212,6 +250,17 @@ pub const Runtime = struct {
         return null;
     }
 };
+
+pub fn freeExpressionRoutineBindings(
+    alloc: std.mem.Allocator,
+    bindings: []const relational_sql.RoutineExpressionBinding,
+) void {
+    for (bindings) |binding| {
+        alloc.free(@constCast(binding.sql_name));
+        runtime_schema.freeRelationalRowsExpression(alloc, binding.expression);
+    }
+    if (bindings.len > 0) alloc.free(@constCast(bindings));
+}
 
 fn nativeQueryFunctionRecordAlloc(
     alloc: std.mem.Allocator,
@@ -431,6 +480,69 @@ test "sql routine runtime executes bounded multi argument expression bodies" {
     try std.testing.expectEqualStrings("\"tenant active\"", label);
 }
 
+test "sql routine runtime exports expression routine bindings for SQL lowering" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    var normalize_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
+    );
+    defer normalize_plan.deinit(alloc);
+    try runtime.apply(switch (normalize_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    var label_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';",
+    );
+    defer label_plan.deinit(alloc);
+    try runtime.apply(switch (label_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    var strict_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION strict_normalize_status(text) RETURNS text LANGUAGE sql STRICT AS 'SELECT lower($1)';",
+    );
+    defer strict_plan.deinit(alloc);
+    try runtime.apply(switch (strict_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const bindings = try runtime.listExpressionRoutineBindingsAlloc(alloc);
+    defer freeExpressionRoutineBindings(alloc, bindings);
+    try std.testing.expectEqual(@as(usize, 3), bindings.len);
+
+    var saw_normalize = false;
+    var saw_label = false;
+    var saw_strict = false;
+    for (bindings) |binding| {
+        if (std.mem.eql(u8, binding.sql_name, "normalize_status")) {
+            saw_normalize = true;
+            try std.testing.expectEqual(@as(u16, 1), binding.arity);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, binding.expression.kind);
+            try std.testing.expect(binding.null_input == null);
+        } else if (std.mem.eql(u8, binding.sql_name, "status_label")) {
+            saw_label = true;
+            try std.testing.expectEqual(@as(u16, 2), binding.arity);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, binding.expression.kind);
+        } else if (std.mem.eql(u8, binding.sql_name, "strict_normalize_status")) {
+            saw_strict = true;
+            try std.testing.expectEqual(@as(u16, 1), binding.arity);
+            try std.testing.expectEqual(relational_sql.RoutineNullInput.returns_null, binding.null_input.?);
+        }
+    }
+    try std.testing.expect(saw_normalize);
+    try std.testing.expect(saw_label);
+    try std.testing.expect(saw_strict);
+}
+
 test "sql routine runtime executes nested safe expression bodies" {
     const alloc = std.testing.allocator;
     var plan = try relational_sql.lowerDdlPlanAlloc(
@@ -479,6 +591,7 @@ test "sql routine runtime replaces ready extension query function bindings" {
         .object_name = "gen_random_uuid",
         .sql_name = "gen_random_uuid",
         .native_expression = "uuid_v4",
+        .native_expression_kind = .uuid_v4,
         .arity = 0,
     }};
 

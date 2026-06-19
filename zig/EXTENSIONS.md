@@ -504,11 +504,13 @@ Expose narrow interfaces, not arbitrary internal structs:
   - manifest-only `query_function` objects persist as extension members with
     validated `config_json` metadata: `native_expression`, bounded `arity`, and
     optional `sql_names` aliases. The runtime binding resolver exposes only
-    ready installed extensions and clones stable native bindings into the SQL
-    routine runtime. Extension DDL refreshes those hooks from the projected
-    metadata snapshot, and SQL read-plan lowering has an explicit binding-aware
-    entrypoint for projecting those functions through native expression nodes,
-    so disabled or dropped extensions cannot publish SQL-visible function hooks.
+    ready installed extensions, projects those declarations into checked
+    row-expression kinds, and clones stable native bindings into the SQL routine
+    runtime. Extension DDL refreshes those hooks from the projected metadata
+    snapshot, and SQL read-plan lowering has an explicit binding-aware entrypoint
+    for projecting those functions through native expression nodes, so disabled
+    or dropped extensions cannot publish SQL-visible function hooks and the SQL
+    adapter does not need parser-local native-expression string mappings.
 - MCP tools and app-facing endpoints:
   - tool name, description, and JSON schema
   - handler mode: declarative Antfly API template, WASM, sidecar, or native

@@ -1033,6 +1033,16 @@ moves behind a `api/sql_adapter/` package:
   predicates, golden-plan fingerprint append mechanics, fixture parsers, and
   fingerprint assertions.
 
+This split has already started, so new SQL semantics should extend the adapter
+package boundary even when compatibility wrappers still live in
+`api/relational_sql.zig`. Binding-aware extension and routine functions follow
+that rule: `relational_sql.zig` may expose public `lower*WithFunctionBindings`
+entrypoints, but function-call recognition, duplicate binding rejection, arity
+checks, and row-expression lowering belong to `api/sql_adapter/lower_expr.zig`
+or adjacent adapter modules until the remaining parser code physically moves.
+Ready extension bindings passed into the adapter are typed
+`RelationalRowsExpressionKind` values, not parser-local string mappings.
+
 The internal flow is always:
 
 ```text
@@ -5141,7 +5151,14 @@ expression hooks through the shared `relational_rows.expressionValueJsonAlloc`
 evaluator, so supported functions such as ordinal identity, `lower`, `upper`,
 `md5`, `concat`, `concat_ws`, `coalesce`, `nullif`, `greatest`, `least`,
 nested allowlisted function calls, and simple bounded numeric addition over
-argument or literal operands are not opaque SQL strings.
+argument or literal operands are not opaque SQL strings. The same runtime
+exports executable expression-body functions as typed SQL lowerer bindings, so
+ordinary read-plan lowering can inline catalog routines by SQL name and overload
+arity into native row-expression projections instead of calling back into SQL
+text. `STRICT` / `RETURNS NULL ON NULL INPUT` routines only plan when a null
+result is statically known from a literal null argument; dynamic strict calls
+fail closed until the row-expression AST has a native null-guard node that can
+preserve PostgreSQL null-input semantics for nullable row fields.
 Table-schema and table-storage application still reject routine-catalog plans
 because routines are catalog/runtime objects, not schema JSON mutations.
 Routine bodies and routine options that do not yet have typed metadata remain
@@ -5662,11 +5679,12 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    instead of mutating relational schema JSON. Manifest-only extension packages
    can now publish validated `query_function` members carrying bounded
    `native_expression` metadata and optional SQL aliases; the extension catalog
-   exposes ready-only native function bindings, and extension DDL refreshes the
-   SQL routine runtime from the projected metadata snapshot. Binding-aware SQL
-   read-plan lowering can project those ready extension functions as typed
-   native expression nodes, so SQL-visible extension functions execute through
-   Antfly hooks instead of opaque package metadata. PL/pgSQL
+   exposes ready-only native function bindings with checked row-expression
+   kinds, and extension DDL refreshes the SQL routine runtime from the projected
+   metadata snapshot. Binding-aware SQL read-plan lowering can project those
+   ready extension functions as typed native expression nodes, so SQL-visible
+   extension functions execute through Antfly hooks instead of opaque package
+   metadata or parser-local string dispatch. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended
