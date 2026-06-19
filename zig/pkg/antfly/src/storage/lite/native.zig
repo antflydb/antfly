@@ -62,17 +62,123 @@ pub const InspectReport = struct {
     issue: ?[]const u8 = null,
 };
 
+pub const NativeFile = struct {
+    allocator: Allocator,
+    io_impl: std.Io.Threaded,
+    path: []u8,
+    file: std.Io.File,
+    header: Header,
+    read_only: bool = false,
+
+    pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        errdefer io_impl.deinit();
+        const io = io_impl.io();
+
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{
+            .mode = if (read_only) .read_only else .read_write,
+        });
+        errdefer file.close(io);
+
+        var header_bytes: [header_size]u8 = undefined;
+        try readExactAt(file, io, &header_bytes, 0);
+
+        return .{
+            .allocator = allocator,
+            .io_impl = io_impl,
+            .path = owned_path,
+            .file = file,
+            .header = try decodeHeader(&header_bytes),
+            .read_only = read_only,
+        };
+    }
+
+    pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        errdefer io_impl.deinit();
+        const io = io_impl.io();
+
+        try createFile(io, path);
+        io_impl.deinit();
+        return try open(allocator, path, false);
+    }
+
+    pub fn close(self: *NativeFile) void {
+        self.file.close(self.io_impl.io());
+        self.allocator.free(self.path);
+        self.io_impl.deinit();
+        self.* = undefined;
+    }
+
+    pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
+        return self.header.checkpoints[self.header.active_checkpoint];
+    }
+
+    pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
+        if (self.read_only) return error.ReadOnly;
+        if (contents.len > self.header.page_size) return error.PageTooLarge;
+
+        const previous = self.activeCheckpoint();
+        const page_id = previous.page_count;
+        const page_size: usize = @intCast(self.header.page_size);
+        const page_offset = page_id * @as(u64, self.header.page_size);
+
+        var page = try self.allocator.alloc(u8, page_size);
+        defer self.allocator.free(page);
+        @memset(page, 0);
+        @memcpy(page[0..contents.len], contents);
+
+        try self.file.setLength(self.io_impl.io(), page_offset + self.header.page_size);
+        try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
+        try self.file.sync(self.io_impl.io());
+
+        var next = previous;
+        next.commit_sequence += 1;
+        next.page_count = page_id + 1;
+        try self.publishCheckpoint(next);
+        return page_id;
+    }
+
+    pub fn readPageAlloc(self: *NativeFile, allocator: Allocator, page_id: u64) ![]u8 {
+        const checkpoint = self.activeCheckpoint();
+        if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
+
+        const page_size: usize = @intCast(self.header.page_size);
+        const page = try allocator.alloc(u8, page_size);
+        errdefer allocator.free(page);
+
+        try readExactAt(self.file, self.io_impl.io(), page, page_id * @as(u64, self.header.page_size));
+        return page;
+    }
+
+    fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
+        const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
+        self.header.checkpoints[next_slot] = checkpoint;
+        self.header.active_checkpoint = next_slot;
+
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, self.header);
+
+        try self.file.writePositionalAll(self.io_impl.io(), &encoded, 0);
+        try self.file.sync(self.io_impl.io());
+    }
+};
+
 pub fn create(io: std.Io, path: []const u8) !void {
+    try createFile(io, path);
+}
+
+fn createFile(io: std.Io, path: []const u8) !void {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
 
     var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
 
-    var file_buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &file_buf);
-    try writer.interface.writeAll(&encoded);
-    try writer.end();
+    try file.writePositionalAll(io, &encoded, 0);
     try file.sync(io);
 }
 
@@ -81,8 +187,7 @@ pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
-    var reader = file.reader(io, &.{});
-    try reader.interface.readSliceAll(&header_bytes);
+    try readExactAt(file, io, &header_bytes, 0);
     return inspectBytes(&header_bytes);
 }
 
@@ -182,6 +287,11 @@ fn decodeCheckpointSlot(raw: []const u8) CheckpointSlot {
     };
 }
 
+fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
+    const read = try file.readPositionalAll(io, out, offset);
+    if (read != out.len) return error.EndOfStream;
+}
+
 fn headerChecksum(raw: []const u8) u32 {
     var crc = std.hash.Crc32.init();
     crc.update(raw[0..header_checksum_offset]);
@@ -277,4 +387,56 @@ test "lite native inspect reads only the header page" {
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(format_version, report.format_version);
+}
+
+test "lite native file appends page and publishes checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-pages.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    const page_id = try file.allocatePage("hello native page");
+    try std.testing.expectEqual(@as(u64, 1), page_id);
+    try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().page_count);
+
+    const page = try file.readPageAlloc(allocator, page_id);
+    defer allocator.free(page);
+    try std.testing.expectEqualStrings("hello native page", page[0.."hello native page".len]);
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
+    try std.testing.expectEqual(@as(u64, 2), report.page_count);
+}
+
+test "lite native file reopens allocated pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-reopen.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        _ = try file.allocatePage("persisted");
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 2), reopened.activeCheckpoint().page_count);
+    const page = try reopened.readPageAlloc(allocator, 1);
+    defer allocator.free(page);
+    try std.testing.expectEqualStrings("persisted", page[0.."persisted".len]);
+    try std.testing.expectError(error.ReadOnly, reopened.allocatePage("nope"));
 }
