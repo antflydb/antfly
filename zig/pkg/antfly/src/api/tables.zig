@@ -71,7 +71,13 @@ pub const AppliedRelationalSqlDdlRecord = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         metadata_table_manager.freeTable(alloc, self.table);
-        if (self.work_items.len > 0) alloc.free(self.work_items);
+        if (self.work_items.len > 0) {
+            for (self.work_items) |item| {
+                var mutable = item;
+                mutable.deinit(alloc);
+            }
+            alloc.free(self.work_items);
+        }
         self.* = undefined;
     }
 };

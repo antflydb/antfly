@@ -15,6 +15,7 @@
 const std = @import("std");
 const group_ids = @import("../common/group_ids.zig");
 const transition_state = @import("transition_state.zig");
+const runtime_schema = @import("../storage/schema.zig");
 
 pub const default_database_name = "default";
 pub const default_namespace_name = "public";
@@ -183,6 +184,33 @@ pub const SecondaryIndexRebuildRangeRecord = struct {
     last_error: []const u8 = "",
 };
 
+pub const schema_rewrite_declared = "declared";
+pub const schema_rewrite_running = "running";
+pub const schema_rewrite_ready = "ready";
+pub const schema_rewrite_invalid = "invalid";
+
+pub const SchemaRewriteExpression = struct {
+    target_column: []const u8,
+    expression: runtime_schema.RelationalRowsExpression,
+};
+
+pub const SchemaRewriteJobRecord = struct {
+    job_id: u64,
+    table_id: u64,
+    schema_generation: u64,
+    action: []const u8,
+    reason: []const u8,
+    state: []const u8 = schema_rewrite_declared,
+    target_column: []const u8 = "",
+    expression: ?runtime_schema.RelationalRowsExpression = null,
+    lease_owner: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempts: u32 = 0,
+    completed_row_count: u64 = 0,
+    progress_row_key: []const u8 = "",
+    last_error: []const u8 = "",
+};
+
 pub const ForeignKeyReferenceRangeSelector = struct {
     child_table_id: u64,
     constraint_name: []const u8,
@@ -292,6 +320,17 @@ pub fn secondaryIndexRebuildRangeStateValid(state: []const u8) bool {
 
 pub fn secondaryIndexRebuildRangeComplete(record: SecondaryIndexRebuildRangeRecord) bool {
     return std.mem.eql(u8, record.state, secondary_index_rebuild_ready);
+}
+
+pub fn schemaRewriteJobStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, schema_rewrite_declared) or
+        std.mem.eql(u8, state, schema_rewrite_running) or
+        std.mem.eql(u8, state, schema_rewrite_ready) or
+        std.mem.eql(u8, state, schema_rewrite_invalid);
+}
+
+pub fn schemaRewriteJobComplete(record: SchemaRewriteJobRecord) bool {
+    return std.mem.eql(u8, record.state, schema_rewrite_ready);
 }
 
 pub const node_lifecycle_active = "active";
@@ -524,6 +563,7 @@ pub const TableManager = struct {
     foreign_key_ref_ranges: std.ArrayListUnmanaged(ForeignKeyReferenceRangeRecord) = .empty,
     unique_constraint_ranges: std.ArrayListUnmanaged(UniqueConstraintRangeRecord) = .empty,
     secondary_index_rebuild_ranges: std.ArrayListUnmanaged(SecondaryIndexRebuildRangeRecord) = .empty,
+    schema_rewrite_jobs: std.ArrayListUnmanaged(SchemaRewriteJobRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
 
@@ -560,6 +600,9 @@ pub const TableManager = struct {
 
         for (self.secondary_index_rebuild_ranges.items) |record| freeSecondaryIndexRebuildRange(self.alloc, record);
         self.secondary_index_rebuild_ranges.deinit(self.alloc);
+
+        for (self.schema_rewrite_jobs.items) |record| freeSchemaRewriteJob(self.alloc, record);
+        self.schema_rewrite_jobs.deinit(self.alloc);
 
         var split_it = self.split_intents.valueIterator();
         while (split_it.next()) |intent| freeSplitIntent(self.alloc, intent.*);
@@ -757,6 +800,25 @@ pub const TableManager = struct {
         try self.secondary_index_rebuild_ranges.append(self.alloc, owned);
     }
 
+    pub fn upsertSchemaRewriteJob(self: *TableManager, record: SchemaRewriteJobRecord) !void {
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.job_id == 0) return error.InvalidSchemaRewriteJob;
+        if (record.schema_generation == 0) return error.InvalidSchemaRewriteGeneration;
+        if (record.action.len == 0 or record.reason.len == 0) return error.InvalidSchemaRewriteJob;
+        if (!schemaRewriteJobStateValid(record.state)) return error.InvalidSchemaRewriteJobState;
+        if (record.expression != null and record.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
+
+        const owned = try cloneSchemaRewriteJob(self.alloc, record);
+        errdefer freeSchemaRewriteJob(self.alloc, owned);
+        for (self.schema_rewrite_jobs.items) |*existing| {
+            if (existing.job_id != record.job_id) continue;
+            freeSchemaRewriteJob(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.schema_rewrite_jobs.append(self.alloc, owned);
+    }
+
     pub fn clearTopology(self: *TableManager) void {
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -774,6 +836,9 @@ pub const TableManager = struct {
 
         for (self.secondary_index_rebuild_ranges.items) |record| freeSecondaryIndexRebuildRange(self.alloc, record);
         self.secondary_index_rebuild_ranges.clearRetainingCapacity();
+
+        for (self.schema_rewrite_jobs.items) |record| freeSchemaRewriteJob(self.alloc, record);
+        self.schema_rewrite_jobs.clearRetainingCapacity();
     }
 
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
@@ -807,12 +872,25 @@ pub const TableManager = struct {
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
         secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
     ) !void {
+        try self.replaceTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{});
+    }
+
+    pub fn replaceTopologyWithDerivedWork(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+        schema_rewrite_jobs: []const SchemaRewriteJobRecord,
+    ) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
         for (ranges) |record| try self.upsertRange(record);
         for (foreign_key_ref_ranges) |record| try self.upsertForeignKeyReferenceRange(record);
         for (unique_constraint_ranges) |record| try self.upsertUniqueConstraintRange(record);
         for (secondary_index_rebuild_ranges) |record| try self.upsertSecondaryIndexRebuildRange(record);
+        for (schema_rewrite_jobs) |record| try self.upsertSchemaRewriteJob(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -850,6 +928,18 @@ pub const TableManager = struct {
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
         secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
     ) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithDerivedWork(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+        schema_rewrite_jobs: []const SchemaRewriteJobRecord,
+    ) !ProjectedTopologyLoadResult {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
 
@@ -882,6 +972,13 @@ pub const TableManager = struct {
             }
             try self.upsertSecondaryIndexRebuildRange(record);
         }
+        for (schema_rewrite_jobs) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertSchemaRewriteJob(record);
+        }
         return result;
     }
 
@@ -892,6 +989,7 @@ pub const TableManager = struct {
             _ = self.removeForeignKeyReferenceRangesForTable(table_id);
             _ = self.removeUniqueConstraintRangesForTable(table_id);
             _ = self.removeSecondaryIndexRebuildRangesForTable(table_id);
+            _ = self.removeSchemaRewriteJobsForTable(table_id);
             return true;
         }
         return false;
@@ -1053,6 +1151,32 @@ pub const TableManager = struct {
             if (!std.mem.eql(u8, record.start_row_key, start_row_key)) continue;
             freeSecondaryIndexRebuildRange(self.alloc, record);
             _ = self.secondary_index_rebuild_ranges.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeSchemaRewriteJobsForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.schema_rewrite_jobs.items.len) {
+            const record = self.schema_rewrite_jobs.items[i];
+            if (record.table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeSchemaRewriteJob(self.alloc, record);
+            _ = self.schema_rewrite_jobs.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeSchemaRewriteJob(self: *TableManager, job_id: u64) bool {
+        for (self.schema_rewrite_jobs.items, 0..) |record, i| {
+            if (record.job_id != job_id) continue;
+            freeSchemaRewriteJob(self.alloc, record);
+            _ = self.schema_rewrite_jobs.orderedRemove(i);
             return true;
         }
         return false;
@@ -1539,6 +1663,21 @@ pub const TableManager = struct {
 
     pub fn freeSecondaryIndexRebuildRanges(_: *TableManager, alloc: std.mem.Allocator, records: []SecondaryIndexRebuildRangeRecord) void {
         for (records) |record| freeSecondaryIndexRebuildRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listSchemaRewriteJobs(self: *TableManager, alloc: std.mem.Allocator) ![]SchemaRewriteJobRecord {
+        var out = std.ArrayListUnmanaged(SchemaRewriteJobRecord).empty;
+        errdefer {
+            for (out.items) |record| freeSchemaRewriteJob(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.schema_rewrite_jobs.items) |record| try out.append(alloc, try cloneSchemaRewriteJob(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeSchemaRewriteJobs(_: *TableManager, alloc: std.mem.Allocator, records: []SchemaRewriteJobRecord) void {
+        for (records) |record| freeSchemaRewriteJob(alloc, record);
         alloc.free(records);
     }
 
@@ -2097,6 +2236,52 @@ pub fn freeSecondaryIndexRebuildRange(alloc: std.mem.Allocator, record: Secondar
     alloc.free(record.start_row_key);
     freeOwnedOptional(alloc, record.end_row_key);
     alloc.free(record.state);
+    alloc.free(record.lease_owner);
+    alloc.free(record.progress_row_key);
+    alloc.free(record.last_error);
+}
+
+pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobRecord) !SchemaRewriteJobRecord {
+    const action = try alloc.dupe(u8, record.action);
+    errdefer alloc.free(action);
+    const reason = try alloc.dupe(u8, record.reason);
+    errdefer alloc.free(reason);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    const target_column = try alloc.dupe(u8, record.target_column);
+    errdefer alloc.free(target_column);
+    const expression = if (record.expression) |expr| try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, expr) else null;
+    errdefer if (expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
+    const lease_owner = try alloc.dupe(u8, record.lease_owner);
+    errdefer alloc.free(lease_owner);
+    const progress_row_key = try alloc.dupe(u8, record.progress_row_key);
+    errdefer alloc.free(progress_row_key);
+    const last_error = try alloc.dupe(u8, record.last_error);
+    errdefer alloc.free(last_error);
+    return .{
+        .job_id = record.job_id,
+        .table_id = record.table_id,
+        .schema_generation = record.schema_generation,
+        .action = action,
+        .reason = reason,
+        .state = state,
+        .target_column = target_column,
+        .expression = expression,
+        .lease_owner = lease_owner,
+        .lease_expires_at_ms = record.lease_expires_at_ms,
+        .attempts = record.attempts,
+        .completed_row_count = record.completed_row_count,
+        .progress_row_key = progress_row_key,
+        .last_error = last_error,
+    };
+}
+
+pub fn freeSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobRecord) void {
+    alloc.free(record.action);
+    alloc.free(record.reason);
+    alloc.free(record.state);
+    alloc.free(record.target_column);
+    if (record.expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
     alloc.free(record.lease_owner);
     alloc.free(record.progress_row_key);
     alloc.free(record.last_error);
@@ -3183,6 +3368,124 @@ test "table manager owns secondary index rebuild work ranges" {
     try std.testing.expectEqual(@as(usize, 3), manager.removeSecondaryIndexRebuildRangesForTable(7));
     const remaining = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
     defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table manager owns schema rewrite jobs" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+
+    const status_expr: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{
+            .{ .kind = .field, .field = "status" },
+        },
+    };
+
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9101,
+        .table_id = 7,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .target_column = "status_norm",
+        .expression = status_expr,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 1234,
+    });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9102,
+        .table_id = 7,
+        .schema_generation = 42,
+        .action = "validate",
+        .reason = "constraints",
+        .state = schema_rewrite_ready,
+        .completed_row_count = 12,
+        .progress_row_key = "order:z",
+    });
+    try std.testing.expectError(error.UnknownTable, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9199,
+        .table_id = 99,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteJob, manager.upsertSchemaRewriteJob(.{
+        .job_id = 0,
+        .table_id = 7,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteGeneration, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .schema_generation = 0,
+        .action = "rewrite",
+        .reason = "row_images",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteJobState, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteExpression, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .expression = status_expr,
+    }));
+
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9101,
+        .table_id = 7,
+        .schema_generation = 43,
+        .action = "rewrite",
+        .reason = "row_images",
+        .state = schema_rewrite_invalid,
+        .target_column = "status_norm",
+        .expression = status_expr,
+        .last_error = "schema generation moved",
+    });
+
+    const listed = try manager.listSchemaRewriteJobs(std.testing.allocator);
+    defer manager.freeSchemaRewriteJobs(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+
+    var saw_replaced = false;
+    var saw_ready = false;
+    for (listed) |record| {
+        if (record.job_id == 9101) {
+            try std.testing.expectEqual(@as(u64, 43), record.schema_generation);
+            try std.testing.expectEqualStrings(schema_rewrite_invalid, record.state);
+            try std.testing.expectEqualStrings("schema generation moved", record.last_error);
+            try std.testing.expectEqualStrings("status_norm", record.target_column);
+            try std.testing.expect(record.expression != null);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, record.expression.?.kind);
+            try std.testing.expectEqual(@as(usize, 1), record.expression.?.operands.len);
+            try std.testing.expectEqualStrings("status", record.expression.?.operands[0].field);
+            saw_replaced = true;
+        } else if (record.job_id == 9102) {
+            try std.testing.expect(schemaRewriteJobComplete(record));
+            try std.testing.expectEqual(@as(u64, 12), record.completed_row_count);
+            try std.testing.expectEqualStrings("order:z", record.progress_row_key);
+            saw_ready = true;
+        }
+    }
+    try std.testing.expect(saw_replaced and saw_ready);
+
+    try std.testing.expect(manager.removeSchemaRewriteJob(9102));
+    try std.testing.expect(!manager.removeSchemaRewriteJob(9102));
+    try std.testing.expectEqual(@as(usize, 1), manager.removeSchemaRewriteJobsForTable(7));
+    const remaining = try manager.listSchemaRewriteJobs(std.testing.allocator);
+    defer manager.freeSchemaRewriteJobs(std.testing.allocator, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 

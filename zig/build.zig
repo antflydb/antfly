@@ -3771,6 +3771,7 @@ pub fn build(b: *std.Build) void {
             "api http server routes prepared transaction SQL DDL to coordinator recovery",
             "api http server executes SQL notification channel plans through native runtime",
             "api http server applies SQL routine catalog plans through native runtime",
+            "api http server schedules typed schema rewrite jobs from applied SQL DDL work",
             "api http server executes SQL COPY FROM STDIN through catalog rows batch",
             "sql auth adapter creates roles and applies table grants through user manager",
             "sql auth adapter resolves role setting conflicts deterministically",

@@ -1197,6 +1197,7 @@ fn applyRelationalSqlDdlOnServiceWithSession(
     defer svc.freeAdminSnapshot(&snapshot);
 
     if (try tables_api.applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, svc, &snapshot, sql, session)) |applied| {
+        try scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
         try svc.runRound();
         return applied;
     }
@@ -1226,6 +1227,7 @@ fn applyRelationalSqlDdlOnServiceWithSession(
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         _ = try workflow.createTableWithRanges(svc, applied.table, ranges);
+        try scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
         try svc.runRound();
         return applied;
     }
@@ -1253,8 +1255,63 @@ fn applyRelationalSqlDdlOnServiceWithSession(
     var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, table, sql, session);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
     try svc.runRound();
     return applied;
+}
+
+fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    applied: tables_api.AppliedRelationalSqlDdlRecord,
+) !void {
+    if (applied.dropped_table or applied.work_items.len == 0) return;
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    var ordinal: u32 = 0;
+    for (applied.work_items) |item| {
+        if (item.action != .rewrite) continue;
+        ordinal += 1;
+        if (!@hasDecl(ServiceDeclType, "upsertSchemaRewriteJob")) return error.UnsupportedOperation;
+        const job = schemaRewriteJobForAppliedDdlWorkItem(applied.table, item, ordinal);
+        try svc.upsertSchemaRewriteJob(job);
+    }
+    _ = alloc;
+}
+
+fn schemaRewriteJobForAppliedDdlWorkItem(
+    table: metadata_table_manager.TableRecord,
+    item: relational_sql.AppliedDdlWorkItem,
+    ordinal: u32,
+) metadata_table_manager.SchemaRewriteJobRecord {
+    var hasher = std.hash.Wyhash.init(0x5352514a);
+    hasher.update(std.mem.asBytes(&table.table_id));
+    hasher.update(&[_]u8{0});
+    hasher.update(table.schema_json);
+    hasher.update(&[_]u8{0});
+    hasher.update(@tagName(item.action));
+    hasher.update(&[_]u8{0});
+    hasher.update(@tagName(item.reason));
+    hasher.update(&[_]u8{0});
+    hasher.update(std.mem.asBytes(&ordinal));
+    const job_id = nonZeroId(hasher.final());
+    const schema_generation = nonZeroId(std.hash.Wyhash.hash(0x53434a47, table.schema_json));
+    return .{
+        .job_id = job_id,
+        .table_id = table.table_id,
+        .schema_generation = schema_generation,
+        .action = @tagName(item.action),
+        .reason = @tagName(item.reason),
+        .target_column = if (item.rewrite_expression) |rewrite| rewrite.target_column else "",
+        .expression = if (item.rewrite_expression) |rewrite| rewrite.expression else null,
+    };
+}
+
+fn nonZeroId(value: u64) u64 {
+    return if (value == 0) 1 else value;
 }
 
 fn droppedRelationalSqlTableRecordAlloc(
@@ -1264,7 +1321,13 @@ fn droppedRelationalSqlTableRecordAlloc(
     const dropped = try metadata_table_manager.cloneTable(alloc, table);
     errdefer metadata_table_manager.freeTable(alloc, dropped);
     const work_items = try relational_sql.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, true, true);
-    errdefer if (work_items.len > 0) alloc.free(work_items);
+    errdefer if (work_items.len > 0) {
+        for (work_items) |item| {
+            var mutable = item;
+            mutable.deinit(alloc);
+        }
+        alloc.free(work_items);
+    };
     return .{
         .table = dropped,
         .dropped_table = true,
@@ -1304,6 +1367,68 @@ test "api http server sql ddl drop table record carries catalog work items" {
     try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rewrite, dropped.work_items[2].action);
     try std.testing.expectEqual(relational_sql.AppliedDdlWorkSubject.table, dropped.work_items[2].subject);
     try std.testing.expectEqual(relational_sql.AppliedDdlWorkReason.row_images, dropped.work_items[2].reason);
+}
+
+test "api http server schedules typed schema rewrite jobs from applied SQL DDL work" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        job: ?metadata_table_manager.SchemaRewriteJobRecord = null,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.job) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            self.* = undefined;
+        }
+
+        fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            if (self.job) |existing| metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, existing);
+            self.job = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+        }
+    };
+
+    const table = try metadata_table_manager.cloneTable(alloc, .{
+        .table_id = 77,
+        .name = "events",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+    });
+    errdefer metadata_table_manager.freeTable(alloc, table);
+    const target_column = try alloc.dupe(u8, "status_key");
+    errdefer alloc.free(target_column);
+    const expression = try runtime_schema_mod.cloneRelationalRowsExpressionAlloc(alloc, .{
+        .kind = .lower,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    });
+    errdefer runtime_schema_mod.freeRelationalRowsExpression(alloc, expression);
+    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    work_items[0] = .{
+        .action = .rewrite,
+        .subject = .table,
+        .reason = .row_images,
+        .rewrite_expression = .{
+            .target_column = target_column,
+            .expression = expression,
+        },
+    };
+    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+        .table = table,
+        .rewrite_required = true,
+        .work_items = work_items,
+    };
+
+    var service = FakeService{};
+    defer service.deinit(alloc);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
+    applied.deinit(alloc);
+
+    const job = service.job orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 77), job.table_id);
+    try std.testing.expect(job.job_id != 0);
+    try std.testing.expect(job.schema_generation != 0);
+    try std.testing.expectEqualStrings("rewrite", job.action);
+    try std.testing.expectEqualStrings("row_images", job.reason);
+    try std.testing.expectEqualStrings("status_key", job.target_column);
+    const job_expression = job.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.lower, job_expression.kind);
+    try std.testing.expectEqualStrings("status", job_expression.operands[0].field);
 }
 
 fn applyDatabaseCatalogPlanOnService(

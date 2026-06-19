@@ -255,6 +255,7 @@ pub const MetadataStatus = struct {
     projected_foreign_key_ref_ranges: usize = 0,
     projected_unique_constraint_ranges: usize = 0,
     projected_secondary_index_rebuild_ranges: usize = 0,
+    projected_schema_rewrite_jobs: usize = 0,
     projected_stores: usize = 0,
     projected_placement_intents: usize = 0,
     projected_snapshot_bootstrap_intents: usize = 0,
@@ -304,6 +305,7 @@ pub const AdminSnapshot = struct {
     foreign_key_ref_ranges: []table_manager.ForeignKeyReferenceRangeRecord = &.{},
     unique_constraint_ranges: []table_manager.UniqueConstraintRangeRecord = &.{},
     secondary_index_rebuild_ranges: []table_manager.SecondaryIndexRebuildRangeRecord = &.{},
+    schema_rewrite_jobs: []table_manager.SchemaRewriteJobRecord = &.{},
     nodes: []table_manager.NodeRecord = &.{},
     stores: []table_manager.StoreRecord,
     placement_intents: []raft_reconciler.PlacementIntent,
@@ -358,6 +360,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     }
     if (@hasDecl(SourceDeclType, "listProjectedSecondaryIndexRebuildRanges")) {
         snapshot.secondary_index_rebuild_ranges = try source.listProjectedSecondaryIndexRebuildRanges(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedSchemaRewriteJobs")) {
+        snapshot.schema_rewrite_jobs = try source.listProjectedSchemaRewriteJobs(alloc);
     }
     if (@hasDecl(SourceDeclType, "listProjectedNodes")) {
         snapshot.nodes = try source.listProjectedNodes(alloc);
@@ -441,6 +446,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedSecondaryIndexRebuildRanges") and snapshot.secondary_index_rebuild_ranges.len > 0) {
         source.freeProjectedSecondaryIndexRebuildRanges(alloc, snapshot.secondary_index_rebuild_ranges);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSchemaRewriteJobs") and snapshot.schema_rewrite_jobs.len > 0) {
+        source.freeProjectedSchemaRewriteJobs(alloc, snapshot.schema_rewrite_jobs);
     }
     if (@hasDecl(SourceDeclType, "freeProjectedNodes") and snapshot.nodes.len > 0) {
         source.freeProjectedNodes(alloc, snapshot.nodes);
