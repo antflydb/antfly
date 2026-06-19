@@ -15,14 +15,14 @@
 const std = @import("std");
 const db_mod = @import("../db/db.zig");
 const backend_erased = @import("../backend_erased.zig");
-const lsm_backend = @import("../lsm_backend/mod.zig");
+const bridge = @import("bridge.zig");
 const docstore = @import("docstore.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
-pub const VacuumReport = lsm_backend.AfliteContainerStorage.VacuumReport;
+pub const VacuumReport = bridge.ContainerStorage.VacuumReport;
 
 pub const EngineKind = enum {
     /// Compatibility bridge for pre-native `.aflite` files and explicit
@@ -49,13 +49,13 @@ pub const OpenOptions = struct {
 
 pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     if (try hasNativeMagic(allocator, path)) return try native.checkFile(allocator, path);
-    return toCheckReport(try lsm_backend.AfliteContainerStorage.checkFile(allocator, path));
+    return toCheckReport(try bridge.ContainerStorage.checkFile(allocator, path));
 }
 
 pub const Handle = struct {
     allocator: Allocator,
     engine: EngineKind,
-    bridge_storage: ?*lsm_backend.AfliteContainerStorage = null,
+    bridge_storage: ?*bridge.ContainerStorage = null,
     native_docstore: ?*docstore.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
 
@@ -132,10 +132,10 @@ pub const Handle = struct {
 };
 
 fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
-    var storage = try allocator.create(lsm_backend.AfliteContainerStorage);
+    var storage = try allocator.create(bridge.ContainerStorage);
     errdefer allocator.destroy(storage);
 
-    storage.* = try lsm_backend.AfliteContainerStorage.openWithOptions(allocator, path, .{
+    storage.* = try bridge.ContainerStorage.openWithOptions(allocator, path, .{
         .read_only = opts.read_only,
     });
     errdefer storage.deinit();
@@ -168,7 +168,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     };
 }
 
-fn toCheckReport(report: lsm_backend.AfliteContainerStorage.CheckReport) CheckReport {
+fn toCheckReport(report: bridge.ContainerStorage.CheckReport) CheckReport {
     return .{
         .valid = report.valid,
         .file_size = report.file_size,

@@ -12,19 +12,19 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Single-file storage container for Antfly Lite.
+//! Legacy LSM bridge container for Antfly Lite.
 //!
-//! This is the first production-shaped `.aflite` storage primitive. It presents
-//! the existing LSM `Storage` interface over one physical file by replaying an
-//! append-only stream of logical-file records into an in-memory name index.
-//! Later work can add free-space reuse and checkpoint/vacuum without changing
-//! the higher-level LSM storage contract.
+//! This module owns the compatibility path for pre-native `.aflite` files. It
+//! presents the existing LSM `Storage` interface over one physical file by
+//! replaying an append-only stream of logical-file records into an in-memory
+//! name index. New Lite files should use `native.zig`; this bridge remains so
+//! old files and storage-engine tests can still open.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const fs_paths = @import("../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
-const storage_io = @import("storage_io.zig");
+const storage_io = @import("../lsm_backend/storage_io.zig");
 
 const Allocator = std.mem.Allocator;
 const AtomicWriteSink = storage_io.AtomicWriteSink;
@@ -990,11 +990,13 @@ test "aflite container storage ignores truncated tail record on reopen" {
     defer io_impl.deinit();
     try appendFile(io_impl.io(), path, "partial-record", true);
 
-    var reopened = try ContainerStorage.open(alloc, path);
-    defer reopened.deinit();
-    const got = try reopened.storage().readFileAlloc(alloc, "/good", 64);
-    defer alloc.free(got);
-    try std.testing.expectEqualStrings("value", got);
+    {
+        var reopened = try ContainerStorage.open(alloc, path);
+        defer reopened.deinit();
+        const got = try reopened.storage().readFileAlloc(alloc, "/good", 64);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings("value", got);
+    }
 
     const report = try ContainerStorage.checkFile(alloc, path);
     try std.testing.expect(!report.valid);
