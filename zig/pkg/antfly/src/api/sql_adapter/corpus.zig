@@ -4075,6 +4075,7 @@ pub const AppParityCorpusCoverage = struct {
     relation_population_select_into_temporary: bool = false,
     relation_population_select_into_unlogged: bool = false,
     relation_population_create_table_as: bool = false,
+    relation_population_create_table_as_no_data: bool = false,
     insert: bool = false,
     insert_source: bool = false,
     insert_source_expression_assignment: bool = false,
@@ -5184,6 +5185,9 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasExactStringToken(entry.plan, ":lifetime=", "unlogged"));
                 self.relation_population_create_table_as = self.relation_population_create_table_as or
                     sql_adapter.planHasExactStringToken(entry.plan, "relation_population:mode=", "create_table_as");
+                self.relation_population_create_table_as_no_data = self.relation_population_create_table_as_no_data or
+                    (sql_adapter.planHasExactStringToken(entry.plan, "relation_population:mode=", "create_table_as") and
+                        sql_adapter.planHasExactBoolToken(entry.plan, ":populate=", false));
             },
             .insert => self.insert = true,
             .insert_source => self.insert_source = true,
@@ -6423,6 +6427,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.relation_population_select_into_temporary);
         try std.testing.expect(self.relation_population_select_into_unlogged);
         try std.testing.expect(self.relation_population_create_table_as);
+        try std.testing.expect(self.relation_population_create_table_as_no_data);
         try std.testing.expect(self.insert);
         try std.testing.expect(self.insert_source);
         try std.testing.expect(self.insert_source_expression_assignment);

@@ -1259,6 +1259,7 @@ pub const RelationPopulationSyntax = struct {
     target_identifier: []const u8,
     target_lifetime: ?RelationLifetimeKind = null,
     if_not_exists: bool = false,
+    populate: bool = true,
     source_sql: []u8,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -5950,8 +5951,61 @@ fn parseSelectIntoPopulationSqlAlloc(
         .target_identifier = tokens[target_index].text,
         .target_lifetime = target_lifetime,
         .if_not_exists = false,
+        .populate = true,
         .source_sql = source_sql,
     };
+}
+
+const RelationPopulationDataClause = struct {
+    start_index: usize,
+    populate: bool,
+};
+
+fn parseTrailingRelationPopulationDataClause(tokens: []const Token, select_index: usize) ?RelationPopulationDataClause {
+    var end = tokens.len;
+    if (end > select_index and tokens[end - 1].kind == .semicolon) end -= 1;
+    if (end < select_index + 2) return null;
+
+    const with_data_index = end - 2;
+    if (tokens[with_data_index].kind == .identifier and
+        tokens[with_data_index + 1].kind == .identifier and
+        std.ascii.eqlIgnoreCase(tokens[with_data_index].text, "with") and
+        std.ascii.eqlIgnoreCase(tokens[with_data_index + 1].text, "data") and
+        topLevelTokenAt(tokens, select_index, with_data_index))
+    {
+        return .{ .start_index = with_data_index, .populate = true };
+    }
+
+    if (end < select_index + 3) return null;
+    const with_no_data_index = end - 3;
+    if (tokens[with_no_data_index].kind == .identifier and
+        tokens[with_no_data_index + 1].kind == .identifier and
+        tokens[with_no_data_index + 2].kind == .identifier and
+        std.ascii.eqlIgnoreCase(tokens[with_no_data_index].text, "with") and
+        std.ascii.eqlIgnoreCase(tokens[with_no_data_index + 1].text, "no") and
+        std.ascii.eqlIgnoreCase(tokens[with_no_data_index + 2].text, "data") and
+        topLevelTokenAt(tokens, select_index, with_no_data_index))
+    {
+        return .{ .start_index = with_no_data_index, .populate = false };
+    }
+
+    return null;
+}
+
+fn topLevelTokenAt(tokens: []const Token, start_index: usize, token_index: usize) bool {
+    var depth: usize = 0;
+    var index = start_index;
+    while (index < token_index) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return depth == 0;
 }
 
 fn parseCreateTableAsPopulationSqlAlloc(
@@ -5979,12 +6033,15 @@ fn parseCreateTableAsPopulationSqlAlloc(
     if (!parser.matchKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
     if (index >= tokens.len or tokens[index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[index].text, "select")) return error.UnsupportedSqlShape;
     const select_start = try tokenStartOffset(sql, tokens[index]);
-    const source_sql = try alloc.dupe(u8, sql[select_start..]);
+    const data_clause = parseTrailingRelationPopulationDataClause(tokens, index);
+    const source_end = if (data_clause) |clause| try tokenStartOffset(sql, tokens[clause.start_index]) else sql.len;
+    const source_sql = try alloc.dupe(u8, std.mem.trim(u8, sql[select_start..source_end], " \t\r\n"));
     return .{
         .mode = .create_table_as,
         .target_identifier = target_identifier,
         .target_lifetime = target_lifetime,
         .if_not_exists = if_not_exists,
+        .populate = if (data_clause) |clause| clause.populate else true,
         .source_sql = source_sql,
     };
 }
@@ -8938,7 +8995,29 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expectEqualStrings("usage_session_archive", create_as.target_identifier);
     try std.testing.expectEqual(RelationLifetimeKind.temporary, create_as.target_lifetime.?);
     try std.testing.expect(create_as.if_not_exists);
+    try std.testing.expect(create_as.populate);
     try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as.source_sql);
+
+    var create_as_no_data = try parseRelationPopulationSqlAlloc(
+        alloc,
+        "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH NO DATA;",
+    );
+    defer create_as_no_data.deinit(alloc);
+    try std.testing.expectEqual(RelationPopulationMode.create_table_as, create_as_no_data.mode);
+    try std.testing.expectEqualStrings("usage_archive", create_as_no_data.target_identifier);
+    try std.testing.expect(create_as_no_data.target_lifetime == null);
+    try std.testing.expect(!create_as_no_data.if_not_exists);
+    try std.testing.expect(!create_as_no_data.populate);
+    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as_no_data.source_sql);
+
+    var create_as_with_data = try parseRelationPopulationSqlAlloc(
+        alloc,
+        "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH DATA;",
+    );
+    defer create_as_with_data.deinit(alloc);
+    try std.testing.expectEqual(RelationPopulationMode.create_table_as, create_as_with_data.mode);
+    try std.testing.expect(create_as_with_data.populate);
+    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as_with_data.source_sql);
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,

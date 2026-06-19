@@ -4528,6 +4528,14 @@ pub fn executeLoweredRelationPopulationPlanAlloc(
     plan: relational_sql_api.LoweredRelationPopulationPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?LoweredRelationPopulationRowsResult {
+    if (!plan.populate) {
+        const target_table_name = try alloc.dupe(u8, plan.target_table_name);
+        return .{
+            .mode = plan.mode,
+            .target_table_name = target_table_name,
+        };
+    }
+
     var read_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source,
@@ -19649,6 +19657,32 @@ test "lowered relation population plans execute routed typed read sources" {
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Grace\"}", result.rows[1]);
+
+    var lowered_no_data = try relational_sql_api.lowerRelationPopulationPlanWithCatalogAlloc(
+        alloc,
+        "CREATE TABLE order_archive_empty AS SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status WITH NO DATA",
+        orders_schema,
+        &.{},
+        catalog.iface(),
+    );
+    defer lowered_no_data.deinit(alloc);
+    try std.testing.expect(!lowered_no_data.populate);
+
+    var no_data_result = (try executeLoweredRelationPopulationPlanAlloc(
+        alloc,
+        fake.source(),
+        catalog.iface(),
+        "orders",
+        orders_schema,
+        lowered_no_data,
+        .read_index,
+    )).?;
+    defer no_data_result.deinit(alloc);
+
+    try std.testing.expectEqualStrings("order_archive_empty", no_data_result.target_table_name);
+    try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 0), no_data_result.total);
+    try std.testing.expectEqual(@as(usize, 0), no_data_result.rows.len);
 }
 
 fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {

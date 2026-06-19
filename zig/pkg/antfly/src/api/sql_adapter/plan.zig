@@ -351,6 +351,7 @@ pub const LoweredRelationPopulationPlan = struct {
     target_table_name: []const u8,
     target_lifetime: ?RelationLifetimeKind = null,
     if_not_exists: bool = false,
+    populate: bool = true,
     source: LoweredReadPlan,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {

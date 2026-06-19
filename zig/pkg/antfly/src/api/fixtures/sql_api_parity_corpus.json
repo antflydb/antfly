@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "59a8e8a6019375e46104e552df9032eb88ad072ab0a70acd30dd7a80541f2284",
-  "source_entry_count": 960,
-  "entry_count": 960,
+  "source_sha256": "8af9be6579493b5c483853eb12b27dcdb0757eb6c40928162f3126274fdf1dbe",
+  "source_entry_count": 961,
+  "entry_count": 961,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3687,8 +3687,17 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "create table as select no data relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_archive_empty"
+      },
+      "plan": "relation_population:mode=create_table_as:target=usage_archive_empty:lifetime=durable:if_not_exists=false:populate=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "CREATE TABLE usage_archive_empty AS SELECT id, status FROM usage_records WHERE status = 'closed' WITH NO DATA"
     },
     {
       "name": "create table if not exists as select relation population plan",
@@ -3696,7 +3705,7 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=true:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE TABLE IF NOT EXISTS usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -3705,7 +3714,7 @@
       "summary": {
         "table_name": "usage_session_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_session_archive:lifetime=temporary:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_session_archive:lifetime=temporary:if_not_exists=true:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -3714,7 +3723,7 @@
       "summary": {
         "table_name": "usage_ingest_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE UNLOGGED TABLE usage_ingest_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -5289,7 +5298,7 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -5298,7 +5307,7 @@
       "summary": {
         "table_name": "usage_session_archive"
       },
-      "plan": "relation_population:mode=select_into:target=usage_session_archive:lifetime=temporary:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=select_into:target=usage_session_archive:lifetime=temporary:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id, status INTO TEMP TABLE usage_session_archive FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -5307,7 +5316,7 @@
       "summary": {
         "table_name": "usage_ingest_archive"
       },
-      "plan": "relation_population:mode=select_into:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=select_into:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id, status INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE status = 'closed'"
     },
     {

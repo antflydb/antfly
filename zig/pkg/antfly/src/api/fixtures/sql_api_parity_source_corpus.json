@@ -4096,8 +4096,17 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "create table as select no data relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_archive_empty"
+      },
+      "plan": "relation_population:mode=create_table_as:target=usage_archive_empty:lifetime=durable:if_not_exists=false:populate=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "CREATE TABLE usage_archive_empty AS SELECT id, status FROM usage_records WHERE status = 'closed' WITH NO DATA"
     },
     {
       "name": "create table if not exists as select relation population plan",
@@ -4105,7 +4114,7 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=true:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE TABLE IF NOT EXISTS usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -4114,7 +4123,7 @@
       "summary": {
         "table_name": "usage_session_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_session_archive:lifetime=temporary:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_session_archive:lifetime=temporary:if_not_exists=true:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -4123,7 +4132,7 @@
       "summary": {
         "table_name": "usage_ingest_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE UNLOGGED TABLE usage_ingest_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -5697,7 +5706,7 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -5706,7 +5715,7 @@
       "summary": {
         "table_name": "usage_session_archive"
       },
-      "plan": "relation_population:mode=select_into:target=usage_session_archive:lifetime=temporary:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=select_into:target=usage_session_archive:lifetime=temporary:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id, status INTO TEMP TABLE usage_session_archive FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -5715,7 +5724,7 @@
       "summary": {
         "table_name": "usage_ingest_archive"
       },
-      "plan": "relation_population:mode=select_into:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=select_into:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id, status INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE status = 'closed'"
     },
     {

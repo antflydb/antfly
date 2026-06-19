@@ -617,6 +617,7 @@ pub fn lowerRelationPopulationPlanWithCatalogAlloc(
         .target_table_name = target,
         .target_lifetime = parsed.target_lifetime,
         .if_not_exists = parsed.if_not_exists,
+        .populate = parsed.populate,
         .source = source,
     };
 }
@@ -58412,8 +58413,8 @@ fn relationPopulationFingerprintAlloc(
     defer alloc.free(source);
     return try std.fmt.allocPrint(
         alloc,
-        "relation_population:mode={s}:target={s}:lifetime={s}:if_not_exists={}:source={s}",
-        .{ relationPopulationModeName(lowered.mode), lowered.target_table_name, relationPopulationTargetLifetimeName(lowered.target_lifetime), lowered.if_not_exists, source },
+        "relation_population:mode={s}:target={s}:lifetime={s}:if_not_exists={}:populate={}:source={s}",
+        .{ relationPopulationModeName(lowered.mode), lowered.target_table_name, relationPopulationTargetLifetimeName(lowered.target_lifetime), lowered.if_not_exists, lowered.populate, source },
     );
 }
 
@@ -59707,7 +59708,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed' ORDER BY id LIMIT 5",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive", .limit = 5 },
-        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -59715,7 +59716,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive", .select = 2 },
-        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -59723,7 +59724,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive", .predicates = 1 },
-        .plan = "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+        .plan = "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -59731,7 +59732,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive" },
-        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:populate=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{

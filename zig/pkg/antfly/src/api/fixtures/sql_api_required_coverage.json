@@ -503,6 +503,7 @@
     "read_set_operation_order_limit",
     "read_window",
     "relation_population_create_table_as",
+    "relation_population_create_table_as_no_data",
     "relation_population_select_into",
     "relation_population_select_into_temporary",
     "relation_population_select_into_unlogged",
