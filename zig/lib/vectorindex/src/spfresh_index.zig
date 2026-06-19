@@ -292,6 +292,65 @@ fn centroidBlockProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProb
     return lhs_lower < rhs_lower;
 }
 
+fn centroidBlockProbeWorse(lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
+    return centroidBlockProbeLess({}, rhs, lhs);
+}
+
+const CentroidBlockProbeCollector = struct {
+    probes: []FlatCentroidProbe,
+    count: usize = 0,
+    heap_ready: bool = false,
+
+    fn init(probes: []FlatCentroidProbe) CentroidBlockProbeCollector {
+        return .{ .probes = probes };
+    }
+
+    fn insert(self: *CentroidBlockProbeCollector, candidate: FlatCentroidProbe) void {
+        if (self.probes.len == 0) return;
+        if (self.count < self.probes.len) {
+            self.probes[self.count] = candidate;
+            self.count += 1;
+            if (self.count == self.probes.len) self.buildHeap();
+            return;
+        }
+
+        if (!self.heap_ready) self.buildHeap();
+        if (!centroidBlockProbeWorse(self.probes[0], candidate)) return;
+        self.probes[0] = candidate;
+        self.siftDown(0);
+    }
+
+    fn items(self: *const CentroidBlockProbeCollector) []FlatCentroidProbe {
+        return self.probes[0..self.count];
+    }
+
+    fn buildHeap(self: *CentroidBlockProbeCollector) void {
+        std.debug.assert(self.count == self.probes.len);
+        var i = self.count / 2;
+        while (i > 0) {
+            i -= 1;
+            self.siftDown(i);
+        }
+        self.heap_ready = true;
+    }
+
+    fn siftDown(self: *CentroidBlockProbeCollector, start_index: usize) void {
+        var index = start_index;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.count) break;
+            const right = left + 1;
+            var worst = left;
+            if (right < self.count and centroidBlockProbeWorse(self.probes[right], self.probes[left])) {
+                worst = right;
+            }
+            if (!centroidBlockProbeWorse(self.probes[worst], self.probes[index])) break;
+            std.mem.swap(FlatCentroidProbe, &self.probes[index], &self.probes[worst]);
+            index = worst;
+        }
+    }
+};
+
 fn centroidBlockProbeErrorBound(metric: vec.DistanceMetric, distance: f32, radius: f32) f32 {
     if (radius <= 0) return 0;
     return switch (metric) {
@@ -993,7 +1052,7 @@ pub fn selectFlatRabitqPostings(
             else
                 try self.alloc.alloc(FlatCentroidProbe, block_probe_candidate_count);
             defer if (!use_block_probe_candidates_stack) self.alloc.free(block_probe_candidates);
-            var block_probe_collector = FlatProbeCollector.init(block_probe_candidates);
+            var block_probe_collector = CentroidBlockProbeCollector.init(block_probe_candidates);
             for (0..directory.blocks.len) |block_index| {
                 block_probe_collector.insert(.{
                     .posting_id = @intCast(block_index),
@@ -2161,6 +2220,22 @@ test "flat probe collector keeps bounded lowest lower bounds" {
     try std.testing.expectEqual(@as(u64, 6), items[0].posting_id);
     try std.testing.expectEqual(@as(u64, 4), items[1].posting_id);
     try std.testing.expectEqual(@as(u64, 2), items[2].posting_id);
+}
+
+test "centroid block probe collector preserves distance tie ordering" {
+    var storage: [2]FlatCentroidProbe = undefined;
+    var collector = CentroidBlockProbeCollector.init(&storage);
+
+    collector.insert(.{ .posting_id = 1, .distance = 5, .error_bound = 1 }); // lower = 4
+    collector.insert(.{ .posting_id = 2, .distance = 4, .error_bound = 0 }); // lower = 4, better tie
+    collector.insert(.{ .posting_id = 3, .distance = 6, .error_bound = 2 }); // lower = 4, worse tie
+    collector.insert(.{ .posting_id = 4, .distance = 3, .error_bound = 0 }); // lower = 3
+
+    const items = collector.items();
+    std.mem.sort(FlatCentroidProbe, items, {}, centroidBlockProbeLess);
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqual(@as(u64, 4), items[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 2), items[1].posting_id);
 }
 
 test "adaptive flat centroid block probing stops at clear margin" {
