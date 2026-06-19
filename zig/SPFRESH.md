@@ -314,8 +314,11 @@ Current status:
   reusable scratch, avoiding a full posting-range value read when the newest
   value answers the single-member lookup; oversized candidate values release
   their heap fallback after each probe instead of being retained until lookup
-  exit. Segment committed-plus-pending scratch replay
-  also now sorts the two delta sources inside retained replay scratch and
+  exit. Mixed-generation in-memory segment delta batches now pre-count records
+  newer than the base generation and reserve pending replay output once, so a
+  large buffered batch with stale folded records does not grow record arrays one
+  live operation at a time. Segment committed-plus-pending scratch replay also
+  now sorts the two delta sources inside retained replay scratch and
   applies them in-place instead of allocating a separate materialized member
   slice; canonical base/delta query replay uses merge-style sorted delta
   application against sorted base members, preserving the sorted-base contract
