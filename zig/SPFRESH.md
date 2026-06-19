@@ -156,7 +156,10 @@ Current status:
   until the selected rerank count is known, so boundary rerank does not size
   vector fetch scratch to candidates it will never exact-score. Small
   transformed-vector matrix loads now use stack-backed lookup, vector-view, and
-  batch-vector scratch before falling back to heap allocation.
+  batch-vector scratch before falling back to heap allocation. Rerank position
+  selection also skips the vector-id sort when the selected positions are
+  already ordered, preserving sorted batch vector loads without paying sort CPU
+  on naturally ordered windows.
 - Delete-heavy posting mutations now switch `PostingStore.removeMembers` from
   repeated linear membership checks to a temporary removal set for larger
   postings/delete lists, preserving member order while avoiding quadratic CPU

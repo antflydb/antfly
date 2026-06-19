@@ -3669,12 +3669,27 @@ fn selectedRerankCandidatePositionsInto(
         out += 1;
     }
     const used = positions[0..out];
+    if (rerankPositionsAreVectorIdOrdered(ranked_items, used)) return used;
     std.mem.sort(usize, used, ranked_items, struct {
         fn lessThan(items: []const search_results.ApproxSearchResult, a: usize, b: usize) bool {
             return items[a].vector_id < items[b].vector_id;
         }
     }.lessThan);
     return used;
+}
+
+fn rerankPositionsAreVectorIdOrdered(
+    ranked_items: []const search_results.ApproxSearchResult,
+    positions: []const usize,
+) bool {
+    if (positions.len < 2) return true;
+    var previous = ranked_items[positions[0]].vector_id;
+    for (positions[1..]) |position| {
+        const current = ranked_items[position].vector_id;
+        if (previous > current) return false;
+        previous = current;
+    }
+    return true;
 }
 
 fn loadRerankVectorsSorted(
@@ -4253,6 +4268,35 @@ test "boundary rerank selects only tail candidates overlapping kth candidate" {
     const never = try selectRerankCandidates(std.testing.allocator, ranked_items[0..], req.k, req, .never);
     defer std.testing.allocator.free(never.flags);
     for (never.flags) |selected| try std.testing.expect(!selected);
+}
+
+test "rerank selected positions skip sort when vector ids are already ordered" {
+    const ranked_items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 10, .distance = 0.10, .error_bound = 0.01 },
+        .{ .vector_id = 20, .distance = 0.20, .error_bound = 0.01 },
+        .{ .vector_id = 30, .distance = 0.30, .error_bound = 0.01 },
+        .{ .vector_id = 40, .distance = 0.40, .error_bound = 0.01 },
+    };
+    const flags = [_]bool{ true, false, true, true };
+    var positions: [3]usize = undefined;
+
+    const selected = selectedRerankCandidatePositionsInto(ranked_items[0..], flags[0..], positions[0..]);
+    try std.testing.expect(rerankPositionsAreVectorIdOrdered(ranked_items[0..], selected));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, selected);
+}
+
+test "rerank selected positions sort when vector ids are out of order" {
+    const ranked_items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 30, .distance = 0.10, .error_bound = 0.01 },
+        .{ .vector_id = 10, .distance = 0.20, .error_bound = 0.01 },
+        .{ .vector_id = 20, .distance = 0.30, .error_bound = 0.01 },
+    };
+    const flags = [_]bool{ true, true, true };
+    var positions: [3]usize = undefined;
+
+    const selected = selectedRerankCandidatePositionsInto(ranked_items[0..], flags[0..], positions[0..]);
+    try std.testing.expect(rerankPositionsAreVectorIdOrdered(ranked_items[0..], selected));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0 }, selected);
 }
 
 test "boundary rerank uses explicit rerank boundary below candidate window" {
