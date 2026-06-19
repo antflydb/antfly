@@ -90,6 +90,11 @@ pub const CheckpointSlot = struct {
     page_count: u64 = 1,
 };
 
+pub const LockMode = enum {
+    writer,
+    reader,
+};
+
 pub const Header = struct {
     page_size: u32 = default_page_size,
     active_checkpoint: u8 = 0,
@@ -135,9 +140,7 @@ pub const NativeFile = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
 
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{
-            .mode = if (read_only) .read_only else .read_write,
-        });
+        const file = try openLockedFile(io, path, if (read_only) .reader else .writer);
         errdefer file.close(io);
 
         var header_bytes: [header_size]u8 = undefined;
@@ -158,7 +161,7 @@ pub const NativeFile = struct {
         errdefer io_impl.deinit();
         const io = io_impl.io();
 
-        try createFile(io, path);
+        try createFile(io, path, .writer);
         io_impl.deinit();
         return try open(allocator, path, false);
     }
@@ -549,22 +552,57 @@ pub const NativeFile = struct {
 };
 
 pub fn create(io: std.Io, path: []const u8) !void {
-    try createFile(io, path);
+    try createFile(io, path, .writer);
 }
 
-fn createFile(io: std.Io, path: []const u8) !void {
+fn createFile(io: std.Io, path: []const u8, lock_mode: LockMode) !void {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
 
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    var file = try createLockedFile(io, path, lock_mode, true);
     defer file.close(io);
 
     try file.writePositionalAll(io, &encoded, 0);
     try file.sync(io);
 }
 
+fn openLockedFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = if (lock_mode == .reader) .read_only else .read_write,
+        .lock = fileLockForMode(lock_mode),
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
+            .mode = if (lock_mode == .reader) .read_only else .read_write,
+        }),
+        else => return err,
+    };
+}
+
+fn createLockedFile(io: std.Io, path: []const u8, lock_mode: LockMode, truncate: bool) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = truncate,
+        .lock = fileLockForMode(lock_mode),
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileLocksUnsupported => try std.Io.Dir.cwd().createFile(io, path, .{
+            .read = true,
+            .truncate = truncate,
+        }),
+        else => return err,
+    };
+}
+
+fn fileLockForMode(mode: LockMode) std.Io.File.Lock {
+    return switch (mode) {
+        .writer => .exclusive,
+        .reader => .shared,
+    };
+}
+
 pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    var file = try openLockedFile(io, path, .reader);
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
@@ -577,7 +615,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    var file = try openLockedFile(io, path, .reader);
     defer file.close(io);
 
     const file_size = (try file.stat(io)).size;
@@ -983,17 +1021,19 @@ test "lite native file appends page and publishes checkpoint" {
     const path = try testPath(allocator, tmp, "native-pages.aflite");
     defer allocator.free(path);
 
-    var file = try NativeFile.create(allocator, path);
-    defer file.close();
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
 
-    const page_id = try file.allocatePage("hello native page");
-    try std.testing.expectEqual(@as(u64, 1), page_id);
-    try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().page_count);
+        const page_id = try file.allocatePage("hello native page");
+        try std.testing.expectEqual(@as(u64, 1), page_id);
+        try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().page_count);
 
-    const page = try file.readPagePayloadAlloc(allocator, page_id);
-    defer allocator.free(page);
-    try std.testing.expectEqualStrings("hello native page", page);
+        const page = try file.readPagePayloadAlloc(allocator, page_id);
+        defer allocator.free(page);
+        try std.testing.expectEqualStrings("hello native page", page);
+    }
 
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
@@ -1024,6 +1064,48 @@ test "lite native file reopens allocated pages" {
     defer allocator.free(page);
     try std.testing.expectEqualStrings("persisted", page);
     try std.testing.expectError(error.ReadOnly, reopened.allocatePage("nope"));
+}
+
+test "lite native file permits concurrent readers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-reader-locks.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        _ = try file.allocatePage("persisted");
+    }
+
+    var reader_a = try NativeFile.open(allocator, path, true);
+    defer reader_a.close();
+
+    var reader_b = try NativeFile.open(allocator, path, true);
+    defer reader_b.close();
+
+    try std.testing.expectEqual(@as(u64, 2), reader_a.activeCheckpoint().page_count);
+    try std.testing.expectEqual(@as(u64, 2), reader_b.activeCheckpoint().page_count);
+}
+
+test "lite native file active writer blocks other opens" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-writer-lock.aflite");
+    defer allocator.free(path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+
+    try std.testing.expectError(error.WouldBlock, NativeFile.open(allocator, path, false));
+    try std.testing.expectError(error.WouldBlock, NativeFile.open(allocator, path, true));
+    try std.testing.expectError(error.WouldBlock, inspect(allocator, std.testing.io, path));
 }
 
 test "lite native file detects corrupted page payload" {
