@@ -4293,6 +4293,7 @@ pub const AppParityCorpusCoverage = struct {
     set_operation_expression_numeric_range_disjoint: bool = false,
     aggregate_offset: bool = false,
     aggregate_input_expression: bool = false,
+    aggregate_percentile_cont: bool = false,
     aggregate_group_expression: bool = false,
     aggregate_group_expression_alias: bool = false,
     aggregate_having_expression: bool = false,
@@ -4815,6 +4816,8 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
                 self.aggregate_regexp_text_expression = self.aggregate_regexp_text_expression or (std.mem.indexOf(u8, entry.sql, "COUNT(DISTINCT regexp_substr(status,") != null and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
+                self.aggregate_percentile_cont = self.aggregate_percentile_cont or
+                    std.mem.indexOf(u8, entry.sql, "percentile_cont") != null;
                 self.aggregate_group_expression = self.aggregate_group_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=");
                 self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=") and
                     std.mem.indexOf(u8, entry.sql, "GROUP BY status_key") != null);
@@ -6322,6 +6325,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.set_operation_expression_numeric_range_disjoint);
         try std.testing.expect(self.aggregate_offset);
         try std.testing.expect(self.aggregate_input_expression);
+        try std.testing.expect(self.aggregate_percentile_cont);
         try std.testing.expect(self.aggregate_octet_length_expression);
         try std.testing.expect(self.aggregate_bit_length_expression);
         try std.testing.expect(self.aggregate_scalar_minmax);

@@ -5089,6 +5089,17 @@
       "family": "unsupported_read",
       "plan": "unsupported:read:requires=ordered_set_aggregate_plan",
       "classification_reason": "ordered_set_aggregate_plan",
+      "sql": "SELECT customer_id, percentile_disc(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount FROM usage_records GROUP BY customer_id"
+    },
+    {
+      "name": "ordered-set percentile continuous aggregate",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "group_by": 1,
+        "aggregations": 1
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=0:limit=-1",
       "sql": "SELECT customer_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount FROM usage_records GROUP BY customer_id"
     },
     {

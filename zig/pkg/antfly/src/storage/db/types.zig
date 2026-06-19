@@ -1889,6 +1889,7 @@ pub const RelationalRowsAggregateOp = enum {
     min,
     max,
     avg,
+    percentile_cont,
     array_agg,
     string_agg,
     bool_or,
@@ -1896,6 +1897,7 @@ pub const RelationalRowsAggregateOp = enum {
 };
 
 pub const default_relational_rows_aggregate_distinct_max_items: u32 = 65536;
+pub const default_relational_rows_percentile_max_items: u32 = 65536;
 pub const default_relational_rows_array_agg_max_items: u32 = 1024;
 
 pub const RelationalRowsAggregateSpec = struct {
@@ -1905,6 +1907,8 @@ pub const RelationalRowsAggregateSpec = struct {
     expression: ?RelationalRowsExpression = null,
     distinct: bool = false,
     distinct_max_items: u32 = default_relational_rows_aggregate_distinct_max_items,
+    percentile: ?f64 = null,
+    percentile_max_items: u32 = 0,
     array_max_items: u32 = 0,
     array_order_by: []const RelationalRowsQueryOrder = &.{},
     string_delimiter: ?[]const u8 = null,

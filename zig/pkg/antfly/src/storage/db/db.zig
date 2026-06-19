@@ -22420,6 +22420,7 @@ pub const DB = struct {
         distinct_seen: std.StringHashMapUnmanaged(void) = .empty,
         array_items: std.ArrayListUnmanaged(RelationalRowsAggregateArrayItem) = .empty,
         array_seen: usize = 0,
+        percentile_samples: std.ArrayListUnmanaged(f64) = .empty,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.min_json) |value| alloc.free(value);
@@ -22429,6 +22430,7 @@ pub const DB = struct {
             self.distinct_seen.deinit(alloc);
             for (self.array_items.items) |*item| item.deinit(alloc);
             self.array_items.deinit(alloc);
+            self.percentile_samples.deinit(alloc);
             self.* = undefined;
         }
 
@@ -22482,6 +22484,18 @@ pub const DB = struct {
                 _ = self.array_items.pop();
             }
             self.count = self.array_items.items.len;
+        }
+
+        fn appendPercentileSample(
+            self: *@This(),
+            alloc: Allocator,
+            value: f64,
+            max_items: u32,
+        ) !void {
+            if (max_items == 0) return error.InvalidQueryRequest;
+            if (self.percentile_samples.items.len >= @as(usize, max_items)) return error.ResourceBudgetExceeded;
+            try self.percentile_samples.append(alloc, value);
+            self.count = self.percentile_samples.items.len;
         }
 
         fn updateMinMaxValue(
@@ -22591,6 +22605,19 @@ pub const DB = struct {
                         if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, parsed.value, spec.distinct_max_items))) continue;
                         self.metrics[i].count += 1;
                         self.metrics[i].sum += number;
+                    },
+                    .percentile_cont => {
+                        if (spec.distinct) return error.InvalidQueryRequest;
+                        const percentile = spec.percentile orelse return error.InvalidQueryRequest;
+                        if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.InvalidQueryRequest;
+                        if (spec.percentile_max_items == 0) return error.InvalidQueryRequest;
+                        const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
+                        defer alloc.free(value_json);
+                        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                        defer parsed.deinit();
+                        if (parsed.value == .null) continue;
+                        const number = jsonNumberAsF64(parsed.value) orelse return error.InvalidQueryRequest;
+                        try self.metrics[i].appendPercentileSample(alloc, number, spec.percentile_max_items);
                     },
                     .min, .max => {
                         const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
@@ -22769,6 +22796,14 @@ pub const DB = struct {
                 if (metric.count == 0) return try writer.writeAll("null");
                 try writeRelationalRowsAggregateNumberJson(writer, metric.sum / @as(f64, @floatFromInt(metric.count)));
             },
+            .percentile_cont => {
+                if (metric.percentile_samples.items.len == 0) return try writer.writeAll("null");
+                const percentile = spec.percentile orelse return error.InvalidQueryRequest;
+                if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.InvalidQueryRequest;
+                std.sort.pdq(f64, metric.percentile_samples.items, {}, relationalRowsAggregateF64LessThan);
+                const value = relationalRowsPercentileCont(metric.percentile_samples.items, percentile);
+                try writeRelationalRowsAggregateNumberJson(writer, value);
+            },
             .min => if (metric.min_json) |value|
                 try writer.writeAll(value)
             else
@@ -22825,6 +22860,21 @@ pub const DB = struct {
             };
         }
         return lhs.ordinal < rhs.ordinal;
+    }
+
+    fn relationalRowsAggregateF64LessThan(_: void, lhs: f64, rhs: f64) bool {
+        return lhs < rhs;
+    }
+
+    fn relationalRowsPercentileCont(samples: []const f64, percentile: f64) f64 {
+        std.debug.assert(samples.len > 0);
+        if (samples.len == 1) return samples[0];
+        const position = percentile * @as(f64, @floatFromInt(samples.len - 1));
+        const lower_index: usize = @intFromFloat(@floor(position));
+        const upper_index: usize = @intFromFloat(@ceil(position));
+        if (lower_index == upper_index) return samples[lower_index];
+        const fraction = position - @as(f64, @floatFromInt(lower_index));
+        return samples[lower_index] + ((samples[upper_index] - samples[lower_index]) * fraction);
     }
 
     fn writeRelationalRowsAggregateNumberJson(writer: *std.Io.Writer, value: f64) !void {

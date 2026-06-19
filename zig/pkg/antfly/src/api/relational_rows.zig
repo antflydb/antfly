@@ -6027,7 +6027,7 @@ fn parseRowsAggregateSpecAlloc(
     value: std.json.Value,
 ) !db_mod.types.RelationalRowsAggregateSpec {
     if (value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(value.object, &.{ "name", "op", "field", "expr", "distinct", "distinct_max_items", "array_max_items", "array_order_by", "delimiter", "filter", "filter_array_any", "filter_array_contains", "filter_array_eq", "filter_in", "filter_json_contains", "filter_json_path_eq", "filter_json_path_exists", "filter_text_patterns", "filter_expressions", "filter_expression_array_contains", "filter_any", "filter_not" });
+    try requireJsonObjectOnlyKeys(value.object, &.{ "name", "op", "field", "expr", "distinct", "distinct_max_items", "percentile", "percentile_max_items", "array_max_items", "array_order_by", "delimiter", "filter", "filter_array_any", "filter_array_contains", "filter_array_eq", "filter_in", "filter_json_contains", "filter_json_path_eq", "filter_json_path_exists", "filter_text_patterns", "filter_expressions", "filter_expression_array_contains", "filter_any", "filter_not" });
     const name_value = value.object.get("name") orelse return error.InvalidRowsRequest;
     const op_value = value.object.get("op") orelse return error.InvalidRowsRequest;
     if (name_value != .string or name_value.string.len == 0) return error.InvalidRowsRequest;
@@ -6062,6 +6062,7 @@ fn parseRowsAggregateSpecAlloc(
     errdefer if (!expression_transferred) if (expression) |owned| freeRowsQueryExpression(alloc, owned);
 
     const distinct = try parseOptionalBool(value.object.get("distinct")) orelse false;
+    if (op == .percentile_cont and distinct) return error.InvalidRowsRequest;
     const distinct_max_items = if (distinct)
         (try parseOptionalU32(value.object.get("distinct_max_items"))) orelse db_mod.types.default_relational_rows_aggregate_distinct_max_items
     else blk: {
@@ -6069,6 +6070,22 @@ fn parseRowsAggregateSpecAlloc(
         break :blk 0;
     };
     if (distinct and distinct_max_items == 0) return error.InvalidRowsRequest;
+
+    const percentile: ?f64 = if (op == .percentile_cont) blk: {
+        const parsed = try parseOptionalF64(value.object.get("percentile")) orelse return error.InvalidRowsRequest;
+        if (!std.math.isFinite(parsed) or parsed < 0 or parsed > 1) return error.InvalidRowsRequest;
+        break :blk parsed;
+    } else blk: {
+        if (value.object.get("percentile") != null) return error.InvalidRowsRequest;
+        break :blk null;
+    };
+    const percentile_max_items = if (op == .percentile_cont)
+        (try parseOptionalU32(value.object.get("percentile_max_items"))) orelse db_mod.types.default_relational_rows_percentile_max_items
+    else blk: {
+        if (value.object.get("percentile_max_items") != null) return error.InvalidRowsRequest;
+        break :blk 0;
+    };
+    if (op == .percentile_cont and percentile_max_items == 0) return error.InvalidRowsRequest;
 
     const is_collection_aggregate = op == .array_agg or op == .string_agg;
     const array_max_items = if (is_collection_aggregate)
@@ -6156,6 +6173,8 @@ fn parseRowsAggregateSpecAlloc(
         .expression = expression,
         .distinct = distinct,
         .distinct_max_items = distinct_max_items,
+        .percentile = percentile,
+        .percentile_max_items = percentile_max_items,
         .array_max_items = array_max_items,
         .array_order_by = array_order_by,
         .string_delimiter = string_delimiter,
@@ -6181,6 +6200,7 @@ fn parseRowsAggregateOp(value: []const u8) ?db_mod.types.RelationalRowsAggregate
     if (std.mem.eql(u8, value, "min")) return .min;
     if (std.mem.eql(u8, value, "max")) return .max;
     if (std.mem.eql(u8, value, "avg")) return .avg;
+    if (std.mem.eql(u8, value, "percentile_cont")) return .percentile_cont;
     if (std.mem.eql(u8, value, "array_agg")) return .array_agg;
     if (std.mem.eql(u8, value, "string_agg")) return .string_agg;
     if (std.mem.eql(u8, value, "bool_or")) return .bool_or;
@@ -6195,7 +6215,7 @@ fn validateRowsAggregateFieldInput(
     switch (op) {
         .count, .array_agg => {},
         .string_agg => if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidRowsRequest,
-        .sum, .avg => if (column.field_type != .numeric) return error.InvalidRowsRequest,
+        .sum, .avg, .percentile_cont => if (column.field_type != .numeric) return error.InvalidRowsRequest,
         .min, .max => if (!rowsAggregateMinMaxTypeAllowed(column.field_type)) return error.InvalidRowsRequest,
         .bool_or, .bool_and => if (column.field_type != .boolean) return error.InvalidRowsRequest,
     }
@@ -6210,7 +6230,7 @@ fn validateRowsAggregateExpressionInput(
     switch (op) {
         .count, .array_agg => {},
         .string_agg => try validateRowsQueryTextExpression(alloc, schema, expression),
-        .sum, .avg => try validateRowsQueryNumericExpression(alloc, schema, expression),
+        .sum, .avg, .percentile_cont => try validateRowsQueryNumericExpression(alloc, schema, expression),
         .min, .max => try validateRowsAggregateMinMaxExpressionInput(alloc, schema, expression),
         .bool_or, .bool_and => try validateRowsQueryBooleanExpression(alloc, schema, expression),
     }
@@ -7388,7 +7408,7 @@ fn rowsAggregateOutputType(
     return switch (aggregation.op) {
         .array_agg => .array,
         .string_agg => .keyword,
-        .count, .sum, .avg => .numeric,
+        .count, .sum, .avg, .percentile_cont => .numeric,
         .min, .max => try rowsAggregateInputType(alloc, schema, aggregation),
         .bool_or, .bool_and => .boolean,
     };
@@ -7412,7 +7432,7 @@ fn rowsAggregateInputType(
 fn rowsAggregateOutputNullable(aggregation: db_mod.types.RelationalRowsAggregateSpec) bool {
     return switch (aggregation.op) {
         .count, .sum, .array_agg => false,
-        .min, .max, .avg, .string_agg, .bool_or, .bool_and => true,
+        .min, .max, .avg, .percentile_cont, .string_agg, .bool_or, .bool_and => true,
     };
 }
 
@@ -12040,6 +12060,16 @@ fn parseOptionalU64(maybe_value: ?std.json.Value) !?u64 {
     const value = maybe_value orelse return null;
     if (value != .integer or value.integer < 0) return error.InvalidRowsRequest;
     return @intCast(value.integer);
+}
+
+fn parseOptionalF64(maybe_value: ?std.json.Value) !?f64 {
+    const value = maybe_value orelse return null;
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch return error.InvalidRowsRequest,
+        else => error.InvalidRowsRequest,
+    };
 }
 
 fn parseOptionalBool(maybe_value: ?std.json.Value) !?bool {

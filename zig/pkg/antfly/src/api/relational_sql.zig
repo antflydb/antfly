@@ -12669,6 +12669,7 @@ const Parser = struct {
             std.ascii.eqlIgnoreCase(name, "min") or
             std.ascii.eqlIgnoreCase(name, "max") or
             std.ascii.eqlIgnoreCase(name, "avg") or
+            std.ascii.eqlIgnoreCase(name, "percentile_cont") or
             std.ascii.eqlIgnoreCase(name, "array_agg") or
             std.ascii.eqlIgnoreCase(name, "string_agg") or
             std.ascii.eqlIgnoreCase(name, "bool_or") or
@@ -12689,12 +12690,42 @@ const Parser = struct {
         var string_delimiter: ?[]const u8 = null;
         var string_delimiter_transferred = false;
         errdefer if (!string_delimiter_transferred) if (string_delimiter) |delimiter| self.alloc.free(delimiter);
+        var percentile: ?f64 = null;
         var array_order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, array_order_by.items);
             array_order_by.deinit(self.alloc);
         }
-        if (op == .count and self.match(.star) != null) {
+        if (op == .percentile_cont) {
+            if (distinct) return error.UnsupportedSqlShape;
+            percentile = try self.parseAggregatePercentileValue();
+            try self.expect(.rparen);
+            try self.expectKeyword("within");
+            try self.expectKeyword("group");
+            try self.expect(.lparen);
+            try self.expectKeyword("order");
+            try self.expectKeyword("by");
+            var order = try self.parseOrderExpressionAlloc();
+            defer {
+                if (order.field.len > 0) self.alloc.free(order.field);
+                if (order.expression) |owned| freeExpression(self.alloc, owned);
+            }
+            const explicit_nulls_first = try self.applyOrderModifiers(&order);
+            if (explicit_nulls_first != null or order.direction != .asc or order.null_test != null) return error.UnsupportedSqlShape;
+            if (order.field.len > 0) {
+                const column = relationalColumnForField(self.schema, order.field, null) orelse return error.InvalidSqlCatalog;
+                if (column.field_type != .numeric) return error.InvalidSqlCatalog;
+                field = order.field;
+                order.field = "";
+            } else if (order.expression) |owned| {
+                try self.validateNumericRowExpression(owned);
+                expression = owned;
+                order.expression = null;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+            try self.expect(.rparen);
+        } else if (op == .count and self.match(.star) != null) {
             if (distinct) return error.UnsupportedSqlShape;
             field = null;
         } else if (op == .count and self.peekKind(.number)) {
@@ -12719,7 +12750,7 @@ const Parser = struct {
                     switch (op) {
                         .count, .array_agg => {},
                         .string_agg => if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog,
-                        .sum, .avg => if (column.field_type != .numeric) return error.InvalidSqlCatalog,
+                        .sum, .avg, .percentile_cont => if (column.field_type != .numeric) return error.InvalidSqlCatalog,
                         .min, .max => if (!sqlAggregateMinMaxTypeAllowed(column.field_type)) return error.InvalidSqlCatalog,
                         .bool_or, .bool_and => if (column.field_type != .boolean) return error.InvalidSqlCatalog,
                     }
@@ -12738,7 +12769,7 @@ const Parser = struct {
             try self.expectKeyword("by");
             try self.parseOrderBy(&array_order_by);
         }
-        try self.expect(.rparen);
+        if (op != .percentile_cont) try self.expect(.rparen);
         const filter = try self.parseAggregateFilterAlloc();
         var filter_transferred = false;
         errdefer if (!filter_transferred) {
@@ -12784,6 +12815,8 @@ const Parser = struct {
             .expression = expression,
             .distinct = distinct,
             .distinct_max_items = if (distinct) db_mod.types.default_relational_rows_aggregate_distinct_max_items else 0,
+            .percentile = percentile,
+            .percentile_max_items = if (op == .percentile_cont) db_mod.types.default_relational_rows_percentile_max_items else 0,
             .array_max_items = if (op == .array_agg or op == .string_agg) default_array_agg_max_items else 0,
             .array_order_by = try array_order_by.toOwnedSlice(self.alloc),
             .string_delimiter = string_delimiter,
@@ -12810,6 +12843,16 @@ const Parser = struct {
         defer parsed.deinit();
         if (parsed.value != .string) return error.UnsupportedSqlShape;
         return try self.alloc.dupe(u8, parsed.value.string);
+    }
+
+    fn parseAggregatePercentileValue(self: *@This()) !f64 {
+        const value_json = try self.parseJsonValueAlloc();
+        defer self.alloc.free(value_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+        defer parsed.deinit();
+        const percentile = sqlJsonNumberAsF64(parsed.value) orelse return error.UnsupportedSqlShape;
+        if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.UnsupportedSqlShape;
+        return percentile;
     }
 
     fn peekAggregateExpressionInput(self: *@This()) bool {
@@ -12979,7 +13022,7 @@ const Parser = struct {
         switch (op) {
             .count, .array_agg => {},
             .string_agg => try self.validateTextRowExpression(expression),
-            .sum, .avg => try self.validateNumericRowExpression(expression),
+            .sum, .avg, .percentile_cont => try self.validateNumericRowExpression(expression),
             .min, .max => try self.validateAggregateMinMaxRowExpression(expression),
             .bool_or, .bool_and => try self.validateBooleanRowExpression(expression),
         }
@@ -26629,7 +26672,7 @@ const Parser = struct {
         return switch (aggregation.op) {
             .array_agg => .array,
             .string_agg => .keyword,
-            .count, .sum, .avg => .numeric,
+            .count, .sum, .avg, .percentile_cont => .numeric,
             .min, .max => try self.aggregateInputType(aggregation),
             .bool_or, .bool_and => .boolean,
         };
@@ -33932,6 +33975,7 @@ fn aggregateOpForName(name: []const u8) ?db_mod.types.RelationalRowsAggregateOp 
     if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
     if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
     if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
+    if (std.ascii.eqlIgnoreCase(name, "percentile_cont")) return .percentile_cont;
     if (std.ascii.eqlIgnoreCase(name, "array_agg")) return .array_agg;
     if (std.ascii.eqlIgnoreCase(name, "string_agg")) return .string_agg;
     if (std.ascii.eqlIgnoreCase(name, "bool_or")) return .bool_or;
@@ -33946,10 +33990,20 @@ fn aggregateOpName(op: db_mod.types.RelationalRowsAggregateOp) []const u8 {
         .min => "min",
         .max => "max",
         .avg => "avg",
+        .percentile_cont => "percentile_cont",
         .array_agg => "array_agg",
         .string_agg => "string_agg",
         .bool_or => "bool_or",
         .bool_and => "bool_and",
+    };
+}
+
+fn sqlJsonNumberAsF64(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
+        else => null,
     };
 }
 
@@ -33997,6 +34051,10 @@ fn aggregateSpecsEquivalent(
     rhs: db_mod.types.RelationalRowsAggregateSpec,
 ) bool {
     if (lhs.op != rhs.op or lhs.distinct != rhs.distinct) return false;
+    if (lhs.percentile_max_items != rhs.percentile_max_items) return false;
+    if (lhs.percentile == null or rhs.percentile == null) {
+        if (lhs.percentile != null or rhs.percentile != null) return false;
+    } else if (lhs.percentile.? != rhs.percentile.?) return false;
     if (!optionalStringEqual(lhs.field, rhs.field)) return false;
     if (!optionalStringEqual(lhs.string_delimiter, rhs.string_delimiter)) return false;
     if (!optionalExpressionEqual(lhs.expression, rhs.expression)) return false;
