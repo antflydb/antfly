@@ -121,7 +121,9 @@ Current status:
   sealed delta values. Segment compaction also pre-counts each sorted posting
   group's retained unique delta sequences before building the replacement delta
   tail, so duplicate-heavy compactions do not grow retained-record scratch one
-  winner at a time.
+  winner at a time. The same compaction pass now decodes retained base headers
+  once into a posting-generation cache before filtering delta records, avoiding
+  repeated base-header decode for postings with many sealed delta values.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and

@@ -2451,6 +2451,12 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
         }
     }
 
+    var base_generations = if (stats.input_delta_values != 0 and bases.count() != 0)
+        try baseGenerationsFromCandidatesAlloc(alloc, &bases)
+    else
+        std.AutoHashMapUnmanaged(PostingId, u64).empty;
+    defer base_generations.deinit(alloc);
+
     var deltas = std.ArrayListUnmanaged(DeltaCandidate).empty;
     defer deltas.deinit(alloc);
     for (segments) |segment| {
@@ -2458,10 +2464,7 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
         var iter = reader.entries();
         while (try iter.next()) |entry| {
             if (entry.kind != .delta) continue;
-            const base_generation = if (bases.get(entry.posting_id)) |base|
-                (try posting.PostingFormat.decodeBaseHeader(base.value)).generation
-            else
-                null;
+            const base_generation = base_generations.get(entry.posting_id);
             var delta_iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             stats.input_delta_records += delta_iterator.recordCount();
             while (try delta_iterator.next()) |record| {
@@ -4988,6 +4991,22 @@ fn retainedDeltaCandidateCount(candidates: []const DeltaCandidate) usize {
     return count;
 }
 
+fn baseGenerationsFromCandidatesAlloc(
+    alloc: Allocator,
+    bases: *const std.AutoHashMapUnmanaged(PostingId, PointCandidate),
+) !std.AutoHashMapUnmanaged(PostingId, u64) {
+    var out = std.AutoHashMapUnmanaged(PostingId, u64).empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, bases.count());
+
+    var iter = bases.iterator();
+    while (iter.next()) |entry| {
+        const header = try posting.PostingFormat.decodeBaseHeader(entry.value_ptr.value);
+        out.putAssumeCapacity(entry.key_ptr.*, header.generation);
+    }
+    return out;
+}
+
 fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence: u64, rhs_posting_id: PostingId, rhs_kind: EntryKind, rhs_sequence: u64) std.math.Order {
     if (lhs_posting_id < rhs_posting_id) return .lt;
     if (lhs_posting_id > rhs_posting_id) return .gt;
@@ -5337,6 +5356,33 @@ pub fn testRetainedDeltaCandidateCountDeduplicatesSequences() !void {
     };
     try std.testing.expectEqual(@as(usize, 0), retainedDeltaCandidateCount(&.{}));
     try std.testing.expectEqual(@as(usize, 3), retainedDeltaCandidateCount(&candidates));
+}
+
+pub fn testBaseGenerationsFromCandidatesDecodesHeadersOnce() !void {
+    const alloc = std.testing.allocator;
+    const base_7 = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 4,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base_7);
+    const base_8 = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 8,
+        .generation = 9,
+        .members = &.{30},
+    });
+    defer alloc.free(base_8);
+
+    var bases = std.AutoHashMapUnmanaged(PostingId, PointCandidate).empty;
+    defer bases.deinit(alloc);
+    try bases.put(alloc, 7, .{ .segment_id = 11, .value = base_7 });
+    try bases.put(alloc, 8, .{ .segment_id = 12, .value = base_8 });
+
+    var generations = try baseGenerationsFromCandidatesAlloc(alloc, &bases);
+    defer generations.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 4), generations.get(7).?);
+    try std.testing.expectEqual(@as(u64, 9), generations.get(8).?);
+    try std.testing.expect(generations.get(9) == null);
 }
 
 pub fn testValidatesFooterAndVersion() !void {
@@ -8013,6 +8059,10 @@ test "posting segment skips sorting ordered batch point reads" {
 
 test "posting segment retained delta candidate count deduplicates sequences" {
     try testRetainedDeltaCandidateCountDeduplicatesSequences();
+}
+
+test "posting segment base generation cache decodes headers once" {
+    try testBaseGenerationsFromCandidatesDecodesHeadersOnce();
 }
 
 test "posting segment validates footer and version" {
