@@ -958,7 +958,7 @@ def _insert_docs(
 
     def route_ready() -> str | None:
         try:
-            return _data_api_url_for_table(
+            api_url = _data_api_url_for_table(
                 cluster,
                 table_name,
                 require_all_group_leaders=True,
@@ -966,6 +966,11 @@ def _insert_docs(
             )
         except (AssertionError, requests.RequestException, ValueError):
             return None
+        if api_url is None:
+            return None
+        if not wait_for_server(api_url, timeout=1.0):
+            return None
+        return api_url
 
     api_url = wait_until(route_ready, timeout_s=60.0, interval_s=0.5)
     assert api_url is not None, (
@@ -977,7 +982,11 @@ def _insert_docs(
 
     def post_once() -> bool | None:
         nonlocal api_url, last_error
-        api_url = route_ready() or api_url
+        next_api_url = route_ready()
+        if next_api_url is None:
+            last_error = "no live write route"
+            return None
+        api_url = next_api_url
         try:
             response = requests.post(
                 f"{api_url}/tables/{table_name}/batch",
