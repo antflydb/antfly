@@ -1567,7 +1567,7 @@ fn replaceManifestSegmentsEntriesWithStatsAlloc(
     new_entries: []const ManifestEntry,
 ) !ManifestReplacementResult {
     try validateManifestEntries(next_segment_id, entries);
-    try rejectDuplicateSegmentIds(remove_segment_ids);
+    const remove_segment_ids_strictly_ascending = try validateSegmentIdsAndReturnStrictlyAscending(remove_segment_ids);
     for (new_entries) |entry| try validateManifestEntry(entry);
 
     var stats = ManifestReplacementStats{
@@ -1579,12 +1579,27 @@ fn replaceManifestSegmentsEntriesWithStatsAlloc(
     defer output_entries.deinit(alloc);
     try output_entries.ensureTotalCapacity(alloc, entries.len + new_entries.len);
 
-    for (entries) |entry| {
-        if (segmentIdIn(entry.meta.segment_id, remove_segment_ids)) {
-            found_remove_count += 1;
-            continue;
+    if (remove_segment_ids_strictly_ascending) {
+        var remove_index: usize = 0;
+        for (entries) |entry| {
+            while (remove_index < remove_segment_ids.len and remove_segment_ids[remove_index] < entry.meta.segment_id) {
+                remove_index += 1;
+            }
+            if (remove_index < remove_segment_ids.len and remove_segment_ids[remove_index] == entry.meta.segment_id) {
+                found_remove_count += 1;
+                remove_index += 1;
+                continue;
+            }
+            output_entries.appendAssumeCapacity(.{ .meta = entry.meta, .path = entry.path });
         }
-        output_entries.appendAssumeCapacity(.{ .meta = entry.meta, .path = entry.path });
+    } else {
+        for (entries) |entry| {
+            if (segmentIdIn(entry.meta.segment_id, remove_segment_ids)) {
+                found_remove_count += 1;
+                continue;
+            }
+            output_entries.appendAssumeCapacity(.{ .meta = entry.meta, .path = entry.path });
+        }
     }
     if (found_remove_count != remove_segment_ids.len) return error.PostingSegmentManifestReplacementMissingSegment;
     stats.removed_segments = found_remove_count;
@@ -2031,7 +2046,7 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
         .path = written.path,
     };
 
-    var replacement = try replaceManifestSegmentsEntriesWithStatsAlloc(alloc, manifest.next_segment_id, manifest.segments, segment_ids, &.{new_entry});
+    var replacement = try replaceManifestSegmentsEntriesWithStatsAlloc(alloc, manifest.next_segment_id, manifest.segments, selected_segment_ids, &.{new_entry});
     defer replacement.deinit(alloc);
 
     try writeManifestFileAlloc(alloc, io, dir, options.manifest_path, replacement.encoded);

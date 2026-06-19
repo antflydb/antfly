@@ -146,7 +146,10 @@ Current status:
   linear selected-id scan, and segment-id validation returns that sortedness
   result while skipping the quadratic duplicate scan for ascending plan output;
   small unsorted selected-compaction inputs sort a stack copy and take the same
-  merge path. Segment garbage and temporary-file cleanup now track live
+  merge path. Manifest replacement also merge-scans sorted removal ids, and
+  selected compaction carries its sorted ids through replacement instead of
+  falling back to a second linear membership pass. Segment garbage and
+  temporary-file cleanup now track live
   canonical basenames and delete through the opened postings directory, and
   manifest temp matching compares entry names against the configured manifest
   basename in place, avoiding per-file path allocation while scanning
