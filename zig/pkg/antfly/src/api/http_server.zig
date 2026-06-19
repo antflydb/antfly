@@ -2109,11 +2109,15 @@ pub const ApiHttpServer = struct {
             if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-            const body = try ard_catalog.agentsJsonWithExtensionsAlloc(
+            const body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
                 self.alloc,
                 self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                uri_parts.query,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
-            );
+            ) catch |err| switch (err) {
+                error.InvalidArdAgentsRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD agents request"),
+                else => return err,
+            };
             return try self.ardCatalogResponse(200, body, false);
         }
         if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
@@ -10792,6 +10796,33 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), skill_agents.status);
     try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"agents\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"count\":0") != null);
+
+    var paged_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1",
+    });
+    defer paged_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), paged_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"pageToken\":\"1\"") != null);
+
+    var next_agents_page = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1&pageToken=1",
+    });
+    defer next_agents_page.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), next_agents_page.status);
+    try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"pageToken\"") == null);
+
+    var invalid_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?orderBy=updatedAt",
+    });
+    defer invalid_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_agents.status);
 }
 
 test "api http server lists extension-owned mcp tools" {

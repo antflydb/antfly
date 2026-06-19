@@ -362,23 +362,91 @@ pub fn agentsJsonAlloc(alloc: std.mem.Allocator, options: CatalogOptions) ![]u8 
 }
 
 pub fn agentsJsonWithExtensionsAlloc(alloc: std.mem.Allocator, options: CatalogOptions, extension_context: ?ExtensionCatalogContext) ![]u8 {
+    return try agentsJsonWithExtensionsQueryAlloc(alloc, options, "", extension_context);
+}
+
+pub fn agentsJsonWithExtensionsQueryAlloc(alloc: std.mem.Allocator, options: CatalogOptions, query: []const u8, extension_context: ?ExtensionCatalogContext) ![]u8 {
+    const request = try parseAgentsRequest(alloc, query);
+    defer request.deinit();
+
+    var agents = std.ArrayListUnmanaged(AgentOutput).empty;
+    defer {
+        for (agents.items) |*agent| agent.deinit(alloc);
+        agents.deinit(alloc);
+    }
+
+    try collectAgentOutputs(alloc, &agents, options, extension_context, request.filter);
+    if (request.order_by.field != .natural) {
+        std.mem.sort(AgentOutput, agents.items, request.order_by, AgentOrder.lessThan);
+    }
+
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
 
     try writer.writer.writeAll("{\"agents\":[");
     var first = true;
-    var count: usize = 0;
-    try writeAgentEntries(&writer.writer, options, &first, &count);
-    if (options.mode == .tenant) {
-        try writeAgentAggregateMcpEntry(alloc, &writer.writer, options, &first, extension_context, &count);
-        try writeAgentCopilotMcpProfileEntry(alloc, &writer.writer, options, &first, extension_context, &count);
-        if (extension_context) |ctx| try writeAgentExtensionEntries(alloc, &writer.writer, options, &first, ctx, &count);
+    const page_end = request.page_start + request.page_size;
+    for (agents.items, 0..) |agent, index| {
+        if (index < request.page_start or index >= page_end) continue;
+        if (first) {
+            first = false;
+        } else {
+            try writer.writer.writeByte(',');
+        }
+        try writer.writer.writeAll(agent.json);
     }
     try writer.writer.writeAll("],\"count\":");
-    try writer.writer.print("{d}", .{count});
+    try writer.writer.print("{d}", .{agents.items.len});
+    if (agents.items.len > page_end) {
+        try writer.writer.writeAll(",\"pageToken\":");
+        try writeStringFmt(&writer.writer, "{d}", .{page_end});
+    }
     try writer.writer.writeByte('}');
     return try writer.toOwnedSlice();
 }
+
+const AgentsRequest = struct {
+    const default_page_size = 100;
+    const max_page_size = 100;
+
+    parsed_filter: ?std.json.Parsed(std.json.Value) = null,
+    filter: ?std.json.Value = null,
+    order_by: AgentOrder = .{},
+    page_start: usize = 0,
+    page_size: usize = default_page_size,
+
+    fn deinit(self: AgentsRequest) void {
+        if (self.parsed_filter) |parsed| parsed.deinit();
+    }
+};
+
+const AgentOrder = struct {
+    const Field = enum { natural, identifier, displayName, type };
+
+    field: Field = .natural,
+    desc: bool = false,
+
+    fn lessThan(order: AgentOrder, lhs: AgentOutput, rhs: AgentOutput) bool {
+        const lhs_value = agentOrderValue(lhs, order.field);
+        const rhs_value = agentOrderValue(rhs, order.field);
+        const ordered = std.mem.order(u8, lhs_value, rhs_value);
+        if (ordered == .eq) return std.mem.order(u8, lhs.identifier, rhs.identifier) == .lt;
+        return if (order.desc) ordered == .gt else ordered == .lt;
+    }
+};
+
+const AgentOutput = struct {
+    json: []u8,
+    identifier: []u8,
+    display_name: []u8,
+    media_type: []const u8,
+
+    fn deinit(self: *AgentOutput, alloc: std.mem.Allocator) void {
+        alloc.free(self.json);
+        alloc.free(self.identifier);
+        alloc.free(self.display_name);
+    }
+};
 
 pub fn skillMarkdownAlloc(alloc: std.mem.Allocator, options: CatalogOptions, slug: []const u8) !?[]u8 {
     var parsed_skills = try parseDefaultSkills(alloc);
@@ -611,6 +679,117 @@ fn deinitFacetAccumulators(alloc: std.mem.Allocator, facets: []FacetAccumulator)
     for (facets) |*facet| facet.deinit(alloc);
 }
 
+fn parseAgentsRequest(alloc: std.mem.Allocator, query: []const u8) !AgentsRequest {
+    var request: AgentsRequest = .{};
+    errdefer request.deinit();
+    if (query.len == 0) return request;
+
+    if (try decodedQueryParamAlloc(alloc, query, "filter")) |filter_json| {
+        defer alloc.free(filter_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{ .allocate = .alloc_always }) catch return error.InvalidArdAgentsRequest;
+        errdefer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidArdAgentsRequest;
+        request.filter = parsed.value;
+        request.parsed_filter = parsed;
+    }
+    if (try decodedQueryParamAlloc(alloc, query, "orderBy")) |order_by| {
+        defer alloc.free(order_by);
+        request.order_by = try parseAgentOrder(order_by);
+    }
+    if (queryParam(query, "pageSize")) |page_size| {
+        const parsed = std.fmt.parseUnsigned(usize, page_size, 10) catch return error.InvalidArdAgentsRequest;
+        if (parsed < 1 or parsed > AgentsRequest.max_page_size) return error.InvalidArdAgentsRequest;
+        request.page_size = parsed;
+    }
+    if (queryParam(query, "pageToken")) |page_token| {
+        const parsed = std.fmt.parseUnsigned(usize, page_token, 10) catch return error.InvalidArdAgentsRequest;
+        if (parsed > std.math.maxInt(usize) - AgentsRequest.max_page_size) return error.InvalidArdAgentsRequest;
+        request.page_start = parsed;
+    }
+    return request;
+}
+
+fn parseAgentOrder(raw: []const u8) !AgentOrder {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .{};
+    var field_text = trimmed;
+    var desc = false;
+    if (std.mem.endsWith(u8, trimmed, " desc")) {
+        field_text = std.mem.trim(u8, trimmed[0 .. trimmed.len - " desc".len], " \t\r\n");
+        desc = true;
+    } else if (std.mem.endsWith(u8, trimmed, " asc")) {
+        field_text = std.mem.trim(u8, trimmed[0 .. trimmed.len - " asc".len], " \t\r\n");
+    } else if (trimmed[0] == '-') {
+        field_text = std.mem.trim(u8, trimmed[1..], " \t\r\n");
+        desc = true;
+    }
+
+    const field: AgentOrder.Field = if (std.mem.eql(u8, field_text, "identifier"))
+        .identifier
+    else if (std.mem.eql(u8, field_text, "displayName"))
+        .displayName
+    else if (std.mem.eql(u8, field_text, "type"))
+        .type
+    else
+        return error.InvalidArdAgentsRequest;
+    return .{ .field = field, .desc = desc };
+}
+
+fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
+    if (query.len == 0) return null;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |part| {
+        if (!std.mem.startsWith(u8, part, key)) continue;
+        if (part.len <= key.len or part[key.len] != '=') continue;
+        return part[key.len + 1 ..];
+    }
+    return null;
+}
+
+fn decodedQueryParamAlloc(alloc: std.mem.Allocator, query: []const u8, key: []const u8) !?[]u8 {
+    const raw = queryParam(query, key) orelse return null;
+    return try decodePercentEncodedAlloc(alloc, raw);
+}
+
+fn decodePercentEncodedAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var needs_decode = false;
+    for (raw) |ch| {
+        if (ch == '%' or ch == '+') {
+            needs_decode = true;
+            break;
+        }
+    }
+    if (!needs_decode) return try alloc.dupe(u8, raw);
+
+    var out = try alloc.alloc(u8, raw.len);
+    errdefer alloc.free(out);
+
+    var in_index: usize = 0;
+    var out_index: usize = 0;
+    while (in_index < raw.len) {
+        const ch = raw[in_index];
+        if (ch == '+') {
+            out[out_index] = ' ';
+            in_index += 1;
+            out_index += 1;
+            continue;
+        }
+        if (ch != '%') {
+            out[out_index] = ch;
+            in_index += 1;
+            out_index += 1;
+            continue;
+        }
+        if (in_index + 2 >= raw.len) return error.InvalidArdAgentsRequest;
+        const hi = std.fmt.charToDigit(raw[in_index + 1], 16) catch return error.InvalidArdAgentsRequest;
+        const lo = std.fmt.charToDigit(raw[in_index + 2], 16) catch return error.InvalidArdAgentsRequest;
+        out[out_index] = @intCast((hi << 4) | lo);
+        in_index += 3;
+        out_index += 1;
+    }
+    return try alloc.realloc(out, out_index);
+}
+
 fn writeCatalogPrefix(writer: *std.Io.Writer, options: CatalogOptions) !void {
     try writer.writeAll("{\"specVersion\":\"1.0\",\"host\":{\"displayName\":");
     try std.json.Stringify.value(options.display_name, .{}, writer);
@@ -808,6 +987,100 @@ fn writeAgentEntries(writer: *std.Io.Writer, options: CatalogOptions, first: *bo
             }
         }
     }
+}
+
+fn collectAgentOutputs(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(AgentOutput),
+    options: CatalogOptions,
+    extension_context: ?ExtensionCatalogContext,
+    filter: ?std.json.Value,
+) !void {
+    for (static_entries) |entry| {
+        if (!isAgentLike(entry) or !catalogOptionsAllowStaticEntry(options, entry) or !entryMatches(entry, options.publisher_domain, null, filter)) continue;
+        try appendStaticAgentOutput(alloc, out, options, entry);
+    }
+    if (options.mode != .tenant) return;
+    for (tenant_entries) |entry| {
+        if (!isAgentLike(entry) or !catalogOptionsAllowStaticEntry(options, entry) or !entryMatches(entry, options.publisher_domain, null, filter)) continue;
+        try appendStaticAgentOutput(alloc, out, options, entry);
+    }
+    if (try aggregateMcpVisible(alloc, extension_context)) {
+        if (catalogOptionsAllowStaticEntry(options, aggregate_mcp_entry) and entryMatches(aggregate_mcp_entry, options.publisher_domain, null, filter)) {
+            try appendStaticAgentOutput(alloc, out, options, aggregate_mcp_entry);
+        }
+    }
+    if (try copilotMcpProfileVisible(alloc, extension_context)) {
+        if (catalogOptionsAllowStaticEntry(options, copilot_mcp_profile_entry) and entryMatches(copilot_mcp_profile_entry, options.publisher_domain, null, filter)) {
+            try appendStaticAgentOutput(alloc, out, options, copilot_mcp_profile_entry);
+        }
+    }
+    if (extension_context) |ctx| {
+        for (ctx.installed_extensions) |installed| {
+            if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) continue;
+            const installed_capabilities = try capabilityNamesAlloc(alloc, installed.granted_capabilities);
+            defer alloc.free(installed_capabilities);
+            if (!catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) or
+                !extensionMcpEntryMatches(installed, installed_capabilities, null, filter, options.publisher_domain)) continue;
+            try appendExtensionMcpAgentOutput(alloc, out, options, installed);
+        }
+    }
+}
+
+fn appendStaticAgentOutput(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(AgentOutput),
+    options: CatalogOptions,
+    entry: Entry,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try entry.write(&writer.writer, options);
+    const json = try writer.toOwnedSlice();
+    errdefer alloc.free(json);
+    const identifier = try std.fmt.allocPrint(alloc, "urn:ai:{s}:antfly:{s}", .{ options.publisher_domain, entry.identifier_suffix });
+    errdefer alloc.free(identifier);
+    const display_name = try alloc.dupe(u8, entry.display_name);
+    errdefer alloc.free(display_name);
+    try out.append(alloc, .{
+        .json = json,
+        .identifier = identifier,
+        .display_name = display_name,
+        .media_type = entry.media_type,
+    });
+}
+
+fn appendExtensionMcpAgentOutput(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(AgentOutput),
+    options: CatalogOptions,
+    installed: extension_domain.InstalledExtension,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.writeByte('{');
+    try writeExtensionMcpFields(&writer.writer, options, installed);
+    try writer.writer.writeByte('}');
+    const json = try writer.toOwnedSlice();
+    errdefer alloc.free(json);
+    const identifier = try std.fmt.allocPrint(alloc, "urn:ai:{s}:antfly:extension:{s}:mcp", .{ options.publisher_domain, installed.name });
+    errdefer alloc.free(identifier);
+    const display_name = try std.fmt.allocPrint(alloc, "Antfly Extension MCP {s}", .{installed.name});
+    errdefer alloc.free(display_name);
+    try out.append(alloc, .{
+        .json = json,
+        .identifier = identifier,
+        .display_name = display_name,
+        .media_type = "application/mcp-server+json",
+    });
+}
+
+fn agentOrderValue(agent: AgentOutput, field: AgentOrder.Field) []const u8 {
+    return switch (field) {
+        .natural, .identifier => agent.identifier,
+        .displayName => agent.display_name,
+        .type => agent.media_type,
+    };
 }
 
 fn writeExtensionEntries(
