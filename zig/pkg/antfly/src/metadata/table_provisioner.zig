@@ -23,6 +23,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const indexes_api = @import("../api/indexes.zig");
 const table_reads = @import("../api/table_reads.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const tables_api = @import("../api/tables.zig");
@@ -37,6 +38,8 @@ pub const ProvisionSummary = struct {
     indexes_added: usize = 0,
     indexes_removed: usize = 0,
     enrichments_added: usize = 0,
+    enrichments_updated: usize = 0,
+    enrichments_removed: usize = 0,
     resolvers_added: usize = 0,
     resolvers_updated: usize = 0,
     resolvers_removed: usize = 0,
@@ -180,6 +183,8 @@ pub fn reconcileReplicaRootWithOptions(
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
         summary.enrichments_added += index_summary.enrichments_added;
+        summary.enrichments_updated += index_summary.enrichments_updated;
+        summary.enrichments_removed += index_summary.enrichments_removed;
         summary.resolvers_added += index_summary.resolvers_added;
         summary.resolvers_updated += index_summary.resolvers_updated;
         summary.resolvers_removed += index_summary.resolvers_removed;
@@ -205,13 +210,25 @@ pub fn reconcileDbIndexesWithOptions(
     indexes_json: []const u8,
     options: ReconcileDbIndexOptions,
 ) !ProvisionSummary {
-    const enrichments_added = try ensureEnrichments(alloc, db, indexes_json);
+    var desired_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
+    defer {
+        for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
+        desired_enrichments.deinit(alloc);
+    }
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try indexes_api.validateArtifactEnrichmentConfigs(desired_enrichments.items);
+    dedupeDesiredEnrichments(alloc, &desired_enrichments);
+    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
+
+    const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
         .drain_backfill = options.drain_resolver_backfill,
     });
-    const removed = try removeMissingIndexes(alloc, db, indexes_json);
-    const added = try ensureIndexes(alloc, db, indexes_json);
-    if (added > 0 or removed > 0 or enrichments_added > 0 or resolver_summary.changed()) {
+    const missing_indexes_removed = try removeMissingIndexes(alloc, db, indexes_json);
+    const index_summary = try ensureIndexes(alloc, db, indexes_json);
+    const enrichments_removed = try removeMissingEnrichments(alloc, db, desired_enrichments.items);
+    const indexes_removed = missing_indexes_removed + index_summary.removed;
+    if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
             try db.core.index_manager.syncAll(false);
@@ -220,9 +237,11 @@ pub fn reconcileDbIndexesWithOptions(
     return .{
         .groups_considered = 0,
         .dbs_opened = 0,
-        .indexes_added = added,
-        .indexes_removed = removed,
-        .enrichments_added = enrichments_added,
+        .indexes_added = index_summary.added,
+        .indexes_removed = indexes_removed,
+        .enrichments_added = enrichment_summary.added,
+        .enrichments_updated = enrichment_summary.updated,
+        .enrichments_removed = enrichments_removed,
         .resolvers_added = resolver_summary.added,
         .resolvers_updated = resolver_summary.updated,
         .resolvers_removed = resolver_summary.removed,
@@ -471,7 +490,12 @@ fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: 
     return removed;
 }
 
-fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
+const IndexEnsureSummary = struct {
+    added: usize = 0,
+    removed: usize = 0,
+};
+
+fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !IndexEnsureSummary {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -479,7 +503,10 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         else => return error.InvalidTableIndexMetadata,
     };
 
-    var added: usize = 0;
+    const current = try db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, current);
+
+    var summary: IndexEnsureSummary = .{};
     var it = object.iterator();
     while (it.next()) |entry| {
         // Reserved top-level sections are handled by their own reconcilers, not
@@ -487,85 +514,220 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
             std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
-        if (db.core.index_manager.has(entry.key_ptr.*)) continue;
+
+        const existing = findIndexConfig(current, entry.key_ptr.*);
+        if (existing) |existing_cfg| {
+            if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) continue;
+        }
 
         const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
         defer alloc.free(config_json);
-        try db.addIndex(.{
+        const desired = db_mod.types.IndexConfig{
             .name = entry.key_ptr.*,
             .kind = kind,
             .config_json = config_json,
+        };
+        if (existing) |existing_cfg| {
+            if (try indexConfigsEqual(alloc, existing_cfg, desired)) continue;
+            if (try db.deleteIndex(desired.name)) summary.removed += 1;
+        }
+        try db.addIndex(.{
+            .name = desired.name,
+            .kind = desired.kind,
+            .config_json = desired.config_json,
         });
-        added += 1;
+        summary.added += 1;
     }
-    return added;
+    return summary;
 }
 
-fn ensureEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-
-    var desired = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
-    defer {
-        for (desired.items) |*cfg| cfg.deinit(alloc);
-        desired.deinit(alloc);
+fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const u8) ?db_mod.types.IndexConfig {
+    for (configs) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return cfg;
     }
-    try collectDesiredEnrichments(alloc, parsed.value, &desired);
+    return null;
+}
 
-    if (desired.items.len == 0) return 0;
+fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: db_mod.types.IndexConfig) !bool {
+    if (a.kind != b.kind) return false;
+    if (a.kind == .full_text) return fullTextIndexConfigsEqual(alloc, a.config_json, b.config_json);
+    if (a.kind == .algebraic) return algebraicIndexConfigsEqual(alloc, a.config_json, b.config_json);
+    return std.mem.eql(u8, a.config_json, b.config_json);
+}
 
+fn indexKindConfigReconcileDeferred(kind: db_mod.types.IndexKind) bool {
+    return switch (kind) {
+        .dense_vector, .sparse_vector, .graph => true,
+        .full_text, .algebraic => false,
+    };
+}
+
+fn fullTextIndexConfigsEqual(alloc: std.mem.Allocator, a_json: []const u8, b_json: []const u8) !bool {
+    var a_parsed = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
+    defer a_parsed.deinit();
+    var b_parsed = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
+    defer b_parsed.deinit();
+    return jsonValuesEqualIgnoringTopLevelEnrichments(a_parsed.value, b_parsed.value, true);
+}
+
+fn algebraicIndexConfigsEqual(alloc: std.mem.Allocator, a_json: []const u8, b_json: []const u8) !bool {
+    var a_parsed = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
+    defer a_parsed.deinit();
+    var b_parsed = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
+    defer b_parsed.deinit();
+    return jsonValuesEqualIgnoringTopLevelEnrichments(a_parsed.value, b_parsed.value, false);
+}
+
+fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Value, top_level: bool) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .null => true,
+        .bool => |value| value == b.bool,
+        .integer => |value| value == b.integer,
+        .float => |value| value == b.float,
+        .number_string => |value| std.mem.eql(u8, value, b.number_string),
+        .string => |value| std.mem.eql(u8, value, b.string),
+        .array => |array| blk: {
+            if (array.items.len != b.array.items.len) break :blk false;
+            for (array.items, b.array.items) |a_item, b_item| {
+                if (!jsonValuesEqualIgnoringTopLevelEnrichments(a_item, b_item, false)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |object| blk: {
+            const b_object = b.object;
+            var a_count: usize = 0;
+            var a_it = object.iterator();
+            while (a_it.next()) |entry| {
+                if (top_level and std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                a_count += 1;
+                const b_value = b_object.get(entry.key_ptr.*) orelse break :blk false;
+                if (!jsonValuesEqualIgnoringTopLevelEnrichments(entry.value_ptr.*, b_value, false)) break :blk false;
+            }
+            var b_count: usize = 0;
+            var b_it = b_object.iterator();
+            while (b_it.next()) |entry| {
+                if (top_level and std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                b_count += 1;
+            }
+            break :blk a_count == b_count;
+        },
+    };
+}
+
+fn collectDesiredEnrichmentsFromJson(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
+) !void {
+    {
+        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+        errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
+        try out.appendSlice(alloc, collected);
+        alloc.free(collected);
+    }
+}
+
+const EnrichmentEnsureSummary = struct {
+    added: usize = 0,
+    updated: usize = 0,
+
+    fn changed(self: EnrichmentEnsureSummary) bool {
+        return self.added > 0 or self.updated > 0;
+    }
+};
+
+fn ensureEnrichments(db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !EnrichmentEnsureSummary {
+    var summary: EnrichmentEnsureSummary = .{};
+    for (desired) |cfg| {
+        switch (try db.upsertEnrichment(cfg)) {
+            .added => summary.added += 1,
+            .updated => summary.updated += 1,
+            .unchanged => {},
+        }
+    }
+    return summary;
+}
+
+fn dedupeDesiredEnrichments(
+    alloc: std.mem.Allocator,
+    desired: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
+) void {
+    var i: usize = 0;
+    while (i < desired.items.len) {
+        const cfg = desired.items[i];
+        var duplicate = false;
+        for (desired.items[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.name, cfg.name)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            i += 1;
+            continue;
+        }
+        var removed = desired.orderedRemove(i);
+        removed.deinit(alloc);
+    }
+}
+
+fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
     const existing = try db.listEnrichments(alloc);
     defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
 
-    var added: usize = 0;
-    for (desired.items) |cfg| {
-        if (enrichmentExists(existing, cfg.kind, cfg.name)) continue;
-        try db.addEnrichment(cfg);
-        added += 1;
+    var removed: usize = 0;
+    var i = existing.len;
+    while (i > 0) {
+        i -= 1;
+        const cfg = existing[i];
+        if (findEnrichmentByName(desired, cfg.name)) |desired_cfg| {
+            if (enrichmentConfigsEqual(cfg, desired_cfg)) continue;
+        }
+        if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
+            if (deleted) removed += 1;
+        } else |err| switch (err) {
+            error.EnrichmentInUse => continue,
+            else => return err,
+        }
     }
-    return added;
+    return removed;
 }
 
-fn collectDesiredEnrichments(
-    alloc: std.mem.Allocator,
-    value: std.json.Value,
-    out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
-) !void {
-    switch (value) {
-        .object => |object| {
-            if (object.get("enrichments")) |enrichments| {
-                if (enrichments == .array) {
-                    for (enrichments.array.items) |item| {
-                        if (item != .object) continue;
-                        const parsed = try std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
-                            .allocate = .alloc_always,
-                            .ignore_unknown_fields = true,
-                        });
-                        defer parsed.deinit();
-                        var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
-                        errdefer owned.deinit(alloc);
-                        try out.append(alloc, owned);
-                    }
-                }
-            }
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                try collectDesiredEnrichments(alloc, entry.value_ptr.*, out);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| try collectDesiredEnrichments(alloc, item, out);
-        },
-        else => {},
+fn findEnrichmentByName(
+    configs: []const db_mod.types.EnrichmentConfig,
+    name: []const u8,
+) ?db_mod.types.EnrichmentConfig {
+    for (configs) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return cfg;
     }
+    return null;
 }
 
-fn enrichmentExists(existing: []const db_mod.types.EnrichmentConfig, kind: db_mod.types.EnrichmentKind, name: []const u8) bool {
-    for (existing) |cfg| {
-        if (cfg.kind == kind and std.mem.eql(u8, cfg.name, name)) return true;
+fn findEnrichment(
+    configs: []const db_mod.types.EnrichmentConfig,
+    kind: db_mod.types.EnrichmentKind,
+    name: []const u8,
+) ?db_mod.types.EnrichmentConfig {
+    for (configs) |cfg| {
+        if (cfg.kind == kind and std.mem.eql(u8, cfg.name, name)) return cfg;
     }
-    return false;
+    return null;
+}
+
+fn enrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.EnrichmentConfig) bool {
+    return a.kind == b.kind and
+        std.mem.eql(u8, a.name, b.name) and
+        std.mem.eql(u8, a.field, b.field) and
+        std.mem.eql(u8, a.template, b.template) and
+        std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
+        a.expected_dims == b.expected_dims and
+        a.chunk_size == b.chunk_size and
+        a.chunk_overlap == b.chunk_overlap and
+        std.mem.eql(u8, a.chunker_json, b.chunker_json) and
+        a.full_text_index == b.full_text_index and
+        std.mem.eql(u8, a.content_type, b.content_type) and
+        std.mem.eql(u8, a.producer_json, b.producer_json);
 }
 
 pub const ResolverReconcileSummary = struct {
@@ -802,7 +964,10 @@ fn schemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
 
 fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (value != .object) return .full_text;
-    const type_value = value.object.get("type") orelse return .full_text;
+    const type_value = value.object.get("type") orelse {
+        if (looksLikeStoredAlgebraicIndexConfig(value)) return .algebraic;
+        return .full_text;
+    };
     if (type_value != .string) return error.InvalidCreateTableRequest;
     if (std.mem.eql(u8, type_value.string, "full_text")) return .full_text;
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
@@ -815,6 +980,16 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
         return if (sparse) .sparse_vector else .dense_vector;
     }
     return error.UnsupportedCreateTableRequest;
+}
+
+fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
+    if (value != .object) return false;
+    if (value.object.get("schema_version") == null and
+        (value.object.get("version") == null or value.object.get("table") == null)) return false;
+    return value.object.get("group_fields") != null or
+        value.object.get("measure_fields") != null or
+        value.object.get("time_fields") != null or
+        value.object.get("materializations") != null;
 }
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
@@ -831,23 +1006,13 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     // this point the marker should already be expanded into a concrete config,
     // but stripping it defensively keeps an unexpanded marker from leaking into
     // the stored config.
-    const is_algebraic = kind == .algebraic;
-
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var first = true;
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "type") or
-            std.mem.eql(u8, entry.key_ptr.*, "name") or
-            std.mem.eql(u8, entry.key_ptr.*, "description") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments") or
-            (is_algebraic and std.mem.eql(u8, entry.key_ptr.*, "derive_from_schema")) or
-            (!is_algebraic and std.mem.eql(u8, entry.key_ptr.*, "version")))
-        {
-            continue;
-        }
+        if (skipPublicIndexMetadataField(kind, entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -858,6 +1023,18 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn skipPublicIndexMetadataField(kind: db_mod.types.IndexKind, field: []const u8) bool {
+    if (std.mem.eql(u8, field, "type") or
+        std.mem.eql(u8, field, "name") or
+        std.mem.eql(u8, field, "description") or
+        std.mem.eql(u8, field, "enrichments") or
+        std.mem.eql(u8, field, "derive_from_schema"))
+    {
+        return true;
+    }
+    return kind != .algebraic and std.mem.eql(u8, field, "version");
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -1059,6 +1236,70 @@ fn groupDbHasAlgebraicDocFactScalarKeyContaining(alloc: std.mem.Allocator, db_pa
             std.mem.indexOf(u8, row.key, needle) != null) return true;
     }
     return false;
+}
+
+test "table provisioner reconciles stored algebraic metadata without public type" {
+    const path = "/tmp/antfly-metadata-table-provisioner-algebraic-existing";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
+    defer std.testing.allocator.free(db_path);
+    try fs_paths.createDirPathPortable(io_impl.io(), db_path);
+
+    const config_json =
+        \\{
+        \\  "version": 1,
+        \\  "schema_version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"product","path":"product","type":"string"}],
+        \\  "materializations": []
+        \\}
+    ;
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "alg", .kind = .algebraic, .config_json = config_json });
+
+    const indexes_json =
+        \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
+    ;
+    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json);
+    try std.testing.expectEqual(@as(usize, 0), summary.added);
+    try std.testing.expectEqual(@as(usize, 0), summary.removed);
+    try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
+}
+
+test "table provisioner extracts public algebraic metadata as internal config" {
+    const alloc = std.testing.allocator;
+    const index_json =
+        \\{"type":"algebraic","version":1,"table":"docs","schema_version":2,"derive_from_schema":true,"group_fields":[{"name":"customer","path":"customer","type":"string"}],"materializations":[]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(db_mod.types.IndexKind.algebraic, try parseIndexKind(parsed.value));
+    const config_json = try extractIndexConfigJson(alloc, "alg", parsed.value);
+    defer alloc.free(config_json);
+    var config = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer config.deinit();
+
+    try std.testing.expect(config.value.object.get("type") == null);
+    try std.testing.expect(config.value.object.get("derive_from_schema") == null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"schema_version\":2") != null);
+}
+
+test "table provisioner recognizes legacy stored algebraic metadata" {
+    const alloc = std.testing.allocator;
+    const index_json =
+        \\{"version":1,"table":"docs","materializations":[]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(db_mod.types.IndexKind.algebraic, try parseIndexKind(parsed.value));
 }
 
 test "table provisioner registers top-level enrichments without creating enrichment index" {
@@ -1307,6 +1548,449 @@ test "table provisioner registers explicit document enrichments from index confi
     try std.testing.expectEqual(.asset, enrichments[0].kind);
     try std.testing.expectEqualStrings("document_chunks_v1", enrichments[1].name);
     try std.testing.expectEqual(.chunk, enrichments[1].kind);
+}
+
+test "table provisioner rejects conflicting inline enrichment definitions" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-conflicting-enrichments";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const indexes_json =
+        \\{
+        \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":512,"chunk_overlap":50},
+        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":256,"chunk_overlap":50}
+        \\  ]}
+        \\}
+    ;
+
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 12,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 12,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    ));
+}
+
+test "table provisioner rejects conflicting enrichment kinds under the same artifact name" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-conflicting-enrichment-kinds";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_artifact_v1","kind":"asset","field":"url","content_type":"application/json"},
+        \\    {"name":"document_artifact_v1","kind":"chunk","field":"text","chunk_size":512}
+        \\  ]}
+    ;
+
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 16,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 16,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    ));
+}
+
+test "table provisioner updates changed enrichment config under the same name" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-changed-enrichment";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const first_indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":512,"chunk_overlap":50}
+        \\  ]}
+    ;
+    const second_indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":256,"chunk_overlap":25,"full_text_index":true}
+        \\  ]}
+    ;
+
+    const first_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 13,
+            .name = "docs",
+            .indexes_json = first_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 13,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), first_summary.enrichments_added);
+
+    const second_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 13,
+            .name = "docs",
+            .indexes_json = second_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 13,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 0), second_summary.enrichments_added);
+    try std.testing.expectEqual(@as(usize, 1), second_summary.enrichments_updated);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    const cfg = findEnrichment(enrichments, .chunk, "document_chunks_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 256), cfg.chunk_size);
+    try std.testing.expectEqual(@as(u32, 25), cfg.chunk_overlap);
+    try std.testing.expect(cfg.full_text_index);
+}
+
+test "table provisioner replaces enrichment kind under the same artifact name" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-replace-enrichment-kind";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const first_indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_artifact_v1","kind":"asset","field":"url","content_type":"application/json"}
+        \\  ]}
+    ;
+    const second_indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_artifact_v1","kind":"chunk","field":"body","chunk_size":256,"chunk_overlap":25}
+        \\  ]}
+    ;
+
+    const first_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 17,
+            .name = "docs",
+            .indexes_json = first_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 17,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), first_summary.enrichments_added);
+
+    const second_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 17,
+            .name = "docs",
+            .indexes_json = second_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 17,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 0), second_summary.enrichments_added);
+    try std.testing.expectEqual(@as(usize, 1), second_summary.enrichments_updated);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+    try std.testing.expectEqual(.chunk, enrichments[0].kind);
+    try std.testing.expectEqualStrings("document_artifact_v1", enrichments[0].name);
+    try std.testing.expectEqualStrings("body", enrichments[0].field);
+    try std.testing.expectEqual(@as(u32, 256), enrichments[0].chunk_size);
+}
+
+test "table provisioner applies artifact enrichments in dependency order" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-enrichment-dependency-order";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const indexes_json =
+        \\{
+        \\  "enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","source_artifact_name":"document_units_v1","field":"text","chunk_size":512,"full_text_index":true},
+        \\    {"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json"}
+        \\  ]}
+    ;
+
+    const summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 18,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 18,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 2), summary.enrichments_added);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expect(findEnrichment(enrichments, .asset, "document_units_v1") != null);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "document_chunks_v1") != null);
+}
+
+test "table provisioner compares full text index configs semantically" {
+    try std.testing.expect(try fullTextIndexConfigsEqual(
+        std.testing.allocator,
+        "{\"type\":\"full_text\",\"artifact_name\":\"document_chunks_v1\",\"description\":\"docs\",\"enrichments\":[{\"name\":\"a\",\"kind\":\"chunk\"}]}",
+        "{\"description\":\"docs\",\"enrichments\":[{\"name\":\"b\",\"kind\":\"chunk\"}],\"artifact_name\":\"document_chunks_v1\",\"type\":\"full_text\"}",
+    ));
+    try std.testing.expect(!try fullTextIndexConfigsEqual(
+        std.testing.allocator,
+        "{\"type\":\"full_text\",\"artifact_name\":\"document_chunks_v1\"}",
+        "{\"type\":\"full_text\",\"artifact_name\":\"document_chunks_v2\"}",
+    ));
+}
+
+test "table provisioner treats duplicate identical inline enrichments as one desired artifact" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-shared-enrichment";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const indexes_json =
+        \\{
+        \\  "document_text_a":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":512,"chunk_overlap":50}
+        \\  ]},
+        \\  "document_text_b":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
+        \\    {"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":512,"chunk_overlap":50}
+        \\  ]}
+        \\}
+    ;
+
+    const summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 15,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 15,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 2), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.enrichments_added);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "document_chunks_v1") != null);
+}
+
+test "table provisioner updates full text artifact mapping and cleans removed enrichments" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-enrichment-remap";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const first_indexes_json =
+        \\{
+        \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
+        \\    {"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"document_chunks_v1","kind":"chunk","source_artifact_name":"document_units_v1","field":"text","chunk_size":512,"chunk_overlap":50}
+        \\  ]}
+        \\}
+    ;
+    const second_indexes_json =
+        \\{
+        \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v2","enrichments":[
+        \\    {"name":"document_units_v2","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"document_chunks_v2","kind":"chunk","source_artifact_name":"document_units_v2","field":"text","chunk_size":512,"chunk_overlap":50}
+        \\  ]}
+        \\}
+    ;
+
+    _ = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 14,
+            .name = "docs",
+            .indexes_json = first_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 14,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+
+    {
+        const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+        defer alloc.free(db_path);
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+
+        const chunk_key = try db_mod.internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v2", 0);
+        defer alloc.free(chunk_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = chunk_key, .value = "{\"text\":\"gamma remap token\"}" },
+        }, &.{});
+    }
+
+    const second_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 14,
+            .name = "docs",
+            .indexes_json = second_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 14,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), second_summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), second_summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 2), second_summary.enrichments_added);
+    try std.testing.expectEqual(@as(usize, 2), second_summary.enrichments_removed);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expect(findEnrichment(enrichments, .asset, "document_units_v2") != null);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "document_chunks_v2") != null);
+
+    const old_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, "document_chunks_v1", false);
+    defer {
+        for (old_text_indexes) |name| alloc.free(name);
+        alloc.free(old_text_indexes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), old_text_indexes.len);
+
+    const new_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, "document_chunks_v2", false);
+    defer {
+        for (new_text_indexes) |name| alloc.free(name);
+        alloc.free(new_text_indexes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), new_text_indexes.len);
+    try std.testing.expectEqualStrings("document_text", new_text_indexes[0]);
+
+    var result = try db.search(alloc, .{
+        .index_name = "document_text",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .limit = 1,
+        .return_mode = .chunk,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
 }
 
 test "table provisioner restores local shard data from metadata restore intent" {

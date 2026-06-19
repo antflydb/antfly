@@ -231,9 +231,33 @@ List available backups:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			listBackups, _ := cmd.Flags().GetBool("list")
 			location, _ := cmd.Flags().GetString("location")
+			formatStr, _ := cmd.Flags().GetString("output")
+			format, err := parseOutputFormat(formatStr)
+			if err != nil {
+				return err
+			}
 
 			// Handle --list flag
 			if listBackups {
+				if format == outputJSON {
+					backups, err := antflyClient.AntflyClient.ListBackups(cmd.Context(), location)
+					if err != nil {
+						return fmt.Errorf("list backups failed: %w", err)
+					}
+					items := make([]map[string]any, len(backups))
+					for i, backup := range backups {
+						items[i] = map[string]any{
+							"backup_id":      backup.BackupID,
+							"timestamp":      backup.Timestamp,
+							"tables":         backup.Tables,
+							"antfly_version": backup.AntflyVersion,
+						}
+					}
+					return writeJSON(map[string]any{"backups": items})
+				}
+				if format != outputTable {
+					return fmt.Errorf("backup --list supports output formats table and json, got %q", formatStr)
+				}
 				if err := antflyClient.ListBackups(cmd.Context(), location); err != nil {
 					return fmt.Errorf("list backups failed: %w", err)
 				}
@@ -274,6 +298,7 @@ List available backups:
 	cmd.Flags().String("backup-id", "", "Unique ID for this backup")
 	cmd.Flags().String("location", "file:///tmp/antfly_backups", "Backup location (e.g., file:///path/to/dir or s3://bucket/path)")
 	cmd.Flags().Bool("list", false, "List available backups at the location")
+	cmd.Flags().StringP("output", "o", "table", "Output format for --list: table, json")
 
 	return cmd
 }

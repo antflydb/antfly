@@ -4557,9 +4557,14 @@ Recommended follow-up release cuts from the current checkpoint:
    types so client drift is caught with the public graph metric read surface.
 
 The remaining promotion work should be tracked as rollout evidence rather than
-PR unit coverage or graph-specific build targets:
+PR unit coverage or graph-specific build targets. The local process harness is
+the canonical rollout-summary producer: it accepts `--profile smoke` and
+`--profile promotion`, emits one `graph_metric_process_harness_summary` row, and
+reports top-level rollout, public-read, remote-owner, service, direct, and
+failure/reclaim gates. Hosted or deployment-sized qualification should consume
+that summary shape instead of adding standalone graph-metric Make targets.
 
-- A future rollout qualification runner
+- The rollout qualification path
   runs degree, PageRank, eigenvector, and paired HITS through the graph-index
   metric API, drains planned maintenance with configurable graph size, worker
   count, tick budget, metrics-per-round budget, page budget, iteration cap,
@@ -5134,11 +5139,11 @@ PR unit coverage or graph-specific build targets:
   latency thresholds disabled until deployment baselines exist, while cleanup
   latency is now part of the deployment-shaped promotion requirement. The
   smoke recipe keeps only loose runaway guards for local, planned, and cleanup
-  phases. The runner should accept `--profile smoke` and
-  `--profile promotion` for focused family or budget overrides. The
-  process-owner summary emits a top-level
-  `remote_owner_release_gate` plus service, direct, and failure/reclaim
-  component booleans. The service gate is split into
+  phases. The runner accepts `--profile smoke` and `--profile promotion` for
+  focused family or budget overrides. The process-owner summary emits top-level
+  `rollout_qualification_gate`, `public_read_release_gate`, and
+  `remote_owner_release_gate` booleans plus service, direct, and
+  failure/reclaim component booleans. The service gate is split into
   `service_lifecycle_release_gate`, `service_multipage_release_gate`, and
   `service_active_read_release_gate`; the direct/failure side is split into
   `direct_publish_read_release_gate`, `direct_reclaim_release_gate`, and

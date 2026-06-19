@@ -2920,6 +2920,20 @@ pub const TableWriteSource = struct {
             metric_name: []const u8,
             action: []const u8,
         ) anyerror!?db_mod.types.GraphMetricStatus = null,
+        reprocess_document_artifact: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?bool = null,
+        reprocess_document_artifact_range: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
         graph_metric_maintenance_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3490,6 +3504,28 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.GraphMetricStatus {
         const fn_ptr = self.vtable.graph_metric_action orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const fn_ptr = self.vtable.reprocess_document_artifact orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifactRange(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
+        const fn_ptr = self.vtable.reprocess_document_artifact_range orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, req);
     }
 
     pub fn graphMetricMaintenanceGroupLocal(
@@ -7038,6 +7074,8 @@ pub const BoundTableWriteSource = struct {
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .graph_metric_action = graphMetricAction,
+                .reprocess_document_artifact = reprocessDocumentArtifact,
+                .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
@@ -8134,6 +8172,30 @@ pub const BoundTableWriteSource = struct {
             return try self.db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
         }
         return error.InvalidGraphMetricAction;
+    }
+
+    fn reprocessDocumentArtifact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try self.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+    }
+
+    fn reprocessDocumentArtifactRange(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try self.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
     }
 
     fn batchGroupLocal(
@@ -9311,6 +9373,8 @@ pub const ProvisionedTableWriteSource = struct {
                 summary.indexes_removed += index_summary.indexes_removed;
                 summary.indexes_added += index_summary.indexes_added;
                 summary.enrichments_added += index_summary.enrichments_added;
+                summary.enrichments_updated += index_summary.enrichments_updated;
+                summary.enrichments_removed += index_summary.enrichments_removed;
                 summary.resolvers_added += index_summary.resolvers_added;
                 summary.resolvers_updated += index_summary.resolvers_updated;
                 summary.resolvers_removed += index_summary.resolvers_removed;

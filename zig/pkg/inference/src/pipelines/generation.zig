@@ -354,6 +354,7 @@ pub const NativeDecodeState = struct {
     moe_runtime: runtime.moe.runtime.MoeRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     qwen35_linear_cache: ?gpt_arch.Qwen35LinearCache = null,
+    gemma4_layer_spec_cache: gpt_arch.Gemma4LayerSpecCache = .{},
     deepseek_v4_compressed_cache: ?gpt_arch.DeepSeekV4CompressedCache = null,
     force_full_recompute: bool = false,
 
@@ -389,6 +390,7 @@ pub const NativeDecodeState = struct {
 
     pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
         self.force_full_recompute = false;
+        if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
     }
 
@@ -549,6 +551,7 @@ pub const NativeDecodeState = struct {
         }
         self.moe_runtime.deinit();
         if (self.qwen35_linear_cache) |*cache| cache.deinit();
+        self.gemma4_layer_spec_cache.deinit(self.allocator);
         if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
         self.kv_block_ids.deinit(self.allocator);
         self.sequence_id = null;
@@ -744,6 +747,7 @@ pub const NativeDecodeState = struct {
                 .kv_position_offset = 0,
                 .moe_runtime = &self.moe_runtime,
                 .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
+                .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
                 .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
             };
         }
@@ -759,6 +763,7 @@ pub const NativeDecodeState = struct {
             .kv_manager = self.kv_manager,
             .moe_runtime = &self.moe_runtime,
             .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
+            .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
             .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
             .kv_cache = if (self.kvView()) |view|
                 .{

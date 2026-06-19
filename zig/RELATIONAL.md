@@ -5039,21 +5039,24 @@ text cannot masquerade as payload. `COPY FROM STDIN` has an initial native CSV
 executor that converts the supplied stream into the row-batch API, and
 `ApiHttpServer.executeBulkSqlCopyFromStdinWithSession` resolves the SQL target
 through the current catalog session, checks the concrete table write permission,
-loads the relational schema for typed default/generated/check validation, and
-dispatches the resulting rows through the catalog-aware row-batch write source.
+loads the relational schema for typed default/generated/check validation,
+validates imported rows against the authenticated identity's effective
+row-filter policy when one applies, and dispatches the resulting rows through
+the catalog-aware row-batch write source.
 `COPY TO STDOUT` has the matching native CSV executor:
 `ApiHttpServer.executeBulkSqlCopyToStdoutWithSession` resolves the SQL target
 through the current catalog session, checks concrete table read permission,
-loads the relational schema, queries through the catalog-aware rows-query read
-vtable, and serializes the selected result columns with `HEADER`, delimiter,
-quote, escape, null-marker, UTF-8 encoding, and `FORCE_QUOTE` semantics. The
+loads the relational schema, pushes the authenticated identity's effective
+row-filter policy into the catalog-aware rows-query read vtable, and serializes
+the selected result columns with `HEADER`, delimiter, quote, escape,
+null-marker, UTF-8 encoding, and `FORCE_QUOTE` semantics. The
 decoder keeps per-field quote metadata, so default CSV `NULL ''` handling
 distinguishes unquoted empty fields from quoted empty strings and
 `FORCE_NULL`/`FORCE_NOT_NULL` follow PostgreSQL CSV semantics before row JSON
 reaches typed schema validation. The remaining production layer is the broader
 streaming executor contract around those paths: chunked protocol backpressure,
-row-policy checks, 2PC staging, retryable range routing, deterministic
-reject-limit accounting, and snapshot-stable export streaming. PostgreSQL
+2PC staging, retryable range routing, deterministic reject-limit accounting,
+and snapshot-stable export streaming. PostgreSQL
 `COPY` syntax is therefore an adapter frontend for those
 contracts, but it must not bypass row-batch, mutation-source, or routed read
 semantics. Until server-file, `PROGRAM`, alternate stream endpoints, binary

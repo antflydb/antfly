@@ -208,6 +208,22 @@ func (a *mcpAdapter) ListIndexes(ctx context.Context, tableName string) ([]antfl
 
 // Query implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) Query(ctx context.Context, req antflymcp.QueryRequest) (*antflymcp.QueryResult, error) {
+	if req.RawQueryRequest != nil {
+		if _, ok := req.RawQueryRequest["table"]; ok {
+			return nil, fmt.Errorf("queryRequest.table is not allowed; pass the table through tableName")
+		}
+		raw, err := json.Marshal(req.RawQueryRequest)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling queryRequest: %w", err)
+		}
+		var internalReq QueryRequest
+		if err := json.Unmarshal(raw, &internalReq); err != nil {
+			return nil, fmt.Errorf("unmarshaling queryRequest: %w", err)
+		}
+		internalReq.Table = req.TableName
+		return a.runMCPQuery(ctx, &internalReq)
+	}
+
 	internalReq := QueryRequest{
 		Table:          req.TableName,
 		SemanticSearch: req.SemanticSearch,
@@ -221,17 +237,21 @@ func (a *mcpAdapter) Query(ctx context.Context, req antflymcp.QueryRequest) (*an
 		internalReq.FilterPrefix = []byte(req.FilterPrefix)
 	}
 
-	// Convert bleve query string syntax to json.RawMessage
-	if req.FullTextSearch != "" {
-		q := query.NewQueryStringQuery(req.FullTextSearch)
-		ftsJSON, err := json.Marshal(q)
+	// Convert MCP full-text args to the same structured query JSON accepted by
+	// the REST query API.
+	if req.FullTextSearch != nil {
+		ftsJSON, err := mcpFullTextSearchJSON(req.FullTextSearch, req.FullTextSearchField)
 		if err != nil {
 			return nil, fmt.Errorf("invalid full text search query: %w", err)
 		}
 		internalReq.FullTextSearch = ftsJSON
 	}
 
-	qr := a.t.runQuery(ctx, &internalReq)
+	return a.runMCPQuery(ctx, &internalReq)
+}
+
+func (a *mcpAdapter) runMCPQuery(ctx context.Context, req *QueryRequest) (*antflymcp.QueryResult, error) {
+	qr := a.t.runQuery(ctx, req)
 	if qr.Error != "" {
 		return nil, fmt.Errorf("query error: %s", qr.Error)
 	}
@@ -255,6 +275,38 @@ func (a *mcpAdapter) Query(ctx context.Context, req antflymcp.QueryRequest) (*an
 		HitCount:   hitCount,
 		Structured: structured,
 	}, nil
+}
+
+func mcpFullTextSearchJSON(fullTextSearch any, field string) (json.RawMessage, error) {
+	switch value := fullTextSearch.(type) {
+	case string:
+		if value == "" {
+			return nil, nil
+		}
+		if field != "" {
+			ftsJSON, err := json.Marshal(map[string]any{
+				"match": value,
+				"field": field,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return ftsJSON, nil
+		}
+
+		q := query.NewQueryStringQuery(value)
+		ftsJSON, err := json.Marshal(q)
+		if err != nil {
+			return nil, err
+		}
+		return ftsJSON, nil
+	case map[string]any:
+		return json.Marshal(value)
+	case json.RawMessage:
+		return value, nil
+	default:
+		return nil, fmt.Errorf("expected string or object")
+	}
 }
 
 // Batch implements antflymcp.AntflyHandler.

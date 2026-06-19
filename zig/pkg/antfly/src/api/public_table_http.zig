@@ -123,6 +123,20 @@ pub const TableApi = struct {
         InternalFailure,
     };
 
+    pub const ExecutePutArtifactEnrichmentError = error{
+        NotFound,
+        MethodNotAllowed,
+        InvalidEnrichmentRequest,
+        InternalFailure,
+    };
+
+    pub const ExecuteDeleteArtifactEnrichmentError = error{
+        NotFound,
+        MethodNotAllowed,
+        InvalidEnrichmentRequest,
+        InternalFailure,
+    };
+
     pub const ExecuteDocumentArtifactManifestError = error{
         NotFound,
         MethodNotAllowed,
@@ -225,6 +239,19 @@ pub const TableApi = struct {
             metric_name: []const u8,
             action: []const u8,
         ) ExecuteGraphMetricActionError![]u8 = null,
+        execute_put_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            body: []const u8,
+        ) ExecutePutArtifactEnrichmentError!void = null,
+        execute_delete_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+        ) ExecuteDeleteArtifactEnrichmentError!void = null,
         execute_document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -349,6 +376,27 @@ pub const TableApi = struct {
     ) ExecuteGraphMetricActionError![]u8 {
         const fn_ptr = self.vtable.execute_table_graph_metric_action orelse return error.MethodNotAllowed;
         return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
+    }
+
+    pub fn executePutArtifactEnrichment(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) ExecutePutArtifactEnrichmentError!void {
+        const fn_ptr = self.vtable.execute_put_artifact_enrichment orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, body);
+    }
+
+    pub fn executeDeleteArtifactEnrichment(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) ExecuteDeleteArtifactEnrichmentError!void {
+        const fn_ptr = self.vtable.execute_delete_artifact_enrichment orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
     }
 
     pub fn executeDocumentArtifactManifest(
@@ -674,6 +722,37 @@ pub fn handleTableGraphMetricAction(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "graph metric action failed") },
     };
     return .{ .status = 200, .body = response_body };
+}
+
+pub fn handlePutArtifactEnrichment(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    body: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    api.executePutArtifactEnrichment(alloc, table_name, artifact_name, body) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment update failed") },
+    };
+    return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+}
+
+pub fn handleDeleteArtifactEnrichment(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    api.executeDeleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment delete failed") },
+    };
+    return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
 }
 
 pub fn handleDocumentArtifactManifest(

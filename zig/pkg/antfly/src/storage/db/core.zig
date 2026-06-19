@@ -607,6 +607,10 @@ pub const DBCore = struct {
         return try self.index_manager.removeEnrichment(self.store, kind, name);
     }
 
+    pub fn upsertEnrichment(self: *DBCore, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        return try self.index_manager.upsertEnrichment(self.store, cfg);
+    }
+
     pub fn planGeneratedEnrichments(
         self: *DBCore,
         alloc: Allocator,

@@ -18,6 +18,7 @@ const platform = @import("antfly_platform");
 const graph_query_mod = antfly.graph_query;
 
 const HarnessProfile = enum {
+    smoke,
     promotion,
 };
 
@@ -184,7 +185,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (!(argv.len == 2 or (argv.len == 4 and std.mem.eql(u8, argv[2], "--profile")))) {
-        std.debug.print("usage: graph_metric_process_harness <antfly-executable> [--profile promotion]\n", .{});
+        std.debug.print("usage: graph_metric_process_harness <antfly-executable> [--profile smoke|promotion]\n", .{});
         std.debug.print("       graph_metric_process_harness claim-degree-page-hold <db-path> <worker-id> <now-ms> <ready-file> <hold-ms>\n", .{});
         std.debug.print("       graph_metric_process_harness claim-metric-page-hold <db-path> <metric-name> <phase> <worker-id> <now-ms> <ready-file> <hold-ms>\n", .{});
         std.process.exit(2);
@@ -857,6 +858,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseHarnessProfile(value: []const u8) !HarnessProfile {
+    if (std.mem.eql(u8, value, "smoke")) return .smoke;
     if (std.mem.eql(u8, value, "promotion")) return .promotion;
     return error.InvalidGraphMetricProcessHarnessProfile;
 }
@@ -928,6 +930,16 @@ fn hasFailureReclaimReleaseGate(summary: ProcessHarnessReleaseSummary, required:
         hasDirectExhaustionFencingReleaseGate(summary, required);
 }
 
+fn hasPublicReadReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return hasServiceActiveReadReleaseGate(summary, required) and
+        hasDirectPublishReadReleaseGate(summary, required);
+}
+
+fn hasRolloutQualificationGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return hasRemoteOwnerReleaseGate(summary, required) and
+        hasPublicReadReleaseGate(summary, required);
+}
+
 fn emitProcessHarnessReleaseSummary(io: std.Io, profile: HarnessProfile, summary: ProcessHarnessReleaseSummary) !void {
     const required = required_process_harness_release_summary;
     var stdout_buffer: [4096]u8 = undefined;
@@ -936,9 +948,13 @@ fn emitProcessHarnessReleaseSummary(io: std.Io, profile: HarnessProfile, summary
     defer out.flush() catch {};
 
     try out.print(
-        "{{\"event\":\"graph_metric_process_harness_summary\",\"profile\":\"{s}\",\"remote_owner_release_gate\":{},\"service_remote_owner_release_gate\":{},\"service_lifecycle_release_gate\":{},\"service_multipage_release_gate\":{},\"service_active_read_release_gate\":{},\"direct_remote_owner_release_gate\":{},\"direct_publish_read_release_gate\":{},\"failure_reclaim_release_gate\":{},\"direct_reclaim_release_gate\":{},\"direct_exhaustion_fencing_release_gate\":{}",
+        "{{\"event\":\"graph_metric_process_harness_summary\",\"profile\":\"{s}\",\"rollout_qualification_gate\":{},\"promotion_profile_floor_configured\":{},\"all_family_execution_configured\":{},\"public_read_release_gate\":{},\"remote_owner_release_gate\":{},\"service_remote_owner_release_gate\":{},\"service_lifecycle_release_gate\":{},\"service_multipage_release_gate\":{},\"service_active_read_release_gate\":{},\"direct_remote_owner_release_gate\":{},\"direct_publish_read_release_gate\":{},\"failure_reclaim_release_gate\":{},\"direct_reclaim_release_gate\":{},\"direct_exhaustion_fencing_release_gate\":{}",
         .{
             @tagName(profile),
+            hasRolloutQualificationGate(summary, required),
+            profile == .promotion,
+            required.launch_families == 4 and summary.launch_families == required.launch_families,
+            hasPublicReadReleaseGate(summary, required),
             hasRemoteOwnerReleaseGate(summary, required),
             hasServiceRemoteOwnerReleaseGate(summary, required),
             hasServiceLifecycleReleaseGate(summary, required),

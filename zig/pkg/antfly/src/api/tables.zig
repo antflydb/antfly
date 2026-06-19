@@ -520,7 +520,8 @@ pub fn encodeSingleTableStatusWithStorageStatuses(
     const status = (try buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), snapshot, table_name, storage_statuses)) orelse return null;
     const encoded = try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
     defer alloc.free(encoded);
-    return try projectInlineEnrichmentConfigsInTableStatusJson(alloc, encoded);
+    const table = findTableByName(snapshot, table_name).?;
+    return try projectSingleTableStatusJson(alloc, encoded, table.indexes_json);
 }
 
 pub fn buildTableListWithStorageStatuses(
@@ -2169,10 +2170,9 @@ fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) 
     var first = true;
     var it = root.iterator();
     while (it.next()) |entry| {
-        // `resolvers` is a reserved entity-resolution section, not an index
-        // config; the provisioner reads it from the stored indexes_json. Skip it
-        // here so the typed IndexConfig validation/projection ignores it.
-        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+        // Reserved metadata sections are not index configs; the provisioner
+        // reads them from the stored indexes_json.
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -2181,6 +2181,10 @@ fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) 
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn isReservedIndexMetadataEntry(name: []const u8) bool {
+    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
 
 fn encodeSingleTableIndex(
@@ -2315,6 +2319,27 @@ fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, enc
     defer deinitJsonValue(alloc, &owned);
     try projectInlineEnrichmentConfigsInTableStatusValue(alloc, &owned);
     return try std.json.Stringify.valueAlloc(alloc, owned, .{ .emit_null_optional_fields = false });
+}
+
+fn projectSingleTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8, indexes_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    var owned = try cloneJsonValueAlloc(alloc, parsed.value);
+    defer deinitJsonValue(alloc, &owned);
+    try projectInlineEnrichmentConfigsInTableStatusValue(alloc, &owned);
+    try attachArtifactEnrichmentsToTableStatus(alloc, &owned, indexes_json);
+    return try std.json.Stringify.valueAlloc(alloc, owned, .{ .emit_null_optional_fields = false });
+}
+
+fn attachArtifactEnrichmentsToTableStatus(alloc: std.mem.Allocator, value: *std.json.Value, indexes_json: []const u8) !void {
+    if (value.* != .object) return;
+    const source = if (indexes_json.len > 0) indexes_json else default_indexes_json;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidTableIndexMetadata;
+    const enrichments = parsed.value.object.get("enrichments") orelse return;
+    if (enrichments != .array or enrichments.array.items.len == 0) return;
+    try value.object.put(alloc, try alloc.dupe(u8, "artifact_enrichments"), try cloneJsonValueAlloc(alloc, enrichments));
 }
 
 fn projectInlineEnrichmentConfigsInTableStatusValue(alloc: std.mem.Allocator, value: *std.json.Value) !void {

@@ -20,6 +20,7 @@ import base64
 import json
 import struct
 import time
+from urllib.parse import quote
 import pytest
 import requests
 
@@ -202,14 +203,14 @@ def test_table_index_lifecycle(table_api):
         raise AssertionError("expected deleted index lookup to return 404")
 
 
-def test_table_rejects_public_full_text_create_index(table_api):
-    table_name = f"index_backfill_{time.time_ns()}"
+def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
+    table_name = f"public_full_text_{time.time_ns()}"
 
-    created = table_api.create_table(table_name)
+    created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    try:
-        table_api.create_index(
+    assert (
+        stateful_api.create_index(
             table_name,
             "search_idx",
             {
@@ -217,11 +218,162 @@ def test_table_rejects_public_full_text_create_index(table_api):
                 "type": "full_text",
             },
         )
-    except requests.HTTPError as exc:
-        assert exc.response is not None
-        assert exc.response.status_code == 400
-    else:
-        raise AssertionError("expected public full-text create_index to be rejected")
+        == {}
+    )
+
+    detail = stateful_api.get_index(table_name, "search_idx")
+    assert detail["config"]["name"] == "search_idx"
+    assert detail["config"]["type"] == "full_text"
+
+
+def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(stateful_api):
+    table_name = f"artifact_enrichment_{time.time_ns()}"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/invalid_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "chunk_size": 512,
+                "full_text_index": True,
+            },
+        )
+    assert exc_info.value.response.status_code == 400
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/orphan_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "missing_units_v1",
+                "field": "text",
+                "chunk_size": 512,
+                "full_text_index": True,
+            },
+        )
+    assert exc_info.value.response.status_code == 400
+
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_units_v1/enrichment",
+            {
+                "kind": "asset",
+                "field": "url",
+                "content_type": "application/json",
+                "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+            },
+        )
+        == {}
+    )
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 512,
+                "chunk_overlap": 50,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+
+    detail = stateful_api.get_index(table_name, "full_text_index_v0")
+    assert detail["config"]["name"] == "full_text_index_v0"
+    assert detail["config"]["type"] == "full_text"
+
+    table = stateful_api.get_table(table_name)
+    encoded_detail = json.dumps(table, sort_keys=True)
+    assert "document_units_v1" in encoded_detail
+    assert "document_chunks_v1" in encoded_detail
+    assert "full_text_index" in encoded_detail
+
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 256,
+                "chunk_overlap": 25,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+    replaced = stateful_api.get_table(table_name)
+    replaced_detail = json.dumps(replaced, sort_keys=True)
+    assert '"chunk_size": 256' in replaced_detail
+    assert '"chunk_overlap": 25' in replaced_detail
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment")
+    assert exc_info.value.response.status_code == 400
+
+    decoded_name = "document chunks v2"
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 128,
+                "chunk_overlap": 10,
+            },
+        )
+        == {}
+    )
+    decoded_table = stateful_api.get_table(table_name)
+    decoded_detail = json.dumps(decoded_table, sort_keys=True)
+    assert decoded_name in decoded_detail
+    assert quote(decoded_name, safe="") not in decoded_detail
+
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment") == {}
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment") == {}
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
+
+
+def test_stateful_table_rejects_document_full_text_create_index_with_inline_enrichments(stateful_api):
+    table_name = f"document_full_text_rejected_{time.time_ns()}"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.create_index(
+            table_name,
+            "document_text",
+            {
+                "name": "document_text",
+                "type": "full_text",
+                "artifact_name": "document_chunks_v1",
+                "enrichments": [
+                    {
+                        "name": "document_units_v1",
+                        "kind": "asset",
+                        "field": "url",
+                        "content_type": "application/json",
+                        "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+                    },
+                    {
+                        "name": "document_chunks_v1",
+                        "kind": "chunk",
+                        "source_artifact_name": "document_units_v1",
+                        "field": "text",
+                        "chunk_size": 512,
+                        "chunk_overlap": 50,
+                    },
+                ],
+            },
+        )
+    assert exc_info.value.response.status_code == 400
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):
@@ -922,9 +1074,9 @@ def test_table_rejects_non_go_full_text_chunk_config(table_api):
     try:
         table_api.create_index(
             table_name,
-            "full_text_index_v1",
+            "search_idx",
             {
-                "name": "full_text_index_v1",
+                "name": "search_idx",
                 "type": "full_text",
                 "chunk_name": "serverless_chunk_preview",
             },

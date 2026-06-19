@@ -502,6 +502,7 @@ const (
 	ChatMessageRoleTool      = oapi.ChatMessageRoleTool
 
 	// ChatToolName values
+	ChatToolNameAggregate        = oapi.ChatToolNameAggregate
 	ChatToolNameAddFilter        = oapi.ChatToolNameAddFilter
 	ChatToolNameAskClarification = oapi.ChatToolNameAskClarification
 	ChatToolNameFetch            = oapi.ChatToolNameFetch
@@ -665,7 +666,7 @@ var allToolNames = []ChatToolName{
 	ChatToolNameAddFilter, ChatToolNameAskClarification, ChatToolNameSearch,
 	ChatToolNameWebsearch, ChatToolNameFetch,
 	ChatToolNameSemanticSearch, ChatToolNameFullTextSearch,
-	ChatToolNameTreeSearch, ChatToolNameGraphSearch,
+	ChatToolNameTreeSearch, ChatToolNameGraphSearch, ChatToolNameAggregate,
 }
 
 // ValidateToolName checks if a tool name is valid.

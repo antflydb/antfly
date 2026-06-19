@@ -136,6 +136,8 @@ func TestListTools(t *testing.T) {
 		"batch",
 		"create_index",
 		"create_table",
+		"describe_mcp_capabilities",
+		"describe_query_request",
 		"drop_index",
 		"drop_table",
 		"list_indexes",
@@ -144,6 +146,51 @@ func TestListTools(t *testing.T) {
 		"restore",
 	}
 	assert.Equal(t, want, got)
+}
+
+func TestDescribeMCPCapabilities(t *testing.T) {
+	session := setupMCPTest(t, &mockHandler{})
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "describe_mcp_capabilities",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	require.True(t, ok)
+	assert.Contains(t, tc.Text, "MCP capabilities")
+
+	sc, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "mcp", sc["protocol"])
+	queryBuilder, ok := sc["query_builder"].(string)
+	require.True(t, ok)
+	assert.Contains(t, queryBuilder, "query-builder")
+	query, ok := sc["query"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, true, query["raw_query_request"])
+}
+
+func TestDescribeQueryRequest(t *testing.T) {
+	session := setupMCPTest(t, &mockHandler{})
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "describe_query_request",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	require.True(t, ok)
+	assert.Contains(t, tc.Text, "QueryRequest")
+
+	sc, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest", sc["openapi_schema"])
+	examples, ok := sc["examples"].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, examples, "fielded_full_text")
 }
 
 func TestListTables(t *testing.T) {
@@ -256,8 +303,10 @@ func TestDropTable(t *testing.T) {
 }
 
 func TestQuery(t *testing.T) {
+	var gotReq QueryRequest
 	handler := &mockHandler{
 		queryFn: func(ctx context.Context, req QueryRequest) (*QueryResult, error) {
+			gotReq = req
 			return &QueryResult{
 				HitCount: 2,
 				Structured: map[string]any{
@@ -277,9 +326,10 @@ func TestQuery(t *testing.T) {
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "query",
 		Arguments: map[string]any{
-			"tableName":      "docs",
-			"fullTextSearch": "test",
-			"limit":          10,
+			"tableName":           "docs",
+			"fullTextSearch":      "test",
+			"fullTextSearchField": "content",
+			"limit":               10,
 		},
 	})
 	require.NoError(t, err)
@@ -288,6 +338,9 @@ func TestQuery(t *testing.T) {
 	tc, ok := result.Content[0].(*mcp.TextContent)
 	require.True(t, ok)
 	assert.Contains(t, tc.Text, "2 results")
+	assert.Equal(t, "docs", gotReq.TableName)
+	assert.Equal(t, "test", gotReq.FullTextSearch)
+	assert.Equal(t, "content", gotReq.FullTextSearchField)
 
 	// Verify structured content is a map (round-tripped query result)
 	if result.StructuredContent != nil {
@@ -299,6 +352,96 @@ func TestQuery(t *testing.T) {
 		require.True(t, ok)
 		assert.Len(t, hitList, 2)
 	}
+}
+
+func TestQueryRawRequest(t *testing.T) {
+	var gotReq QueryRequest
+	handler := &mockHandler{
+		queryFn: func(ctx context.Context, req QueryRequest) (*QueryResult, error) {
+			gotReq = req
+			return &QueryResult{
+				HitCount:   1,
+				Structured: map[string]any{"hits": map[string]any{"total": 1}},
+			}, nil
+		},
+	}
+	session := setupMCPTest(t, handler)
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "query",
+		Arguments: map[string]any{
+			"tableName": "docs",
+			"queryRequest": map[string]any{
+				"full_text_search": map[string]any{"match": "hello", "field": "body"},
+				"fields":           []string{"title", "body"},
+				"limit":            5,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	require.True(t, ok)
+	assert.Contains(t, tc.Text, "1 results")
+	assert.Equal(t, "docs", gotReq.TableName)
+	require.NotNil(t, gotReq.RawQueryRequest)
+	assert.Equal(t, []any{"title", "body"}, gotReq.RawQueryRequest["fields"])
+	assert.Equal(t, float64(5), gotReq.RawQueryRequest["limit"])
+	fts, ok := gotReq.RawQueryRequest["full_text_search"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "hello", fts["match"])
+	assert.Equal(t, "body", fts["field"])
+}
+
+func TestQueryRawRequestRejectsShorthandMix(t *testing.T) {
+	session := setupMCPTest(t, &mockHandler{
+		queryFn: func(ctx context.Context, req QueryRequest) (*QueryResult, error) {
+			t.Fatal("query handler should not be called")
+			return nil, nil
+		},
+	})
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "query",
+		Arguments: map[string]any{
+			"tableName": "docs",
+			"queryRequest": map[string]any{
+				"full_text_search": map[string]any{"match": "hello", "field": "body"},
+			},
+			"limit": 5,
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	require.True(t, ok)
+	assert.Contains(t, tc.Text, "queryRequest cannot be combined")
+}
+
+func TestQueryRawRequestRejectsTableField(t *testing.T) {
+	session := setupMCPTest(t, &mockHandler{
+		queryFn: func(ctx context.Context, req QueryRequest) (*QueryResult, error) {
+			t.Fatal("query handler should not be called")
+			return nil, nil
+		},
+	})
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "query",
+		Arguments: map[string]any{
+			"tableName": "docs",
+			"queryRequest": map[string]any{
+				"table":            "docs",
+				"full_text_search": map[string]any{"match": "hello", "field": "body"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Content)
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	require.True(t, ok)
+	assert.Contains(t, tc.Text, "queryRequest.table is not allowed")
 }
 
 func TestBatch(t *testing.T) {

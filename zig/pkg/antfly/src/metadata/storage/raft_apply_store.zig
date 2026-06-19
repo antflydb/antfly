@@ -5422,6 +5422,8 @@ fn readTableRecordWithCatalogIdentity(
     errdefer alloc.free(restore_backup_id);
     const restore_location = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(restore_location);
+    const tablespace_name = try readOptionalRequiredString(alloc, encoded, pos, "");
+    errdefer alloc.free(tablespace_name);
     return .{
         .table_id = table_id,
         .name = name,
@@ -5436,6 +5438,7 @@ fn readTableRecordWithCatalogIdentity(
         .placement_role = placement_role,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
+        .tablespace_name = tablespace_name,
         .desired_replica_count = desired_replica_count,
         .min_ranges = min_ranges,
     };
@@ -7922,6 +7925,7 @@ test "metadata.table record decoder round-trips catalog identity" {
         .indexes_json = "{\"default\":{}}",
         .replication_sources_json = "[]",
         .placement_role = "data",
+        .tablespace_name = "hot",
         .desired_replica_count = 5,
         .min_ranges = 2,
     });
@@ -7935,6 +7939,7 @@ test "metadata.table record decoder round-trips catalog identity" {
     try std.testing.expectEqualStrings("billing", decoded.namespace_name);
     try std.testing.expectEqualStrings("invoices", decoded.name);
     try std.testing.expectEqualStrings("tenant billing invoices", decoded.description);
+    try std.testing.expectEqualStrings("hot", decoded.tablespace_name);
 }
 
 test "metadata catalog identity transition commands round-trip database and namespace records" {

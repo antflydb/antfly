@@ -958,7 +958,7 @@ def _insert_docs(
 
     def route_ready() -> str | None:
         try:
-            return _data_api_url_for_table(
+            api_url = _data_api_url_for_table(
                 cluster,
                 table_name,
                 require_all_group_leaders=True,
@@ -966,6 +966,11 @@ def _insert_docs(
             )
         except (AssertionError, requests.RequestException, ValueError):
             return None
+        if api_url is None:
+            return None
+        if not wait_for_server(api_url, timeout=1.0):
+            return None
+        return api_url
 
     api_url = wait_until(route_ready, timeout_s=60.0, interval_s=0.5)
     assert api_url is not None, (
@@ -977,7 +982,11 @@ def _insert_docs(
 
     def post_once() -> bool | None:
         nonlocal api_url, last_error
-        api_url = route_ready() or api_url
+        next_api_url = route_ready()
+        if next_api_url is None:
+            last_error = "no live write route"
+            return None
+        api_url = next_api_url
         try:
             response = requests.post(
                 f"{api_url}/tables/{table_name}/batch",
@@ -1225,21 +1234,7 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     cluster.create_table(table_name, num_shards=5)
 
     docs = {f"doc-{i:02d}": {"title": f"doc {i}", "rank": i} for i in range(10)}
-    try:
-        batch = requests.post(
-            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
-            json={"inserts": docs, "sync_level": "write"},
-            timeout=30,
-        )
-        batch.raise_for_status()
-    except requests.RequestException as exc:
-        # Connection resets here have flaked CI with no server-side context;
-        # attach node logs and native stacks so the failure is diagnosable.
-        raise AssertionError(
-            f"seed batch failed table={table_name!r}: {exc!r}"
-            f"\n[native stacks]\n{cluster.native_stack_dumps()}"
-            f"\n[logs]\n{cluster.debug_logs()}"
-        ) from exc
+    _insert_docs(cluster, table_name, docs, min_group_count=5)
 
     group_ids = wait_until(lambda: _table_group_ids(cluster, table_name), timeout_s=60.0, interval_s=0.5)
     assert group_ids is not None and len(group_ids) >= 5, (

@@ -708,6 +708,27 @@ pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, bod
     return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Register or replace an artifact enrichment
+pub const PutArtifactEnrichmentPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Stable generated artifact name.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for putArtifactEnrichment.
+pub fn parsePutArtifactEnrichmentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.EnrichmentConfig) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.EnrichmentConfig, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Delete an artifact enrichment
+pub const DeleteArtifactEnrichmentPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Stable generated artifact name.
+    artifact_name: []const u8,
+};
+
 /// Create a derived document artifact reprocess job
 pub const StartDocumentArtifactReprocessJobPathParams = struct {
     /// Name of the table
@@ -1086,6 +1107,8 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
+    .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance", .operation_id = "advanceDocumentArtifactReprocessJob" },
@@ -1204,6 +1227,8 @@ pub const routes = [_]Route{
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn startDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn getDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response

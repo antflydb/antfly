@@ -22,6 +22,8 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     var backup_id: ?[]const u8 = null;
     var location: []const u8 = "file:///tmp/antfly_backups";
     var format: ?[]const u8 = null;
+    var url: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
     var list_backups = false;
 
     while (args.next()) |arg| {
@@ -35,12 +37,23 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
             location = args.next() orelse location;
         } else if (std.mem.eql(u8, arg, "--format")) {
             format = args.next();
+        } else if (std.mem.eql(u8, arg, "--url")) {
+            url = args.next();
+        } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
+            output = args.next();
         } else if (std.mem.eql(u8, arg, "--list")) {
             list_backups = true;
         }
     }
 
+    if (url) |value| try client.setBaseUrl(value);
+
     if (list_backups) {
+        if (output) |value| {
+            if (!std.mem.eql(u8, value, "json")) {
+                cli.fatal("only JSON output is supported for backup --list", .{});
+            }
+        }
         var resp = try client.listBackups(.{ .location = location });
         defer resp.deinit();
         if (resp.data) |data| {
@@ -91,6 +104,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     var location: []const u8 = "file:///tmp/antfly_backups";
     var format: ?[]const u8 = null;
     var restore_mode: ?[]const u8 = null;
+    var url: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -105,8 +119,12 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
             format = args.next();
         } else if (std.mem.eql(u8, arg, "--mode")) {
             restore_mode = args.next();
+        } else if (std.mem.eql(u8, arg, "--url")) {
+            url = args.next();
         }
     }
+
+    if (url) |value| try client.setBaseUrl(value);
 
     const bid = backup_id orelse cli.fatal("--backup-id is required", .{});
 

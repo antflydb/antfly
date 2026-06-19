@@ -35,10 +35,21 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
 
 fn runWithFlags(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, first_arg: []const u8, args: *std.process.Args.Iterator) !void {
     var parsed = TableArgs{ .catalog = cli.CatalogFlags.defaultsFromEnv() };
+    var output: ?[]const u8 = null;
     var current_arg: ?[]const u8 = first_arg;
 
     while (current_arg) |arg| : (current_arg = args.next()) {
-        parseTableArg(&parsed, arg, args);
+        if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t") or cli.isCatalogFlag(arg)) {
+            parseTableArg(&parsed, arg, args);
+        } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
+            output = args.next() orelse cli.fatal("--output requires a value", .{});
+        }
+    }
+
+    if (output) |value| {
+        if (!std.mem.eql(u8, value, "json")) {
+            cli.fatal("only JSON output is supported for table", .{});
+        }
     }
 
     if (parsed.table_name) |name| {
