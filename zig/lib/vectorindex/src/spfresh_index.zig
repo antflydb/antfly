@@ -24,6 +24,8 @@ const vec = @import("antfly_vector").vector;
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_block_metadata_stack_capacity = 256;
 const flat_centroid_query_probe_stack_capacity = 512;
+const flat_centroid_zero_stack_capacity = 4096;
+const flat_centroid_coarse_scratch_stack_capacity = 8192;
 
 pub const FlatCentroidBlock = struct {
     posting_ids: []u64,
@@ -534,8 +536,10 @@ fn appendFlatCentroidBlock(
     std.debug.assert(levels.len == posting_ids.len);
     std.debug.assert(states.len == posting_ids.len);
     std.debug.assert(radii.len == posting_ids.len);
-    const zero = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(zero);
+    var zero_stack: [flat_centroid_zero_stack_capacity]f32 = undefined;
+    const use_zero_stack = dims <= zero_stack.len;
+    const zero = if (use_zero_stack) zero_stack[0..dims] else try self.alloc.alloc(f32, dims);
+    defer if (!use_zero_stack) self.alloc.free(zero);
     @memset(zero, 0);
 
     const ids = try self.alloc.dupe(u64, posting_ids);
@@ -783,12 +787,20 @@ fn finalizeFlatCentroidDirectory(
     var coarse_quantized: ?proto.RaBitQuantizedVectorSet = null;
     var posting_quantized: ?proto.RaBitQuantizedVectorSet = null;
     if (owned_blocks.len > 0) {
-        const zero = try self.alloc.alloc(f32, dims);
-        defer self.alloc.free(zero);
+        var zero_stack: [flat_centroid_zero_stack_capacity]f32 = undefined;
+        const use_zero_stack = dims <= zero_stack.len;
+        const zero = if (use_zero_stack) zero_stack[0..dims] else try self.alloc.alloc(f32, dims);
+        defer if (!use_zero_stack) self.alloc.free(zero);
         @memset(zero, 0);
 
-        const coarse_centroids = try self.alloc.alloc(f32, owned_blocks.len * dims);
-        defer self.alloc.free(coarse_centroids);
+        const coarse_centroid_count = owned_blocks.len * dims;
+        var coarse_centroids_stack: [flat_centroid_coarse_scratch_stack_capacity]f32 = undefined;
+        const use_coarse_centroids_stack = coarse_centroid_count <= coarse_centroids_stack.len;
+        const coarse_centroids = if (use_coarse_centroids_stack)
+            coarse_centroids_stack[0..coarse_centroid_count]
+        else
+            try self.alloc.alloc(f32, coarse_centroid_count);
+        defer if (!use_coarse_centroids_stack) self.alloc.free(coarse_centroids);
         for (owned_blocks, 0..) |*block, i| {
             @memcpy(coarse_centroids[i * dims ..][0..dims], block.centroid);
         }
