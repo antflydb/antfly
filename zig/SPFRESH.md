@@ -1095,8 +1095,9 @@ implementations cleanly:
     flat/two-level directory probes do not turn a selected posting batch into
     one file read per base value. The same newest-first batch scan keeps a
     compact unresolved-position list, so older segments only check postings
-    still missing from the batch. That preserves the format's sequence contract
-    across the file/runtime boundary. Query scratch replay applies that combined stream
+    still missing from the batch, and its per-segment point-read candidates are
+    stack-backed for common probe windows. That preserves the format's sequence
+    contract across the file/runtime boundary. Query scratch replay applies that combined stream
     directly into retained member scratch, using sorted merge for canonical bases
     and avoiding a second owned materialized member buffer on pending-overlay
     reads while preserving canonical sorted output; segment materialization now
