@@ -1157,6 +1157,7 @@ pub const LazyDirectorySnapshot = struct {
             if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
             if (best_record != null and entry.meta.max_delta_sequence <= best_sequence) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+            const all_records_after_generation = segmentDeltaTailFullyAfterGeneration(entry.meta, base_generation);
 
             const manifest_entry = ManifestEntry{
                 .meta = entry.meta,
@@ -1198,7 +1199,7 @@ pub const LazyDirectorySnapshot = struct {
                     value,
                     vector_id,
                     base_generation,
-                    posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
+                    all_records_after_generation or posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation,
                     &best_sequence,
                     &best_record,
                 );
@@ -2320,6 +2321,10 @@ pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entr
 }
 
 pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+    const all_records_after_generation = if (min_generation) |generation|
+        segmentDeltaTailFullyAfterGeneration(entry.meta, generation)
+    else
+        true;
     if (min_generation) |generation| {
         if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, generation)) {
             return try alloc.alloc(posting.PostingDeltaRecord, 0);
@@ -2342,7 +2347,7 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
         const found = try deltaIndexEntryFromRange(index_data.data, range, index);
         const value = try deltaValueFromEntryRange(range, found);
         if (min_generation) |generation| {
-            if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > generation) {
+            if (all_records_after_generation or posting.PostingFormat.deltaSequenceGeneration(found.sequence) > generation) {
                 try appendDeltaValueAllRecordsAlloc(alloc, value, &records);
                 continue;
             }
@@ -2365,6 +2370,10 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
     records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
     stats: *posting.PostingDeltaTailStats,
 ) !void {
+    const all_records_after_generation = if (min_generation) |generation|
+        segmentDeltaTailFullyAfterGeneration(entry.meta, generation)
+    else
+        true;
     if (min_generation) |generation| {
         if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, generation)) return;
     }
@@ -2382,7 +2391,7 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
     while (index < range.past_index) : (index += 1) {
         const found = try deltaIndexEntryFromRange(index_data.data, range, index);
         const value = try deltaValueFromEntryRange(range, found);
-        if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
+        if (all_records_after_generation or posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
             try appendDeltaValueAllRecordsWithStatsAlloc(alloc, value, records, stats);
             continue;
         }
@@ -2401,6 +2410,7 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
     stats: *posting.PostingDeltaTailStats,
 ) !void {
     if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, base_generation)) return;
+    const all_records_after_generation = segmentDeltaTailFullyAfterGeneration(entry.meta, base_generation);
 
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
@@ -2414,7 +2424,7 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
     while (index < range.past_index) : (index += 1) {
         const found = try deltaIndexEntryFromRange(index_data.data, range, index);
         const value = try deltaValueFromEntryRange(range, found);
-        if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
+        if (all_records_after_generation or posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
             try appendDeltaValueAllRecordsIntoScratchWithStatsAlloc(alloc, value, scratch, stats);
             continue;
         }
@@ -2424,6 +2434,7 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
 
 pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
     if (segmentDeltaTailFullyAtOrBeforeGeneration(entry.meta, base_generation)) return .{};
+    const all_records_after_generation = segmentDeltaTailFullyAfterGeneration(entry.meta, base_generation);
 
     var stack_index: [stack_index_max_bytes]u8 = undefined;
     const index_data = try readSegmentIndexWithScratchAlloc(alloc, io, dir, entry, &stack_index);
@@ -2438,7 +2449,7 @@ pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.
     while (index < range.past_index) : (index += 1) {
         const found = try deltaIndexEntryFromRange(index_data.data, range, index);
         const value = try deltaValueFromEntryRange(range, found);
-        if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
+        if (all_records_after_generation or posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
             try accumulateDeltaValueAllRecordsStats(value, &out);
             continue;
         }
@@ -4516,6 +4527,10 @@ fn deltaValueFromEntryRange(range: DeltaValueRange, found: IndexEntry) ![]const 
 
 fn segmentDeltaTailFullyAtOrBeforeGeneration(meta: SegmentMeta, generation: u64) bool {
     return meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(meta.max_delta_sequence) <= generation;
+}
+
+fn segmentDeltaTailFullyAfterGeneration(meta: SegmentMeta, generation: u64) bool {
+    return meta.min_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(meta.min_delta_sequence) > generation;
 }
 
 fn latestDeltaValueRecordAfterGenerationForMember(

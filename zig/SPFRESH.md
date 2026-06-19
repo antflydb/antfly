@@ -1248,7 +1248,9 @@ implementations cleanly:
     values whose sequence can still beat the current best record. Pending and
     committed segment delta entries now use their min
     sequence to select all-record stats/replay/latest-op paths when the whole
-    value is newer than the base generation. Allocation-returning delta loads,
+    value is newer than the base generation, and committed segment readers also
+    use segment-level min-delta metadata to take that path for every matching
+    value in an all-live segment. Allocation-returning delta loads,
     stats reads, and scratch replay now all skip segment bytes entirely when
     manifest max-sequence metadata proves the requested base generation already
     covers every delta in that segment. This removes the duplicate
