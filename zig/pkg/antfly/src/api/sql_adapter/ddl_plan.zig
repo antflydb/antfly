@@ -694,6 +694,12 @@ pub const RoutineKind = enum {
     procedure,
 };
 
+pub const RoutineVolatility = enum {
+    immutable,
+    stable,
+    @"volatile",
+};
+
 pub const CreateRoutinePlan = struct {
     kind: RoutineKind,
     routine_name: []const u8,
@@ -701,6 +707,7 @@ pub const CreateRoutinePlan = struct {
     argument_count: usize = 0,
     returns_type: ?[]const u8 = null,
     language: ?[]const u8 = null,
+    volatility: ?RoutineVolatility = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.routine_name);
@@ -2390,6 +2397,7 @@ test "SQL adapter DDL function and authorization plans own strings" {
         .routine_name = try alloc.dupe(u8, "normalize_status"),
         .returns_type = try alloc.dupe(u8, "text"),
         .language = try alloc.dupe(u8, "sql"),
+        .volatility = .stable,
     } };
     create_routine.deinit(alloc);
 

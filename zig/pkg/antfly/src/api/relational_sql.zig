@@ -174,6 +174,7 @@ pub const FunctionCatalogPlan = sql_adapter.FunctionCatalogPlan;
 pub const CreateRoutinePlan = sql_adapter.CreateRoutinePlan;
 pub const DropRoutinePlan = sql_adapter.DropRoutinePlan;
 pub const RoutineKind = sql_adapter.RoutineKind;
+pub const RoutineVolatility = sql_adapter.RoutineVolatility;
 pub const AuthorizationCatalogPlan = sql_adapter.AuthorizationCatalogPlan;
 pub const CreateRolePlan = sql_adapter.CreateRolePlan;
 pub const AlterRolePlan = sql_adapter.AlterRolePlan;
@@ -3519,6 +3520,7 @@ const Parser = struct {
         const routine_name = syntax.routine_name;
         const returns_type = syntax.returns_type;
         const language = syntax.language;
+        const volatility = syntax.volatility;
         syntax.routine_name = "";
         syntax.returns_type = null;
         syntax.language = null;
@@ -3529,6 +3531,7 @@ const Parser = struct {
             .argument_count = syntax.argument_count,
             .returns_type = returns_type,
             .language = language,
+            .volatility = volatility,
         };
     }
 
@@ -45149,8 +45152,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql", replace_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_function));
 
+    var stable_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql STABLE;");
+    defer stable_function.deinit(alloc);
+    const stable_function_plan = switch (stable_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineVolatility.stable, stable_function_plan.volatility.?);
+    const stable_function_fingerprint = try ddlFingerprintAlloc(alloc, stable_function);
+    defer alloc.free(stable_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=stable_audit:args=0:replace=false:returns=trigger:language=plpgsql:volatility=stable", stable_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, stable_function));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql STABLE;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -56770,31 +56788,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 ),
         },
         .function_catalog => |plan| switch (plan) {
-            .create => |create| if (create.language) |language|
-                try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:create_{s}:name={s}:args={d}:replace={}:returns={s}:language={s}",
-                    .{
-                        routineKindName(create.kind),
-                        create.routine_name,
-                        create.argument_count,
-                        create.replace_existing,
-                        create.returns_type orelse "",
-                        language,
-                    },
-                )
-            else
-                try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:create_{s}:name={s}:args={d}:replace={}:returns={s}",
-                    .{
-                        routineKindName(create.kind),
-                        create.routine_name,
-                        create.argument_count,
-                        create.replace_existing,
-                        create.returns_type orelse "",
-                    },
-                ),
+            .create => |create| try createRoutineFingerprintAlloc(alloc, create),
             .drop => |drop| if (drop.cascade)
                 try std.fmt.allocPrint(
                     alloc,
@@ -57472,6 +57466,50 @@ fn routineKindName(kind: RoutineKind) []const u8 {
         .function => "function",
         .procedure => "procedure",
     };
+}
+
+fn routineVolatilityName(volatility: RoutineVolatility) []const u8 {
+    return switch (volatility) {
+        .immutable => "immutable",
+        .stable => "stable",
+        .@"volatile" => "volatile",
+    };
+}
+
+fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutinePlan) ![]u8 {
+    const base = if (create.language) |language|
+        try std.fmt.allocPrint(
+            alloc,
+            "ddl:create_{s}:name={s}:args={d}:replace={}:returns={s}:language={s}",
+            .{
+                routineKindName(create.kind),
+                create.routine_name,
+                create.argument_count,
+                create.replace_existing,
+                create.returns_type orelse "",
+                language,
+            },
+        )
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "ddl:create_{s}:name={s}:args={d}:replace={}:returns={s}",
+            .{
+                routineKindName(create.kind),
+                create.routine_name,
+                create.argument_count,
+                create.replace_existing,
+                create.returns_type orelse "",
+            },
+        );
+    errdefer alloc.free(base);
+    const volatility = create.volatility orelse return base;
+    defer alloc.free(base);
+    return try std.fmt.allocPrint(
+        alloc,
+        "{s}:volatility={s}",
+        .{ base, routineVolatilityName(volatility) },
+    );
 }
 
 fn bulkIoDirectionName(direction: BulkIoDirection) []const u8 {

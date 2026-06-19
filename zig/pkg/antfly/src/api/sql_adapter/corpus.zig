@@ -3912,6 +3912,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_extension_drop_cascade: bool = false,
     ddl_function_create: bool = false,
     ddl_function_replace: bool = false,
+    ddl_function_volatility: bool = false,
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
@@ -5420,7 +5421,7 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_routine_option = self.unsupported_ddl_routine_option or
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
-                    std.mem.indexOf(u8, entry.sql, " STABLE") != null);
+                    std.mem.indexOf(u8, entry.sql, " SECURITY DEFINER") != null);
             self.unsupported_ddl_row_security_policy_expression = self.unsupported_ddl_row_security_policy_expression or
                 (std.mem.eql(u8, entry.classification_reason, "row_security_policy_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE POLICY ") and
@@ -5585,6 +5586,7 @@ pub const AppParityCorpusCoverage = struct {
                 .create_function => {
                     self.ddl_function_create = true;
                     self.ddl_function_replace = self.ddl_function_replace or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
+                    self.ddl_function_volatility = self.ddl_function_volatility or std.mem.indexOf(u8, entry.plan, ":volatility=") != null;
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;
@@ -6559,6 +6561,7 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_extension_drop_cascade);
         try std.testing.expect(self.ddl_function_create);
         try std.testing.expect(self.ddl_function_replace);
+        try std.testing.expect(self.ddl_function_volatility);
         try std.testing.expect(self.ddl_function_drop);
         try std.testing.expect(self.ddl_function_drop_cascade);
         try std.testing.expect(self.ddl_procedure_create);

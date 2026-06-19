@@ -405,6 +405,7 @@ pub const CreateRoutineSyntax = struct {
     argument_count: usize = 0,
     returns_type: ?[]const u8 = null,
     language: ?[]const u8 = null,
+    volatility: ?ddl_plan.RoutineVolatility = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.routine_name));
@@ -2506,6 +2507,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     errdefer if (returns_type) |value| alloc.free(@constCast(value));
     var language: ?[]const u8 = null;
     errdefer if (language) |value| alloc.free(@constCast(value));
+    var volatility: ?ddl_plan.RoutineVolatility = null;
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
         if (cursor.matchKeyword("returns")) {
             if (kind != .function or returns_type != null) return error.UnsupportedSqlShape;
@@ -2515,6 +2517,21 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         if (cursor.matchKeyword("language")) {
             if (language != null) return error.UnsupportedSqlShape;
             language = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            continue;
+        }
+        if (cursor.matchKeyword("immutable")) {
+            if (volatility != null) return error.UnsupportedSqlShape;
+            volatility = .immutable;
+            continue;
+        }
+        if (cursor.matchKeyword("stable")) {
+            if (volatility != null) return error.UnsupportedSqlShape;
+            volatility = .stable;
+            continue;
+        }
+        if (cursor.matchKeyword("volatile")) {
+            if (volatility != null) return error.UnsupportedSqlShape;
+            volatility = .@"volatile";
             continue;
         }
         return error.UnsupportedSqlShape;
@@ -2528,6 +2545,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         .argument_count = argument_count,
         .returns_type = returns_type,
         .language = language,
+        .volatility = volatility,
     };
     returns_type = null;
     language = null;
@@ -6955,6 +6973,15 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqualStrings("text", create_function.returns_type.?);
     try std.testing.expectEqualStrings("sql", create_function.language.?);
 
+    var stable_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql STABLE;");
+    defer lexer.freeTokens(alloc, &stable_function_tokens);
+    var stable_function_pos: usize = 0;
+    var stable_function = try parseCreateRoutineCatalogTailAlloc(alloc, stable_function_tokens.items, &stable_function_pos);
+    defer stable_function.deinit(alloc);
+    try std.testing.expectEqual(stable_function_tokens.items.len, stable_function_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.function, stable_function.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineVolatility.stable, stable_function.volatility.?);
+
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);
     var create_procedure_pos: usize = 0;
@@ -7000,7 +7027,7 @@ test "sql adapter grammar parses routine catalog tails" {
     var body_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, body_tokens.items, &body_pos));
 
-    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql STABLE;");
+    var option_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SECURITY DEFINER;");
     defer lexer.freeTokens(alloc, &option_tokens);
     var option_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, option_tokens.items, &option_pos));

@@ -5011,20 +5011,21 @@ parity corpus requires them to fail closed under `bulk_io_plan`.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,
-language, and drop dependency metadata such as `CASCADE`, then fails closed when
-applied to table schema or runtime storage. Routine lifecycle tails parse in
+language, optional volatility (`IMMUTABLE`, `STABLE`, or `VOLATILE`), and drop
+dependency metadata such as `CASCADE`, then fails closed when applied to table
+schema or runtime storage. Routine lifecycle tails parse in
 `api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper
 definition uses that same typed routine-catalog boundary; the native behavior
 still lives in table-owned update-policy metadata created by `CREATE TRIGGER`.
-Routine bodies and richer routine options remain unsupported and are pinned in
-the source parity corpus under `routine_body_plan` and `routine_option_plan`
-until there is a native mutation-hook/catalog contract: deterministic hook
-identity, declared row inputs and outputs, allowed side effects, dependency
-tracking, schema promotion, authorization hooks, replay behavior, and
-repair/rebuild semantics. Storage should never execute or persist opaque
-PL/pgSQL bodies as part of the relational model.
+Routine bodies and non-volatility routine options remain unsupported and are
+pinned in the source parity corpus under `routine_body_plan` and
+`routine_option_plan` until there is a native mutation-hook/catalog contract:
+deterministic hook identity, declared row inputs and outputs, allowed side
+effects, dependency tracking, schema promotion, authorization hooks, replay
+behavior, and repair/rebuild semantics. Storage should never execute or persist
+opaque PL/pgSQL bodies as part of the relational model.
 
 | 0a. SQL table-reference normalization | Keep SQL table-reference sugar out of storage and typed request contracts. | Golden corpus entries now pin `ONLY` as an adapter-only no-op for index targets, single-table reads, inserts, point deletes, claimed mutation sources, truncate, and joined mutation sources, including `public.`-qualified table names. | Table-reference spelling changes produce the same Antfly typed plan or fail closed before storage. |
 | 1. Shared expression spine | Replace shape-specific predicate/projection/update/index cases with one bound expression AST over fields, literals, parameters, casts, deterministic functions, boolean ops, arithmetic, null semantics, JSON, and arrays. | Existing row queries, JSONB/array predicates, order keys, aggregate filters, conflict updates, and `RETURNING` use typed expression nodes, and those nodes now live in the shared storage schema layer instead of the db request module so schema/catalog features can adopt the same type without depending on row execution internals. Generated columns and checks still have narrower typed metadata today. | The same AST is used for `WHERE`, projections, checks, generated columns, expression indexes, partial predicates, `ON CONFLICT` actions, update transforms, aggregate filters, order keys, and `RETURNING`; pushdown is derived from the AST rather than hand-coded parser cases. |
