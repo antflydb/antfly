@@ -257,8 +257,10 @@ Current status:
   logical key while laying out values by record kind: posting bases first,
   centroid-directory values next, and delta tails last. That preserves
   binary-search lookup and makes base-batch prefetch plus centroid-directory
-  scans more sequential for file/serverless reads. The runtime batcher also
-  coalesces pending
+  scans more sequential for file/serverless reads. The writer's transient value
+  offset table is stack-backed for common bounded segment flushes, so that
+  layout no longer adds a heap allocation per small segment. The runtime
+  batcher also coalesces pending
   posting-base and centroid-directory point records so a publish window keeps
   only the latest point value while the immutable segment writer continues to
   reject duplicate exact keys; identical pending point replacements now keep the

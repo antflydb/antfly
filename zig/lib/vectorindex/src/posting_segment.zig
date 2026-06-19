@@ -43,6 +43,7 @@ const base_data_batch_bulk_read_max_bytes: usize = 1024 * 1024;
 const base_data_batch_bulk_read_max_gap_bytes: usize = 16 * 1024;
 const base_data_batch_unresolved_stack_capacity: usize = 512;
 const base_data_batch_point_read_stack_capacity: usize = 512;
+const writer_value_offsets_stack_capacity: usize = 512;
 const stack_index_max_bytes: usize = 64 * 1024;
 const stack_base_value_range_max_bytes: usize = 64 * 1024;
 const stack_delta_value_range_max_bytes: usize = 64 * 1024;
@@ -2894,8 +2895,13 @@ pub const Writer = struct {
         sortPendingEntriesIfNeeded(self.entries.items);
         try rejectDuplicateEntries(self.entries.items);
 
-        const value_offsets = try self.alloc.alloc(usize, self.entries.items.len);
-        defer self.alloc.free(value_offsets);
+        var value_offsets_stack: [writer_value_offsets_stack_capacity]usize = undefined;
+        const use_value_offsets_stack = self.entries.items.len <= value_offsets_stack.len;
+        const value_offsets = if (use_value_offsets_stack)
+            value_offsets_stack[0..self.entries.items.len]
+        else
+            try self.alloc.alloc(usize, self.entries.items.len);
+        defer if (!use_value_offsets_stack) self.alloc.free(value_offsets);
 
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(self.alloc);
