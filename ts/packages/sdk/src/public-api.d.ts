@@ -7914,9 +7914,10 @@ export interface components {
          *     - full_text_search: Execute full-text BM25 search against an index
          *     - tree_search: Execute tree search with beam search navigation
          *     - graph_search: Execute graph traversal search
+         *     - aggregate: Execute aggregations against an index
          * @enum {string}
          */
-        ChatToolName: "add_filter" | "ask_clarification" | "search" | "websearch" | "fetch" | "semantic_search" | "full_text_search" | "tree_search" | "graph_search";
+        ChatToolName: "add_filter" | "ask_clarification" | "search" | "websearch" | "fetch" | "semantic_search" | "full_text_search" | "tree_search" | "graph_search" | "aggregate";
         /**
          * @description The web search provider to use.
          *
