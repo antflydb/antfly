@@ -382,7 +382,7 @@ fn validateSchemaDefinition(schema_value: std.json.Value) !void {
         if (field_id < 0) return error.InvalidIcebergMetadata;
         _ = try requiredString(field_object, "name");
         _ = try requiredBool(field_object, "required");
-        _ = field_object.get("type") orelse return error.InvalidIcebergMetadata;
+        try validateSupportedTopLevelFieldType(field_object.get("type") orelse return error.InvalidIcebergMetadata);
         for (fields.items[0..idx]) |previous_value| {
             const previous_object = switch (previous_value) {
                 .object => |object| object,
@@ -390,6 +390,25 @@ fn validateSchemaDefinition(schema_value: std.json.Value) !void {
             };
             if ((try requiredI64(previous_object, "id")) == field_id) return error.InvalidIcebergMetadata;
         }
+    }
+}
+
+fn validateSupportedTopLevelFieldType(field_type: std.json.Value) !void {
+    switch (field_type) {
+        .string => |text| {
+            if (text.len == 0) return error.InvalidIcebergMetadata;
+        },
+        .object => |object| {
+            const kind = try requiredString(object, "type");
+            if (std.mem.eql(u8, kind, "struct") or
+                std.mem.eql(u8, kind, "list") or
+                std.mem.eql(u8, kind, "map"))
+            {
+                return error.UnsupportedIcebergSchemaEvolution;
+            }
+            return error.InvalidIcebergMetadata;
+        },
+        else => return error.InvalidIcebergMetadata,
     }
 }
 
@@ -763,6 +782,43 @@ test "iceberg metadata plan rejects missing or malformed schema definitions" {
         alloc,
         "s3://bucket/warehouse/events/metadata/v2.metadata.json",
         duplicate_field,
+        null,
+    ));
+
+    const nested_field =
+        \\{
+        \\  "format-version": 2,
+        \\  "table-uuid": "uuid-events",
+        \\  "location": "s3://bucket/warehouse/events",
+        \\  "current-schema-id": 7,
+        \\  "schemas": [
+        \\    {
+        \\      "schema-id": 7,
+        \\      "fields": [
+        \\        {
+        \\          "id": 1,
+        \\          "name": "payload",
+        \\          "required": false,
+        \\          "type": {
+        \\            "type": "struct",
+        \\            "fields": [
+        \\              {"id": 2, "name": "amount", "required": false, "type": "long"}
+        \\            ]
+        \\          }
+        \\        }
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "current-snapshot-id": 123,
+        \\  "snapshots": [
+        \\    {"snapshot-id": 123, "manifest-list": "s3://bucket/warehouse/events/metadata/snap-123.avro"}
+        \\  ]
+        \\}
+    ;
+    try std.testing.expectError(error.UnsupportedIcebergSchemaEvolution, parseMetadataPlanAlloc(
+        alloc,
+        "s3://bucket/warehouse/events/metadata/v2.metadata.json",
+        nested_field,
         null,
     ));
 }
