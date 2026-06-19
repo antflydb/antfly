@@ -22,7 +22,6 @@ const proto = @import("antfly_vector").proto;
 const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
-const flat_centroid_block_metadata_stack_capacity = 256;
 const flat_centroid_query_probe_stack_capacity = 512;
 const flat_centroid_zero_stack_capacity = 4096;
 const flat_centroid_coarse_scratch_stack_capacity = 8192;
@@ -664,59 +663,53 @@ fn directoryMatches(directory: *const FlatCentroidDirectory, root_node: u64, nod
         directory.publish_generation_snapshot == publish_generation;
 }
 
-fn appendFlatCentroidBlock(
+fn appendFlatCentroidBlockFromEntries(
     self: anytype,
     blocks: *std.ArrayListUnmanaged(FlatCentroidBlock),
-    posting_ids: []const u64,
-    parents: []const u64,
-    levels: []const u16,
-    states: []const types.PostingState,
-    radii: []const f32,
-    centroids: []const f32,
+    entries: []const FlatCentroidEntry,
     dims: usize,
     posting_offset: usize,
 ) !void {
-    if (posting_ids.len == 0) return;
-    std.debug.assert(parents.len == posting_ids.len);
-    std.debug.assert(levels.len == posting_ids.len);
-    std.debug.assert(states.len == posting_ids.len);
-    std.debug.assert(radii.len == posting_ids.len);
+    if (entries.len == 0) return;
     var zero_stack: [flat_centroid_zero_stack_capacity]f32 = undefined;
     const use_zero_stack = dims <= zero_stack.len;
     const zero = if (use_zero_stack) zero_stack[0..dims] else try self.alloc.alloc(f32, dims);
     defer if (!use_zero_stack) self.alloc.free(zero);
     @memset(zero, 0);
 
-    const metadata = try allocFlatCentroidBlockMetadataStorage(self.alloc, posting_ids.len);
+    const metadata = try allocFlatCentroidBlockMetadataStorage(self.alloc, entries.len);
     errdefer self.alloc.free(metadata.storage);
-    @memcpy(metadata.posting_ids, posting_ids);
-    @memcpy(metadata.parents, parents);
-    @memcpy(metadata.levels, levels);
-    @memcpy(metadata.states, states);
+    for (entries, 0..) |entry, i| {
+        std.debug.assert(entry.centroid.len == dims);
+        metadata.posting_ids[i] = entry.posting_id;
+        metadata.parents[i] = entry.parent;
+        metadata.levels[i] = entry.level;
+        metadata.states[i] = entry.state;
+    }
 
-    const vectors = try allocFlatCentroidBlockVectorStorage(self.alloc, posting_ids.len, dims);
+    const vectors = try allocFlatCentroidBlockVectorStorage(self.alloc, entries.len, dims);
     errdefer self.alloc.free(vectors.storage);
-    @memcpy(vectors.radii, radii);
-    @memcpy(vectors.centroids, centroids);
-    for (0..posting_ids.len) |i| {
+    for (entries, 0..) |entry, i| {
+        vectors.radii[i] = entry.bounds_radius;
+        @memcpy(vectors.centroids[i * dims ..][0..dims], entry.centroid[0..dims]);
         const centroid = vectors.centroids[i * dims ..][0..dims];
         vectors.centroid_measures[i] = vec.vectorMeasureForMetric(centroid, self.config.metric);
     }
     @memset(vectors.centroid, 0);
-    for (0..posting_ids.len) |i| {
+    for (0..entries.len) |i| {
         const centroid = vectors.centroids[i * dims ..][0..dims];
         vec.add(vectors.centroid, centroid);
     }
-    vec.scale(1.0 / @as(f32, @floatFromInt(posting_ids.len)), vectors.centroid);
+    vec.scale(1.0 / @as(f32, @floatFromInt(entries.len)), vectors.centroid);
     if (self.config.metric == .cosine and vectors.centroid.len > 0) {
         _ = vec.normalize(vectors.centroid);
     }
     var block_radius: f32 = 0;
-    for (0..posting_ids.len) |i| {
+    for (0..entries.len) |i| {
         const centroid = vectors.centroids[i * dims ..][0..dims];
         block_radius = @max(block_radius, vec.distance(vectors.centroid, centroid, self.config.metric) + vectors.radii[i]);
     }
-    var quantized = try self.quantizer.quantize(zero, vectors.centroids, posting_ids.len);
+    var quantized = try self.quantizer.quantize(zero, vectors.centroids, entries.len);
     errdefer quantized.deinit(self.alloc);
     try blocks.append(self.alloc, .{
         .metadata_storage = metadata.storage,
@@ -866,46 +859,17 @@ fn appendFlatCentroidBlocksFromEntries(
         std.mem.sort(FlatCentroidEntry, entries.items, FlatCentroidEntrySortContext{ .dim = sort_dim }, flatCentroidEntryLess);
     }
 
-    var posting_ids_stack: [flat_centroid_block_metadata_stack_capacity]u64 = undefined;
-    var parents_stack: [flat_centroid_block_metadata_stack_capacity]u64 = undefined;
-    var levels_stack: [flat_centroid_block_metadata_stack_capacity]u16 = undefined;
-    var states_stack: [flat_centroid_block_metadata_stack_capacity]types.PostingState = undefined;
-    var radii_stack: [flat_centroid_block_metadata_stack_capacity]f32 = undefined;
-    const use_metadata_stack = block_size <= flat_centroid_block_metadata_stack_capacity;
-    var posting_ids = if (use_metadata_stack) posting_ids_stack[0..block_size] else try self.alloc.alloc(u64, block_size);
-    defer if (!use_metadata_stack) self.alloc.free(posting_ids);
-    var parents = if (use_metadata_stack) parents_stack[0..block_size] else try self.alloc.alloc(u64, block_size);
-    defer if (!use_metadata_stack) self.alloc.free(parents);
-    var levels = if (use_metadata_stack) levels_stack[0..block_size] else try self.alloc.alloc(u16, block_size);
-    defer if (!use_metadata_stack) self.alloc.free(levels);
-    var states = if (use_metadata_stack) states_stack[0..block_size] else try self.alloc.alloc(types.PostingState, block_size);
-    defer if (!use_metadata_stack) self.alloc.free(states);
-    var radii = if (use_metadata_stack) radii_stack[0..block_size] else try self.alloc.alloc(f32, block_size);
-    defer if (!use_metadata_stack) self.alloc.free(radii);
-    var centroids = try self.alloc.alloc(f32, block_size * dims);
-    defer self.alloc.free(centroids);
-
-    var block_count: usize = 0;
+    const effective_block_size = @max(block_size, 1);
     var posting_offset: usize = 0;
-    for (entries.items) |*entry| {
-        posting_ids[block_count] = entry.posting_id;
-        parents[block_count] = entry.parent;
-        levels[block_count] = entry.level;
-        states[block_count] = entry.state;
-        radii[block_count] = entry.bounds_radius;
-        @memcpy(centroids[block_count * dims ..][0..dims], entry.centroid[0..dims]);
-        self.alloc.free(entry.centroid);
-        entry.centroid = &.{};
-        block_count += 1;
-
-        if (block_count == block_size) {
-            try appendFlatCentroidBlock(self, blocks, posting_ids[0..block_count], parents[0..block_count], levels[0..block_count], states[0..block_count], radii[0..block_count], centroids[0 .. block_count * dims], dims, posting_offset);
-            posting_offset += block_count;
-            block_count = 0;
+    while (posting_offset < entries.items.len) {
+        const block_end = @min(posting_offset + effective_block_size, entries.items.len);
+        const block_entries = entries.items[posting_offset..block_end];
+        try appendFlatCentroidBlockFromEntries(self, blocks, block_entries, dims, posting_offset);
+        for (block_entries) |*entry| {
+            self.alloc.free(entry.centroid);
+            entry.centroid = &.{};
         }
-    }
-    if (block_count > 0) {
-        try appendFlatCentroidBlock(self, blocks, posting_ids[0..block_count], parents[0..block_count], levels[0..block_count], states[0..block_count], radii[0..block_count], centroids[0 .. block_count * dims], dims, posting_offset);
+        posting_offset = block_end;
     }
     deinitFlatCentroidEntries(self.alloc, entries);
     return posting_count;

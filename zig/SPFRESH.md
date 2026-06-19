@@ -863,7 +863,8 @@ implementations cleanly:
    changing eviction behavior.
    Flat/two-level centroid-directory blocks now slab posting metadata arrays
    and f32 centroid/radius/measure arrays into two backing allocations per
-   block, reducing retained directory allocation count as posting count grows.
+   block, and directory construction fills those slabs directly from sorted
+   entries instead of first copying through block-sized scratch arrays.
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed
