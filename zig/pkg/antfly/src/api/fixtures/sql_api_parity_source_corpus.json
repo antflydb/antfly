@@ -3328,6 +3328,17 @@
       "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)"
     },
     {
+      "name": "create domain default not null catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_domain",
+        "table_name": "status_text",
+        "predicates": 0
+      },
+      "plan": "ddl:create_domain:domain=status_text:type=keyword:checks=0:not_null=true:default=true",
+      "sql": "CREATE DOMAIN status_text AS text DEFAULT 'queued' NOT NULL"
+    },
+    {
       "name": "alter domain catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3347,6 +3358,16 @@
       },
       "plan": "ddl:drop_domain:domain=positive_amount:if_exists=false",
       "sql": "DROP DOMAIN positive_amount"
+    },
+    {
+      "name": "drop domain cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_domain",
+        "table_name": "positive_amount"
+      },
+      "plan": "ddl:drop_domain:domain=positive_amount:if_exists=true:cascade=true",
+      "sql": "DROP DOMAIN IF EXISTS positive_amount CASCADE"
     },
     {
       "name": "create sequence catalog ddl",

@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "25cdf0ed89effa4891da6ff0d9ed0928ec42d294f5a3079d7d40e43aec98b811",
-  "source_entry_count": 926,
-  "entry_count": 926,
+  "source_sha256": "bffa198b57bbd8e3b08dec3aa41084ae2159eaaa224366f44371f42f7938088e",
+  "source_entry_count": 928,
+  "entry_count": 928,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -2919,6 +2919,17 @@
       "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)"
     },
     {
+      "name": "create domain default not null catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_domain",
+        "table_name": "status_text",
+        "predicates": 0
+      },
+      "plan": "ddl:create_domain:domain=status_text:type=keyword:checks=0:not_null=true:default=true",
+      "sql": "CREATE DOMAIN status_text AS text DEFAULT 'queued' NOT NULL"
+    },
+    {
       "name": "alter domain catalog ddl",
       "family": "ddl",
       "summary": {
@@ -2938,6 +2949,16 @@
       },
       "plan": "ddl:drop_domain:domain=positive_amount:if_exists=false",
       "sql": "DROP DOMAIN positive_amount"
+    },
+    {
+      "name": "drop domain cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_domain",
+        "table_name": "positive_amount"
+      },
+      "plan": "ddl:drop_domain:domain=positive_amount:if_exists=true:cascade=true",
+      "sql": "DROP DOMAIN IF EXISTS positive_amount CASCADE"
     },
     {
       "name": "create sequence catalog ddl",

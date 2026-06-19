@@ -1217,7 +1217,8 @@ enum-type catalog grammar for `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD
 VALUE`, and `DROP TYPE`, including idempotent positioned enum additions and drop
 dependency metadata,
 domain catalog grammar for `CREATE DOMAIN ... AS`, `ALTER DOMAIN`, and
-`DROP DOMAIN`,
+`DROP DOMAIN`, including default/not-null/check metadata and drop dependency
+metadata,
 comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
 `COMMENT ON INDEX`, and `COMMENT ON CONSTRAINT`,
 drop-catalog grammar for `DROP TABLE`, `DROP TABLE IF EXISTS`, `DROP INDEX`,

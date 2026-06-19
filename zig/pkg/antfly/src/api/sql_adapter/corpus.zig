@@ -3878,8 +3878,11 @@ pub const AppParityCorpusCoverage = struct {
     ddl_enum_type_drop: bool = false,
     ddl_enum_type_drop_cascade: bool = false,
     ddl_domain_create: bool = false,
+    ddl_domain_create_default: bool = false,
+    ddl_domain_create_not_null: bool = false,
     ddl_domain_alter: bool = false,
     ddl_domain_drop: bool = false,
+    ddl_domain_drop_cascade: bool = false,
     ddl_sequence_create: bool = false,
     ddl_sequence_create_if_not_exists: bool = false,
     ddl_sequence_create_typed_owned: bool = false,
@@ -5404,9 +5407,16 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_enum_type_drop = true;
                     self.ddl_enum_type_drop_cascade = self.ddl_enum_type_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
                 },
-                .create_domain => self.ddl_domain_create = true,
+                .create_domain => {
+                    self.ddl_domain_create = true;
+                    self.ddl_domain_create_default = self.ddl_domain_create_default or sql_adapter.planHasExactBoolToken(entry.plan, ":default=", true);
+                    self.ddl_domain_create_not_null = self.ddl_domain_create_not_null or sql_adapter.planHasExactBoolToken(entry.plan, ":not_null=", true);
+                },
                 .alter_domain => self.ddl_domain_alter = true,
-                .drop_domain => self.ddl_domain_drop = true,
+                .drop_domain => {
+                    self.ddl_domain_drop = true;
+                    self.ddl_domain_drop_cascade = self.ddl_domain_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
+                },
                 .create_sequence => {
                     self.ddl_sequence_create = true;
                     self.ddl_sequence_create_if_not_exists = self.ddl_sequence_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
@@ -6219,8 +6229,11 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_enum_type_drop);
         try std.testing.expect(self.ddl_enum_type_drop_cascade);
         try std.testing.expect(self.ddl_domain_create);
+        try std.testing.expect(self.ddl_domain_create_default);
+        try std.testing.expect(self.ddl_domain_create_not_null);
         try std.testing.expect(self.ddl_domain_alter);
         try std.testing.expect(self.ddl_domain_drop);
+        try std.testing.expect(self.ddl_domain_drop_cascade);
         try std.testing.expect(self.ddl_sequence_create);
         try std.testing.expect(self.ddl_sequence_create_if_not_exists);
         try std.testing.expect(self.ddl_sequence_create_typed_owned);

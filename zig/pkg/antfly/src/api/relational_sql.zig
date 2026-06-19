@@ -44659,6 +44659,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_domain:domain=positive_amount:type=numeric:checks=1:not_null=false:default=false", create_domain_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_domain));
 
+    var create_default_not_null_domain = try lowerDdlPlanAlloc(alloc, "CREATE DOMAIN status_text AS text DEFAULT 'queued' NOT NULL;");
+    defer create_default_not_null_domain.deinit(alloc);
+    const create_default_not_null_fingerprint = try ddlFingerprintAlloc(alloc, create_default_not_null_domain);
+    defer alloc.free(create_default_not_null_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_domain:domain=status_text:type=keyword:checks=0:not_null=true:default=true", create_default_not_null_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_default_not_null_domain));
+
     var alter_domain = try lowerDdlPlanAlloc(alloc, "ALTER DOMAIN positive_amount SET NOT NULL;");
     defer alter_domain.deinit(alloc);
     const alter_domain_plan = switch (alter_domain) {
