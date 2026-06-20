@@ -126,6 +126,11 @@ The library API should be small and boring:
 The C ABI should be the long-term stable boundary. Native Zig, Go, Rust,
 Python, Node, and Java bindings can layer on top of it.
 
+The C ABI should expose a single Lite status JSON call that mirrors
+`antfly lite status`: storage identity, DB stats, pending work, and capability
+flags. Bindings should not have to reconstruct Lite status by combining several
+lower-level calls differently in each language.
+
 ### File Format
 
 Antfly Lite v1 should use `.aflite` as the live database format. Users should

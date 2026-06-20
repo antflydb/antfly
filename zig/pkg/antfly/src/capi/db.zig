@@ -497,6 +497,16 @@ const JsonDBStats = struct {
     term_doc_freq_cache_misses: u64,
 };
 
+const JsonLiteStorageStatus = struct {
+    format: []const u8 = "aflite",
+    engine: []const u8,
+    format_version: ?u32 = null,
+    page_size: ?u32 = null,
+    active_checkpoint: ?u8 = null,
+    checkpoint_sequence: ?u64 = null,
+    page_count: ?u64 = null,
+};
+
 const JsonDBIndexStats = struct {
     name: []const u8,
     kind: []const u8,
@@ -1637,6 +1647,29 @@ pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *c
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     out_buf.* = stringifyJson(lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native)) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
+
+    const storage_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(liteStorageStatus(backend), .{})}) catch return .internal;
+    defer handle.alloc.free(storage_json);
+    const stats_json = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
+    defer handle.alloc.free(stats_json);
+    const pending_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(handle.db.pendingWorkStats(), .{})}) catch return .internal;
+    defer handle.alloc.free(pending_json);
+    const capabilities_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native), .{})}) catch return .internal;
+    defer handle.alloc.free(capabilities_json);
+
+    const bytes = std.fmt.allocPrint(handle.alloc, "{{\"storage\":{s},\"stats\":{s},\"pending_work\":{s},\"capabilities\":{s}}}", .{
+        storage_json,
+        stats_json,
+        pending_json,
+        capabilities_json,
+    }) catch return .internal;
+    out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
 
@@ -3004,10 +3037,16 @@ pub export fn antfly_db_stats_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const stats = handle.db.stats(handle.alloc) catch |err| return capi.mapError(err);
+    const bytes = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
+    out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
+    const stats = try handle.db.stats(handle.alloc);
     defer db_mod.types.freeDBStats(handle.alloc, stats);
 
-    var indexes = handle.alloc.alloc(JsonDBIndexStats, stats.indexes.len) catch return .internal;
+    var indexes = try handle.alloc.alloc(JsonDBIndexStats, stats.indexes.len);
     defer if (indexes.len > 0) handle.alloc.free(indexes);
     for (stats.indexes, 0..) |item, i| {
         indexes[i] = .{
@@ -3020,7 +3059,7 @@ pub export fn antfly_db_stats_json(
         };
     }
 
-    out_buf.* = stringifyJson(JsonDBStats{
+    const json = try std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(JsonDBStats{
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
@@ -3102,8 +3141,29 @@ pub export fn antfly_db_stats_json(
         },
         .term_doc_freq_cache_hits = stats.term_doc_freq_cache_hits,
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
-    }) catch return .internal;
-    return .ok;
+    }, .{})});
+    return json;
+}
+
+fn liteStorageStatus(backend: *lite_backend.Handle) JsonLiteStorageStatus {
+    return switch (backend.engine) {
+        .native_single_file => blk: {
+            const file = &backend.native_docstore.?.file;
+            const checkpoint = file.activeCheckpoint();
+            break :blk .{
+                .engine = @tagName(backend.engine),
+                .format_version = lite_backend.native.format_version,
+                .page_size = file.header.page_size,
+                .active_checkpoint = file.header.active_checkpoint,
+                .checkpoint_sequence = checkpoint.commit_sequence,
+                .page_count = checkpoint.page_count,
+            };
+        },
+        .bridge_lsm_container => .{
+            .format = "aflite-internal",
+            .engine = @tagName(backend.engine),
+        },
+    };
 }
 
 pub export fn antfly_db_search_json(
@@ -5819,10 +5879,24 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_close(plain_handle);
     var invalid_caps: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(plain_handle, &invalid_caps));
+    var invalid_status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(plain_handle, &invalid_status));
 
     var src_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
     defer antfly_db_close(src_handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(src_handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"storage\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format\":\"aflite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"engine\":\"native_single_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
 
     var capabilities: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(src_handle, &capabilities));
