@@ -1787,6 +1787,7 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
         .storage = backend.storageStatus(),
         .stats = jsonDBStatsProjection(stats, indexes),
         .pending_work = handle.db.pendingWorkStats(),
+        .inference = lite_backend.inferenceStatusForProfile(handle.lite_profile orelse .native),
         .capabilities = lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native),
     };
 
@@ -6107,6 +6108,12 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format_version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"remote_provider_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_runtime_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_runtime_available\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
     antfly_buffer_free_zero(&status);
     try std.testing.expect(status.ptr == null);

@@ -58,6 +58,11 @@ The status output includes the live format and engine:
     "format": "aflite",
     "engine": "native_single_file",
     "format_version": 1
+  },
+  "inference": {
+    "mode": "caller_supplied_or_disabled",
+    "configured": false,
+    "no_inference_configured_ok": true
   }
 }
 ```
@@ -172,6 +177,11 @@ antfly lite status app.aflite
 The capabilities block reports fields such as `inference_mode`,
 `no_inference_configured_ok`, `caller_supplied_artifacts`, and
 `local_inference_runtime`.
+
+The status output also includes an `inference` block. A fresh Lite database
+reports `configured: false` with `no_inference_configured_ok: true`; this means
+caller-supplied artifacts and deferred enrichment are valid, not that the
+database is unhealthy.
 
 Use `antfly lite run-until-idle app.aflite` after writes when you want the CLI
 to drain available local maintenance work before querying or backing up.

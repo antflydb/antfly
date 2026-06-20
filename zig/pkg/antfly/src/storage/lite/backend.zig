@@ -67,6 +67,16 @@ pub const Capabilities = struct {
     object_storage_primary: bool = false,
 };
 
+pub const InferenceStatus = struct {
+    mode: []const u8 = "caller_supplied_or_disabled",
+    configured: bool = false,
+    remote_provider_configured: bool = false,
+    local_runtime_configured: bool = false,
+    local_runtime_available: bool = false,
+    caller_supplied_artifacts: bool = true,
+    no_inference_configured_ok: bool = true,
+};
+
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
     const freestanding = builtin.os.tag == .freestanding;
     const hosted = profile == .hosted;
@@ -98,6 +108,19 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
         .server_side_autoscaling = false,
         .kubernetes_operator = false,
         .object_storage_primary = false,
+    };
+}
+
+pub fn inferenceStatusForProfile(profile: Profile) InferenceStatus {
+    const caps = capabilitiesForProfile(profile);
+    return .{
+        .mode = caps.inference_mode,
+        .configured = false,
+        .remote_provider_configured = false,
+        .local_runtime_configured = false,
+        .local_runtime_available = caps.local_inference_runtime,
+        .caller_supplied_artifacts = caps.caller_supplied_artifacts,
+        .no_inference_configured_ok = caps.no_inference_configured_ok,
     };
 }
 
@@ -142,6 +165,7 @@ pub fn Status(comptime Stats: type) type {
         storage: StorageStatus,
         stats: Stats,
         pending_work: db_core.PendingWorkStats,
+        inference: InferenceStatus,
         capabilities: Capabilities,
 
         pub fn deinit(self: *@This(), allocator: Allocator) void {
@@ -281,6 +305,7 @@ pub const Handle = struct {
             .storage = self.storageStatus(),
             .stats = stats_value,
             .pending_work = db.pendingWorkStats(),
+            .inference = inferenceStatusForProfile(profile),
             .capabilities = capabilitiesForProfile(profile),
         };
     }
@@ -508,6 +533,38 @@ test "lite backend capabilities contract is stable" {
     });
     defer allocator.free(expected_hosted);
     try std.testing.expectEqualStrings(expected_hosted, hosted_json);
+}
+
+test "lite backend inference status reports disabled as clean state" {
+    const expected_fields = [_][]const u8{
+        "mode",
+        "configured",
+        "remote_provider_configured",
+        "local_runtime_configured",
+        "local_runtime_available",
+        "caller_supplied_artifacts",
+        "no_inference_configured_ok",
+    };
+
+    const fields = @typeInfo(InferenceStatus).@"struct".fields;
+    try std.testing.expectEqual(expected_fields.len, fields.len);
+    inline for (fields, 0..) |field, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    }
+
+    const status = inferenceStatusForProfile(.native);
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", status.mode);
+    try std.testing.expect(!status.configured);
+    try std.testing.expect(!status.remote_provider_configured);
+    try std.testing.expect(!status.local_runtime_configured);
+    try std.testing.expect(!status.local_runtime_available);
+    try std.testing.expect(status.caller_supplied_artifacts);
+    try std.testing.expect(status.no_inference_configured_ok);
+
+    const hosted = inferenceStatusForProfile(.hosted);
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", hosted.mode);
+    try std.testing.expect(!hosted.configured);
+    try std.testing.expect(hosted.no_inference_configured_ok);
 }
 
 test "lite backend native engine creates and checks aflite file" {

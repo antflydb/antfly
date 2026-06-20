@@ -2026,6 +2026,12 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"checkpoint_sequence\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"pending_work\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"inference\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"remote_provider_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"local_runtime_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"local_runtime_available\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"manual_maintenance\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"background_enrichment_runtime\":true") != null);
