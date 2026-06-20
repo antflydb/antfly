@@ -146,6 +146,16 @@ pub const LockMode = enum {
     reader,
 };
 
+pub const OpenOptions = struct {
+    read_only: bool = false,
+    no_sync: bool = false,
+};
+
+pub const CreateOptions = struct {
+    exclusive: bool = false,
+    no_sync: bool = false,
+};
+
 pub const Header = struct {
     page_size: u32 = default_page_size,
     active_checkpoint: u8 = 0,
@@ -204,8 +214,13 @@ pub const NativeFile = struct {
     writer_lock_file: ?std.Io.File = null,
     header: Header,
     read_only: bool = false,
+    no_sync: bool = false,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
+        return try openWithOptions(allocator, path, .{ .read_only = read_only });
+    }
+
+    pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !NativeFile {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         errdefer io_impl.deinit();
         const io = io_impl.io();
@@ -214,12 +229,12 @@ pub const NativeFile = struct {
         errdefer allocator.free(owned_path);
 
         var writer_lock_file: ?std.Io.File = null;
-        if (!read_only) {
+        if (!opts.read_only) {
             writer_lock_file = try acquireWriterLock(allocator, io, path);
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
-        const file = try openDataFile(io, path, if (read_only) .reader else .writer);
+        const file = try openDataFile(io, path, if (opts.read_only) .reader else .writer);
         errdefer file.close(io);
 
         var header_bytes: [header_size]u8 = undefined;
@@ -235,19 +250,24 @@ pub const NativeFile = struct {
             .file = file,
             .writer_lock_file = writer_lock_file,
             .header = header,
-            .read_only = read_only,
+            .read_only = opts.read_only,
+            .no_sync = opts.no_sync,
         };
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, false);
+        return try createWithMode(allocator, path, false, false);
     }
 
     pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, true);
+        return try createWithMode(allocator, path, true, false);
     }
 
-    fn createWithMode(allocator: Allocator, path: []const u8, exclusive: bool) !NativeFile {
+    pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync);
+    }
+
+    fn createWithMode(allocator: Allocator, path: []const u8, exclusive: bool, no_sync: bool) !NativeFile {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         errdefer io_impl.deinit();
         const io = io_impl.io();
@@ -268,7 +288,7 @@ pub const NativeFile = struct {
         errdefer file.close(io);
 
         try file.writePositionalAll(io, &encoded, 0);
-        try file.sync(io);
+        if (!no_sync) try file.sync(io);
 
         return .{
             .allocator = allocator,
@@ -278,6 +298,7 @@ pub const NativeFile = struct {
             .writer_lock_file = writer_lock_file,
             .header = .{},
             .read_only = false,
+            .no_sync = no_sync,
         };
     }
 
@@ -361,7 +382,7 @@ pub const NativeFile = struct {
         const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
         defer self.allocator.free(free_pages);
         try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
-        try self.file.sync(self.io_impl.io());
+        try self.syncIfRequired();
 
         try self.publishCheckpoint(next);
         return page_id;
@@ -451,7 +472,7 @@ pub const NativeFile = struct {
         const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
         defer self.allocator.free(free_pages);
         try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
-        try self.file.sync(self.io_impl.io());
+        try self.syncIfRequired();
 
         try self.publishCheckpoint(next);
     }
@@ -601,7 +622,7 @@ pub const NativeFile = struct {
         const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
         defer self.allocator.free(free_pages);
         try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
-        try self.file.sync(self.io_impl.io());
+        try self.syncIfRequired();
 
         try self.publishCheckpoint(next);
     }
@@ -789,7 +810,7 @@ pub const NativeFile = struct {
         encodeHeader(&encoded_header, compact_header);
         @memcpy(image.items[0..header_size], &encoded_header);
 
-        try rewriteOpenFile(self.file, self.io_impl.io(), image.items);
+        try rewriteOpenFile(self.file, self.io_impl.io(), image.items, self.no_sync);
         self.header = compact_header;
 
         const after_size: u64 = @intCast(image.items.len);
@@ -1235,13 +1256,17 @@ pub const NativeFile = struct {
         encodeCheckpointSlot(&encoded_slot, checkpoint);
 
         try self.file.writePositionalAll(self.io_impl.io(), &encoded_slot, checkpointOffset(next_slot));
-        try self.file.sync(self.io_impl.io());
+        try self.syncIfRequired();
         const active_checkpoint: [1]u8 = .{next_slot};
         try self.file.writePositionalAll(self.io_impl.io(), &active_checkpoint, active_checkpoint_offset);
-        try self.file.sync(self.io_impl.io());
+        try self.syncIfRequired();
 
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
+    }
+
+    fn syncIfRequired(self: *NativeFile) !void {
+        if (!self.no_sync) try self.file.sync(self.io_impl.io());
     }
 };
 
@@ -1322,11 +1347,11 @@ fn setCatalogRootPage(slot: *CheckpointSlot, root: CatalogRoot, page_id: u64) vo
     }
 }
 
-fn rewriteOpenFile(file: std.Io.File, io: std.Io, contents: []const u8) !void {
+fn rewriteOpenFile(file: std.Io.File, io: std.Io, contents: []const u8, no_sync: bool) !void {
     try file.setLength(io, 0);
     try file.writePositionalAll(io, contents, 0);
     try file.setLength(io, contents.len);
-    try file.sync(io);
+    if (!no_sync) try file.sync(io);
 }
 
 pub fn create(io: std.Io, path: []const u8) !void {
@@ -2083,6 +2108,36 @@ test "lite native create writes inspectable aflite file" {
     try std.testing.expectEqual(@as(u8, 0), report.active_checkpoint);
     try std.testing.expectEqual(@as(u64, 0), report.commit_sequence);
     try std.testing.expectEqual(@as(u64, 1), report.page_count);
+}
+
+test "lite native open options propagate no_sync to file writes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-no-sync.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.createWithOptions(allocator, path, .{ .no_sync = true });
+        defer file.close();
+        try std.testing.expect(file.no_sync);
+        try file.putDocument("doc:no-sync", "value");
+    }
+
+    {
+        var reopened = try NativeFile.openWithOptions(allocator, path, .{
+            .read_only = true,
+            .no_sync = true,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.no_sync);
+
+        const value = (try reopened.getDocumentAlloc(allocator, "doc:no-sync")) orelse return error.TestExpectedEqual;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("value", value);
+    }
 }
 
 test "lite native createNew rejects existing aflite without truncating" {

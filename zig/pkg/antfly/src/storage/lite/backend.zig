@@ -119,6 +119,7 @@ pub const EngineSelection = enum {
 pub const OpenOptions = struct {
     engine: EngineSelection = .auto,
     read_only: bool = false,
+    no_sync: bool = false,
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -321,7 +322,10 @@ fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOpti
 }
 
 fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
-    var initial_store = try docstore.Store.open(allocator, path, opts.read_only);
+    var initial_store = try docstore.Store.openWithOptions(allocator, path, .{
+        .read_only = opts.read_only,
+        .no_sync = opts.no_sync,
+    });
     errdefer initial_store.close();
     return try initNativeSingleFile(allocator, &initial_store);
 }
@@ -472,6 +476,41 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expectEqual(report.file_size, vacuumed.before_size);
     try std.testing.expectEqual(report.file_size, vacuumed.after_size);
     try std.testing.expectEqual(@as(u64, 0), vacuumed.reclaimed_bytes);
+}
+
+test "lite backend propagates no_sync to native engine" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-backend-no-sync.aflite");
+    defer allocator.free(path);
+
+    {
+        var handle = try Handle.open(allocator, path, .{
+            .engine = .native_single_file,
+            .no_sync = true,
+        });
+        defer handle.deinit();
+
+        try std.testing.expect(handle.native_docstore.?.file.no_sync);
+        try handle.native_docstore.?.file.putDocument("doc:no-sync", "value");
+    }
+
+    {
+        var handle = try Handle.open(allocator, path, .{
+            .engine = .native_single_file,
+            .read_only = true,
+            .no_sync = true,
+        });
+        defer handle.deinit();
+
+        try std.testing.expect(handle.native_docstore.?.file.no_sync);
+        const value = (try handle.native_docstore.?.file.getDocumentAlloc(allocator, "doc:no-sync")) orelse return error.MissingNativeLiteDocument;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("value", value);
+    }
 }
 
 test "lite backend reports native storage status from active checkpoint" {

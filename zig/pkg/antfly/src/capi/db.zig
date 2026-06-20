@@ -1672,6 +1672,7 @@ fn openLiteHandle(
 
     var backend = lite_backend.Handle.open(alloc, path, .{
         .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
+        .no_sync = resolved.no_sync,
     }) catch |err| return capi.mapError(err);
     errdefer backend.deinit();
 

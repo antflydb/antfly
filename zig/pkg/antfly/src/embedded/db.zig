@@ -82,6 +82,7 @@ pub const DB = struct {
     pub fn openLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         var lite_backend = try support.lite.backend.Handle.open(alloc, path, .{
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
+            .no_sync = opts.no_sync,
         });
         errdefer lite_backend.deinit();
 
@@ -316,6 +317,24 @@ test "embedded db openLite persists documents in aflite file" {
 
         try std.testing.expect(std.mem.indexOf(u8, result.json, "\"lite persisted\"") != null);
     }
+}
+
+test "embedded db openLite propagates no_sync to aflite backend" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite-no-sync.aflite");
+    defer alloc.free(path);
+
+    var db = try DB.openLite(alloc, path, .{
+        .no_sync = true,
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer db.close();
+
+    try std.testing.expect(db.owned_lite_backend.?.native_docstore.?.file.no_sync);
 }
 
 test "embedded db liteStatus exposes storage stats work and capabilities" {

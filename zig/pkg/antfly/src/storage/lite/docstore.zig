@@ -25,6 +25,16 @@ const native = @import("native.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const OpenOptions = struct {
+    read_only: bool = false,
+    no_sync: bool = false,
+};
+
+pub const CreateOptions = struct {
+    exclusive: bool = false,
+    no_sync: bool = false,
+};
+
 pub const Store = struct {
     allocator: Allocator,
     file: native.NativeFile,
@@ -33,13 +43,20 @@ pub const Store = struct {
     writer_active: bool = false,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !Store {
-        const file = native.NativeFile.open(allocator, path, read_only) catch |err| switch (err) {
+        return try openWithOptions(allocator, path, .{ .read_only = read_only });
+    }
+
+    pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !Store {
+        const file = native.NativeFile.openWithOptions(allocator, path, .{
+            .read_only = opts.read_only,
+            .no_sync = opts.no_sync,
+        }) catch |err| switch (err) {
             error.FileNotFound => {
-                if (read_only) return err;
+                if (opts.read_only) return err;
                 return .{
                     .allocator = allocator,
-                    .file = try native.NativeFile.create(allocator, path),
-                    .read_only = read_only,
+                    .file = try native.NativeFile.createWithOptions(allocator, path, .{ .no_sync = opts.no_sync }),
+                    .read_only = opts.read_only,
                 };
             },
             else => return err,
@@ -47,15 +64,19 @@ pub const Store = struct {
         return .{
             .allocator = allocator,
             .file = file,
-            .read_only = read_only,
+            .read_only = opts.read_only,
         };
     }
 
     pub fn create(allocator: Allocator, path: []const u8, exclusive: bool) !Store {
-        const file = if (exclusive)
-            try native.NativeFile.createNew(allocator, path)
-        else
-            try native.NativeFile.create(allocator, path);
+        return try createWithOptions(allocator, path, .{ .exclusive = exclusive });
+    }
+
+    pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !Store {
+        const file = try native.NativeFile.createWithOptions(allocator, path, .{
+            .exclusive = opts.exclusive,
+            .no_sync = opts.no_sync,
+        });
         return .{
             .allocator = allocator,
             .file = file,
