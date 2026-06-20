@@ -2677,6 +2677,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, lite_native_test_mod, true, true);
     const lite_native_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
+        .filters = &.{"storage.lite."},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

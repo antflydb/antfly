@@ -386,6 +386,50 @@ test "lite native index storage handles large files rename and delete tree" {
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/sub/file", 8));
 }
 
+test "lite native index storage aborts atomic writes without publishing partial files" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-index-storage-atomic-abort.aflite");
+    defer allocator.free(path);
+
+    {
+        var docs = try docstore.Store.open(allocator, path, false);
+        defer docs.close();
+        var index_store = Store.init(allocator, &docs);
+        const storage = index_store.storage();
+
+        try storage.writeFileAbsolute("/indexes/ft/stable.tbl", "stable");
+
+        var replace_writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/stable.tbl");
+        try replace_writer.appendSlice("partial replacement");
+        replace_writer.abort();
+
+        const stable = try storage.readFileAlloc(allocator, "/indexes/ft/stable.tbl", 64);
+        defer allocator.free(stable);
+        try std.testing.expectEqualStrings("stable", stable);
+
+        var new_writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/new.tbl");
+        try new_writer.appendSlice("partial new file");
+        new_writer.abort();
+
+        try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/indexes/ft/new.tbl", 64));
+    }
+
+    {
+        var reopened_docs = try docstore.Store.open(allocator, path, true);
+        defer reopened_docs.close();
+        var reopened_index_store = Store.init(allocator, &reopened_docs);
+        const storage = reopened_index_store.storage();
+
+        const stable = try storage.readFileAlloc(allocator, "/indexes/ft/stable.tbl", 64);
+        defer allocator.free(stable);
+        try std.testing.expectEqualStrings("stable", stable);
+        try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/indexes/ft/new.tbl", 64));
+    }
+}
+
 test "lite native index storage participates in native writer reservation" {
     const allocator = std.testing.allocator;
 
