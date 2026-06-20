@@ -951,6 +951,341 @@ pub fn rowExpressionConditionDeterministic(condition: runtime_schema.RelationalR
     return true;
 }
 
+pub fn writeRowExpressionJson(writer: *std.Io.Writer, expression: db_mod.types.RelationalRowsExpression) !void {
+    switch (expression.kind) {
+        .field => {
+            try writer.print("{{\"field\":{f}", .{std.json.fmt(expression.field, .{})});
+            if (expression.field_source != .row) {
+                try writer.print(",\"source\":{f}", .{std.json.fmt(rowExpressionFieldSourceName(expression.field_source), .{})});
+            }
+            try writer.writeByte('}');
+        },
+        .value => {
+            try writer.writeAll("{\"value\":");
+            try writer.writeAll(expression.value_json);
+            try writer.writeByte('}');
+        },
+        .now => {
+            try writer.writeAll("{\"op\":\"now\",\"args\":[]}");
+        },
+        .case => {
+            try writer.writeAll("{\"op\":\"case\",\"cases\":[");
+            for (expression.case_branches, 0..) |branch, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.writeAll("{\"when\":{\"lhs\":");
+                try writeRowExpressionJson(writer, branch.when.lhs);
+                try writer.print(",\"op\":{f}", .{std.json.fmt(rowExpressionConditionOpName(branch.when.op), .{})});
+                if (branch.when.rhs.len == 1) {
+                    try writer.writeAll(",\"rhs\":");
+                    try writeRowExpressionJson(writer, branch.when.rhs[0]);
+                }
+                try writer.writeAll("},\"then\":");
+                try writeRowExpressionJson(writer, branch.then);
+                try writer.writeByte('}');
+            }
+            try writer.writeAll("],\"else\":");
+            if (expression.case_else.len != 1) return error.UnsupportedSqlShape;
+            try writeRowExpressionJson(writer, expression.case_else[0]);
+            try writer.writeByte('}');
+        },
+        .cast => {
+            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
+            const cast_type = expression.cast_type orelse return error.UnsupportedSqlShape;
+            try writer.print("{{\"op\":\"cast\",\"to\":{f},\"args\":[", .{std.json.fmt(rowExpressionCastTypeName(cast_type), .{})});
+            try writeRowExpressionJson(writer, expression.operands[0]);
+            try writer.writeAll("]}");
+        },
+        .json_extract => {
+            if (expression.operands.len != 1 or expression.json_path.len == 0) return error.UnsupportedSqlShape;
+            try writer.writeAll("{\"op\":\"json_extract\",\"args\":[");
+            try writeRowExpressionJson(writer, expression.operands[0]);
+            try writer.print("],\"path\":{f}", .{std.json.fmt(expression.json_path, .{})});
+            if (expression.json_as_text) try writer.writeAll(",\"as_text\":true");
+            try writer.writeByte('}');
+        },
+        else => {
+            try writer.print("{{\"op\":{f},\"args\":[", .{std.json.fmt(rowExpressionOpName(expression.kind), .{})});
+            for (expression.operands, 0..) |operand, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writeRowExpressionJson(writer, operand);
+            }
+            try writer.writeAll("]}");
+        },
+    }
+}
+
+pub fn writeRowExpressionConditionJson(writer: *std.Io.Writer, condition: db_mod.types.RelationalRowsExpressionCondition) !void {
+    try writer.writeAll("{\"lhs\":");
+    try writeRowExpressionJson(writer, condition.lhs);
+    try writer.print(",\"op\":{f}", .{std.json.fmt(rowExpressionConditionOpName(condition.op), .{})});
+    if (condition.rhs.len == 1) {
+        try writer.writeAll(",\"rhs\":");
+        try writeRowExpressionJson(writer, condition.rhs[0]);
+    }
+    try writer.writeByte('}');
+}
+
+pub fn writeRowExpressionPredicateGroupsJson(
+    writer: *std.Io.Writer,
+    field_name: []const u8,
+    groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+) !void {
+    try writer.print("{f}:[", .{std.json.fmt(field_name, .{})});
+    for (groups, 0..) |group, group_i| {
+        if (group_i != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"all\":[");
+        for (group.conditions, 0..) |condition, condition_i| {
+            if (condition_i != 0) try writer.writeByte(',');
+            try writeRowExpressionConditionJson(writer, condition);
+        }
+        try writer.writeAll("]}");
+    }
+    try writer.writeByte(']');
+}
+
+pub fn rowExpressionOpName(kind: db_mod.types.RelationalRowsExpressionKind) []const u8 {
+    return switch (kind) {
+        .field, .value => unreachable,
+        .now => "now",
+        .uuid_v4 => "uuid_v4",
+        .coalesce => "coalesce",
+        .lower => "lower",
+        .upper => "upper",
+        .initcap => "initcap",
+        .trim => "trim",
+        .ltrim => "ltrim",
+        .rtrim => "rtrim",
+        .replace => "replace",
+        .regexp_replace => "regexp_replace",
+        .regexp_substr => "regexp_substr",
+        .regexp_count => "regexp_count",
+        .regexp_instr => "regexp_instr",
+        .translate => "translate",
+        .substring => "substring",
+        .overlay => "overlay",
+        .split_part => "split_part",
+        .strpos => "strpos",
+        .ascii => "ascii",
+        .left => "left",
+        .right => "right",
+        .lpad => "lpad",
+        .rpad => "rpad",
+        .repeat => "repeat",
+        .reverse => "reverse",
+        .md5 => "md5",
+        .starts_with => "starts_with",
+        .ends_with => "ends_with",
+        .chr => "chr",
+        .like => "like",
+        .ilike => "ilike",
+        .regexp_match => "regexp_match",
+        .bool_and => "and",
+        .bool_or => "or",
+        .bool_not => "not",
+        .date_trunc => "date_trunc",
+        .date_bin => "date_bin",
+        .date_part => "date_part",
+        .concat => "concat",
+        .concat_ws => "concat_ws",
+        .length => "length",
+        .octet_length => "octet_length",
+        .bit_length => "bit_length",
+        .nullif => "nullif",
+        .greatest => "greatest",
+        .least => "least",
+        .abs => "abs",
+        .round => "round",
+        .trunc => "trunc",
+        .floor => "floor",
+        .ceil => "ceil",
+        .sqrt => "sqrt",
+        .sign => "sign",
+        .power => "power",
+        .add => "add",
+        .sub => "sub",
+        .mul => "mul",
+        .div => "div",
+        .mod => "mod",
+        .case => unreachable,
+        .cast => unreachable,
+        .json_extract => unreachable,
+        .json_path_exists => "json_path_exists",
+        .json_typeof => "json_typeof",
+        .json_array_length => "json_array_length",
+        .json_build_object => "jsonb_build_object",
+        .to_jsonb => "to_jsonb",
+        .array_length => "array_length",
+        .array_position => "array_position",
+        .array_positions => "array_positions",
+        .array_append => "array_append",
+        .array_prepend => "array_prepend",
+        .array_cat => "array_cat",
+        .array_remove => "array_remove",
+        .array_replace => "array_replace",
+        .array_to_string => "array_to_string",
+        .string_to_array => "string_to_array",
+        .interval_ns => "interval_ns",
+        .interval_months => "interval_months",
+    };
+}
+
+pub fn rowExpressionDefaultOutputName(kind: db_mod.types.RelationalRowsExpressionKind) []const u8 {
+    return switch (kind) {
+        .field => "field",
+        .value => "value",
+        .case => "case",
+        .cast => "cast",
+        .json_extract => "json_extract",
+        .json_typeof => "json_typeof",
+        .json_array_length => "json_array_length",
+        .json_build_object => "jsonb_build_object",
+        .to_jsonb => "to_jsonb",
+        else => rowExpressionOpName(kind),
+    };
+}
+
+pub fn rowExpressionFieldSourceName(source: db_mod.types.RelationalRowsExpressionFieldSource) []const u8 {
+    return switch (source) {
+        .row => "row",
+        .existing => "existing",
+        .proposed => "proposed",
+        .source => "source",
+    };
+}
+
+pub fn rowExpressionCastTypeName(cast_type: db_mod.types.RelationalRowsExpressionCastType) []const u8 {
+    return switch (cast_type) {
+        .text => "text",
+        .numeric => "numeric",
+        .bool => "bool",
+        .datetime => "datetime",
+    };
+}
+
+pub fn rowExpressionConditionOpName(op: runtime_schema.RelationalCheckOp) []const u8 {
+    return switch (op) {
+        .eq => "eq",
+        .ne => "ne",
+        .gt => "gt",
+        .gte => "gte",
+        .lt => "lt",
+        .lte => "lte",
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+        .is_distinct => "is_distinct",
+        .is_not_distinct => "is_not_distinct",
+    };
+}
+
+pub fn writeRelationalCheckAtomsJson(
+    writer: *std.Io.Writer,
+    wrote_atom: *bool,
+    predicates: []const runtime_schema.RelationalCheck,
+) !void {
+    for (predicates) |predicate| {
+        if (wrote_atom.*) try writer.writeByte(',');
+        try writeRelationalCheckAtomJson(writer, predicate);
+        wrote_atom.* = true;
+    }
+}
+
+pub fn writeRelationalCheckAtomJson(writer: *std.Io.Writer, predicate: runtime_schema.RelationalCheck) !void {
+    try writer.print("{{\"field\":{f},\"op\":{f}", .{
+        std.json.fmt(predicate.field, .{}),
+        std.json.fmt(ddl_plan.relationalCheckOpToken(predicate.op), .{}),
+    });
+    if (predicate.value_json) |value_json| {
+        try writer.writeAll(",\"value\":");
+        try writer.writeAll(value_json);
+    }
+    try writer.writeByte('}');
+}
+
+pub fn writeInPredicateAtomsJson(
+    writer: *std.Io.Writer,
+    wrote_atom: *bool,
+    predicates: []const db_mod.types.RelationalRowsInPredicate,
+) !void {
+    for (predicates) |predicate| {
+        if (wrote_atom.*) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"op\":{f},\"value\":", .{
+            std.json.fmt(predicate.field, .{}),
+            std.json.fmt(if (predicate.negated) "not_in" else "in", .{}),
+        });
+        try writer.writeAll(predicate.values_json);
+        try writer.writeByte('}');
+        wrote_atom.* = true;
+    }
+}
+
+pub fn writeTextPatternPredicateAtomsJson(
+    writer: *std.Io.Writer,
+    wrote_atom: *bool,
+    predicates: []const db_mod.types.RelationalRowsTextPatternPredicate,
+) !void {
+    for (predicates) |predicate| {
+        if (wrote_atom.*) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"op\":\"text_pattern\",\"pattern\":{f}", .{
+            std.json.fmt(predicate.field, .{}),
+            std.json.fmt(predicate.pattern, .{}),
+        });
+        if (predicate.case_insensitive) try writer.writeAll(",\"case_insensitive\":true");
+        if (predicate.negated) try writer.writeAll(",\"negated\":true");
+        try writer.writeByte('}');
+        wrote_atom.* = true;
+    }
+}
+
+pub fn writeStructuredValuePredicateAtomsJson(
+    writer: *std.Io.Writer,
+    wrote_atom: *bool,
+    op_name: []const u8,
+    predicates: anytype,
+) !void {
+    for (predicates) |predicate| {
+        if (wrote_atom.*) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"op\":{f},\"value\":", .{
+            std.json.fmt(predicate.field, .{}),
+            std.json.fmt(op_name, .{}),
+        });
+        try writer.writeAll(predicate.value_json);
+        try writer.writeByte('}');
+        wrote_atom.* = true;
+    }
+}
+
+pub fn writeJsonPathEqPredicateAtomsJson(
+    writer: *std.Io.Writer,
+    wrote_atom: *bool,
+    predicates: []const db_mod.types.RelationalRowsJsonPathEqPredicate,
+) !void {
+    for (predicates) |predicate| {
+        if (wrote_atom.*) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"op\":\"json_path_eq\",\"path\":{f},\"value\":", .{
+            std.json.fmt(predicate.field, .{}),
+            std.json.fmt(predicate.path, .{}),
+        });
+        try writer.writeAll(predicate.value_json);
+        try writer.writeByte('}');
+        wrote_atom.* = true;
+    }
+}
+
+pub fn writeJsonPathExistsPredicateAtomsJson(
+    writer: *std.Io.Writer,
+    wrote_atom: *bool,
+    predicates: []const db_mod.types.RelationalRowsJsonPathExistsPredicate,
+) !void {
+    for (predicates) |predicate| {
+        if (wrote_atom.*) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"op\":\"json_path_exists\",\"path\":{f}}}", .{
+            std.json.fmt(predicate.field, .{}),
+            std.json.fmt(predicate.path, .{}),
+        });
+        wrote_atom.* = true;
+    }
+}
+
 pub fn validateCheckExpressionConditionForColumns(
     columns: []const runtime_schema.RelationalColumn,
     condition: runtime_schema.RelationalRowsExpressionCondition,

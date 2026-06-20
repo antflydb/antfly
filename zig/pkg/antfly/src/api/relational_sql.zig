@@ -213,6 +213,8 @@ const relationalPeriodRangeTypeName = sql_adapter.relationalPeriodRangeTypeName;
 const rewriteExpressionConditionFieldsToSource = sql_adapter.rewriteExpressionConditionFieldsToSource;
 const rewriteExpressionFieldsToSource = sql_adapter.rewriteExpressionFieldsToSource;
 const routineKindFromSyntax = sql_adapter.routineKindFromSyntax;
+const rowExpressionDefaultOutputName = sql_adapter.rowExpressionDefaultOutputName;
+const rowExpressionOpName = sql_adapter.rowExpressionOpName;
 const setSqlRowClaimClause = sql_adapter.setSqlRowClaimClause;
 const tableSchemaCatalogExists = sql_adapter.tableSchemaCatalogExists;
 const tableLockModeFromSyntax = sql_adapter.tableLockModeFromSyntax;
@@ -276,6 +278,16 @@ const validateUniquePredicatesForColumns = sql_adapter.validateUniquePredicatesF
 const validateUniquePredicateExpressionsForColumns = sql_adapter.validateUniquePredicateExpressionsForColumns;
 const writeAllFieldValuesObjectJson = sql_adapter.writeAllFieldValuesObjectJson;
 const writeFieldValuesObjectJson = sql_adapter.writeFieldValuesObjectJson;
+const writeInPredicateAtomsJson = sql_adapter.writeInPredicateAtomsJson;
+const writeJsonPathEqPredicateAtomsJson = sql_adapter.writeJsonPathEqPredicateAtomsJson;
+const writeJsonPathExistsPredicateAtomsJson = sql_adapter.writeJsonPathExistsPredicateAtomsJson;
+const writeRelationalCheckAtomJson = sql_adapter.writeRelationalCheckAtomJson;
+const writeRelationalCheckAtomsJson = sql_adapter.writeRelationalCheckAtomsJson;
+const writeRowExpressionConditionJson = sql_adapter.writeRowExpressionConditionJson;
+const writeRowExpressionJson = sql_adapter.writeRowExpressionJson;
+const writeRowExpressionPredicateGroupsJson = sql_adapter.writeRowExpressionPredicateGroupsJson;
+const writeStructuredValuePredicateAtomsJson = sql_adapter.writeStructuredValuePredicateAtomsJson;
+const writeTextPatternPredicateAtomsJson = sql_adapter.writeTextPatternPredicateAtomsJson;
 const ScalarOrCheckBranch = std.ArrayListUnmanaged(runtime_schema.RelationalCheck);
 const AccessPredicateBranch = struct {
     predicates: std.ArrayListUnmanaged(runtime_schema.RelationalCheck) = .empty,
@@ -361,7 +373,9 @@ pub const MergePredicateSide = sql_adapter.MergePredicateSide;
 pub const MergeArmPredicate = sql_adapter.MergeArmPredicate;
 pub const MergeMatchedArm = sql_adapter.MergeMatchedArm;
 pub const MergeNotMatchedArm = sql_adapter.MergeNotMatchedArm;
+pub const MergeExecutionTargetRow = sql_adapter.MergeExecutionTargetRow;
 pub const LoweredMergeMutationPlan = sql_adapter.LoweredMergeMutationPlan;
+pub const buildMergeMutationBatchAlloc = sql_adapter.buildMergeMutationBatchAlloc;
 pub const LoweredWritePlan = sql_adapter.LoweredWritePlan;
 
 pub const LowerWritePlanOptions = sql_adapter.LowerWritePlanOptions;
@@ -1907,7 +1921,7 @@ fn writeMergeReturningProjectionJson(writer: *std.Io.Writer, returning: Returnin
     for (returning.expressions, 0..) |projection, i| {
         if (i != 0) try writer.writeByte(',');
         try writer.print("{{\"as\":{f},\"expr\":", .{std.json.fmt(projection.output, .{})});
-        try Parser.writeRowExpressionJson(writer, projection.expression);
+        try writeRowExpressionJson(writer, projection.expression);
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -18032,7 +18046,7 @@ const Parser = struct {
             .lower, .upper, .md5 => try writer.print(",\"field\":{f}", .{std.json.fmt(expression.field, .{})}),
             .expression => {
                 try writer.writeAll(",\"expression\":");
-                try Parser.writeRowExpressionJson(writer, expression.expression orelse return error.UnsupportedSqlShape);
+                try writeRowExpressionJson(writer, expression.expression orelse return error.UnsupportedSqlShape);
             },
         }
         try writer.writeByte('}');
@@ -22078,232 +22092,6 @@ const Parser = struct {
             try writer.writeByte('}');
         }
         try writer.writeByte(']');
-    }
-
-    fn writeRowExpressionJson(writer: *std.Io.Writer, expression: db_mod.types.RelationalRowsExpression) !void {
-        switch (expression.kind) {
-            .field => {
-                try writer.print("{{\"field\":{f}", .{std.json.fmt(expression.field, .{})});
-                if (expression.field_source != .row) {
-                    try writer.print(",\"source\":{f}", .{std.json.fmt(rowExpressionFieldSourceName(expression.field_source), .{})});
-                }
-                try writer.writeByte('}');
-            },
-            .value => {
-                try writer.writeAll("{\"value\":");
-                try writer.writeAll(expression.value_json);
-                try writer.writeByte('}');
-            },
-            .now => {
-                try writer.writeAll("{\"op\":\"now\",\"args\":[]}");
-            },
-            .case => {
-                try writer.writeAll("{\"op\":\"case\",\"cases\":[");
-                for (expression.case_branches, 0..) |branch, i| {
-                    if (i != 0) try writer.writeByte(',');
-                    try writer.writeAll("{\"when\":{\"lhs\":");
-                    try writeRowExpressionJson(writer, branch.when.lhs);
-                    try writer.print(",\"op\":{f}", .{std.json.fmt(rowExpressionConditionOpName(branch.when.op), .{})});
-                    if (branch.when.rhs.len == 1) {
-                        try writer.writeAll(",\"rhs\":");
-                        try writeRowExpressionJson(writer, branch.when.rhs[0]);
-                    }
-                    try writer.writeAll("},\"then\":");
-                    try writeRowExpressionJson(writer, branch.then);
-                    try writer.writeByte('}');
-                }
-                try writer.writeAll("],\"else\":");
-                if (expression.case_else.len != 1) return error.UnsupportedSqlShape;
-                try writeRowExpressionJson(writer, expression.case_else[0]);
-                try writer.writeByte('}');
-            },
-            .cast => {
-                if (expression.operands.len != 1) return error.UnsupportedSqlShape;
-                const cast_type = expression.cast_type orelse return error.UnsupportedSqlShape;
-                try writer.print("{{\"op\":\"cast\",\"to\":{f},\"args\":[", .{std.json.fmt(rowExpressionCastTypeName(cast_type), .{})});
-                try writeRowExpressionJson(writer, expression.operands[0]);
-                try writer.writeAll("]}");
-            },
-            .json_extract => {
-                if (expression.operands.len != 1 or expression.json_path.len == 0) return error.UnsupportedSqlShape;
-                try writer.writeAll("{\"op\":\"json_extract\",\"args\":[");
-                try writeRowExpressionJson(writer, expression.operands[0]);
-                try writer.print("],\"path\":{f}", .{std.json.fmt(expression.json_path, .{})});
-                if (expression.json_as_text) try writer.writeAll(",\"as_text\":true");
-                try writer.writeByte('}');
-            },
-            else => {
-                try writer.print("{{\"op\":{f},\"args\":[", .{std.json.fmt(rowExpressionOpName(expression.kind), .{})});
-                for (expression.operands, 0..) |operand, i| {
-                    if (i != 0) try writer.writeByte(',');
-                    try writeRowExpressionJson(writer, operand);
-                }
-                try writer.writeAll("]}");
-            },
-        }
-    }
-
-    fn writeRowExpressionConditionJson(writer: *std.Io.Writer, condition: db_mod.types.RelationalRowsExpressionCondition) !void {
-        try writer.writeAll("{\"lhs\":");
-        try writeRowExpressionJson(writer, condition.lhs);
-        try writer.print(",\"op\":{f}", .{std.json.fmt(rowExpressionConditionOpName(condition.op), .{})});
-        if (condition.rhs.len == 1) {
-            try writer.writeAll(",\"rhs\":");
-            try writeRowExpressionJson(writer, condition.rhs[0]);
-        }
-        try writer.writeByte('}');
-    }
-
-    fn writeRowExpressionPredicateGroupsJson(
-        writer: *std.Io.Writer,
-        field_name: []const u8,
-        groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
-    ) !void {
-        try writer.print("{f}:[", .{std.json.fmt(field_name, .{})});
-        for (groups, 0..) |group, group_i| {
-            if (group_i != 0) try writer.writeByte(',');
-            try writer.writeAll("{\"all\":[");
-            for (group.conditions, 0..) |condition, condition_i| {
-                if (condition_i != 0) try writer.writeByte(',');
-                try writeRowExpressionConditionJson(writer, condition);
-            }
-            try writer.writeAll("]}");
-        }
-        try writer.writeByte(']');
-    }
-
-    fn rowExpressionOpName(kind: db_mod.types.RelationalRowsExpressionKind) []const u8 {
-        return switch (kind) {
-            .field, .value => unreachable,
-            .now => "now",
-            .uuid_v4 => "uuid_v4",
-            .coalesce => "coalesce",
-            .lower => "lower",
-            .upper => "upper",
-            .initcap => "initcap",
-            .trim => "trim",
-            .ltrim => "ltrim",
-            .rtrim => "rtrim",
-            .replace => "replace",
-            .regexp_replace => "regexp_replace",
-            .regexp_substr => "regexp_substr",
-            .regexp_count => "regexp_count",
-            .regexp_instr => "regexp_instr",
-            .translate => "translate",
-            .substring => "substring",
-            .overlay => "overlay",
-            .split_part => "split_part",
-            .strpos => "strpos",
-            .ascii => "ascii",
-            .left => "left",
-            .right => "right",
-            .lpad => "lpad",
-            .rpad => "rpad",
-            .repeat => "repeat",
-            .reverse => "reverse",
-            .md5 => "md5",
-            .starts_with => "starts_with",
-            .ends_with => "ends_with",
-            .chr => "chr",
-            .like => "like",
-            .ilike => "ilike",
-            .regexp_match => "regexp_match",
-            .bool_and => "and",
-            .bool_or => "or",
-            .bool_not => "not",
-            .date_trunc => "date_trunc",
-            .date_bin => "date_bin",
-            .date_part => "date_part",
-            .concat => "concat",
-            .concat_ws => "concat_ws",
-            .length => "length",
-            .octet_length => "octet_length",
-            .bit_length => "bit_length",
-            .nullif => "nullif",
-            .greatest => "greatest",
-            .least => "least",
-            .abs => "abs",
-            .round => "round",
-            .trunc => "trunc",
-            .floor => "floor",
-            .ceil => "ceil",
-            .sqrt => "sqrt",
-            .sign => "sign",
-            .power => "power",
-            .add => "add",
-            .sub => "sub",
-            .mul => "mul",
-            .div => "div",
-            .mod => "mod",
-            .case => unreachable,
-            .cast => unreachable,
-            .json_extract => unreachable,
-            .json_path_exists => "json_path_exists",
-            .json_typeof => "json_typeof",
-            .json_array_length => "json_array_length",
-            .json_build_object => "jsonb_build_object",
-            .to_jsonb => "to_jsonb",
-            .array_length => "array_length",
-            .array_position => "array_position",
-            .array_positions => "array_positions",
-            .array_append => "array_append",
-            .array_prepend => "array_prepend",
-            .array_cat => "array_cat",
-            .array_remove => "array_remove",
-            .array_replace => "array_replace",
-            .array_to_string => "array_to_string",
-            .string_to_array => "string_to_array",
-            .interval_ns => "interval_ns",
-            .interval_months => "interval_months",
-        };
-    }
-
-    fn rowExpressionDefaultOutputName(kind: db_mod.types.RelationalRowsExpressionKind) []const u8 {
-        return switch (kind) {
-            .field => "field",
-            .value => "value",
-            .case => "case",
-            .cast => "cast",
-            .json_extract => "json_extract",
-            .json_typeof => "json_typeof",
-            .json_array_length => "json_array_length",
-            .json_build_object => "jsonb_build_object",
-            .to_jsonb => "to_jsonb",
-            else => rowExpressionOpName(kind),
-        };
-    }
-
-    fn rowExpressionFieldSourceName(source: db_mod.types.RelationalRowsExpressionFieldSource) []const u8 {
-        return switch (source) {
-            .row => "row",
-            .existing => "existing",
-            .proposed => "proposed",
-            .source => "source",
-        };
-    }
-
-    fn rowExpressionCastTypeName(cast_type: db_mod.types.RelationalRowsExpressionCastType) []const u8 {
-        return switch (cast_type) {
-            .text => "text",
-            .numeric => "numeric",
-            .bool => "bool",
-            .datetime => "datetime",
-        };
-    }
-
-    fn rowExpressionConditionOpName(op: runtime_schema.RelationalCheckOp) []const u8 {
-        return switch (op) {
-            .eq => "eq",
-            .ne => "ne",
-            .gt => "gt",
-            .gte => "gte",
-            .lt => "lt",
-            .lte => "lte",
-            .is_null => "is_null",
-            .is_not_null => "is_not_null",
-            .is_distinct => "is_distinct",
-            .is_not_distinct => "is_not_distinct",
-        };
     }
 
     fn parseWhere(
@@ -34348,115 +34136,6 @@ fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []con
     return try sql_adapter.normalizeSqlObjectIdentifierAlloc(alloc, identifier);
 }
 
-fn writeRelationalCheckAtomsJson(
-    writer: *std.Io.Writer,
-    wrote_atom: *bool,
-    predicates: []const runtime_schema.RelationalCheck,
-) !void {
-    for (predicates) |predicate| {
-        if (wrote_atom.*) try writer.writeByte(',');
-        try writeRelationalCheckAtomJson(writer, predicate);
-        wrote_atom.* = true;
-    }
-}
-
-fn writeRelationalCheckAtomJson(writer: *std.Io.Writer, predicate: runtime_schema.RelationalCheck) !void {
-    try writer.print("{{\"field\":{f},\"op\":{f}", .{
-        std.json.fmt(predicate.field, .{}),
-        std.json.fmt(relationalCheckOpToken(predicate.op), .{}),
-    });
-    if (predicate.value_json) |value_json| {
-        try writer.writeAll(",\"value\":");
-        try writer.writeAll(value_json);
-    }
-    try writer.writeByte('}');
-}
-
-fn writeInPredicateAtomsJson(
-    writer: *std.Io.Writer,
-    wrote_atom: *bool,
-    predicates: []const db_mod.types.RelationalRowsInPredicate,
-) !void {
-    for (predicates) |predicate| {
-        if (wrote_atom.*) try writer.writeByte(',');
-        try writer.print("{{\"field\":{f},\"op\":{f},\"value\":", .{
-            std.json.fmt(predicate.field, .{}),
-            std.json.fmt(if (predicate.negated) "not_in" else "in", .{}),
-        });
-        try writer.writeAll(predicate.values_json);
-        try writer.writeByte('}');
-        wrote_atom.* = true;
-    }
-}
-
-fn writeTextPatternPredicateAtomsJson(
-    writer: *std.Io.Writer,
-    wrote_atom: *bool,
-    predicates: []const db_mod.types.RelationalRowsTextPatternPredicate,
-) !void {
-    for (predicates) |predicate| {
-        if (wrote_atom.*) try writer.writeByte(',');
-        try writer.print("{{\"field\":{f},\"op\":\"text_pattern\",\"pattern\":{f}", .{
-            std.json.fmt(predicate.field, .{}),
-            std.json.fmt(predicate.pattern, .{}),
-        });
-        if (predicate.case_insensitive) try writer.writeAll(",\"case_insensitive\":true");
-        if (predicate.negated) try writer.writeAll(",\"negated\":true");
-        try writer.writeByte('}');
-        wrote_atom.* = true;
-    }
-}
-
-fn writeStructuredValuePredicateAtomsJson(
-    writer: *std.Io.Writer,
-    wrote_atom: *bool,
-    op_name: []const u8,
-    predicates: anytype,
-) !void {
-    for (predicates) |predicate| {
-        if (wrote_atom.*) try writer.writeByte(',');
-        try writer.print("{{\"field\":{f},\"op\":{f},\"value\":", .{
-            std.json.fmt(predicate.field, .{}),
-            std.json.fmt(op_name, .{}),
-        });
-        try writer.writeAll(predicate.value_json);
-        try writer.writeByte('}');
-        wrote_atom.* = true;
-    }
-}
-
-fn writeJsonPathEqPredicateAtomsJson(
-    writer: *std.Io.Writer,
-    wrote_atom: *bool,
-    predicates: []const db_mod.types.RelationalRowsJsonPathEqPredicate,
-) !void {
-    for (predicates) |predicate| {
-        if (wrote_atom.*) try writer.writeByte(',');
-        try writer.print("{{\"field\":{f},\"op\":\"json_path_eq\",\"path\":{f},\"value\":", .{
-            std.json.fmt(predicate.field, .{}),
-            std.json.fmt(predicate.path, .{}),
-        });
-        try writer.writeAll(predicate.value_json);
-        try writer.writeByte('}');
-        wrote_atom.* = true;
-    }
-}
-
-fn writeJsonPathExistsPredicateAtomsJson(
-    writer: *std.Io.Writer,
-    wrote_atom: *bool,
-    predicates: []const db_mod.types.RelationalRowsJsonPathExistsPredicate,
-) !void {
-    for (predicates) |predicate| {
-        if (wrote_atom.*) try writer.writeByte(',');
-        try writer.print("{{\"field\":{f},\"op\":\"json_path_exists\",\"path\":{f}}}", .{
-            std.json.fmt(predicate.field, .{}),
-            std.json.fmt(predicate.path, .{}),
-        });
-        wrote_atom.* = true;
-    }
-}
-
 fn encodeSqlTxnIdHex(txn_id: db_mod.types.TxnId) [32]u8 {
     var out: [32]u8 = undefined;
     const hex = "0123456789abcdef";
@@ -35899,7 +35578,7 @@ fn schemaJsonExpressionConditionsAlloc(
     try writer.writeByte('[');
     for (conditions, 0..) |condition, i| {
         if (i != 0) try writer.writeByte(',');
-        try Parser.writeRowExpressionConditionJson(writer, condition);
+        try writeRowExpressionConditionJson(writer, condition);
     }
     try writer.writeByte(']');
     const json = try out.toOwnedSlice();
@@ -35916,7 +35595,7 @@ fn schemaJsonExpressionAlloc(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    try Parser.writeRowExpressionJson(writer, expression);
+    try writeRowExpressionJson(writer, expression);
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});

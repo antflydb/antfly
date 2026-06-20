@@ -170,6 +170,21 @@ pub fn validateCsvOptions(plan: BulkSqlIoExecutionPlan) !void {
     if (delimiter == quote) return error.UnsupportedSqlShape;
 }
 
+fn validatePostgresTextOptions(plan: BulkSqlIoExecutionPlan) !void {
+    const delimiter = try singleByteOption(plan.delimiter, '\t');
+    if (delimiter == '\n' or delimiter == '\r') return error.UnsupportedSqlShape;
+    if (plan.quote != null or plan.escape != null) return error.UnsupportedSqlShape;
+    if (plan.force_quote_all or plan.force_quote_columns.len != 0) return error.UnsupportedSqlShape;
+    if (plan.force_not_null_columns.len != 0 or plan.force_null_columns.len != 0) return error.UnsupportedSqlShape;
+}
+
+fn validateCodecOptions(plan: BulkSqlIoExecutionPlan) !void {
+    switch (plan.codec) {
+        .csv => try validateCsvOptions(plan),
+        .postgres_text => try validatePostgresTextOptions(plan),
+    }
+}
+
 pub fn validatePlanForSchema(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
@@ -199,9 +214,8 @@ pub fn importRowsBatchFromStdinAlloc(
     stdin_payload: []const u8,
 ) !relational_rows.OwnedRowsBatchRequest {
     if (plan.operation != .import_rows or plan.native_route != .rows_batch or plan.stream != .stdin) return error.UnsupportedSqlShape;
-    if (plan.codec != .csv) return error.UnsupportedSqlShape;
     if (plan.columns.len == 0) return error.UnsupportedSqlShape;
-    try validateCsvOptions(plan);
+    try validateCodecOptions(plan);
     try validatePlanForSchema(alloc, schema, plan);
     if (plan.encoding) |encoding| {
         if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
@@ -230,7 +244,7 @@ pub fn importRowsBatchFromStdinAlloc(
             continue;
         }
 
-        const fields = try parseCsvRecordAlloc(alloc, line, plan);
+        const fields = try parseRecordAlloc(alloc, line, plan);
         defer freeCsvFields(alloc, fields);
         if (fields.len != plan.columns.len) return error.InvalidRowsRequest;
         const row_json = try rowJsonFromCsvFieldsAlloc(alloc, schema, plan, fields);
@@ -254,8 +268,7 @@ pub fn exportRowsCsvToStdoutAlloc(
     result: db_mod.types.RelationalRowsQueryResult,
 ) ![]u8 {
     if (plan.operation != .export_rows or plan.native_route != .rows_query or plan.stream != .stdout) return error.UnsupportedSqlShape;
-    if (plan.codec != .csv) return error.UnsupportedSqlShape;
-    try validateCsvOptions(plan);
+    try validateCodecOptions(plan);
     try validatePlanForSchema(alloc, schema, plan);
     if (plan.encoding) |encoding| {
         if (!std.ascii.eqlIgnoreCase(encoding, "UTF8") and !std.ascii.eqlIgnoreCase(encoding, "UTF-8")) {
@@ -277,7 +290,10 @@ pub fn exportRowsCsvToStdoutAlloc(
     if (plan.header) {
         for (columns, 0..) |column_name, i| {
             if (i != 0) try writer.writeByte(delimiter);
-            try appendCsvField(writer, column_name, delimiter, quote, escape, false);
+            switch (plan.codec) {
+                .csv => try appendCsvField(writer, column_name, delimiter, quote, escape, false),
+                .postgres_text => try appendPostgresTextField(writer, column_name, delimiter),
+            }
         }
         try writer.writeByte('\n');
     }
@@ -289,10 +305,15 @@ pub fn exportRowsCsvToStdoutAlloc(
         for (columns, 0..) |column_name, i| {
             if (i != 0) try writer.writeByte(delimiter);
             const value = parsed.value.object.get(column_name);
-            const field = try csvFieldFromJsonValueAlloc(alloc, value, plan);
+            const field = try fieldFromJsonValueAlloc(alloc, value, plan);
             defer alloc.free(field);
-            const force_quote = plan.force_quote_all or stringSliceContains(plan.force_quote_columns, column_name);
-            try appendCsvField(writer, field, delimiter, quote, escape, force_quote);
+            switch (plan.codec) {
+                .csv => {
+                    const force_quote = plan.force_quote_all or stringSliceContains(plan.force_quote_columns, column_name);
+                    try appendCsvField(writer, field, delimiter, quote, escape, force_quote);
+                },
+                .postgres_text => try appendPostgresTextField(writer, field, delimiter),
+            }
         }
         try writer.writeByte('\n');
     }
@@ -326,14 +347,14 @@ fn exportColumnsAlloc(
     return columns;
 }
 
-fn csvFieldFromJsonValueAlloc(
+fn fieldFromJsonValueAlloc(
     alloc: std.mem.Allocator,
     maybe_value: ?std.json.Value,
     plan: BulkSqlIoExecutionPlan,
 ) ![]u8 {
-    const value = maybe_value orelse return try alloc.dupe(u8, plan.null_marker orelse "");
+    const value = maybe_value orelse return try alloc.dupe(u8, nullMarker(plan));
     return switch (value) {
-        .null => try alloc.dupe(u8, plan.null_marker orelse ""),
+        .null => try alloc.dupe(u8, nullMarker(plan)),
         .string => |raw| try alloc.dupe(u8, raw),
         .bool => |raw| try alloc.dupe(u8, if (raw) "true" else "false"),
         .integer, .float, .object, .array => try std.json.Stringify.valueAlloc(alloc, value, .{}),
@@ -366,6 +387,38 @@ fn appendCsvField(
         try writer.writeByte(c);
     }
     try writer.writeByte(quote);
+}
+
+fn appendPostgresTextField(writer: anytype, field: []const u8, delimiter: u8) !void {
+    for (field) |c| {
+        switch (c) {
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => if (delimiter == '\t') try writer.writeAll("\\t") else try writer.writeByte(c),
+            '\x08' => try writer.writeAll("\\b"),
+            '\x0c' => try writer.writeAll("\\f"),
+            else => {
+                if (c == delimiter) {
+                    try writer.writeByte('\\');
+                    try writer.writeByte(c);
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
+fn parseRecordAlloc(
+    alloc: std.mem.Allocator,
+    line: []const u8,
+    plan: BulkSqlIoExecutionPlan,
+) ![]BulkSqlIoCsvField {
+    return switch (plan.codec) {
+        .csv => try parseCsvRecordAlloc(alloc, line, plan),
+        .postgres_text => try parsePostgresTextRecordAlloc(alloc, line, plan),
+    };
 }
 
 fn parseCsvRecordAlloc(
@@ -421,6 +474,84 @@ fn parseCsvRecordAlloc(
     if (in_quote) return error.InvalidRowsRequest;
     try appendCsvFieldAlloc(alloc, &fields, &field, field_quoted);
     return try fields.toOwnedSlice(alloc);
+}
+
+fn parsePostgresTextRecordAlloc(
+    alloc: std.mem.Allocator,
+    line: []const u8,
+    plan: BulkSqlIoExecutionPlan,
+) ![]BulkSqlIoCsvField {
+    const delimiter = try singleByteOption(plan.delimiter, '\t');
+    var fields = std.ArrayListUnmanaged(BulkSqlIoCsvField).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field.value);
+        fields.deinit(alloc);
+    }
+    var field = std.ArrayListUnmanaged(u8).empty;
+    errdefer field.deinit(alloc);
+    const marker = nullMarker(plan);
+    var field_start: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (c == delimiter) {
+            try appendPostgresTextFieldAlloc(alloc, &fields, &field, line[field_start..i], marker);
+            field_start = i + 1;
+            continue;
+        }
+        if (c == '\\') {
+            i += 1;
+            if (i >= line.len) return error.InvalidRowsRequest;
+            try appendPostgresTextEscapedByte(alloc, &field, line, &i);
+            continue;
+        }
+        try field.append(alloc, c);
+    }
+    try appendPostgresTextFieldAlloc(alloc, &fields, &field, line[field_start..], marker);
+    return try fields.toOwnedSlice(alloc);
+}
+
+fn appendPostgresTextFieldAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(BulkSqlIoCsvField),
+    field: *std.ArrayListUnmanaged(u8),
+    raw_field: []const u8,
+    null_marker: []const u8,
+) !void {
+    if (std.mem.eql(u8, raw_field, null_marker)) {
+        field.deinit(alloc);
+        field.* = .empty;
+        try field.appendSlice(alloc, null_marker);
+    }
+    try appendCsvFieldAlloc(alloc, fields, field, false);
+}
+
+fn appendPostgresTextEscapedByte(
+    alloc: std.mem.Allocator,
+    field: *std.ArrayListUnmanaged(u8),
+    line: []const u8,
+    index: *usize,
+) !void {
+    const c = line[index.*];
+    switch (c) {
+        'b' => try field.append(alloc, '\x08'),
+        'f' => try field.append(alloc, '\x0c'),
+        'n' => try field.append(alloc, '\n'),
+        'r' => try field.append(alloc, '\r'),
+        't' => try field.append(alloc, '\t'),
+        'v' => try field.append(alloc, '\x0b'),
+        '0'...'7' => {
+            var value: u16 = c - '0';
+            var consumed: usize = 1;
+            while (consumed < 3 and index.* + 1 < line.len and line[index.* + 1] >= '0' and line[index.* + 1] <= '7') : (consumed += 1) {
+                index.* += 1;
+                value = value * 8 + (line[index.*] - '0');
+            }
+            if (value > std.math.maxInt(u8)) return error.InvalidRowsRequest;
+            try field.append(alloc, @intCast(value));
+        },
+        else => try field.append(alloc, c),
+    }
 }
 
 fn appendCsvFieldAlloc(
@@ -485,7 +616,7 @@ fn csvValueJsonAlloc(
     if (plan.default_marker) |marker| {
         if (std.mem.eql(u8, raw_value, marker)) return null;
     }
-    const null_marker = plan.null_marker orelse "";
+    const null_marker = nullMarker(plan);
     const forced_not_null = stringSliceContains(plan.force_not_null_columns, column.name);
     const forced_null = stringSliceContains(plan.force_null_columns, column.name);
     if (std.mem.eql(u8, raw_value, null_marker)) {
@@ -502,6 +633,13 @@ fn csvValueJsonAlloc(
         .json => try parsedJsonValueAlloc(alloc, raw_value, false),
         .array => try parsedJsonValueAlloc(alloc, raw_value, true),
         else => error.UnsupportedSqlShape,
+    };
+}
+
+fn nullMarker(plan: BulkSqlIoExecutionPlan) []const u8 {
+    return plan.null_marker orelse switch (plan.codec) {
+        .csv => "",
+        .postgres_text => "\\N",
     };
 }
 
