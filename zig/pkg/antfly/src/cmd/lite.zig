@@ -790,7 +790,7 @@ fn serve(_: Allocator, _: std.Io, args: *std.process.Args.Iterator) !void {
     const opts = try parseServeOptions(args);
     try requireAflitePath(opts.path);
     std.debug.print(
-        "error: antfly lite serve is not included in this build; use a lite-dev build with HTTP serve support\n",
+        "error: antfly lite serve is planned but not implemented yet; use the embedded API or CLI commands for this build\n",
         .{},
     );
     return error.UnsupportedLiteServe;
@@ -1221,7 +1221,7 @@ fn printUsage(argv0: []const u8) void {
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
-        \\  serve <db.aflite> --addr 127.0.0.1:8080 (lite-dev only)
+        \\  serve <db.aflite> --addr 127.0.0.1:8080 (planned lite-dev HTTP mode)
         \\
     , .{argv0});
 }
