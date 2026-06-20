@@ -5772,6 +5772,7 @@ test "gemma4 shared kv tail does not require per-layer k/v tensors" {
         .family = .gemma,
         .num_hidden_layers = 2,
         .num_kv_shared_layers = 1,
+        .position_encoding = .rope,
         .weight_tying = true,
     }, &names, &missing, false);
 

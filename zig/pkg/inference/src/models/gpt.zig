@@ -2072,7 +2072,7 @@ test "parse gguf metadata for llama config" {
     try data.appendSlice(allocator, "GGUF");
     try appendLe(u32, allocator, &data, 3);
     try appendLe(u64, allocator, &data, 0);
-    try appendLe(u64, allocator, &data, 10);
+    try appendLe(u64, allocator, &data, 8);
 
     try appendMetadataString(allocator, &data, "general.architecture", "llama");
     try appendMetadataU32(allocator, &data, "llama.embedding_length", 4096);
