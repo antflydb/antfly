@@ -430,6 +430,48 @@ test "lite native index storage aborts atomic writes without publishing partial 
     }
 }
 
+test "lite native index storage recovers previous checkpoint after interrupted update" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-index-storage-crash-recovery.aflite");
+    defer allocator.free(path);
+
+    {
+        var docs = try docstore.Store.open(allocator, path, false);
+        defer docs.close();
+        var index_store = Store.init(allocator, &docs);
+        const storage = index_store.storage();
+
+        try storage.writeFileAbsolute("/indexes/ft/stable.tbl", "stable");
+
+        var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/stable.tbl");
+        try writer.appendSlice("replacement");
+        try writer.finish();
+
+        const active_slot = docs.file.header.active_checkpoint;
+        const previous_slot: u8 = if (active_slot == 0) 1 else 0;
+        const previous = docs.file.header.checkpoints[previous_slot];
+        try std.testing.expect(previous.commit_sequence > 0);
+        try std.testing.expect(docs.file.activeCheckpoint().commit_sequence > previous.commit_sequence);
+
+        try docs.file.file.setLength(docs.file.io_impl.io(), previous.page_count * @as(u64, docs.file.header.page_size));
+        try docs.file.file.sync(docs.file.io_impl.io());
+    }
+
+    {
+        var reopened_docs = try docstore.Store.open(allocator, path, true);
+        defer reopened_docs.close();
+        var reopened_index_store = Store.init(allocator, &reopened_docs);
+        const storage = reopened_index_store.storage();
+
+        const stable = try storage.readFileAlloc(allocator, "/indexes/ft/stable.tbl", 64);
+        defer allocator.free(stable);
+        try std.testing.expectEqualStrings("stable", stable);
+    }
+}
+
 test "lite native index storage participates in native writer reservation" {
     const allocator = std.testing.allocator;
 
