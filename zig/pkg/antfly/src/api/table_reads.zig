@@ -6256,7 +6256,14 @@ pub const ExternalLakeRoutingTableReadSource = struct {
     fn rowsSetOperationPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (runtime_schema.external_base_source == null) return try self.base.rowsSetOperationPlan(alloc, table_name, runtime_schema, plan, consistency);
-        return error.UnsupportedRowsQuery;
+        var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
+        defer lake_source.deinit();
+
+        var left = (try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan.left, consistency)) orelse return null;
+        defer left.deinit(alloc);
+        var right = (try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan.right, consistency)) orelse return null;
+        defer right.deinit(alloc);
+        return try executeRelationalRowsSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
     }
 
     fn rowsAggregatePlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsAggregatePlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsAggregateResult {
@@ -17801,6 +17808,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
                     .scan = scan,
                     .query = query,
                     .rows_query_plan = rowsQueryPlan,
+                    .rows_set_operation_plan = rowsSetOperationPlan,
                     .rows_aggregate_plan = rowsAggregatePlan,
                     .lake_rows_scan = lakeRowsScan,
                     .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
@@ -17853,6 +17861,18 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         ) !?db_mod.types.RelationalRowsQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsSetOperationPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsSetOperationPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsSetOperationPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
         }
 
         fn rowsAggregatePlan(
@@ -18373,6 +18393,57 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
+
+    const set_left = db_mod.types.RelationalRowsQueryPlan{ .query = .{
+        .select = select[0..],
+        .select_all = false,
+    } };
+    const set_right = db_mod.types.RelationalRowsQueryPlan{ .query = .{
+        .select = select[0..],
+        .select_all = false,
+        .predicates = residual_predicates[0..],
+    } };
+    var except_result = (try source.rowsSetOperationPlan(alloc, "events", schema, .{
+        .operation = .except,
+        .left = set_left,
+        .right = set_right,
+    }, .read_index)).?;
+    defer except_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 19), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), except_result.total);
+    try std.testing.expectEqual(@as(usize, 1), except_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":20}", except_result.rows[0]);
+
+    const set_order = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .desc,
+    }};
+    var union_all_result = (try source.rowsSetOperationPlan(alloc, "events", schema, .{
+        .operation = .union_all,
+        .left = set_left,
+        .right = set_right,
+        .order_by = set_order[0..],
+        .limit = 2,
+    }, .read_index)).?;
+    defer union_all_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 21), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 3), union_all_result.total);
+    try std.testing.expectEqual(@as(usize, 2), union_all_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", union_all_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"amount\":30}", union_all_result.rows[1]);
+
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsSetOperationPlan(alloc, "events", schema, .{
+        .operation = .union_all,
+        .left = set_left,
+        .right = set_right,
+        .max_rows = 2,
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 23), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
 }
 
 test "pinned external lake rows scanner validates schema binding against inventory" {

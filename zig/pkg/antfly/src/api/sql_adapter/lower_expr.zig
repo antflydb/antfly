@@ -59,6 +59,62 @@ pub const SqlFunctionBindings = struct {
     routine_expressions: []const RoutineExpressionBinding = &.{},
 };
 
+pub fn sqlRowClaimForClause(clause: ast.SqlRowClaimClause) db_mod.types.RowClaimRequest {
+    return .{
+        .mode = clause.mode,
+        .wait_policy = clause.wait_policy,
+        .skip_locked = clause.wait_policy == .skip_locked,
+    };
+}
+
+pub fn setSqlRowClaimClause(claim: *db_mod.types.RowClaimRequest, clause: ast.SqlRowClaimClause) void {
+    claim.mode = clause.mode;
+    claim.wait_policy = clause.wait_policy;
+    claim.skip_locked = clause.wait_policy == .skip_locked;
+}
+
+pub fn sqlRowClaimModeName(mode: db_mod.types.RowClaimMode) []const u8 {
+    return switch (mode) {
+        .for_update => "for_update",
+        .for_no_key_update => "for_no_key_update",
+        .for_share => "for_share",
+        .for_key_share => "for_key_share",
+    };
+}
+
+pub fn sqlRowClaimWaitPolicyName(wait_policy: db_mod.types.RowClaimWaitPolicy) []const u8 {
+    return switch (wait_policy) {
+        .wait => "wait",
+        .nowait => "nowait",
+        .skip_locked => "skip_locked",
+    };
+}
+
+pub fn sqlRowClaimFingerprintName(claim: db_mod.types.RowClaimRequest) []const u8 {
+    return switch (claim.mode) {
+        .for_update => switch (claim.effectiveWaitPolicy()) {
+            .wait => "locked",
+            .nowait => "nowait",
+            .skip_locked => "skip_locked",
+        },
+        .for_no_key_update => switch (claim.effectiveWaitPolicy()) {
+            .wait => "no_key_update",
+            .nowait => "no_key_update_nowait",
+            .skip_locked => "no_key_update_skip_locked",
+        },
+        .for_share => switch (claim.effectiveWaitPolicy()) {
+            .wait => "share",
+            .nowait => "share_nowait",
+            .skip_locked => "share_skip_locked",
+        },
+        .for_key_share => switch (claim.effectiveWaitPolicy()) {
+            .wait => "key_share",
+            .nowait => "key_share_nowait",
+            .skip_locked => "key_share_skip_locked",
+        },
+    };
+}
+
 pub fn sqlKeywordIsAnyOrSome(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "any") or std.ascii.eqlIgnoreCase(text, "some");
 }
@@ -1853,6 +1909,138 @@ pub fn conflictInsertedValueForColumn(insert_columns: []const []const u8, row: [
         if (std.mem.eql(u8, insert_column, column)) return value_json;
     }
     return null;
+}
+
+pub fn findUniqueConstraintByColumnsAndExpressions(
+    schema: runtime_schema.TableSchema,
+    columns: []const []const u8,
+    expressions: []const runtime_schema.UniqueExpression,
+    require_partial: bool,
+) ?runtime_schema.UniqueConstraint {
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
+        if (require_partial and constraint.where.len == 0) continue;
+        if (!require_partial and constraint.where.len != 0) continue;
+        if (!stringSlicesEqual(constraint.columns, columns)) continue;
+        if (!uniqueExpressionsEqual(constraint.expressions, expressions)) continue;
+        return constraint;
+    }
+    return null;
+}
+
+pub fn findUniqueConstraintByColumnsExpressionsAndConflictWhere(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    columns: []const []const u8,
+    expressions: []const runtime_schema.UniqueExpression,
+    where_json: []const u8,
+    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition,
+) !?runtime_schema.UniqueConstraint {
+    const has_field_where = where_json.len > 0;
+    const has_expression_where = where_expressions.len > 0;
+    if (has_field_where and has_expression_where) return error.UnsupportedSqlShape;
+
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
+        if (!stringSlicesEqual(constraint.columns, columns)) continue;
+        if (!uniqueExpressionsEqual(constraint.expressions, expressions)) continue;
+
+        if (!has_field_where and !has_expression_where) {
+            if (constraint.where.len == 0 and constraint.where_expressions.len == 0) return constraint;
+            continue;
+        }
+
+        if (has_field_where) {
+            if (constraint.where.len != 0 and constraint.where_expressions.len == 0) {
+                validateUniqueWhereJsonMatches(alloc, where_json, constraint.where) catch continue;
+                return constraint;
+            }
+            if (constraint.where.len == 0 and constraint.where_expressions.len != 0) {
+                const predicates = try relationalChecksFromUniqueWhereJsonAlloc(alloc, where_json);
+                defer {
+                    freeRelationalChecks(alloc, predicates);
+                    if (predicates.len > 0) alloc.free(predicates);
+                }
+                if (try db_mod.DB.relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(
+                    alloc,
+                    predicates,
+                    constraint.where_expressions,
+                )) return constraint;
+            }
+            continue;
+        }
+
+        if (constraint.where.len != 0) continue;
+        if (relationalRowsExpressionConditionsEqual(constraint.where_expressions, where_expressions)) return constraint;
+    }
+    return null;
+}
+
+fn relationalChecksFromUniqueWhereJsonAlloc(
+    alloc: std.mem.Allocator,
+    where_json: []const u8,
+) ![]runtime_schema.RelationalCheck {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, where_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnsupportedSqlShape;
+    const all_value = parsed.value.object.get("all") orelse return error.UnsupportedSqlShape;
+    if (all_value != .array) return error.UnsupportedSqlShape;
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, all_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |check| {
+            alloc.free(check.field);
+            if (check.value_json) |json| alloc.free(json);
+        }
+        alloc.free(out);
+    }
+    for (all_value.array.items) |item| {
+        if (item != .object) return error.UnsupportedSqlShape;
+        const field_value = item.object.get("field") orelse return error.UnsupportedSqlShape;
+        const op_value = item.object.get("op") orelse return error.UnsupportedSqlShape;
+        if (field_value != .string or op_value != .string) return error.UnsupportedSqlShape;
+        const op = relationalCheckOpFromUniquePredicateToken(op_value.string) orelse return error.UnsupportedSqlShape;
+        const field = try alloc.dupe(u8, field_value.string);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const value_json: ?[]const u8 = if (item.object.get("value")) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null;
+        var value_transferred = false;
+        errdefer if (!value_transferred) if (value_json) |json| alloc.free(json);
+        out[initialized] = .{
+            .name = "",
+            .field = field,
+            .op = op,
+            .value_json = value_json,
+        };
+        initialized += 1;
+        field_transferred = true;
+        value_transferred = true;
+    }
+    return out;
+}
+
+fn validateUniqueWhereJsonMatches(alloc: std.mem.Allocator, where_json: []const u8, predicates: []const runtime_schema.UniquePredicate) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, where_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnsupportedSqlShape;
+    const all_value = parsed.value.object.get("all") orelse return error.UnsupportedSqlShape;
+    if (all_value != .array or all_value.array.items.len != predicates.len) return error.UnsupportedSqlShape;
+    for (all_value.array.items, predicates) |item, predicate| {
+        if (item != .object) return error.UnsupportedSqlShape;
+        const field_value = item.object.get("field") orelse return error.UnsupportedSqlShape;
+        const op_value = item.object.get("op") orelse return error.UnsupportedSqlShape;
+        if (field_value != .string or !std.mem.eql(u8, field_value.string, predicate.field)) return error.UnsupportedSqlShape;
+        if (op_value != .string or !std.mem.eql(u8, op_value.string, uniquePredicateOpToken(predicate.op))) return error.UnsupportedSqlShape;
+        const supplied_value = item.object.get("value");
+        if (predicate.value_json) |expected_json| {
+            const supplied = supplied_value orelse return error.UnsupportedSqlShape;
+            const supplied_json = try std.json.Stringify.valueAlloc(alloc, supplied, .{});
+            defer alloc.free(supplied_json);
+            if (!std.mem.eql(u8, supplied_json, expected_json)) return error.UnsupportedSqlShape;
+        } else if (supplied_value != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
 }
 
 pub fn queryHasOnlySimpleUnionPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
