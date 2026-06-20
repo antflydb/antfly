@@ -632,6 +632,8 @@ fn restoreFromSourceFile(
         try portable_backup.importPortable(allocator, lite.db.core.store, body);
     }
 
+    try finishRestoredLiteImportPath(allocator, tmp_path);
+
     renameFilePath(io, tmp_path, out_path) catch |err| {
         deleteFilePath(io, tmp_path) catch {};
         return err;
@@ -647,6 +649,16 @@ fn readPortableRestoreSourceAlloc(allocator: Allocator, io: std.Io, source_path:
         return try cli.readFileAlloc(io, allocator, source_path, max_afb_file_bytes);
     }
     return error.InvalidArguments;
+}
+
+fn finishRestoredLiteImportPath(allocator: Allocator, path: []const u8) !void {
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+    _ = try lite.db.rebuildDenseIndexesForTargetCoverage(allocator);
+    _ = try lite.db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+    try lite.db.runUntilIdle();
+    try lite.db.sync(true);
+    try lite.db.syncIndexes(true);
 }
 
 const PromoteOptions = struct {

@@ -1918,6 +1918,25 @@ fn restorePortableBackupToLiteFile(
         try portable_backup.importPortable(alloc, db.core.store, backup);
     }
 
+    {
+        var backend = try lite_backend.Handle.open(alloc, tmp_path, .{});
+        defer backend.deinit();
+
+        var opts = db_mod.OpenOptions{
+            .open_mode = .writer,
+            .external_derived_checkpoints = false,
+        };
+        try backend.configureDbOpenOptions(&opts);
+
+        var db = try db_mod.DB.open(alloc, tmp_path, opts);
+        defer db.close();
+        _ = try db.rebuildDenseIndexesForTargetCoverage(alloc);
+        _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+        try db.runUntilIdle();
+        try db.sync(true);
+        try db.syncIndexes(true);
+    }
+
     try preflightLiteRestoreTarget(alloc, io, dest_path, replace);
     liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
         liteCapiDeleteFilePath(io, tmp_path) catch {};

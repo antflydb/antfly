@@ -8010,6 +8010,24 @@ pub const DB = struct {
         _ = try self.runLsmMaintenanceUntilIdle();
     }
 
+    pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+
+        for (self.core.index_manager.dense_indexes.items) |*entry| {
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+
+        var rebuilt: usize = 0;
+        for (names.items) |name| {
+            rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
+        }
+        return rebuilt;
+    }
+
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();

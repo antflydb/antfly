@@ -85,9 +85,21 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("indexes JSON %q did not contain configured index", indexes)
 	}
 
+	denseIndex := []byte(`{"name":"dv_embedding_v1","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}"}`)
+	if err := db.AddIndexJSON(denseIndex); err != nil {
+		t.Fatalf("add dense index: %v", err)
+	}
+	indexes, err = db.IndexesJSON()
+	if err != nil {
+		t.Fatalf("list indexes after dense index: %v", err)
+	}
+	if !bytes.Contains(indexes, []byte("dv_embedding_v1")) {
+		t.Fatalf("indexes JSON %q did not contain configured dense index", indexes)
+	}
+
 	err = db.Batch([]WriteIntent{{
 		Key:   "doc:go-search",
-		Value: []byte(`{"title":"searchable","body":"go binding full text search"}`),
+		Value: []byte(`{"title":"searchable","body":"go binding full text search","embedding":[1.0,0.0]}`),
 	}}, 2)
 	if err != nil {
 		t.Fatalf("batch searchable document: %v", err)
@@ -115,6 +127,13 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if !bytes.Contains(search, []byte("go binding full text search")) {
 		t.Fatalf("search JSON %q did not contain searchable document", search)
+	}
+	denseSearch, err := db.SearchJSON([]byte(`{"mode":"dense","index_name":"dv_embedding_v1","vector":[1.0,0.0],"k":1,"limit":1}`))
+	if err != nil {
+		t.Fatalf("dense search: %v", err)
+	}
+	if !bytes.Contains(denseSearch, []byte("go binding full text search")) {
+		t.Fatalf("dense search JSON %q did not contain caller-supplied embedding document", denseSearch)
 	}
 
 	if deleted, err := db.DeleteIndex("missing-index"); err != nil {
@@ -224,6 +243,20 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if !bytes.Contains(restoredLookup, []byte("go api lite")) {
 		t.Fatalf("restored lookup JSON %q did not contain written document", restoredLookup)
+	}
+	restoredSearch, err := restored.SearchJSON([]byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`))
+	if err != nil {
+		t.Fatalf("search restored document: %v", err)
+	}
+	if !bytes.Contains(restoredSearch, []byte("go binding full text search")) {
+		t.Fatalf("restored search JSON %q did not contain searchable document", restoredSearch)
+	}
+	restoredDenseSearch, err := restored.SearchJSON([]byte(`{"mode":"dense","index_name":"dv_embedding_v1","vector":[1.0,0.0],"k":1,"limit":1}`))
+	if err != nil {
+		t.Fatalf("dense search restored document: %v", err)
+	}
+	if !bytes.Contains(restoredDenseSearch, []byte("go binding full text search")) {
+		t.Fatalf("restored dense search JSON %q did not contain caller-supplied embedding document", restoredDenseSearch)
 	}
 	if err := restored.Close(); err != nil {
 		t.Fatalf("close restored Lite database: %v", err)
