@@ -187,7 +187,6 @@ pub const NativeFile = struct {
         var header_bytes: [header_size]u8 = undefined;
         try readExactAt(file, io, &header_bytes, 0);
         const header = try decodeHeader(&header_bytes);
-        if (!read_only) try normalizeHeaderChecksum(file, io, &header_bytes);
 
         return .{
             .allocator = allocator,
@@ -1245,7 +1244,8 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
 
-    _ = try headerChecksumKind(header_raw);
+    const expected_checksum = std.mem.readInt(u32, header_raw[header_checksum_offset..][0..4], .little);
+    if (expected_checksum != headerChecksum(header_raw)) return error.NativeHeaderChecksumMismatch;
 
     const page_size = std.mem.readInt(u32, header_raw[page_size_offset..][0..4], .little);
     if (!validPageSize(page_size)) return error.InvalidNativePageSize;
@@ -1506,42 +1506,11 @@ fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
     if (read != out.len) return error.EndOfStream;
 }
 
-const HeaderChecksumKind = enum {
-    stable,
-    legacy,
-};
-
-fn headerChecksumKind(raw: []const u8) !HeaderChecksumKind {
-    if (raw.len < header_size) return error.TruncatedNativeHeader;
-    const header_raw = raw[0..header_size];
-    const expected_checksum = std.mem.readInt(u32, header_raw[header_checksum_offset..][0..4], .little);
-    if (expected_checksum == headerChecksum(header_raw)) return .stable;
-    if (expected_checksum == legacyHeaderChecksum(header_raw)) return .legacy;
-    return error.NativeHeaderChecksumMismatch;
-}
-
-fn normalizeHeaderChecksum(file: std.Io.File, io: std.Io, header_bytes: *[header_size]u8) !void {
-    switch (try headerChecksumKind(header_bytes)) {
-        .stable => return,
-        .legacy => {
-            std.mem.writeInt(u32, header_bytes[header_checksum_offset..][0..4], headerChecksum(header_bytes), .little);
-            try file.writePositionalAll(io, header_bytes[header_checksum_offset..][0..4], header_checksum_offset);
-            try file.sync(io);
-        },
-    }
-}
-
 fn headerChecksum(raw: []const u8) u32 {
     var crc = std.hash.Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
     crc.update(raw[checkpoint_slots_end..header_checksum_offset]);
-    return crc.final();
-}
-
-fn legacyHeaderChecksum(raw: []const u8) u32 {
-    var crc = std.hash.Crc32.init();
-    crc.update(raw[0..header_checksum_offset]);
     return crc.final();
 }
 
@@ -1633,16 +1602,6 @@ test "lite native header rejects corrupted checksum" {
     const report = inspectBytes(&encoded);
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
-}
-
-test "lite native header accepts legacy whole-header checksum" {
-    var encoded: [header_size]u8 = undefined;
-    encodeHeader(&encoded, .{});
-    std.mem.writeInt(u32, encoded[header_checksum_offset..][0..4], legacyHeaderChecksum(&encoded), .little);
-
-    const header = try decodeHeader(&encoded);
-    try std.testing.expectEqual(@as(u8, 0), header.active_checkpoint);
-    try std.testing.expectEqual(@as(u64, 1), header.checkpoints[header.active_checkpoint].page_count);
 }
 
 test "lite native header selects newest valid checkpoint slot" {
@@ -1821,47 +1780,6 @@ test "lite native file publishes checkpoint without rewriting static header" {
         try std.testing.expectEqual(@as(u8, 1), after[active_checkpoint_offset]);
         try std.testing.expect(!std.mem.eql(u8, before[checkpointOffset(1)..][0..checkpoint_slot_size], after[checkpointOffset(1)..][0..checkpoint_slot_size]));
     }
-
-    var reopened = try NativeFile.open(allocator, path, true);
-    defer reopened.close();
-    try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(@as(u64, 2), reopened.activeCheckpoint().page_count);
-}
-
-test "lite native writer normalizes legacy header checksum before slot publish" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try testPath(allocator, tmp, "native-legacy-checksum-normalize.aflite");
-    defer allocator.free(path);
-
-    {
-        var file = try NativeFile.create(allocator, path);
-        file.close();
-    }
-
-    {
-        var header_bytes = try readHeaderForTest(path);
-        std.mem.writeInt(u32, header_bytes[header_checksum_offset..][0..4], legacyHeaderChecksum(&header_bytes), .little);
-
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, header_bytes[header_checksum_offset..][0..4], header_checksum_offset);
-        try file.sync(std.testing.io);
-    }
-
-    {
-        var file = try NativeFile.open(allocator, path, false);
-        defer file.close();
-        _ = try file.allocatePage("legacy normalized");
-    }
-
-    const header_bytes = try readHeaderForTest(path);
-    const stored_checksum = std.mem.readInt(u32, header_bytes[header_checksum_offset..][0..4], .little);
-    try std.testing.expectEqual(headerChecksum(&header_bytes), stored_checksum);
-    try std.testing.expect(stored_checksum != legacyHeaderChecksum(&header_bytes));
 
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();

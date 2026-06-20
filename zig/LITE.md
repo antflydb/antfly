@@ -213,7 +213,6 @@ internally:
 - comparing native `.aflite` behavior against the current filesystem storage
 - debugging corruption or recovery issues
 - measuring native backend performance against the bridge implementation
-- providing an importer for pre-native experimental `.aflite` files if needed
 
 These profiles should be hidden behind developer flags or build steps. They
 should not appear in the normal user docs as Lite database formats.

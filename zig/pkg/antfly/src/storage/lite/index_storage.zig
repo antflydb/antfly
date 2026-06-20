@@ -17,7 +17,7 @@
 //! This is an incremental Lite-native index backend: existing Antfly index
 //! implementations can still use their LSM storage contract, but their logical
 //! files are stored under the dedicated native `.aflite` index checkpoint root
-//! rather than in the legacy bridge container.
+//! rather than in the internal bridge container.
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;

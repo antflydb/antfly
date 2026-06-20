@@ -67,8 +67,7 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
 }
 
 pub const EngineKind = enum {
-    /// Compatibility bridge for pre-native `.aflite` files and explicit
-    /// storage-engine development.
+    /// Internal LSM bridge for explicit storage-engine development.
     bridge_lsm_container,
 
     /// Native v1 `.aflite` file engine. It owns real Lite pages and checkpoint
@@ -77,8 +76,7 @@ pub const EngineKind = enum {
 };
 
 pub const EngineSelection = enum {
-    /// Create new files as native v1 and preserve existing bridge-container
-    /// files by detecting the on-disk magic.
+    /// Open and create public Lite files as native v1.
     auto,
     bridge_lsm_container,
     native_single_file,
@@ -90,8 +88,7 @@ pub const OpenOptions = struct {
 };
 
 pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
-    if (try hasNativeMagic(allocator, path)) return try native.checkFile(allocator, path);
-    return toCheckReport(try bridge.ContainerStorage.checkFile(allocator, path));
+    return try native.checkFile(allocator, path);
 }
 
 pub const Handle = struct {
@@ -104,7 +101,7 @@ pub const Handle = struct {
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         const engine = switch (opts.engine) {
-            .auto => try detectEngine(allocator, path) orelse .native_single_file,
+            .auto => EngineKind.native_single_file,
             .bridge_lsm_container => EngineKind.bridge_lsm_container,
             .native_single_file => EngineKind.native_single_file,
         };
@@ -256,14 +253,6 @@ fn toCheckReport(report: bridge.ContainerStorage.CheckReport) CheckReport {
     };
 }
 
-fn detectEngine(allocator: Allocator, path: []const u8) !?EngineKind {
-    if (hasNativeMagic(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    }) return .native_single_file;
-    return .bridge_lsm_container;
-}
-
 fn nativeVacuumReport(handle: *Handle) !VacuumReport {
     const report = try handle.native_docstore.?.vacuum();
     return .{
@@ -280,19 +269,6 @@ fn nativeStableSnapshot(handle: *Handle, dest_path: []const u8, replace: bool) !
     platform_sync.lockYielding(&store.mutex);
     defer store.mutex.unlock();
     return try store.file.copyStableSnapshotToPath(dest_path, replace);
-}
-
-fn hasNativeMagic(allocator: Allocator, path: []const u8) !bool {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
-    defer file.close(io);
-
-    var prefix: [native.magic.len]u8 = undefined;
-    const read = try file.readPositionalAll(io, &prefix, 0);
-    return read == native.magic.len and std.mem.eql(u8, &prefix, native.magic);
 }
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
@@ -414,7 +390,7 @@ test "lite backend auto creates new aflite files with native engine" {
     try std.testing.expectEqual(@as(u64, 1), report.record_count);
 }
 
-test "lite backend auto preserves existing bridge aflite files" {
+test "lite backend auto rejects internal bridge aflite files" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -429,10 +405,9 @@ test "lite backend auto preserves existing bridge aflite files" {
         try std.testing.expectEqual(EngineKind.bridge_lsm_container, handle.engine);
     }
 
-    var reopened = try Handle.open(allocator, path, .{});
+    var reopened = Handle.open(allocator, path, .{}) catch return;
     defer reopened.deinit();
-
-    try std.testing.expectEqual(EngineKind.bridge_lsm_container, reopened.engine);
+    return error.TestExpectedError;
 }
 
 test "lite backend native engine can back db primary documents" {

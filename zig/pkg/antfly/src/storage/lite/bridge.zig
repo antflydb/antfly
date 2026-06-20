@@ -12,13 +12,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Legacy LSM bridge container for Antfly Lite.
+//! Internal LSM bridge container for Antfly Lite.
 //!
-//! This module owns the compatibility path for pre-native `.aflite` files. It
-//! presents the existing LSM `Storage` interface over one physical file by
-//! replaying an append-only stream of logical-file records into an in-memory
-//! name index. New Lite files should use `native.zig`; this bridge remains so
-//! old files and storage-engine tests can still open.
+//! This module presents the existing LSM `Storage` interface over one physical
+//! file by replaying an append-only stream of logical-file records into an
+//! in-memory name index. Public Lite files should use `native.zig`; this bridge
+//! remains for storage-engine development and conformance tests.
 
 const std = @import("std");
 const builtin = @import("builtin");
