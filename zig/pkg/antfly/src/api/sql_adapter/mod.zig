@@ -949,6 +949,8 @@ pub const uniqueConstraintNameExists = binder.uniqueConstraintNameExists;
 
 test {
     _ = binder;
+    _ = corpus;
+    _ = diagnostics;
     _ = ddl_plan;
     _ = lower_dml;
     _ = plan;

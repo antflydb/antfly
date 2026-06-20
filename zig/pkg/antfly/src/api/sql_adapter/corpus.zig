@@ -3668,11 +3668,11 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(corpusFixtureFamilyAllowsSummary(.join));
     try std.testing.expect(!corpusFixtureFamilyAllowsSummary(.unsupported_read));
 
-    try std.testing.expect(corpusReadPlanHasPrefix(.{ .family = .read, .plan = "read:query:table=usage_records" }, "read:query:"));
-    try std.testing.expect(corpusReadPlanHasPrefix(.{ .family = .explain, .plan = "explain:kind=read:inner=read:query:table=usage_records" }, "read:query:"));
-    try std.testing.expect(!corpusReadPlanHasPrefix(.{ .family = .read, .plan = "read:aggregate:table=usage_records" }, "read:query:"));
-    try std.testing.expect(corpusExplainWriteInnerHasPrefix(.{ .family = .explain, .plan = "explain:kind=write:inner=insert:table=usage_records" }, ":inner=insert:"));
-    try std.testing.expect(!corpusExplainWriteInnerHasPrefix(.{ .family = .explain, .plan = "explain:kind=read:inner=insert:table=usage_records" }, ":inner=insert:"));
+    try std.testing.expect(corpusReadPlanHasPrefix(.{ .name = "read query", .family = .read, .plan = "read:query:table=usage_records", .sql = "SELECT * FROM usage_records" }, "read:query:"));
+    try std.testing.expect(corpusReadPlanHasPrefix(.{ .name = "explain read", .family = .explain, .plan = "explain:kind=read:inner=read:query:table=usage_records", .sql = "EXPLAIN SELECT * FROM usage_records" }, "read:query:"));
+    try std.testing.expect(!corpusReadPlanHasPrefix(.{ .name = "read aggregate", .family = .read, .plan = "read:aggregate:table=usage_records", .sql = "SELECT count(*) FROM usage_records" }, "read:query:"));
+    try std.testing.expect(corpusExplainWriteInnerHasPrefix(.{ .name = "explain write", .family = .explain, .plan = "explain:kind=write:inner=insert:table=usage_records", .sql = "EXPLAIN INSERT INTO usage_records VALUES ('1')" }, ":inner=insert:"));
+    try std.testing.expect(!corpusExplainWriteInnerHasPrefix(.{ .name = "explain read insert token", .family = .explain, .plan = "explain:kind=read:inner=insert:table=usage_records", .sql = "EXPLAIN SELECT * FROM usage_records" }, ":inner=insert:"));
 
     try std.testing.expect(corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records", ":having_expr=", 0));
     try std.testing.expect(corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records:having_expr=2", ":having_expr=", 2));
@@ -3683,32 +3683,36 @@ test "sql adapter corpus owns fixture family policies" {
 
     try std.testing.expect(corpusFixtureHasAccessSummary(.{ .json_contains = 1 }));
     try std.testing.expect(!corpusFixtureHasAccessSummary(.{ .table_name = "usage_records" }));
-    try std.testing.expect(corpusFixtureHasTemporalDdlSummary(.{ .summary = .{ .temporal_foreign_keys = 1 } }));
-    try std.testing.expect(!corpusFixtureHasTemporalDdlSummary(.{ .summary = .{ .ddl_tag = .create_table } }));
+    try std.testing.expect(corpusFixtureHasTemporalDdlSummary(.{ .name = "temporal ddl", .family = .ddl, .plan = "ddl:create_table:table=usage_records", .sql = "CREATE TABLE usage_records (id text)", .summary = .{ .temporal_foreign_keys = 1 } }));
+    try std.testing.expect(!corpusFixtureHasTemporalDdlSummary(.{ .name = "ordinary ddl", .family = .ddl, .plan = "ddl:create_table:table=usage_records", .sql = "CREATE TABLE usage_records (id text)", .summary = .{ .ddl_tag = .create_table } }));
     try std.testing.expect(corpusFixturePlanMatchesSourceTable(
-        .{ .family = .insert_source, .plan = "insert_source:table=usage_records:source_table=usage_sources" },
+        .{ .name = "insert source", .family = .insert_source, .plan = "insert_source:table=usage_records:source_table=usage_sources", .sql = "INSERT INTO usage_records SELECT * FROM usage_sources" },
         "usage_sources",
     ));
     try std.testing.expect(!corpusFixturePlanMatchesSourceTable(
-        .{ .family = .insert_source, .plan = "insert_source:table=usage_records:source_table=usage_sources" },
+        .{ .name = "insert source mismatch", .family = .insert_source, .plan = "insert_source:table=usage_records:source_table=usage_sources", .sql = "INSERT INTO usage_records SELECT * FROM usage_sources" },
         "other_sources",
     ));
     try std.testing.expect(corpusFixturePlanMatchesSourceTable(
-        .{ .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records" },
+        .{ .name = "set operation", .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records", .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records" },
         "archived_records",
     ));
     try std.testing.expect(corpusFixtureSqlParameterCoverageMatches(.{
+        .name = "query params",
         .family = .query,
+        .plan = "query:table=usage_records",
         .sql = "SELECT id FROM usage_records WHERE tenant_id = $1",
         .params = &.{.{ .string = "tenant-a" }},
     }));
     try std.testing.expect(corpusFixtureSqlParameterCoverageMatches(.{
+        .name = "prepare params",
         .family = .ddl,
         .summary = .{ .ddl_tag = .prepare_statement },
         .plan = "ddl:prepare:params=2",
         .sql = "PREPARE lookup AS SELECT id FROM usage_records WHERE tenant_id = $1 AND user_id = $2",
     }));
     try std.testing.expect(!corpusFixtureSqlParameterCoverageMatches(.{
+        .name = "prepare missing param",
         .family = .ddl,
         .summary = .{ .ddl_tag = .prepare_statement },
         .plan = "ddl:prepare:params=2",
