@@ -2619,6 +2619,12 @@ pub export fn antfly_db_set_schema_json(
     return .ok;
 }
 
+pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    return .ok;
+}
+
 fn antflyDbExtractEnrichmentsJson(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -5905,6 +5911,7 @@ test "capi lite exposes hosted and status-only profiles" {
         .is_delete = false,
     }};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(hosted_handle, &writes, writes.len, null, 0, 1_000, 0));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(hosted_handle));
     antfly_db_close(hosted_handle);
     hosted_handle = null;
 
