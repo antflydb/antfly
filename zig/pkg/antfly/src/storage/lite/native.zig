@@ -240,13 +240,16 @@ pub const NativeFile = struct {
         if (checkpoint.page_count == 0) return invalidCheck(report, "invalid_page_count");
         if (file_size < expected_size) return invalidCheck(report, "truncated_file");
 
-        const catalog_records = self.countChainPages(.catalog, checkpoint.catalog_root_page) catch |err| {
+        var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer reachable_pages.deinit(self.allocator);
+
+        const catalog_records = self.countReachableChainPages(.catalog, checkpoint.catalog_root_page, &reachable_pages) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        const index_catalog_records = self.countChainPages(.catalog, checkpoint.index_catalog_root_page) catch |err| {
+        const index_catalog_records = self.countReachableChainPages(.catalog, checkpoint.index_catalog_root_page, &reachable_pages) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        const document_records = self.countChainPages(.document, checkpoint.document_root_page) catch |err| {
+        const document_records = self.countReachableChainPages(.document, checkpoint.document_root_page, &reachable_pages) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         const live = self.liveStats() catch |err| {
@@ -795,24 +798,33 @@ pub const NativeFile = struct {
         return try decodePagePayloadAlloc(allocator, page, kind);
     }
 
-    fn countChainPages(self: *NativeFile, kind: PageKind, root_page_id: u64) !u64 {
+    const ReachablePageSet = std.AutoHashMapUnmanaged(u64, void);
+
+    fn markReachablePage(self: *NativeFile, reachable_pages: *ReachablePageSet, page_id: u64) !void {
+        if (page_id == 0 or page_id >= self.activeCheckpoint().page_count) return error.InvalidPageId;
+        const entry = try reachable_pages.getOrPut(self.allocator, page_id);
+        if (entry.found_existing) return error.InvalidNativePageChain;
+    }
+
+    fn countReachableChainPages(self: *NativeFile, kind: PageKind, root_page_id: u64, reachable_pages: *ReachablePageSet) !u64 {
         var count: u64 = 0;
         var page_id = root_page_id;
         while (page_id != 0) {
+            try self.markReachablePage(reachable_pages, page_id);
             const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, kind);
             defer self.allocator.free(payload);
             page_id = switch (kind) {
                 .catalog => blk: {
                     const entry = try decodeCatalogEntry(payload);
                     if (entry.external_value_root_page != 0) {
-                        try self.validateValuePages(entry.external_value_root_page, entry.external_value_len);
+                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, reachable_pages);
                     }
                     break :blk entry.previous_page;
                 },
                 .document => blk: {
                     const entry = try decodeDocumentEntry(payload);
                     if (entry.external_value_root_page != 0) {
-                        try self.validateValuePages(entry.external_value_root_page, entry.external_value_len);
+                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, reachable_pages);
                     }
                     break :blk entry.previous_page;
                 },
@@ -891,9 +903,29 @@ pub const NativeFile = struct {
         return value;
     }
 
-    fn validateValuePages(self: *NativeFile, root_page_id: u64, value_len: usize) !void {
-        const value = try self.readValuePagesAlloc(self.allocator, root_page_id, value_len);
-        self.allocator.free(value);
+    fn validateReachableValuePages(self: *NativeFile, root_page_id: u64, value_len: usize, reachable_pages: *ReachablePageSet) !void {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+
+        var remaining = value_len;
+        var page_id = root_page_id;
+        var pages_seen: u64 = 0;
+        while (page_id != 0) {
+            pages_seen += 1;
+            if (pages_seen > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+
+            try self.markReachablePage(reachable_pages, page_id);
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .value);
+            defer self.allocator.free(payload);
+
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+            remaining -= page.chunk.len;
+            page_id = page.next_page;
+            if (remaining == 0 and page_id != 0) return error.InvalidNativeValueChain;
+        }
+
+        if (remaining != 0) return error.InvalidNativeValueChain;
     }
 
     const LiveStats = struct {
@@ -2254,6 +2286,46 @@ test "lite native check validates committed index catalog root chain" {
     const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
     defer allocator.free(index_file);
     try std.testing.expectEqualStrings("index bytes", index_file);
+}
+
+test "lite native check reports overlapping committed root pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-overlap.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        try file.putCatalogRecord("schema", "{\"version\":1}");
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+
+        const checkpoint = file.activeCheckpoint();
+        try std.testing.expect(checkpoint.catalog_root_page != 0);
+        try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+        try std.testing.expect(checkpoint.catalog_root_page != checkpoint.index_catalog_root_page);
+    }
+
+    var header_bytes = try readHeaderForTest(path);
+    var header = try decodeHeader(&header_bytes);
+    header.checkpoints[header.active_checkpoint].index_catalog_root_page =
+        header.checkpoints[header.active_checkpoint].catalog_root_page;
+    encodeHeader(&header_bytes, header);
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
+        try raw.sync(std.testing.io);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_page_chain", report.issue.?);
 }
 
 test "lite native stable snapshot copies committed prefix without tail bytes" {
