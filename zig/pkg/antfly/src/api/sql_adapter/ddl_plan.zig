@@ -884,6 +884,11 @@ pub const AuthorizationCatalogPlan = union(enum) {
     }
 };
 
+pub const PrivilegeChangeAction = enum {
+    grant,
+    revoke,
+};
+
 pub const CreateRolePlan = struct {
     role_name: []const u8,
 
@@ -1845,6 +1850,7 @@ pub const BulkIoPlan = struct {
     direction: BulkIoDirection,
     table_name: []const u8,
     columns: []const []const u8 = &.{},
+    endpoint_kind: BulkIoEndpointKind = .stream,
     endpoint: []const u8,
     format: ?[]const u8 = null,
     header: bool = false,
@@ -1887,6 +1893,12 @@ pub const BulkIoPlan = struct {
 pub const BulkIoDirection = enum {
     from,
     to,
+};
+
+pub const BulkIoEndpointKind = enum {
+    stream,
+    file,
+    program,
 };
 
 pub const BulkIoOnErrorPolicy = enum {
@@ -2254,6 +2266,79 @@ pub fn preparedStatementStatementKindFromSyntax(syntax: grammar.PreparedStatemen
     };
 }
 
+pub fn savepointNamePlanFromSyntaxAlloc(alloc: std.mem.Allocator, syntax: grammar.SavepointNameSyntax) !SavepointNamePlan {
+    return .{ .savepoint_name = try alloc.dupe(u8, syntax.savepoint_name) };
+}
+
+pub fn deallocatePreparedStatementPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.NamedOrAllSyntax,
+) !DeallocatePreparedStatementPlan {
+    if (syntax.all) return .{ .all = true };
+    const statement_name = syntax.name orelse return error.UnsupportedSqlShape;
+    return .{ .statement_name = try alloc.dupe(u8, statement_name) };
+}
+
+pub fn closeCursorPortalPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.NamedOrAllSyntax,
+) !CloseCursorPortalPlan {
+    if (syntax.all) return .{ .all = true };
+    const portal_name = syntax.name orelse return error.UnsupportedSqlShape;
+    return .{ .portal_name = try alloc.dupe(u8, portal_name) };
+}
+
+pub fn commentMetadataPlanFromSyntax(syntax: *grammar.CommentMetadataSyntax) CommentMetadataPlan {
+    const object_name = syntax.object_name;
+    const parent_table_name = syntax.parent_table_name;
+    const comment_json = syntax.comment_json;
+    syntax.object_name = "";
+    syntax.parent_table_name = null;
+    syntax.comment_json = null;
+    return .{
+        .target = syntax.target,
+        .object_name = object_name,
+        .parent_table_name = parent_table_name,
+        .comment_json = comment_json,
+    };
+}
+
+pub fn tableLockPlanFromSyntax(syntax: *grammar.TableLockSyntax) TableLockPlan {
+    const table_names = syntax.table_names;
+    syntax.table_names = &.{};
+    return .{
+        .table_names = table_names,
+        .mode = tableLockModeFromSyntax(syntax.mode),
+    };
+}
+
+pub fn constraintModePlanFromSyntax(syntax: *grammar.ConstraintModeSyntax) ConstraintModePlan {
+    const constraint_names = syntax.constraint_names;
+    syntax.constraint_names = &.{};
+    return .{
+        .all = syntax.all,
+        .constraint_names = constraint_names,
+        .mode = constraintCheckModeFromSyntax(syntax.mode),
+    };
+}
+
+pub fn transactionModePlanFromSyntax(syntax: grammar.TransactionModeSyntax) TransactionModePlan {
+    return .{
+        .starter = transactionModeStarterFromSyntax(syntax.starter),
+        .isolation_level = transactionIsolationLevelFromSyntax(syntax.isolation_level),
+        .access_mode = transactionAccessModeFromSyntax(syntax.access_mode),
+        .deferrable = syntax.deferrable,
+    };
+}
+
+pub fn advisoryLockPlanFromSyntax(syntax: grammar.AdvisoryLockSyntax) AdvisoryLockPlan {
+    return .{
+        .action = advisoryLockActionFromSyntax(syntax.action),
+        .key1 = syntax.key1,
+        .key2 = syntax.key2,
+    };
+}
+
 pub fn tableLockModeFromSyntax(syntax: grammar.TableLockModeSyntax) TableLockMode {
     return switch (syntax) {
         .access_share => .access_share,
@@ -2350,6 +2435,716 @@ pub fn bulkIoDirectionFromSyntax(syntax: grammar.BulkIoDirectionSyntax) BulkIoDi
     return switch (syntax) {
         .from => .from,
         .to => .to,
+    };
+}
+
+pub fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) grammar.PrivilegeChangeActionSyntax {
+    return switch (action) {
+        .grant => .grant,
+        .revoke => .revoke,
+    };
+}
+
+pub fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(extension_name, "pgcrypto") or
+        std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp");
+}
+
+pub fn createExtensionPlanFromSyntax(
+    syntax: *grammar.CreateExtensionSyntax,
+    default_namespace_name: []const u8,
+) !CreateExtensionPlan {
+    if (syntax.schema_name) |schema_name| {
+        if (!syntax.if_not_exists or
+            !isAdapterNoopExtensionName(syntax.extension_name) or
+            !std.ascii.eqlIgnoreCase(schema_name, default_namespace_name))
+        {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    const extension_name = syntax.extension_name;
+    const version = syntax.version;
+    syntax.extension_name = "";
+    syntax.version = null;
+    return .{
+        .extension_name = extension_name,
+        .version = version,
+        .if_not_exists = syntax.if_not_exists,
+    };
+}
+
+pub fn updateExtensionPlanFromSyntax(syntax: *grammar.UpdateExtensionSyntax) UpdateExtensionPlan {
+    const extension_name = syntax.extension_name;
+    const target_version = syntax.target_version;
+    syntax.extension_name = "";
+    syntax.target_version = null;
+    return .{
+        .extension_name = extension_name,
+        .target_version = target_version,
+    };
+}
+
+pub fn dropExtensionPlanFromSyntax(syntax: *grammar.DropExtensionSyntax) DropExtensionPlan {
+    const extension_name = syntax.extension_name;
+    syntax.extension_name = "";
+    return .{
+        .extension_name = extension_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn createSchemaNamespacePlanFromSyntax(syntax: *grammar.CreateSchemaNamespaceSyntax) CreateSchemaNamespacePlan {
+    const schema_name = syntax.schema_name;
+    syntax.schema_name = "";
+    return .{
+        .schema_name = schema_name,
+        .if_not_exists = syntax.if_not_exists,
+    };
+}
+
+pub fn renameSchemaNamespacePlanFromSyntax(syntax: *grammar.RenameSchemaNamespaceSyntax) RenameSchemaNamespacePlan {
+    const schema_name = syntax.schema_name;
+    const new_schema_name = syntax.new_schema_name;
+    syntax.schema_name = "";
+    syntax.new_schema_name = "";
+    return .{
+        .schema_name = schema_name,
+        .new_schema_name = new_schema_name,
+    };
+}
+
+pub fn dropSchemaNamespacePlanFromSyntax(syntax: *grammar.DropSchemaNamespaceSyntax) DropSchemaNamespacePlan {
+    const schema_name = syntax.schema_name;
+    syntax.schema_name = "";
+    return .{
+        .schema_name = schema_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn createDatabasePlanFromSyntax(syntax: *grammar.CreateDatabaseSyntax) CreateDatabasePlan {
+    const database_name = syntax.database_name;
+    syntax.database_name = "";
+    return .{ .database_name = database_name };
+}
+
+pub fn alterDatabasePlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: *grammar.AlterDatabaseSyntax,
+) !AlterDatabasePlan {
+    const operations = try alloc.alloc(DatabaseAlterOperation, 1);
+    errdefer alloc.free(operations);
+    operations[0] = .{ .set_parameter = .{
+        .name = syntax.setting_name,
+        .value_json = syntax.value_json,
+    } };
+    const database_name = syntax.database_name;
+    syntax.database_name = "";
+    syntax.setting_name = "";
+    syntax.value_json = "";
+    return .{
+        .database_name = database_name,
+        .operations = operations,
+    };
+}
+
+pub fn dropDatabasePlanFromSyntax(syntax: *grammar.DropDatabaseSyntax) DropDatabasePlan {
+    const database_name = syntax.database_name;
+    syntax.database_name = "";
+    return .{
+        .database_name = database_name,
+        .if_exists = syntax.if_exists,
+        .force = syntax.force,
+    };
+}
+
+pub fn createTablespacePlanFromSyntax(syntax: *grammar.CreateTablespaceSyntax) CreateTablespacePlan {
+    const tablespace_name = syntax.tablespace_name;
+    const location_json = syntax.location_json;
+    const placement_policy_json = syntax.placement_policy_json;
+    syntax.tablespace_name = "";
+    syntax.location_json = "";
+    syntax.placement_policy_json = "";
+    return .{
+        .tablespace_name = tablespace_name,
+        .location_json = location_json,
+        .placement_policy_json = placement_policy_json,
+    };
+}
+
+pub fn renameTablespacePlanFromSyntax(syntax: *grammar.RenameTablespaceSyntax) RenameTablespacePlan {
+    const tablespace_name = syntax.tablespace_name;
+    const new_tablespace_name = syntax.new_tablespace_name;
+    syntax.tablespace_name = "";
+    syntax.new_tablespace_name = "";
+    return .{
+        .tablespace_name = tablespace_name,
+        .new_tablespace_name = new_tablespace_name,
+    };
+}
+
+pub fn dropTablespacePlanFromSyntax(syntax: *grammar.DropTablespaceSyntax) DropTablespacePlan {
+    const tablespace_name = syntax.tablespace_name;
+    syntax.tablespace_name = "";
+    return .{
+        .tablespace_name = tablespace_name,
+        .if_exists = syntax.if_exists,
+    };
+}
+
+pub fn listenNotificationPlanFromSyntax(syntax: *grammar.ListenNotificationSyntax) ListenNotificationPlan {
+    const channel_name = syntax.channel_name;
+    syntax.channel_name = "";
+    return .{ .channel_name = channel_name };
+}
+
+pub fn notifyNotificationPlanFromSyntax(syntax: *grammar.NotifyNotificationSyntax) NotifyNotificationPlan {
+    const channel_name = syntax.channel_name;
+    const payload_json = syntax.payload_json;
+    syntax.channel_name = "";
+    syntax.payload_json = null;
+    return .{
+        .channel_name = channel_name,
+        .payload_json = payload_json,
+    };
+}
+
+pub fn unlistenNotificationPlanFromSyntax(syntax: *grammar.UnlistenNotificationSyntax) UnlistenNotificationPlan {
+    const channel_name = syntax.channel_name;
+    syntax.channel_name = null;
+    return .{
+        .channel_name = channel_name,
+        .all = syntax.all,
+    };
+}
+
+pub fn createPublicationPlanFromSyntax(syntax: *grammar.CreatePublicationSyntax) CreatePublicationPlan {
+    const publication_name = syntax.publication_name;
+    const table_names = syntax.table_names;
+    syntax.publication_name = "";
+    syntax.table_names = &.{};
+    return .{
+        .publication_name = publication_name,
+        .table_names = table_names,
+        .all_tables = syntax.all_tables,
+    };
+}
+
+pub fn alterPublicationPlanFromSyntax(syntax: *grammar.AlterPublicationSyntax) AlterPublicationPlan {
+    const publication_name = syntax.publication_name;
+    const table_names = syntax.table_names;
+    syntax.publication_name = "";
+    syntax.table_names = &.{};
+    return .{
+        .publication_name = publication_name,
+        .operation = .{ .add_tables = table_names },
+    };
+}
+
+pub fn dropPublicationPlanFromSyntax(syntax: *grammar.DropPublicationSyntax) DropPublicationPlan {
+    const publication_name = syntax.publication_name;
+    syntax.publication_name = "";
+    return .{
+        .publication_name = publication_name,
+        .if_exists = syntax.if_exists,
+    };
+}
+
+pub fn createSubscriptionPlanFromSyntax(syntax: *grammar.CreateSubscriptionSyntax) CreateSubscriptionPlan {
+    const subscription_name = syntax.subscription_name;
+    const connection_json = syntax.connection_json;
+    const publication_names = syntax.publication_names;
+    syntax.subscription_name = "";
+    syntax.connection_json = "";
+    syntax.publication_names = &.{};
+    return .{
+        .subscription_name = subscription_name,
+        .connection_json = connection_json,
+        .publication_names = publication_names,
+    };
+}
+
+pub fn alterSubscriptionPlanFromSyntax(syntax: *grammar.AlterSubscriptionSyntax) AlterSubscriptionPlan {
+    const subscription_name = syntax.subscription_name;
+    syntax.subscription_name = "";
+    return .{
+        .subscription_name = subscription_name,
+        .enabled = syntax.enabled,
+    };
+}
+
+pub fn dropSubscriptionPlanFromSyntax(syntax: *grammar.DropSubscriptionSyntax) DropSubscriptionPlan {
+    const subscription_name = syntax.subscription_name;
+    syntax.subscription_name = "";
+    return .{
+        .subscription_name = subscription_name,
+        .if_exists = syntax.if_exists,
+    };
+}
+
+pub fn vacuumMaintenancePlanFromSyntax(syntax: *grammar.VacuumMaintenanceSyntax) VacuumMaintenancePlan {
+    const table_name = syntax.table_name;
+    syntax.table_name = "";
+    return .{
+        .table_name = table_name,
+        .full = syntax.full,
+        .freeze = syntax.freeze,
+        .verbose = syntax.verbose,
+        .analyze = syntax.analyze,
+    };
+}
+
+pub fn analyzeMaintenancePlanFromSyntax(syntax: *grammar.AnalyzeMaintenanceSyntax) AnalyzeMaintenancePlan {
+    const table_name = syntax.table_name;
+    syntax.table_name = "";
+    return .{
+        .table_name = table_name,
+        .verbose = syntax.verbose,
+        .column_count = syntax.column_count,
+    };
+}
+
+pub fn reindexMaintenancePlanFromSyntax(syntax: *grammar.ReindexMaintenanceSyntax) ReindexMaintenancePlan {
+    const name = syntax.name;
+    syntax.name = "";
+    return .{
+        .target = reindexMaintenanceTargetFromSyntax(syntax.target),
+        .name = name,
+        .concurrently = syntax.concurrently,
+    };
+}
+
+pub fn clusterMaintenancePlanFromSyntax(syntax: *grammar.ClusterMaintenanceSyntax) ClusterMaintenancePlan {
+    const table_name = syntax.table_name;
+    const index_name = syntax.index_name;
+    syntax.table_name = "";
+    syntax.index_name = null;
+    return .{
+        .table_name = table_name,
+        .index_name = index_name,
+        .verbose = syntax.verbose,
+    };
+}
+
+pub fn prepareStatementPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.PrepareStatementSyntax,
+) !PrepareStatementPlan {
+    return .{
+        .statement_name = try alloc.dupe(u8, syntax.statement_name),
+        .parameter_count = syntax.parameter_count,
+        .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind),
+        .statement_family = preparedStatementStatementKindFromSyntax(syntax.statement_family),
+    };
+}
+
+pub fn executePreparedStatementPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.ExecutePreparedStatementSyntax,
+) !ExecutePreparedStatementPlan {
+    return .{
+        .statement_name = try alloc.dupe(u8, syntax.statement_name),
+        .argument_count = syntax.argument_count,
+    };
+}
+
+pub fn declareCursorPortalPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.DeclareCursorPortalSyntax,
+) !DeclareCursorPortalPlan {
+    return .{
+        .portal_name = try alloc.dupe(u8, syntax.portal_name),
+        .scroll = cursorScrollModeFromSyntax(syntax.scroll),
+        .binary = syntax.binary,
+        .hold = syntax.hold,
+        .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind orelse return error.UnsupportedSqlShape),
+    };
+}
+
+pub fn fetchCursorPortalPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.FetchCursorPortalSyntax,
+) !FetchCursorPortalPlan {
+    return .{
+        .portal_name = try alloc.dupe(u8, syntax.portal_name),
+        .direction = cursorFetchDirectionFromSyntax(syntax.direction),
+        .count = syntax.count,
+    };
+}
+
+pub fn dropDomainPlanFromSyntax(syntax: *grammar.DropDomainSyntax) DropDomainPlan {
+    const domain_name = syntax.domain_name;
+    syntax.domain_name = "";
+    return .{
+        .domain_name = domain_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn createSequencePlanFromSyntax(syntax: *grammar.CreateSequenceSyntax) CreateSequencePlan {
+    const sequence_name = syntax.sequence_name;
+    const options = syntax.options;
+    syntax.sequence_name = "";
+    syntax.options = .{};
+    return .{
+        .sequence_name = sequence_name,
+        .if_not_exists = syntax.if_not_exists,
+        .options = options,
+    };
+}
+
+pub fn alterSequencePlanFromSyntax(syntax: *grammar.AlterSequenceSyntax) AlterSequencePlan {
+    const sequence_name = syntax.sequence_name;
+    const operations = syntax.operations;
+    syntax.sequence_name = "";
+    syntax.operations = &.{};
+    return .{
+        .sequence_name = sequence_name,
+        .if_exists = syntax.if_exists,
+        .operations = operations,
+    };
+}
+
+pub fn dropSequencePlanFromSyntax(syntax: *grammar.DropSequenceSyntax) DropSequencePlan {
+    const sequence_name = syntax.sequence_name;
+    syntax.sequence_name = "";
+    return .{
+        .sequence_name = sequence_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn createEnumTypePlanFromSyntax(syntax: *grammar.CreateEnumTypeSyntax) CreateEnumTypePlan {
+    const type_name = syntax.type_name;
+    const values = syntax.values;
+    syntax.type_name = "";
+    syntax.values = &.{};
+    return .{
+        .type_name = type_name,
+        .values = values,
+    };
+}
+
+pub fn addEnumValuePlanFromSyntax(syntax: *grammar.AddEnumValueSyntax) AddEnumValuePlan {
+    const type_name = syntax.type_name;
+    const value = syntax.value;
+    const neighbor_value = syntax.neighbor_value;
+    syntax.type_name = "";
+    syntax.value = "";
+    syntax.neighbor_value = null;
+    return .{
+        .type_name = type_name,
+        .value = value,
+        .if_not_exists = syntax.if_not_exists,
+        .position = syntax.position,
+        .neighbor_value = neighbor_value,
+    };
+}
+
+pub fn dropEnumTypePlanFromSyntax(syntax: *grammar.DropEnumTypeSyntax) DropEnumTypePlan {
+    const type_name = syntax.type_name;
+    syntax.type_name = "";
+    return .{
+        .type_name = type_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn createCollationPlanFromSyntax(syntax: *grammar.CreateCollationSyntax) CreateCollationPlan {
+    const collation_name = syntax.collation_name;
+    syntax.collation_name = "";
+    return .{
+        .collation_name = collation_name,
+        .option_count = syntax.option_count,
+    };
+}
+
+pub fn renameCollationPlanFromSyntax(syntax: *grammar.RenameCollationSyntax) RenameCollationPlan {
+    const collation_name = syntax.collation_name;
+    const new_collation_name = syntax.new_collation_name;
+    syntax.collation_name = "";
+    syntax.new_collation_name = "";
+    return .{
+        .collation_name = collation_name,
+        .new_collation_name = new_collation_name,
+    };
+}
+
+pub fn dropCollationPlanFromSyntax(syntax: *grammar.DropCollationSyntax) DropCollationPlan {
+    const collation_name = syntax.collation_name;
+    syntax.collation_name = "";
+    return .{
+        .collation_name = collation_name,
+        .if_exists = syntax.if_exists,
+    };
+}
+
+pub fn createOperatorPlanFromSyntax(syntax: *grammar.CreateOperatorSyntax) CreateOperatorPlan {
+    const operator_name = syntax.operator_name;
+    syntax.operator_name = "";
+    return .{
+        .operator_name = operator_name,
+        .option_count = syntax.option_count,
+    };
+}
+
+pub fn dropOperatorPlanFromSyntax(syntax: *grammar.DropOperatorSyntax) DropOperatorPlan {
+    const operator_name = syntax.operator_name;
+    syntax.operator_name = "";
+    return .{
+        .operator_name = operator_name,
+        .argument_count = syntax.argument_count,
+    };
+}
+
+pub fn createAggregatePlanFromSyntax(syntax: *grammar.CreateAggregateSyntax) CreateAggregatePlan {
+    const aggregate_name = syntax.aggregate_name;
+    syntax.aggregate_name = "";
+    return .{
+        .aggregate_name = aggregate_name,
+        .argument_count = syntax.argument_count,
+        .option_count = syntax.option_count,
+    };
+}
+
+pub fn dropAggregatePlanFromSyntax(syntax: *grammar.DropAggregateSyntax) DropAggregatePlan {
+    const aggregate_name = syntax.aggregate_name;
+    syntax.aggregate_name = "";
+    return .{
+        .aggregate_name = aggregate_name,
+        .argument_count = syntax.argument_count,
+    };
+}
+
+pub fn createCastPlanFromSyntax(syntax: *grammar.CreateCastSyntax) CreateCastPlan {
+    const source_type = syntax.source_type;
+    const target_type = syntax.target_type;
+    const function_name = syntax.function_name;
+    syntax.source_type = "";
+    syntax.target_type = "";
+    syntax.function_name = "";
+    return .{
+        .source_type = source_type,
+        .target_type = target_type,
+        .function_name = function_name,
+        .assignment = syntax.assignment,
+    };
+}
+
+pub fn dropCastPlanFromSyntax(syntax: *grammar.DropCastSyntax) DropCastPlan {
+    const source_type = syntax.source_type;
+    const target_type = syntax.target_type;
+    syntax.source_type = "";
+    syntax.target_type = "";
+    return .{
+        .source_type = source_type,
+        .target_type = target_type,
+    };
+}
+
+pub fn createMaterializedViewPlanFromSyntax(syntax: *grammar.CreateMaterializedViewSyntax) CreateMaterializedViewPlan {
+    const view_name = syntax.view_name;
+    const source_table_name = syntax.source_table_name;
+    const source_fields = syntax.source_fields;
+    const output_fields = syntax.output_fields;
+    syntax.view_name = "";
+    syntax.source_table_name = "";
+    syntax.source_fields = &.{};
+    syntax.output_fields = &.{};
+    return .{
+        .view_name = view_name,
+        .source_table_name = source_table_name,
+        .source_fields = source_fields,
+        .output_fields = output_fields,
+        .replace_existing = syntax.replace_existing,
+        .if_not_exists = syntax.if_not_exists,
+        .populate_on_create = syntax.populate_on_create,
+    };
+}
+
+pub fn refreshMaterializedViewPlanFromSyntax(syntax: *grammar.RefreshMaterializedViewSyntax) RefreshMaterializedViewPlan {
+    const view_name = syntax.view_name;
+    syntax.view_name = "";
+    return .{
+        .view_name = view_name,
+        .concurrently = syntax.concurrently,
+        .populate = syntax.populate,
+    };
+}
+
+pub fn dropMaterializedViewPlanFromSyntax(syntax: *grammar.DropMaterializedViewSyntax) DropMaterializedViewPlan {
+    const view_name = syntax.view_name;
+    syntax.view_name = "";
+    return .{
+        .view_name = view_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn createViewPlanFromSyntax(syntax: *grammar.CreateViewSyntax) CreateViewPlan {
+    const view_name = syntax.view_name;
+    const source_table_name = syntax.source_table_name;
+    const source_fields = syntax.source_fields;
+    const output_fields = syntax.output_fields;
+    syntax.view_name = "";
+    syntax.source_table_name = "";
+    syntax.source_fields = &.{};
+    syntax.output_fields = &.{};
+    return .{
+        .view_name = view_name,
+        .source_table_name = source_table_name,
+        .source_fields = source_fields,
+        .output_fields = output_fields,
+        .replace_existing = syntax.replace_existing,
+        .if_not_exists = syntax.if_not_exists,
+    };
+}
+
+pub fn renameViewPlanFromSyntax(syntax: *grammar.RenameViewSyntax) RenameViewPlan {
+    const view_name = syntax.view_name;
+    const new_view_name = syntax.new_view_name;
+    syntax.view_name = "";
+    syntax.new_view_name = "";
+    return .{
+        .view_name = view_name,
+        .new_view_name = new_view_name,
+    };
+}
+
+pub fn dropViewPlanFromSyntax(syntax: *grammar.DropViewSyntax) DropViewPlan {
+    const view_name = syntax.view_name;
+    syntax.view_name = "";
+    return .{
+        .view_name = view_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn dropTablePlanFromSyntax(syntax: *grammar.DropTableSyntax) DropTablePlan {
+    const table_name = syntax.table_name;
+    syntax.table_name = "";
+    return .{
+        .table_name = table_name,
+        .if_exists = syntax.if_exists,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn dropIndexPlanFromSyntax(syntax: *grammar.DropIndexSyntax) DropIndexPlan {
+    const index_name = syntax.index_name;
+    syntax.index_name = "";
+    return .{
+        .index_name = index_name,
+        .if_exists = syntax.if_exists,
+    };
+}
+
+pub fn dropUpdatePolicyTriggerPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: *grammar.DropUpdatePolicySyntax,
+) !AlterTablePlan {
+    const operations = try alloc.alloc(AlterTableOperation, 1);
+    var operations_transferred = false;
+    errdefer if (!operations_transferred) alloc.free(operations);
+
+    const table_name = syntax.table_name;
+    const trigger_name = syntax.trigger_name;
+    syntax.table_name = "";
+    syntax.trigger_name = "";
+    operations[0] = .{ .drop_update_policy = .{
+        .trigger_name = trigger_name,
+        .if_exists = syntax.if_exists,
+    } };
+
+    operations_transferred = true;
+    return .{
+        .table_name = table_name,
+        .operations = operations,
+    };
+}
+
+pub fn createUpdatePolicyTriggerPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: *grammar.CreateUpdatePolicySyntax,
+) !CreateUpdatePolicyPlan {
+    const value_json = try alloc.dupe(u8, "");
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+
+    const trigger_name = syntax.trigger_name;
+    const table_name = syntax.table_name;
+    const column_name = syntax.column_name;
+    syntax.trigger_name = "";
+    syntax.table_name = "";
+    syntax.column_name = "";
+
+    value_transferred = true;
+    return .{
+        .trigger_name = trigger_name,
+        .table_name = table_name,
+        .column_name = column_name,
+        .on_update_value = .{ .kind = .now_ns, .value_json = value_json },
+    };
+}
+
+pub fn alterRowSecurityPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.RowSecurityAlterSyntax,
+) !AlterRowSecurityPlan {
+    return .{
+        .table_name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, syntax.table_identifier),
+        .enabled = syntax.enabled,
+    };
+}
+
+pub fn createRowSecurityPolicyPlanFromSyntax(syntax: *grammar.CreateRowSecurityPolicySyntax) CreateRowSecurityPolicyPlan {
+    const policy_name = syntax.policy_name;
+    const table_name = syntax.table_name;
+    const role_targets = syntax.role_targets;
+    const predicate = syntax.predicate;
+    syntax.policy_name = "";
+    syntax.table_name = "";
+    syntax.role_targets = &.{};
+    return .{
+        .policy_name = policy_name,
+        .table_name = table_name,
+        .role_targets = role_targets,
+        .predicate = predicate,
+    };
+}
+
+pub fn alterRowSecurityPolicyPlanFromSyntax(syntax: *grammar.AlterRowSecurityPolicySyntax) AlterRowSecurityPolicyPlan {
+    const policy_name = syntax.policy_name;
+    const table_name = syntax.table_name;
+    const role_targets = syntax.role_targets;
+    const predicate = syntax.predicate;
+    syntax.policy_name = "";
+    syntax.table_name = "";
+    syntax.role_targets = &.{};
+    return .{
+        .policy_name = policy_name,
+        .table_name = table_name,
+        .role_targets = role_targets,
+        .predicate = predicate,
+    };
+}
+
+pub fn dropRowSecurityPolicyPlanFromSyntax(syntax: *grammar.DropRowSecurityPolicySyntax) DropRowSecurityPolicyPlan {
+    const policy_name = syntax.policy_name;
+    const table_name = syntax.table_name;
+    syntax.policy_name = "";
+    syntax.table_name = "";
+    return .{
+        .policy_name = policy_name,
+        .table_name = table_name,
+        .if_exists = syntax.if_exists,
     };
 }
 
@@ -2498,6 +3293,7 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqual(AdvisoryLockAction.unlock, advisoryLockActionFromSyntax(.unlock));
     try std.testing.expectEqual(ReindexMaintenanceTarget.system, reindexMaintenanceTargetFromSyntax(.system));
     try std.testing.expectEqual(BulkIoDirection.to, bulkIoDirectionFromSyntax(.to));
+    try std.testing.expectEqual(grammar.PrivilegeChangeActionSyntax.grant, privilegeChangeActionToSyntax(.grant));
     try std.testing.expectEqual(RoutineKind.procedure, routineKindFromSyntax(.procedure));
     try std.testing.expectEqual(runtime_schema.AntflyType.datetime, ddlRangeBoundTypeForName("tstzrange").?);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, ddlRangeBoundTypeForName("numrange").?);
@@ -2512,6 +3308,354 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqualStrings("partial", foreignKeyMatchName(.partial));
     try std.testing.expectEqualStrings("unvalidated", foreignKeyValidationStateName(.unvalidated));
     try std.testing.expectEqualStrings("dropping", relationalIndexLifecycleName(.dropping));
+    try std.testing.expect(isAdapterNoopExtensionName("pgcrypto"));
+    try std.testing.expect(isAdapterNoopExtensionName("uuid-ossp"));
+    try std.testing.expect(!isAdapterNoopExtensionName("postgis"));
+
+    const alloc = std.testing.allocator;
+    var syntax: grammar.CreateExtensionSyntax = .{
+        .extension_name = try alloc.dupe(u8, "pgcrypto"),
+        .schema_name = try alloc.dupe(u8, "public"),
+        .version = try alloc.dupe(u8, "1.3"),
+        .if_not_exists = true,
+    };
+    defer syntax.deinit(alloc);
+    var plan = try createExtensionPlanFromSyntax(&syntax, "public");
+    defer plan.deinit(alloc);
+    try std.testing.expectEqualStrings("pgcrypto", plan.extension_name);
+    try std.testing.expectEqualStrings("1.3", plan.version.?);
+    try std.testing.expect(plan.if_not_exists);
+
+    var unsupported_schema: grammar.CreateExtensionSyntax = .{
+        .extension_name = try alloc.dupe(u8, "pgcrypto"),
+        .schema_name = try alloc.dupe(u8, "tenant"),
+        .if_not_exists = true,
+    };
+    defer unsupported_schema.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, createExtensionPlanFromSyntax(&unsupported_schema, "public"));
+
+    var create_schema_syntax: grammar.CreateSchemaNamespaceSyntax = .{
+        .schema_name = try alloc.dupe(u8, "tenant"),
+        .if_not_exists = true,
+    };
+    var create_schema = createSchemaNamespacePlanFromSyntax(&create_schema_syntax);
+    defer create_schema.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant", create_schema.schema_name);
+    try std.testing.expect(create_schema.if_not_exists);
+
+    var alter_database_syntax: grammar.AlterDatabaseSyntax = .{
+        .database_name = try alloc.dupe(u8, "app"),
+        .setting_name = try alloc.dupe(u8, "statement_timeout"),
+        .value_json = try alloc.dupe(u8, "5000"),
+    };
+    var alter_database = try alterDatabasePlanFromSyntaxAlloc(alloc, &alter_database_syntax);
+    defer alter_database.deinit(alloc);
+    try std.testing.expectEqualStrings("app", alter_database.database_name);
+    try std.testing.expectEqual(@as(usize, 1), alter_database.operations.len);
+    switch (alter_database.operations[0]) {
+        .set_parameter => |parameter| {
+            try std.testing.expectEqualStrings("statement_timeout", parameter.name);
+            try std.testing.expectEqualStrings("5000", parameter.value_json);
+        },
+    }
+
+    var notify_syntax: grammar.NotifyNotificationSyntax = .{
+        .channel_name = try alloc.dupe(u8, "jobs"),
+        .payload_json = try alloc.dupe(u8, "\"ready\""),
+    };
+    var notify = notifyNotificationPlanFromSyntax(&notify_syntax);
+    defer notify.deinit(alloc);
+    try std.testing.expectEqualStrings("jobs", notify.channel_name);
+    try std.testing.expectEqualStrings("\"ready\"", notify.payload_json.?);
+
+    var publication_tables = try alloc.alloc([]const u8, 1);
+    publication_tables[0] = try alloc.dupe(u8, "usage_records");
+    var publication_syntax: grammar.CreatePublicationSyntax = .{
+        .publication_name = try alloc.dupe(u8, "usage_pub"),
+        .table_names = publication_tables,
+    };
+    var publication = createPublicationPlanFromSyntax(&publication_syntax);
+    defer publication.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_pub", publication.publication_name);
+    try std.testing.expectEqualStrings("usage_records", publication.table_names[0]);
+
+    var subscription_publications = try alloc.alloc([]const u8, 1);
+    subscription_publications[0] = try alloc.dupe(u8, "usage_pub");
+    var subscription_syntax: grammar.CreateSubscriptionSyntax = .{
+        .subscription_name = try alloc.dupe(u8, "usage_sub"),
+        .connection_json = try alloc.dupe(u8, "\"host=primary\""),
+        .publication_names = subscription_publications,
+    };
+    var subscription = createSubscriptionPlanFromSyntax(&subscription_syntax);
+    defer subscription.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_sub", subscription.subscription_name);
+    try std.testing.expectEqualStrings("\"host=primary\"", subscription.connection_json);
+    try std.testing.expectEqualStrings("usage_pub", subscription.publication_names[0]);
+
+    var vacuum_syntax: grammar.VacuumMaintenanceSyntax = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .full = true,
+        .analyze = true,
+    };
+    var vacuum = vacuumMaintenancePlanFromSyntax(&vacuum_syntax);
+    defer vacuum.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", vacuum.table_name);
+    try std.testing.expect(vacuum.full);
+    try std.testing.expect(vacuum.analyze);
+
+    const prepare = try prepareStatementPlanFromSyntaxAlloc(alloc, .{
+        .statement_name = "usage_plan",
+        .parameter_count = 2,
+        .statement_kind = .read,
+        .statement_family = .read,
+    });
+    var mutable_prepare = prepare;
+    defer mutable_prepare.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_plan", mutable_prepare.statement_name);
+    try std.testing.expectEqual(@as(usize, 2), mutable_prepare.parameter_count);
+
+    const declare = try declareCursorPortalPlanFromSyntaxAlloc(alloc, .{
+        .portal_name = "usage_cursor",
+        .scroll = .scroll,
+        .hold = true,
+        .statement_kind = .read,
+    });
+    var mutable_declare = declare;
+    defer mutable_declare.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_cursor", mutable_declare.portal_name);
+    try std.testing.expectEqual(CursorScrollMode.scroll, mutable_declare.scroll);
+    try std.testing.expect(mutable_declare.hold);
+
+    var comment_syntax: grammar.CommentMetadataSyntax = .{
+        .target = .column,
+        .object_name = try alloc.dupe(u8, "amount"),
+        .parent_table_name = try alloc.dupe(u8, "usage_records"),
+        .comment_json = try alloc.dupe(u8, "\"billable amount\""),
+    };
+    var comment = commentMetadataPlanFromSyntax(&comment_syntax);
+    defer comment.deinit(alloc);
+    try std.testing.expectEqual(CommentMetadataTarget.column, comment.target);
+    try std.testing.expectEqualStrings("amount", comment.object_name);
+    try std.testing.expectEqualStrings("usage_records", comment.parent_table_name.?);
+
+    var lock_tables = try alloc.alloc([]const u8, 1);
+    lock_tables[0] = try alloc.dupe(u8, "usage_records");
+    var lock_syntax: grammar.TableLockSyntax = .{
+        .table_names = lock_tables,
+        .mode = .share,
+    };
+    var table_lock = tableLockPlanFromSyntax(&lock_syntax);
+    defer table_lock.deinit(alloc);
+    try std.testing.expectEqual(TableLockMode.share, table_lock.mode);
+    try std.testing.expectEqualStrings("usage_records", table_lock.table_names[0]);
+
+    var constraint_names = try alloc.alloc([]const u8, 1);
+    constraint_names[0] = try alloc.dupe(u8, "usage_tenant_fk");
+    var constraint_syntax: grammar.ConstraintModeSyntax = .{
+        .constraint_names = constraint_names,
+        .mode = .deferred,
+    };
+    var constraint_mode = constraintModePlanFromSyntax(&constraint_syntax);
+    defer constraint_mode.deinit(alloc);
+    try std.testing.expectEqual(ConstraintCheckMode.deferred, constraint_mode.mode);
+    try std.testing.expectEqualStrings("usage_tenant_fk", constraint_mode.constraint_names[0]);
+
+    const transaction_mode = transactionModePlanFromSyntax(.{
+        .starter = .start_transaction,
+        .isolation_level = .serializable,
+        .access_mode = .read_only,
+        .deferrable = true,
+    });
+    try std.testing.expectEqual(TransactionModeStarter.start_transaction, transaction_mode.starter);
+    try std.testing.expectEqual(TransactionIsolationLevel.serializable, transaction_mode.isolation_level.?);
+    try std.testing.expectEqual(TransactionAccessMode.read_only, transaction_mode.access_mode.?);
+    try std.testing.expect(transaction_mode.deferrable.?);
+
+    const advisory_lock = advisoryLockPlanFromSyntax(.{
+        .action = .lock,
+        .key1 = 42,
+        .key2 = 7,
+    });
+    try std.testing.expectEqual(AdvisoryLockAction.lock, advisory_lock.action);
+    try std.testing.expectEqual(@as(i64, 42), advisory_lock.key1);
+    try std.testing.expectEqual(@as(i64, 7), advisory_lock.key2.?);
+
+    var sequence_syntax: grammar.CreateSequenceSyntax = .{
+        .sequence_name = try alloc.dupe(u8, "usage_seq"),
+        .if_not_exists = true,
+        .options = .{ .start_with = 10 },
+    };
+    var sequence = createSequencePlanFromSyntax(&sequence_syntax);
+    defer sequence.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_seq", sequence.sequence_name);
+    try std.testing.expect(sequence.if_not_exists);
+    try std.testing.expectEqual(@as(i64, 10), sequence.options.start_with.?);
+
+    var enum_values = try alloc.alloc([]const u8, 2);
+    enum_values[0] = try alloc.dupe(u8, "queued");
+    enum_values[1] = try alloc.dupe(u8, "running");
+    var enum_syntax: grammar.CreateEnumTypeSyntax = .{
+        .type_name = try alloc.dupe(u8, "job_state"),
+        .values = enum_values,
+    };
+    var enum_plan = createEnumTypePlanFromSyntax(&enum_syntax);
+    defer enum_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("job_state", enum_plan.type_name);
+    try std.testing.expectEqualStrings("running", enum_plan.values[1]);
+
+    var collation_syntax: grammar.RenameCollationSyntax = .{
+        .collation_name = try alloc.dupe(u8, "old_collation"),
+        .new_collation_name = try alloc.dupe(u8, "new_collation"),
+    };
+    var collation = renameCollationPlanFromSyntax(&collation_syntax);
+    defer collation.deinit(alloc);
+    try std.testing.expectEqualStrings("old_collation", collation.collation_name);
+    try std.testing.expectEqualStrings("new_collation", collation.new_collation_name);
+
+    var cast_syntax: grammar.CreateCastSyntax = .{
+        .source_type = try alloc.dupe(u8, "text"),
+        .target_type = try alloc.dupe(u8, "jsonb"),
+        .function_name = try alloc.dupe(u8, "text_to_jsonb"),
+        .assignment = true,
+    };
+    var cast_plan = createCastPlanFromSyntax(&cast_syntax);
+    defer cast_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("text", cast_plan.source_type);
+    try std.testing.expectEqualStrings("jsonb", cast_plan.target_type);
+    try std.testing.expect(cast_plan.assignment);
+
+    var view_fields = try alloc.alloc([]const u8, 1);
+    view_fields[0] = try alloc.dupe(u8, "tenant_id");
+    var view_outputs = try alloc.alloc([]const u8, 1);
+    view_outputs[0] = try alloc.dupe(u8, "tenant_id");
+    var view_syntax: grammar.CreateViewSyntax = .{
+        .view_name = try alloc.dupe(u8, "active_usage"),
+        .source_table_name = try alloc.dupe(u8, "usage_records"),
+        .source_fields = view_fields,
+        .output_fields = view_outputs,
+        .replace_existing = true,
+    };
+    var view_plan = createViewPlanFromSyntax(&view_syntax);
+    defer view_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("active_usage", view_plan.view_name);
+    try std.testing.expectEqualStrings("usage_records", view_plan.source_table_name);
+    try std.testing.expectEqualStrings("tenant_id", view_plan.output_fields[0]);
+    try std.testing.expect(view_plan.replace_existing);
+
+    var materialized_syntax: grammar.CreateMaterializedViewSyntax = .{
+        .view_name = try alloc.dupe(u8, "usage_rollup"),
+        .source_table_name = try alloc.dupe(u8, "usage_records"),
+        .if_not_exists = true,
+        .populate_on_create = false,
+    };
+    var materialized_plan = createMaterializedViewPlanFromSyntax(&materialized_syntax);
+    defer materialized_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_rollup", materialized_plan.view_name);
+    try std.testing.expect(materialized_plan.if_not_exists);
+    try std.testing.expect(!materialized_plan.populate_on_create);
+
+    var drop_table_syntax: grammar.DropTableSyntax = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .if_exists = true,
+        .cascade = true,
+    };
+    var drop_table = dropTablePlanFromSyntax(&drop_table_syntax);
+    defer drop_table.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", drop_table.table_name);
+    try std.testing.expect(drop_table.if_exists);
+    try std.testing.expect(drop_table.cascade);
+
+    var drop_index_syntax: grammar.DropIndexSyntax = .{
+        .index_name = try alloc.dupe(u8, "usage_tenant_idx"),
+        .if_exists = true,
+    };
+    var drop_index = dropIndexPlanFromSyntax(&drop_index_syntax);
+    defer drop_index.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_tenant_idx", drop_index.index_name);
+    try std.testing.expect(drop_index.if_exists);
+
+    var create_policy_syntax: grammar.CreateUpdatePolicySyntax = .{
+        .trigger_name = try alloc.dupe(u8, "usage_updated_at"),
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .column_name = try alloc.dupe(u8, "updated_at"),
+    };
+    var create_policy = try createUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &create_policy_syntax);
+    defer create_policy.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_updated_at", create_policy.trigger_name);
+    try std.testing.expectEqualStrings("usage_records", create_policy.table_name);
+    try std.testing.expectEqualStrings("updated_at", create_policy.column_name);
+    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, create_policy.on_update_value.kind);
+
+    var drop_policy_syntax: grammar.DropUpdatePolicySyntax = .{
+        .trigger_name = try alloc.dupe(u8, "usage_updated_at"),
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .if_exists = true,
+    };
+    var drop_policy = try dropUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &drop_policy_syntax);
+    defer drop_policy.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", drop_policy.table_name);
+    try std.testing.expectEqual(@as(usize, 1), drop_policy.operations.len);
+    switch (drop_policy.operations[0]) {
+        .drop_update_policy => |operation| {
+            try std.testing.expectEqualStrings("usage_updated_at", operation.trigger_name);
+            try std.testing.expect(operation.if_exists);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var alter_row_security = try alterRowSecurityPlanFromSyntaxAlloc(alloc, .{
+        .table_identifier = "public.usage_records",
+        .enabled = true,
+    });
+    defer alter_row_security.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", alter_row_security.table_name);
+    try std.testing.expect(alter_row_security.enabled);
+
+    var policy_roles = try alloc.alloc([]const u8, 1);
+    policy_roles[0] = try alloc.dupe(u8, "tenant_reader");
+    var create_row_policy_syntax: grammar.CreateRowSecurityPolicySyntax = .{
+        .policy_name = try alloc.dupe(u8, "tenant_visible"),
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .role_targets = policy_roles,
+        .predicate = .{ .literal_equals = .{
+            .field = try alloc.dupe(u8, "tenant_id"),
+            .value_json = try alloc.dupe(u8, "\"tenant_a\""),
+        } },
+    };
+    var create_row_policy = createRowSecurityPolicyPlanFromSyntax(&create_row_policy_syntax);
+    defer create_row_policy.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant_visible", create_row_policy.policy_name);
+    try std.testing.expectEqualStrings("tenant_reader", create_row_policy.role_targets[0]);
+    switch (create_row_policy.predicate) {
+        .literal_equals => |predicate| try std.testing.expectEqualStrings("tenant_id", predicate.field),
+        else => return error.TestExpectedEqual,
+    }
+
+    var alter_row_policy_syntax: grammar.AlterRowSecurityPolicySyntax = .{
+        .policy_name = try alloc.dupe(u8, "tenant_visible"),
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .predicate = .{ .literal_equals = .{
+            .field = try alloc.dupe(u8, "region"),
+            .value_json = try alloc.dupe(u8, "\"us\""),
+        } },
+    };
+    var alter_row_policy = alterRowSecurityPolicyPlanFromSyntax(&alter_row_policy_syntax);
+    defer alter_row_policy.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant_visible", alter_row_policy.policy_name);
+    switch (alter_row_policy.predicate) {
+        .literal_equals => |predicate| try std.testing.expectEqualStrings("region", predicate.field),
+        else => return error.TestExpectedEqual,
+    }
+
+    var drop_row_policy_syntax: grammar.DropRowSecurityPolicySyntax = .{
+        .policy_name = try alloc.dupe(u8, "tenant_visible"),
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .if_exists = true,
+    };
+    var drop_row_policy = dropRowSecurityPolicyPlanFromSyntax(&drop_row_policy_syntax);
+    defer drop_row_policy.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant_visible", drop_row_policy.policy_name);
+    try std.testing.expect(drop_row_policy.if_exists);
 }
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
@@ -3746,7 +4890,7 @@ pub fn cloneDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtim
     return out;
 }
 
-fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlterOperation) void {
+pub fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlterOperation) void {
     switch (operation) {
         .set_type => |type_name| alloc.free(type_name),
         .set_owned_by => |owned_by| {
@@ -3757,11 +4901,11 @@ fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlter
     }
 }
 
-fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const SequenceAlterOperation) void {
+pub fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const SequenceAlterOperation) void {
     for (operations) |operation| freeSequenceAlterOperation(alloc, operation);
 }
 
-fn freeDatabaseAlterOperations(alloc: std.mem.Allocator, operations: []const DatabaseAlterOperation) void {
+pub fn freeDatabaseAlterOperations(alloc: std.mem.Allocator, operations: []const DatabaseAlterOperation) void {
     for (operations) |operation| {
         var mutable = operation;
         mutable.deinit(alloc);
@@ -3769,7 +4913,7 @@ fn freeDatabaseAlterOperations(alloc: std.mem.Allocator, operations: []const Dat
     if (operations.len > 0) alloc.free(operations);
 }
 
-fn freeAlterTableOperation(alloc: std.mem.Allocator, operation: AlterTableOperation) void {
+pub fn freeAlterTableOperation(alloc: std.mem.Allocator, operation: AlterTableOperation) void {
     switch (operation) {
         .add_column => |add_column| {
             freeDdlRelationalColumn(alloc, add_column.column);
@@ -3810,19 +4954,23 @@ fn freeAlterTableOperation(alloc: std.mem.Allocator, operation: AlterTableOperat
     }
 }
 
-fn freeDdlRelationalCheck(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) void {
+pub fn freeDdlRelationalCheck(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) void {
     alloc.free(check.name);
     alloc.free(check.field);
     if (check.value_json) |value| alloc.free(value);
     if (check.expression) |expression| plan_mod.freeExpressionCondition(alloc, expression);
 }
 
-fn freeDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
+pub fn clearDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
     for (checks) |check| freeDdlRelationalCheck(alloc, check);
+}
+
+pub fn freeDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
+    clearDdlRelationalChecks(alloc, checks);
     if (checks.len > 0) alloc.free(checks);
 }
 
-fn freeDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) void {
+pub fn freeDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) void {
     alloc.free(column.name);
     alloc.free(column.path);
     if (column.collation) |collation| alloc.free(collation);
@@ -3836,41 +4984,41 @@ fn freeDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.Rela
     if (column.index_where_expressions.len > 0) alloc.free(column.index_where_expressions);
 }
 
-fn clearDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
+pub fn clearDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
     for (columns) |column| freeDdlRelationalColumn(alloc, column);
 }
 
-fn freeDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
+pub fn freeDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
     clearDdlRelationalColumns(alloc, columns);
     if (columns.len > 0) alloc.free(columns);
 }
 
-fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) void {
+pub fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) void {
     if (generated.field) |field| alloc.free(field);
     freeStringSlice(alloc, generated.fields);
     if (generated.separator.len > 0) alloc.free(generated.separator);
     if (generated.expression) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
 }
 
-fn freeDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) void {
+pub fn freeDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) void {
     if (primary_key.name) |name| alloc.free(name);
     freeStringSlice(alloc, primary_key.columns);
     freeStringSlice(alloc, primary_key.include_columns);
     if (primary_key.without_overlaps_period) |period| alloc.free(period);
 }
 
-fn freeDdlPeriod(alloc: std.mem.Allocator, period: runtime_schema.RelationalPeriod) void {
+pub fn freeDdlPeriod(alloc: std.mem.Allocator, period: runtime_schema.RelationalPeriod) void {
     alloc.free(period.name);
     alloc.free(period.start_column);
     alloc.free(period.end_column);
 }
 
-fn freeDdlPeriods(alloc: std.mem.Allocator, periods: []const runtime_schema.RelationalPeriod) void {
+pub fn freeDdlPeriods(alloc: std.mem.Allocator, periods: []const runtime_schema.RelationalPeriod) void {
     for (periods) |period| freeDdlPeriod(alloc, period);
     if (periods.len > 0) alloc.free(periods);
 }
 
-fn freeDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.UniqueConstraint) void {
+pub fn freeDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.UniqueConstraint) void {
     alloc.free(constraint.name);
     freeStringSlice(alloc, constraint.columns);
     freeDdlUniqueExpressions(alloc, constraint.expressions);
@@ -3881,22 +5029,30 @@ fn freeDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.
     if (constraint.where_expressions.len > 0) alloc.free(constraint.where_expressions);
 }
 
-fn freeDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) void {
+pub fn clearDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) void {
     for (constraints) |constraint| freeDdlUniqueConstraint(alloc, constraint);
+}
+
+pub fn freeDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) void {
+    clearDdlUniqueConstraints(alloc, constraints);
     if (constraints.len > 0) alloc.free(constraints);
 }
 
-fn freeDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) void {
+pub fn freeDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) void {
     if (expression.field.len > 0) alloc.free(expression.field);
     if (expression.expression) |row_expression| runtime_schema.freeRelationalRowsExpression(alloc, row_expression);
 }
 
-fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
+pub fn clearDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
     for (expressions) |expression| freeDdlUniqueExpression(alloc, expression);
+}
+
+pub fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
+    clearDdlUniqueExpressions(alloc, expressions);
     if (expressions.len > 0) alloc.free(expressions);
 }
 
-fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) void {
+pub fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) void {
     for (predicates) |predicate| {
         alloc.free(predicate.field);
         if (predicate.value_json) |value| alloc.free(value);
@@ -3904,7 +5060,7 @@ fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime
     if (predicates.len > 0) alloc.free(predicates);
 }
 
-fn freeDdlForeignKey(alloc: std.mem.Allocator, foreign_key: runtime_schema.ForeignKey) void {
+pub fn freeDdlForeignKey(alloc: std.mem.Allocator, foreign_key: runtime_schema.ForeignKey) void {
     alloc.free(foreign_key.name);
     freeStringSlice(alloc, foreign_key.child_columns);
     if (foreign_key.child_period) |period| alloc.free(period);
@@ -3913,8 +5069,12 @@ fn freeDdlForeignKey(alloc: std.mem.Allocator, foreign_key: runtime_schema.Forei
     if (foreign_key.parent_period) |period| alloc.free(period);
 }
 
-fn freeDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) void {
+pub fn clearDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) void {
     for (foreign_keys) |foreign_key| freeDdlForeignKey(alloc, foreign_key);
+}
+
+pub fn freeDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) void {
+    clearDdlForeignKeys(alloc, foreign_keys);
     if (foreign_keys.len > 0) alloc.free(foreign_keys);
 }
 
@@ -3922,12 +5082,16 @@ fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.typ
     for (values) |value| plan_mod.freeExpressionCondition(alloc, value);
 }
 
-fn freeDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
+pub fn freeDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
+    clearDomainAlterOperations(alloc, operations);
+    if (operations.len > 0) alloc.free(operations);
+}
+
+pub fn clearDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
     for (operations) |operation_const| {
         var operation = operation_const;
         operation.deinit(alloc);
     }
-    if (operations.len > 0) alloc.free(operations);
 }
 
 test "SQL adapter DDL enum plans own nested values" {

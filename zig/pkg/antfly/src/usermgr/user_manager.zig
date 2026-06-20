@@ -1592,17 +1592,54 @@ pub const UserManager = struct {
             for (rules) |*rule| rule.deinit(self.alloc);
             self.alloc.free(rules);
         }
+
+        var sql_filters = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]u8)){};
+        defer {
+            var it = sql_filters.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                for (entry.value_ptr.items) |filter| self.alloc.free(filter);
+                entry.value_ptr.deinit(self.alloc);
+            }
+            sql_filters.deinit(self.alloc);
+        }
+
         for (rules) |rule| {
             if (rule.fields.len < 3) continue;
             if (!isSqlRowSecurityPolicySubject(rule.fields[0])) continue;
             if (!(try self.sqlRowSecurityEnabled(rule.fields[1]))) continue;
             if (!(try self.sqlRowSecurityPolicyAppliesToUser(rule.fields[0], rule.fields[1], username, roles))) continue;
-            const entry = RowFilterEntry{
-                .table = @constCast(rule.fields[1]),
-                .filter = @constCast(rule.fields[2]),
-            };
-            try mergeRowFilterEntry(self.alloc, merged, entry);
+            const gop = try sql_filters.getOrPut(self.alloc, rule.fields[1]);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.alloc.dupe(u8, rule.fields[1]);
+                gop.value_ptr.* = .empty;
+            }
+            const filter = try self.alloc.dupe(u8, rule.fields[2]);
+            errdefer self.alloc.free(filter);
+            try gop.value_ptr.append(self.alloc, filter);
         }
+
+        var it = sql_filters.iterator();
+        while (it.next()) |entry| {
+            const filter = try sqlRowSecurityPermissiveFilterJsonAlloc(self.alloc, entry.value_ptr.items);
+            defer self.alloc.free(filter);
+            try mergeRowFilter(self.alloc, merged, entry.key_ptr.*, filter);
+        }
+    }
+
+    fn sqlRowSecurityPermissiveFilterJsonAlloc(alloc: Allocator, filters: []const []const u8) ![]u8 {
+        if (filters.len == 0) return error.InvalidRowFilter;
+        if (filters.len == 1) return try alloc.dupe(u8, filters[0]);
+
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "{\"disjuncts\":[");
+        for (filters, 0..) |filter, i| {
+            if (i != 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, filter);
+        }
+        try out.appendSlice(alloc, "]}");
+        return try out.toOwnedSlice(alloc);
     }
 
     fn sqlRowSecurityPolicyAppliesToUser(self: *const UserManager, policy_subject: []const u8, table: []const u8, username: []const u8, roles: []const []const u8) !bool {
@@ -2061,17 +2098,26 @@ fn mergeRowFilterEntry(
     merged: *std.StringArrayHashMapUnmanaged([]u8),
     entry: RowFilterEntry,
 ) !void {
-    const gop = try merged.getOrPut(alloc, entry.table);
+    try mergeRowFilter(alloc, merged, entry.table, entry.filter);
+}
+
+fn mergeRowFilter(
+    alloc: Allocator,
+    merged: *std.StringArrayHashMapUnmanaged([]u8),
+    table: []const u8,
+    filter: []const u8,
+) !void {
+    const gop = try merged.getOrPut(alloc, table);
     if (!gop.found_existing) {
-        gop.key_ptr.* = try alloc.dupe(u8, entry.table);
-        gop.value_ptr.* = try alloc.dupe(u8, entry.filter);
+        gop.key_ptr.* = try alloc.dupe(u8, table);
+        gop.value_ptr.* = try alloc.dupe(u8, filter);
         return;
     }
 
     const combined = try std.fmt.allocPrint(
         alloc,
         "{{\"conjuncts\":[{s},{s}]}}",
-        .{ gop.value_ptr.*, entry.filter },
+        .{ gop.value_ptr.*, filter },
     );
     alloc.free(gop.value_ptr.*);
     gop.value_ptr.* = combined;
@@ -2745,6 +2791,8 @@ test "usermgr SQL row security policy targets follow role membership durably" {
         alloc.free(alice_filters);
     }
     try std.testing.expectEqual(@as(usize, 1), alice_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"disjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"conjuncts\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"tenant_id\":\"acme\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"visibility\":\"public\"") != null);
 

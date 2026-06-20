@@ -1312,7 +1312,17 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAlloc(
     sql: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !AppliedRelationalSqlDdlRecord {
-    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    return try applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(alloc, table, sql, session, .{});
+}
+
+pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: relational_sql.SqlFunctionBindings,
+) !AppliedRelationalSqlDdlRecord {
+    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     if (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) |table_ref_value| {
@@ -1358,7 +1368,16 @@ pub fn relationalSqlDdlTargetWithSessionAlloc(
     sql: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !RelationalSqlDdlTarget {
-    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    return try relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(alloc, sql, session, .{});
+}
+
+pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: relational_sql.SqlFunctionBindings,
+) !RelationalSqlDdlTarget {
+    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     var table_ref = (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) orelse return error.UnsupportedSqlShape;
@@ -3369,6 +3388,17 @@ pub fn applyRelationalCatalogDdlOnServiceWithSessionAlloc(
     sql: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !?AppliedRelationalSqlDdlRecord {
+    return try applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(alloc, svc, snapshot, sql, session, .{});
+}
+
+pub fn applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: relational_sql.SqlFunctionBindings,
+) !?AppliedRelationalSqlDdlRecord {
     const ServiceType = @TypeOf(svc);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -3384,7 +3414,7 @@ pub fn applyRelationalCatalogDdlOnServiceWithSessionAlloc(
         return null;
     }
 
-    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     switch (plan) {

@@ -60,7 +60,17 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalog(
     sql: []const u8,
     catalog: SqlAuthCatalog,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    return try executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(manager, alloc, sql, catalog, .{});
+}
+
+pub fn executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    catalog: SqlAuthCatalog,
+    function_bindings: relational_sql.SqlFunctionBindings,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     switch (plan) {
@@ -1101,8 +1111,11 @@ test "sql auth adapter applies row security policies through user manager" {
     }
     try std.testing.expectEqual(@as(usize, 1), filters.len);
     try std.testing.expectEqualStrings(usage_records_resource, filters[0].table);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"disjuncts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"$auth\":\"settings.app.tenant_id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"status\":\"archived\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"expression_where\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"field\":\"status\"") != null);
 
     try std.testing.expectError(error.PolicyExists, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
     var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;

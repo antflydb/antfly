@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const binder = @import("binder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const json_helpers = @import("../json_helpers.zig");
@@ -436,6 +437,700 @@ pub fn applyCreateUpdatePolicyPlanToSchemaJsonValue(
     try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-on-update"), try schemaJsonDefaultValueAlloc(alloc, plan.on_update_value, true));
 }
 
+pub fn applyCommentMetadataPlanToSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    plan: ddl_plan.CommentMetadataPlan,
+) !void {
+    const schema_parts = try relationalSchemaJsonParts(root);
+    if (plan.object_name.len == 0) return error.InvalidSqlCatalog;
+
+    const comments = try rootObjectFieldAlloc(alloc, root, "comments");
+    switch (plan.target) {
+        .table => try applyStringCommentValueToObject(alloc, comments, "table", plan.comment_json),
+        .column => {
+            const column_name = commentColumnName(plan.object_name);
+            const property = schema_parts.properties.getPtr(column_name) orelse return error.InvalidSqlCatalog;
+            if (property.* != .object) return error.InvalidSqlCatalog;
+            const columns = try rootObjectFieldAlloc(alloc, comments, "columns");
+            try applyStringCommentValueToObject(alloc, columns, column_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "columns");
+        },
+        .index => {
+            if (!try schemaJsonIndexNameExists(schema_parts.properties, root.getPtr("unique_constraints"), plan.object_name)) return error.InvalidSqlCatalog;
+            const indexes = try rootObjectFieldAlloc(alloc, comments, "indexes");
+            try applyStringCommentValueToObject(alloc, indexes, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "indexes");
+        },
+        .constraint => {
+            const parent_table = plan.parent_table_name orelse return error.InvalidSqlCatalog;
+            if (!try jsonConstraintNameExists(root, parent_table, plan.object_name)) return error.InvalidSqlCatalog;
+            const constraints = try rootObjectFieldAlloc(alloc, comments, "constraints");
+            try applyStringCommentValueToObject(alloc, constraints, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "constraints");
+        },
+    }
+    if (try schemaJsonCommentCountInObject(comments) == 0) _ = root.orderedRemove("comments");
+}
+
+fn commentColumnName(object_name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, object_name, '.') orelse return object_name;
+    return object_name[dot + 1 ..];
+}
+
+fn applyStringCommentValueToObject(
+    alloc: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    comment_json: ?[]const u8,
+) !void {
+    const raw = comment_json orelse {
+        _ = object.orderedRemove(key);
+        return;
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const value = switch (parsed.value) {
+        .string => |value| value,
+        else => return error.UnsupportedSqlShape,
+    };
+    try putJsonString(alloc, object, key, value);
+}
+
+pub fn applyAlterTablePlanToSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    plan: ddl_plan.AlterTablePlan,
+) !void {
+    const schema_parts = try relationalSchemaJsonParts(root);
+    for (plan.operations) |operation| {
+        switch (operation) {
+            .add_column => |add_column| try addColumnOperationToSchemaJsonValue(alloc, root, schema_parts, add_column),
+            .add_period => |period| {
+                var periods = try rootArrayFieldAlloc(alloc, root, "periods");
+                try periods.append(try schemaJsonPeriodAlloc(alloc, period));
+            },
+            .add_primary_key => |primary_key| {
+                if (root.get("primary_key") != null) return error.InvalidSqlCatalog;
+                try root.put(alloc, try alloc.dupe(u8, "primary_key"), try schemaJsonPrimaryKeyAlloc(alloc, primary_key));
+            },
+            .rename_column => |rename_column| try renameColumnInSchemaJsonValue(alloc, root, schema_parts, rename_column),
+            .rename_constraint => |rename_constraint| try renameConstraintInSchemaJsonValue(alloc, root, plan.table_name, rename_constraint),
+            .drop_column => |drop_column| try dropColumnFromSchemaJsonValue(alloc, root, schema_parts, drop_column),
+            .drop_constraint => |drop_constraint| try dropConstraintFromSchemaJsonValue(root, plan.table_name, drop_constraint),
+            .drop_update_policy => |drop_update_policy| try dropUpdatePolicyFromSchemaJsonValue(schema_parts, drop_update_policy),
+            .alter_column_default => |alter_column_default| try alterColumnDefaultInSchemaJsonValue(alloc, schema_parts, alter_column_default),
+            .alter_column_nullability => |alter_column_nullability| try alterColumnNullabilityInSchemaJsonValue(alloc, root, schema_parts, alter_column_nullability),
+            .alter_column_type => |alter_column_type| try alterColumnTypeInSchemaJsonValue(alloc, schema_parts, alter_column_type),
+            .add_unique_constraint => |constraint| {
+                var constraints = try rootArrayFieldAlloc(alloc, root, "unique_constraints");
+                try constraints.append(try schemaJsonUniqueConstraintAlloc(alloc, constraint));
+            },
+            .add_foreign_key => |foreign_key| {
+                var foreign_keys = try rootArrayFieldAlloc(alloc, root, "foreign_keys");
+                try foreign_keys.append(try schemaJsonForeignKeyAlloc(alloc, foreign_key));
+            },
+            .add_check => |check| {
+                var checks = try rootArrayFieldAlloc(alloc, root, "checks");
+                try checks.append(try schemaJsonRelationalCheckAlloc(alloc, check));
+            },
+            .validate_constraint => |constraint_name| try validateConstraintByNameInSchemaJson(alloc, root, plan.table_name, constraint_name),
+        }
+    }
+    try pruneSchemaJsonCommentsForCurrentSchema(root, plan.table_name);
+}
+
+fn addColumnOperationToSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    schema_parts: RelationalSchemaJsonParts,
+    operation: ddl_plan.AddColumnOperation,
+) !void {
+    if (schema_parts.properties.get(operation.column.name) != null) {
+        if (operation.if_not_exists) return;
+        return error.InvalidSqlCatalog;
+    }
+    try schema_parts.properties.put(alloc, try alloc.dupe(u8, operation.column.name), try schemaJsonPropertyFromColumnAlloc(alloc, operation.column));
+    if (!operation.column.nullable) {
+        var required = try rootArrayFieldAlloc(alloc, schema_parts.schema, "required");
+        try required.append(.{ .string = try alloc.dupe(u8, operation.column.name) });
+    }
+    if (operation.unique_constraints.len > 0) {
+        var constraints = try rootArrayFieldAlloc(alloc, root, "unique_constraints");
+        for (operation.unique_constraints) |constraint| try constraints.append(try schemaJsonUniqueConstraintAlloc(alloc, constraint));
+    }
+    if (operation.foreign_keys.len > 0) {
+        var foreign_keys = try rootArrayFieldAlloc(alloc, root, "foreign_keys");
+        for (operation.foreign_keys) |foreign_key| try foreign_keys.append(try schemaJsonForeignKeyAlloc(alloc, foreign_key));
+    }
+    if (operation.checks.len > 0) {
+        var checks = try rootArrayFieldAlloc(alloc, root, "checks");
+        for (operation.checks) |check| try checks.append(try schemaJsonRelationalCheckAlloc(alloc, check));
+    }
+}
+
+fn dropUpdatePolicyFromSchemaJsonValue(
+    schema_parts: RelationalSchemaJsonParts,
+    operation: ddl_plan.DropUpdatePolicyOperation,
+) !void {
+    _ = operation.trigger_name;
+    var policy_count: usize = 0;
+    var it = schema_parts.properties.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidSqlCatalog;
+        if (entry.value_ptr.object.get("x-antfly-on-update") == null) continue;
+        policy_count += 1;
+    }
+    if (policy_count == 0) {
+        if (operation.if_exists) return;
+        return error.InvalidSqlCatalog;
+    }
+    if (policy_count > 1) return error.InvalidSqlCatalog;
+
+    var remove_it = schema_parts.properties.iterator();
+    while (remove_it.next()) |entry| {
+        if (entry.value_ptr.object.get("x-antfly-on-update") == null) continue;
+        _ = entry.value_ptr.object.orderedRemove("x-antfly-on-update");
+        return;
+    }
+    return error.InvalidSqlCatalog;
+}
+
+fn renameColumnInSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    schema_parts: RelationalSchemaJsonParts,
+    operation: ddl_plan.RenameColumnOperation,
+) !void {
+    if (std.mem.eql(u8, operation.old_name, operation.new_name)) return error.InvalidSqlCatalog;
+    if (schema_parts.properties.get(operation.new_name) != null) return error.InvalidSqlCatalog;
+    const property = schema_parts.properties.get(operation.old_name) orelse return error.InvalidSqlCatalog;
+    _ = schema_parts.properties.orderedRemove(operation.old_name);
+    try schema_parts.properties.put(alloc, try alloc.dupe(u8, operation.new_name), property);
+
+    try renameStringInJsonArray(alloc, schema_parts.schema.getPtr("required"), operation.old_name, operation.new_name);
+    if (root.getPtr("primary_key")) |primary_key| try renamePrimaryKeyJsonFields(alloc, primary_key, operation.old_name, operation.new_name);
+
+    var property_it = schema_parts.properties.iterator();
+    while (property_it.next()) |entry| {
+        try renameSchemaPropertyReferences(alloc, entry.value_ptr, operation.old_name, operation.new_name);
+    }
+
+    try renameConstraintArrayFields(alloc, root.getPtr("unique_constraints"), operation.old_name, operation.new_name, .unique);
+    try renameConstraintArrayFields(alloc, root.getPtr("foreign_keys"), operation.old_name, operation.new_name, .foreign_key);
+    try renameConstraintArrayFields(alloc, root.getPtr("checks"), operation.old_name, operation.new_name, .check);
+    try renameCommentMapEntry(alloc, root, "columns", operation.old_name, operation.new_name);
+}
+
+fn dropColumnFromSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    schema_parts: RelationalSchemaJsonParts,
+    drop_column: ddl_plan.DropColumnOperation,
+) !void {
+    if (schema_parts.properties.get(drop_column.name) == null) {
+        if (drop_column.if_exists) return;
+        return error.InvalidSqlCatalog;
+    }
+
+    var dropped = std.ArrayListUnmanaged([]const u8).empty;
+    defer dropped.deinit(alloc);
+    try appendUniqueBorrowedString(alloc, &dropped, drop_column.name);
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var it = schema_parts.properties.iterator();
+        while (it.next()) |entry| {
+            if (stringSlicesContains(dropped.items, entry.key_ptr.*)) continue;
+            if (propertyGeneratedReferencesAny(entry.value_ptr.*, dropped.items)) {
+                try appendUniqueBorrowedString(alloc, &dropped, entry.key_ptr.*);
+                changed = true;
+            }
+        }
+    }
+
+    try rejectPrimaryKeyDropFromSchemaJson(root, dropped.items);
+    if (drop_column.dependency_mode == .restrict and try schemaJsonHasDropDependencies(root, dropped.items)) {
+        return error.InvalidSqlCatalog;
+    }
+
+    for (dropped.items) |name| {
+        if (!schema_parts.properties.orderedRemove(name)) return error.InvalidSqlCatalog;
+    }
+    try removeStringsFromJsonArray(schema_parts.schema.getPtr("required"), dropped.items);
+    try removeDependentConstraintsFromJsonArray(root.getPtr("unique_constraints"), dropped.items, .unique);
+    try removeDependentConstraintsFromJsonArray(root.getPtr("foreign_keys"), dropped.items, .foreign_key);
+    try removeDependentConstraintsFromJsonArray(root.getPtr("checks"), dropped.items, .check);
+}
+
+fn schemaJsonHasDropDependencies(root: *std.json.ObjectMap, dropped: []const []const u8) !bool {
+    if (dropped.len > 1) return true;
+    if (try jsonConstraintArrayReferencesAny(root.getPtr("unique_constraints"), dropped, .unique)) return true;
+    if (try jsonConstraintArrayReferencesAny(root.getPtr("foreign_keys"), dropped, .foreign_key)) return true;
+    if (try jsonConstraintArrayReferencesAny(root.getPtr("checks"), dropped, .check)) return true;
+    const schema_parts = try relationalSchemaJsonParts(root);
+    var it = schema_parts.properties.iterator();
+    while (it.next()) |entry| {
+        if (schemaJsonSecondaryIndexReferencesAny(entry.value_ptr.*, dropped)) return true;
+    }
+    return false;
+}
+
+fn jsonConstraintArrayReferencesAny(
+    value: ?*std.json.Value,
+    fields: []const []const u8,
+    kind: JsonConstraintKind,
+) !bool {
+    const array_value = value orelse return false;
+    if (array_value.* != .array) return error.InvalidSqlCatalog;
+    for (array_value.array.items) |item| {
+        if (item != .object) return error.InvalidSqlCatalog;
+        const references = switch (kind) {
+            .unique => jsonUniqueConstraintReferencesAny(item, fields),
+            .foreign_key => jsonStringArrayReferencesAny(item.object.get("columns") orelse return error.InvalidSqlCatalog, fields),
+            .check => blk: {
+                const field = item.object.get("field") orelse return error.InvalidSqlCatalog;
+                break :blk field == .string and stringSlicesContains(fields, field.string);
+            },
+        };
+        if (references) return true;
+    }
+    return false;
+}
+
+fn validateConstraintByNameInSchemaJson(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    table_name: []const u8,
+    constraint_name: []const u8,
+) !void {
+    if (try schemaJsonPrimaryKeyNameEquals(root, table_name, constraint_name)) return;
+    if (try setNamedConstraintValidationStateInArray(alloc, root, "unique_constraints", constraint_name, "enforced")) return;
+    if (try setNamedConstraintValidationStateInArray(alloc, root, "foreign_keys", constraint_name, "enforced")) return;
+    if (try setNamedConstraintValidationStateInArray(alloc, root, "checks", constraint_name, "enforced")) return;
+    return error.InvalidSqlCatalog;
+}
+
+fn dropConstraintFromSchemaJsonValue(
+    root: *std.json.ObjectMap,
+    table_name: []const u8,
+    drop_constraint: ddl_plan.DropConstraintOperation,
+) !void {
+    if (try dropPrimaryKeyFromSchemaJsonValue(root, table_name, drop_constraint.name)) {
+        removeCommentMapEntry(root, "constraints", drop_constraint.name);
+        return;
+    }
+    if (try removeNamedConstraintFromJsonArray(root.getPtr("unique_constraints"), drop_constraint.name)) return;
+    if (try removeNamedConstraintFromJsonArray(root.getPtr("foreign_keys"), drop_constraint.name)) return;
+    if (try removeNamedConstraintFromJsonArray(root.getPtr("checks"), drop_constraint.name)) return;
+    if (drop_constraint.if_exists) return;
+    return error.InvalidSqlCatalog;
+}
+
+fn dropPrimaryKeyFromSchemaJsonValue(
+    root: *std.json.ObjectMap,
+    table_name: []const u8,
+    constraint_name: []const u8,
+) !bool {
+    if (!try schemaJsonPrimaryKeyNameEquals(root, table_name, constraint_name)) return false;
+    _ = root.orderedRemove("primary_key");
+    return true;
+}
+
+fn renameConstraintInSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    table_name: []const u8,
+    operation: ddl_plan.RenameConstraintOperation,
+) !void {
+    if (std.mem.eql(u8, operation.old_name, operation.new_name)) return error.InvalidSqlCatalog;
+    if (try jsonConstraintNameExists(root, table_name, operation.new_name)) return error.InvalidSqlCatalog;
+    const renamed =
+        try renamePrimaryKeyConstraintInSchemaJsonValue(alloc, root, table_name, operation.old_name, operation.new_name) or
+        try renameNamedConstraintInJsonArray(alloc, root.getPtr("unique_constraints"), operation.old_name, operation.new_name) or
+        try renameNamedConstraintInJsonArray(alloc, root.getPtr("foreign_keys"), operation.old_name, operation.new_name) or
+        try renameNamedConstraintInJsonArray(alloc, root.getPtr("checks"), operation.old_name, operation.new_name);
+    if (!renamed) return error.InvalidSqlCatalog;
+    try renameCommentMapEntry(alloc, root, "constraints", operation.old_name, operation.new_name);
+    try renameCommentMapEntry(alloc, root, "indexes", operation.old_name, operation.new_name);
+}
+
+fn renamePrimaryKeyConstraintInSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    table_name: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) !bool {
+    const primary_key = root.getPtr("primary_key") orelse return false;
+    if (primary_key.* == .null) return false;
+    if (primary_key.* != .object) return error.InvalidSqlCatalog;
+    if (primary_key.object.get("name")) |existing| {
+        if (existing != .string) return error.InvalidSqlCatalog;
+        if (!std.mem.eql(u8, existing.string, old_name)) return false;
+        _ = primary_key.object.orderedRemove("name");
+        try putJsonString(alloc, &primary_key.object, "name", new_name);
+        return true;
+    }
+    if (!binder.defaultPrimaryKeyNameEquals(table_name, old_name)) return false;
+    _ = primary_key.object.orderedRemove("name");
+    try putJsonString(alloc, &primary_key.object, "name", new_name);
+    return true;
+}
+
+fn renameNamedConstraintInJsonArray(
+    alloc: std.mem.Allocator,
+    value: ?*std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !bool {
+    const array_value = value orelse return false;
+    if (array_value.* != .array) return error.InvalidSqlCatalog;
+    for (array_value.array.items) |*item| {
+        if (item.* != .object) return error.InvalidSqlCatalog;
+        const name = item.object.get("name") orelse return error.InvalidSqlCatalog;
+        if (name != .string) return error.InvalidSqlCatalog;
+        if (!std.mem.eql(u8, name.string, old_name)) continue;
+        try putJsonString(alloc, &item.object, "name", new_name);
+        return true;
+    }
+    return false;
+}
+
+fn alterColumnDefaultInSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    schema_parts: RelationalSchemaJsonParts,
+    operation: ddl_plan.AlterColumnDefaultOperation,
+) !void {
+    const property = schema_parts.properties.getPtr(operation.column_name) orelse return error.InvalidSqlCatalog;
+    if (property.* != .object) return error.InvalidSqlCatalog;
+    _ = property.object.orderedRemove("default");
+    _ = property.object.orderedRemove("x-antfly-default");
+    if (operation.default_value) |default_value| {
+        const key = if (default_value.kind == .literal) "default" else "x-antfly-default";
+        try property.object.put(alloc, try alloc.dupe(u8, key), try schemaJsonDefaultValueAlloc(alloc, default_value, default_value.kind != .literal));
+    }
+}
+
+fn alterColumnNullabilityInSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    schema_parts: RelationalSchemaJsonParts,
+    operation: ddl_plan.AlterColumnNullabilityOperation,
+) !void {
+    if (schema_parts.properties.get(operation.column_name) == null) return error.InvalidSqlCatalog;
+    if (operation.nullable) {
+        try rejectPrimaryKeyDropFromSchemaJson(root, &.{operation.column_name});
+        try removeStringsFromJsonArray(schema_parts.schema.getPtr("required"), &.{operation.column_name});
+        return;
+    }
+    const required = try rootArrayFieldAlloc(alloc, schema_parts.schema, "required");
+    try appendUniqueJsonString(alloc, required, operation.column_name);
+}
+
+fn alterColumnTypeInSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    schema_parts: RelationalSchemaJsonParts,
+    operation: ddl_plan.AlterColumnTypeOperation,
+) !void {
+    const property = schema_parts.properties.getPtr(operation.column_name) orelse return error.InvalidSqlCatalog;
+    if (property.* != .object) return error.InvalidSqlCatalog;
+    if (property.object.get("generated") != null) return error.UnsupportedSqlShape;
+    if (operation.collation != null and !binder.relationalFieldTypeSupportsCollation(operation.field_type)) return error.UnsupportedSqlShape;
+    if (!binder.relationalFieldTypeSupportsCollation(operation.field_type) and property.object.get("collation") != null) return error.UnsupportedSqlShape;
+    try putJsonString(alloc, &property.object, "type", ddl_plan.antflyTypeSchemaName(operation.field_type));
+    _ = property.object.orderedRemove("items");
+    if (operation.field_type == .array) {
+        const item_type = operation.array_item_type orelse return error.InvalidSqlCatalog;
+        var item_object = std.json.ObjectMap.empty;
+        try putJsonString(alloc, &item_object, "type", ddl_plan.antflyTypeSchemaName(item_type));
+        try property.object.put(alloc, try alloc.dupe(u8, "items"), .{ .object = item_object });
+    }
+    if (operation.collation) |collation| try putJsonString(alloc, &property.object, "collation", collation);
+}
+
+fn appendUniqueJsonString(
+    alloc: std.mem.Allocator,
+    array: *std.json.Array,
+    value: []const u8,
+) !void {
+    for (array.items) |item| {
+        if (item != .string) return error.InvalidSqlCatalog;
+        if (std.mem.eql(u8, item.string, value)) return;
+    }
+    try array.append(.{ .string = try alloc.dupe(u8, value) });
+}
+
+fn renamePrimaryKeyJsonFields(
+    alloc: std.mem.Allocator,
+    primary_key: *std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (primary_key.* != .object) return error.InvalidSqlCatalog;
+    try renameStringInJsonArray(alloc, primary_key.object.getPtr("columns"), old_name, new_name);
+    try renameStringInJsonArray(alloc, primary_key.object.getPtr("include_columns"), old_name, new_name);
+}
+
+fn renameSchemaPropertyReferences(
+    alloc: std.mem.Allocator,
+    property: *std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (property.* != .object) return;
+    if (property.object.getPtr("generated")) |generated| try renameGeneratedJsonFields(alloc, generated, old_name, new_name);
+    try renameStringInJsonArray(alloc, property.object.getPtr("x-antfly-index-include"), old_name, new_name);
+    if (property.object.getPtr("x-antfly-index-where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
+    if (property.object.getPtr("x-antfly-index-where-expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
+}
+
+fn renameGeneratedJsonFields(
+    alloc: std.mem.Allocator,
+    generated: *std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (generated.* != .object) return error.InvalidSqlCatalog;
+    try renameStringFieldInJsonObject(alloc, &generated.object, "field", old_name, new_name);
+    try renameStringInJsonArray(alloc, generated.object.getPtr("fields"), old_name, new_name);
+    if (generated.object.getPtr("expression")) |expression| try renameExpressionJsonFields(alloc, expression, old_name, new_name);
+}
+
+fn renameConstraintArrayFields(
+    alloc: std.mem.Allocator,
+    value: ?*std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+    kind: JsonConstraintKind,
+) !void {
+    const array_value = value orelse return;
+    if (array_value.* != .array) return error.InvalidSqlCatalog;
+    for (array_value.array.items) |*item| {
+        if (item.* != .object) return error.InvalidSqlCatalog;
+        switch (kind) {
+            .unique => {
+                try renameStringInJsonArray(alloc, item.object.getPtr("columns"), old_name, new_name);
+                if (item.object.getPtr("expressions")) |expressions| try renameUniqueExpressionJsonFields(alloc, expressions, old_name, new_name);
+                try renameStringInJsonArray(alloc, item.object.getPtr("include_columns"), old_name, new_name);
+                if (item.object.getPtr("where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
+                if (item.object.getPtr("where_expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
+            },
+            .foreign_key => try renameStringInJsonArray(alloc, item.object.getPtr("columns"), old_name, new_name),
+            .check => {
+                try renameStringFieldInJsonObject(alloc, &item.object, "field", old_name, new_name);
+                if (item.object.getPtr("expression")) |expression| try renameExpressionJsonFields(alloc, expression, old_name, new_name);
+            },
+        }
+    }
+}
+
+fn renameUniqueExpressionJsonFields(
+    alloc: std.mem.Allocator,
+    expressions: *std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (expressions.* != .array) return error.InvalidSqlCatalog;
+    for (expressions.array.items) |*expression| {
+        if (expression.* != .object) return error.InvalidSqlCatalog;
+        try renameStringFieldInJsonObject(alloc, &expression.object, "field", old_name, new_name);
+        if (expression.object.getPtr("expression")) |row_expression| try renameExpressionJsonFields(alloc, row_expression, old_name, new_name);
+    }
+}
+
+fn renameUniquePredicateDefinitionJsonFields(
+    alloc: std.mem.Allocator,
+    value: *std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (value.* != .object) return error.InvalidSqlCatalog;
+    const all = value.object.getPtr("all") orelse return;
+    if (all.* != .array) return error.InvalidSqlCatalog;
+    for (all.array.items) |*item| {
+        if (item.* != .object) return error.InvalidSqlCatalog;
+        try renameStringFieldInJsonObject(alloc, &item.object, "field", old_name, new_name);
+    }
+}
+
+fn renameExpressionJsonFields(
+    alloc: std.mem.Allocator,
+    value: *std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    switch (value.*) {
+        .object => |*object| {
+            try renameStringFieldInJsonObject(alloc, object, "field", old_name, new_name);
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                try renameExpressionJsonFields(alloc, entry.value_ptr, old_name, new_name);
+            }
+        },
+        .array => |*array| {
+            for (array.items) |*item| {
+                try renameExpressionJsonFields(alloc, item, old_name, new_name);
+            }
+        },
+        else => {},
+    }
+}
+
+fn renameStringInJsonArray(
+    alloc: std.mem.Allocator,
+    value: ?*std.json.Value,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    const array_value = value orelse return;
+    if (array_value.* != .array) return error.InvalidSqlCatalog;
+    for (array_value.array.items) |*item| {
+        if (item.* != .string) return error.InvalidSqlCatalog;
+        if (std.mem.eql(u8, item.string, old_name)) item.* = .{ .string = try alloc.dupe(u8, new_name) };
+    }
+}
+
+fn renameStringFieldInJsonObject(
+    alloc: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    field_name: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    const value = object.get(field_name) orelse return;
+    if (value != .string) return error.InvalidSqlCatalog;
+    if (!std.mem.eql(u8, value.string, old_name)) return;
+    try putJsonString(alloc, object, field_name, new_name);
+}
+
+fn setNamedConstraintValidationStateInArray(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    field: []const u8,
+    constraint_name: []const u8,
+    validation_state: []const u8,
+) !bool {
+    const value = root.getPtr(field) orelse return false;
+    if (value.* != .array) return error.InvalidSqlCatalog;
+    for (value.array.items) |*item| {
+        if (item.* != .object) return error.InvalidSqlCatalog;
+        const name = item.object.get("name") orelse return error.InvalidSqlCatalog;
+        if (name != .string) return error.InvalidSqlCatalog;
+        if (!std.mem.eql(u8, name.string, constraint_name)) continue;
+        try putJsonString(alloc, &item.object, "validation_state", validation_state);
+        return true;
+    }
+    return false;
+}
+
+fn appendUniqueBorrowedString(
+    alloc: std.mem.Allocator,
+    values: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    if (stringSlicesContains(values.items, value)) return;
+    try values.append(alloc, value);
+}
+
+fn propertyGeneratedReferencesAny(property: std.json.Value, fields: []const []const u8) bool {
+    if (property != .object) return false;
+    const generated = property.object.get("generated") orelse return false;
+    if (generated != .object) return false;
+    if (generated.object.get("field")) |field| {
+        if (field == .string and stringSlicesContains(fields, field.string)) return true;
+    }
+    if (generated.object.get("fields")) |fields_value| {
+        if (jsonStringArrayReferencesAny(fields_value, fields)) return true;
+    }
+    if (generated.object.get("expression")) |expression| {
+        if (jsonExpressionReferencesAny(expression, fields)) return true;
+    }
+    return false;
+}
+
+fn removeStringsFromJsonArray(value: ?*std.json.Value, fields: []const []const u8) !void {
+    const array_value = value orelse return;
+    if (array_value.* != .array) return error.InvalidSqlCatalog;
+    var i: usize = 0;
+    while (i < array_value.array.items.len) {
+        const item = array_value.array.items[i];
+        if (item != .string) return error.InvalidSqlCatalog;
+        if (stringSlicesContains(fields, item.string)) {
+            _ = array_value.array.orderedRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn rejectPrimaryKeyDropFromSchemaJson(root: *std.json.ObjectMap, fields: []const []const u8) !void {
+    const primary_key = root.get("primary_key") orelse return error.InvalidSqlCatalog;
+    if (primary_key != .object) return error.InvalidSqlCatalog;
+    const columns = primary_key.object.get("columns") orelse return error.InvalidSqlCatalog;
+    if (jsonStringArrayReferencesAny(columns, fields)) return error.UnsupportedSqlShape;
+    if (primary_key.object.get("include_columns")) |include_columns| {
+        if (jsonStringArrayReferencesAny(include_columns, fields)) return error.UnsupportedSqlShape;
+    }
+}
+
+const JsonConstraintKind = enum {
+    unique,
+    foreign_key,
+    check,
+};
+
+fn removeDependentConstraintsFromJsonArray(
+    value: ?*std.json.Value,
+    fields: []const []const u8,
+    kind: JsonConstraintKind,
+) !void {
+    const array_value = value orelse return;
+    if (array_value.* != .array) return error.InvalidSqlCatalog;
+    var i: usize = 0;
+    while (i < array_value.array.items.len) {
+        const item = array_value.array.items[i];
+        if (item != .object) return error.InvalidSqlCatalog;
+        const remove = switch (kind) {
+            .unique => jsonUniqueConstraintReferencesAny(item, fields),
+            .foreign_key => jsonStringArrayReferencesAny(item.object.get("columns") orelse return error.InvalidSqlCatalog, fields),
+            .check => blk: {
+                const field = item.object.get("field") orelse return error.InvalidSqlCatalog;
+                break :blk field == .string and stringSlicesContains(fields, field.string);
+            },
+        };
+        if (remove) {
+            _ = array_value.array.orderedRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn jsonUniqueConstraintReferencesAny(value: std.json.Value, fields: []const []const u8) bool {
+    if (value != .object) return false;
+    if (value.object.get("columns")) |columns| {
+        if (jsonStringArrayReferencesAny(columns, fields)) return true;
+    }
+    if (value.object.get("expressions")) |expressions| {
+        if (expressions == .array) {
+            for (expressions.array.items) |expression| {
+                if (expression != .object) continue;
+                const field = expression.object.get("field") orelse continue;
+                if (field == .string and stringSlicesContains(fields, field.string)) return true;
+            }
+        }
+    }
+    if (value.object.get("include_columns")) |include_columns| {
+        if (jsonStringArrayReferencesAny(include_columns, fields)) return true;
+    }
+    if (value.object.get("where")) |where| {
+        if (jsonUniquePredicateDefinitionReferencesAny(where, fields)) return true;
+    }
+    return false;
+}
+
 pub fn relationalSchemaJsonParts(root: *std.json.ObjectMap) !RelationalSchemaJsonParts {
     const storage_mode = root.get("storage_mode") orelse return error.InvalidSqlCatalog;
     if (storage_mode != .string or !std.mem.eql(u8, storage_mode.string, "relational")) return error.InvalidSqlCatalog;
@@ -664,6 +1359,98 @@ pub fn removeCommentMapEntry(root: *std.json.ObjectMap, map_name: []const u8, ke
     _ = map_value.object.orderedRemove(key);
     removeEmptyCommentMap(&comments_value.object, map_name);
     if ((schemaJsonCommentCountInObject(&comments_value.object) catch 1) == 0) _ = root.orderedRemove("comments");
+}
+
+pub fn renameCommentMapEntry(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    map_name: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    const comments_value = root.getPtr("comments") orelse return;
+    if (comments_value.* != .object) return error.InvalidSqlCatalog;
+    const map_value = comments_value.object.getPtr(map_name) orelse return;
+    if (map_value.* != .object) return error.InvalidSqlCatalog;
+    const comment = map_value.object.get(old_name) orelse return;
+    if (comment != .string) return error.InvalidSqlCatalog;
+    _ = map_value.object.orderedRemove(old_name);
+    try putJsonString(alloc, &map_value.object, new_name, comment.string);
+}
+
+pub fn pruneSchemaJsonCommentsForCurrentSchema(root: *std.json.ObjectMap, table_name: []const u8) !void {
+    const comments_value = root.getPtr("comments") orelse return;
+    if (comments_value.* != .object) return error.InvalidSqlCatalog;
+    const schema_parts = try relationalSchemaJsonParts(root);
+
+    if (comments_value.object.getPtr("columns")) |columns| {
+        if (columns.* != .object) return error.InvalidSqlCatalog;
+        while (true) {
+            var removed = false;
+            var it = columns.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .string) return error.InvalidSqlCatalog;
+                if (schema_parts.properties.get(entry.key_ptr.*) != null) continue;
+                _ = columns.object.orderedRemove(entry.key_ptr.*);
+                removed = true;
+                break;
+            }
+            if (!removed) break;
+        }
+        removeEmptyCommentMap(&comments_value.object, "columns");
+    }
+    if (comments_value.object.getPtr("indexes")) |indexes| {
+        if (indexes.* != .object) return error.InvalidSqlCatalog;
+        while (true) {
+            var removed = false;
+            var it = indexes.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .string) return error.InvalidSqlCatalog;
+                if (try schemaJsonIndexNameExists(schema_parts.properties, root.getPtr("unique_constraints"), entry.key_ptr.*)) continue;
+                _ = indexes.object.orderedRemove(entry.key_ptr.*);
+                removed = true;
+                break;
+            }
+            if (!removed) break;
+        }
+        removeEmptyCommentMap(&comments_value.object, "indexes");
+    }
+    if (comments_value.object.getPtr("constraints")) |constraints| {
+        if (constraints.* != .object) return error.InvalidSqlCatalog;
+        while (true) {
+            var removed = false;
+            var it = constraints.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .string) return error.InvalidSqlCatalog;
+                if (try jsonConstraintNameExists(root, table_name, entry.key_ptr.*)) continue;
+                _ = constraints.object.orderedRemove(entry.key_ptr.*);
+                removed = true;
+                break;
+            }
+            if (!removed) break;
+        }
+        removeEmptyCommentMap(&comments_value.object, "constraints");
+    }
+    if (try schemaJsonCommentCountInObject(&comments_value.object) == 0) _ = root.orderedRemove("comments");
+}
+
+pub fn jsonConstraintNameExists(root: *std.json.ObjectMap, table_name: []const u8, constraint_name: []const u8) !bool {
+    if (try schemaJsonPrimaryKeyNameEquals(root, table_name, constraint_name)) return true;
+    if (try jsonConstraintArrayNameExists(root.getPtr("unique_constraints"), constraint_name)) return true;
+    if (try jsonConstraintArrayNameExists(root.getPtr("foreign_keys"), constraint_name)) return true;
+    if (try jsonConstraintArrayNameExists(root.getPtr("checks"), constraint_name)) return true;
+    return false;
+}
+
+pub fn schemaJsonPrimaryKeyNameEquals(root: *std.json.ObjectMap, table_name: []const u8, constraint_name: []const u8) !bool {
+    const primary_key = root.get("primary_key") orelse return false;
+    if (primary_key == .null) return false;
+    if (primary_key != .object) return error.InvalidSqlCatalog;
+    if (primary_key.object.get("name")) |name| {
+        if (name != .string) return error.InvalidSqlCatalog;
+        return std.mem.eql(u8, name.string, constraint_name);
+    }
+    return binder.defaultPrimaryKeyNameEquals(table_name, constraint_name);
 }
 
 pub fn removeNamedConstraintFromJsonArray(

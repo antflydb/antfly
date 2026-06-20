@@ -60,6 +60,8 @@ const aggregatePercentileArrayCount = sql_adapter.aggregatePercentileArrayCount;
 const alterRelationalColumnDefaultAlloc = sql_adapter.alterRelationalColumnDefaultAlloc;
 const alterRelationalColumnNullability = sql_adapter.alterRelationalColumnNullability;
 const alterRelationalColumnTypeAlloc = sql_adapter.alterRelationalColumnTypeAlloc;
+const applyAlterTablePlanToSchemaJsonValue = sql_adapter.applyAlterTablePlanToSchemaJsonValue;
+const applyCommentMetadataPlanToSchemaJsonValue = sql_adapter.applyCommentMetadataPlanToSchemaJsonValue;
 const applyCreateIndexPlanToSchemaJsonValue = sql_adapter.applyCreateIndexPlanToSchemaJsonValue;
 const applyCreateUpdatePolicyPlanToSchemaJsonValue = sql_adapter.applyCreateUpdatePolicyPlanToSchemaJsonValue;
 const applyDropIndexPlanToSchemaJsonValue = sql_adapter.applyDropIndexPlanToSchemaJsonValue;
@@ -76,6 +78,11 @@ const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAllo
 const appendUniqueConstraintAlloc = sql_adapter.appendUniqueConstraintAlloc;
 const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
 const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
+const clearDdlForeignKeys = sql_adapter.clearDdlForeignKeys;
+const clearDdlRelationalChecks = sql_adapter.clearDdlRelationalChecks;
+const clearDdlRelationalColumns = sql_adapter.clearDdlRelationalColumns;
+const clearDdlUniqueConstraints = sql_adapter.clearDdlUniqueConstraints;
+const clearDdlUniqueExpressions = sql_adapter.clearDdlUniqueExpressions;
 const cloneExpressionAlloc = sql_adapter.cloneExpressionAlloc;
 const cloneExpressionConditionAlloc = sql_adapter.cloneExpressionConditionAlloc;
 const cloneExpressionConditionsAlloc = sql_adapter.cloneExpressionConditionsAlloc;
@@ -151,6 +158,22 @@ const freeExpressionPredicateGroups = sql_adapter.freeExpressionPredicateGroups;
 const freeExpressionProjection = sql_adapter.freeExpressionProjection;
 const freeExpressionProjections = sql_adapter.freeExpressionProjections;
 const freeExpressionSlice = sql_adapter.freeExpressionSlice;
+const freeAlterTableOperation = sql_adapter.freeAlterTableOperation;
+const freeDdlForeignKey = sql_adapter.freeDdlForeignKey;
+const freeDdlForeignKeys = sql_adapter.freeDdlForeignKeys;
+const freeDdlGeneratedValue = sql_adapter.freeDdlGeneratedValue;
+const freeDdlPeriod = sql_adapter.freeDdlPeriod;
+const freeDdlPeriods = sql_adapter.freeDdlPeriods;
+const freeDdlPrimaryKey = sql_adapter.freeDdlPrimaryKey;
+const freeDdlRelationalCheck = sql_adapter.freeDdlRelationalCheck;
+const freeDdlRelationalChecks = sql_adapter.freeDdlRelationalChecks;
+const freeDdlRelationalColumn = sql_adapter.freeDdlRelationalColumn;
+const freeDdlRelationalColumns = sql_adapter.freeDdlRelationalColumns;
+const freeDdlUniqueConstraint = sql_adapter.freeDdlUniqueConstraint;
+const freeDdlUniqueConstraints = sql_adapter.freeDdlUniqueConstraints;
+const freeDdlUniqueExpression = sql_adapter.freeDdlUniqueExpression;
+const freeDdlUniqueExpressions = sql_adapter.freeDdlUniqueExpressions;
+const freeDdlUniquePredicates = sql_adapter.freeDdlUniquePredicates;
 const freeFieldAliasProjections = sql_adapter.freeFieldAliasProjections;
 const freeInPredicates = sql_adapter.freeInPredicates;
 const freeJoinOn = sql_adapter.freeJoinOn;
@@ -240,11 +263,6 @@ const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
 const relationalPeriodNameExists = sql_adapter.relationalPeriodNameExists;
 const relationalPeriodRangeTypeName = sql_adapter.relationalPeriodRangeTypeName;
-const RelationalSchemaJsonParts = sql_adapter.RelationalSchemaJsonParts;
-const relationalSchemaJsonParts = sql_adapter.relationalSchemaJsonParts;
-const removeCommentMapEntry = sql_adapter.removeCommentMapEntry;
-const removeEmptyCommentMap = sql_adapter.removeEmptyCommentMap;
-const removeNamedConstraintFromJsonArray = sql_adapter.removeNamedConstraintFromJsonArray;
 const renameRelationalColumnAlloc = sql_adapter.renameRelationalColumnAlloc;
 const renameRelationalConstraintAlloc = sql_adapter.renameRelationalConstraintAlloc;
 const rewriteExpressionConditionFieldsToSource = sql_adapter.rewriteExpressionConditionFieldsToSource;
@@ -253,24 +271,12 @@ const routineKindFromSyntax = sql_adapter.routineKindFromSyntax;
 const rowExpressionDefaultOutputName = sql_adapter.rowExpressionDefaultOutputName;
 const rowExpressionOpName = sql_adapter.rowExpressionOpName;
 const putJsonString = sql_adapter.putJsonString;
-const rootArrayFieldAlloc = sql_adapter.rootArrayFieldAlloc;
-const rootObjectFieldAlloc = sql_adapter.rootObjectFieldAlloc;
-const schemaJsonDefaultValueAlloc = sql_adapter.schemaJsonDefaultValueAlloc;
 const schemaJsonExpressionConditionsAlloc = sql_adapter.schemaJsonExpressionConditionsAlloc;
-const schemaJsonForeignKeyAlloc = sql_adapter.schemaJsonForeignKeyAlloc;
 const schemaJsonForeignKeysAlloc = sql_adapter.schemaJsonForeignKeysAlloc;
-const schemaJsonIndexNameExists = sql_adapter.schemaJsonIndexNameExists;
-const schemaJsonPeriodAlloc = sql_adapter.schemaJsonPeriodAlloc;
 const schemaJsonPeriodsAlloc = sql_adapter.schemaJsonPeriodsAlloc;
-const schemaJsonPrimaryKeyAlloc = sql_adapter.schemaJsonPrimaryKeyAlloc;
-const schemaJsonCommentCountInObject = sql_adapter.schemaJsonCommentCountInObject;
 const schemaJsonCommentCountInRoot = sql_adapter.schemaJsonCommentCountInRoot;
-const schemaJsonPropertyFromColumnAlloc = sql_adapter.schemaJsonPropertyFromColumnAlloc;
-const schemaJsonRelationalCheckAlloc = sql_adapter.schemaJsonRelationalCheckAlloc;
+const schemaJsonPrimaryKeyNameEquals = sql_adapter.schemaJsonPrimaryKeyNameEquals;
 const schemaJsonRelationalChecksAlloc = sql_adapter.schemaJsonRelationalChecksAlloc;
-const schemaJsonSecondaryIndexReferencesAny = sql_adapter.schemaJsonSecondaryIndexReferencesAny;
-const schemaJsonStringArrayAlloc = sql_adapter.schemaJsonStringArrayAlloc;
-const schemaJsonUniqueConstraintAlloc = sql_adapter.schemaJsonUniqueConstraintAlloc;
 const schemaJsonUniqueConstraintsAlloc = sql_adapter.schemaJsonUniqueConstraintsAlloc;
 const schemaJsonUniquePredicateDefinitionAlloc = sql_adapter.schemaJsonUniquePredicateDefinitionAlloc;
 const schemaJsonValueFromCreateTablePlanAlloc = sql_adapter.schemaJsonValueFromCreateTablePlanAlloc;
@@ -589,6 +595,7 @@ pub const ReindexMaintenanceTarget = sql_adapter.ReindexMaintenanceTarget;
 pub const ClusterMaintenancePlan = sql_adapter.ClusterMaintenancePlan;
 pub const BulkIoPlan = sql_adapter.BulkIoPlan;
 pub const BulkIoDirection = sql_adapter.BulkIoDirection;
+pub const BulkIoEndpointKind = sql_adapter.BulkIoEndpointKind;
 pub const BulkIoOnErrorPolicy = sql_adapter.BulkIoOnErrorPolicy;
 pub const BulkIoLogVerbosity = sql_adapter.BulkIoLogVerbosity;
 pub const BulkSqlIoOperation = sql_adapter.BulkSqlIoOperation;
@@ -632,11 +639,7 @@ pub const IdentityAllocatorSpec = sql_adapter.IdentityAllocatorSpec;
 pub const LoweredDdlPlan = sql_adapter.LoweredDdlPlan;
 pub const RelationLifetimePlan = sql_adapter.RelationLifetimePlan;
 pub const RelationLifetimeKind = sql_adapter.RelationLifetimeKind;
-
-const PrivilegeChangeAction = enum {
-    grant,
-    revoke,
-};
+pub const PrivilegeChangeAction = sql_adapter.PrivilegeChangeAction;
 
 pub const TablePartitionCatalogPlan = sql_adapter.TablePartitionCatalogPlan;
 pub const CreatePartitionedTablePlan = sql_adapter.CreatePartitionedTablePlan;
@@ -1899,12 +1902,21 @@ pub fn lowerDdlPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !LoweredDdlPlan {
+    return try lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, .{});
+}
+
+pub fn lowerDdlPlanWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    function_bindings: SqlFunctionBindings,
+) !LoweredDdlPlan {
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
 
     var parser = Parser{
         .alloc = alloc,
         .tokens = tokens.items,
+        .function_bindings = function_bindings,
     };
     return parser.parseDdlPlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -3202,13 +3214,6 @@ fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpu
     }
 }
 
-fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) sql_adapter.PrivilegeChangeActionSyntax {
-    return switch (action) {
-        .grant => .grant,
-        .revoke => .revoke,
-    };
-}
-
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3289,7 +3294,7 @@ const Parser = struct {
             }
             if (self.peekKeyword("extension")) {
                 var create_extension = try self.parseCreateExtensionDdl();
-                if (create_extension.if_not_exists and isAdapterNoopExtensionName(create_extension.extension_name)) {
+                if (create_extension.if_not_exists and sql_adapter.isAdapterNoopExtensionName(create_extension.extension_name)) {
                     create_extension.deinit(self.alloc);
                     return .{ .adapter_noop = .{ .reason = .extension } };
                 }
@@ -3685,68 +3690,37 @@ const Parser = struct {
     fn parseCreateSchemaNamespaceDdl(self: *@This()) !CreateSchemaNamespacePlan {
         var syntax = try sql_adapter.parseCreateSchemaNamespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const schema_name = syntax.schema_name;
-        syntax.schema_name = "";
-        return .{ .schema_name = schema_name, .if_not_exists = syntax.if_not_exists };
+        return sql_adapter.createSchemaNamespacePlanFromSyntax(&syntax);
     }
 
     fn parseRenameSchemaNamespaceDdl(self: *@This()) !RenameSchemaNamespacePlan {
         var syntax = try sql_adapter.parseRenameSchemaNamespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const schema_name = syntax.schema_name;
-        const new_schema_name = syntax.new_schema_name;
-        syntax.schema_name = "";
-        syntax.new_schema_name = "";
-        return .{ .schema_name = schema_name, .new_schema_name = new_schema_name };
+        return sql_adapter.renameSchemaNamespacePlanFromSyntax(&syntax);
     }
 
     fn parseDropSchemaNamespaceDdl(self: *@This()) !DropSchemaNamespacePlan {
         var syntax = try sql_adapter.parseDropSchemaNamespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const schema_name = syntax.schema_name;
-        syntax.schema_name = "";
-        return .{ .schema_name = schema_name, .if_exists = syntax.if_exists, .cascade = syntax.cascade };
+        return sql_adapter.dropSchemaNamespacePlanFromSyntax(&syntax);
     }
 
     fn parseCreateExtensionDdl(self: *@This()) !CreateExtensionPlan {
         var syntax = try sql_adapter.parseCreateExtensionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         defer syntax.deinit(self.alloc);
-        if (syntax.schema_name) |schema_name| {
-            if (!syntax.if_not_exists or
-                !isAdapterNoopExtensionName(syntax.extension_name) or
-                !std.ascii.eqlIgnoreCase(schema_name, catalog_resources.default_namespace_name))
-            {
-                return error.UnsupportedSqlShape;
-            }
-        }
-        const extension_name = syntax.extension_name;
-        const version = syntax.version;
-        syntax.extension_name = "";
-        syntax.version = null;
-        return .{ .extension_name = extension_name, .version = version, .if_not_exists = syntax.if_not_exists };
+        return try sql_adapter.createExtensionPlanFromSyntax(&syntax, catalog_resources.default_namespace_name);
     }
 
     fn parseAlterExtensionDdl(self: *@This()) !UpdateExtensionPlan {
         var syntax = try sql_adapter.parseUpdateExtensionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         defer syntax.deinit(self.alloc);
-        const extension_name = syntax.extension_name;
-        const target_version = syntax.target_version;
-        syntax.extension_name = "";
-        syntax.target_version = null;
-        return .{ .extension_name = extension_name, .target_version = target_version };
+        return sql_adapter.updateExtensionPlanFromSyntax(&syntax);
     }
 
     fn parseDropExtensionDdl(self: *@This()) !DropExtensionPlan {
         var syntax = try sql_adapter.parseDropExtensionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         defer syntax.deinit(self.alloc);
-        const extension_name = syntax.extension_name;
-        syntax.extension_name = "";
-        return .{ .extension_name = extension_name, .if_exists = syntax.if_exists, .cascade = syntax.cascade };
-    }
-
-    fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(extension_name, "pgcrypto") or
-            std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp");
+        return sql_adapter.dropExtensionPlanFromSyntax(&syntax);
     }
 
     fn parseCreateRoutineDdl(self: *@This(), replace_existing: bool) !CreateRoutinePlan {
@@ -3856,7 +3830,7 @@ const Parser = struct {
             self.alloc,
             self.tokens,
             &self.pos,
-            privilegeChangeActionToSyntax(action),
+            sql_adapter.privilegeChangeActionToSyntax(action),
         );
         errdefer syntax.deinit(self.alloc);
         const privileges = syntax.privileges;
@@ -3880,6 +3854,7 @@ const Parser = struct {
         errdefer syntax.deinit(self.alloc);
         const table_name = syntax.table_name;
         const columns = syntax.columns;
+        const endpoint_kind = syntax.endpoint_kind;
         const endpoint = syntax.endpoint;
         const format = syntax.format;
         const header = syntax.header;
@@ -3921,6 +3896,7 @@ const Parser = struct {
             .direction = bulkIoDirectionFromSyntax(syntax.direction),
             .table_name = table_name,
             .columns = columns,
+            .endpoint_kind = endpoint_kind,
             .endpoint = endpoint,
             .format = format,
             .header = header,
@@ -3999,537 +3975,274 @@ const Parser = struct {
     fn parseCreateDatabaseDdl(self: *@This()) !CreateDatabasePlan {
         var syntax = try sql_adapter.parseCreateDatabaseCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const database_name = syntax.database_name;
-        syntax.database_name = "";
-        return .{ .database_name = database_name };
+        return sql_adapter.createDatabasePlanFromSyntax(&syntax);
     }
 
     fn parseAlterDatabaseDdl(self: *@This()) !AlterDatabasePlan {
         var syntax = try sql_adapter.parseAlterDatabaseCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const operations = try self.alloc.alloc(DatabaseAlterOperation, 1);
-        errdefer self.alloc.free(operations);
-        operations[0] = .{ .set_parameter = .{
-            .name = syntax.setting_name,
-            .value_json = syntax.value_json,
-        } };
-        const database_name = syntax.database_name;
-        syntax.database_name = "";
-        syntax.setting_name = "";
-        syntax.value_json = "";
-        return .{ .database_name = database_name, .operations = operations };
+        return try sql_adapter.alterDatabasePlanFromSyntaxAlloc(self.alloc, &syntax);
     }
 
     fn parseDropDatabaseDdl(self: *@This()) !DropDatabasePlan {
         var syntax = try sql_adapter.parseDropDatabaseCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const database_name = syntax.database_name;
-        syntax.database_name = "";
-        return .{ .database_name = database_name, .if_exists = syntax.if_exists, .force = syntax.force };
+        return sql_adapter.dropDatabasePlanFromSyntax(&syntax);
     }
 
     fn parseCreateTablespaceDdl(self: *@This()) !CreateTablespacePlan {
         var syntax = try sql_adapter.parseCreateTablespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const tablespace_name = syntax.tablespace_name;
-        const location_json = syntax.location_json;
-        const placement_policy_json = syntax.placement_policy_json;
-        syntax.tablespace_name = "";
-        syntax.location_json = "";
-        syntax.placement_policy_json = "";
-        return .{ .tablespace_name = tablespace_name, .location_json = location_json, .placement_policy_json = placement_policy_json };
+        return sql_adapter.createTablespacePlanFromSyntax(&syntax);
     }
 
     fn parseRenameTablespaceDdl(self: *@This()) !RenameTablespacePlan {
         var syntax = try sql_adapter.parseRenameTablespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const tablespace_name = syntax.tablespace_name;
-        const new_tablespace_name = syntax.new_tablespace_name;
-        syntax.tablespace_name = "";
-        syntax.new_tablespace_name = "";
-        return .{ .tablespace_name = tablespace_name, .new_tablespace_name = new_tablespace_name };
+        return sql_adapter.renameTablespacePlanFromSyntax(&syntax);
     }
 
     fn parseDropTablespaceDdl(self: *@This()) !DropTablespacePlan {
         var syntax = try sql_adapter.parseDropTablespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const tablespace_name = syntax.tablespace_name;
-        syntax.tablespace_name = "";
-        return .{ .tablespace_name = tablespace_name, .if_exists = syntax.if_exists };
+        return sql_adapter.dropTablespacePlanFromSyntax(&syntax);
     }
 
     fn parseListenNotificationDdl(self: *@This()) !ListenNotificationPlan {
         var syntax = try sql_adapter.parseListenNotificationTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const channel_name = syntax.channel_name;
-        syntax.channel_name = "";
-        return .{ .channel_name = channel_name };
+        return sql_adapter.listenNotificationPlanFromSyntax(&syntax);
     }
 
     fn parseNotifyNotificationDdl(self: *@This()) !NotifyNotificationPlan {
         var syntax = try sql_adapter.parseNotifyNotificationTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const channel_name = syntax.channel_name;
-        const payload_json = syntax.payload_json;
-        syntax.channel_name = "";
-        syntax.payload_json = null;
-        const out = NotifyNotificationPlan{
-            .channel_name = channel_name,
-            .payload_json = payload_json,
-        };
-        return out;
+        return sql_adapter.notifyNotificationPlanFromSyntax(&syntax);
     }
 
     fn parseUnlistenNotificationDdl(self: *@This()) !UnlistenNotificationPlan {
         var syntax = try sql_adapter.parseUnlistenNotificationTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const channel_name = syntax.channel_name;
-        syntax.channel_name = null;
-        return .{ .channel_name = channel_name, .all = syntax.all };
+        return sql_adapter.unlistenNotificationPlanFromSyntax(&syntax);
     }
 
     fn parseCreatePublicationDdl(self: *@This()) !CreatePublicationPlan {
         var syntax = try sql_adapter.parseCreatePublicationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const publication_name = syntax.publication_name;
-        const table_names = syntax.table_names;
-        syntax.publication_name = "";
-        syntax.table_names = &.{};
-        return CreatePublicationPlan{
-            .publication_name = publication_name,
-            .table_names = table_names,
-            .all_tables = syntax.all_tables,
-        };
+        return sql_adapter.createPublicationPlanFromSyntax(&syntax);
     }
 
     fn parseAlterPublicationDdl(self: *@This()) !AlterPublicationPlan {
         var syntax = try sql_adapter.parseAlterPublicationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const publication_name = syntax.publication_name;
-        const table_names = syntax.table_names;
-        syntax.publication_name = "";
-        syntax.table_names = &.{};
-        return AlterPublicationPlan{
-            .publication_name = publication_name,
-            .operation = .{ .add_tables = table_names },
-        };
+        return sql_adapter.alterPublicationPlanFromSyntax(&syntax);
     }
 
     fn parseDropPublicationDdl(self: *@This()) !DropPublicationPlan {
         var syntax = try sql_adapter.parseDropPublicationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const publication_name = syntax.publication_name;
-        syntax.publication_name = "";
-        return .{ .publication_name = publication_name, .if_exists = syntax.if_exists };
+        return sql_adapter.dropPublicationPlanFromSyntax(&syntax);
     }
 
     fn parseCreateSubscriptionDdl(self: *@This()) !CreateSubscriptionPlan {
         var syntax = try sql_adapter.parseCreateSubscriptionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const subscription_name = syntax.subscription_name;
-        const connection_json = syntax.connection_json;
-        const publication_names = syntax.publication_names;
-        syntax.subscription_name = "";
-        syntax.connection_json = "";
-        syntax.publication_names = &.{};
-        return CreateSubscriptionPlan{
-            .subscription_name = subscription_name,
-            .connection_json = connection_json,
-            .publication_names = publication_names,
-        };
+        return sql_adapter.createSubscriptionPlanFromSyntax(&syntax);
     }
 
     fn parseAlterSubscriptionDdl(self: *@This()) !AlterSubscriptionPlan {
         var syntax = try sql_adapter.parseAlterSubscriptionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const subscription_name = syntax.subscription_name;
-        syntax.subscription_name = "";
-        return .{ .subscription_name = subscription_name, .enabled = syntax.enabled };
+        return sql_adapter.alterSubscriptionPlanFromSyntax(&syntax);
     }
 
     fn parseDropSubscriptionDdl(self: *@This()) !DropSubscriptionPlan {
         var syntax = try sql_adapter.parseDropSubscriptionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const subscription_name = syntax.subscription_name;
-        syntax.subscription_name = "";
-        return .{ .subscription_name = subscription_name, .if_exists = syntax.if_exists };
+        return sql_adapter.dropSubscriptionPlanFromSyntax(&syntax);
     }
 
     fn parseVacuumMaintenanceDdl(self: *@This()) !VacuumMaintenancePlan {
         var syntax = try sql_adapter.parseVacuumMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const table_name = syntax.table_name;
-        syntax.table_name = "";
-        return .{ .table_name = table_name, .full = syntax.full, .freeze = syntax.freeze, .verbose = syntax.verbose, .analyze = syntax.analyze };
+        return sql_adapter.vacuumMaintenancePlanFromSyntax(&syntax);
     }
 
     fn parseAnalyzeMaintenanceDdl(self: *@This()) !AnalyzeMaintenancePlan {
         var syntax = try sql_adapter.parseAnalyzeMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const table_name = syntax.table_name;
-        syntax.table_name = "";
-        return .{ .table_name = table_name, .verbose = syntax.verbose, .column_count = syntax.column_count };
+        return sql_adapter.analyzeMaintenancePlanFromSyntax(&syntax);
     }
 
     fn parseReindexMaintenanceDdl(self: *@This()) !ReindexMaintenancePlan {
         var syntax = try sql_adapter.parseReindexMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const name = syntax.name;
-        syntax.name = "";
-        return .{
-            .target = reindexMaintenanceTargetFromSyntax(syntax.target),
-            .name = name,
-            .concurrently = syntax.concurrently,
-        };
+        return sql_adapter.reindexMaintenancePlanFromSyntax(&syntax);
     }
 
     fn parseClusterMaintenanceDdl(self: *@This()) !ClusterMaintenancePlan {
         var syntax = try sql_adapter.parseClusterMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const table_name = syntax.table_name;
-        const index_name = syntax.index_name;
-        syntax.table_name = "";
-        syntax.index_name = null;
-        return .{ .table_name = table_name, .index_name = index_name, .verbose = syntax.verbose };
+        return sql_adapter.clusterMaintenancePlanFromSyntax(&syntax);
     }
 
     fn parsePrepareStatementDdl(self: *@This()) !PrepareStatementPlan {
         const syntax = try sql_adapter.parsePrepareStatementTail(self.tokens, &self.pos);
-        const statement_name = try self.alloc.dupe(u8, syntax.statement_name);
-        var statement_transferred = false;
-        errdefer if (!statement_transferred) self.alloc.free(statement_name);
-        statement_transferred = true;
-        return .{
-            .statement_name = statement_name,
-            .parameter_count = syntax.parameter_count,
-            .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind),
-            .statement_family = preparedStatementStatementKindFromSyntax(syntax.statement_family),
-        };
+        return try sql_adapter.prepareStatementPlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseExecutePreparedStatementDdl(self: *@This()) !ExecutePreparedStatementPlan {
         const syntax = try sql_adapter.parseExecutePreparedStatementTail(self.tokens, &self.pos);
-        const statement_name = try self.alloc.dupe(u8, syntax.statement_name);
-        var statement_transferred = false;
-        errdefer if (!statement_transferred) self.alloc.free(statement_name);
-        statement_transferred = true;
-        return .{ .statement_name = statement_name, .argument_count = syntax.argument_count };
+        return try sql_adapter.executePreparedStatementPlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseDeallocatePreparedStatementDdl(self: *@This()) !DeallocatePreparedStatementPlan {
         const syntax = try sql_adapter.parseDeallocatePreparedStatementTail(self.tokens, &self.pos);
-        return try self.deallocatePreparedStatementPlanFromSyntax(syntax);
+        return try sql_adapter.deallocatePreparedStatementPlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parsePreparedTransactionDdl(self: *@This(), action: PreparedTransactionAction) !PreparedTransactionPlan {
-        switch (action) {
-            .prepare => try self.expectKeyword("transaction"),
-            .commit, .rollback => try self.expectKeyword("prepared"),
-        }
-        const gid_token = self.match(.string) orelse return error.UnsupportedSqlShape;
-        if (gid_token.text.len == 0) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        return .{
-            .action = action,
-            .gid = try self.alloc.dupe(u8, gid_token.text),
-        };
+        return try sql_adapter.parsePreparedTransactionTailAlloc(self.alloc, self.tokens, &self.pos, action);
     }
 
     fn parseDeclareCursorPortalDdl(self: *@This()) !DeclareCursorPortalPlan {
         const syntax = try sql_adapter.parseDeclareCursorPortalTail(self.tokens, &self.pos);
-        const portal_name = try self.alloc.dupe(u8, syntax.portal_name);
-        var portal_transferred = false;
-        errdefer if (!portal_transferred) self.alloc.free(portal_name);
-        portal_transferred = true;
-        return .{
-            .portal_name = portal_name,
-            .scroll = cursorScrollModeFromSyntax(syntax.scroll),
-            .binary = syntax.binary,
-            .hold = syntax.hold,
-            .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind orelse return error.UnsupportedSqlShape),
-        };
+        return try sql_adapter.declareCursorPortalPlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseFetchCursorPortalDdl(self: *@This()) !FetchCursorPortalPlan {
         const syntax = try sql_adapter.parseFetchCursorPortalTail(self.tokens, &self.pos);
-        const portal_name = try self.alloc.dupe(u8, syntax.portal_name);
-        var portal_transferred = false;
-        errdefer if (!portal_transferred) self.alloc.free(portal_name);
-        portal_transferred = true;
-        return .{
-            .portal_name = portal_name,
-            .direction = cursorFetchDirectionFromSyntax(syntax.direction),
-            .count = syntax.count,
-        };
+        return try sql_adapter.fetchCursorPortalPlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseCloseCursorPortalDdl(self: *@This()) !CloseCursorPortalPlan {
         const syntax = try sql_adapter.parseCloseCursorPortalTail(self.tokens, &self.pos);
-        return try self.closeCursorPortalPlanFromSyntax(syntax);
+        return try sql_adapter.closeCursorPortalPlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseSavepointTransactionDdl(self: *@This()) !SavepointNamePlan {
         const syntax = try sql_adapter.parseSavepointTransactionTail(self.tokens, &self.pos);
-        return try self.savepointNamePlanFromSyntax(syntax);
+        return try sql_adapter.savepointNamePlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseReleaseSavepointDdl(self: *@This()) !SavepointNamePlan {
         const syntax = try sql_adapter.parseReleaseSavepointTail(self.tokens, &self.pos);
-        return try self.savepointNamePlanFromSyntax(syntax);
+        return try sql_adapter.savepointNamePlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseRollbackToSavepointDdl(self: *@This()) !SavepointNamePlan {
         const syntax = try sql_adapter.parseRollbackToSavepointTail(self.tokens, &self.pos);
-        return try self.savepointNamePlanFromSyntax(syntax);
-    }
-
-    fn savepointNamePlanFromSyntax(self: *@This(), syntax: sql_adapter.SavepointNameSyntax) !SavepointNamePlan {
-        return .{ .savepoint_name = try self.alloc.dupe(u8, syntax.savepoint_name) };
-    }
-
-    fn deallocatePreparedStatementPlanFromSyntax(self: *@This(), syntax: sql_adapter.NamedOrAllSyntax) !DeallocatePreparedStatementPlan {
-        if (syntax.all) return .{ .all = true };
-        const statement_name = syntax.name orelse return error.UnsupportedSqlShape;
-        return .{ .statement_name = try self.alloc.dupe(u8, statement_name) };
-    }
-
-    fn closeCursorPortalPlanFromSyntax(self: *@This(), syntax: sql_adapter.NamedOrAllSyntax) !CloseCursorPortalPlan {
-        if (syntax.all) return .{ .all = true };
-        const portal_name = syntax.name orelse return error.UnsupportedSqlShape;
-        return .{ .portal_name = try self.alloc.dupe(u8, portal_name) };
+        return try sql_adapter.savepointNamePlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseCommentMetadataDdl(self: *@This()) !CommentMetadataPlan {
         var syntax = try sql_adapter.parseCommentMetadataCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .target = syntax.target,
-            .object_name = syntax.object_name,
-            .parent_table_name = syntax.parent_table_name,
-            .comment_json = syntax.comment_json,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.commentMetadataPlanFromSyntax(&syntax);
     }
 
     fn parseTableLockDdl(self: *@This()) !TableLockPlan {
         var syntax = try sql_adapter.parseTableLockTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const table_names = syntax.table_names;
-        syntax.table_names = &.{};
-        return .{
-            .table_names = table_names,
-            .mode = tableLockModeFromSyntax(syntax.mode),
-        };
+        return sql_adapter.tableLockPlanFromSyntax(&syntax);
     }
 
     fn parseConstraintModeDdl(self: *@This()) !ConstraintModePlan {
         var syntax = try sql_adapter.parseConstraintModeTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const constraint_names = syntax.constraint_names;
-        syntax.constraint_names = &.{};
-        return .{
-            .all = syntax.all,
-            .constraint_names = constraint_names,
-            .mode = constraintCheckModeFromSyntax(syntax.mode),
-        };
+        return sql_adapter.constraintModePlanFromSyntax(&syntax);
     }
 
     fn parseTransactionModeDdl(self: *@This(), starter: TransactionModeStarter) !TransactionModePlan {
         const syntax = try sql_adapter.parseTransactionModeTail(self.tokens, &self.pos, transactionModeStarterToSyntax(starter));
-        return .{
-            .starter = transactionModeStarterFromSyntax(syntax.starter),
-            .isolation_level = transactionIsolationLevelFromSyntax(syntax.isolation_level),
-            .access_mode = transactionAccessModeFromSyntax(syntax.access_mode),
-            .deferrable = syntax.deferrable,
-        };
+        return sql_adapter.transactionModePlanFromSyntax(syntax);
     }
 
     fn parseAdvisoryLockDdl(self: *@This()) !AdvisoryLockPlan {
         const syntax = try sql_adapter.parseAdvisoryLockTail(self.tokens, &self.pos);
-        return .{
-            .action = advisoryLockActionFromSyntax(syntax.action),
-            .key1 = syntax.key1,
-            .key2 = syntax.key2,
-        };
+        return sql_adapter.advisoryLockPlanFromSyntax(syntax);
     }
 
     fn parseCreateCollationDdl(self: *@This()) !CreateCollationPlan {
         var syntax = try sql_adapter.parseCreateCollationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const collation_name = syntax.collation_name;
-        syntax.collation_name = "";
-        return .{ .collation_name = collation_name, .option_count = syntax.option_count };
+        return sql_adapter.createCollationPlanFromSyntax(&syntax);
     }
 
     fn parseRenameCollationDdl(self: *@This()) !RenameCollationPlan {
         var syntax = try sql_adapter.parseRenameCollationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const collation_name = syntax.collation_name;
-        const new_collation_name = syntax.new_collation_name;
-        syntax.collation_name = "";
-        syntax.new_collation_name = "";
-        return .{ .collation_name = collation_name, .new_collation_name = new_collation_name };
+        return sql_adapter.renameCollationPlanFromSyntax(&syntax);
     }
 
     fn parseDropCollationDdl(self: *@This()) !DropCollationPlan {
         var syntax = try sql_adapter.parseDropCollationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const collation_name = syntax.collation_name;
-        syntax.collation_name = "";
-        return .{ .collation_name = collation_name, .if_exists = syntax.if_exists };
+        return sql_adapter.dropCollationPlanFromSyntax(&syntax);
     }
 
     fn parseCreateOperatorDdl(self: *@This()) !CreateOperatorPlan {
         var syntax = try sql_adapter.parseCreateOperatorCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const operator_name = syntax.operator_name;
-        syntax.operator_name = "";
-        return .{ .operator_name = operator_name, .option_count = syntax.option_count };
+        return sql_adapter.createOperatorPlanFromSyntax(&syntax);
     }
 
     fn parseDropOperatorDdl(self: *@This()) !DropOperatorPlan {
         var syntax = try sql_adapter.parseDropOperatorCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const operator_name = syntax.operator_name;
-        syntax.operator_name = "";
-        return .{ .operator_name = operator_name, .argument_count = syntax.argument_count };
+        return sql_adapter.dropOperatorPlanFromSyntax(&syntax);
     }
 
     fn parseCreateAggregateDdl(self: *@This()) !CreateAggregatePlan {
         var syntax = try sql_adapter.parseCreateAggregateCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const aggregate_name = syntax.aggregate_name;
-        syntax.aggregate_name = "";
-        return .{ .aggregate_name = aggregate_name, .argument_count = syntax.argument_count, .option_count = syntax.option_count };
+        return sql_adapter.createAggregatePlanFromSyntax(&syntax);
     }
 
     fn parseDropAggregateDdl(self: *@This()) !DropAggregatePlan {
         var syntax = try sql_adapter.parseDropAggregateCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const aggregate_name = syntax.aggregate_name;
-        syntax.aggregate_name = "";
-        return .{ .aggregate_name = aggregate_name, .argument_count = syntax.argument_count };
+        return sql_adapter.dropAggregatePlanFromSyntax(&syntax);
     }
 
     fn parseCreateCastDdl(self: *@This()) !CreateCastPlan {
         var syntax = try sql_adapter.parseCreateCastCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const source_type = syntax.source_type;
-        const target_type = syntax.target_type;
-        const function_name = syntax.function_name;
-        syntax.source_type = "";
-        syntax.target_type = "";
-        syntax.function_name = "";
-        return .{ .source_type = source_type, .target_type = target_type, .function_name = function_name, .assignment = syntax.assignment };
+        return sql_adapter.createCastPlanFromSyntax(&syntax);
     }
 
     fn parseDropCastDdl(self: *@This()) !DropCastPlan {
         var syntax = try sql_adapter.parseDropCastCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
-        const source_type = syntax.source_type;
-        const target_type = syntax.target_type;
-        syntax.source_type = "";
-        syntax.target_type = "";
-        return .{ .source_type = source_type, .target_type = target_type };
+        return sql_adapter.dropCastPlanFromSyntax(&syntax);
     }
 
     fn parseAlterDomainDdl(self: *@This()) !AlterDomainPlan {
-        var header = try sql_adapter.parseAlterDomainHeaderAlloc(self.alloc, self.tokens, &self.pos);
-        var header_transferred = false;
-        errdefer if (!header_transferred) header.deinit(self.alloc);
-        var operations = std.ArrayListUnmanaged(DomainAlterOperation).empty;
-        errdefer {
-            clearDomainAlterOperations(self.alloc, operations.items);
-            operations.deinit(self.alloc);
-        }
-        while (true) {
-            if (self.matchKeyword("set")) {
-                if (self.matchKeyword("not")) {
-                    try self.expectKeyword("null");
-                    try operations.append(self.alloc, .set_not_null);
-                } else if (self.matchKeyword("default")) {
-                    const default_value = try self.parseDdlDefaultValueUntyped();
-                    errdefer self.alloc.free(default_value.value_json);
-                    try operations.append(self.alloc, .{ .set_default = default_value });
-                } else {
-                    return error.UnsupportedSqlShape;
-                }
-            } else if (self.matchKeyword("drop")) {
-                if (self.matchKeyword("not")) {
-                    try self.expectKeyword("null");
-                    try operations.append(self.alloc, .drop_not_null);
-                } else if (self.matchKeyword("default")) {
-                    try operations.append(self.alloc, .drop_default);
-                } else {
-                    return error.UnsupportedSqlShape;
-                }
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-            if (self.match(.comma) == null) break;
-        }
-        if (operations.items.len == 0) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        const owned_operations = try operations.toOwnedSlice(self.alloc);
-        var operations_transferred = false;
-        errdefer if (!operations_transferred) freeDomainAlterOperations(self.alloc, owned_operations);
-        header_transferred = true;
-        operations_transferred = true;
-        return .{
-            .domain_name = header.domain_name,
-            .operations = owned_operations,
-        };
+        return try sql_adapter.parseAlterDomainCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseDropDomainDdl(self: *@This()) !DropDomainPlan {
         var syntax = try sql_adapter.parseDropDomainCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .domain_name = syntax.domain_name,
-            .if_exists = syntax.if_exists,
-            .cascade = syntax.cascade,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropDomainPlanFromSyntax(&syntax);
     }
 
     fn parseCreateSequenceDdl(self: *@This()) !CreateSequencePlan {
         var syntax = try sql_adapter.parseCreateSequenceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .sequence_name = syntax.sequence_name,
-            .if_not_exists = syntax.if_not_exists,
-            .options = syntax.options,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.createSequencePlanFromSyntax(&syntax);
     }
 
     fn parseAlterSequenceDdl(self: *@This()) !AlterSequencePlan {
         var syntax = try sql_adapter.parseAlterSequenceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .sequence_name = syntax.sequence_name,
-            .if_exists = syntax.if_exists,
-            .operations = syntax.operations,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.alterSequencePlanFromSyntax(&syntax);
     }
 
     fn parseDropSequenceDdl(self: *@This()) !DropSequencePlan {
         var syntax = try sql_adapter.parseDropSequenceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .sequence_name = syntax.sequence_name,
-            .if_exists = syntax.if_exists,
-            .cascade = syntax.cascade,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropSequencePlanFromSyntax(&syntax);
     }
 
     fn parseDomainCheckConstraint(
@@ -4565,39 +4278,20 @@ const Parser = struct {
 
     fn parseCreateEnumTypeDdl(self: *@This()) !CreateEnumTypePlan {
         var syntax = try sql_adapter.parseCreateEnumTypeCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .type_name = syntax.type_name,
-            .values = syntax.values,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.createEnumTypePlanFromSyntax(&syntax);
     }
 
     fn parseAlterEnumTypeDdl(self: *@This()) !AddEnumValuePlan {
         var syntax = try sql_adapter.parseAlterEnumTypeCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .type_name = syntax.type_name,
-            .value = syntax.value,
-            .if_not_exists = syntax.if_not_exists,
-            .position = syntax.position,
-            .neighbor_value = syntax.neighbor_value,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.addEnumValuePlanFromSyntax(&syntax);
     }
 
     fn parseDropEnumTypeDdl(self: *@This()) !DropEnumTypePlan {
         var syntax = try sql_adapter.parseDropEnumTypeCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .type_name = syntax.type_name,
-            .if_exists = syntax.if_exists,
-            .cascade = syntax.cascade,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropEnumTypePlanFromSyntax(&syntax);
     }
 
     fn parseRelationLifetimeDdl(self: *@This()) !RelationLifetimePlan {
@@ -4609,189 +4303,206 @@ const Parser = struct {
 
     fn parseCreateMaterializedViewDdl(self: *@This(), replace_existing: bool) !CreateMaterializedViewPlan {
         var syntax = try sql_adapter.parseCreateMaterializedViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos, replace_existing);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .view_name = syntax.view_name,
-            .source_table_name = syntax.source_table_name,
-            .source_fields = syntax.source_fields,
-            .output_fields = syntax.output_fields,
-            .replace_existing = syntax.replace_existing,
-            .if_not_exists = syntax.if_not_exists,
-            .populate_on_create = syntax.populate_on_create,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.createMaterializedViewPlanFromSyntax(&syntax);
     }
 
     fn parseRefreshMaterializedViewDdl(self: *@This()) !RefreshMaterializedViewPlan {
         var syntax = try sql_adapter.parseRefreshMaterializedViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .view_name = syntax.view_name,
-            .concurrently = syntax.concurrently,
-            .populate = syntax.populate,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.refreshMaterializedViewPlanFromSyntax(&syntax);
     }
 
     fn parseDropMaterializedViewDdl(self: *@This()) !DropMaterializedViewPlan {
         var syntax = try sql_adapter.parseDropMaterializedViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .view_name = syntax.view_name,
-            .if_exists = syntax.if_exists,
-            .cascade = syntax.cascade,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropMaterializedViewPlanFromSyntax(&syntax);
     }
 
     fn parseCreateViewDdl(self: *@This(), replace_existing: bool) !CreateViewPlan {
         var syntax = try sql_adapter.parseCreateViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos, replace_existing);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .view_name = syntax.view_name,
-            .source_table_name = syntax.source_table_name,
-            .source_fields = syntax.source_fields,
-            .output_fields = syntax.output_fields,
-            .replace_existing = syntax.replace_existing,
-            .if_not_exists = syntax.if_not_exists,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.createViewPlanFromSyntax(&syntax);
     }
 
     fn parseRenameViewDdl(self: *@This()) !RenameViewPlan {
         var syntax = try sql_adapter.parseRenameViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .view_name = syntax.view_name,
-            .new_view_name = syntax.new_view_name,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.renameViewPlanFromSyntax(&syntax);
     }
 
     fn parseDropViewDdl(self: *@This()) !DropViewPlan {
         var syntax = try sql_adapter.parseDropViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .view_name = syntax.view_name,
-            .if_exists = syntax.if_exists,
-            .cascade = syntax.cascade,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropViewPlanFromSyntax(&syntax);
     }
 
     fn parseDropTableDdl(self: *@This()) !DropTablePlan {
         var syntax = try sql_adapter.parseDropTableCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .table_name = syntax.table_name,
-            .if_exists = syntax.if_exists,
-            .cascade = syntax.cascade,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropTablePlanFromSyntax(&syntax);
     }
 
     fn parseDropIndexDdl(self: *@This()) !DropIndexPlan {
         var syntax = try sql_adapter.parseDropIndexCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .index_name = syntax.index_name,
-            .if_exists = syntax.if_exists,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropIndexPlanFromSyntax(&syntax);
     }
 
     fn parseDropTriggerPolicyDdl(self: *@This()) !AlterTablePlan {
         var syntax = try sql_adapter.parseDropUpdatePolicyTriggerCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var syntax_transferred = false;
-        errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-
-        const operations = try self.alloc.alloc(AlterTableOperation, 1);
-        var operations_transferred = false;
-        errdefer if (!operations_transferred) self.alloc.free(operations);
-        operations[0] = .{ .drop_update_policy = .{
-            .trigger_name = syntax.trigger_name,
-            .if_exists = syntax.if_exists,
-        } };
-
-        syntax_transferred = true;
-        operations_transferred = true;
-        return .{
-            .table_name = syntax.table_name,
-            .operations = operations,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropUpdatePolicyTriggerPlanFromSyntaxAlloc(self.alloc, &syntax);
     }
 
     fn parseCreateTriggerPolicyDdl(self: *@This()) !CreateUpdatePolicyPlan {
         var syntax = try sql_adapter.parseCreateUpdatePolicyTriggerCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var syntax_transferred = false;
-        errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-
-        const value_json = try self.alloc.dupe(u8, "");
-        var value_transferred = false;
-        errdefer if (!value_transferred) self.alloc.free(value_json);
-        syntax_transferred = true;
-        value_transferred = true;
-        return .{
-            .trigger_name = syntax.trigger_name,
-            .table_name = syntax.table_name,
-            .column_name = syntax.column_name,
-            .on_update_value = .{ .kind = .now_ns, .value_json = value_json },
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.createUpdatePolicyTriggerPlanFromSyntaxAlloc(self.alloc, &syntax);
     }
 
     fn parseAlterRowSecurityDdl(self: *@This()) !AlterRowSecurityPlan {
         const syntax = (try sql_adapter.parseAlterRowSecurity(self.tokens, &self.pos)) orelse return error.UnsupportedSqlShape;
-        const table_name = try normalizeSqlObjectIdentifierAlloc(self.alloc, syntax.table_identifier);
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        table_name_transferred = true;
-        return .{ .table_name = table_name, .enabled = syntax.enabled };
+        return sql_adapter.alterRowSecurityPlanFromSyntaxAlloc(self.alloc, syntax);
     }
 
     fn parseCreateRowSecurityPolicyDdl(self: *@This()) !CreateRowSecurityPolicyPlan {
-        var syntax = try sql_adapter.parseCreateRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .policy_name = syntax.policy_name,
-            .table_name = syntax.table_name,
-            .role_targets = syntax.role_targets,
-            .predicate = syntax.predicate,
+        const start = self.pos;
+        var syntax = sql_adapter.parseCreateRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos) catch |err| {
+            if (err == error.OutOfMemory or self.function_bindings.routine_expressions.len == 0) return err;
+            self.pos = start;
+            return try self.parseCreateRowSecurityPolicyDdlWithExpressionBindings();
         };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.createRowSecurityPolicyPlanFromSyntax(&syntax);
     }
 
     fn parseAlterRowSecurityPolicyDdl(self: *@This()) !AlterRowSecurityPolicyPlan {
-        var syntax = try sql_adapter.parseAlterRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .policy_name = syntax.policy_name,
-            .table_name = syntax.table_name,
-            .role_targets = syntax.role_targets,
-            .predicate = syntax.predicate,
+        const start = self.pos;
+        var syntax = sql_adapter.parseAlterRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos) catch |err| {
+            if (err == error.OutOfMemory or self.function_bindings.routine_expressions.len == 0) return err;
+            self.pos = start;
+            return try self.parseAlterRowSecurityPolicyDdlWithExpressionBindings();
         };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.alterRowSecurityPolicyPlanFromSyntax(&syntax);
+    }
+
+    fn parseCreateRowSecurityPolicyDdlWithExpressionBindings(self: *@This()) !CreateRowSecurityPolicyPlan {
+        try self.expectKeyword("policy");
+        const policy_name = try self.parseIdentifierOwned();
+        var policy_transferred = false;
+        errdefer if (!policy_transferred) self.alloc.free(policy_name);
+        try self.expectKeyword("on");
+        const table_name = try self.parseSqlObjectIdentifierOwned();
+        var table_transferred = false;
+        errdefer if (!table_transferred) self.alloc.free(table_name);
+        const role_targets = try self.parseOptionalRowSecurityPolicyRoleTargetsAlloc();
+        var role_targets_transferred = false;
+        errdefer if (!role_targets_transferred) freeStringSlice(self.alloc, role_targets);
+        try self.expectKeyword("using");
+        var predicate = try self.parseRowSecurityPolicyExpressionBindingPredicateAlloc();
+        var predicate_transferred = false;
+        errdefer if (!predicate_transferred) predicate.deinit(self.alloc);
+        try self.parseAdapterNoopStatementEnd();
+
+        policy_transferred = true;
+        table_transferred = true;
+        role_targets_transferred = true;
+        predicate_transferred = true;
+        return .{
+            .policy_name = policy_name,
+            .table_name = table_name,
+            .role_targets = role_targets,
+            .predicate = predicate,
+        };
+    }
+
+    fn parseAlterRowSecurityPolicyDdlWithExpressionBindings(self: *@This()) !AlterRowSecurityPolicyPlan {
+        try self.expectKeyword("policy");
+        const policy_name = try self.parseIdentifierOwned();
+        var policy_transferred = false;
+        errdefer if (!policy_transferred) self.alloc.free(policy_name);
+        try self.expectKeyword("on");
+        const table_name = try self.parseSqlObjectIdentifierOwned();
+        var table_transferred = false;
+        errdefer if (!table_transferred) self.alloc.free(table_name);
+        const role_targets = try self.parseOptionalRowSecurityPolicyRoleTargetsAlloc();
+        var role_targets_transferred = false;
+        errdefer if (!role_targets_transferred) freeStringSlice(self.alloc, role_targets);
+        try self.expectKeyword("using");
+        var predicate = try self.parseRowSecurityPolicyExpressionBindingPredicateAlloc();
+        var predicate_transferred = false;
+        errdefer if (!predicate_transferred) predicate.deinit(self.alloc);
+        try self.parseAdapterNoopStatementEnd();
+
+        policy_transferred = true;
+        table_transferred = true;
+        role_targets_transferred = true;
+        predicate_transferred = true;
+        return .{
+            .policy_name = policy_name,
+            .table_name = table_name,
+            .role_targets = role_targets,
+            .predicate = predicate,
+        };
+    }
+
+    fn parseOptionalRowSecurityPolicyRoleTargetsAlloc(self: *@This()) ![]const []const u8 {
+        if (!self.matchKeyword("to")) return &.{};
+        var roles = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (roles.items) |role| self.alloc.free(role);
+            roles.deinit(self.alloc);
+        }
+        while (true) {
+            const role = try self.parseIdentifierOwned();
+            var role_transferred = false;
+            errdefer if (!role_transferred) self.alloc.free(role);
+            try roles.append(self.alloc, role);
+            role_transferred = true;
+            if (self.match(.comma) == null) break;
+        }
+        return try roles.toOwnedSlice(self.alloc);
+    }
+
+    fn parseRowSecurityPolicyExpressionBindingPredicateAlloc(self: *@This()) !RowSecurityPolicyPredicate {
+        const wrapped = self.match(.lparen) != null;
+        const previous_defer_validation = self.defer_row_expression_field_validation;
+        self.defer_row_expression_field_validation = true;
+        defer self.defer_row_expression_field_validation = previous_defer_validation;
+
+        const lhs = try self.parseBooleanRowExpressionAlloc();
+        var lhs_transferred = false;
+        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
+        const op = try self.parseComparisonOp();
+        const rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+        var rhs_transferred = false;
+        errdefer {
+            if (!rhs_transferred) self.alloc.free(rhs);
+        }
+        rhs[0] = try self.parseBooleanRowExpressionAlloc();
+        errdefer if (!rhs_transferred) freeExpression(self.alloc, rhs[0]);
+        if (wrapped) try self.expect(.rparen);
+
+        lhs_transferred = true;
+        rhs_transferred = true;
+        return .{ .expression = .{
+            .lhs = lhs,
+            .op = op,
+            .rhs = rhs,
+        } };
+    }
+
+    fn parseAdapterNoopStatementEnd(self: *@This()) !void {
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
     }
 
     fn parseDropRowSecurityPolicyDdl(self: *@This()) !DropRowSecurityPolicyPlan {
         var syntax = try sql_adapter.parseDropRowSecurityPolicyCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
-        var transferred = false;
-        errdefer if (!transferred) syntax.deinit(self.alloc);
-        transferred = true;
-        return .{
-            .policy_name = syntax.policy_name,
-            .table_name = syntax.table_name,
-            .if_exists = syntax.if_exists,
-        };
+        errdefer syntax.deinit(self.alloc);
+        return sql_adapter.dropRowSecurityPolicyPlanFromSyntax(&syntax);
     }
 
     fn parseAlterTableDdl(self: *@This()) !AlterTablePlan {
@@ -5644,6 +5355,32 @@ const Parser = struct {
     }
 
     fn parseDdlGeneratedValue(self: *@This()) !runtime_schema.RelationalGeneratedValue {
+        if (self.function_bindings.routine_expressions.len != 0) {
+            const start = self.pos;
+            if (self.matchKeyword("always")) {
+                try self.expectKeyword("as");
+                try self.expect(.lparen);
+                const previous_defer_validation = self.defer_row_expression_field_validation;
+                self.defer_row_expression_field_validation = true;
+                const expression = self.parseRowExpressionAlloc() catch |err| {
+                    self.defer_row_expression_field_validation = previous_defer_validation;
+                    self.pos = start;
+                    if (err == error.OutOfMemory) return err;
+                    return try sql_adapter.parseDdlStoredGeneratedValueAlloc(self.alloc, self.tokens, &self.pos);
+                };
+                self.defer_row_expression_field_validation = previous_defer_validation;
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(self.alloc, expression);
+                try self.expect(.rparen);
+                try self.expectKeyword("stored");
+                expression_transferred = true;
+                return .{
+                    .op = .expression,
+                    .expression = expression,
+                };
+            }
+            self.pos = start;
+        }
         return sql_adapter.parseDdlStoredGeneratedValueAlloc(self.alloc, self.tokens, &self.pos);
     }
 
@@ -5711,45 +5448,14 @@ const Parser = struct {
 
     fn parseDdlDefaultValue(self: *@This(), field_type: runtime_schema.AntflyType) !runtime_schema.RelationalDefaultValue {
         if (try sql_adapter.parseOptionalDdlKnownDefault(self.tokens, &self.pos)) |known| {
-            return try self.ddlDefaultValueFromKnownSyntax(known, field_type);
+            return try sql_adapter.ddlDefaultValueFromKnownSyntaxAlloc(self.alloc, known, field_type);
         }
         const value = try self.parseSqlColumnValueAlloc(.{ .name = "", .path = "", .field_type = field_type });
         return .{ .kind = .literal, .value_json = value };
     }
 
     fn parseDdlDefaultValueUntyped(self: *@This()) !runtime_schema.RelationalDefaultValue {
-        if (try sql_adapter.parseOptionalDdlKnownDefault(self.tokens, &self.pos)) |known| {
-            return try self.ddlDefaultValueFromKnownSyntax(known, null);
-        }
-        return .{ .kind = .literal, .value_json = try sql_adapter.parseSqlUntypedValueJsonAlloc(self.alloc, self.tokens, &self.pos) };
-    }
-
-    fn ddlDefaultValueFromKnownSyntax(
-        self: *@This(),
-        known: sql_adapter.DdlKnownDefaultSyntax,
-        field_type: ?runtime_schema.AntflyType,
-    ) !runtime_schema.RelationalDefaultValue {
-        return switch (known) {
-            .null_literal => .{ .kind = .literal, .value_json = try self.alloc.dupe(u8, "null") },
-            .uuid_v4 => blk: {
-                if (field_type) |ty| {
-                    if (ty != .keyword and ty != .text and ty != .link) return error.UnsupportedSqlShape;
-                }
-                break :blk .{ .kind = .uuid_v4, .value_json = try self.alloc.dupe(u8, "") };
-            },
-            .now_ns => blk: {
-                if (field_type) |ty| {
-                    if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
-                }
-                break :blk .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
-            },
-            .current_date_ns => blk: {
-                if (field_type) |ty| {
-                    if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
-                }
-                break :blk .{ .kind = .current_date_ns, .value_json = try self.alloc.dupe(u8, "") };
-            },
-        };
+        return try sql_adapter.parseDdlDefaultValueUntypedAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseOptionalCurrentTimestampPrecision(self: *@This()) !void {
@@ -33791,874 +33497,6 @@ fn stringSlicesIntersect(a: []const []const u8, b: []const []const u8) bool {
     return false;
 }
 
-fn addColumnOperationToSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    schema_parts: RelationalSchemaJsonParts,
-    operation: AddColumnOperation,
-) !void {
-    if (schema_parts.properties.get(operation.column.name) != null) {
-        if (operation.if_not_exists) return;
-        return error.InvalidSqlCatalog;
-    }
-    try schema_parts.properties.put(alloc, try alloc.dupe(u8, operation.column.name), try schemaJsonPropertyFromColumnAlloc(alloc, operation.column));
-    if (!operation.column.nullable) {
-        var required = try rootArrayFieldAlloc(alloc, schema_parts.schema, "required");
-        try required.append(.{ .string = try alloc.dupe(u8, operation.column.name) });
-    }
-    if (operation.unique_constraints.len > 0) {
-        var constraints = try rootArrayFieldAlloc(alloc, root, "unique_constraints");
-        for (operation.unique_constraints) |constraint| try constraints.append(try schemaJsonUniqueConstraintAlloc(alloc, constraint));
-    }
-    if (operation.foreign_keys.len > 0) {
-        var foreign_keys = try rootArrayFieldAlloc(alloc, root, "foreign_keys");
-        for (operation.foreign_keys) |foreign_key| try foreign_keys.append(try schemaJsonForeignKeyAlloc(alloc, foreign_key));
-    }
-    if (operation.checks.len > 0) {
-        var checks = try rootArrayFieldAlloc(alloc, root, "checks");
-        for (operation.checks) |check| try checks.append(try schemaJsonRelationalCheckAlloc(alloc, check));
-    }
-}
-
-fn applyAlterTablePlanToSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    plan: AlterTablePlan,
-) !void {
-    const schema_parts = try relationalSchemaJsonParts(root);
-    for (plan.operations) |operation| {
-        switch (operation) {
-            .add_column => |add_column| try addColumnOperationToSchemaJsonValue(alloc, root, schema_parts, add_column),
-            .add_period => |period| {
-                var periods = try rootArrayFieldAlloc(alloc, root, "periods");
-                try periods.append(try schemaJsonPeriodAlloc(alloc, period));
-            },
-            .add_primary_key => |primary_key| {
-                if (root.get("primary_key") != null) return error.InvalidSqlCatalog;
-                try root.put(alloc, try alloc.dupe(u8, "primary_key"), try schemaJsonPrimaryKeyAlloc(alloc, primary_key));
-            },
-            .rename_column => |rename_column| try renameColumnInSchemaJsonValue(alloc, root, schema_parts, rename_column),
-            .rename_constraint => |rename_constraint| try renameConstraintInSchemaJsonValue(alloc, root, plan.table_name, rename_constraint),
-            .drop_column => |drop_column| try dropColumnFromSchemaJsonValue(alloc, root, schema_parts, drop_column),
-            .drop_constraint => |drop_constraint| try dropConstraintFromSchemaJsonValue(root, plan.table_name, drop_constraint),
-            .drop_update_policy => |drop_update_policy| try dropUpdatePolicyFromSchemaJsonValue(schema_parts, drop_update_policy),
-            .alter_column_default => |alter_column_default| try alterColumnDefaultInSchemaJsonValue(alloc, schema_parts, alter_column_default),
-            .alter_column_nullability => |alter_column_nullability| try alterColumnNullabilityInSchemaJsonValue(alloc, root, schema_parts, alter_column_nullability),
-            .alter_column_type => |alter_column_type| try alterColumnTypeInSchemaJsonValue(alloc, schema_parts, alter_column_type),
-            .add_unique_constraint => |constraint| {
-                var constraints = try rootArrayFieldAlloc(alloc, root, "unique_constraints");
-                try constraints.append(try schemaJsonUniqueConstraintAlloc(alloc, constraint));
-            },
-            .add_foreign_key => |foreign_key| {
-                var foreign_keys = try rootArrayFieldAlloc(alloc, root, "foreign_keys");
-                try foreign_keys.append(try schemaJsonForeignKeyAlloc(alloc, foreign_key));
-            },
-            .add_check => |check| {
-                var checks = try rootArrayFieldAlloc(alloc, root, "checks");
-                try checks.append(try schemaJsonRelationalCheckAlloc(alloc, check));
-            },
-            .validate_constraint => |constraint_name| try validateConstraintByNameInSchemaJson(alloc, root, plan.table_name, constraint_name),
-        }
-    }
-    try pruneSchemaJsonCommentsForCurrentSchema(root, plan.table_name);
-}
-
-fn applyCreateUpdatePolicyPlanToSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    plan: CreateUpdatePolicyPlan,
-) !void {
-    const schema_parts = try relationalSchemaJsonParts(root);
-    const property = schema_parts.properties.getPtr(plan.column_name) orelse return error.InvalidSqlCatalog;
-    if (property.* != .object) return error.InvalidSqlCatalog;
-    try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-on-update"), try schemaJsonDefaultValueAlloc(alloc, plan.on_update_value, true));
-}
-
-fn applyCommentMetadataPlanToSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    plan: CommentMetadataPlan,
-) !void {
-    const schema_parts = try relationalSchemaJsonParts(root);
-    if (plan.object_name.len == 0) return error.InvalidSqlCatalog;
-
-    const comments = try rootObjectFieldAlloc(alloc, root, "comments");
-    switch (plan.target) {
-        .table => try applyStringCommentValueToObject(alloc, comments, "table", plan.comment_json),
-        .column => {
-            const column_name = commentColumnName(plan.object_name);
-            const property = schema_parts.properties.getPtr(column_name) orelse return error.InvalidSqlCatalog;
-            if (property.* != .object) return error.InvalidSqlCatalog;
-            const columns = try rootObjectFieldAlloc(alloc, comments, "columns");
-            try applyStringCommentValueToObject(alloc, columns, column_name, plan.comment_json);
-            removeEmptyCommentMap(comments, "columns");
-        },
-        .index => {
-            if (!try schemaJsonIndexNameExists(schema_parts.properties, root.getPtr("unique_constraints"), plan.object_name)) return error.InvalidSqlCatalog;
-            const indexes = try rootObjectFieldAlloc(alloc, comments, "indexes");
-            try applyStringCommentValueToObject(alloc, indexes, plan.object_name, plan.comment_json);
-            removeEmptyCommentMap(comments, "indexes");
-        },
-        .constraint => {
-            const parent_table = plan.parent_table_name orelse return error.InvalidSqlCatalog;
-            if (!try jsonConstraintNameExists(root, parent_table, plan.object_name)) return error.InvalidSqlCatalog;
-            const constraints = try rootObjectFieldAlloc(alloc, comments, "constraints");
-            try applyStringCommentValueToObject(alloc, constraints, plan.object_name, plan.comment_json);
-            removeEmptyCommentMap(comments, "constraints");
-        },
-    }
-    if (try schemaJsonCommentCountInObject(comments) == 0) _ = root.orderedRemove("comments");
-}
-
-fn commentColumnName(object_name: []const u8) []const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, object_name, '.') orelse return object_name;
-    return object_name[dot + 1 ..];
-}
-
-fn applyStringCommentValueToObject(
-    alloc: std.mem.Allocator,
-    object: *std.json.ObjectMap,
-    key: []const u8,
-    comment_json: ?[]const u8,
-) !void {
-    const raw = comment_json orelse {
-        _ = object.orderedRemove(key);
-        return;
-    };
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
-    defer parsed.deinit();
-    const value = switch (parsed.value) {
-        .string => |value| value,
-        else => return error.UnsupportedSqlShape,
-    };
-    try putJsonString(alloc, object, key, value);
-}
-
-fn renameCommentMapEntry(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    map_name: []const u8,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    const comments_value = root.getPtr("comments") orelse return;
-    if (comments_value.* != .object) return error.InvalidSqlCatalog;
-    const map_value = comments_value.object.getPtr(map_name) orelse return;
-    if (map_value.* != .object) return error.InvalidSqlCatalog;
-    const comment = map_value.object.get(old_name) orelse return;
-    if (comment != .string) return error.InvalidSqlCatalog;
-    _ = map_value.object.orderedRemove(old_name);
-    try putJsonString(alloc, &map_value.object, new_name, comment.string);
-}
-
-fn pruneSchemaJsonCommentsForCurrentSchema(root: *std.json.ObjectMap, table_name: []const u8) !void {
-    const comments_value = root.getPtr("comments") orelse return;
-    if (comments_value.* != .object) return error.InvalidSqlCatalog;
-    const schema_parts = try relationalSchemaJsonParts(root);
-
-    if (comments_value.object.getPtr("columns")) |columns| {
-        if (columns.* != .object) return error.InvalidSqlCatalog;
-        while (true) {
-            var removed = false;
-            var it = columns.object.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* != .string) return error.InvalidSqlCatalog;
-                if (schema_parts.properties.get(entry.key_ptr.*) != null) continue;
-                _ = columns.object.orderedRemove(entry.key_ptr.*);
-                removed = true;
-                break;
-            }
-            if (!removed) break;
-        }
-        removeEmptyCommentMap(&comments_value.object, "columns");
-    }
-    if (comments_value.object.getPtr("indexes")) |indexes| {
-        if (indexes.* != .object) return error.InvalidSqlCatalog;
-        while (true) {
-            var removed = false;
-            var it = indexes.object.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* != .string) return error.InvalidSqlCatalog;
-                if (try schemaJsonIndexNameExists(schema_parts.properties, root.getPtr("unique_constraints"), entry.key_ptr.*)) continue;
-                _ = indexes.object.orderedRemove(entry.key_ptr.*);
-                removed = true;
-                break;
-            }
-            if (!removed) break;
-        }
-        removeEmptyCommentMap(&comments_value.object, "indexes");
-    }
-    if (comments_value.object.getPtr("constraints")) |constraints| {
-        if (constraints.* != .object) return error.InvalidSqlCatalog;
-        while (true) {
-            var removed = false;
-            var it = constraints.object.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* != .string) return error.InvalidSqlCatalog;
-                if (try jsonConstraintNameExists(root, table_name, entry.key_ptr.*)) continue;
-                _ = constraints.object.orderedRemove(entry.key_ptr.*);
-                removed = true;
-                break;
-            }
-            if (!removed) break;
-        }
-        removeEmptyCommentMap(&comments_value.object, "constraints");
-    }
-    if (try schemaJsonCommentCountInObject(&comments_value.object) == 0) _ = root.orderedRemove("comments");
-}
-
-fn dropUpdatePolicyFromSchemaJsonValue(
-    schema_parts: RelationalSchemaJsonParts,
-    operation: DropUpdatePolicyOperation,
-) !void {
-    _ = operation.trigger_name;
-    var policy_count: usize = 0;
-    var it = schema_parts.properties.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .object) return error.InvalidSqlCatalog;
-        if (entry.value_ptr.object.get("x-antfly-on-update") == null) continue;
-        policy_count += 1;
-    }
-    if (policy_count == 0) {
-        if (operation.if_exists) return;
-        return error.InvalidSqlCatalog;
-    }
-    if (policy_count > 1) return error.InvalidSqlCatalog;
-
-    var remove_it = schema_parts.properties.iterator();
-    while (remove_it.next()) |entry| {
-        if (entry.value_ptr.object.get("x-antfly-on-update") == null) continue;
-        _ = entry.value_ptr.object.orderedRemove("x-antfly-on-update");
-        return;
-    }
-    return error.InvalidSqlCatalog;
-}
-
-fn renameColumnInSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    schema_parts: RelationalSchemaJsonParts,
-    operation: RenameColumnOperation,
-) !void {
-    if (std.mem.eql(u8, operation.old_name, operation.new_name)) return error.InvalidSqlCatalog;
-    if (schema_parts.properties.get(operation.new_name) != null) return error.InvalidSqlCatalog;
-    const property = schema_parts.properties.get(operation.old_name) orelse return error.InvalidSqlCatalog;
-    _ = schema_parts.properties.orderedRemove(operation.old_name);
-    try schema_parts.properties.put(alloc, try alloc.dupe(u8, operation.new_name), property);
-
-    try renameStringInJsonArray(alloc, schema_parts.schema.getPtr("required"), operation.old_name, operation.new_name);
-    if (root.getPtr("primary_key")) |primary_key| try renamePrimaryKeyJsonFields(alloc, primary_key, operation.old_name, operation.new_name);
-
-    var property_it = schema_parts.properties.iterator();
-    while (property_it.next()) |entry| {
-        try renameSchemaPropertyReferences(alloc, entry.value_ptr, operation.old_name, operation.new_name);
-    }
-
-    try renameConstraintArrayFields(alloc, root.getPtr("unique_constraints"), operation.old_name, operation.new_name, .unique);
-    try renameConstraintArrayFields(alloc, root.getPtr("foreign_keys"), operation.old_name, operation.new_name, .foreign_key);
-    try renameConstraintArrayFields(alloc, root.getPtr("checks"), operation.old_name, operation.new_name, .check);
-    try renameCommentMapEntry(alloc, root, "columns", operation.old_name, operation.new_name);
-}
-
-fn dropColumnFromSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    schema_parts: RelationalSchemaJsonParts,
-    drop_column: DropColumnOperation,
-) !void {
-    if (schema_parts.properties.get(drop_column.name) == null) {
-        if (drop_column.if_exists) return;
-        return error.InvalidSqlCatalog;
-    }
-
-    var dropped = std.ArrayListUnmanaged([]const u8).empty;
-    defer dropped.deinit(alloc);
-    try appendUniqueBorrowedString(alloc, &dropped, drop_column.name);
-
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var it = schema_parts.properties.iterator();
-        while (it.next()) |entry| {
-            if (stringSlicesContains(dropped.items, entry.key_ptr.*)) continue;
-            if (propertyGeneratedReferencesAny(entry.value_ptr.*, dropped.items)) {
-                try appendUniqueBorrowedString(alloc, &dropped, entry.key_ptr.*);
-                changed = true;
-            }
-        }
-    }
-
-    try rejectPrimaryKeyDropFromSchemaJson(root, dropped.items);
-    if (drop_column.dependency_mode == .restrict and try schemaJsonHasDropDependencies(root, dropped.items)) {
-        return error.InvalidSqlCatalog;
-    }
-
-    for (dropped.items) |name| {
-        if (!schema_parts.properties.orderedRemove(name)) return error.InvalidSqlCatalog;
-    }
-    try removeStringsFromJsonArray(schema_parts.schema.getPtr("required"), dropped.items);
-    try removeDependentConstraintsFromJsonArray(root.getPtr("unique_constraints"), dropped.items, .unique);
-    try removeDependentConstraintsFromJsonArray(root.getPtr("foreign_keys"), dropped.items, .foreign_key);
-    try removeDependentConstraintsFromJsonArray(root.getPtr("checks"), dropped.items, .check);
-}
-
-fn schemaJsonHasDropDependencies(root: *std.json.ObjectMap, dropped: []const []const u8) !bool {
-    if (dropped.len > 1) return true;
-    if (try jsonConstraintArrayReferencesAny(root.getPtr("unique_constraints"), dropped, .unique)) return true;
-    if (try jsonConstraintArrayReferencesAny(root.getPtr("foreign_keys"), dropped, .foreign_key)) return true;
-    if (try jsonConstraintArrayReferencesAny(root.getPtr("checks"), dropped, .check)) return true;
-    const schema_parts = try relationalSchemaJsonParts(root);
-    var it = schema_parts.properties.iterator();
-    while (it.next()) |entry| {
-        if (schemaJsonSecondaryIndexReferencesAny(entry.value_ptr.*, dropped)) return true;
-    }
-    return false;
-}
-
-fn jsonConstraintArrayReferencesAny(
-    value: ?*std.json.Value,
-    fields: []const []const u8,
-    kind: JsonConstraintKind,
-) !bool {
-    const array_value = value orelse return false;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    for (array_value.array.items) |item| {
-        if (item != .object) return error.InvalidSqlCatalog;
-        const references = switch (kind) {
-            .unique => jsonUniqueConstraintReferencesAny(item, fields),
-            .foreign_key => jsonStringArrayReferencesAny(item.object.get("columns") orelse return error.InvalidSqlCatalog, fields),
-            .check => blk: {
-                const field = item.object.get("field") orelse return error.InvalidSqlCatalog;
-                break :blk field == .string and stringSlicesContains(fields, field.string);
-            },
-        };
-        if (references) return true;
-    }
-    return false;
-}
-
-fn validateConstraintByNameInSchemaJson(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    table_name: []const u8,
-    constraint_name: []const u8,
-) !void {
-    if (try schemaJsonPrimaryKeyNameEquals(root, table_name, constraint_name)) return;
-    if (try setNamedConstraintValidationStateInArray(alloc, root, "unique_constraints", constraint_name, "enforced")) return;
-    if (try setNamedConstraintValidationStateInArray(alloc, root, "foreign_keys", constraint_name, "enforced")) return;
-    if (try setNamedConstraintValidationStateInArray(alloc, root, "checks", constraint_name, "enforced")) return;
-    return error.InvalidSqlCatalog;
-}
-
-fn dropConstraintFromSchemaJsonValue(
-    root: *std.json.ObjectMap,
-    table_name: []const u8,
-    drop_constraint: DropConstraintOperation,
-) !void {
-    if (try dropPrimaryKeyFromSchemaJsonValue(root, table_name, drop_constraint.name)) {
-        removeCommentMapEntry(root, "constraints", drop_constraint.name);
-        return;
-    }
-    if (try removeNamedConstraintFromJsonArray(root.getPtr("unique_constraints"), drop_constraint.name)) return;
-    if (try removeNamedConstraintFromJsonArray(root.getPtr("foreign_keys"), drop_constraint.name)) return;
-    if (try removeNamedConstraintFromJsonArray(root.getPtr("checks"), drop_constraint.name)) return;
-    if (drop_constraint.if_exists) return;
-    return error.InvalidSqlCatalog;
-}
-
-fn dropPrimaryKeyFromSchemaJsonValue(
-    root: *std.json.ObjectMap,
-    table_name: []const u8,
-    constraint_name: []const u8,
-) !bool {
-    if (!try schemaJsonPrimaryKeyNameEquals(root, table_name, constraint_name)) return false;
-    _ = root.orderedRemove("primary_key");
-    return true;
-}
-
-fn renameConstraintInSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    table_name: []const u8,
-    operation: RenameConstraintOperation,
-) !void {
-    if (std.mem.eql(u8, operation.old_name, operation.new_name)) return error.InvalidSqlCatalog;
-    if (try jsonConstraintNameExists(root, table_name, operation.new_name)) return error.InvalidSqlCatalog;
-    const renamed =
-        try renamePrimaryKeyConstraintInSchemaJsonValue(alloc, root, table_name, operation.old_name, operation.new_name) or
-        try renameNamedConstraintInJsonArray(alloc, root.getPtr("unique_constraints"), operation.old_name, operation.new_name) or
-        try renameNamedConstraintInJsonArray(alloc, root.getPtr("foreign_keys"), operation.old_name, operation.new_name) or
-        try renameNamedConstraintInJsonArray(alloc, root.getPtr("checks"), operation.old_name, operation.new_name);
-    if (!renamed) return error.InvalidSqlCatalog;
-    try renameCommentMapEntry(alloc, root, "constraints", operation.old_name, operation.new_name);
-    try renameCommentMapEntry(alloc, root, "indexes", operation.old_name, operation.new_name);
-}
-
-fn jsonConstraintNameExists(root: *std.json.ObjectMap, table_name: []const u8, constraint_name: []const u8) !bool {
-    if (try schemaJsonPrimaryKeyNameEquals(root, table_name, constraint_name)) return true;
-    if (try jsonConstraintArrayNameExists(root.getPtr("unique_constraints"), constraint_name)) return true;
-    if (try jsonConstraintArrayNameExists(root.getPtr("foreign_keys"), constraint_name)) return true;
-    if (try jsonConstraintArrayNameExists(root.getPtr("checks"), constraint_name)) return true;
-    return false;
-}
-
-fn schemaJsonPrimaryKeyNameEquals(root: *std.json.ObjectMap, table_name: []const u8, constraint_name: []const u8) !bool {
-    const primary_key = root.get("primary_key") orelse return false;
-    if (primary_key == .null) return false;
-    if (primary_key != .object) return error.InvalidSqlCatalog;
-    if (primary_key.object.get("name")) |name| {
-        if (name != .string) return error.InvalidSqlCatalog;
-        return std.mem.eql(u8, name.string, constraint_name);
-    }
-    return defaultPrimaryKeyNameEquals(table_name, constraint_name);
-}
-
-fn renamePrimaryKeyConstraintInSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    table_name: []const u8,
-    old_name: []const u8,
-    new_name: []const u8,
-) !bool {
-    const primary_key = root.getPtr("primary_key") orelse return false;
-    if (primary_key.* == .null) return false;
-    if (primary_key.* != .object) return error.InvalidSqlCatalog;
-    if (primary_key.object.get("name")) |existing| {
-        if (existing != .string) return error.InvalidSqlCatalog;
-        if (!std.mem.eql(u8, existing.string, old_name)) return false;
-        _ = primary_key.object.orderedRemove("name");
-        try putJsonString(alloc, &primary_key.object, "name", new_name);
-        return true;
-    }
-    if (!defaultPrimaryKeyNameEquals(table_name, old_name)) return false;
-    _ = primary_key.object.orderedRemove("name");
-    try putJsonString(alloc, &primary_key.object, "name", new_name);
-    return true;
-}
-
-fn jsonConstraintArrayNameExists(
-    value: ?*std.json.Value,
-    constraint_name: []const u8,
-) !bool {
-    const array_value = value orelse return false;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    for (array_value.array.items) |item| {
-        if (item != .object) return error.InvalidSqlCatalog;
-        const name = item.object.get("name") orelse return error.InvalidSqlCatalog;
-        if (name != .string) return error.InvalidSqlCatalog;
-        if (std.mem.eql(u8, name.string, constraint_name)) return true;
-    }
-    return false;
-}
-
-fn renameNamedConstraintInJsonArray(
-    alloc: std.mem.Allocator,
-    value: ?*std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !bool {
-    const array_value = value orelse return false;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    for (array_value.array.items) |*item| {
-        if (item.* != .object) return error.InvalidSqlCatalog;
-        const name = item.object.get("name") orelse return error.InvalidSqlCatalog;
-        if (name != .string) return error.InvalidSqlCatalog;
-        if (!std.mem.eql(u8, name.string, old_name)) continue;
-        try putJsonString(alloc, &item.object, "name", new_name);
-        return true;
-    }
-    return false;
-}
-
-fn alterColumnDefaultInSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    schema_parts: RelationalSchemaJsonParts,
-    operation: AlterColumnDefaultOperation,
-) !void {
-    const property = schema_parts.properties.getPtr(operation.column_name) orelse return error.InvalidSqlCatalog;
-    if (property.* != .object) return error.InvalidSqlCatalog;
-    _ = property.object.orderedRemove("default");
-    _ = property.object.orderedRemove("x-antfly-default");
-    if (operation.default_value) |default_value| {
-        const key = if (default_value.kind == .literal) "default" else "x-antfly-default";
-        try property.object.put(alloc, try alloc.dupe(u8, key), try schemaJsonDefaultValueAlloc(alloc, default_value, default_value.kind != .literal));
-    }
-}
-
-fn alterColumnNullabilityInSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    schema_parts: RelationalSchemaJsonParts,
-    operation: AlterColumnNullabilityOperation,
-) !void {
-    if (schema_parts.properties.get(operation.column_name) == null) return error.InvalidSqlCatalog;
-    if (operation.nullable) {
-        try rejectPrimaryKeyDropFromSchemaJson(root, &.{operation.column_name});
-        try removeStringsFromJsonArray(schema_parts.schema.getPtr("required"), &.{operation.column_name});
-        return;
-    }
-    const required = try rootArrayFieldAlloc(alloc, schema_parts.schema, "required");
-    try appendUniqueJsonString(alloc, required, operation.column_name);
-}
-
-fn alterColumnTypeInSchemaJsonValue(
-    alloc: std.mem.Allocator,
-    schema_parts: RelationalSchemaJsonParts,
-    operation: AlterColumnTypeOperation,
-) !void {
-    const property = schema_parts.properties.getPtr(operation.column_name) orelse return error.InvalidSqlCatalog;
-    if (property.* != .object) return error.InvalidSqlCatalog;
-    if (property.object.get("generated") != null) return error.UnsupportedSqlShape;
-    if (operation.collation != null and !relationalFieldTypeSupportsCollation(operation.field_type)) return error.UnsupportedSqlShape;
-    if (!relationalFieldTypeSupportsCollation(operation.field_type) and property.object.get("collation") != null) return error.UnsupportedSqlShape;
-    try putJsonString(alloc, &property.object, "type", antflyTypeSchemaName(operation.field_type));
-    _ = property.object.orderedRemove("items");
-    if (operation.field_type == .array) {
-        const item_type = operation.array_item_type orelse return error.InvalidSqlCatalog;
-        var item_object = std.json.ObjectMap.empty;
-        try putJsonString(alloc, &item_object, "type", antflyTypeSchemaName(item_type));
-        try property.object.put(alloc, try alloc.dupe(u8, "items"), .{ .object = item_object });
-    }
-    if (operation.collation) |collation| try putJsonString(alloc, &property.object, "collation", collation);
-}
-
-fn appendUniqueJsonString(
-    alloc: std.mem.Allocator,
-    array: *std.json.Array,
-    value: []const u8,
-) !void {
-    for (array.items) |item| {
-        if (item != .string) return error.InvalidSqlCatalog;
-        if (std.mem.eql(u8, item.string, value)) return;
-    }
-    try array.append(.{ .string = try alloc.dupe(u8, value) });
-}
-
-fn renamePrimaryKeyJsonFields(
-    alloc: std.mem.Allocator,
-    primary_key: *std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    if (primary_key.* != .object) return error.InvalidSqlCatalog;
-    try renameStringInJsonArray(alloc, primary_key.object.getPtr("columns"), old_name, new_name);
-    try renameStringInJsonArray(alloc, primary_key.object.getPtr("include_columns"), old_name, new_name);
-}
-
-fn renameSchemaPropertyReferences(
-    alloc: std.mem.Allocator,
-    property: *std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    if (property.* != .object) return;
-    if (property.object.getPtr("generated")) |generated| try renameGeneratedJsonFields(alloc, generated, old_name, new_name);
-    try renameStringInJsonArray(alloc, property.object.getPtr("x-antfly-index-include"), old_name, new_name);
-    if (property.object.getPtr("x-antfly-index-where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
-    if (property.object.getPtr("x-antfly-index-where-expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
-}
-
-fn renameGeneratedJsonFields(
-    alloc: std.mem.Allocator,
-    generated: *std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    if (generated.* != .object) return error.InvalidSqlCatalog;
-    try renameStringFieldInJsonObject(alloc, &generated.object, "field", old_name, new_name);
-    try renameStringInJsonArray(alloc, generated.object.getPtr("fields"), old_name, new_name);
-    if (generated.object.getPtr("expression")) |expression| try renameExpressionJsonFields(alloc, expression, old_name, new_name);
-}
-
-fn renameConstraintArrayFields(
-    alloc: std.mem.Allocator,
-    value: ?*std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-    kind: JsonConstraintKind,
-) !void {
-    const array_value = value orelse return;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    for (array_value.array.items) |*item| {
-        if (item.* != .object) return error.InvalidSqlCatalog;
-        switch (kind) {
-            .unique => {
-                try renameStringInJsonArray(alloc, item.object.getPtr("columns"), old_name, new_name);
-                if (item.object.getPtr("expressions")) |expressions| try renameUniqueExpressionJsonFields(alloc, expressions, old_name, new_name);
-                try renameStringInJsonArray(alloc, item.object.getPtr("include_columns"), old_name, new_name);
-                if (item.object.getPtr("where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
-                if (item.object.getPtr("where_expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
-            },
-            .foreign_key => try renameStringInJsonArray(alloc, item.object.getPtr("columns"), old_name, new_name),
-            .check => {
-                try renameStringFieldInJsonObject(alloc, &item.object, "field", old_name, new_name);
-                if (item.object.getPtr("expression")) |expression| try renameExpressionJsonFields(alloc, expression, old_name, new_name);
-            },
-        }
-    }
-}
-
-fn renameUniqueExpressionJsonFields(
-    alloc: std.mem.Allocator,
-    expressions: *std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    if (expressions.* != .array) return error.InvalidSqlCatalog;
-    for (expressions.array.items) |*expression| {
-        if (expression.* != .object) return error.InvalidSqlCatalog;
-        try renameStringFieldInJsonObject(alloc, &expression.object, "field", old_name, new_name);
-        if (expression.object.getPtr("expression")) |row_expression| try renameExpressionJsonFields(alloc, row_expression, old_name, new_name);
-    }
-}
-
-fn renameUniquePredicateDefinitionJsonFields(
-    alloc: std.mem.Allocator,
-    value: *std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    if (value.* != .object) return error.InvalidSqlCatalog;
-    const all = value.object.getPtr("all") orelse return;
-    if (all.* != .array) return error.InvalidSqlCatalog;
-    for (all.array.items) |*item| {
-        if (item.* != .object) return error.InvalidSqlCatalog;
-        try renameStringFieldInJsonObject(alloc, &item.object, "field", old_name, new_name);
-    }
-}
-
-fn renameExpressionJsonFields(
-    alloc: std.mem.Allocator,
-    value: *std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    switch (value.*) {
-        .object => |*object| {
-            try renameStringFieldInJsonObject(alloc, object, "field", old_name, new_name);
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                try renameExpressionJsonFields(alloc, entry.value_ptr, old_name, new_name);
-            }
-        },
-        .array => |*array| {
-            for (array.items) |*item| {
-                try renameExpressionJsonFields(alloc, item, old_name, new_name);
-            }
-        },
-        else => {},
-    }
-}
-
-fn renameStringInJsonArray(
-    alloc: std.mem.Allocator,
-    value: ?*std.json.Value,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    const array_value = value orelse return;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    for (array_value.array.items) |*item| {
-        if (item.* != .string) return error.InvalidSqlCatalog;
-        if (std.mem.eql(u8, item.string, old_name)) item.* = .{ .string = try alloc.dupe(u8, new_name) };
-    }
-}
-
-fn renameStringFieldInJsonObject(
-    alloc: std.mem.Allocator,
-    object: *std.json.ObjectMap,
-    field_name: []const u8,
-    old_name: []const u8,
-    new_name: []const u8,
-) !void {
-    const value = object.get(field_name) orelse return;
-    if (value != .string) return error.InvalidSqlCatalog;
-    if (!std.mem.eql(u8, value.string, old_name)) return;
-    try putJsonString(alloc, object, field_name, new_name);
-}
-
-fn namedConstraintExistsInJsonArray(
-    value: ?*std.json.Value,
-    constraint_name: []const u8,
-) !bool {
-    const array_value = value orelse return false;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    for (array_value.array.items) |item| {
-        if (item != .object) return error.InvalidSqlCatalog;
-        const name = item.object.get("name") orelse return error.InvalidSqlCatalog;
-        if (name != .string) return error.InvalidSqlCatalog;
-        if (std.mem.eql(u8, name.string, constraint_name)) return true;
-    }
-    return false;
-}
-
-fn setNamedConstraintValidationStateInArray(
-    alloc: std.mem.Allocator,
-    root: *std.json.ObjectMap,
-    field: []const u8,
-    constraint_name: []const u8,
-    validation_state: []const u8,
-) !bool {
-    const value = root.getPtr(field) orelse return false;
-    if (value.* != .array) return error.InvalidSqlCatalog;
-    for (value.array.items) |*item| {
-        if (item.* != .object) return error.InvalidSqlCatalog;
-        const name = item.object.get("name") orelse return error.InvalidSqlCatalog;
-        if (name != .string) return error.InvalidSqlCatalog;
-        if (!std.mem.eql(u8, name.string, constraint_name)) continue;
-        try putJsonString(alloc, &item.object, "validation_state", validation_state);
-        return true;
-    }
-    return false;
-}
-
-fn appendUniqueBorrowedString(
-    alloc: std.mem.Allocator,
-    values: *std.ArrayListUnmanaged([]const u8),
-    value: []const u8,
-) !void {
-    if (stringSlicesContains(values.items, value)) return;
-    try values.append(alloc, value);
-}
-
-fn propertyGeneratedReferencesAny(property: std.json.Value, fields: []const []const u8) bool {
-    if (property != .object) return false;
-    const generated = property.object.get("generated") orelse return false;
-    if (generated != .object) return false;
-    if (generated.object.get("field")) |field| {
-        if (field == .string and stringSlicesContains(fields, field.string)) return true;
-    }
-    if (generated.object.get("fields")) |fields_value| {
-        if (jsonStringArrayReferencesAny(fields_value, fields)) return true;
-    }
-    if (generated.object.get("expression")) |expression| {
-        if (jsonExpressionReferencesAny(expression, fields)) return true;
-    }
-    return false;
-}
-
-fn jsonExpressionReferencesAny(value: std.json.Value, fields: []const []const u8) bool {
-    switch (value) {
-        .object => |object| {
-            if (object.get("field")) |field| {
-                if (field == .string and stringSlicesContains(fields, field.string)) return true;
-            }
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (jsonExpressionReferencesAny(entry.value_ptr.*, fields)) return true;
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                if (jsonExpressionReferencesAny(item, fields)) return true;
-            }
-        },
-        else => {},
-    }
-    return false;
-}
-
-fn removeStringsFromJsonArray(value: ?*std.json.Value, fields: []const []const u8) !void {
-    const array_value = value orelse return;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    var i: usize = 0;
-    while (i < array_value.array.items.len) {
-        const item = array_value.array.items[i];
-        if (item != .string) return error.InvalidSqlCatalog;
-        if (stringSlicesContains(fields, item.string)) {
-            _ = array_value.array.orderedRemove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn rejectPrimaryKeyDropFromSchemaJson(root: *std.json.ObjectMap, fields: []const []const u8) !void {
-    const primary_key = root.get("primary_key") orelse return error.InvalidSqlCatalog;
-    if (primary_key != .object) return error.InvalidSqlCatalog;
-    const columns = primary_key.object.get("columns") orelse return error.InvalidSqlCatalog;
-    if (jsonStringArrayReferencesAny(columns, fields)) return error.UnsupportedSqlShape;
-    if (primary_key.object.get("include_columns")) |include_columns| {
-        if (jsonStringArrayReferencesAny(include_columns, fields)) return error.UnsupportedSqlShape;
-    }
-}
-
-const JsonConstraintKind = enum {
-    unique,
-    foreign_key,
-    check,
-};
-
-fn removeDependentConstraintsFromJsonArray(
-    value: ?*std.json.Value,
-    fields: []const []const u8,
-    kind: JsonConstraintKind,
-) !void {
-    const array_value = value orelse return;
-    if (array_value.* != .array) return error.InvalidSqlCatalog;
-    var i: usize = 0;
-    while (i < array_value.array.items.len) {
-        const item = array_value.array.items[i];
-        if (item != .object) return error.InvalidSqlCatalog;
-        const remove = switch (kind) {
-            .unique => jsonUniqueConstraintReferencesAny(item, fields),
-            .foreign_key => jsonStringArrayReferencesAny(item.object.get("columns") orelse return error.InvalidSqlCatalog, fields),
-            .check => blk: {
-                const field = item.object.get("field") orelse return error.InvalidSqlCatalog;
-                break :blk field == .string and stringSlicesContains(fields, field.string);
-            },
-        };
-        if (remove) {
-            _ = array_value.array.orderedRemove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn jsonUniqueConstraintReferencesAny(value: std.json.Value, fields: []const []const u8) bool {
-    if (value != .object) return false;
-    if (value.object.get("columns")) |columns| {
-        if (jsonStringArrayReferencesAny(columns, fields)) return true;
-    }
-    if (value.object.get("expressions")) |expressions| {
-        if (expressions == .array) {
-            for (expressions.array.items) |expression| {
-                if (expression != .object) continue;
-                const field = expression.object.get("field") orelse continue;
-                if (field == .string and stringSlicesContains(fields, field.string)) return true;
-            }
-        }
-    }
-    if (value.object.get("include_columns")) |include_columns| {
-        if (jsonStringArrayReferencesAny(include_columns, fields)) return true;
-    }
-    if (value.object.get("where")) |where| {
-        if (jsonUniquePredicateDefinitionReferencesAny(where, fields)) return true;
-    }
-    return false;
-}
-
-fn jsonUniquePredicateDefinitionReferencesAny(value: std.json.Value, fields: []const []const u8) bool {
-    if (value != .object) return false;
-    const all = value.object.get("all") orelse return false;
-    if (all != .array) return false;
-    for (all.array.items) |item| {
-        if (item != .object) continue;
-        const field = item.object.get("field") orelse continue;
-        if (field == .string and stringSlicesContains(fields, field.string)) return true;
-    }
-    return false;
-}
-
-fn jsonStringArrayReferencesAny(value: std.json.Value, fields: []const []const u8) bool {
-    if (value != .array) return false;
-    for (value.array.items) |item| {
-        if (item == .string and stringSlicesContains(fields, item.string)) return true;
-    }
-    return false;
-}
-
 fn validateDdlAppliedSchemaJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !void {
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -34703,209 +33541,12 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
-fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlterOperation) void {
-    switch (operation) {
-        .set_type => |type_name| alloc.free(type_name),
-        .set_owned_by => |owned_by| {
-            var owned = owned_by;
-            owned.deinit(alloc);
-        },
-        else => {},
-    }
-}
-
-fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const SequenceAlterOperation) void {
-    for (operations) |operation| freeSequenceAlterOperation(alloc, operation);
-}
-
 fn freeRowsDocKeyRanges(alloc: std.mem.Allocator, ranges: []const db_mod.types.RelationalRowsDocKeyRange) void {
     for (ranges) |range| {
         if (range.start.len > 0) alloc.free(range.start);
         if (range.end.len > 0) alloc.free(range.end);
     }
     if (ranges.len > 0) alloc.free(ranges);
-}
-
-fn freeAlterTableOperation(alloc: std.mem.Allocator, operation: AlterTableOperation) void {
-    switch (operation) {
-        .add_column => |add_column| {
-            freeDdlRelationalColumn(alloc, add_column.column);
-            freeDdlUniqueConstraints(alloc, add_column.unique_constraints);
-            freeDdlForeignKeys(alloc, add_column.foreign_keys);
-            freeDdlRelationalChecks(alloc, add_column.checks);
-        },
-        .add_period => |period| freeDdlPeriod(alloc, period),
-        .add_primary_key => |primary_key| freeDdlPrimaryKey(alloc, primary_key),
-        .rename_column => |rename_column| {
-            alloc.free(rename_column.old_name);
-            alloc.free(rename_column.new_name);
-        },
-        .rename_constraint => |rename_constraint| {
-            alloc.free(rename_constraint.old_name);
-            alloc.free(rename_constraint.new_name);
-        },
-        .drop_column => |drop_column| alloc.free(drop_column.name),
-        .drop_constraint => |drop_constraint| alloc.free(drop_constraint.name),
-        .drop_update_policy => |drop_update_policy| alloc.free(drop_update_policy.trigger_name),
-        .alter_column_default => |alter_column_default| {
-            alloc.free(alter_column_default.column_name);
-            if (alter_column_default.default_value) |default_value| alloc.free(default_value.value_json);
-        },
-        .alter_column_nullability => |alter_column_nullability| alloc.free(alter_column_nullability.column_name),
-        .alter_column_type => |alter_column_type| {
-            alloc.free(alter_column_type.column_name);
-            if (alter_column_type.collation) |collation| alloc.free(collation);
-            if (alter_column_type.rewrite_expression) |rewrite| {
-                var mutable_rewrite = rewrite;
-                mutable_rewrite.deinit(alloc);
-            }
-        },
-        .add_unique_constraint => |constraint| freeDdlUniqueConstraint(alloc, constraint),
-        .add_foreign_key => |foreign_key| freeDdlForeignKey(alloc, foreign_key),
-        .add_check => |check| freeDdlRelationalCheck(alloc, check),
-        .validate_constraint => |constraint_name| alloc.free(constraint_name),
-    }
-}
-
-fn freeDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) void {
-    alloc.free(column.name);
-    alloc.free(column.path);
-    if (column.collation) |collation| alloc.free(collation);
-    if (column.index_name) |index_name| alloc.free(index_name);
-    freeStringSlice(alloc, column.index_include_columns);
-    if (column.default_value) |value| alloc.free(value.value_json);
-    if (column.on_update_value) |value| alloc.free(value.value_json);
-    if (column.generated) |generated| {
-        freeDdlGeneratedValue(alloc, generated);
-    }
-    for (column.index_where) |predicate| {
-        alloc.free(predicate.field);
-        if (predicate.value_json) |value| alloc.free(value);
-    }
-    if (column.index_where.len > 0) alloc.free(column.index_where);
-    freeExpressionConditions(alloc, column.index_where_expressions);
-    if (column.index_where_expressions.len > 0) alloc.free(column.index_where_expressions);
-}
-
-fn clearDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
-    for (columns) |column| freeDdlRelationalColumn(alloc, column);
-}
-
-fn freeDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
-    clearDdlRelationalColumns(alloc, columns);
-    if (columns.len > 0) alloc.free(columns);
-}
-
-fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) void {
-    if (generated.field) |field| alloc.free(field);
-    freeStringSlice(alloc, generated.fields);
-    alloc.free(generated.separator);
-}
-
-fn freeDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) void {
-    if (primary_key.name) |name| alloc.free(name);
-    freeStringSlice(alloc, primary_key.columns);
-    freeStringSlice(alloc, primary_key.include_columns);
-    if (primary_key.without_overlaps_period) |period| alloc.free(period);
-}
-
-fn freeDdlPeriod(alloc: std.mem.Allocator, period: runtime_schema.RelationalPeriod) void {
-    alloc.free(period.name);
-    alloc.free(period.start_column);
-    alloc.free(period.end_column);
-}
-
-fn freeDdlPeriods(alloc: std.mem.Allocator, periods: []const runtime_schema.RelationalPeriod) void {
-    for (periods) |period| freeDdlPeriod(alloc, period);
-    if (periods.len > 0) alloc.free(periods);
-}
-
-fn freeDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.UniqueConstraint) void {
-    alloc.free(constraint.name);
-    freeStringSlice(alloc, constraint.columns);
-    freeDdlUniqueExpressions(alloc, constraint.expressions);
-    freeStringSlice(alloc, constraint.include_columns);
-    if (constraint.without_overlaps_period) |period| alloc.free(period);
-    freeDdlUniquePredicates(alloc, constraint.where);
-    freeExpressionConditions(alloc, constraint.where_expressions);
-    if (constraint.where_expressions.len > 0) alloc.free(constraint.where_expressions);
-}
-
-fn freeDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) void {
-    clearDdlUniqueConstraints(alloc, constraints);
-    if (constraints.len > 0) alloc.free(constraints);
-}
-
-fn clearDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) void {
-    for (constraints) |constraint| freeDdlUniqueConstraint(alloc, constraint);
-}
-
-fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
-    clearDdlUniqueExpressions(alloc, expressions);
-    if (expressions.len > 0) alloc.free(expressions);
-}
-
-fn clearDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
-    for (expressions) |expression| freeDdlUniqueExpression(alloc, expression);
-}
-
-fn freeDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) void {
-    if (expression.field.len > 0) alloc.free(expression.field);
-    if (expression.expression) |row_expression| freeExpression(alloc, row_expression);
-}
-
-fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) void {
-    for (predicates) |predicate| {
-        alloc.free(predicate.field);
-        if (predicate.value_json) |value| alloc.free(value);
-    }
-    if (predicates.len > 0) alloc.free(predicates);
-}
-
-fn freeDdlForeignKey(alloc: std.mem.Allocator, foreign_key: runtime_schema.ForeignKey) void {
-    alloc.free(foreign_key.name);
-    freeStringSlice(alloc, foreign_key.child_columns);
-    if (foreign_key.child_period) |period| alloc.free(period);
-    alloc.free(foreign_key.parent_table);
-    freeStringSlice(alloc, foreign_key.parent_columns);
-    if (foreign_key.parent_period) |period| alloc.free(period);
-}
-
-fn freeDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) void {
-    clearDdlForeignKeys(alloc, foreign_keys);
-    if (foreign_keys.len > 0) alloc.free(foreign_keys);
-}
-
-fn clearDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) void {
-    for (foreign_keys) |foreign_key| freeDdlForeignKey(alloc, foreign_key);
-}
-
-fn freeDdlRelationalCheck(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) void {
-    alloc.free(check.name);
-    alloc.free(check.field);
-    if (check.value_json) |value| alloc.free(value);
-    if (check.expression) |expression| freeExpressionCondition(alloc, expression);
-}
-
-fn freeDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
-    clearDdlRelationalChecks(alloc, checks);
-    if (checks.len > 0) alloc.free(checks);
-}
-
-fn clearDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
-    for (checks) |check| freeDdlRelationalCheck(alloc, check);
-}
-
-fn freeDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
-    clearDomainAlterOperations(alloc, operations);
-    if (operations.len > 0) alloc.free(operations);
-}
-
-fn clearDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
-    for (operations) |operation_const| {
-        var operation = operation_const;
-        operation.deinit(alloc);
-    }
 }
 
 fn freeFieldJsonValues(alloc: std.mem.Allocator, values: []const Parser.FieldJsonValue) void {
@@ -40325,6 +38966,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(copy_from_plan.null_marker == null);
     try std.testing.expect(copy_from_plan.default_marker == null);
     try std.testing.expect(copy_from_plan.encoding == null);
+    try std.testing.expectEqual(BulkIoEndpointKind.stream, copy_from_plan.endpoint_kind);
     const copy_from_fingerprint = try ddlFingerprintAlloc(alloc, copy_from);
     defer alloc.free(copy_from_fingerprint);
     try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0", copy_from_fingerprint);
@@ -40333,12 +38975,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_batch, copy_from_execution.native_route);
     try std.testing.expectEqual(BulkSqlIoStream.stdin, copy_from_execution.stream);
     try std.testing.expectEqual(BulkSqlIoCodec.csv, copy_from_execution.codec);
+    try std.testing.expectEqual(BulkIoEndpointKind.stream, copy_from_execution.endpoint_kind);
     try std.testing.expectEqual(usermgr.PermissionType.write, copy_from_execution.required_permission);
     try std.testing.expectEqual(BulkSqlIoAuditAction.copy_from, copy_from_execution.audit_action);
     try std.testing.expect(copy_from_execution.requires_external_stream);
     const copy_from_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_from_execution);
     defer alloc.free(copy_from_execution_fingerprint);
-    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_from_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:endpoint=STDIN:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_from_execution_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
     var copy_from_text = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN;");
@@ -40350,7 +38993,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(BulkSqlIoCodec.postgres_text, copy_from_text_execution.codec);
     const copy_from_text_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_from_text_execution);
     defer alloc.free(copy_from_text_execution_fingerprint);
-    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=postgres_text:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_from_text_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=postgres_text:endpoint=STDIN:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_from_text_execution_fingerprint);
 
     var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');");
     defer copy_from_header.deinit(alloc);
@@ -40603,7 +39246,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(BulkSqlIoAuditAction.copy_to, copy_to_execution.audit_action);
     const copy_to_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_to_execution);
     defer alloc.free(copy_to_execution_fingerprint);
-    try std.testing.expectEqualStrings("bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=csv:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_to_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=csv:endpoint=STDOUT:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_to_execution_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_to));
     var invalid_csv_options_export_plan = copy_to_execution;
     invalid_csv_options_export_plan.delimiter = "|";
@@ -40641,6 +39284,47 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     };
     try std.testing.expectError(error.UnsupportedSqlShape, bulkSqlIoExecutionPlanFromDdlPlan(copy_binary_plan));
 
+    var copy_from_file = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM '/tmp/usage.csv' WITH (FORMAT csv, HEADER true);");
+    defer copy_from_file.deinit(alloc);
+    const copy_from_file_plan = switch (copy_from_file) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(BulkIoEndpointKind.file, copy_from_file_plan.endpoint_kind);
+    try std.testing.expectEqualStrings("/tmp/usage.csv", copy_from_file_plan.endpoint);
+    const copy_from_file_execution = try bulkSqlIoExecutionPlanFromDdlPlan(copy_from_file_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.import_rows, copy_from_file_execution.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_batch, copy_from_file_execution.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.file, copy_from_file_execution.stream);
+    try std.testing.expectEqual(BulkIoEndpointKind.file, copy_from_file_execution.endpoint_kind);
+    try std.testing.expect(!copy_from_file_execution.requires_external_stream);
+    const copy_from_file_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_from_file_execution);
+    defer alloc.free(copy_from_file_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=file:codec=csv:endpoint_kind=file:endpoint=/tmp/usage.csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=false", copy_from_file_execution_fingerprint);
+
+    var copy_to_file = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO '/tmp/usage.csv' WITH (FORMAT csv);");
+    defer copy_to_file.deinit(alloc);
+    const copy_to_file_plan = switch (copy_to_file) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(BulkIoEndpointKind.file, copy_to_file_plan.endpoint_kind);
+    const copy_to_file_execution = try bulkSqlIoExecutionPlanFromDdlPlan(copy_to_file_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.export_rows, copy_to_file_execution.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_query, copy_to_file_execution.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.file, copy_to_file_execution.stream);
+    try std.testing.expectEqual(BulkIoEndpointKind.file, copy_to_file_execution.endpoint_kind);
+    try std.testing.expect(!copy_to_file_execution.requires_external_stream);
+
+    var copy_from_program = try lowerDdlPlanAlloc(alloc, "COPY usage_records FROM PROGRAM 'cat /tmp/usage.csv';");
+    defer copy_from_program.deinit(alloc);
+    const copy_from_program_plan = switch (copy_from_program) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(BulkIoEndpointKind.program, copy_from_program_plan.endpoint_kind);
+    try std.testing.expectError(error.UnsupportedSqlShape, bulkSqlIoExecutionPlanFromDdlPlan(copy_from_program_plan));
+
     const csv_columns = [_]runtime_schema.RelationalColumn{
         .{ .name = "id", .path = "id", .field_type = .text, .nullable = false },
         .{ .name = "status", .path = "status", .field_type = .text, .nullable = true },
@@ -40656,6 +39340,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         .native_route = .rows_batch,
         .stream = .stdin,
         .codec = .csv,
+        .endpoint_kind = .stream,
+        .endpoint = "STDIN",
         .table_name = "usage_records",
         .columns = csv_plan_columns[0..],
         .required_permission = .write,
@@ -40672,6 +39358,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         .native_route = .rows_batch,
         .stream = .stdin,
         .codec = .csv,
+        .endpoint_kind = .stream,
+        .endpoint = "STDIN",
         .table_name = "usage_records",
         .columns = csv_plan_columns[0..],
         .required_permission = .write,
@@ -40689,6 +39377,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         .native_route = .rows_batch,
         .stream = .stdin,
         .codec = .postgres_text,
+        .endpoint_kind = .stream,
+        .endpoint = "STDIN",
         .table_name = "usage_records",
         .columns = csv_plan_columns[0..],
         .required_permission = .write,
@@ -40709,6 +39399,8 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         .native_route = .rows_query,
         .stream = .stdout,
         .codec = .postgres_text,
+        .endpoint_kind = .stream,
+        .endpoint = "STDOUT",
         .table_name = "usage_records",
         .columns = csv_plan_columns[0..],
         .required_permission = .read,
@@ -51107,6 +49799,44 @@ test "postgres sql adapter lowers routine expression bindings into row expressio
         error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
         else => return err,
     }
+
+    var generated_table = try lowerDdlPlanWithFunctionBindingsAlloc(
+        alloc,
+        "CREATE TABLE usage_records (id text PRIMARY KEY, status text, status_key text GENERATED ALWAYS AS (normalize_status(status)) STORED);",
+        .{ .routine_expressions = &bindings },
+    );
+    defer generated_table.deinit(alloc);
+    const generated_create = switch (generated_table) {
+        .create_table => |create| create,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 3), generated_create.columns.len);
+    const generated = generated_create.columns[2].generated orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const generated_expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_expression.operands.len);
+    try std.testing.expectEqualStrings("status", generated_expression.operands[0].field);
+
+    var routine_policy = try lowerDdlPlanWithFunctionBindingsAlloc(
+        alloc,
+        "CREATE POLICY usage_records_normalized_policy ON usage_records USING (normalize_status(status) = 'active');",
+        .{ .routine_expressions = &bindings },
+    );
+    defer routine_policy.deinit(alloc);
+    const routine_policy_create = switch (routine_policy) {
+        .row_security_catalog => |catalog_plan| switch (catalog_plan) {
+            .create_policy => |create| create,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const routine_policy_expression = switch (routine_policy_create.predicate) {
+        .expression => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, routine_policy_expression.lhs.kind);
+    try std.testing.expectEqualStrings("status", routine_policy_expression.lhs.operands[0].field);
 }
 
 test "postgres sql adapter lowers uuid generation update values and conflict actions" {
@@ -53347,6 +52077,14 @@ fn bulkIoDirectionName(direction: BulkIoDirection) []const u8 {
     return switch (direction) {
         .from => "from",
         .to => "to",
+    };
+}
+
+fn bulkIoEndpointKindName(kind: sql_adapter.BulkIoEndpointKind) []const u8 {
+    return switch (kind) {
+        .stream => "stream",
+        .file => "file",
+        .program => "program",
     };
 }
 

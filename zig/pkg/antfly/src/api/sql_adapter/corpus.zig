@@ -4313,6 +4313,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_binary_execution_unsupported: bool = false,
     ddl_copy_from: bool = false,
     ddl_copy_from_execution_contract: bool = false,
+    ddl_copy_file_endpoint: bool = false,
     ddl_copy_from_text_execution_contract: bool = false,
     ddl_copy_default_marker: bool = false,
     ddl_copy_header: bool = false,
@@ -4326,6 +4327,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_log_verbosity: bool = false,
     ddl_copy_null_marker: bool = false,
     ddl_copy_on_error_ignore: bool = false,
+    ddl_copy_program_execution_unsupported: bool = false,
     ddl_copy_reject_limit: bool = false,
     ddl_copy_quote: bool = false,
     ddl_copy_to: bool = false,
@@ -4522,8 +4524,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_query: bool = false,
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
-    unsupported_ddl_copy_file_endpoint: bool = false,
-    unsupported_ddl_copy_program_endpoint: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
     unsupported_ddl_copy_unsupported_options: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
@@ -5788,14 +5788,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
         } else if (entry.family == .unsupported_ddl) {
-            self.unsupported_ddl_copy_file_endpoint = self.unsupported_ddl_copy_file_endpoint or
-                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
-                    std.mem.startsWith(u8, entry.sql, "COPY ") and
-                    std.mem.indexOf(u8, entry.sql, " FROM '/") != null);
-            self.unsupported_ddl_copy_program_endpoint = self.unsupported_ddl_copy_program_endpoint or
-                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
-                    std.mem.startsWith(u8, entry.sql, "COPY ") and
-                    std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null);
             self.unsupported_ddl_copy_wrong_stream_endpoint = self.unsupported_ddl_copy_wrong_stream_endpoint or
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     std.mem.startsWith(u8, entry.sql, "COPY ") and
@@ -6037,6 +6029,9 @@ pub const AppParityCorpusCoverage = struct {
                             sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
                     self.ddl_copy_from_execution_contract = self.ddl_copy_from_execution_contract or
                         std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:");
+                    self.ddl_copy_file_endpoint = self.ddl_copy_file_endpoint or
+                        std.mem.indexOf(u8, entry.execution_plan, ":stream=file:") != null and
+                            std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=file:") != null;
                     self.ddl_copy_from_text_execution_contract = self.ddl_copy_from_text_execution_contract or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
                             std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_text:") != null);
@@ -6051,6 +6046,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_log_verbosity = self.ddl_copy_log_verbosity or sql_adapter.planHasExactStringToken(entry.plan, ":log_verbosity=", "verbose");
                     self.ddl_copy_null_marker = self.ddl_copy_null_marker or sql_adapter.planHasExactStringToken(entry.plan, ":null_marker_hex=", "empty");
                     self.ddl_copy_on_error_ignore = self.ddl_copy_on_error_ignore or sql_adapter.planHasExactStringToken(entry.plan, ":on_error=", "ignore");
+                    self.ddl_copy_program_execution_unsupported = self.ddl_copy_program_execution_unsupported or
+                        std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null and
+                            sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
                     self.ddl_copy_reject_limit = self.ddl_copy_reject_limit or sql_adapter.planHasExactUsizeToken(entry.plan, ":reject_limit=", 10);
                     self.ddl_copy_quote = self.ddl_copy_quote or sql_adapter.planHasExactStringToken(entry.plan, ":quote_hex=", "22");
                     self.ddl_copy_where_expression = self.ddl_copy_where_expression or sql_adapter.planHasExactUsizeToken(entry.plan, ":where_expressions=", 1);

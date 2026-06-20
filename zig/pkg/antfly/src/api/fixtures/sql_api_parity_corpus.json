@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "8b612417ef59247e748c85feaa82386ac1895461cbc4653925e880e932c4c02f",
+  "source_sha256": "9f6b88fd91b737203e2cc210075189ec04556096aa3dbb2b0c292560c7f29539",
   "source_entry_count": 997,
   "entry_count": 997,
   "skipped_entries": [
@@ -3902,17 +3902,27 @@
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT text)"
     },
     {
-      "name": "unsupported copy from server file endpoint",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=bulk_io_plan",
-      "classification_reason": "bulk_io_plan",
+      "name": "copy from server file bulk import ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=/tmp/usage.csv:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=file:codec=csv:endpoint_kind=file:endpoint=/tmp/usage.csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=false",
       "sql": "COPY usage_records (id, status) FROM '/tmp/usage.csv' WITH (FORMAT csv)"
     },
     {
       "name": "unsupported copy from program endpoint",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=bulk_io_plan",
-      "classification_reason": "bulk_io_plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=cat /tmp/usage.csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "unsupported:ddl:requires=bulk_io_plan",
       "sql": "COPY usage_records (id, status) FROM PROGRAM 'cat /tmp/usage.csv'"
     },
     {

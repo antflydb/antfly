@@ -468,7 +468,7 @@ pub const AlterSequenceSyntax = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.sequence_name));
-        freeSequenceAlterOperations(alloc, self.operations);
+        ddl_plan.freeSequenceAlterOperations(alloc, self.operations);
         if (self.operations.len > 0) alloc.free(@constCast(self.operations));
         self.* = undefined;
     }
@@ -1016,6 +1016,7 @@ pub const BulkIoSyntax = struct {
     direction: BulkIoDirectionSyntax,
     table_name: []const u8,
     columns: []const []const u8 = &.{},
+    endpoint_kind: ddl_plan.BulkIoEndpointKind = .stream,
     endpoint: []const u8,
     format: ?[]const u8 = null,
     header: bool = false,
@@ -1953,6 +1954,26 @@ pub fn parseRollbackToSavepointTail(tokens: []const Token, pos: *usize) !Savepoi
     try cursor.expectKeyword("to");
     _ = cursor.matchKeyword("savepoint");
     return try parseSavepointNameTailFromCursor(cursor);
+}
+
+pub fn parsePreparedTransactionTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    action: ddl_plan.PreparedTransactionAction,
+) !ddl_plan.PreparedTransactionPlan {
+    var cursor = parser.Cursor.init(tokens, pos);
+    switch (action) {
+        .prepare => try cursor.expectKeyword("transaction"),
+        .commit, .rollback => try cursor.expectKeyword("prepared"),
+    }
+    const gid_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+    if (gid_token.text.len == 0) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{
+        .action = action,
+        .gid = try alloc.dupe(u8, gid_token.text),
+    };
 }
 
 pub fn parseForRowClaimClauseAlloc(
@@ -3213,7 +3234,7 @@ pub fn parseAlterSequenceCatalogTailAlloc(
     errdefer if (!sequence_transferred) alloc.free(sequence_name);
     var operations = std.ArrayListUnmanaged(ddl_plan.SequenceAlterOperation).empty;
     errdefer {
-        freeSequenceAlterOperations(alloc, operations.items);
+        ddl_plan.freeSequenceAlterOperations(alloc, operations.items);
         operations.deinit(alloc);
     }
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
@@ -3429,6 +3450,63 @@ pub fn parseAlterDomainHeaderAlloc(
 
     domain_transferred = true;
     return .{ .domain_name = domain_name };
+}
+
+pub fn parseAlterDomainCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.AlterDomainPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var header = try parseAlterDomainHeaderAlloc(alloc, tokens, pos);
+    var header_transferred = false;
+    errdefer if (!header_transferred) header.deinit(alloc);
+
+    var operations = std.ArrayListUnmanaged(ddl_plan.DomainAlterOperation).empty;
+    errdefer {
+        ddl_plan.clearDomainAlterOperations(alloc, operations.items);
+        operations.deinit(alloc);
+    }
+
+    while (true) {
+        if (cursor.matchKeyword("set")) {
+            if (cursor.matchKeyword("not")) {
+                try cursor.expectKeyword("null");
+                try operations.append(alloc, .set_not_null);
+            } else if (cursor.matchKeyword("default")) {
+                const default_value = try parseDdlDefaultValueUntypedAlloc(alloc, tokens, pos);
+                errdefer alloc.free(default_value.value_json);
+                try operations.append(alloc, .{ .set_default = default_value });
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (cursor.matchKeyword("drop")) {
+            if (cursor.matchKeyword("not")) {
+                try cursor.expectKeyword("null");
+                try operations.append(alloc, .drop_not_null);
+            } else if (cursor.matchKeyword("default")) {
+                try operations.append(alloc, .drop_default);
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    if (operations.items.len == 0) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+
+    const owned_operations = try operations.toOwnedSlice(alloc);
+    var operations_transferred = false;
+    errdefer if (!operations_transferred) ddl_plan.freeDomainAlterOperations(alloc, owned_operations);
+
+    header_transferred = true;
+    operations_transferred = true;
+    return .{
+        .domain_name = header.domain_name,
+        .operations = owned_operations,
+    };
 }
 
 pub fn parseDropDomainCatalogTailAlloc(
@@ -4710,6 +4788,45 @@ pub fn parseOptionalDdlKnownDefault(tokens: []const Token, pos: *usize) !?DdlKno
     return null;
 }
 
+pub fn parseDdlDefaultValueUntypedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !runtime_schema.RelationalDefaultValue {
+    if (try parseOptionalDdlKnownDefault(tokens, pos)) |known| {
+        return try ddlDefaultValueFromKnownSyntaxAlloc(alloc, known, null);
+    }
+    return .{ .kind = .literal, .value_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos) };
+}
+
+pub fn ddlDefaultValueFromKnownSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    known: DdlKnownDefaultSyntax,
+    field_type: ?runtime_schema.AntflyType,
+) !runtime_schema.RelationalDefaultValue {
+    return switch (known) {
+        .null_literal => .{ .kind = .literal, .value_json = try alloc.dupe(u8, "null") },
+        .uuid_v4 => blk: {
+            if (field_type) |ty| {
+                if (ty != .keyword and ty != .text and ty != .link) return error.UnsupportedSqlShape;
+            }
+            break :blk .{ .kind = .uuid_v4, .value_json = try alloc.dupe(u8, "") };
+        },
+        .now_ns => blk: {
+            if (field_type) |ty| {
+                if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
+            }
+            break :blk .{ .kind = .now_ns, .value_json = try alloc.dupe(u8, "") };
+        },
+        .current_date_ns => blk: {
+            if (field_type) |ty| {
+                if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
+            }
+            break :blk .{ .kind = .current_date_ns, .value_json = try alloc.dupe(u8, "") };
+        },
+    };
+}
+
 pub fn parseDdlForeignKeyOptions(tokens: []const Token, pos: *usize) !DdlForeignKeyOptionsSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     var options: DdlForeignKeyOptionsSyntax = .{};
@@ -5641,12 +5758,25 @@ pub fn parseBulkIoTailAlloc(
         .to
     else
         return error.UnsupportedSqlShape;
-    const endpoint = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var endpoint_kind: ddl_plan.BulkIoEndpointKind = .stream;
+    const endpoint = blk: {
+        if (cursor.matchKeyword("program")) {
+            endpoint_kind = .program;
+            break :blk try parseSqlStringLiteralValueAlloc(alloc, cursor);
+        }
+        if (cursor.matchToken(.string)) |token| {
+            endpoint_kind = .file;
+            break :blk try alloc.dupe(u8, token.text);
+        }
+        break :blk try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    };
     var endpoint_transferred = false;
     errdefer if (!endpoint_transferred) alloc.free(endpoint);
-    switch (direction) {
-        .from => if (!std.ascii.eqlIgnoreCase(endpoint, "STDIN")) return error.UnsupportedSqlShape,
-        .to => if (!std.ascii.eqlIgnoreCase(endpoint, "STDOUT")) return error.UnsupportedSqlShape,
+    if (endpoint_kind == .stream) {
+        switch (direction) {
+            .from => if (!std.ascii.eqlIgnoreCase(endpoint, "STDIN")) return error.UnsupportedSqlShape,
+            .to => if (!std.ascii.eqlIgnoreCase(endpoint, "STDOUT")) return error.UnsupportedSqlShape,
+        }
     }
 
     var format: ?[]const u8 = null;
@@ -5814,6 +5944,7 @@ pub fn parseBulkIoTailAlloc(
         .direction = direction,
         .table_name = table_name,
         .columns = try columns.toOwnedSlice(alloc),
+        .endpoint_kind = endpoint_kind,
         .endpoint = endpoint,
         .format = format,
         .header = header,
@@ -6969,21 +7100,6 @@ fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Rel
     freeStringSlice(alloc, generated.fields);
     alloc.free(@constCast(generated.separator));
     if (generated.expression) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
-}
-
-fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: ddl_plan.SequenceAlterOperation) void {
-    switch (operation) {
-        .set_type => |value| alloc.free(@constCast(value)),
-        .set_owned_by => |owned_by| {
-            var owned_by_mut = owned_by;
-            owned_by_mut.deinit(alloc);
-        },
-        else => {},
-    }
-}
-
-fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const ddl_plan.SequenceAlterOperation) void {
-    for (operations) |operation| freeSequenceAlterOperation(alloc, operation);
 }
 
 pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
@@ -8211,13 +8327,29 @@ test "sql adapter grammar parses domain catalog tails" {
     try std.testing.expectEqualStrings("positive_amount", create.domain_name);
     try std.testing.expect(std.ascii.eqlIgnoreCase(create_tokens.items[create_pos].text, "numeric"));
 
-    var alter_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN public.positive_amount SET NOT NULL;");
+    var alter_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN public.positive_amount SET NOT NULL, SET DEFAULT 42, DROP DEFAULT;");
     defer lexer.freeTokens(alloc, &alter_tokens);
     var alter_pos: usize = 0;
-    var alter = try parseAlterDomainHeaderAlloc(alloc, alter_tokens.items, &alter_pos);
+    var alter = try parseAlterDomainCatalogTailAlloc(alloc, alter_tokens.items, &alter_pos);
     defer alter.deinit(alloc);
+    try std.testing.expectEqual(alter_tokens.items.len, alter_pos);
     try std.testing.expectEqualStrings("positive_amount", alter.domain_name);
-    try std.testing.expect(std.ascii.eqlIgnoreCase(alter_tokens.items[alter_pos].text, "set"));
+    try std.testing.expectEqual(@as(usize, 3), alter.operations.len);
+    switch (alter.operations[0]) {
+        .set_not_null => {},
+        else => return error.TestExpectedEqual,
+    }
+    switch (alter.operations[1]) {
+        .set_default => |default| {
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, default.kind);
+            try std.testing.expectEqualStrings("42", default.value_json);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (alter.operations[2]) {
+        .drop_default => {},
+        else => return error.TestExpectedEqual,
+    }
 
     var drop_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN IF EXISTS public.positive_amount CASCADE;");
     defer lexer.freeTokens(alloc, &drop_tokens);
@@ -10052,6 +10184,7 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("id", copy_from.columns[0]);
     try std.testing.expectEqualStrings("status", copy_from.columns[1]);
     try std.testing.expectEqualStrings("STDIN", copy_from.endpoint);
+    try std.testing.expectEqual(ddl_plan.BulkIoEndpointKind.stream, copy_from.endpoint_kind);
     try std.testing.expectEqualStrings("csv", copy_from.format.?);
     try std.testing.expect(!copy_from.header);
 
@@ -10090,9 +10223,42 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("usage_records", copy_to.table_name);
     try std.testing.expectEqual(@as(usize, 0), copy_to.columns.len);
     try std.testing.expectEqualStrings("STDOUT", copy_to.endpoint);
+    try std.testing.expectEqual(ddl_plan.BulkIoEndpointKind.stream, copy_to.endpoint_kind);
     try std.testing.expect(copy_to.format == null);
     try std.testing.expect(!copy_to.header);
     try std.testing.expect(copy_to.force_quote_all);
+
+    var copy_from_file_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM '/tmp/usage.csv' WITH (FORMAT csv, HEADER true);");
+    defer lexer.freeTokens(alloc, &copy_from_file_tokens);
+    var copy_from_file_pos: usize = 0;
+    var copy_from_file = try parseBulkIoTailAlloc(alloc, copy_from_file_tokens.items, &copy_from_file_pos);
+    defer copy_from_file.deinit(alloc);
+    try std.testing.expectEqual(copy_from_file_tokens.items.len, copy_from_file_pos);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.from, copy_from_file.direction);
+    try std.testing.expectEqual(ddl_plan.BulkIoEndpointKind.file, copy_from_file.endpoint_kind);
+    try std.testing.expectEqualStrings("/tmp/usage.csv", copy_from_file.endpoint);
+    try std.testing.expectEqualStrings("csv", copy_from_file.format.?);
+    try std.testing.expect(copy_from_file.header);
+
+    var copy_to_file_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) TO '/tmp/usage.csv' WITH (FORMAT csv);");
+    defer lexer.freeTokens(alloc, &copy_to_file_tokens);
+    var copy_to_file_pos: usize = 0;
+    var copy_to_file = try parseBulkIoTailAlloc(alloc, copy_to_file_tokens.items, &copy_to_file_pos);
+    defer copy_to_file.deinit(alloc);
+    try std.testing.expectEqual(copy_to_file_tokens.items.len, copy_to_file_pos);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.to, copy_to_file.direction);
+    try std.testing.expectEqual(ddl_plan.BulkIoEndpointKind.file, copy_to_file.endpoint_kind);
+    try std.testing.expectEqualStrings("/tmp/usage.csv", copy_to_file.endpoint);
+
+    var copy_program_tokens = try lexer.tokenizeAlloc(alloc, "usage_records FROM PROGRAM 'cat /tmp/usage.csv';");
+    defer lexer.freeTokens(alloc, &copy_program_tokens);
+    var copy_program_pos: usize = 0;
+    var copy_program = try parseBulkIoTailAlloc(alloc, copy_program_tokens.items, &copy_program_pos);
+    defer copy_program.deinit(alloc);
+    try std.testing.expectEqual(copy_program_tokens.items.len, copy_program_pos);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.from, copy_program.direction);
+    try std.testing.expectEqual(ddl_plan.BulkIoEndpointKind.program, copy_program.endpoint_kind);
+    try std.testing.expectEqualStrings("cat /tmp/usage.csv", copy_program.endpoint);
 
     var force_quote_columns_tokens = try lexer.tokenizeAlloc(alloc, "usage_records TO STDOUT WITH (FORCE_QUOTE (id, status));");
     defer lexer.freeTokens(alloc, &force_quote_columns_tokens);
@@ -10336,6 +10502,29 @@ test "sql adapter grammar parses protocol cleanup tails" {
     defer lexer.freeTokens(alloc, &extra_tokens);
     var extra_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCloseCursorPortalTail(extra_tokens.items, &extra_pos));
+
+    var prepare_transaction_tokens = try lexer.tokenizeAlloc(alloc, "TRANSACTION 'gid-1';");
+    defer lexer.freeTokens(alloc, &prepare_transaction_tokens);
+    var prepare_transaction_pos: usize = 0;
+    var prepare_transaction = try parsePreparedTransactionTailAlloc(alloc, prepare_transaction_tokens.items, &prepare_transaction_pos, .prepare);
+    defer prepare_transaction.deinit(alloc);
+    try std.testing.expectEqual(ddl_plan.PreparedTransactionAction.prepare, prepare_transaction.action);
+    try std.testing.expectEqualStrings("gid-1", prepare_transaction.gid);
+    try std.testing.expectEqual(prepare_transaction_tokens.items.len, prepare_transaction_pos);
+
+    var commit_prepared_tokens = try lexer.tokenizeAlloc(alloc, "PREPARED 'gid-1';");
+    defer lexer.freeTokens(alloc, &commit_prepared_tokens);
+    var commit_prepared_pos: usize = 0;
+    var commit_prepared = try parsePreparedTransactionTailAlloc(alloc, commit_prepared_tokens.items, &commit_prepared_pos, .commit);
+    defer commit_prepared.deinit(alloc);
+    try std.testing.expectEqual(ddl_plan.PreparedTransactionAction.commit, commit_prepared.action);
+    try std.testing.expectEqualStrings("gid-1", commit_prepared.gid);
+    try std.testing.expectEqual(commit_prepared_tokens.items.len, commit_prepared_pos);
+
+    var empty_gid_tokens = try lexer.tokenizeAlloc(alloc, "PREPARED '';");
+    defer lexer.freeTokens(alloc, &empty_gid_tokens);
+    var empty_gid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parsePreparedTransactionTailAlloc(alloc, empty_gid_tokens.items, &empty_gid_pos, .commit));
 }
 
 test "sql adapter grammar parses prepared statement syntax" {
