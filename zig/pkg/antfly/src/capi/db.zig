@@ -52,6 +52,14 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
     return try alloc.dupeZ(u8, path);
 }
 
+fn tempTestAflitePath(alloc: Allocator, label: []const u8) ![:0]u8 {
+    const base = try tempTestPath(alloc, label);
+    defer alloc.free(base);
+    const path = try std.fmt.allocPrint(alloc, "{s}.aflite", .{base});
+    defer alloc.free(path);
+    return try alloc.dupeZ(u8, path);
+}
+
 const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
@@ -5840,17 +5848,21 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     const alloc = std.testing.allocator;
     const plain_path = try tempTestPath(alloc, "capi-lite-plain");
     defer alloc.free(plain_path);
-    const src_path = try tempTestPath(alloc, "capi-lite-src");
+    const invalid_lite_path = try tempTestPath(alloc, "capi-lite-invalid");
+    defer alloc.free(invalid_lite_path);
+    const src_path = try tempTestAflitePath(alloc, "capi-lite-src");
     defer alloc.free(src_path);
-    const dst_path = try tempTestPath(alloc, "capi-lite-dst");
+    const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
     defer alloc.free(dst_path);
-    const snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot");
+    const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
     cleanupTestDir(plain_path);
+    cleanupTestFile(invalid_lite_path);
     cleanupTestFile(src_path);
     cleanupTestFile(dst_path);
     cleanupTestFile(snapshot_path);
     defer cleanupTestDir(plain_path);
+    defer cleanupTestFile(invalid_lite_path);
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(snapshot_path);
@@ -5870,6 +5882,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(plain_handle, &invalid_caps));
     var invalid_status: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(plain_handle, &invalid_status));
+
+    var invalid_lite_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(invalid_lite_path, &invalid_lite_handle));
+    defer antfly_db_close(invalid_lite_handle);
 
     var src_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
@@ -6105,7 +6121,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
 
 test "capi lite exposes hosted and status-only profiles" {
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-lite-profiles");
+    const path = try tempTestAflitePath(alloc, "capi-lite-profiles");
     defer alloc.free(path);
     cleanupTestFile(path);
     defer cleanupTestFile(path);

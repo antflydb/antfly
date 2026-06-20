@@ -115,6 +115,10 @@ pub const OpenOptions = struct {
     read_only: bool = false,
 };
 
+pub fn isAflitePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".aflite");
+}
+
 pub const StorageStatus = struct {
     format: []const u8 = "aflite",
     engine: []const u8,
@@ -138,6 +142,8 @@ pub const Handle = struct {
     native_runtime_store: ?*backend_erased.Store = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
+        if (!isAflitePath(path)) return error.InvalidArgument;
+
         const engine = switch (opts.engine) {
             .auto => EngineKind.native_single_file,
             .bridge_lsm_container => EngineKind.bridge_lsm_container,
@@ -495,6 +501,19 @@ test "lite backend auto creates new aflite files with native engine" {
     const report = try handle.check();
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.record_count);
+}
+
+test "lite backend rejects non-aflite paths" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "not-lite.db");
+    defer allocator.free(path);
+
+    try std.testing.expect(!isAflitePath(path));
+    try std.testing.expectError(error.InvalidArgument, Handle.open(allocator, path, .{}));
 }
 
 test "lite backend auto rejects internal bridge aflite files" {
