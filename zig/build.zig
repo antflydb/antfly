@@ -6327,6 +6327,21 @@ pub fn build(b: *std.Build) void {
         .name = "antfly-lite-core",
         .root_module = lite_core_main_mod,
     });
+    const lite_cli_smoke = b.addExecutable(.{
+        .name = "antfly-lite-cli-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/antfly_lite_cli_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_lite_core_cli_smoke = b.addRunArtifact(lite_cli_smoke);
+    run_lite_core_cli_smoke.addArtifactArg(lite_core_main);
+    const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
+    run_lite_full_cli_smoke.addArtifactArg(antfly_main);
+    const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
+    lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
+    lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);
     const lite_core_main_tests = b.addTest(.{
         .root_module = lite_core_main_mod,
         .filters = &.{"lite core main compiles"},
@@ -6346,6 +6361,7 @@ pub fn build(b: *std.Build) void {
     lite_core_step.dependOn(&install_lite_capi_header.step);
     lite_core_step.dependOn(&run_lite_core_main_tests.step);
     lite_core_step.dependOn(&run_lite_capi_smoke.step);
+    lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, embedded package check, and libantflylite C ABI");
@@ -6356,6 +6372,7 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&run_lite_cli_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
     lite_full_step.dependOn(&run_lite_capi_smoke.step);
+    lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
@@ -6367,6 +6384,8 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&run_lite_cli_tests.step);
     lite_dev_step.dependOn(&run_lite_native_tests.step);
     lite_dev_step.dependOn(&run_lite_capi_smoke.step);
+    lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
+    lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_dev_step.dependOn(&run_capi_tests.step);
     lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
