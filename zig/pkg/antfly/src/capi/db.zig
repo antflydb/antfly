@@ -1759,6 +1759,10 @@ pub export fn antfly_buffer_free(buffer: ?*capi.Buffer) void {
     out.* = .{};
 }
 
+pub export fn antfly_buffer_free_zero(buffer: ?*capi.Buffer) void {
+    antfly_buffer_free(buffer);
+}
+
 pub export fn antfly_db_dense_search_result_free(result: *capi.DenseSearchResult) void {
     if (result.hits_ptr) |hits_ptr| {
         const hits = hits_ptr[0..result.hit_count];
@@ -5927,7 +5931,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
-    antfly_buffer_free(&status);
+    antfly_buffer_free_zero(&status);
     try std.testing.expect(status.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), status.len);
 
