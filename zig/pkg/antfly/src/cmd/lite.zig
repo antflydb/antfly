@@ -129,6 +129,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "promote")) return try promote(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "check")) return try check(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "compact") or std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "serve")) return try serve(init.gpa, init.io, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -679,6 +680,41 @@ fn vacuum(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     writeJsonLine(io, json);
 }
 
+const ServeOptions = struct {
+    path: []const u8,
+    addr: []const u8 = "127.0.0.1:8080",
+};
+
+fn serve(_: Allocator, _: std.Io, args: *std.process.Args.Iterator) !void {
+    const opts = try parseServeOptions(args);
+    try requireAflitePath(opts.path);
+    std.debug.print(
+        "error: antfly lite serve is not included in this build; use a lite-dev build with HTTP serve support\n",
+        .{},
+    );
+    return error.UnsupportedLiteServe;
+}
+
+fn parseServeOptions(args: *std.process.Args.Iterator) !ServeOptions {
+    const path = args.next() orelse {
+        std.debug.print("error: database path is required\n", .{});
+        return error.InvalidArguments;
+    };
+    var opts: ServeOptions = .{ .path = path };
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--addr")) {
+            opts.addr = args.next() orelse {
+                std.debug.print("error: --addr value is required\n", .{});
+                return error.InvalidArguments;
+            };
+        } else {
+            std.debug.print("error: unknown serve argument: {s}\n", .{arg});
+            return error.InvalidArguments;
+        }
+    }
+    return opts;
+}
+
 fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
     return open_mode == .query_readonly or open_mode == .status_only;
 }
@@ -1102,6 +1138,7 @@ fn printUsage(argv0: []const u8) void {
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
+        \\  serve <db.aflite> --addr 127.0.0.1:8080 (lite-dev only)
         \\
     , .{argv0});
 }
@@ -1126,6 +1163,28 @@ test "lite restore source validation accepts afb and aflite" {
     try requireRestoreSourcePath("app.afb");
     try requireRestoreSourcePath("app.aflite");
     try std.testing.expectError(error.InvalidArguments, requireRestoreSourcePath("app.db"));
+}
+
+test "lite serve parser preserves optional addr and rejects unknown args" {
+    {
+        const argv = [_][*:0]const u8{"app.aflite"};
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        const opts = try parseServeOptions(&args);
+        try std.testing.expectEqualStrings("app.aflite", opts.path);
+        try std.testing.expectEqualStrings("127.0.0.1:8080", opts.addr);
+    }
+    {
+        const argv = [_][*:0]const u8{ "app.aflite", "--addr", "127.0.0.1:9090" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        const opts = try parseServeOptions(&args);
+        try std.testing.expectEqualStrings("app.aflite", opts.path);
+        try std.testing.expectEqualStrings("127.0.0.1:9090", opts.addr);
+    }
+    {
+        const argv = [_][*:0]const u8{ "app.aflite", "--port", "9090" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try std.testing.expectError(error.InvalidArguments, parseServeOptions(&args));
+    }
 }
 
 test "lite read file parser accepts explicit readonly flag" {

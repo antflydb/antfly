@@ -104,6 +104,8 @@ keeps internal bridge profiles from being mistaken for the v1 contract.
 `antfly lite serve` is optional convenience mode. It should expose a local
 single-node HTTP API for development and migration testing, but the primary
 contract is embedded use.
+The base `lite-core` CLI may recognize the command and return a clear
+unsupported error until the `lite-dev` HTTP serve profile is wired.
 
 ### Embedded Library
 
