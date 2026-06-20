@@ -444,6 +444,72 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     try std.testing.expect(!hosted_caps.transaction_recovery_runtime);
 }
 
+test "lite backend capabilities contract is stable" {
+    const expected_fields = [_][]const u8{
+        "freestanding_build",
+        "hosted_profile",
+        "manual_maintenance",
+        "background_enrichment_runtime",
+        "ttl_cleanup_runtime",
+        "transaction_recovery_runtime",
+        "local_template_rendering",
+        "remote_template_rendering",
+        "remote_template_host_callbacks",
+        "inference_mode",
+        "inference_required",
+        "no_inference_configured_ok",
+        "caller_supplied_artifacts",
+        "remote_inference_providers",
+        "local_inference_runtime",
+        "generated_enrichment_planning",
+        "dense_vector_search",
+        "sparse_vector_search",
+        "distributed_shard_ownership",
+        "raft_replication",
+        "cluster_placement",
+        "cross_node_joins",
+        "remote_shard_fanout",
+        "distributed_transaction_coordination",
+        "cluster_heartbeat_status_aggregation",
+        "server_side_autoscaling",
+        "kubernetes_operator",
+        "object_storage_primary",
+    };
+
+    const fields = @typeInfo(Capabilities).@"struct".fields;
+    try std.testing.expectEqual(expected_fields.len, fields.len);
+    inline for (fields, 0..) |field, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    }
+
+    const allocator = std.testing.allocator;
+    const freestanding = builtin.os.tag == .freestanding;
+    const native_json = try std.json.Stringify.valueAlloc(allocator, capabilitiesForProfile(.native), .{});
+    defer allocator.free(native_json);
+    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+        freestanding,
+        !freestanding,
+        !freestanding,
+        !freestanding,
+        !freestanding,
+        freestanding,
+        !freestanding,
+    });
+    defer allocator.free(expected_native);
+    try std.testing.expectEqualStrings(expected_native, native_json);
+
+    const hosted_json = try std.json.Stringify.valueAlloc(allocator, capabilitiesForProfile(.hosted), .{});
+    defer allocator.free(hosted_json);
+    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+        freestanding,
+        !freestanding,
+        freestanding,
+        !freestanding,
+    });
+    defer allocator.free(expected_hosted);
+    try std.testing.expectEqualStrings(expected_hosted, hosted_json);
+}
+
 test "lite backend native engine creates and checks aflite file" {
     const allocator = std.testing.allocator;
 
