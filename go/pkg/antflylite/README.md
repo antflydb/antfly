@@ -30,7 +30,9 @@ maintenance reports while keeping the raw JSON methods available.
 
 Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
 handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application
-wants hosted/manual maintenance and will call `RunUntilIdle` itself.
+wants hosted/manual maintenance and will call `RunUntilIdle` itself. Use
+`RunUntilIdleJSON` when the application also wants the post-drain pending-work
+readiness document.
 Use `OpenWithOptions` for advanced settings such as map size and native-profile
 TTL cleanup.
 

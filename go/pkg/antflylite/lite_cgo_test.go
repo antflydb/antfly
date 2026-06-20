@@ -184,8 +184,12 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("batch searchable document: %v", err)
 	}
-	if err := db.RunUntilIdle(); err != nil {
-		t.Fatalf("run until idle: %v", err)
+	idle, err := db.RunUntilIdleJSON()
+	if err != nil {
+		t.Fatalf("run until idle json: %v", err)
+	}
+	if !bytes.Contains(idle, []byte("has_async_indexes")) {
+		t.Fatalf("run-until-idle JSON %q did not include async index status", idle)
 	}
 	pending, err := db.PendingWorkStatsJSON()
 	if err != nil {

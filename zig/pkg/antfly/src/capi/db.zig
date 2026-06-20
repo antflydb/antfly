@@ -2994,6 +2994,16 @@ pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
     return .ok;
 }
 
+pub export fn antfly_db_run_until_idle_json(
+    handle_ptr: ?*anyopaque,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_db_pending_work_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
@@ -6674,12 +6684,12 @@ test "capi lite exposes hosted and status-only profiles" {
     try std.testing.expect(std.mem.indexOf(u8, pending_before.ptr.?[0..pending_before.len], "\"has_async_indexes\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending_before.ptr.?[0..pending_before.len], "\"derived_target_sequence\":") != null);
 
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(hosted_handle));
+    var idle_after: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle_json(hosted_handle, &idle_after));
+    defer antfly_db_buffer_free(idle_after.ptr, idle_after.len);
+    try std.testing.expect(std.mem.indexOf(u8, idle_after.ptr.?[0..idle_after.len], "\"text_merge\"") != null);
 
-    var pending_after: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_pending_work_stats_json(hosted_handle, &pending_after));
-    defer antfly_db_buffer_free(pending_after.ptr, pending_after.len);
-    try std.testing.expect(std.mem.indexOf(u8, pending_after.ptr.?[0..pending_after.len], "\"text_merge\"") != null);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(hosted_handle));
 
     antfly_db_close(hosted_handle);
     hosted_handle = null;
