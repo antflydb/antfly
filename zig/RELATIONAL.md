@@ -1827,7 +1827,12 @@ SQL `UNION ALL`, `UNION`, `INTERSECT`, and `EXCEPT` result streams use the
 same row/byte materialization admission model as typed CTEs before returning
 rows or applying result-tail ordering and pagination. Outputs classified as
 spill-required fail closed until Antfly has a durable spill store and
-backpressure contract for result-stream materialization.
+backpressure contract for result-stream materialization. The SQL adapter's
+stable unsupported classifications now carry native execution-requirement
+metadata: `recursive_cte_stream_plan` and `set_operation_plan` both require a
+stream-materialization runtime with explicit materialization, spill, and
+backpressure support before the parser can admit broader recursive or general
+set-operation execution.
 
 `PRIMARY KEY ... [NOT] DEFERRABLE [INITIALLY IMMEDIATE|DEFERRED]`,
 `CREATE UNIQUE INDEX ... NULLS DISTINCT`, and `UNIQUE NULLS DISTINCT (...)`
