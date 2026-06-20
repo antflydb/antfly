@@ -784,25 +784,26 @@ fn workerMain(worker: *Worker) void {
             return;
         };
         if (stats.last_sequence == 0 and target_sequence > from_sequence) {
-            if (worker.replay_cursor != null and worker.replay_cursor.?.canFollowTail()) {
-                const target_visible = runtime.replay_source.isSequenceVisible(target_sequence) catch |err| {
-                    runtime.mutex.lockUncancelable(io);
-                    worker.catch_up_active = false;
-                    runtime.cond.broadcast(io);
-                    runtime.mutex.unlock(io);
-                    close_success = false;
-                    runtime.recordError(io, worker.name, "target_visibility", err);
-                    return;
-                };
-                if (!target_visible) {
-                    runtime.mutex.lockUncancelable(io);
-                    worker.catch_up_active = false;
-                    runtime.cond.broadcast(io);
-                    runtime.mutex.unlock(io);
-                    io.sleep(Io.Duration.zero, .awake) catch {};
-                    continue;
+            if (worker.replay_cursor != null) {
+                if (worker.replay_cursor.?.canFollowTail()) {
+                    const target_visible = runtime.replay_source.isSequenceVisible(target_sequence) catch |err| {
+                        runtime.mutex.lockUncancelable(io);
+                        worker.catch_up_active = false;
+                        runtime.cond.broadcast(io);
+                        runtime.mutex.unlock(io);
+                        close_success = false;
+                        runtime.recordError(io, worker.name, "target_visibility", err);
+                        return;
+                    };
+                    if (!target_visible) {
+                        runtime.mutex.lockUncancelable(io);
+                        worker.catch_up_active = false;
+                        runtime.cond.broadcast(io);
+                        runtime.mutex.unlock(io);
+                        io.sleep(Io.Duration.zero, .awake) catch {};
+                        continue;
+                    }
                 }
-            } else if (worker.replay_cursor != null) {
                 closeWorkerReplayCursor(runtime, worker);
                 ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
                     runtime.mutex.lockUncancelable(io);
@@ -1080,6 +1081,13 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
     if (worker.replay_cursor == null) {
         try ensureWorkerCatchUpState(runtime, worker, worker.applied_sequence);
     }
+    const max_windows_per_call: usize = blk: {
+        const io = runtime.ioContext();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        if (runtime.force_catch_up_sequence >= worker.target_sequence) break :blk 0;
+        break :blk policy.max_windows_per_publish;
+    };
     return try derived_worker.catchUpIndexFromMatchingCursor(
         runtime.alloc,
         &worker.replay_cursor.?,
@@ -1088,7 +1096,7 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         runtime.apply_fn,
         .{
             .resource_manager = runtime.backlog.resource_manager,
-            .max_windows_per_call = policy.max_windows_per_publish,
+            .max_windows_per_call = max_windows_per_call,
             .max_items_per_window = policy.max_items_per_window,
             .max_chunk_bytes = policy.max_chunk_bytes,
             .estimated_dense_vector_bytes = policy.estimated_dense_vector_bytes,

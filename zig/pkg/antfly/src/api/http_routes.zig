@@ -35,7 +35,19 @@ pub const Routes = struct {
     pub const mcp_v1_prefix = "/mcp/v1/";
     pub const mcp_v1_extensions = "/mcp/v1/extensions";
     pub const mcp_v1_extensions_prefix = "/mcp/v1/extensions/";
+    pub const mcp_v1_extension_profiles_prefix = "/mcp/v1/extensions/profiles/";
+    pub const agents_v1_extensions_prefix = "/agents/v1/extensions/";
     pub const a2a = "/a2a";
+    pub const ai_catalog = "/.well-known/ai-catalog.json";
+    pub const ard_v1 = "/ard/v1";
+    pub const ard_v1_openapi = "/ard/v1/openapi.yaml";
+    pub const ard_v1_openapi_prefix = "/ard/v1/openapi/";
+    pub const ard_v1_catalog = "/ard/v1/catalog";
+    pub const ard_v1_search = "/ard/v1/search";
+    pub const ard_v1_explore = "/ard/v1/explore";
+    pub const ard_v1_agents = "/ard/v1/agents";
+    pub const ard_v1_skills_prefix = "/ard/v1/skills/";
+    pub const ard_v1_resources_prefix = "/ard/v1/resources/";
     pub const extensions_v1 = "/extensions/v1";
     pub const extensions_v1_packages = "/extensions/v1/packages";
     pub const extensions_v1_packages_prefix = "/extensions/v1/packages/";
@@ -106,6 +118,7 @@ pub const Routes = struct {
     pub const reprocess_suffix = "/reprocess";
     pub const reprocess_jobs_suffix = "/reprocess-jobs";
     pub const reprocess_jobs_marker = "/reprocess-jobs/";
+    pub const enrichment_suffix = "/enrichment";
     pub const advance_suffix = "/advance";
     pub const cancel_suffix = "/cancel";
     pub const placement_update_suffix = ":placement";
@@ -496,6 +509,23 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
         const effective_path = path[0 .. path.len - reprocess_suffix.len];
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
+    }
+
+    pub fn matchTableArtifactEnrichment(path: []const u8) ?TableArtifact {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, enrichment_suffix)) return null;
+        const effective_path = path[0 .. path.len - enrichment_suffix.len];
         const rest = effective_path[tables_prefix.len..];
         const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
         if (artifacts_index == 0) return null;

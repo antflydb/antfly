@@ -2648,6 +2648,8 @@ pub const TableStatus = struct {
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
     storage_status: StorageStatus,
+    /// Table-level generated artifact enrichments registered outside a specific index.
+    artifact_enrichments: ?[]const antfly_indexes_openapi.EnrichmentConfig = null,
 };
 
 pub const QueryBuilderResult = struct {

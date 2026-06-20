@@ -14,7 +14,7 @@ replace (
 )
 
 require (
-	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
+	github.com/antflydb/antfly/go/pkg/libaf v0.0.0-20260619041320-35ccb29dfeb9
 	github.com/getkin/kin-openapi v0.133.0
 	github.com/kaptinlin/jsonschema v0.7.6
 	github.com/oapi-codegen/runtime v1.3.0

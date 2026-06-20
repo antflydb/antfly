@@ -1,0 +1,2004 @@
+openapi: "3.0.3"
+info:
+  title: Antfly Admin API
+  version: v1alpha1
+  description: |
+    Stable operator-facing administration API for Antfly nodes.
+
+    This API is separate from the public `/db/v1` API and from node-to-node
+    `/internal/v1` RPCs. Kubernetes operators, automation, and CLIs should use
+    this surface for typed HA control-plane operations.
+servers:
+  - url: /admin/v1
+    description: Node-local admin API
+security:
+  - BearerAuth: []
+tags:
+  - name: ha
+    x-displayName: High Availability
+    description: Hot-standby HA status and replication-slot management.
+paths:
+  /ha/primary/status:
+    get:
+      tags: [ha]
+      operationId: getHAPrimaryStatus
+      summary: Get primary HA status
+      parameters:
+        - name: max_lag_lsn
+          in: query
+          required: false
+          description: Mark slots reseed-recommended after this many retained LSNs.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+        - name: max_retained_bytes
+          in: query
+          required: false
+          description: Mark oldest slots reseed-recommended when retained WAL bytes exceed this cap.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+        - name: max_retained_age_ns
+          in: query
+          required: false
+          description: Mark oldest slots reseed-recommended when retained WAL timestamp span exceeds this cap.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+        - name: sync_mode
+          in: query
+          required: false
+          description: Optional synchronous durability mode to evaluate.
+          schema:
+            type: string
+            enum: [async, remote-write, remote-apply]
+        - name: sync_selection
+          in: query
+          required: false
+          description: How named standbys satisfy the synchronous policy.
+          schema:
+            type: string
+            enum: [any, first, all]
+        - name: sync_required
+          in: query
+          required: false
+          description: Number of standbys required for the synchronous policy.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 1
+        - name: sync_standby
+          in: query
+          required: false
+          description: Repeatable synchronous standby name.
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/HASlotName"
+          style: form
+          explode: true
+        - name: sync_failure
+          in: query
+          required: false
+          description: Synchronous standby failure policy.
+          schema:
+            type: string
+            enum: [block, fail-closed, degrade-to-async]
+      responses:
+        "200":
+          description: Primary status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAPrimaryStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/standby/status:
+    get:
+      tags: [ha]
+      operationId: getHAStandbyStatus
+      summary: Get standby HA status
+      parameters:
+        - name: upstream_lsn
+          in: query
+          required: false
+          description: Current upstream primary LSN used to compute standby lag.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+      responses:
+        "200":
+          description: Standby status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAStandbyStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/commit/check:
+    post:
+      tags: [ha]
+      operationId: checkHACommit
+      summary: Evaluate synchronous commit durability for an existing LSN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitCheckRequest"
+      responses:
+        "200":
+          description: Commit gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommitCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/commit/append:
+    post:
+      tags: [ha]
+      operationId: appendHACommit
+      summary: Append a primary WAL/effects record and evaluate synchronous commit durability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitAppendRequest"
+      responses:
+        "200":
+          description: Appended LSN and commit gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommitAppendResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/read/check:
+    post:
+      tags: [ha]
+      operationId: checkHARead
+      summary: Evaluate standby read freshness and routing
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReadCheckRequest"
+      responses:
+        "200":
+          description: Read gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReadCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/write/check:
+    post:
+      tags: [ha]
+      operationId: checkHAWrite
+      summary: Evaluate whether this node can accept writes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WriteCheckRequest"
+      responses:
+        "200":
+          description: Write gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAWriteCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/owner-jobs/check:
+    post:
+      tags: [ha]
+      operationId: checkHAOwnerJob
+      summary: Evaluate whether an owner-only background job may run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnerJobCheckRequest"
+      responses:
+        "200":
+          description: Owner-job gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAOwnerJobCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots:
+    get:
+      tags: [ha]
+      operationId: listHAReplicationSlots
+      summary: List HA replication slots
+      responses:
+        "200":
+          description: Replication slot list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReplicationSlotListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    post:
+      tags: [ha]
+      operationId: createHAReplicationSlot
+      summary: Create an HA replication slot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplicationSlotCreateRequest"
+      responses:
+        "200":
+          description: Created slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots/{slot_name}:
+    delete:
+      tags: [ha]
+      operationId: dropHAReplicationSlot
+      summary: Drop an HA replication slot
+      parameters:
+        - $ref: "#/components/parameters/SlotName"
+      responses:
+        "200":
+          description: Dropped slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots/{slot_name}/pause:
+    put:
+      tags: [ha]
+      operationId: pauseHAReplicationSlot
+      summary: Pause an HA replication slot
+      parameters:
+        - $ref: "#/components/parameters/SlotName"
+      responses:
+        "200":
+          description: Paused slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots/{slot_name}/resume:
+    put:
+      tags: [ha]
+      operationId: resumeHAReplicationSlot
+      summary: Resume an HA replication slot
+      parameters:
+        - $ref: "#/components/parameters/SlotName"
+      responses:
+        "200":
+          description: Resumed slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/base-backups:
+    post:
+      tags: [ha]
+      operationId: beginHABaseBackup
+      summary: Begin an HA base backup and reserve its replication slot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BaseBackupStartRequest"
+      responses:
+        "200":
+          description: Base backup start boundary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HABaseBackupBeginResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/base-backups/finish:
+    post:
+      tags: [ha]
+      operationId: finishHABaseBackup
+      summary: Finish an HA base backup from a local manifest path
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BaseBackupManifestPathRequest"
+      responses:
+        "200":
+          description: Base backup end boundary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HABaseBackupFinishResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/standby/bootstrap:
+    post:
+      tags: [ha]
+      operationId: bootstrapHAStandby
+      summary: Bootstrap this standby from a local base-backup manifest and copied files
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StandbyBootstrapRequest"
+      responses:
+        "200":
+          description: Standby bootstrap result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAStandbyBootstrapResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/fence:
+    post:
+      tags: [ha]
+      operationId: acquireHAFence
+      summary: Acquire a durable HA promotion fence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FenceAcquireRequest"
+      responses:
+        "200":
+          description: Acquired or returned the current matching fence receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAFenceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/fence/current:
+    get:
+      tags: [ha]
+      operationId: getHACurrentFence
+      summary: Get the current durable HA promotion fence
+      responses:
+        "200":
+          description: Current fence receipt, if any.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACurrentFenceResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/promotion/assess:
+    post:
+      tags: [ha]
+      operationId: assessHAPromotion
+      summary: Assess whether this standby can be promoted
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PromotionAssessRequest"
+      responses:
+        "200":
+          description: Promotion safety assessment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAPromotionAssessResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/promotion/current-fence:
+    post:
+      tags: [ha]
+      operationId: promoteHAWithCurrentFence
+      summary: Promote this standby using the current durable fence receipt
+      responses:
+        "200":
+          description: Promotion result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAPromotionResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/promotion:
+    post:
+      tags: [ha]
+      operationId: promoteHA
+      summary: Acquire a fence and promote this standby
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FenceAcquireRequest"
+      responses:
+        "200":
+          description: Promotion result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAPromotionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/rejoin/assess:
+    post:
+      tags: [ha]
+      operationId: assessHARejoin
+      summary: Assess whether a former primary can safely rejoin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejoinAssessRequest"
+      responses:
+        "200":
+          description: Former-primary rejoin assessment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HARejoinAssessResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /ha/rejoin/rewind:
+    post:
+      tags: [ha]
+      operationId: rewindHARejoin
+      summary: Rewind a fenced former primary onto the promoted timeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejoinAssessRequest"
+      responses:
+        "200":
+          description: Former-primary rewind assessment accepted for execution.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HARejoinAssessResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/rejoin/reseed:
+    post:
+      tags: [ha]
+      operationId: reseedHARejoin
+      summary: Reseed a fenced former primary when rewind is unsafe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejoinAssessRequest"
+      responses:
+        "200":
+          description: Former-primary reseed assessment accepted for execution.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HARejoinAssessResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Optional node-local HA admin bearer token. When an Antfly process is
+        started with `--ha-admin-token-env`, typed `/admin/v1/ha` routes require
+        `Authorization: Bearer <token>`.
+  parameters:
+    SlotName:
+      name: slot_name
+      in: path
+      required: true
+      description: Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+      schema:
+        $ref: "#/components/schemas/HASlotName"
+  responses:
+    BadRequest:
+      description: Invalid admin request.
+      content:
+        text/plain:
+          schema:
+            type: string
+    Conflict:
+      description: HA operation cannot be completed in the current state.
+      content:
+        text/plain:
+          schema:
+            type: string
+    Unauthorized:
+      description: HA admin bearer token is missing or invalid.
+      content:
+        text/plain:
+          schema:
+            type: string
+    NotFound:
+      description: HA resource was not found.
+      content:
+        text/plain:
+          schema:
+            type: string
+  schemas:
+    HAIdentifier:
+      type: string
+      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    HASlotName:
+      description: Stable standby replication slot name.
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    HANodeID:
+      description: Stable HA node id.
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    ReplicationSlotCreateRequest:
+      type: object
+      required: [slot_name]
+      additionalProperties: false
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        initial_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    BaseBackupStartRequest:
+      type: object
+      required: [slot_name, manifest_id]
+      additionalProperties: false
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        manifest_id:
+          type: string
+          description: Operator-chosen stable id for the base-backup manifest.
+          minLength: 1
+          maxLength: 256
+    BaseBackupManifestPathRequest:
+      type: object
+      required: [manifest_path]
+      additionalProperties: false
+      properties:
+        manifest_path:
+          type: string
+          description: Absolute normalized pod-local path to the HA base-backup manifest.
+          minLength: 1
+    StandbyBootstrapRequest:
+      type: object
+      required: [manifest_path]
+      additionalProperties: false
+      properties:
+        manifest_path:
+          type: string
+          description: Absolute normalized pod-local path to the HA base-backup manifest.
+          minLength: 1
+        content_root:
+          type: string
+          nullable: true
+          description: Optional absolute normalized pod-local directory containing files referenced by the manifest.
+    HASyncPolicy:
+      type: object
+      required: [mode]
+      additionalProperties: false
+      properties:
+        mode:
+          type: string
+          enum: [async, remote_write, remote_apply]
+          description: Durability mode to require before acknowledging the commit.
+        selection:
+          type: string
+          enum: [any, first, all]
+          default: any
+          description: How named standbys are selected to satisfy the policy.
+        required:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 1
+          description: Number of eligible standbys required for `any` selection.
+        standby_names:
+          type: array
+          items:
+            $ref: "#/components/schemas/HASlotName"
+          default: []
+          description: Ordered candidate standby names for synchronous commit.
+        failure_policy:
+          type: string
+          enum: [block, fail_closed, degrade_to_async]
+          default: block
+          description: Caller-visible action when synchronous durability is not currently satisfied.
+    CommitCheckRequest:
+      type: object
+      required: [target_lsn, sync_policy]
+      additionalProperties: false
+      properties:
+        target_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        sync_policy:
+          $ref: "#/components/schemas/HASyncPolicy"
+    CommitAppendRequest:
+      type: object
+      required: [payload, sync_policy]
+      additionalProperties: false
+      properties:
+        payload:
+          type: string
+          description: Logical WAL/effects payload to append.
+        kind:
+          type: string
+          enum:
+            - batch_mutation
+            - metadata_mutation
+            - derived_effect
+            - backup_start
+            - backup_end
+            - checkpoint
+            - manifest
+            - truncate
+            - timeline_switch
+          default: batch_mutation
+        payload_codec:
+          type: string
+          enum: [raw, json, binary]
+          default: raw
+        shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+        table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+        commit_timestamp_ns:
+          type: integer
+          format: int64
+          default: 0
+        sync_policy:
+          $ref: "#/components/schemas/HASyncPolicy"
+    ReadCheckRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        consistency:
+          type: string
+          enum: [stale_ok, at_least_lsn, primary]
+          default: stale_ok
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        required_metadata_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        metadata_applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+    WriteCheckRequest:
+      type: object
+      required: [role]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary, standby]
+        expected_identity:
+          nullable: true
+          $ref: "#/components/schemas/HAIdentity"
+    OwnerJobCheckRequest:
+      type: object
+      required: [role, kind]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary, standby]
+        kind:
+          type: string
+          enum: [compaction_publish, derived_effect_writer, enrichment_writer, retention_advance]
+        expected_identity:
+          nullable: true
+          $ref: "#/components/schemas/HAIdentity"
+    HAIdentity:
+      type: object
+      required: [cluster_id, shard_id, table_id, timeline_id, epoch]
+      additionalProperties: false
+      properties:
+        cluster_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Shard identity. Use 0 for whole-instance HA scope.
+        table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Table identity. Use 0 for whole-instance HA scope.
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+    FenceAcquireRequest:
+      type: object
+      required:
+        - identity
+        - old_primary_id
+        - promoted_node_id
+        - new_timeline_id
+        - new_epoch
+        - required_lsn
+        - observed_lsn
+        - force
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        old_primary_id:
+          $ref: "#/components/schemas/HANodeID"
+        promoted_node_id:
+          $ref: "#/components/schemas/HANodeID"
+        new_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        new_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        observed_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        force:
+          type: boolean
+          default: false
+        reason:
+          type: string
+          default: ""
+    HAFenceReceipt:
+      type: object
+      required:
+        - identity
+        - old_primary_id
+        - promoted_node_id
+        - parent_timeline_id
+        - parent_epoch
+        - new_timeline_id
+        - new_epoch
+        - required_lsn
+        - observed_lsn
+        - generation
+        - forced
+        - token
+        - reason
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        old_primary_id:
+          $ref: "#/components/schemas/HANodeID"
+        promoted_node_id:
+          $ref: "#/components/schemas/HANodeID"
+        parent_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        parent_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        new_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        new_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        observed_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        forced:
+          type: boolean
+        token:
+          type: string
+          minLength: 1
+        reason:
+          type: string
+    RejoinAssessRequest:
+      type: object
+      required:
+        - node_id
+        - identity
+        - last_lsn
+        - retained_from_lsn
+        - allow_rewind_after_forced_promotion
+      additionalProperties: false
+      properties:
+        node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Former primary node id that is attempting to rejoin.
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Last local LSN durably present on the former primary.
+        retained_from_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Earliest parent-timeline WAL LSN still retained for rewind.
+        allow_rewind_after_forced_promotion:
+          type: boolean
+          default: false
+        receipt:
+          $ref: "#/components/schemas/HAFenceReceipt"
+          description: Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
+    PromotionAssessRequest:
+      type: object
+      required:
+        - required_lsn
+        - fencing_confirmed
+        - force
+        - use_current_fence
+      additionalProperties: false
+      properties:
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        fencing_confirmed:
+          type: boolean
+          default: false
+        force:
+          type: boolean
+          default: false
+        use_current_fence:
+          type: boolean
+          default: false
+    HAPrimaryStatusResponse:
+      type: object
+      required: [schema_version, snapshot]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        snapshot:
+          $ref: "#/components/schemas/HAPrimarySnapshot"
+    HAStandbyStatusResponse:
+      type: object
+      required: [schema_version, snapshot]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        snapshot:
+          $ref: "#/components/schemas/HAStandbySnapshot"
+    HACommitCheckResponse:
+      type: object
+      required: [schema_version, gate]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        gate:
+          $ref: "#/components/schemas/HACommitGate"
+    HACommitAppendResponse:
+      type: object
+      required: [schema_version, lsn, gate]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        gate:
+          $ref: "#/components/schemas/HACommitGate"
+    HAReadCheckResponse:
+      type: object
+      required: [schema_version, decision]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        decision:
+          $ref: "#/components/schemas/HAReadDecision"
+    HAWriteCheckResponse:
+      type: object
+      required: [schema_version, decision]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        decision:
+          $ref: "#/components/schemas/HAWriteDecision"
+    HAOwnerJobCheckResponse:
+      type: object
+      required: [schema_version, decision]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        decision:
+          $ref: "#/components/schemas/HAOwnerJobDecision"
+    HAActionReceipt:
+      type: object
+      required: [action_id, action_kind, target, state, node_id]
+      additionalProperties: false
+      properties:
+        action_id:
+          type: string
+          minLength: 1
+          description: Stable action correlation id derived from the acted-on HA resource and boundary values.
+        action_kind:
+          type: string
+          enum:
+            - replication_slot_create
+            - replication_slot_pause
+            - replication_slot_resume
+            - replication_slot_drop
+            - base_backup_begin
+            - base_backup_finish
+            - standby_bootstrap
+            - fence_acquire
+            - promotion_assess
+            - promotion
+            - rejoin_assess
+            - rejoin_rewind
+            - rejoin_reseed
+          description: Typed HA action that produced this response.
+        target:
+          type: string
+          minLength: 1
+          description: Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
+        state:
+          type: string
+          enum: [assessed, applied, already_applied]
+          description: Idempotency state for this action response.
+        node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Node id for the node-local admin endpoint that produced this receipt.
+    HAReplicationSlotActionResponse:
+      type: object
+      required: [schema_version, action, slot_action, slot]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        slot_action:
+          type: string
+          enum: [create, pause, resume, drop]
+        slot:
+          $ref: "#/components/schemas/HAReplicationSlot"
+    HAReplicationSlotListResponse:
+      type: object
+      required: [schema_version, slots]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        slots:
+          type: array
+          items:
+            $ref: "#/components/schemas/HAReplicationSlot"
+    HABaseBackupBeginResponse:
+      type: object
+      required: [schema_version, action, slot_name, manifest_id, backup_lsn, start_record_lsn]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+          description: Stable standby replication slot reserved for the base backup.
+        manifest_id:
+          type: string
+          minLength: 1
+          description: Stable base-backup manifest id for retry and action correlation.
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: LSN reserved as the base-backup start boundary.
+        start_record_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Durable `backup_start` record LSN.
+    HABaseBackupFinishResponse:
+      type: object
+      required: [schema_version, action, manifest_id, backup_lsn, end_record_lsn]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        manifest_id:
+          type: string
+          minLength: 1
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        end_record_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Durable `backup_end` record LSN.
+    HAStandbyBootstrapResponse:
+      type: object
+      required: [schema_version, action, manifest_id, backup_lsn, checkpoint_lsn]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        manifest_id:
+          type: string
+          minLength: 1
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Standby checkpoint LSN after manifest validation.
+    HAFenceResponse:
+      type: object
+      required: [schema_version, action, receipt]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        receipt:
+          $ref: "#/components/schemas/HAFenceReceipt"
+    HACurrentFenceResponse:
+      type: object
+      required: [schema_version, held]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        held:
+          type: boolean
+        receipt:
+          nullable: true
+          $ref: "#/components/schemas/HAFenceReceipt"
+    HAPromotionAssessResponse:
+      type: object
+      required: [schema_version, action, assessment]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        assessment:
+          $ref: "#/components/schemas/HAPromotionAssessment"
+    HAPromotionResponse:
+      type: object
+      required: [schema_version, action, assessment, promotion, fence_generation, fence_token, forced]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        assessment:
+          $ref: "#/components/schemas/HAPromotionAssessment"
+        promotion:
+          $ref: "#/components/schemas/HAPromotionResult"
+        fence_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        fence_token:
+          type: string
+          minLength: 1
+        forced:
+          type: boolean
+    HARejoinAssessResponse:
+      type: object
+      required: [schema_version, action, assessment]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        assessment:
+          $ref: "#/components/schemas/HARejoinAssessment"
+        rewind:
+          $ref: "#/components/schemas/HARejoinRewindResult"
+          description: Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
+        reseed:
+          $ref: "#/components/schemas/HARejoinReseedResult"
+          description: Present when `/ha/rejoin/reseed` marked the former-primary slot for base-backup reseed.
+    HARejoinRewindResult:
+      type: object
+      required:
+        - node_id
+        - fork_lsn
+        - previous_last_lsn
+        - current_last_lsn
+        - next_lsn
+        - discarded_lsn_count
+        - target_timeline_id
+        - target_epoch
+        - data_loss_discarded
+      additionalProperties: false
+      properties:
+        node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Former primary node id whose local log was rewound.
+        fork_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        previous_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        current_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        discarded_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        target_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        target_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        data_loss_discarded:
+          type: boolean
+    HARejoinReseedResult:
+      type: object
+      required:
+        - node_id
+        - slot_name
+        - target_timeline_id
+        - target_epoch
+        - fork_lsn
+        - former_last_lsn
+        - reseed_required
+        - base_backup_required
+      additionalProperties: false
+      properties:
+        node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Former primary node id scheduled for reseed.
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        target_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        target_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        fork_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        former_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        reseed_required:
+          type: boolean
+        base_backup_required:
+          type: boolean
+    HAPromotionAssessment:
+      type: object
+      required:
+        - required_lsn
+        - received_lsn
+        - applied_lsn
+        - has_required_lsn
+        - caught_up_to_received
+        - fencing_confirmed
+        - force
+        - mode
+        - data_loss_possible
+        - safe
+        - requires_fencing
+        - requires_force
+        - can_promote
+      additionalProperties: false
+      properties:
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        has_required_lsn:
+          type: boolean
+        caught_up_to_received:
+          type: boolean
+        fencing_confirmed:
+          type: boolean
+        force:
+          type: boolean
+        mode:
+          type: string
+          enum: [blocked, safe, forced, lossy]
+          description: |
+            Explicit promotion mode for automation. `blocked` means the
+            assessment is not promotable. `safe` means fencing is confirmed and
+            all required/applied LSN evidence is present without forcing.
+            `forced` means force was requested but no data loss is indicated.
+            `lossy` means force was requested and data loss is possible.
+        data_loss_possible:
+          type: boolean
+        safe:
+          type: boolean
+        requires_fencing:
+          type: boolean
+        requires_force:
+          type: boolean
+        can_promote:
+          type: boolean
+    HAPromotionResult:
+      type: object
+      required: [node_id, switch_lsn, old_identity, new_identity, forced, data_loss_possible]
+      additionalProperties: false
+      properties:
+        node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Standby node id that executed the promotion.
+        switch_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        old_identity:
+          $ref: "#/components/schemas/HAIdentity"
+        new_identity:
+          $ref: "#/components/schemas/HAIdentity"
+        forced:
+          type: boolean
+        data_loss_possible:
+          type: boolean
+    HARejoinAssessment:
+      type: object
+      required:
+        - action
+        - reason
+        - former_node_id
+        - target_timeline_id
+        - target_epoch
+        - parent_cluster_id
+        - parent_shard_id
+        - parent_table_id
+        - parent_timeline_id
+        - parent_epoch
+        - fork_lsn
+        - former_last_lsn
+        - retained_from_lsn
+        - data_loss_discarded
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [reject_unfenced, already_current, rewind, reseed]
+        reason:
+          type: string
+          enum:
+            - no_fence
+            - current_timeline
+            - parent_timeline_retained
+            - parent_timeline_wal_expired
+            - incompatible_timeline
+            - wrong_old_primary
+            - wrong_cluster
+            - wrong_shard
+            - wrong_table
+            - local_lsn_before_fork
+        former_node_id:
+          $ref: "#/components/schemas/HANodeID"
+        target_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        target_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        parent_cluster_id:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Cluster identity of the retained parent-timeline fork record.
+        parent_shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Shard identity of the retained parent-timeline fork record.
+        parent_table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Table identity of the retained parent-timeline fork record.
+        parent_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Parent timeline that must contain the fork record before rewind.
+        parent_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Parent epoch that must contain the fork record before rewind.
+        fork_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        former_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        retained_from_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        data_loss_discarded:
+          type: boolean
+    HAPrimarySnapshot:
+      type: object
+      required: [role, node_id, identity, current_lsn, slots, retention]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary]
+        node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Node id for the node-local admin endpoint that produced this status snapshot.
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        current_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        slots:
+          type: array
+          items:
+            $ref: "#/components/schemas/HASlotSnapshot"
+        retention:
+          $ref: "#/components/schemas/HARetentionSnapshot"
+        durability:
+          nullable: true
+          $ref: "#/components/schemas/HADurabilityDecision"
+    HAStandbySnapshot:
+      type: object
+      required:
+        - role
+        - node_id
+        - identity
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - unapplied_lsn_count
+        - caught_up_to_received
+        - can_serve_safe_reads
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [standby]
+        node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Node id for the node-local admin endpoint that produced this status snapshot.
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        upstream_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        write_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        receive_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        apply_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
+          description: Last local standby replication pull or apply error observed by the node-local runtime.
+        last_attempt_ns:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Monotonic nanosecond timestamp for the most recent local standby replication attempt.
+        last_success_ns:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Monotonic nanosecond timestamp for the most recent successful local standby replication round.
+        replication_failures_total:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Local standby replication rounds that exited early with an error.
+        unapplied_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        caught_up_to_received:
+          type: boolean
+        can_serve_safe_reads:
+          type: boolean
+    HASlotSnapshot:
+      type: object
+      required:
+        - name
+        - timeline_id
+        - active
+        - reseed_required
+        - restart_lsn
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - write_lag_lsn
+        - apply_lag_lsn
+        - safe_read_lag_lsn
+        - retention_lag_lsn
+        - status
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        active:
+          type: boolean
+        reseed_required:
+          type: boolean
+        restart_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        write_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        apply_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        retention_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        status:
+          type: string
+          enum: [healthy, lagging, reseed_required]
+        last_error:
+          type: string
+          nullable: true
+    HARetentionSnapshot:
+      type: object
+      required: [primary_lsn, oldest_restart_lsn, retained_lsn_count, retained_byte_count, retained_age_ns, active_slots, reseed_recommended]
+      additionalProperties: false
+      properties:
+        primary_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        oldest_restart_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        retained_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        retained_byte_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        retained_age_ns:
+          type: integer
+          format: uint64
+          minimum: 0
+        active_slots:
+          type: integer
+          format: uint64
+          minimum: 0
+        reseed_recommended:
+          type: integer
+          format: uint64
+          minimum: 0
+    HADurabilityDecision:
+      type: object
+      required:
+        - status
+        - mode
+        - selection
+        - target_lsn
+        - progress_lsn
+        - missing_lsn_count
+        - satisfied_count
+        - required_count
+        - candidate_count
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [satisfied, would_block, fail_closed, degraded_to_async]
+        mode:
+          type: string
+          enum: [async, remote_write, remote_apply]
+        selection:
+          type: string
+          enum: [any, first, all]
+        target_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        progress_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        missing_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        satisfied_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        required_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        candidate_count:
+          type: integer
+          format: uint64
+          minimum: 0
+    HAReadDecision:
+      type: object
+      required:
+        - action
+        - consistency
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - missing_lsn_count
+        - metadata_missing_lsn_count
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [serve_standby, wait_for_apply, wait_for_metadata, route_to_primary]
+        consistency:
+          type: string
+          enum: [stale_ok, at_least_lsn, primary]
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        required_metadata_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        metadata_applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        serve_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        missing_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        metadata_missing_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+    HAPromotionHandoff:
+      type: object
+      required: [identity, switch_lsn, next_lsn]
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        switch_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+    HAWriteDecision:
+      type: object
+      required: [role, action, identity, durable_lsn, next_lsn]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary, standby, promoted_standby, fenced_primary]
+        action:
+          type: string
+          enum: [allow_write, reject_read_only_standby, open_promoted_primary, reject_fenced_primary]
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        durable_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        promotion_handoff:
+          nullable: true
+          $ref: "#/components/schemas/HAPromotionHandoff"
+    HAOwnerJobDecision:
+      type: object
+      required: [kind, role, action, identity, durable_lsn, next_lsn]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [compaction_publish, derived_effect_writer, enrichment_writer, retention_advance]
+        role:
+          type: string
+          enum: [primary, standby, promoted_standby]
+        action:
+          type: string
+          enum: [run, disable_on_standby, open_promoted_primary]
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        durable_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        promotion_handoff:
+          nullable: true
+          $ref: "#/components/schemas/HAPromotionHandoff"
+    HACommitGate:
+      type: object
+      required: [target_lsn, action, durability]
+      additionalProperties: false
+      properties:
+        target_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        action:
+          type: string
+          enum: [acknowledge, wait_for_standby, reject, acknowledge_degraded]
+        durability:
+          $ref: "#/components/schemas/HADurabilityDecision"
+    HAReplicationSlot:
+      type: object
+      required:
+        - slot_name
+        - timeline_id
+        - restart_lsn
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - active
+        - reseed_required
+        - current_lsn
+      additionalProperties: false
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        restart_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        active:
+          type: boolean
+        reseed_required:
+          type: boolean
+        last_error:
+          type: string
+          nullable: true
+        current_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        dropped:
+          type: boolean
+          nullable: true

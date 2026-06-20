@@ -278,6 +278,8 @@ pub const LookupKeyPathParams = struct {
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
+    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
+    consistency: ?[]const u8 = null,
 };
 
 /// List derived document artifact manifests
@@ -305,6 +307,27 @@ pub const ReprocessDocumentArtifactRangePathParams = struct {
 pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
     return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
+
+/// Register or replace an artifact enrichment
+pub const PutArtifactEnrichmentPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Stable generated artifact name.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for putArtifactEnrichment.
+pub fn parsePutArtifactEnrichmentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.EnrichmentConfig) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.EnrichmentConfig, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Delete an artifact enrichment
+pub const DeleteArtifactEnrichmentPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Stable generated artifact name.
+    artifact_name: []const u8,
+};
 
 /// Create a derived document artifact reprocess job
 pub const StartDocumentArtifactReprocessJobPathParams = struct {
@@ -458,6 +481,8 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
+    .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance", .operation_id = "advanceDocumentArtifactReprocessJob" },
@@ -522,6 +547,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
         if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifactRange")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifactRange'");
+        if (!@hasDecl(Impl, "putArtifactEnrichment")) @compileError("ServerRouter: Impl missing required method 'putArtifactEnrichment'");
+        if (!@hasDecl(Impl, "deleteArtifactEnrichment")) @compileError("ServerRouter: Impl missing required method 'deleteArtifactEnrichment'");
         if (!@hasDecl(Impl, "startDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'startDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "getDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "advanceDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'advanceDocumentArtifactReprocessJob'");
@@ -587,6 +614,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/documents/:key", lookupKey);
             try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess", reprocessDocumentArtifactRange);
+            try server.put("/tables/:tableName/artifacts/:artifactName/enrichment", putArtifactEnrichment);
+            try server.delete("/tables/:tableName/artifacts/:artifactName/enrichment", deleteArtifactEnrichment);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs", startDocumentArtifactReprocessJob);
             try server.get("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId", getDocumentArtifactReprocessJob);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/advance", advanceDocumentArtifactReprocessJob);
@@ -910,6 +939,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const query_params = LookupKeyParams{
                 .fields = ctx.query("fields"),
+                .consistency = ctx.query("consistency"),
             };
             return impl.lookupKey(ctx, table_name, key, query_params);
         }
@@ -933,6 +963,24 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             return impl.reprocessDocumentArtifactRange(ctx, table_name, artifact_name);
+        }
+
+        /// Register or replace an artifact enrichment
+        /// PUT /tables/{tableName}/artifacts/{artifactName}/enrichment
+        fn putArtifactEnrichment(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.putArtifactEnrichment(ctx, table_name, artifact_name);
+        }
+
+        /// Delete an artifact enrichment
+        /// DELETE /tables/{tableName}/artifacts/{artifactName}/enrichment
+        fn deleteArtifactEnrichment(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.deleteArtifactEnrichment(ctx, table_name, artifact_name);
         }
 
         /// Create a derived document artifact reprocess job
@@ -1077,6 +1125,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn startDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn getDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response

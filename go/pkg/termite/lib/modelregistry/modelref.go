@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/antflydb/antfly/go/pkg/libaf/modelcache"
 )
 
 // ModelRef represents a parsed model reference
@@ -28,6 +30,8 @@ type ModelRef struct {
 	Name string
 	// Variant is the optional model variant (e.g., "i8", "f16")
 	Variant string
+	// Format is the optional artifact format (e.g., "gguf")
+	Format string
 	// IsHuggingFace indicates if this was a hf: prefixed reference
 	IsHuggingFace bool
 }
@@ -70,7 +74,9 @@ func (r ModelRef) DirPath() string {
 // String returns a human-readable representation
 func (r ModelRef) String() string {
 	s := r.FullName()
-	if r.Variant != "" {
+	if r.Format != "" && r.Variant != "" {
+		s += ":" + r.Format + ":" + r.Variant
+	} else if r.Variant != "" {
 		s += ":" + r.Variant
 	}
 	if r.IsHuggingFace {
@@ -83,6 +89,7 @@ func (r ModelRef) String() string {
 //
 //	"BAAI/bge-small-en-v1.5"         -> Owner: BAAI, Name: bge-small-en-v1.5
 //	"BAAI/bge-small-en-v1.5:i8"      -> Owner: BAAI, Name: bge-small-en-v1.5, Variant: i8
+//	"antflydb/clipclap:gguf:Q4_K"    -> Owner: antflydb, Name: clipclap, Format: gguf, Variant: Q4_K
 //	"hf:BAAI/bge-small-en-v1.5"      -> same, but IsHuggingFace: true
 //	"hf:BAAI/bge-small-en-v1.5:i8"   -> full form with HF prefix and variant
 //	"bge-small-en-v1.5"              -> Owner: "", Name: bge-small-en-v1.5 (legacy)
@@ -98,6 +105,24 @@ func ParseModelRef(ref string) (ModelRef, error) {
 	if after, ok := strings.CutPrefix(ref, "hf:"); ok {
 		result.IsHuggingFace = true
 		ref = after
+	}
+
+	// Owner-qualified refs share the Antfly model cache parser so SDK,
+	// Termite, and Zig-facing tooling agree on owner/repo[:format[:variant]].
+	if strings.Contains(strings.SplitN(ref, ":", 2)[0], "/") {
+		cacheRef, err := modelcache.ParseModelRef(ref)
+		if err != nil {
+			return ModelRef{}, err
+		}
+		result.Owner = cacheRef.Owner
+		result.Name = cacheRef.Repo
+		result.Format = cacheRef.Format
+		result.Variant = cacheRef.Variant
+		if result.Format == "" && result.Variant != "" && !isValidVariantID(result.Variant) {
+			return ModelRef{}, fmt.Errorf("invalid variant %q: valid variants are %v",
+				result.Variant, validVariantIDs())
+		}
+		return result, nil
 	}
 
 	// Check for variant suffix (colon-separated like Docker/Ollama tags)
@@ -169,6 +194,7 @@ func (r ModelRef) WithVariant(variant string) ModelRef {
 		Owner:         r.Owner,
 		Name:          r.Name,
 		Variant:       variant,
+		Format:        r.Format,
 		IsHuggingFace: r.IsHuggingFace,
 	}
 }
@@ -183,7 +209,7 @@ func (r ModelRef) Validate() error {
 	if r.Name == "" {
 		return fmt.Errorf("model name is required")
 	}
-	if r.Variant != "" && !isValidVariantID(r.Variant) {
+	if r.Format == "" && r.Variant != "" && !isValidVariantID(r.Variant) {
 		return fmt.Errorf("invalid variant %q", r.Variant)
 	}
 	return nil

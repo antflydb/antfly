@@ -247,6 +247,7 @@ pub const EnrichmentConfig = struct {
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
+    full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
 
@@ -261,6 +262,7 @@ pub const EnrichmentConfig = struct {
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+            .full_text_index = cfg.full_text_index,
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
             .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         };

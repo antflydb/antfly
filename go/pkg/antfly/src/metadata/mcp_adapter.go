@@ -208,6 +208,22 @@ func (a *mcpAdapter) ListIndexes(ctx context.Context, tableName string) ([]antfl
 
 // Query implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) Query(ctx context.Context, req antflymcp.QueryRequest) (*antflymcp.QueryResult, error) {
+	if req.RawQueryRequest != nil {
+		if _, ok := req.RawQueryRequest["table"]; ok {
+			return nil, fmt.Errorf("queryRequest.table is not allowed; pass the table through tableName")
+		}
+		raw, err := json.Marshal(req.RawQueryRequest)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling queryRequest: %w", err)
+		}
+		var internalReq QueryRequest
+		if err := json.Unmarshal(raw, &internalReq); err != nil {
+			return nil, fmt.Errorf("unmarshaling queryRequest: %w", err)
+		}
+		internalReq.Table = req.TableName
+		return a.runMCPQuery(ctx, &internalReq)
+	}
+
 	internalReq := QueryRequest{
 		Table:          req.TableName,
 		SemanticSearch: req.SemanticSearch,
@@ -231,7 +247,11 @@ func (a *mcpAdapter) Query(ctx context.Context, req antflymcp.QueryRequest) (*an
 		internalReq.FullTextSearch = ftsJSON
 	}
 
-	qr := a.t.runQuery(ctx, &internalReq)
+	return a.runMCPQuery(ctx, &internalReq)
+}
+
+func (a *mcpAdapter) runMCPQuery(ctx context.Context, req *QueryRequest) (*antflymcp.QueryResult, error) {
+	qr := a.t.runQuery(ctx, req)
 	if qr.Error != "" {
 		return nil, fmt.Errorf("query error: %s", qr.Error)
 	}

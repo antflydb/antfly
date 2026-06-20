@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
@@ -55,6 +56,8 @@ const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+const admin_routes = @import("../admin/routes.zig");
+const internal_api_routes = @import("../internal/routes.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -83,9 +86,14 @@ const httpx = @import("httpx");
 const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 const protocol_adapters = @import("protocol_adapters.zig");
+const ard_catalog = @import("ard_catalog.zig");
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const parseOwnedJsonObjectMapAlloc = json_helpers.parseOwnedJsonObjectMapAlloc;
+const ArdOpenApiSpec = struct {
+    body: []const u8,
+    admin_only: bool = false,
+};
 
 const ParsedGlobalQueryTable = struct {
     parsed: std.json.Parsed(metadata_openapi.QueryRequest),
@@ -241,6 +249,10 @@ test "public API request body limit matches Go linear merge contract" {
 
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
+    ard_base_url: ?[]const u8 = null,
+    ard_publisher_domain: []const u8 = "antfly.local",
+    ard_display_name: []const u8 = "Antfly",
+    ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
     swarm_mode: bool = false,
@@ -260,6 +272,8 @@ pub const ApiHttpServerConfig = struct {
     session_executor: ?http_common.RequestExecutor = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
+    ha_admin_executor: ?http_common.RequestExecutor = null,
+    ha_internal_executor: ?http_common.RequestExecutor = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -355,6 +369,8 @@ pub const StatusSource = struct {
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
+        put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
+        delete_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) anyerror!void = null,
         wait_table_lifecycle: ?*const fn (ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) anyerror!void = null,
         wait_table_projection: ?*const fn (ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) anyerror!void = null,
         run_round: ?*const fn (ptr: *anyopaque) anyerror!void = null,
@@ -418,6 +434,16 @@ pub const StatusSource = struct {
     pub fn dropIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_index orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn putArtifactEnrichment(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+        const fn_ptr = self.vtable.put_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
+    }
+
+    pub fn deleteArtifactEnrichment(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+        const fn_ptr = self.vtable.delete_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
     }
 
     pub fn waitTableLifecycle(self: StatusSource, table_name: []const u8, expected: TableVisibility) !bool {
@@ -542,6 +568,14 @@ pub const StatusSource = struct {
                 return try dropIndexOnService(cast(ptr), alloc, table_name, index_name);
             }
 
+            fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void {
+                return try putArtifactEnrichmentOnService(cast(ptr), alloc, table_name, artifact_name, enrichment_json);
+            }
+
+            fn deleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) anyerror!void {
+                return try deleteArtifactEnrichmentOnService(cast(ptr), alloc, table_name, artifact_name);
+            }
+
             fn waitTableLifecycle(ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) anyerror!void {
                 return try cast(ptr).waitForTableLifecycle(table_name, switch (expected) {
                     .present => .present,
@@ -618,6 +652,8 @@ pub const StatusSource = struct {
             .update_schema = Gen.updateSchema,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
+            .put_artifact_enrichment = Gen.putArtifactEnrichment,
+            .delete_artifact_enrichment = Gen.deleteArtifactEnrichment,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
             .wait_table_projection = Gen.waitTableProjection,
             .run_round = Gen.runRound,
@@ -756,6 +792,35 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
 
     const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(indexes_json);
+    var updated_record = table.*;
+    updated_record.indexes_json = indexes_json;
+    try svc.upsertTable(updated_record);
+    try svc.runRound();
+}
+
+fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsEnrichment(&snapshot, table_name, artifact_name)) return error.ExtensionOwnedObject;
+
+    var updated_record = table.*;
+    updated_record.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
+    defer alloc.free(updated_record.indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
+    try svc.upsertTable(updated_record);
+    try svc.runRound();
+}
+
+fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsEnrichment(&snapshot, table_name, artifact_name)) return error.ExtensionOwnedObject;
+
+    const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, artifact_name)) orelse return error.EnrichmentNotFound;
+    defer alloc.free(indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.upsertTable(updated_record);
@@ -1701,8 +1766,15 @@ pub const ApiHttpServer = struct {
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return false;
         if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
+        if (std.mem.eql(u8, path, routes.Routes.ai_catalog) and self.cfg.ard_public_catalog_enabled) return false;
         if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
-        return !std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix);
+        if (std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix)) return false;
+        if (isHaInternalPath(path)) return false;
+        return true;
+    }
+
+    fn requestCarriesAuthentication(_: *const ApiHttpServer, req: http_common.HttpRequest) bool {
+        return req.authorization != null or req.header(trusted_principal_header) != null;
     }
 
     pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
@@ -1851,7 +1923,12 @@ pub const ApiHttpServer = struct {
             return try jsonResponse(self.alloc, .{ .status = "ready" });
         }
 
-        if (self.requiresAuthentication(uri_parts.path)) {
+        const route_requires_authentication = self.requiresAuthentication(uri_parts.path);
+        const should_authenticate_optional_ard_catalog =
+            !route_requires_authentication and
+            std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog) and
+            self.requestCarriesAuthentication(req);
+        if (route_requires_authentication or should_authenticate_optional_ard_catalog) {
             authenticated_identity = self.authenticateRequest(.{
                 .authorization = req.authorization,
                 .trusted_principal = req.header(trusted_principal_header),
@@ -1863,16 +1940,19 @@ pub const ApiHttpServer = struct {
             };
             const identity = authenticated_identity.?;
 
-            if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) {
+            if (route_requires_authentication and requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) {
                 return try textResponse(self.alloc, 403, "forbidden");
             }
-            if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
-                if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
-                    return try textResponse(self.alloc, 403, "forbidden");
+            if (route_requires_authentication) {
+                if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
+                    if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
+                        return try textResponse(self.alloc, 403, "forbidden");
+                    }
                 }
             }
         }
 
+        if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
             const metadata_status = try self.source.status();
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
@@ -1926,6 +2006,8 @@ pub const ApiHttpServer = struct {
                 .body = body,
             };
         }
+        if (try self.dispatchArdRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
+        if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchExtensionRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
@@ -1937,8 +2019,25 @@ pub const ApiHttpServer = struct {
         return try textResponse(self.alloc, 404, "not found");
     }
 
+    fn dispatchHaRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
+        if (isHaAdminPath(uri_parts.path)) {
+            const ha_exec = self.cfg.ha_admin_executor orelse return null;
+            return try ha_exec.execute(self.alloc, req);
+        }
+        if (isHaInternalPath(uri_parts.path)) {
+            const ha_exec = self.cfg.ha_internal_executor orelse return null;
+            return try ha_exec.execute(self.alloc, req);
+        }
+        return null;
+    }
+
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET or req.method == .POST or req.method == .DELETE) {
+            if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_extension_profiles_prefix)) {
+                const profile = uri_parts.path[routes.Routes.mcp_v1_extension_profiles_prefix.len..];
+                if (!std.mem.eql(u8, profile, "copilot")) return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
+            }
             if (routes.Routes.matchMcpExtension(uri_parts.path)) |mcp_extension| {
                 return try protocol_adapters.handleExtensionMcpRequest(self, req, authenticated_identity, mcp_extension.name);
             }
@@ -1953,6 +2052,306 @@ pub const ApiHttpServer = struct {
             return try protocol_adapters.handleA2aCard(self);
         }
         return null;
+    }
+
+    fn dispatchArdRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_openapi)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            return try self.bodyResponse(200, "application/yaml", build_options.ard_openapi_ard_yaml, false);
+        }
+        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_openapi_prefix)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const name = uri_parts.path[routes.Routes.ard_v1_openapi_prefix.len..];
+            const spec = ardOpenApiSpec(name) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+            if (spec.admin_only and self.cfg.auth_enabled and !authenticatedIdentityIsAdmin(authenticated_identity)) {
+                if (authenticated_identity == null) return try unauthorizedResponse(self.alloc);
+                return try textResponse(self.alloc, 403, "forbidden");
+            }
+            return try self.bodyResponse(200, "application/yaml", spec.body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
+            var snapshot_opt: ?metadata_api.AdminSnapshot = null;
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const extension_context = if (mode == .tenant) blk: {
+                snapshot_opt = try self.source.adminSnapshot();
+                break :blk self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity);
+            } else null;
+            const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
+                self.alloc,
+                self.ardCatalogOptions(mode, uri_parts.query, authenticated_identity),
+                extension_context,
+            );
+            return try self.ardCatalogResponse(200, body, mode == .public_bootstrap);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
+                self.alloc,
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            );
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_search)) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+                self.alloc,
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                req.body,
+                false,
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            ) catch |err| switch (err) {
+                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD search request"),
+                else => return err,
+            };
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_explore)) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+                self.alloc,
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                req.body,
+                true,
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            ) catch |err| switch (err) {
+                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD explore request"),
+                else => return err,
+            };
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_agents)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            var snapshot_opt = try self.source.adminSnapshot();
+            defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+            const body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
+                self.alloc,
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                uri_parts.query,
+                self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+            ) catch |err| switch (err) {
+                error.InvalidArdAgentsRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD agents request"),
+                else => return err,
+            };
+            return try self.ardCatalogResponse(200, body, false);
+        }
+        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
+            const options = self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity);
+            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
+                var snapshot_opt = try self.source.adminSnapshot();
+                defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+                break :blk (try ard_catalog.extensionSkillMarkdownAlloc(
+                    self.alloc,
+                    options,
+                    slug,
+                    self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity) orelse return try jsonErrorResponse(self.alloc, 404, "not found"),
+                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
+            return try self.bodyResponseOwned(200, "text/markdown; charset=utf-8", body, false);
+        }
+        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_resources_prefix)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const rest = uri_parts.path[routes.Routes.ard_v1_resources_prefix.len..];
+            if (std.mem.startsWith(u8, rest, "mcp/")) {
+                const name = rest["mcp/".len..];
+                var snapshot_opt = if (std.mem.eql(u8, name, "default") or std.mem.startsWith(u8, name, "extensions/") or std.mem.startsWith(u8, name, "profiles/")) try self.source.adminSnapshot() else null;
+                defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+                const body = (try ard_catalog.mcpDescriptorJsonAlloc(
+                    self.alloc,
+                    name,
+                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                    if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
+                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try self.ardCatalogResponse(200, body, false);
+            }
+            if (std.mem.startsWith(u8, rest, "agents/")) {
+                const name = rest["agents/".len..];
+                var snapshot_opt = if (std.mem.startsWith(u8, name, "extensions/")) try self.source.adminSnapshot() else null;
+                defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+                const body = (try ard_catalog.agentDescriptorJsonAlloc(
+                    self.alloc,
+                    name,
+                    self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
+                    if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
+                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try self.ardCatalogResponse(200, body, false);
+            }
+            return try jsonErrorResponse(self.alloc, 404, "not found");
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            return try self.ardCatalogResponse(200, try self.ardRegistryRootJsonAlloc(), false);
+        }
+        return null;
+    }
+
+    fn dispatchExtensionAgentRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        const parsed = parseExtensionAgentRunRoute(uri_parts.path) orelse return null;
+        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAlloc(parsed.extension_name, parsed.agent_name, uri_parts.query, authenticated_identity)) orelse
+            return try jsonErrorResponse(self.alloc, 404, "not found");
+        self.alloc.free(descriptor);
+
+        if (std.mem.eql(u8, parsed.tail, "runs")) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, null);
+            return try self.bodyResponseOwned(501, "application/json", body, false);
+        }
+        if (!std.mem.startsWith(u8, parsed.tail, "runs/")) return try jsonErrorResponse(self.alloc, 404, "not found");
+        const run_tail = parsed.tail["runs/".len..];
+        if (run_tail.len == 0) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (std.mem.endsWith(u8, run_tail, "/events")) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const run_id = run_tail[0 .. run_tail.len - "/events".len];
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            const body = try extensionAgentUnsupportedRuntimeEventAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
+            defer self.alloc.free(body);
+            return try eventStreamResponse(self.alloc, 501, body);
+        }
+        if (std.mem.endsWith(u8, run_tail, "/cancel")) {
+            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const run_id = run_tail[0 .. run_tail.len - "/cancel".len];
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
+            return try self.bodyResponseOwned(501, "application/json", body, false);
+        }
+        if (std.mem.indexOfScalar(u8, run_tail, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_tail);
+        return try self.bodyResponseOwned(501, "application/json", body, false);
+    }
+
+    fn visibleExtensionAgentDescriptorJsonAlloc(
+        self: *ApiHttpServer,
+        extension_name: []const u8,
+        agent_name: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !?[]u8 {
+        const route = try std.fmt.allocPrint(self.alloc, "extensions/{s}/{s}", .{ extension_name, agent_name });
+        defer self.alloc.free(route);
+        var snapshot_opt = try self.source.adminSnapshot();
+        defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        return try ard_catalog.agentDescriptorJsonAlloc(
+            self.alloc,
+            route,
+            self.ardCatalogOptions(.tenant, query, authenticated_identity),
+            self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
+        );
+    }
+
+    fn ardRegistryRootJsonAlloc(self: *ApiHttpServer) ![]u8 {
+        var writer: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer writer.deinit();
+
+        try writer.writer.writeAll("{\"catalog\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_catalog);
+        try writer.writer.writeAll(",\"search\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_search);
+        try writer.writer.writeAll(",\"explore\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_explore);
+        try writer.writer.writeAll(",\"agents\":");
+        try writeMaybeAbsoluteUrl(&writer.writer, self.cfg.ard_base_url, routes.Routes.ard_v1_agents);
+        try writer.writer.writeByte('}');
+        return try writer.toOwnedSlice();
+    }
+
+    fn ardExtensionCatalogContext(self: *ApiHttpServer, snapshot_opt: ?metadata_api.AdminSnapshot, authenticated_identity: ?AuthenticatedIdentity) ?ard_catalog.ExtensionCatalogContext {
+        _ = self;
+        const snapshot = snapshot_opt orelse return null;
+        return .{
+            .extension_packages = snapshot.extension_packages,
+            .installed_extensions = snapshot.installed_extensions,
+            .extension_members = snapshot.extension_members,
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
+        };
+    }
+
+    fn ardCatalogOptions(self: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) ard_catalog.CatalogOptions {
+        return .{
+            .mode = mode,
+            .base_url = self.cfg.ard_base_url,
+            .publisher_domain = if (self.cfg.ard_publisher_domain.len > 0) self.cfg.ard_publisher_domain else "antfly.local",
+            .display_name = if (self.cfg.ard_display_name.len > 0) self.cfg.ard_display_name else "Antfly",
+            .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
+            .profile = parseSimpleQueryParam(query, "profile"),
+            .types = parseSimpleQueryParam(query, "types"),
+            .include = parseSimpleQueryParam(query, "include"),
+        };
+    }
+
+    fn authenticatedIdentityIsAdmin(authenticated_identity: ?AuthenticatedIdentity) bool {
+        const identity = authenticated_identity orelse return false;
+        return permissionsAllow(identity.permissions, .@"*", "*", .admin);
+    }
+
+    fn ardOpenApiSpec(name: []const u8) ?ArdOpenApiSpec {
+        if (std.mem.eql(u8, name, "antfly.yaml")) return .{ .body = build_options.ard_openapi_antfly_yaml };
+        if (std.mem.eql(u8, name, "metadata.yaml")) return .{ .body = build_options.ard_openapi_metadata_yaml };
+        if (std.mem.eql(u8, name, "inference-config.yaml")) return .{ .body = build_options.ard_openapi_inference_config_yaml };
+        if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = build_options.ard_openapi_extensions_yaml, .admin_only = true };
+        if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = build_options.ard_openapi_auth_yaml, .admin_only = true };
+        return null;
+    }
+
+    fn ardCatalogResponse(self: *ApiHttpServer, status: u16, body: []u8, public_cors: bool) !http_common.HttpResponse {
+        errdefer self.alloc.free(body);
+        var headers: []http_common.Header = &.{};
+        errdefer {
+            for (headers) |*header| header.deinit(self.alloc);
+            if (headers.len > 0) self.alloc.free(headers);
+        }
+        if (public_cors) {
+            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
+                .{
+                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
+                    .value = try self.alloc.dupe(u8, "*"),
+                },
+            });
+        }
+        return .{
+            .status = status,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .headers = headers,
+            .body = body,
+        };
+    }
+
+    fn bodyResponse(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []const u8, public_cors: bool) !http_common.HttpResponse {
+        return try self.bodyResponseOwned(status, content_type, try self.alloc.dupe(u8, body), public_cors);
+    }
+
+    fn bodyResponseOwned(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []u8, public_cors: bool) !http_common.HttpResponse {
+        errdefer self.alloc.free(body);
+        var headers: []http_common.Header = &.{};
+        errdefer {
+            for (headers) |*header| header.deinit(self.alloc);
+            if (headers.len > 0) self.alloc.free(headers);
+        }
+        if (public_cors) {
+            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
+                .{
+                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
+                    .value = try self.alloc.dupe(u8, "*"),
+                },
+            });
+        }
+        return .{
+            .status = status,
+            .content_type = try self.alloc.dupe(u8, content_type),
+            .headers = headers,
+            .body = body,
+        };
     }
 
     fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
@@ -3615,6 +4014,9 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .PUT) {
+            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicPutArtifactEnrichment(artifact_route.table_name, artifact_route.artifact_name, req.body);
+            }
             if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
                 const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid schema update request");
@@ -3683,6 +4085,9 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .DELETE) {
+            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDeleteArtifactEnrichment(artifact_route.table_name, artifact_route.artifact_name);
+            }
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
                 return try self.handlePublicTableDeleteIndex(table_index.table_name, table_index.index_name);
             }
@@ -3694,8 +4099,18 @@ pub const ApiHttpServer = struct {
                 defer self.alloc.free(decoded_key);
                 var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, uri_parts.query);
                 defer lookup_opts.deinit(self.alloc);
+                const consistency = parseLookupReadConsistency(uri_parts.query) catch {
+                    return try textResponse(self.alloc, 400, "invalid read consistency");
+                };
 
-                var result = (try source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, .read_index)) orelse {
+                var result = (source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
+                    error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    else => {
+                        std.log.err("public table lookup failed table={s} key={s} err={}", .{ lookup.table_name, decoded_key, err });
+                        return try textResponse(self.alloc, 500, "lookup failed");
+                    },
+                }) orelse {
                     return try textResponse(self.alloc, 404, "not found");
                 };
                 defer result.deinit(self.alloc);
@@ -3745,10 +4160,9 @@ pub const ApiHttpServer = struct {
                         (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(arena_impl.allocator(), &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
                     return try jsonResponse(self.alloc, response);
                 }
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
-                return try jsonResponse(self.alloc, response);
+                const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
+                defer self.alloc.free(body);
+                return try jsonBodyResponseWithStatus(self.alloc, 200, body);
             }
         }
         if (req.method == .DELETE) {
@@ -5019,6 +5433,8 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
+                .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
                 .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
                 .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
                 .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
@@ -5078,6 +5494,8 @@ pub const ApiHttpServer = struct {
         return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5149,6 +5567,8 @@ pub const ApiHttpServer = struct {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
                 error.TableNotFound => return error.TableNotFound,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+                error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+                error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -5164,6 +5584,8 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5198,6 +5620,8 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5851,6 +6275,77 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn executePublicPutArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const table_before = (self.loadOwnedTableRecord(table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        defer metadata_table_manager.freeTable(alloc, table_before);
+        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
+            return error.InvalidEnrichmentRequest;
+        };
+        defer alloc.free(enrichment_json);
+
+        const expected_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+        defer alloc.free(expected_indexes_json);
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+
+        self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
+            error.TableNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
+            error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => {
+                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                return error.InternalFailure;
+            },
+        };
+        self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
+            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+            return error.InternalFailure;
+        };
+    }
+
+    fn executePublicDeleteArtifactEnrichment(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteDeleteArtifactEnrichmentError!void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const table_before = (self.loadOwnedTableRecord(table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        defer metadata_table_manager.freeTable(alloc, table_before);
+        const expected_indexes_json = (indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table_before.indexes_json, artifact_name) catch return error.InternalFailure) orelse {
+            return error.NotFound;
+        };
+        defer alloc.free(expected_indexes_json);
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+
+        self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
+            error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
+            error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
+            else => return error.InternalFailure,
+        };
+        self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch {
+            return error.InternalFailure;
+        };
+    }
+
     fn executePublicDocumentArtifactManifest(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5862,6 +6357,8 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -5880,6 +6377,8 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -6353,6 +6852,38 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicTableDeleteIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8) !http_common.HttpResponse {
         var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            201 => blk: {
+                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_impl.deinit();
+                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
+                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
+            },
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicPutArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        var resp = try public_table_http.handlePutArtifactEnrichment(self.alloc, table_name, artifact_name, body, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            201 => blk: {
+                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_impl.deinit();
+                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
+                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
+            },
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicDeleteArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        var resp = try public_table_http.handleDeleteArtifactEnrichment(self.alloc, table_name, artifact_name, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -6929,6 +7460,8 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
         error.InvalidExtensionEnrichment,
+        error.InvalidEnrichmentConfig,
+        error.ConflictingEnrichmentConfig,
         error.InvalidExtensionLifecycleRequest,
         error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
@@ -7139,6 +7672,16 @@ fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: [
     return false;
 }
 
+fn extensionOwnsEnrichment(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, enrichment_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionEnrichmentMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, enrichment_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
     for (snapshot.extension_members) |member| {
         if (member.object_kind != .table_schema) continue;
@@ -7233,6 +7776,7 @@ fn planExtensionStorageMemberDeltaAlloc(
         }
 
         if (!changed) continue;
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, owned_indexes_json.?);
         var updated_record = try metadata_table_manager.cloneTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, updated_record);
         alloc.free(@constCast(updated_record.indexes_json));
@@ -7419,6 +7963,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (isHaAdminPath(path)) return true;
     if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
@@ -7426,6 +7971,14 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
+}
+
+fn isHaAdminPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+}
+
+fn isHaInternalPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, internal_api_routes.ha) or std.mem.startsWith(u8, path, internal_api_routes.ha ++ "/");
 }
 
 fn isExtensionPath(path: []const u8) bool {
@@ -7528,6 +8081,14 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .permission_type = switch (method) {
             .POST => .admin,
             .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactEnrichment(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .PUT, .DELETE => .admin,
+            .GET, .POST => return null,
         },
     };
     if (routes.Routes.matchTablePath(path)) |table_path| {
@@ -7817,6 +8378,16 @@ fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpRespo
     return try jsonResponseWithStatus(alloc, 200, value);
 }
 
+fn writeMaybeAbsoluteUrl(writer: *std.Io.Writer, base_url: ?[]const u8, url: []const u8) !void {
+    const base = base_url orelse return try std.json.Stringify.value(url, .{}, writer);
+    if (base.len == 0 or !std.mem.startsWith(u8, url, "/")) return try std.json.Stringify.value(url, .{}, writer);
+    var buf: [1024]u8 = undefined;
+    var end = base.len;
+    while (end > 0 and base[end - 1] == '/') end -= 1;
+    const resolved = try std.fmt.bufPrint(&buf, "{s}{s}", .{ base[0..end], url });
+    try std.json.Stringify.value(resolved, .{}, writer);
+}
+
 fn jsonBodyResponseWithStatus(
     alloc: std.mem.Allocator,
     status: u16,
@@ -7861,6 +8432,60 @@ fn jsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8)
         .content_type = try alloc.dupe(u8, "application/json"),
         .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt(message, .{})}),
     };
+}
+
+const ExtensionAgentRunRoute = struct {
+    extension_name: []const u8,
+    agent_name: []const u8,
+    tail: []const u8,
+};
+
+fn parseExtensionAgentRunRoute(path: []const u8) ?ExtensionAgentRunRoute {
+    if (!std.mem.startsWith(u8, path, routes.Routes.agents_v1_extensions_prefix)) return null;
+    const rest = path[routes.Routes.agents_v1_extensions_prefix.len..];
+    const extension_slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const extension_name = rest[0..extension_slash];
+    const agent_rest = rest[extension_slash + 1 ..];
+    const agent_slash = std.mem.indexOfScalar(u8, agent_rest, '/') orelse return null;
+    const agent_name = agent_rest[0..agent_slash];
+    const tail = agent_rest[agent_slash + 1 ..];
+    if (extension_name.len == 0 or agent_name.len == 0 or tail.len == 0) return null;
+    return .{ .extension_name = extension_name, .agent_name = agent_name, .tail = tail };
+}
+
+fn extensionAgentUnsupportedRuntimeJsonAlloc(
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    agent_name: []const u8,
+    run_id: ?[]const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("{\"error\":\"extension agent runtime not implemented\",\"status\":\"unsupported_runtime\",\"extension\":");
+    try std.json.Stringify.value(extension_name, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"agent\":");
+    try std.json.Stringify.value(agent_name, .{}, &writer.writer);
+    if (run_id) |id| {
+        try writer.writer.writeAll(",\"runId\":");
+        try std.json.Stringify.value(id, .{}, &writer.writer);
+    }
+    const descriptor_path = try std.fmt.allocPrint(alloc, "/ard/v1/resources/agents/extensions/{s}/{s}", .{ extension_name, agent_name });
+    defer alloc.free(descriptor_path);
+    try writer.writer.writeAll(",\"descriptor\":");
+    try std.json.Stringify.value(descriptor_path, .{}, &writer.writer);
+    try writer.writer.writeByte('}');
+    return try writer.toOwnedSlice();
+}
+
+fn extensionAgentUnsupportedRuntimeEventAlloc(
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    agent_name: []const u8,
+    run_id: []const u8,
+) ![]u8 {
+    const data = try extensionAgentUnsupportedRuntimeJsonAlloc(alloc, extension_name, agent_name, run_id);
+    defer alloc.free(data);
+    return try std.fmt.allocPrint(alloc, "event: error\ndata: {s}\n\n", .{data});
 }
 
 pub fn makeSecretEntry(listed: common_secrets.ListedSecret) metadata_openapi.SecretEntry {
@@ -8945,6 +9570,16 @@ fn parseSimpleQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+pub fn parseLookupReadConsistency(query: []const u8) !raft_mod.ReadConsistency {
+    const value = parseSimpleQueryParam(query, "consistency") orelse
+        parseSimpleQueryParam(query, "read_consistency") orelse
+        return .read_index;
+    if (std.mem.eql(u8, value, "stale")) return .stale;
+    if (std.mem.eql(u8, value, "read_index") or std.mem.eql(u8, value, "read-index")) return .read_index;
+    if (std.mem.eql(u8, value, "leader_lease") or std.mem.eql(u8, value, "leader-lease")) return .leader_lease;
+    return error.InvalidReadConsistency;
+}
+
 pub fn runtimeSchemaDebugRequested(query: []const u8) bool {
     const value = parseSimpleQueryParam(query, "debug") orelse return false;
     return std.mem.eql(u8, value, "runtime_schema");
@@ -9519,6 +10154,52 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
     try std.testing.expectEqual(@as(usize, 2), service.member_removes);
 }
 
+test "extension lifecycle storage delta validates artifact enrichment dependencies" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"document_units_v1\",\"chunk_size\":512}]}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const source_only = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "docaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .enrichment,
+        .object_name = "document_units_v1",
+        .table_name = "docs",
+    }};
+
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        planExtensionStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, source_only[0..], &.{}),
+    );
+
+    const source_and_dependent = [_]extension_domain.ExtensionMember{
+        source_only[0],
+        .{
+            .extension_name = "docaf",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .object_kind = .enrichment,
+            .object_name = "document_chunks_v1",
+            .table_name = "docs",
+        },
+    };
+    const updates = try planExtensionStorageMemberDeltaAlloc(std.testing.allocator, &snapshot, source_and_dependent[0..], &.{});
+    defer freeExtensionLifecycleTables(std.testing.allocator, updates);
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_units_v1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_chunks_v1") == null);
+}
+
 test "direct index deletion rejects extension-owned indexes" {
     const FakeService = struct {
         table_record: metadata_table_manager.TableRecord = .{
@@ -9957,6 +10638,565 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
 }
 
+test "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .ard_publisher_domain = "tenant.example.com",
+        .ard_display_name = "Tenant Antfly",
+    }, source.iface(), null, null);
+    defer server.deinit();
+
+    var public_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer public_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), public_catalog.status);
+    try std.testing.expectEqualStrings("application/json", public_catalog.content_type.?);
+    try std.testing.expectEqual(@as(usize, 1), public_catalog.headers.len);
+    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_catalog.headers[0].name);
+    try std.testing.expectEqualStrings("*", public_catalog.headers[0].value);
+    try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/ai-registry+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/mcp-server+json\"") == null);
+
+    var tenant_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer tenant_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tenant_catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"displayName\":\"Tenant Antfly\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"identifier\":\"did:web:tenant.example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "urn:ai:tenant.example.com:antfly:mcp") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tenant_catalog.body, .{});
+    defer parsed.deinit();
+    const entries = parsed.value.object.get("entries").?.array.items;
+    try std.testing.expect(entries.len >= 4);
+    for (entries) |entry| {
+        const object = entry.object;
+        try std.testing.expect(object.get("identifier") != null);
+        try std.testing.expect(object.get("displayName") != null);
+        try std.testing.expect(object.get("type") != null);
+        const has_url = object.get("url") != null;
+        const has_data = object.get("data") != null;
+        try std.testing.expect(has_url != has_data);
+    }
+}
+
+test "api http server requires auth for ARD tenant catalog when auth is enabled" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const secret = "ard-catalog-trusted-principal-secret";
+    var auth = try initTestAuthManager(std.testing.allocator);
+    try bindTestAuthManager(std.testing.allocator, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var admin_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(std.testing.allocator, .@"*", "*", .admin),
+    };
+    defer admin_permission[0].deinit(std.testing.allocator);
+    var admin_user = try auth.manager.createUser("admin", "admin", &admin_permission);
+    defer admin_user.deinit(std.testing.allocator);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .auth_enabled = true,
+            .user_manager = &auth.manager,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    var unauthorized = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer unauthorized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+
+    var unauthorized_well_known = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer unauthorized_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_well_known.status);
+
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"tenant-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, payload);
+    defer std.testing.allocator.free(token);
+    const trusted_principal_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = token },
+    };
+
+    var authorized = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer authorized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), authorized.status);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Extensions OpenAPI") == null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Auth OpenAPI") == null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Extension Management") == null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Retrieval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Query Builder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Schema Design") == null);
+
+    var authorized_well_known = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer authorized_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), authorized_well_known.status);
+    try std.testing.expectEqual(@as(usize, 0), authorized_well_known.headers.len);
+    try std.testing.expect(std.mem.indexOf(u8, authorized_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
+
+    var forbidden_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/extensions.yaml",
+        .headers = &trusted_principal_headers,
+    });
+    defer forbidden_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), forbidden_spec.status);
+
+    var forbidden_auth_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/auth.yaml",
+        .headers = &trusted_principal_headers,
+    });
+    defer forbidden_auth_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), forbidden_auth_spec.status);
+
+    var hidden_admin_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/antfly-extension-management",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_admin_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_admin_skill.status);
+
+    var read_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/antfly-retrieval",
+        .headers = &trusted_principal_headers,
+    });
+    defer read_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), read_skill.status);
+    try std.testing.expect(std.mem.indexOf(u8, read_skill.body, "# Antfly Retrieval") != null);
+
+    const admin_auth = try encodeBasicAuthorization(std.testing.allocator, "admin", "admin");
+    defer std.testing.allocator.free(admin_auth);
+    var admin_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .authorization = admin_auth,
+    });
+    defer admin_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), admin_catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Extensions OpenAPI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Auth OpenAPI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Extension Management") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Schema Design") != null);
+
+    var admin_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/extensions.yaml",
+        .authorization = admin_auth,
+    });
+    defer admin_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), admin_spec.status);
+    try std.testing.expectEqualStrings("application/yaml", admin_spec.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, admin_spec.body, "title: Antfly Extensions API") != null);
+
+    var admin_auth_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/auth.yaml",
+        .authorization = admin_auth,
+    });
+    defer admin_auth_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), admin_auth_spec.status);
+    try std.testing.expectEqualStrings("application/yaml", admin_auth_spec.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, admin_auth_spec.body, "title: User Management API") != null);
+
+    var admin_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/antfly-extension-management",
+        .authorization = admin_auth,
+    });
+    defer admin_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), admin_skill.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_skill.body, "# Antfly Extension Management") != null);
+
+    var public_catalog_server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .auth_enabled = true,
+            .user_manager = &auth.manager,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+            .ard_public_catalog_enabled = true,
+        },
+        source.iface(),
+        null,
+        null,
+    );
+    defer public_catalog_server.deinit();
+
+    var public_well_known = try public_catalog_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer public_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), public_well_known.status);
+    try std.testing.expectEqualStrings("application/json", public_well_known.content_type.?);
+    try std.testing.expectEqual(@as(usize, 1), public_well_known.headers.len);
+    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_well_known.headers[0].name);
+    try std.testing.expectEqualStrings("*", public_well_known.headers[0].value);
+    try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/ai-registry+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/mcp-server+json\"") == null);
+
+    var public_flag_authenticated_well_known = try public_catalog_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ai_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer public_flag_authenticated_well_known.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), public_flag_authenticated_well_known.status);
+    try std.testing.expectEqual(@as(usize, 0), public_flag_authenticated_well_known.headers.len);
+    try std.testing.expect(std.mem.indexOf(u8, public_flag_authenticated_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
+}
+
+test "api http server serves ARD OpenAPI, skill, resource, and registry endpoints" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/openapi+yaml\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "Antfly Public OpenAPI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "Antfly Inference OpenAPI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/ai-skill+md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"representativeQueries\"") != null);
+
+    var openapi = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_openapi,
+    });
+    defer openapi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), openapi.status);
+    try std.testing.expectEqualStrings("application/yaml", openapi.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "openapi:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/openapi/{spec}.yaml:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/skills/extensions/{extension}/{skill}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/default:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/extensions/{extension}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/mcp/profiles/{profile}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/ard/v1/resources/agents/extensions/{extension}/{agent}:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/agents/v1/extensions/{extension}/{agent}/runs:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "/agents/v1/extensions/{extension}/{agent}/runs/{run_id}/events:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "$ref: '#/components/parameters/profile'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "name: orderBy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "enum: [none, referrals, auto]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "Search requires query.text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "AntflyAuthorization:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "X-Antfly-Trusted-Principal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "MethodNotAllowed:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openapi.body, "RegistryRoot") != null);
+
+    var openapi_wrong_method = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_openapi,
+    });
+    defer openapi_wrong_method.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), openapi_wrong_method.status);
+
+    var catalog_wrong_method = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer catalog_wrong_method.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), catalog_wrong_method.status);
+
+    var well_known_wrong_method = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ai_catalog,
+    });
+    defer well_known_wrong_method.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), well_known_wrong_method.status);
+
+    var antfly_openapi = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/antfly.yaml",
+    });
+    defer antfly_openapi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), antfly_openapi.status);
+    try std.testing.expectEqualStrings("application/yaml", antfly_openapi.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, antfly_openapi.body, "title: Antfly Public API") != null);
+
+    var inference_openapi = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/inference-config.yaml",
+    });
+    defer inference_openapi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), inference_openapi.status);
+    try std.testing.expectEqualStrings("application/yaml", inference_openapi.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, inference_openapi.body, "title: Antfly Inference Configuration Schema") != null);
+
+    var skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/antfly-retrieval",
+    });
+    defer skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), skill.status);
+    try std.testing.expectEqualStrings("text/markdown; charset=utf-8", skill.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, skill.body, "# Antfly Retrieval") != null);
+
+    var mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+    });
+    defer mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
+
+    var skill_filtered_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default?types=application/ai-skill+md",
+    });
+    defer skill_filtered_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), skill_filtered_mcp_resource.status);
+
+    var registry_root = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1,
+    });
+    defer registry_root.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), registry_root.status);
+    try std.testing.expect(std.mem.indexOf(u8, registry_root.body, "\"catalog\":\"/ard/v1/catalog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, registry_root.body, "\"search\":\"/ard/v1/search\"") != null);
+
+    var hosted_server = ApiHttpServer.init(std.testing.allocator, .{ .ard_base_url = "https://tenant.example.com/" }, source.iface(), null, null);
+    defer hosted_server.deinit();
+    var hosted_mcp_resource = try hosted_server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+    });
+    defer hosted_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), hosted_mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_mcp_resource.body, "\"endpoint\":\"https://tenant.example.com/mcp/v1\"") != null);
+    var hosted_registry_root = try hosted_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1,
+    });
+    defer hosted_registry_root.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), hosted_registry_root.status);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"catalog\":\"https://tenant.example.com/ard/v1/catalog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"search\":\"https://tenant.example.com/ard/v1/search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"explore\":\"https://tenant.example.com/ard/v1/explore\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"agents\":\"https://tenant.example.com/ard/v1/agents\"") != null);
+
+    var search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
+    });
+    defer search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), search.status);
+    try std.testing.expect(std.mem.indexOf(u8, search.body, "\"results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/ai-skill+md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/mcp-server+json\"") == null);
+
+    var filter_only_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
+    });
+    defer filter_only_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), filter_only_search.status);
+
+    var blank_text_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"   \",\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
+    });
+    defer blank_text_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), blank_text_search.status);
+
+    var profile_search = try server.handle(.{
+        .method = .POST,
+        .uri = "/ard/v1/search?profile=copilot",
+        .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
+    });
+    defer profile_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_search.body, "\"results\":[]") != null);
+
+    var federated_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"referrals\"}",
+    });
+    defer federated_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), federated_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"federation\":\"referrals\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"referrals\":[]") != null);
+
+    var invalid_federation = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"recursive\"}",
+    });
+    defer invalid_federation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_federation.status);
+
+    var explore = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_explore,
+        .body = "{\"query\":{\"filter\":{\"capabilities\":[\"retrieval\"]}}}",
+    });
+    defer explore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), explore.status);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"resultType\":\"facets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"facets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"buckets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"value\":\"retrieval\"") != null);
+
+    var profile_explore = try server.handle(.{
+        .method = .POST,
+        .uri = "/ard/v1/explore?profile=copilot",
+        .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
+    });
+    defer profile_explore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_explore.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_explore.body, "\"value\":\"application/ai-skill+md\"") == null);
+
+    var agents = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_agents,
+    });
+    defer agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+
+    var profile_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?profile=copilot",
+    });
+    defer profile_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+
+    var mcp_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?include=mcp",
+    });
+    defer mcp_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), mcp_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+
+    var skill_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?types=application/ai-skill+md",
+    });
+    defer skill_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), skill_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"agents\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"count\":0") != null);
+
+    var paged_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1",
+    });
+    defer paged_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), paged_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"pageToken\":\"1\"") != null);
+
+    var next_agents_page = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1&pageToken=1",
+    });
+    defer next_agents_page.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), next_agents_page.status);
+    try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"pageToken\"") == null);
+
+    var invalid_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?orderBy=updatedAt",
+    });
+    defer invalid_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_agents.status);
+}
+
 test "api http server lists extension-owned mcp tools" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -10147,7 +11387,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 2, .projected_extension_members = 3 };
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 2, .projected_extension_members = 6 };
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -10157,6 +11397,32 @@ test "api http server filters extension mcp tools by trusted principal table per
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{
+                    .{
+                        .name = "docsaf",
+                        .version = "1.0.0",
+                        .description = "Docs extension package",
+                        .digest = "sha256:docs",
+                        .capabilities_requested = &.{
+                            .{ .name = "db:read", .scope = "docsaf" },
+                            .{ .name = "db:write", .scope = "docsaf" },
+                        },
+                        .artifacts = &.{
+                            .{ .kind = .manifest, .path = "antfly-extension.json", .digest = "sha256:docs-manifest" },
+                            .{ .kind = .wasm, .path = "docsaf.wasm", .digest = "sha256:docs-wasm" },
+                        },
+                        .install = .{},
+                    },
+                    .{
+                        .name = "memoryaf",
+                        .version = "1.0.0",
+                        .description = "Memory extension package",
+                        .digest = "sha256:memories",
+                        .capabilities_requested = &.{.{ .name = "db:read", .scope = "memoryaf" }},
+                        .artifacts = &.{.{ .kind = .wasm, .path = "memoryaf.wasm", .digest = "sha256:memory-wasm" }},
+                        .install = .{},
+                    },
+                })[0..]),
                 .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{
                     .{
                         .name = "docsaf",
@@ -10184,6 +11450,14 @@ test "api http server filters extension mcp tools by trusted principal table per
                     .{
                         .extension_name = "docsaf",
                         .scope = .{ .kind = .table, .table_name = "docs" },
+                        .object_kind = .agent,
+                        .object_name = "research",
+                        .table_name = "docs",
+                        .owner_metadata_json = "{\"displayName\":\"DocsAF Research Agent\",\"description\":\"Research visible docs.\",\"profile\":\"copilot\",\"protocols\":[\"agents-api\",\"stream\"],\"tags\":[\"docsaf\",\"research\"],\"capabilities\":[\"docs-search\",\"docs-research\"],\"representativeQueries\":[\"research docs\"],\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"docsaf\"}],\"handler\":\"wasm:docsaf/research\",\"stream_handler\":\"wasm:docsaf/research_stream\"}",
+                    },
+                    .{
+                        .extension_name = "docsaf",
+                        .scope = .{ .kind = .table, .table_name = "docs" },
                         .object_kind = .mcp_tool,
                         .object_name = "search_docs",
                         .table_name = "docs",
@@ -10200,10 +11474,26 @@ test "api http server filters extension mcp tools by trusted principal table per
                     .{
                         .extension_name = "memoryaf",
                         .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .agent,
+                        .object_name = "research",
+                        .table_name = "memories",
+                        .owner_metadata_json = "{\"displayName\":\"MemoryAF Research Agent\",\"description\":\"Research visible memories.\",\"profile\":\"copilot\",\"protocols\":[\"agents-api\",\"stream\"],\"tags\":[\"memoryaf\",\"research\"],\"capabilities\":[\"memory-search\",\"memory-research\"],\"representativeQueries\":[\"research memories\"],\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}],\"handler\":\"wasm:memoryaf/research\",\"stream_handler\":\"wasm:memoryaf/research_stream\"}",
+                    },
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
                         .object_kind = .mcp_tool,
                         .object_name = "search_memories",
                         .table_name = "memories",
                         .owner_metadata_json = "{\"description\":\"Search memories\",\"input_schema\":{\"type\":\"object\"},\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}]}",
+                    },
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .skill,
+                        .object_name = "memory",
+                        .table_name = "memories",
+                        .owner_metadata_json = "{\"displayName\":\"Memoryaf\",\"description\":\"Use the memory extension for storing, listing, and searching memories.\",\"profile\":\"copilot\",\"tags\":[\"memoryaf\"],\"capabilities\":[\"memory-store\",\"memory-search\",\"extension-tools\"],\"representativeQueries\":[\"remember this for later\",\"search my saved memories\",\"list memoryaf MCP tools\"],\"body\":\"# Memoryaf\\n\\nUse this skill when an agent needs to store, list, or search memories through a visible Memoryaf extension.\\n\\nUse `/mcp/v1/extensions/memoryaf` or the Copilot MCP profile only when the same Antfly identity can discover the Memoryaf MCP tools.\\n\"}",
                     },
                 })[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -10269,6 +11559,345 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") == null);
+
+    var ard_catalog_resp = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_catalog_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_catalog_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"type\":\"application/antfly-installed-extension+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:package:docsaf:1.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"sourceDigest\":\"sha256:docs-wasm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:package:memoryaf:1.0.0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "/ard/v1/resources/agents/extensions/docsaf/research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") != null);
+
+    var hidden_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_memory_skill.status);
+
+    var ard_extension_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/docsaf",
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_extension_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_extension_mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"endpoint\":\"/mcp/v1/extensions/docsaf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"store_doc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_memories\"") == null);
+
+    var ard_extension_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/docsaf/research",
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_extension_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_extension_agent_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"runEndpoint\":\"/agents/v1/extensions/docsaf/research/runs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"profile\":\"copilot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"streamHandler\":\"wasm:docsaf/research_stream\"") != null);
+
+    var mcp_filtered_extension_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/docsaf/research?include=mcp",
+        .headers = &trusted_principal_headers,
+    });
+    defer mcp_filtered_extension_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), mcp_filtered_extension_agent_resource.status);
+
+    var hidden_extension_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_extension_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_resource.status);
+
+    var extension_agents = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/agents?include=agents",
+        .headers = &trusted_principal_headers,
+    });
+    defer extension_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), extension_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "\"type\":\"application/antfly-agent+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
+
+    var extension_agent_run = try server.handle(.{
+        .method = .POST,
+        .uri = "/agents/v1/extensions/docsaf/research/runs",
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"input\":{\"query\":\"docs\"}}",
+    });
+    defer extension_agent_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 501), extension_agent_run.status);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"status\":\"unsupported_runtime\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"descriptor\":\"/ard/v1/resources/agents/extensions/docsaf/research\"") != null);
+
+    var extension_agent_events = try server.handle(.{
+        .method = .GET,
+        .uri = "/agents/v1/extensions/docsaf/research/runs/run-1/events",
+        .headers = &trusted_principal_headers,
+    });
+    defer extension_agent_events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 501), extension_agent_events.status);
+    try std.testing.expectEqualStrings("text/event-stream", extension_agent_events.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "event: error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "\"runId\":\"run-1\"") != null);
+
+    var hidden_extension_agent_run = try server.handle(.{
+        .method = .POST,
+        .uri = "/agents/v1/extensions/memoryaf/research/runs",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_extension_agent_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_run.status);
+
+    var skill_filtered_extension_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/docsaf?include=skills",
+        .headers = &trusted_principal_headers,
+    });
+    defer skill_filtered_extension_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), skill_filtered_extension_mcp_resource.status);
+
+    var hidden_extension_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/memoryaf",
+        .headers = &trusted_principal_headers,
+    });
+    defer hidden_extension_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), hidden_extension_mcp_resource.status);
+
+    var aggregate_mcp_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+        .headers = &trusted_principal_headers,
+    });
+    defer aggregate_mcp_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), aggregate_mcp_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"search_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"store_doc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_mcp_resource.body, "\"name\":\"search_memories\"") == null);
+
+    const memory_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:bob","tenant":"tenant-1","tables":["memories"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(memory_payload);
+    const memory_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, memory_payload);
+    defer std.testing.allocator.free(memory_token);
+    const memory_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = memory_token },
+    };
+
+    var memory_catalog_resp = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .headers = &memory_headers,
+    });
+    defer memory_catalog_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_catalog_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/resources/agents/extensions/memoryaf/research") != null);
+
+    var memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory",
+        .headers = &memory_headers,
+    });
+    defer memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_skill.status);
+    try std.testing.expectEqualStrings("text/markdown; charset=utf-8", memory_skill.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, memory_skill.body, "# Memoryaf") != null);
+
+    var profile_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory?profile=copilot",
+        .headers = &memory_headers,
+    });
+    defer profile_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), profile_memory_skill.status);
+    try std.testing.expect(std.mem.indexOf(u8, profile_memory_skill.body, "# Memoryaf") != null);
+
+    var mcp_filtered_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory?include=mcp",
+        .headers = &memory_headers,
+    });
+    defer mcp_filtered_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), mcp_filtered_memory_skill.status);
+
+    var wrong_type_memory_skill = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/skills/extensions/memoryaf/memory?types=application/mcp-server+json",
+        .headers = &memory_headers,
+    });
+    defer wrong_type_memory_skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), wrong_type_memory_skill.status);
+
+    var memory_skill_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &memory_headers,
+        .body = "{\"query\":{\"text\":\"memoryaf\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
+    });
+    defer memory_skill_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_skill_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_skill_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
+
+    var memory_agent_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
+        .headers = &memory_headers,
+    });
+    defer memory_agent_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_agent_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_agent_resource.body, "\"runEndpoint\":\"/agents/v1/extensions/memoryaf/research/runs\"") != null);
+
+    var memory_agent_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &memory_headers,
+        .body = "{\"query\":{\"text\":\"memoryaf\",\"filter\":{\"type\":[\"application/antfly-agent+json\"]}}}",
+    });
+    defer memory_agent_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), memory_agent_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, memory_agent_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") != null);
+
+    var ard_filtered_catalog_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_filtered_catalog_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_filtered_catalog_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "Antfly Copilot MCP Profile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/profiles/copilot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/default\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") == null);
+
+    var copilot_profile_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/profiles/copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer copilot_profile_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), copilot_profile_resource.status);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"endpoint\":\"/mcp/v1/extensions/profiles/copilot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"store_doc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_memories\"") == null);
+
+    var skill_filtered_profile_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/profiles/copilot?types=application/ai-skill+md",
+        .headers = &trusted_principal_headers,
+    });
+    defer skill_filtered_profile_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), skill_filtered_profile_resource.status);
+
+    var profile_filtered_default_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default?profile=copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer profile_filtered_default_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), profile_filtered_default_resource.status);
+
+    var profile_filtered_extension_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/extensions/docsaf?profile=copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer profile_filtered_extension_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), profile_filtered_extension_resource.status);
+
+    const no_permission_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:eve","tenant":"tenant-1","tables":[],"operations":[],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(no_permission_payload);
+    const no_permission_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, no_permission_payload);
+    defer std.testing.allocator.free(no_permission_token);
+    const no_permission_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = no_permission_token },
+    };
+
+    var no_permission_profile_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
+        .headers = &no_permission_headers,
+    });
+    defer no_permission_profile_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), no_permission_profile_catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly Copilot MCP Profile") == null);
+    try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly MCP Server") == null);
+
+    var no_permission_profile_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/profiles/copilot",
+        .headers = &no_permission_headers,
+    });
+    defer no_permission_profile_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), no_permission_profile_resource.status);
+
+    var no_permission_aggregate_resource = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/resources/mcp/default",
+        .headers = &no_permission_headers,
+    });
+    defer no_permission_aggregate_resource.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), no_permission_aggregate_resource.status);
+
+    var ard_search_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &trusted_principal_headers,
+        .body = "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/mcp-server+json\"]}}}",
+    });
+    defer ard_search_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+
+    var ard_agent_search_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .headers = &trusted_principal_headers,
+        .body = "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/antfly-agent+json\"]}}}",
+    });
+    defer ard_agent_search_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_agent_search_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_agent_search_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_agent_search_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
 }
 
 test "api http server authenticates trusted principal" {
@@ -10451,6 +12080,193 @@ test "api http server requires auth on public routes when enabled" {
     var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
     defer readyz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), readyz.status);
+}
+
+test "api http server dispatches HA admin and internal executors" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    const RecordingExecutor = struct {
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        calls: usize = 0,
+        last_method: ?http_common.Method = null,
+        last_uri: ?[]const u8 = null,
+        last_body: ?[]const u8 = null,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_method = req.method;
+            self.last_uri = req.uri;
+            self.last_body = req.body;
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "application/json"),
+                .body = try self.alloc.dupe(u8, self.body),
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var admin_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-admin\"}" };
+    var internal_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-internal\"}" };
+    var server = ApiHttpServer.init(alloc, .{
+        .ha_admin_executor = admin_exec.executor(),
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+
+    var admin_resp = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status ++ "?max_lag_lsn=0",
+    });
+    defer admin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
+    try std.testing.expectEqualStrings("{\"handler\":\"ha-admin\"}", admin_resp.body);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+    try std.testing.expectEqual(http_common.Method.GET, admin_exec.last_method.?);
+    try std.testing.expectEqualStrings(admin_routes.ha_primary_status ++ "?max_lag_lsn=0", admin_exec.last_uri.?);
+
+    var internal_resp = try server.handle(.{
+        .method = .POST,
+        .uri = internal_api_routes.ha_replication_status,
+        .body = "{\"slot_name\":\"standby-a\"}",
+    });
+    defer internal_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
+    try std.testing.expectEqualStrings("{\"handler\":\"ha-internal\"}", internal_resp.body);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+    try std.testing.expectEqual(http_common.Method.POST, internal_exec.last_method.?);
+    try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
+    try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
+
+    var missing = try server.handle(.{ .method = .GET, .uri = admin_routes.ha });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), missing.status);
+    try std.testing.expectEqual(@as(usize, 2), admin_exec.calls);
+}
+
+test "api http server protects HA admin routes while exempting HA internal routes" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    const RecordingExecutor = struct {
+        alloc: std.mem.Allocator,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "text/plain"),
+                .body = try self.alloc.dupe(u8, "ha"),
+            };
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var reader = try auth.manager.createUser("reader", "reader", &.{});
+    defer reader.deinit(alloc);
+
+    var admin_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin),
+    };
+    defer admin_permission[0].deinit(alloc);
+    var admin = try auth.manager.createUser("admin", "admin", &admin_permission);
+    defer admin.deinit(alloc);
+
+    var source = FakeSource{};
+    var admin_exec = RecordingExecutor{ .alloc = alloc };
+    var internal_exec = RecordingExecutor{ .alloc = alloc };
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .ha_admin_executor = admin_exec.executor(),
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+
+    var unauthorized = try server.handle(.{ .method = .GET, .uri = admin_routes.ha_primary_status });
+    defer unauthorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+    try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
+
+    const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
+    defer alloc.free(reader_auth);
+    var forbidden = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status,
+        .authorization = reader_auth,
+    });
+    defer forbidden.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+    try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
+
+    const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
+    defer alloc.free(admin_auth);
+    var authorized = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status,
+        .authorization = admin_auth,
+    });
+    defer authorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), authorized.status);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+
+    var internal = try server.handle(.{
+        .method = .GET,
+        .uri = internal_api_routes.ha_replication_identify,
+    });
+    defer internal.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal.status);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 }
 
 test "api http server auth fixture can be moved before binding" {
@@ -11550,6 +13366,75 @@ test "api http server serves table lookup with version header" {
     try std.testing.expectEqualStrings("4321", resp.headers[0].value);
 }
 
+test "api http server allows explicit stale table lookup consistency" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a", key);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency);
+            return .{
+                .json = try inner_alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+                .version = 42,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", resp.body);
+
+    var invalid = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=linearizable" });
+    defer invalid.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
+    try std.testing.expectEqualStrings("invalid read consistency", invalid.body);
+}
+
 test "api http server decodes percent-encoded lookup keys" {
     const LookupResponse = struct {
         title: []const u8,
@@ -11765,11 +13650,13 @@ test "api http server serves fielded full-text search through mcp tools" {
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
 
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                 },
             };
         }
@@ -11777,6 +13664,31 @@ test "api http server serves fielded full-text search through mcp tools" {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 77,
+                    .name = "docs",
+                    .schema_json = "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\",\"field\":\"body\"}}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 77,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
     var source = FakeSource{};
@@ -11804,9 +13716,90 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_query_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_table\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_indexes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"sample_documents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_mcp_capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"queryRequest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Raw Antfly QueryRequest body") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
+
+    var describe_table_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_table\",\"arguments\":{\"tableName\":\"docs\"}}}",
+    });
+    defer describe_table_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_table_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"name\":\"docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"full_text_index_v0\"") != null);
+
+    var describe_indexes_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_indexes\",\"arguments\":{\"tableName\":\"docs\"}}}",
+    });
+    defer describe_indexes_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_indexes_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"full_text_index_v0\"") != null);
+
+    var sample_documents_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"fields\":[\"title\",\"body\"],\"limit\":1,\"inclusiveFrom\":true}}}",
+    });
+    defer sample_documents_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), sample_documents_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"hello\"") != null);
+
+    var sample_documents_zero_limit_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"limit\":0}}}",
+    });
+    defer sample_documents_zero_limit_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), sample_documents_zero_limit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "limit must be greater than 0") != null);
+
+    var sample_documents_large_limit_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"limit\":101}}}",
+    });
+    defer sample_documents_large_limit_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), sample_documents_large_limit_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "limit exceeds maximum sample size") != null);
+
+    var describe_capabilities_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_mcp_capabilities\",\"arguments\":{}}}",
+    });
+    defer describe_capabilities_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_capabilities_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "query-builder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"raw_query_request\":true") != null);
 
     var wrong_field_resp = try server.handle(.{
         .method = .POST,
@@ -11851,6 +13844,56 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer query_rest_alias_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_rest_alias_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_rest_alias_resp.body, "\"doc:a\"") != null);
+
+    var raw_query_request_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"},\"fields\":[\"title\",\"body\"],\"limit\":5}}}}",
+    });
+    defer raw_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_resp.body, "\"doc:a\"") != null);
+
+    var mixed_query_request_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}},\"limit\":5}}}",
+    });
+    defer mixed_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), mixed_query_request_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "queryRequest cannot be combined") != null);
+
+    var raw_query_request_table_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"table\":\"docs\",\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}}}}}",
+    });
+    defer raw_query_request_table_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), raw_query_request_table_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "queryRequest.table is not allowed") != null);
+
+    var describe_query_request_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"describe_query_request\",\"arguments\":{}}}",
+    });
+    defer describe_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), describe_query_request_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "metadata.yaml#/components/schemas/QueryRequest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"queryRequest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fielded_full_text\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fields\":[\"title\",\"body\"],\"limit\":5") != null);
 }
 
 test "api http server serves table scan as ndjson" {
