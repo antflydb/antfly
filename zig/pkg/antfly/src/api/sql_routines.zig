@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const extension_domain = @import("../extensions/mod.zig");
+const docstore_mod = @import("../storage/docstore.zig");
 const relational_rows = @import("relational_rows.zig");
 const relational_sql = @import("relational_sql.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -70,10 +71,38 @@ pub const RoutineOrigin = enum {
     extension_query_function,
 };
 
+pub const OpenedStore = struct {
+    alloc: std.mem.Allocator,
+    path_z: [:0]u8,
+    docstore: *docstore_mod.DocStore,
+
+    pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedStore {
+        const path_z = try alloc.dupeZ(u8, path);
+        errdefer alloc.free(path_z);
+        const docstore = try alloc.create(docstore_mod.DocStore);
+        errdefer alloc.destroy(docstore);
+        docstore.* = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        errdefer docstore.close();
+        return .{
+            .alloc = alloc,
+            .path_z = path_z,
+            .docstore = docstore,
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.docstore.close();
+        self.alloc.destroy(self.docstore);
+        self.alloc.free(self.path_z);
+        self.* = undefined;
+    }
+};
+
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
     mutex: SpinMutex = .{},
     routines: std.ArrayListUnmanaged(RoutineRecord) = .empty,
+    opened_store: ?*OpenedStore = null,
 
     pub fn init(alloc: std.mem.Allocator) Runtime {
         return .{ .alloc = alloc };
@@ -84,6 +113,19 @@ pub const Runtime = struct {
         defer self.mutex.unlock();
         for (self.routines.items) |*routine| routine.deinit(self.alloc);
         self.routines.deinit(self.alloc);
+        if (self.opened_store) |opened| {
+            opened.deinit();
+            self.alloc.destroy(opened);
+        }
+    }
+
+    pub fn attachOpenedStore(self: *@This(), opened: *OpenedStore) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.opened_store != null) return error.InvalidRoutineStore;
+        self.opened_store = opened;
+        errdefer self.opened_store = null;
+        try self.recoverPersistedRoutinesLocked(opened);
     }
 
     pub fn apply(self: *@This(), plan: relational_sql.FunctionCatalogPlan) !void {
@@ -184,14 +226,19 @@ pub const Runtime = struct {
         if (plan.body) |body| {
             if (body.kind != .sql_expression or body.hook != .expression) return error.UnsupportedSqlShape;
         }
-        if (self.findRoutineIndexLocked(plan.kind, plan.routine_name, plan.argument_count)) |existing| {
+        const existing_index = self.findRoutineIndexLocked(plan.kind, plan.routine_name, plan.argument_count);
+        if (existing_index != null) {
             if (!plan.replace_existing) return error.RoutineAlreadyExists;
-            var removed = self.routines.orderedRemove(existing);
-            removed.deinit(self.alloc);
         }
         var record = try cloneCreateRoutineRecordAlloc(self.alloc, plan);
         errdefer record.deinit(self.alloc);
-        try self.routines.append(self.alloc, record);
+        try self.routines.ensureUnusedCapacity(self.alloc, 1);
+        try self.persistCatalogRoutineLocked(record);
+        if (existing_index) |existing| {
+            var removed = self.routines.orderedRemove(existing);
+            removed.deinit(self.alloc);
+        }
+        self.routines.appendAssumeCapacity(record);
     }
 
     fn createNativeQueryFunctionLocked(
@@ -209,6 +256,7 @@ pub const Runtime = struct {
     fn dropLocked(self: *@This(), plan: relational_sql.DropRoutinePlan) !void {
         if (plan.cascade) return error.UnsupportedSqlShape;
         if (self.findRoutineIndexLocked(plan.kind, plan.routine_name, plan.argument_count)) |existing| {
+            try self.deletePersistedCatalogRoutineLocked(self.routines.items[existing]);
             var removed = self.routines.orderedRemove(existing);
             removed.deinit(self.alloc);
             return;
@@ -248,6 +296,41 @@ pub const Runtime = struct {
             if (routine.kind == kind and routine.argument_count == argument_count and std.ascii.eqlIgnoreCase(routine.name, name)) return i;
         }
         return null;
+    }
+
+    fn persistCatalogRoutineLocked(self: *@This(), record: RoutineRecord) !void {
+        if (record.origin != .catalog) return;
+        const opened = self.opened_store orelse return;
+        const key = try routineRecordKeyAlloc(self.alloc, record.kind, record.name, record.argument_count);
+        defer self.alloc.free(key);
+        const encoded = try encodeRoutineRecordAlloc(self.alloc, record);
+        defer self.alloc.free(encoded);
+        try opened.docstore.put(key, encoded);
+    }
+
+    fn deletePersistedCatalogRoutineLocked(self: *@This(), record: RoutineRecord) !void {
+        if (record.origin != .catalog) return;
+        const opened = self.opened_store orelse return;
+        const key = try routineRecordKeyAlloc(self.alloc, record.kind, record.name, record.argument_count);
+        defer self.alloc.free(key);
+        try opened.docstore.delete(key);
+    }
+
+    fn recoverPersistedRoutinesLocked(self: *@This(), opened: *OpenedStore) !void {
+        const results = try opened.docstore.scanPrefix(self.alloc, routine_key_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, results);
+        for (results) |kv| {
+            var parsed = std.json.parseFromSlice(PersistedRoutineRecord, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
+            defer parsed.deinit();
+            if (parsed.value.version != 1 or parsed.value.origin != .catalog) continue;
+            var record = clonePersistedRoutineRecordAlloc(self.alloc, parsed.value) catch continue;
+            errdefer record.deinit(self.alloc);
+            if (self.findRoutineIndexLocked(record.kind, record.name, record.argument_count)) |existing| {
+                var removed = self.routines.orderedRemove(existing);
+                removed.deinit(self.alloc);
+            }
+            try self.routines.append(self.alloc, record);
+        }
     }
 };
 
@@ -426,6 +509,125 @@ fn cloneRoutineBodyAlloc(alloc: std.mem.Allocator, body: relational_sql.RoutineB
     };
 }
 
+const PersistedRoutineRecord = struct {
+    version: u32 = 1,
+    origin: RoutineOrigin = .catalog,
+    kind: relational_sql.RoutineKind,
+    name: []u8,
+    argument_count: usize,
+    returns_type: ?[]u8 = null,
+    language: ?[]u8 = null,
+    volatility: ?relational_sql.RoutineVolatility = null,
+    security: ?relational_sql.RoutineSecurity = null,
+    null_input: ?relational_sql.RoutineNullInput = null,
+    parallel_safety: ?relational_sql.RoutineParallelSafety = null,
+    leakproof: bool = false,
+    window: bool = false,
+    support_function: ?[]u8 = null,
+    transform_types: [][]u8 = &.{},
+    settings: []relational_sql.RoutineSetting = &.{},
+    cost: ?[]u8 = null,
+    rows: ?[]u8 = null,
+    body: ?relational_sql.RoutineBodyPlan = null,
+};
+
+fn encodeRoutineRecordAlloc(alloc: std.mem.Allocator, record: RoutineRecord) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, PersistedRoutineRecord{
+        .version = 1,
+        .origin = record.origin,
+        .kind = record.kind,
+        .name = record.name,
+        .argument_count = record.argument_count,
+        .returns_type = record.returns_type,
+        .language = record.language,
+        .volatility = record.volatility,
+        .security = record.security,
+        .null_input = record.null_input,
+        .parallel_safety = record.parallel_safety,
+        .leakproof = record.leakproof,
+        .window = record.window,
+        .support_function = record.support_function,
+        .transform_types = record.transform_types,
+        .settings = record.settings,
+        .cost = record.cost,
+        .rows = record.rows,
+        .body = record.body,
+    }, .{ .emit_null_optional_fields = false });
+}
+
+fn clonePersistedRoutineRecordAlloc(alloc: std.mem.Allocator, persisted: PersistedRoutineRecord) !RoutineRecord {
+    const name = try alloc.dupe(u8, persisted.name);
+    errdefer alloc.free(name);
+    const returns_type = if (persisted.returns_type) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (returns_type) |value| alloc.free(value);
+    const language = if (persisted.language) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (language) |value| alloc.free(value);
+    const support_function = if (persisted.support_function) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (support_function) |value| alloc.free(value);
+    const transform_types = try cloneStringSliceAlloc(alloc, persisted.transform_types);
+    errdefer freeOwnedStringSlice(alloc, transform_types);
+    const settings = try cloneRoutineSettingsAlloc(alloc, persisted.settings);
+    errdefer freeRoutineSettings(alloc, settings);
+    const cost = if (persisted.cost) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cost) |value| alloc.free(value);
+    const rows = if (persisted.rows) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (rows) |value| alloc.free(value);
+    const body = if (persisted.body) |value| try cloneRoutineBodyAlloc(alloc, value) else null;
+    errdefer if (body) |*value| value.deinit(alloc);
+    return .{
+        .origin = persisted.origin,
+        .kind = persisted.kind,
+        .name = name,
+        .argument_count = persisted.argument_count,
+        .returns_type = returns_type,
+        .language = language,
+        .volatility = persisted.volatility,
+        .security = persisted.security,
+        .null_input = persisted.null_input,
+        .parallel_safety = persisted.parallel_safety,
+        .leakproof = persisted.leakproof,
+        .window = persisted.window,
+        .support_function = support_function,
+        .transform_types = transform_types,
+        .settings = settings,
+        .cost = cost,
+        .rows = rows,
+        .body = body,
+    };
+}
+
+fn routineRecordKeyAlloc(
+    alloc: std.mem.Allocator,
+    kind: relational_sql.RoutineKind,
+    name: []const u8,
+    argument_count: usize,
+) ![]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var hasher = Sha256.init(.{});
+    hasher.update("antfly.sql.routine.catalog.v1\x00");
+    hasher.update(@tagName(kind));
+    hasher.update("\x00");
+    var lower_buf: [256]u8 = undefined;
+    if (name.len <= lower_buf.len) {
+        for (name, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
+        hasher.update(lower_buf[0..name.len]);
+    } else {
+        const lower = try alloc.alloc(u8, name.len);
+        defer alloc.free(lower);
+        for (name, 0..) |c, i| lower[i] = std.ascii.toLower(c);
+        hasher.update(lower);
+    }
+    hasher.update("\x00");
+    var arity_buf: [32]u8 = undefined;
+    const arity = try std.fmt.bufPrint(&arity_buf, "{d}", .{argument_count});
+    hasher.update(arity);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ routine_key_prefix, std.fmt.fmtSliceHexLower(&digest) });
+}
+
+const routine_key_prefix = "__api_sql_routines__:";
+
 test "sql routine runtime stores and executes safe expression bodies" {
     const alloc = std.testing.allocator;
     var plan = try relational_sql.lowerDdlPlanAlloc(
@@ -445,6 +647,77 @@ test "sql routine runtime stores and executes safe expression bodies" {
     const out = try runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"ACTIVE\"");
     defer alloc.free(out);
     try std.testing.expectEqualStrings("\"active\"", out);
+}
+
+test "sql routine runtime persists catalog routines across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-routines", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        try runtime.attachOpenedStore(opened);
+
+        var plan = try relational_sql.lowerDdlPlanAlloc(
+            alloc,
+            "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
+        );
+        defer plan.deinit(alloc);
+        try runtime.apply(switch (plan) {
+            .function_catalog => |function_plan| function_plan,
+            else => return error.TestUnexpectedResult,
+        });
+
+        const bindings = [_]extension_domain.QueryFunctionBinding{.{
+            .extension_name = "pgcrypto",
+            .object_name = "gen_random_uuid",
+            .sql_name = "gen_random_uuid",
+            .native_expression = "uuid_v4",
+            .native_expression_kind = .uuid_v4,
+            .arity = 0,
+        }};
+        try runtime.replaceNativeQueryFunctionBindings(&bindings);
+        try std.testing.expectEqual(@as(usize, 2), runtime.routineCountForTest());
+    }
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        try runtime.attachOpenedStore(opened);
+        try std.testing.expectEqual(@as(usize, 1), runtime.routineCountForTest());
+
+        const out = try runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"ACTIVE\"");
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings("\"active\"", out);
+        try std.testing.expectError(error.RoutineNotFound, runtime.executeExpressionRoutineArgsAlloc(alloc, "gen_random_uuid", &.{}));
+
+        var drop_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION normalize_status(text);");
+        defer drop_plan.deinit(alloc);
+        try runtime.apply(switch (drop_plan) {
+            .function_catalog => |function_plan| function_plan,
+            else => return error.TestUnexpectedResult,
+        });
+        try std.testing.expectEqual(@as(usize, 0), runtime.routineCountForTest());
+    }
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        try runtime.attachOpenedStore(opened);
+        try std.testing.expectEqual(@as(usize, 0), runtime.routineCountForTest());
+    }
 }
 
 test "sql routine runtime executes bounded multi argument expression bodies" {

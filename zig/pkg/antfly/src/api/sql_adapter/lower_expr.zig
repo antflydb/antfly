@@ -171,6 +171,69 @@ pub fn matchPostfixNullTest(tokens: []const Token, pos: *usize) ?runtime_schema.
     return null;
 }
 
+pub const ExpressionIsTailKind = enum {
+    null_test,
+    distinct_comparison,
+    boolean_unknown,
+    boolean_literal,
+};
+
+pub const ExpressionIsTailOptions = struct {
+    allow_boolean_unknown: bool = false,
+    allow_boolean_literal: bool = false,
+};
+
+pub const ExpressionIsTail = struct {
+    op: runtime_schema.RelationalCheckOp,
+    kind: ExpressionIsTailKind,
+    boolean_value: bool = false,
+};
+
+pub fn parseExpressionIsTailIf(
+    tokens: []const Token,
+    pos: *usize,
+    options: ExpressionIsTailOptions,
+) !?ExpressionIsTail {
+    if (!parser.matchKeyword(tokens, pos, "is")) return null;
+    const not = parser.matchKeyword(tokens, pos, "not");
+    if (parser.matchKeyword(tokens, pos, "distinct")) {
+        try parser.expectKeyword(tokens, pos, "from");
+        return .{
+            .op = if (not) .is_not_distinct else .is_distinct,
+            .kind = .distinct_comparison,
+        };
+    }
+    if (options.allow_boolean_unknown and parser.matchKeyword(tokens, pos, "unknown")) {
+        return .{
+            .op = if (not) .is_not_null else .is_null,
+            .kind = .boolean_unknown,
+        };
+    }
+    if (options.allow_boolean_literal) {
+        if (parser.matchKeyword(tokens, pos, "true")) {
+            if (not) return error.UnsupportedSqlShape;
+            return .{
+                .op = .eq,
+                .kind = .boolean_literal,
+                .boolean_value = true,
+            };
+        }
+        if (parser.matchKeyword(tokens, pos, "false")) {
+            if (not) return error.UnsupportedSqlShape;
+            return .{
+                .op = .eq,
+                .kind = .boolean_literal,
+                .boolean_value = false,
+            };
+        }
+    }
+    try parser.expectKeyword(tokens, pos, "null");
+    return .{
+        .op = if (not) .is_not_null else .is_null,
+        .kind = .null_test,
+    };
+}
+
 pub fn parseComparisonOp(tokens: []const Token, pos: *usize) !runtime_schema.RelationalCheckOp {
     if (parser.matchToken(tokens, pos, .eq) != null) return .eq;
     if (parser.matchToken(tokens, pos, .neq) != null) return .ne;
@@ -9852,6 +9915,57 @@ test "sql adapter expression keyword predicates classify function and tail token
     var not_pos: usize = 0;
     try parseBooleanNotExpressionStart(not_tokens[0..], &not_pos);
     try std.testing.expectEqual(@as(usize, 1), not_pos);
+
+    const is_null_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "is" },
+        .{ .kind = .identifier, .text = "not" },
+        .{ .kind = .identifier, .text = "null" },
+    };
+    var is_null_pos: usize = 0;
+    const is_null_tail = (try parseExpressionIsTailIf(is_null_tokens[0..], &is_null_pos, .{})).?;
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, is_null_tail.op);
+    try std.testing.expectEqual(ExpressionIsTailKind.null_test, is_null_tail.kind);
+    try std.testing.expectEqual(@as(usize, 3), is_null_pos);
+
+    const is_distinct_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "is" },
+        .{ .kind = .identifier, .text = "distinct" },
+        .{ .kind = .identifier, .text = "from" },
+    };
+    var is_distinct_pos: usize = 0;
+    const is_distinct_tail = (try parseExpressionIsTailIf(is_distinct_tokens[0..], &is_distinct_pos, .{})).?;
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_distinct, is_distinct_tail.op);
+    try std.testing.expectEqual(ExpressionIsTailKind.distinct_comparison, is_distinct_tail.kind);
+    try std.testing.expectEqual(@as(usize, 3), is_distinct_pos);
+
+    const is_unknown_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "is" },
+        .{ .kind = .identifier, .text = "unknown" },
+    };
+    var is_unknown_pos: usize = 0;
+    const is_unknown_tail = (try parseExpressionIsTailIf(is_unknown_tokens[0..], &is_unknown_pos, .{ .allow_boolean_unknown = true })).?;
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, is_unknown_tail.op);
+    try std.testing.expectEqual(ExpressionIsTailKind.boolean_unknown, is_unknown_tail.kind);
+    try std.testing.expectEqual(@as(usize, 2), is_unknown_pos);
+
+    const is_true_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "is" },
+        .{ .kind = .identifier, .text = "true" },
+    };
+    var is_true_pos: usize = 0;
+    const is_true_tail = (try parseExpressionIsTailIf(is_true_tokens[0..], &is_true_pos, .{ .allow_boolean_literal = true })).?;
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, is_true_tail.op);
+    try std.testing.expectEqual(ExpressionIsTailKind.boolean_literal, is_true_tail.kind);
+    try std.testing.expect(is_true_tail.boolean_value);
+    try std.testing.expectEqual(@as(usize, 2), is_true_pos);
+
+    const is_not_true_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "is" },
+        .{ .kind = .identifier, .text = "not" },
+        .{ .kind = .identifier, .text = "true" },
+    };
+    var is_not_true_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseExpressionIsTailIf(is_not_true_tokens[0..], &is_not_true_pos, .{ .allow_boolean_literal = true }));
 
     const grouped_tokens = [_]Token{
         .{ .kind = .lparen, .text = "(" },

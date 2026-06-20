@@ -305,6 +305,7 @@ pub const ApiHttpServerConfig = struct {
     join_job_retention_ms: ?u64 = null,
     artifact_reprocess_job_store_path: ?[]const u8 = null,
     artifact_reprocess_job_retention_ms: ?u64 = null,
+    sql_routine_store_path: ?[]const u8 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -2270,6 +2271,18 @@ pub const ApiHttpServer = struct {
             opened.* = try artifact_reprocess_jobs.OpenedStore.open(alloc, path);
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
+        }
+        if (cfg.sql_routine_store_path orelse cfg.session_store_path) |base_path| {
+            const routine_path = if (cfg.sql_routine_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.sql_routines", .{base_path});
+            defer alloc.free(routine_path);
+            const opened = try alloc.create(sql_routines.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try sql_routines.OpenedStore.open(alloc, routine_path);
+            errdefer opened.deinit();
+            try server.sql_routine_runtime.attachOpenedStore(opened);
         }
         return server;
     }
@@ -20650,6 +20663,61 @@ test "api http server applies SQL routine catalog plans through native runtime" 
     var dropped = try server.applyRelationalSqlDdlWithSession("DROP FUNCTION normalize_status(text);", &session);
     defer dropped.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), server.sql_routine_runtime.routineCountForTest());
+}
+
+test "api http server recovers durable SQL routine catalog" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{},
+            };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-routine-catalog", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var source = FakeSource{};
+        var server = try ApiHttpServer.initWithConfig(alloc, .{ .sql_routine_store_path = path }, source.iface(), null, null);
+        defer server.deinit();
+        var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+        defer session.deinit(alloc);
+
+        var created = try server.applyRelationalSqlDdlWithSession(
+            "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
+            &session,
+        );
+        defer created.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.routineCountForTest());
+    }
+
+    {
+        var source = FakeSource{};
+        var server = try ApiHttpServer.initWithConfig(alloc, .{ .sql_routine_store_path = path }, source.iface(), null, null);
+        defer server.deinit();
+        try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.routineCountForTest());
+        const normalized = try server.sql_routine_runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"ACTIVE\"");
+        defer alloc.free(normalized);
+        try std.testing.expectEqualStrings("\"active\"", normalized);
+
+        var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+        defer session.deinit(alloc);
+        var dropped = try server.applyRelationalSqlDdlWithSession("DROP FUNCTION normalize_status(text);", &session);
+        defer dropped.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.routineCountForTest());
+    }
+
+    {
+        var source = FakeSource{};
+        var server = try ApiHttpServer.initWithConfig(alloc, .{ .sql_routine_store_path = path }, source.iface(), null, null);
+        defer server.deinit();
+        try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.routineCountForTest());
+    }
 }
 
 test "api http server exposes SQL routine bindings to catalog read planning" {

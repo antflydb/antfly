@@ -12790,38 +12790,25 @@ const Parser = struct {
         var lhs_transferred = false;
         errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
 
-        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
-            const not = self.matchKeyword("not");
-            if (self.matchKeyword("distinct")) {
-                try self.expectKeyword("from");
-                break :blk if (not) .is_not_distinct else .is_distinct;
-            }
-            if (self.matchKeyword("unknown")) {
-                try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                const condition = sql_adapter.expressionNullTestCondition(lhs, if (not) .is_not_null else .is_null);
-                lhs_transferred = true;
-                try sql_adapter.appendExpressionConditionGroup(self.alloc, alternatives, condition);
-                if (parenthesized) try self.expect(.rparen);
-                return;
-            }
-            if (self.matchKeyword("true") or self.matchKeyword("false")) {
-                const value = std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "true");
-                try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                if (not) {
-                    try sql_adapter.appendExpressionBooleanIsNotGroups(self.alloc, alternatives, lhs, value);
-                    freeExpression(self.alloc, lhs);
+        const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{
+            .allow_boolean_unknown = true,
+            .allow_boolean_literal = true,
+        })) |is_tail| blk: {
+            switch (is_tail.kind) {
+                .distinct_comparison, .null_test => {},
+                .boolean_unknown => {
+                    try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
                     lhs_transferred = true;
-                    if (parenthesized) try self.expect(.rparen);
-                    return;
-                }
-                const condition = try sql_adapter.expressionBooleanComparisonConditionAlloc(self.alloc, lhs, .eq, value);
-                lhs_transferred = true;
-                try sql_adapter.appendExpressionConditionGroup(self.alloc, alternatives, condition);
-                if (parenthesized) try self.expect(.rparen);
-                return;
+                    return sql_adapter.expressionNullTestCondition(lhs, is_tail.op);
+                },
+                .boolean_literal => {
+                    try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
+                    const condition = try sql_adapter.expressionBooleanComparisonConditionAlloc(self.alloc, lhs, is_tail.op, is_tail.boolean_value);
+                    lhs_transferred = true;
+                    return condition;
+                },
             }
-            try self.expectKeyword("null");
-            break :blk if (not) .is_not_null else .is_null;
+            break :blk is_tail.op;
         } else if (sql_adapter.matchPostfixNullTest(self.tokens, &self.pos)) |postfix_null_test|
             postfix_null_test
         else
@@ -12853,15 +12840,9 @@ const Parser = struct {
         };
         try sql_adapter.validateExpressionConditionTypes(self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, lhs, op, rhs);
 
-        const condition: db_mod.types.RelationalRowsExpressionCondition = .{
-            .lhs = lhs,
-            .op = op,
-            .rhs = rhs,
-        };
         lhs_transferred = true;
         rhs_transferred = true;
-        try sql_adapter.appendExpressionConditionGroup(self.alloc, alternatives, condition);
-        if (parenthesized) try self.expect(.rparen);
+        return .{ .lhs = lhs, .op = op, .rhs = rhs };
     }
 
     fn parseConflictActionWhereConditionAlloc(
@@ -14244,27 +14225,25 @@ const Parser = struct {
         var lhs_transferred = false;
         errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
 
-        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
-            const not = self.matchKeyword("not");
-            if (self.matchKeyword("distinct")) {
-                try self.expectKeyword("from");
-                break :blk if (not) .is_not_distinct else .is_distinct;
+        const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{
+            .allow_boolean_unknown = true,
+            .allow_boolean_literal = true,
+        })) |is_tail| blk: {
+            switch (is_tail.kind) {
+                .distinct_comparison, .null_test => {},
+                .boolean_unknown => {
+                    try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
+                    lhs_transferred = true;
+                    return sql_adapter.expressionNullTestCondition(lhs, is_tail.op);
+                },
+                .boolean_literal => {
+                    try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
+                    const condition = try sql_adapter.expressionBooleanComparisonConditionAlloc(self.alloc, lhs, is_tail.op, is_tail.boolean_value);
+                    lhs_transferred = true;
+                    return condition;
+                },
             }
-            if (self.matchKeyword("unknown")) {
-                try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                lhs_transferred = true;
-                return sql_adapter.expressionNullTestCondition(lhs, if (not) .is_not_null else .is_null);
-            }
-            if (self.matchKeyword("true") or self.matchKeyword("false")) {
-                const value = std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "true");
-                try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                if (not) return error.UnsupportedSqlShape;
-                const condition = try sql_adapter.expressionBooleanComparisonConditionAlloc(self.alloc, lhs, .eq, value);
-                lhs_transferred = true;
-                return condition;
-            }
-            try self.expectKeyword("null");
-            break :blk if (not) .is_not_null else .is_null;
+            break :blk is_tail.op;
         } else if (sql_adapter.matchPostfixNullTest(self.tokens, &self.pos)) |postfix_null_test|
             postfix_null_test
         else
@@ -21033,15 +21012,10 @@ const Parser = struct {
         var lhs_transferred = false;
         errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
 
-        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
-            const not = self.matchKeyword("not");
-            if (self.matchKeyword("distinct")) {
-                try self.expectKeyword("from");
-                break :blk if (not) .is_not_distinct else .is_distinct;
-            }
-            try self.expectKeyword("null");
-            break :blk if (not) .is_not_null else .is_null;
-        } else try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
+        const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{})) |is_tail|
+            is_tail.op
+        else
+            try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
 
         const rhs = switch (op) {
             .is_null, .is_not_null => &.{},
