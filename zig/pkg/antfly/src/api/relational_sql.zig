@@ -3343,6 +3343,13 @@ const Parser = struct {
         };
     }
 
+    fn unaryNegativeRowExpressionParserHooks(self: *@This()) sql_adapter.UnaryNegativeRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseUnaryNegativeRowExpressionOperandHook,
+        };
+    }
+
     fn conflictCoalesceExpressionParserHooks(self: *@This()) sql_adapter.ConflictCoalesceExpressionParserHooks {
         return .{
             .ptr = self,
@@ -3546,6 +3553,11 @@ const Parser = struct {
     fn parseRoutineExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseBooleanRowExpressionAlloc();
+    }
+
+    fn parseUnaryNegativeRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseRowExpressionOperandAlloc();
     }
 
     fn parseConflictCoalesceExpressionOperandHook(
@@ -14910,11 +14922,13 @@ const Parser = struct {
     }
 
     fn parseSelectItem(self: *@This()) !SelectItem {
-        if (sql_adapter.selectItemStartAt(self.tokens, self.pos)) |start| {
+        if (sql_adapter.selectItemStartWithFunctionBindingsAt(self.tokens, self.pos, self.function_bindings)) |start| {
             switch (start) {
                 .pipe_concat => return .{ .expression = try self.parseTextExpressionProjectionAlloc() },
                 .unary_negative => return .{ .expression = try self.parseGenericExpressionProjectionAlloc() },
                 .boolean_not => return .{ .expression = try self.parseBooleanExpressionProjectionAlloc() },
+                .extension_function => return .{ .expression = try self.parseExtensionFunctionExpressionProjectionAlloc() },
+                .routine_expression => return .{ .expression = try self.parseRoutineExpressionProjectionAlloc() },
                 .uuid_v4 => return .{ .expression = try self.parseUuidV4ExpressionProjectionAlloc() },
                 .now => return .{ .expression = try self.parseNowExpressionProjectionAlloc() },
                 .current_date => return .{ .expression = try self.parseCurrentDateExpressionProjectionAlloc() },
@@ -14978,8 +14992,6 @@ const Parser = struct {
                 },
             }
         }
-        if (sql_adapter.peekExtensionFunctionCall(self.tokens, self.pos, self.function_bindings.extension_functions)) return .{ .expression = try self.parseExtensionFunctionExpressionProjectionAlloc() };
-        if (sql_adapter.peekRoutineExpressionCall(self.tokens, self.pos, self.function_bindings.routine_expressions)) return .{ .expression = try self.parseRoutineExpressionProjectionAlloc() };
 
         return try sql_adapter.parseSelectFieldItemAlloc(
             self.alloc,
@@ -16197,11 +16209,13 @@ const Parser = struct {
     }
 
     fn parseRowExpressionOperandAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        if (sql_adapter.rowExpressionOperandStartAt(self.tokens, self.pos)) |start| {
+        if (sql_adapter.rowExpressionOperandStartWithFunctionBindingsAt(self.tokens, self.pos, self.function_bindings)) |start| {
             switch (start) {
                 .parenthesized => return try self.parseParenthesizedRowExpressionAlloc(),
                 .unary_negative => return try self.parseUnaryNegativeRowExpressionAlloc(),
                 .boolean_not => return try self.parseBooleanNotRowExpressionAlloc(),
+                .extension_function => return (try self.parseExtensionFunctionRowExpressionAlloc()) orelse unreachable,
+                .routine_expression => return (try self.parseRoutineExpressionRowExpressionAlloc()) orelse unreachable,
                 .cast => return try self.parseCastRowExpressionAlloc(),
                 .case => return try self.parseCaseRowExpressionAlloc(),
                 .now => return try sql_adapter.parseSqlNowRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
@@ -16263,12 +16277,6 @@ const Parser = struct {
                 .array_to_string => return try self.parseArrayToStringRowExpressionAlloc(),
                 .string_to_array => return try self.parseStringToArrayRowExpressionAlloc(),
             }
-        }
-        if (try self.parseExtensionFunctionRowExpressionAlloc()) |expression| {
-            return expression;
-        }
-        if (try self.parseRoutineExpressionRowExpressionAlloc()) |expression| {
-            return expression;
         }
         if (try sql_adapter.parseRowExpressionFieldOperandOrNullAlloc(
             self.alloc,
@@ -16338,20 +16346,7 @@ const Parser = struct {
     }
 
     fn parseUnaryNegativeRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        _ = self.match(.minus) orelse return error.UnsupportedSqlShape;
-        if (self.match(.number)) |token| {
-            return .{
-                .kind = .value,
-                .value_json = try std.fmt.allocPrint(self.alloc, "-{s}", .{token.text}),
-            };
-        }
-
-        const operand = try self.parseRowExpressionOperandAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        const expression = try sql_adapter.buildUnaryNegativeExpressionAlloc(self.alloc, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseUnaryNegativeRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.unaryNegativeRowExpressionParserHooks());
     }
 
     fn parseCastRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {

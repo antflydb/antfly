@@ -598,6 +598,22 @@ pub const RoutineExpressionRowExpressionParserHooks = struct {
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const ParenthesizedRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const BooleanNotRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_parenthesized_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const UnaryNegativeRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub fn sqlRowClaimForClause(clause: ast.SqlRowClaimClause) db_mod.types.RowClaimRequest {
     return .{
         .mode = clause.mode,
@@ -2156,6 +2172,63 @@ pub fn parseRoutineExpressionRowExpressionOrNullAlloc(
 
 pub fn routineArgumentExpressionIsNullLiteral(value: runtime_schema.RelationalRowsExpression) bool {
     return value.kind == .value and std.mem.eql(u8, value.value_json, "null");
+}
+
+pub fn parseParenthesizedRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: ParenthesizedRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parser.expectToken(tokens, pos, .lparen);
+    const expression = try hooks.parse_expression(hooks.ptr);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try parser.expectToken(tokens, pos, .rparen);
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseBooleanNotRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: BooleanNotRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseBooleanNotExpressionStart(tokens, pos);
+    const operand = if (peekParenthesizedExpressionSyntax(tokens, pos.*))
+        try hooks.parse_parenthesized_operand(hooks.ptr)
+    else
+        try hooks.parse_operand(hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateBooleanRowExpression(operand);
+    const expression = try wrapBooleanNotExpressionAlloc(alloc, operand);
+    operand_transferred = true;
+    return expression;
+}
+
+pub fn parseUnaryNegativeRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: UnaryNegativeRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    _ = parser.matchToken(tokens, pos, .minus) orelse return error.UnsupportedSqlShape;
+    if (parser.matchToken(tokens, pos, .number)) |token| {
+        return .{
+            .kind = .value,
+            .value_json = try std.fmt.allocPrint(alloc, "-{s}", .{token.text}),
+        };
+    }
+
+    const operand = try hooks.parse_operand(hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    const expression = try buildUnaryNegativeExpressionAlloc(alloc, operand);
+    operand_transferred = true;
+    return expression;
 }
 
 pub fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {
@@ -9425,6 +9498,8 @@ pub const SelectItemStart = enum {
     pipe_concat,
     unary_negative,
     boolean_not,
+    extension_function,
+    routine_expression,
     uuid_v4,
     now,
     current_date,
@@ -9553,6 +9628,13 @@ pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
     return null;
 }
 
+pub fn selectItemStartWithFunctionBindingsAt(tokens: []const Token, pos: usize, bindings: SqlFunctionBindings) ?SelectItemStart {
+    if (selectItemStartAt(tokens, pos)) |start| return start;
+    if (peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
+    if (peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
+    return null;
+}
+
 pub fn parseSelectFieldItemAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -9664,6 +9746,8 @@ pub const RowExpressionOperandStart = enum {
     parenthesized,
     unary_negative,
     boolean_not,
+    extension_function,
+    routine_expression,
     cast,
     case,
     now,
@@ -9787,6 +9871,13 @@ pub fn rowExpressionOperandStartAt(tokens: []const Token, pos: usize) ?RowExpres
     if (peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
     if (peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
     if (peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
+    return null;
+}
+
+pub fn rowExpressionOperandStartWithFunctionBindingsAt(tokens: []const Token, pos: usize, bindings: SqlFunctionBindings) ?RowExpressionOperandStart {
+    if (rowExpressionOperandStartAt(tokens, pos)) |start| return start;
+    if (peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
+    if (peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
     return null;
 }
 
