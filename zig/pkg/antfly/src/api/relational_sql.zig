@@ -114,6 +114,9 @@ const advisoryLockActionFromSyntax = sql_adapter.advisoryLockActionFromSyntax;
 const bulkIoDirectionFromSyntax = sql_adapter.bulkIoDirectionFromSyntax;
 const constraintCheckModeFromSyntax = sql_adapter.constraintCheckModeFromSyntax;
 const defaultPrimaryKeyNameEquals = sql_adapter.defaultPrimaryKeyNameEquals;
+const findUniqueConstraintByColumns = sql_adapter.findUniqueConstraintByColumns;
+const findUniqueConstraintByExpression = sql_adapter.findUniqueConstraintByExpression;
+const findUniqueConstraintByName = sql_adapter.findUniqueConstraintByName;
 const foreignKeyActionSupportsTemporalUpdate = sql_adapter.foreignKeyActionSupportsTemporalUpdate;
 const foreignKeyNameExists = sql_adapter.foreignKeyNameExists;
 const preparedStatementStatementKindFromSyntax = sql_adapter.preparedStatementStatementKindFromSyntax;
@@ -125,6 +128,7 @@ const reindexMaintenanceTargetFromSyntax = sql_adapter.reindexMaintenanceTargetF
 const relationalCheckNameExists = sql_adapter.relationalCheckNameExists;
 const relationalColumnForDdl = sql_adapter.relationalColumnForDdl;
 const relationalColumnForField = sql_adapter.relationalColumnForField;
+const relationalColumnForReturningField = sql_adapter.relationalColumnForReturningField;
 const relationalColumnHasIndexName = sql_adapter.relationalColumnHasIndexName;
 const relationalColumnIndex = sql_adapter.relationalColumnIndex;
 const relationalColumnIndexForIndexName = sql_adapter.relationalColumnIndexForIndexName;
@@ -35267,24 +35271,6 @@ fn concatCallMatchesGenerated(
     return i < tokens.len and tokens[i].kind == .rparen;
 }
 
-fn relationalColumnForReturningField(schema: runtime_schema.TableSchema, field: []const u8) ?runtime_schema.RelationalColumn {
-    if (relationalColumnForField(schema, field, null)) |column| return column;
-    const dot_index = std.mem.indexOfScalar(u8, field, '.') orelse return null;
-    if (dot_index == 0 or dot_index + 1 >= field.len) return null;
-    return relationalColumnForField(schema, field[0..dot_index], .json);
-}
-
-fn findUniqueConstraintByColumns(schema: runtime_schema.TableSchema, columns: []const []const u8, require_partial: bool) ?runtime_schema.UniqueConstraint {
-    for (schema.unique_constraints) |constraint| {
-        if (constraint.validation_state != .enforced) continue;
-        if (constraint.expressions.len != 0) continue;
-        if (require_partial and constraint.where.len == 0) continue;
-        if (!require_partial and constraint.where.len != 0) continue;
-        if (stringSlicesEqual(constraint.columns, columns)) return constraint;
-    }
-    return null;
-}
-
 fn findUniqueConstraintByColumnsAndExpressions(
     schema: runtime_schema.TableSchema,
     columns: []const []const u8,
@@ -35654,28 +35640,6 @@ fn expressionReferencesField(expression: db_mod.types.RelationalRowsExpression, 
         if (expressionReferencesField(fallback, field)) return true;
     }
     return false;
-}
-
-fn findUniqueConstraintByName(schema: runtime_schema.TableSchema, name: []const u8) ?runtime_schema.UniqueConstraint {
-    for (schema.unique_constraints) |constraint| {
-        if (constraint.validation_state != .enforced) continue;
-        if (std.mem.eql(u8, constraint.name, name)) return constraint;
-    }
-    return null;
-}
-
-fn findUniqueConstraintByExpression(
-    schema: runtime_schema.TableSchema,
-    op: runtime_schema.UniqueExpressionOp,
-    field: []const u8,
-) ?runtime_schema.UniqueConstraint {
-    for (schema.unique_constraints) |constraint| {
-        if (constraint.validation_state != .enforced) continue;
-        if (constraint.columns.len != 0 or constraint.expressions.len != 1) continue;
-        const expression = constraint.expressions[0];
-        if (expression.op == op and std.mem.eql(u8, expression.field, field)) return constraint;
-    }
-    return null;
 }
 
 fn uniqueExpressionsEqual(a: []const runtime_schema.UniqueExpression, b: []const runtime_schema.UniqueExpression) bool {
