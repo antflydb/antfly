@@ -1806,6 +1806,8 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
 pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
+    if (backup.len == 0) return .invalid_argument;
+    if (backup.ptr == null and backup.len != 0) return .invalid_argument;
     portable_backup.importPortable(handle.alloc, handle.db.core.store, backup.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -6285,6 +6287,14 @@ test "capi lite opens exports imports checks and vacuums aflite" {
 
     var dst_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(dst_path, &dst_handle));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(dst_handle, .{
+        .ptr = null,
+        .len = 16,
+    }));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(dst_handle, .{
+        .ptr = null,
+        .len = 0,
+    }));
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import_backup(dst_handle, .{
         .ptr = backup.ptr,
         .len = backup.len,
