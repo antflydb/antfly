@@ -1264,6 +1264,12 @@ pub fn corpusStableReasonToken(reason: []const u8) bool {
     return diagnostics.classificationReasonTokenIsKnown(reason);
 }
 
+pub fn corpusReasonHasNativeRequirement(reason: []const u8) bool {
+    const diagnostic_reason = diagnostics.classificationReasonFromToken(reason) orelse return false;
+    _ = diagnostics.nativeExecutionRequirement(diagnostic_reason);
+    return true;
+}
+
 const InvalidPlanFamily = enum {
     insert,
     update,
@@ -1629,6 +1635,9 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
         return error.TestUnexpectedResult;
     }
     if (entry.classification_reason.len > 0 and !corpusStableReasonToken(entry.classification_reason)) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.classification_reason.len > 0 and !corpusReasonHasNativeRequirement(entry.classification_reason)) {
         return error.TestUnexpectedResult;
     }
     if (corpusFixtureFamilyNeedsReason(entry.family) and
@@ -3645,6 +3654,9 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(!corpusFixtureFamilyNeedsReason(.insert));
     try std.testing.expect(corpusStableReasonToken("multi_table_generation_barrier"));
     try std.testing.expect(!corpusStableReasonToken("future_unknown_reason"));
+    try std.testing.expect(corpusReasonHasNativeRequirement("recursive_cte_stream_plan"));
+    try std.testing.expect(corpusReasonHasNativeRequirement("set_operation_plan"));
+    try std.testing.expect(!corpusReasonHasNativeRequirement("future_unknown_reason"));
     try std.testing.expect(corpusPlanMatchesReason(.unsupported_write, "unsupported:write:requires=multi_table_generation_barrier", "multi_table_generation_barrier"));
     try std.testing.expect(!corpusPlanMatchesReason(.unsupported_write, "unsupported:write:requires=session_setting", "session_setting"));
     try std.testing.expect(corpusPlanMatchesReason(.adapter_noop_ddl, "adapter_noop:ddl:reason=session_setting", "session_setting"));

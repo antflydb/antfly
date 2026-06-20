@@ -893,9 +893,17 @@ test "sql adapter binder validates relational catalog lookups" {
         .{ .name = "id", .path = "id", .field_type = .keyword },
         .{ .name = "email", .path = "email", .field_type = .keyword, .index_name = "users_email_idx" },
         .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "profile", .path = "profile", .field_type = .json },
     };
     const primary_key = runtime_schema.PrimaryKey{ .columns = &.{"id"} };
-    const uniques = [_]runtime_schema.UniqueConstraint{.{ .name = "users_email_key", .columns = &.{"email"} }};
+    const unique_expression = [_]runtime_schema.UniqueExpression{.{ .op = .lower, .field = "email" }};
+    const unique_where = [_]runtime_schema.UniquePredicate{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }};
+    const uniques = [_]runtime_schema.UniqueConstraint{
+        .{ .name = "users_email_key", .columns = &.{"email"} },
+        .{ .name = "users_status_email_key", .columns = &.{ "status", "email" }, .where = &unique_where },
+        .{ .name = "users_lower_email_key", .expressions = &unique_expression },
+        .{ .name = "users_unvalidated_key", .columns = &.{"status"}, .validation_state = .unvalidated },
+    };
     const foreign_keys = [_]runtime_schema.ForeignKey{.{ .name = "users_org_fkey", .parent_table = "orgs" }};
     const checks = [_]runtime_schema.RelationalCheck{.{ .name = "users_status_check", .field = "status" }};
     const schema = runtime_schema.TableSchema{
@@ -909,12 +917,22 @@ test "sql adapter binder validates relational catalog lookups" {
 
     try std.testing.expect(tableSchemaCatalogExists(schema));
     try std.testing.expect(relationalColumnForDdl(&columns, "email") != null);
+    try std.testing.expect(relationalColumnForReturningField(schema, "email") != null);
+    try std.testing.expect(relationalColumnForReturningField(schema, "profile.city") != null);
+    try std.testing.expect(relationalColumnForReturningField(schema, "email.domain") == null);
     try std.testing.expectEqual(@as(?usize, 1), relationalColumnIndexForIndexName(&columns, "users_email_idx"));
     try std.testing.expect(relationalIndexNameExists(schema, "users_email_key"));
     try std.testing.expect(relationalIndexNameExists(schema, "users_email_idx"));
     try std.testing.expect(relationalConstraintNameExists(schema, "users", "users_pkey"));
     try std.testing.expect(relationalConstraintNameExists(schema, "users", "users_status_check"));
     try std.testing.expect(!relationalConstraintNameExists(schema, "users", "missing_check"));
+    try std.testing.expect(findUniqueConstraintByName(schema, "users_email_key") != null);
+    try std.testing.expect(findUniqueConstraintByName(schema, "users_unvalidated_key") == null);
+    try std.testing.expect(findUniqueConstraintByColumns(schema, &.{"email"}, false) != null);
+    try std.testing.expect(findUniqueConstraintByColumns(schema, &.{ "status", "email" }, true) != null);
+    try std.testing.expect(findUniqueConstraintByColumns(schema, &.{ "status", "email" }, false) == null);
+    try std.testing.expect(findUniqueConstraintByExpression(schema, .lower, "email") != null);
+    try std.testing.expect(findUniqueConstraintByExpression(schema, .upper, "email") == null);
 
     const period_columns = [_]runtime_schema.RelationalColumn{
         .{ .name = "id", .path = "id", .field_type = .keyword },

@@ -71,6 +71,76 @@ pub fn classificationReasonIsUnsupportedRequirement(reason: SqlAdapterClassifica
     return !classificationReasonIsAdapterNoop(reason);
 }
 
+pub const NativeRequirementCategory = enum {
+    auth_row_filter,
+    bulk_io_route,
+    catalog_lifecycle,
+    conflict_target_validation,
+    output_shape_validation,
+    prepared_transaction_recovery,
+    role_setting_model,
+    routine_execution_hooks,
+    schema_rewrite_backfill,
+    stream_materialization,
+    temporal_execution_model,
+    transaction_control,
+};
+
+pub const NativeExecutionRequirement = struct {
+    category: NativeRequirementCategory,
+    durable_metadata: bool = false,
+    coordinator_recovery: bool = false,
+    auth_and_audit: bool = false,
+    materialization: bool = false,
+    spill: bool = false,
+    backpressure: bool = false,
+};
+
+pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) NativeExecutionRequirement {
+    return switch (reason) {
+        .bulk_io_plan => .{ .category = .bulk_io_route, .auth_and_audit = true },
+        .cte_mutation_source_plan => .{ .category = .stream_materialization, .materialization = true },
+        .duplicate_conflict_update_target,
+        .duplicate_row_batch_target,
+        .duplicate_update_target,
+        .enforced_unique_conflict_target,
+        .invalid_expression_conflict_target,
+        .invalid_named_conflict_target,
+        => .{ .category = .conflict_target_validation },
+        .aggregate_duplicate_output_name,
+        .duplicate_output_name,
+        .multi_output_subquery_delete_selector,
+        .multi_output_subquery_update_selector,
+        => .{ .category = .output_shape_validation },
+        .extension,
+        .schema_namespace,
+        => .{ .category = .catalog_lifecycle, .durable_metadata = true },
+        .multi_table_generation_barrier => .{ .category = .catalog_lifecycle, .durable_metadata = true },
+        .prepared_transaction_plan => .{ .category = .prepared_transaction_recovery, .coordinator_recovery = true },
+        .recursive_cte_stream_plan,
+        .set_operation_plan,
+        => .{
+            .category = .stream_materialization,
+            .materialization = true,
+            .spill = true,
+            .backpressure = true,
+        },
+        .role_setting_plan,
+        .session_setting,
+        => .{ .category = .role_setting_model, .durable_metadata = reason == .role_setting_plan },
+        .routine_body_plan,
+        .routine_option_plan,
+        => .{ .category = .routine_execution_hooks, .durable_metadata = true },
+        .row_rewrite_expression_plan => .{ .category = .schema_rewrite_backfill, .durable_metadata = true },
+        .row_lock_mode_plan,
+        .transaction_control,
+        => .{ .category = .transaction_control, .durable_metadata = reason == .row_lock_mode_plan },
+        .system_time_temporal_table,
+        .temporal_fk_action,
+        => .{ .category = .temporal_execution_model, .durable_metadata = true },
+    };
+}
+
 test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_plan"));
     try std.testing.expect(classificationReasonTokenIsKnown("bulk_io_plan"));
@@ -89,4 +159,35 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(!classificationReasonTokenIsKnown("set operation plan"));
     try std.testing.expect(!classificationReasonTokenIsKnown("future_reason"));
     try std.testing.expect(!classificationReasonTokenIsKnown(""));
+}
+
+test "sql adapter diagnostics map unsupported classifications to native requirements" {
+    const recursive = nativeExecutionRequirement(.recursive_cte_stream_plan);
+    try std.testing.expectEqual(NativeRequirementCategory.stream_materialization, recursive.category);
+    try std.testing.expect(recursive.materialization);
+    try std.testing.expect(recursive.spill);
+    try std.testing.expect(recursive.backpressure);
+
+    const set_operation = nativeExecutionRequirement(.set_operation_plan);
+    try std.testing.expectEqual(NativeRequirementCategory.stream_materialization, set_operation.category);
+    try std.testing.expect(set_operation.materialization);
+    try std.testing.expect(set_operation.spill);
+    try std.testing.expect(set_operation.backpressure);
+
+    const bulk = nativeExecutionRequirement(.bulk_io_plan);
+    try std.testing.expectEqual(NativeRequirementCategory.bulk_io_route, bulk.category);
+    try std.testing.expect(bulk.auth_and_audit);
+
+    const prepared = nativeExecutionRequirement(.prepared_transaction_plan);
+    try std.testing.expectEqual(NativeRequirementCategory.prepared_transaction_recovery, prepared.category);
+    try std.testing.expect(prepared.coordinator_recovery);
+
+    const rewrite = nativeExecutionRequirement(.row_rewrite_expression_plan);
+    try std.testing.expectEqual(NativeRequirementCategory.schema_rewrite_backfill, rewrite.category);
+    try std.testing.expect(rewrite.durable_metadata);
+
+    inline for (std.meta.fields(SqlAdapterClassificationReason)) |field| {
+        const reason: SqlAdapterClassificationReason = @enumFromInt(field.value);
+        _ = nativeExecutionRequirement(reason);
+    }
 }

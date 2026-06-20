@@ -1085,6 +1085,39 @@ pub fn expressionConditionReferencesAny(condition: runtime_schema.RelationalRows
     return false;
 }
 
+pub fn expressionReferencesField(expression: runtime_schema.RelationalRowsExpression, field: []const u8) bool {
+    if (expression.kind == .field and expression.field_source == .row and std.mem.eql(u8, expression.field, field)) return true;
+    for (expression.operands) |operand| {
+        if (expressionReferencesField(operand, field)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (expressionConditionReferencesField(branch.when, field)) return true;
+        if (expressionReferencesField(branch.then, field)) return true;
+    }
+    for (expression.case_else) |fallback| {
+        if (expressionReferencesField(fallback, field)) return true;
+    }
+    return false;
+}
+
+pub fn expressionConditionReferencesField(condition: runtime_schema.RelationalRowsExpressionCondition, field: []const u8) bool {
+    if (expressionReferencesField(condition.lhs, field)) return true;
+    for (condition.rhs) |rhs| {
+        if (expressionReferencesField(rhs, field)) return true;
+    }
+    return false;
+}
+
+pub fn uniqueExpressionsEqual(a: []const runtime_schema.UniqueExpression, b: []const runtime_schema.UniqueExpression) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (!relationalRowsExpressionOptionalEqual(left.expression, right.expression)) return false;
+    }
+    return true;
+}
+
 pub fn uniqueConstraintReferencesAny(
     constraint: runtime_schema.UniqueConstraint,
     fields: []const []const u8,
