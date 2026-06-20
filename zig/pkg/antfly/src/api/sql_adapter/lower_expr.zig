@@ -619,6 +619,11 @@ pub const CoalesceRowExpressionParserHooks = struct {
     parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const CoalesceProjectionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_value_json: *const fn (*anyopaque) anyerror![]const u8,
+};
+
 pub const NullifRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
@@ -665,6 +670,12 @@ pub const ArithmeticExpressionParserHooks = struct {
 
 pub const BooleanExpressionParserHooks = struct {
     ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const BooleanRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
@@ -3351,6 +3362,30 @@ pub fn parseBooleanExpressionRestAlloc(
     return current;
 }
 
+pub fn parseBooleanRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: BooleanRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var expression = try hooks.parse_expression(hooks.ptr);
+    var expression_owned = true;
+    errdefer if (expression_owned) freeExpression(alloc, expression);
+    if (peekBooleanOperator(tokens, pos.*)) |_| {
+        try type_context.validateBooleanRowExpression(expression);
+        expression_owned = false;
+        expression = try parseBooleanExpressionRestAlloc(alloc, tokens, pos, expression, 0, type_context, .{
+            .ptr = hooks.ptr,
+            .parse_operand = hooks.parse_operand,
+        });
+        expression_owned = true;
+        try type_context.validateBooleanRowExpression(expression);
+    }
+    expression_owned = false;
+    return expression;
+}
+
 pub fn parseCaseRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3654,6 +3689,64 @@ pub fn parseArrayLengthRowExpressionAlloc(
     const expression = try buildUnaryFunctionExpressionAlloc(alloc, .array_length, field_expression);
     field_transferred = true;
     return expression;
+}
+
+pub fn parseArrayLengthProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+) !db_mod.types.RelationalRowsArrayLengthProjection {
+    const keyword = try parseArrayLengthFunctionCallStart(tokens, pos);
+    const field = try parseArrayFieldOwnedAlloc(alloc, tokens, pos, schema);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    try value_mod.parseArrayLengthFunctionTail(tokens, pos, params, keyword);
+    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, arrayLengthDefaultOutput(keyword));
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+    field_transferred = true;
+    output_transferred = true;
+    return .{ .output = output, .field = field };
+}
+
+pub fn parseArrayLengthExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const keyword = try parseArrayLengthFunctionCallStart(tokens, pos);
+    const field = try parseRowExpressionArrayFieldOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    try value_mod.parseArrayLengthFunctionTail(tokens, pos, params, keyword);
+    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, arrayLengthDefaultOutput(keyword));
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+    const expression = try buildUnaryFunctionExpressionAlloc(
+        alloc,
+        .array_length,
+        .{ .kind = .field, .field = field, .field_source = field_source },
+    );
+
+    field_transferred = true;
+    output_transferred = true;
+    return buildExpressionProjection(output, expression);
 }
 
 pub fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {

@@ -360,7 +360,6 @@ const writeStructuredValuePredicateAtomsJson = sql_adapter.writeStructuredValueP
 const writeTextPatternPredicateAtomsJson = sql_adapter.writeTextPatternPredicateAtomsJson;
 const ScalarOrCheckBranch = sql_adapter.ScalarOrCheckBranch;
 const AccessPredicateBranch = sql_adapter.AccessPredicateBranch;
-const arrayLengthDefaultOutput = sql_adapter.arrayLengthDefaultOutput;
 const conflictActionName = sql_adapter.conflictActionName;
 const expressionAssignmentComputedCount = sql_adapter.expressionAssignmentComputedCount;
 const transformOperationCount = sql_adapter.transformOperationCount;
@@ -3390,6 +3389,14 @@ const Parser = struct {
     fn booleanExpressionParserHooks(self: *@This()) sql_adapter.BooleanExpressionParserHooks {
         return .{
             .ptr = self,
+            .parse_operand = parseNullifRowExpressionOperandHook,
+        };
+    }
+
+    fn booleanRowExpressionParserHooks(self: *@This()) sql_adapter.BooleanRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
             .parse_operand = parseNullifRowExpressionOperandHook,
         };
     }
@@ -15735,18 +15742,7 @@ const Parser = struct {
     }
 
     fn parseBooleanRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        var expression = try self.parseRowExpressionAlloc();
-        var expression_owned = true;
-        errdefer if (expression_owned) freeExpression(self.alloc, expression);
-        if (sql_adapter.peekBooleanOperator(self.tokens, self.pos)) |_| {
-            try self.rowExpressionTypeContext().validateBooleanRowExpression(expression);
-            expression_owned = false;
-            expression = try self.parseBooleanExpressionRestAlloc(expression, 0);
-            expression_owned = true;
-            try self.rowExpressionTypeContext().validateBooleanRowExpression(expression);
-        }
-        expression_owned = false;
-        return expression;
+        return try sql_adapter.parseBooleanRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.booleanRowExpressionParserHooks());
     }
 
     fn parseBooleanExpressionRestAlloc(
@@ -16107,45 +16103,21 @@ const Parser = struct {
     }
 
     fn parseArrayLengthProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsArrayLengthProjection {
-        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
-        const field = try sql_adapter.parseArrayFieldOwnedAlloc(self.alloc, self.tokens, &self.pos, self.schema);
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(field);
-        try sql_adapter.parseArrayLengthFunctionTail(self.tokens, &self.pos, self.params, keyword);
-        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, arrayLengthDefaultOutput(keyword));
-        var output_transferred = false;
-        errdefer if (!output_transferred) self.alloc.free(output);
-        field_transferred = true;
-        output_transferred = true;
-        return .{ .output = output, .field = field };
+        return try sql_adapter.parseArrayLengthProjectionAlloc(self.alloc, self.tokens, &self.pos, self.params, self.schema);
     }
 
     fn parseArrayLengthExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
-        const field = try sql_adapter.parseRowExpressionArrayFieldOwnedAlloc(
+        return try sql_adapter.parseArrayLengthExpressionProjectionAlloc(
             self.alloc,
             self.tokens,
             &self.pos,
+            self.params,
             self.schema,
             self.field_expression_qualifiers,
             self.returning_expression_qualifiers,
             self.defer_row_expression_field_validation,
+            self.rowExpressionFieldSource(),
         );
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(field);
-        try sql_adapter.parseArrayLengthFunctionTail(self.tokens, &self.pos, self.params, keyword);
-        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, arrayLengthDefaultOutput(keyword));
-        var output_transferred = false;
-        errdefer if (!output_transferred) self.alloc.free(output);
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(
-            self.alloc,
-            .array_length,
-            .{ .kind = .field, .field = field, .field_source = self.rowExpressionFieldSource() },
-        );
-
-        field_transferred = true;
-        output_transferred = true;
-        return sql_adapter.buildExpressionProjection(output, expression);
     }
 
     fn parseArrayPositionExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
