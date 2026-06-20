@@ -153,6 +153,8 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.InvalidAggregation,
         error.UnsupportedAggregation,
         error.ReadOnly,
+        error.InvalidNativeSnapshotPath,
+        error.PathAlreadyExists,
         => .invalid_argument,
         error.FileNotFound => .not_found,
         else => .internal,

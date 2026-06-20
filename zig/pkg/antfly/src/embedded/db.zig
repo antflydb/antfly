@@ -29,6 +29,7 @@ pub const types = support.db_types;
 pub const RemoteTemplateRenderConfig = template_remote_host.RenderConfig;
 pub const RemoteTemplateRenderer = template_remote_host.HostRenderer;
 pub const LiteCheckReport = support.lite.backend.CheckReport;
+pub const LiteStableSnapshotReport = support.lite.backend.StableSnapshotReport;
 pub const LiteVacuumReport = support.lite.backend.VacuumReport;
 
 pub const OpenOptions = struct {
@@ -209,6 +210,11 @@ pub const DB = struct {
 
     pub fn checkLite(self: *DB) !LiteCheckReport {
         if (self.owned_lite_backend) |*lite_backend| return try lite_backend.check();
+        return error.NotLiteDatabase;
+    }
+
+    pub fn copyStableLiteSnapshot(self: *DB, dest_path: []const u8, replace: bool) !LiteStableSnapshotReport {
+        if (self.owned_lite_backend) |*lite_backend| return try lite_backend.copyStableSnapshot(dest_path, replace);
         return error.NotLiteDatabase;
     }
 

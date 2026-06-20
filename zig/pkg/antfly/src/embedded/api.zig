@@ -249,6 +249,10 @@ pub const Api = struct {
         return try std.json.Stringify.valueAlloc(alloc, try self.db.checkLite(), .{});
     }
 
+    pub fn copyStableLiteSnapshotJson(self: *Api, alloc: Allocator, dest_path: []const u8, replace: bool) ![]u8 {
+        return try std.json.Stringify.valueAlloc(alloc, try self.db.copyStableLiteSnapshot(dest_path, replace), .{});
+    }
+
     pub fn vacuumLiteJson(self: *Api, alloc: Allocator) ![]u8 {
         return try std.json.Stringify.valueAlloc(alloc, try self.db.vacuumLite(), .{});
     }
@@ -839,6 +843,8 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     defer alloc.free(src_path);
     const dst_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-dst.aflite", .{tmp.sub_path});
     defer alloc.free(dst_path);
+    const snapshot_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-snapshot.aflite", .{tmp.sub_path});
+    defer alloc.free(snapshot_path);
 
     var backup = std.ArrayList(u8).empty;
     defer backup.deinit(alloc);
@@ -897,8 +903,28 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         try std.testing.expect(std.mem.indexOf(u8, check_after, "\"valid\":true") != null);
         try std.testing.expect(std.mem.indexOf(u8, check_after, "\"reclaimable_bytes\":0") != null);
 
+        const snapshot_report = try api.copyStableLiteSnapshotJson(alloc, snapshot_path, false);
+        defer alloc.free(snapshot_report);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot_report, "\"tail_bytes\":0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot_report, "\"snapshot_size\":") != null);
+
         try api.exportPortable(alloc, &backup);
         try std.testing.expect(backup.items.len > 0);
+    }
+
+    {
+        var snapshot = try Api.openLite(alloc, snapshot_path, .{
+            .table_name = "docs",
+            .db = .{
+                .open_mode = .query_readonly,
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer snapshot.close();
+
+        const lookup_json = try snapshot.lookupJson(alloc, "doc:a", "{}");
+        defer alloc.free(lookup_json);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"second\"") != null);
     }
 
     {
