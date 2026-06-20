@@ -2920,30 +2920,36 @@ fn selectOutputColumnAlloc(
 ) !runtime_schema.RelationalColumn {
     return switch (output.kind) {
         .field => blk: {
+            if (output.index >= select.fields.len) return error.UnsupportedSqlShape;
             const field = select.fields[output.index];
             const source = binder.relationalColumnForField(type_context.schema, field, null) orelse return error.InvalidSqlCatalog;
             break :blk try projectedColumnAlloc(alloc, field, source.field_type, source.array_item_type, source.nullable);
         },
         .json_extract => blk: {
+            if (output.index >= select.json_extract.len) return error.UnsupportedSqlShape;
             const projection = select.json_extract[output.index];
             const field_type: runtime_schema.AntflyType = if (projection.as_text) .keyword else .json;
             break :blk try projectedColumnAlloc(alloc, projection.output, field_type, null, true);
         },
         .array_length => blk: {
+            if (output.index >= select.array_length.len) return error.UnsupportedSqlShape;
             const projection = select.array_length[output.index];
             break :blk try projectedColumnAlloc(alloc, projection.output, .numeric, null, true);
         },
         .coalesce => blk: {
+            if (output.index >= select.coalesce.len) return error.UnsupportedSqlShape;
             const projection = select.coalesce[output.index];
             const field_type = try coalesceOutputType(alloc, type_context.schema.relational_columns, projection);
             break :blk try projectedColumnAlloc(alloc, projection.output, field_type.field_type, field_type.array_item_type, true);
         },
         .field_alias => blk: {
+            if (output.index >= select.field_aliases.len) return error.UnsupportedSqlShape;
             const projection = select.field_aliases[output.index];
             const source = binder.relationalColumnForField(type_context.schema, projection.field, null) orelse return error.InvalidSqlCatalog;
             break :blk try projectedColumnAlloc(alloc, projection.output, source.field_type, source.array_item_type, source.nullable);
         },
         .expression => blk: {
+            if (output.index >= select.expressions.len) return error.UnsupportedSqlShape;
             const projection = select.expressions[output.index];
             break :blk try projectedColumnAlloc(alloc, projection.output, try type_context.rowExpressionOutputType(projection.expression), null, true);
         },
@@ -10295,6 +10301,10 @@ test "sql adapter lower expr compares aggregate specs" {
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, select_columns[2].field_type);
     try std.testing.expectEqualStrings("enabled", select_columns[3].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.boolean, select_columns[3].field_type);
+    try std.testing.expectError(error.UnsupportedSqlShape, selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = select_schema }, .{
+        .fields = &.{"status"},
+        .outputs = &.{.{ .kind = .field, .index = 1 }},
+    }));
     try validateAggregateGroupBy(&.{"status"}, &.{group_projection}, &.{"status"}, &.{group_projection});
     try std.testing.expectError(error.UnsupportedSqlShape, validateAggregateGroupBy(&.{"status"}, &.{}, &.{"tenant_id"}, &.{}));
 

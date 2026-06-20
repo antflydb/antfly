@@ -1127,12 +1127,7 @@ fn mergeGraphSearchMetricStatus(
 ) !void {
     for (statuses.items) |*status| {
         if (!std.mem.eql(u8, status.name, source.name)) continue;
-        if (status.published_generation != 0 and
-            source.published_generation != 0 and
-            status.published_generation != source.published_generation)
-        {
-            return error.UnsupportedQueryRequest;
-        }
+        if (status.published_generation != source.published_generation) return error.UnsupportedQueryRequest;
         try validateGraphMetricStatusCompatible(status.*, source);
         try mergeGraphMetricStatusInto(alloc, status, source);
         return;
@@ -5000,6 +4995,7 @@ test "query merge requires comparable graph search metric generations across sha
     try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, right }, 0, 10));
 
     right_results[0].metric_status[0].published_generation = 0;
+    right_results[0].metric_status[0].state = .not_ready;
     try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, right }, 0, 10));
 
     var missing = db_mod.types.SearchResult{

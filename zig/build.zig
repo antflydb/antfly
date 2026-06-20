@@ -3884,6 +3884,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lowered read plans own nested storage plan memory",
             "sql adapter plan resolves CTE and base table sources",
             "sql adapter plan resolves join CTE sides to physical base table",
+            "postgres sql adapter lowers recursive cte stream contract",
             "SQL adapter DDL syntax conversions map grammar enums to plan enums",
             "sql adapter value parses timestamp literals",
             "sql adapter value parses scalar json literals",

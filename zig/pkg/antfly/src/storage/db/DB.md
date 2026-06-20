@@ -29,10 +29,10 @@ forwarding methods on `DB`:
 const write_path = @import("db/write_path.zig");
 
 pub const DB = struct {
+    // fields stay here
+
     const Self = @This();
     const write_path_impl = write_path.Impl(Self);
-
-    // fields stay here
 
     pub fn batch(self: *Self, req: types.BatchRequest) anyerror!void {
         return write_path_impl.batch(self, req);
@@ -71,6 +71,28 @@ Mixins can be reconsidered later for a very cohesive method family if the
 forwarding boilerplate becomes a real burden. They should not be the default
 because injected methods make it harder to answer "where did this method come
 from?", which is one of the problems this refactor is meant to solve.
+
+## Implementation Module Contract
+
+The extracted implementation modules should follow a small contract so the split
+does not recreate the same coupling across files:
+
+- `db.zig` owns the concrete `DB` type, field layout, public forwarding methods,
+  and cross-subsystem workflow tests.
+- Implementation modules own behavior, not storage layout. They should operate
+  on `*DB` passed through `Impl(comptime DB: type)`.
+- Implementation modules must not import `../db.zig` to recover the `DB` type.
+- `db/internal.zig` or `db/context.zig` must also not import `db.zig`. Shared
+  internal types should be DB-agnostic or generic over `DB` when they truly need
+  the concrete type.
+- Sibling implementation modules should not call each other's private `Impl`
+  declarations. Cross-module behavior should go through public `DB` forwarding
+  methods, explicitly shared helpers in `internal.zig`, or lower-level domain
+  modules such as `core.zig`, `query/`, `relational_store.zig`, `derived/`,
+  `catalog/`, `enrichment/`, and `maintenance/`.
+- If two coarse modules need the same helper, prefer moving that helper to the
+  smallest shared owner instead of importing one implementation module from the
+  other.
 
 ## Proposed Coarse Modules
 
@@ -131,7 +153,9 @@ cross-cutting enough that moved modules will need them immediately:
 Use a deliberately boring name such as `db/internal.zig` or `db/context.zig`.
 Keep this module narrow: it should hold shared DB orchestration state and helper
 plumbing that at least two coarse modules need. Avoid creating a generic dumping
-ground for unrelated helpers.
+ground for unrelated helpers. It should remain below `db.zig` in the dependency
+graph: `db.zig` and implementation modules may import it, but it must not import
+`db.zig`.
 
 ## Suggested Migration Order
 

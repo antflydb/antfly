@@ -324,10 +324,14 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
+        const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(gq);
+        var execution_params = gq.params;
+        if (defer_result_limit) execution_params.max_results = 0;
+
         var result = try switch (gq.query_type) {
-            .traverse => self.executeTraverse(graph_index, gq.params, resolved_keys, resolveTargetKeys(gq)),
+            .traverse => self.executeTraverse(graph_index, execution_params, resolved_keys, resolveTargetKeys(gq)),
             .neighbors => blk: {
-                var params = gq.params;
+                var params = execution_params;
                 params.max_depth = 1;
                 break :blk self.executeTraverse(graph_index, params, resolved_keys, resolveTargetKeys(gq));
             },
@@ -345,7 +349,27 @@ pub const GraphQueryEngine = struct {
         if (gq.order_by.len > 0) {
             try self.orderByGraphMetric(graph_index, gq.order_by, &result);
         }
+        if (defer_result_limit) {
+            try self.limitGraphMetricPostProcessedNodes(gq.params.max_results, &result);
+        }
         return result;
+    }
+
+    fn graphMetricPostProcessingNeedsFullCandidateSet(gq: GraphQuery) bool {
+        return gq.where_metric.len > 0 or gq.order_by.len > 0;
+    }
+
+    fn limitGraphMetricPostProcessedNodes(
+        self: *GraphQueryEngine,
+        max_results: u32,
+        result: *GraphQueryResult,
+    ) !void {
+        const keep_count: usize = @intCast(max_results);
+        if (max_results == 0 or result.nodes.len <= keep_count) return;
+        for (result.nodes[keep_count..]) |*node| node.deinit(self.alloc);
+        const kept = try self.alloc.dupe(GraphResultNode, result.nodes[0..keep_count]);
+        self.alloc.free(result.nodes);
+        result.nodes = kept;
     }
 
     fn filterByGraphMetric(
@@ -1794,6 +1818,56 @@ test "graph metric order and filter dependencies attach status without projectio
     try std.testing.expectEqual(@as(usize, 1), result.metric_status.len);
     try std.testing.expectEqualStrings("degree", result.metric_status[0].name);
     try std.testing.expect(result.metric_status[0].published_generation != 0);
+}
+
+test "graph metric order and filter apply max results after metric processing" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{
+        .name = "degree",
+        .kind = .degree,
+    }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-limit-s", "gq-metric-limit-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "D", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "X", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "Y", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const metric_orders = [_]GraphMetricOrder{.{
+        .name = "degree",
+        .direction = .desc,
+        .freshness = .published,
+    }};
+    const metric_filters = [_]GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 3.0,
+        .freshness = .published,
+    }};
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .neighbors,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_results = 1 },
+        .order_by = &metric_orders,
+        .where_metric = &metric_filters,
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("C", result.nodes[0].key);
 }
 
 test "traverse can execute through algebraic provenance semiring path" {

@@ -2116,6 +2116,22 @@ fn finalRecursiveCteSelectReferencesName(tokens: []const Token, cte_name: []cons
     return tokensContainTopLevelSourceName(tokens, cte_name);
 }
 
+fn applyRecursiveCteOutputColumnAliasesAlloc(
+    alloc: std.mem.Allocator,
+    columns: []const runtime_schema.RelationalColumn,
+    aliases: []const []const u8,
+) !void {
+    if (aliases.len == 0) return;
+    if (aliases.len != columns.len) return error.UnsupportedSqlShape;
+    for (columns, aliases) |*column_const, alias| {
+        const column: *runtime_schema.RelationalColumn = @constCast(column_const);
+        const owned_alias = try alloc.dupe(u8, alias);
+        errdefer alloc.free(owned_alias);
+        alloc.free(column.name);
+        column.name = owned_alias;
+    }
+}
+
 fn tokensContainTopLevelSourceName(tokens: []const Token, name: []const u8) bool {
     var depth: usize = 0;
     var previous_source_keyword = false;
@@ -4451,6 +4467,10 @@ const Parser = struct {
         };
         var anchor = try body.parseSelectWithSetBoundary(true);
         errdefer anchor.deinit(self.alloc);
+        const output_columns = try self.setOperationOutputColumnsAlloc(anchor);
+        var output_columns_transferred = false;
+        errdefer if (!output_columns_transferred) freeDdlRelationalColumns(self.alloc, output_columns);
+        try applyRecursiveCteOutputColumnAliasesAlloc(self.alloc, output_columns, cte_column_aliases);
         try sql_adapter.applyCteColumnAliasesAlloc(self.alloc, &anchor, cte_column_aliases);
         var base_table_name: ?[]const u8 = null;
         defer if (base_table_name) |name| self.alloc.free(name);
@@ -4468,10 +4488,6 @@ const Parser = struct {
 
         if (!self.peekKeyword("select")) return error.UnsupportedSqlShape;
         if (!finalRecursiveCteSelectReferencesName(self.tokens[self.pos..], cte_name)) return error.UnsupportedSqlShape;
-
-        const output_columns = try self.setOperationOutputColumnsAlloc(anchor);
-        var output_columns_transferred = false;
-        errdefer if (!output_columns_transferred) freeDdlRelationalColumns(self.alloc, output_columns);
 
         const anchor_table_name = anchor.table_name;
         anchor.table_name = "";
@@ -51491,6 +51507,50 @@ test "postgres sql adapter lowers non recursive cte query plans" {
         "WITH ids_only AS (SELECT id FROM orders), bad AS (SELECT amount FROM ids_only) SELECT amount FROM bad",
         schema,
         &.{},
+    ));
+}
+
+test "postgres sql adapter lowers recursive cte stream contract" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"depth":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerReadPlanAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    const recursive = switch (lowered) {
+        .recursive_cte => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("walk", recursive.cte_name);
+    try std.testing.expectEqual(SelectSetOperation.union_all, recursive.operation);
+    try std.testing.expect(recursive.recursive_member_references_cte);
+    try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), recursive.max_rows);
+    try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), recursive.max_bytes);
+    try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), recursive.spill_after_bytes);
+    try std.testing.expectEqualStrings("nodes", recursive.anchor.table_name);
+    try std.testing.expectEqual(@as(usize, 1), recursive.anchor.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("parent_id", recursive.anchor.plan.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 2), recursive.output_columns.len);
+    try std.testing.expectEqualStrings("id", recursive.output_columns[0].name);
+    try std.testing.expectEqualStrings("depth", recursive.output_columns[1].name);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRecursiveCtePlanAlloc(
+        alloc,
+        "WITH RECURSIVE walk AS (SELECT id FROM nodes UNION ALL SELECT id FROM nodes) SELECT id FROM walk",
+        schema,
+        &.{},
+        .{},
     ));
 }
 

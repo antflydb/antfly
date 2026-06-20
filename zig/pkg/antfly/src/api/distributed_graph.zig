@@ -1028,6 +1028,7 @@ fn executeDistributedTraverse(
 
     var frontier = try resolveStartFrontier(alloc, &state, req, base_result, prior_results, graph_query.query.start_nodes, include_paths);
     defer freeFrontier(alloc, frontier);
+    const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(graph_query.query);
 
     for (frontier) |item| {
         try state.seen.put(alloc, try alloc.dupe(u8, item.key), {});
@@ -1091,17 +1092,17 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
-                                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                                if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
                             }
                         }
 
-                        if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                        if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                 }
             } else {
                 const fanout_start_ns = platform_time.monotonicNs();
@@ -1152,17 +1153,17 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
-                                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                                if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
                             }
                         }
 
-                        if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                        if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                 }
             }
         } else {
@@ -1201,17 +1202,17 @@ fn executeDistributedTraverse(
                         if (return_node) {
                             try state.nodes.append(alloc, merged_node);
                             merged_node_owned = false;
-                            if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                            if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                         } else {
                             merged_node.deinit(alloc);
                             merged_node_owned = false;
                         }
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                 }
 
-                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
             }
         }
 
@@ -1226,6 +1227,7 @@ fn executeDistributedTraverse(
     );
     try filterDistributedGraphNodesByMetric(alloc, &state.nodes, graph_query.query.where_metric);
     try orderDistributedGraphNodesByMetric(alloc, state.nodes.items, graph_query.query.order_by);
+    if (defer_result_limit) limitDistributedGraphMetricPostProcessedNodes(alloc, &state.nodes, graph_query.query.params.max_results);
     try retainDistributedGraphProjectedMetrics(alloc, &state.nodes, graph_query.query.metrics);
     if (!graph_query.query.include_metric_status) {
         for (state.metric_status.items) |*status| status.deinit(alloc);
@@ -4618,12 +4620,7 @@ fn mergeGraphMetricStatus(
     for (statuses.items) |*status| {
         if (!std.mem.eql(u8, status.name, source.name)) continue;
         try validateDistributedGraphMetricStatusCompatible(status.*, source);
-        if (status.published_generation != 0 and
-            source.published_generation != 0 and
-            status.published_generation != source.published_generation)
-        {
-            return error.UnsupportedQueryRequest;
-        }
+        if (status.published_generation != source.published_generation) return error.UnsupportedQueryRequest;
         try mergeGraphMetricStatusInto(alloc, status, source);
         return;
     }
@@ -4862,6 +4859,21 @@ fn graphNodeMetricScore(node: graph_query_mod.GraphResultNode, name: []const u8)
         if (std.mem.eql(u8, metric.name, name)) return metric.score;
     }
     return null;
+}
+
+fn graphMetricPostProcessingNeedsFullCandidateSet(query: graph_query_mod.GraphQuery) bool {
+    return query.where_metric.len > 0 or query.order_by.len > 0;
+}
+
+fn limitDistributedGraphMetricPostProcessedNodes(
+    alloc: std.mem.Allocator,
+    nodes: *std.ArrayListUnmanaged(graph_query_mod.GraphResultNode),
+    max_results: u32,
+) void {
+    const keep_count: usize = @intCast(max_results);
+    if (max_results == 0 or nodes.items.len <= keep_count) return;
+    for (nodes.items[keep_count..]) |*node| node.deinit(alloc);
+    nodes.items.len = keep_count;
 }
 
 fn retainDistributedGraphProjectedMetrics(
@@ -6682,4 +6694,72 @@ test "distributed graph metric status merge validates metadata compatibility" {
             .converged = true,
         },
     }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .not_ready,
+            .edge_filter = .{ .mode = .types, .types = &reordered_types },
+            .metadata_version = 3,
+            .published_generation = 0,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 0.0,
+            .converged = false,
+        },
+    }));
+}
+
+test "distributed graph metric post processing applies max results after filter and order" {
+    const alloc = std.testing.allocator;
+
+    var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
+    defer {
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+
+    try nodes.append(alloc, .{
+        .key = try alloc.dupe(u8, "B"),
+        .depth = 1,
+        .distance = 1,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "degree"), .score = 1.0 },
+        }),
+    });
+    try nodes.append(alloc, .{
+        .key = try alloc.dupe(u8, "C"),
+        .depth = 1,
+        .distance = 1,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "degree"), .score = 3.0 },
+        }),
+    });
+    try nodes.append(alloc, .{
+        .key = try alloc.dupe(u8, "D"),
+        .depth = 1,
+        .distance = 1,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "degree"), .score = 2.0 },
+        }),
+    });
+
+    const filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 2.0,
+        .freshness = .published,
+    }};
+    const orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "degree",
+        .direction = .desc,
+        .freshness = .published,
+    }};
+
+    try filterDistributedGraphNodesByMetric(alloc, &nodes, &filters);
+    try orderDistributedGraphNodesByMetric(alloc, nodes.items, &orders);
+    limitDistributedGraphMetricPostProcessedNodes(alloc, &nodes, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), nodes.items.len);
+    try std.testing.expectEqualStrings("C", nodes.items[0].key);
 }
