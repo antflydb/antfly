@@ -14,4 +14,5 @@
 
 test {
     _ = @import("cmd/lite.zig");
+    _ = @import("cmd/cli/backup.zig");
 }

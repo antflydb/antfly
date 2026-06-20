@@ -2702,7 +2702,7 @@ pub fn build(b: *std.Build) void {
     lite_cli_test_mod.addOptions("build_options", build_options);
     const lite_cli_tests = b.addTest(.{
         .root_module = lite_cli_test_mod,
-        .filters = &.{"cmd.lite"},
+        .filters = &.{ "cmd.lite", "cmd.cli.backup" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
