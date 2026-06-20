@@ -105,6 +105,87 @@ pub fn routineArgumentExpressionIsNullLiteral(value: runtime_schema.RelationalRo
     return value.kind == .value and std.mem.eql(u8, value.value_json, "null");
 }
 
+pub fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {
+    return switch (op) {
+        .lower, .upper, .md5 => true,
+        .expression => false,
+    };
+}
+
+pub fn relationalGeneratedOpForUniqueExpressionOp(op: runtime_schema.UniqueExpressionOp) runtime_schema.RelationalGeneratedOp {
+    return switch (op) {
+        .lower => .lower,
+        .upper => .upper,
+        .md5 => .md5,
+        .expression => unreachable,
+    };
+}
+
+pub fn uniqueExpressionOpToken(op: runtime_schema.UniqueExpressionOp) []const u8 {
+    return switch (op) {
+        .lower => "lower",
+        .upper => "upper",
+        .md5 => "md5",
+        .expression => "expression",
+    };
+}
+
+pub fn uniquePredicateOpToken(op: runtime_schema.UniquePredicateOp) []const u8 {
+    return switch (op) {
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+        .eq => "eq",
+        .ne => "ne",
+    };
+}
+
+pub fn uniquePredicateAsRelationalCheckOp(op: runtime_schema.UniquePredicateOp) runtime_schema.RelationalCheckOp {
+    return switch (op) {
+        .is_null => .is_null,
+        .is_not_null => .is_not_null,
+        .eq => .eq,
+        .ne => .ne,
+    };
+}
+
+pub fn relationalCheckOpFromUniquePredicateToken(token: []const u8) ?runtime_schema.RelationalCheckOp {
+    if (std.mem.eql(u8, token, "is_null")) return .is_null;
+    if (std.mem.eql(u8, token, "is_not_null")) return .is_not_null;
+    if (std.mem.eql(u8, token, "eq")) return .eq;
+    if (std.mem.eql(u8, token, "ne")) return .ne;
+    return null;
+}
+
+pub fn tokenKindIsJsonExtractOperator(kind: token_mod.TokenKind) bool {
+    return kind == .arrow_json or kind == .arrow_text or kind == .path_arrow_json or kind == .path_arrow_text;
+}
+
+pub fn tokenKindIsJsonExtractTextOperator(kind: token_mod.TokenKind) bool {
+    return kind == .arrow_text or kind == .path_arrow_text;
+}
+
+pub fn tokenKindIsJsonExtractPathOperator(kind: token_mod.TokenKind) bool {
+    return kind == .path_arrow_json or kind == .path_arrow_text;
+}
+
+pub fn generatedUnaryTextColumnForField(
+    schema: runtime_schema.TableSchema,
+    op: runtime_schema.RelationalGeneratedOp,
+    field: []const u8,
+) ?runtime_schema.RelationalColumn {
+    switch (op) {
+        .lower, .upper, .md5 => {},
+        .concat, .concat_ws, .expression => return null,
+    }
+    for (schema.relational_columns) |column| {
+        const generated = column.generated orelse continue;
+        if (generated.op != op) continue;
+        const generated_field = generated.field orelse continue;
+        if (std.mem.eql(u8, generated_field, field)) return column;
+    }
+    return null;
+}
+
 fn routineArgIndex(field: []const u8) ?usize {
     if (!std.mem.startsWith(u8, field, "arg") or field.len <= 3) return null;
     var index: usize = 0;
@@ -1118,6 +1199,207 @@ pub fn uniqueExpressionsEqual(a: []const runtime_schema.UniqueExpression, b: []c
     return true;
 }
 
+pub fn selectorExpressionValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    expression: db_mod.types.RelationalRowsExpression,
+    values: anytype,
+) ![]u8 {
+    return switch (expression.kind) {
+        .field => blk: {
+            if (expression.field_source != .row) return error.UnsupportedSqlShape;
+            const value_json = fieldValueJsonFor(values, expression.field) orelse return error.UnsupportedSqlShape;
+            break :blk try alloc.dupe(u8, value_json);
+        },
+        .value => try alloc.dupe(u8, expression.value_json),
+        .lower, .upper, .initcap, .md5 => blk: {
+            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
+            const value_json = try selectorExpressionValueJsonAlloc(alloc, expression.operands[0], values);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .null => break :blk try alloc.dupe(u8, "null"),
+                .string => |text| {
+                    const transformed = switch (expression.kind) {
+                        .lower => try std.ascii.allocLowerString(alloc, text),
+                        .upper => try std.ascii.allocUpperString(alloc, text),
+                        .initcap => try selectorInitcapTextAlloc(alloc, text),
+                        .md5 => try selectorMd5HexTextAlloc(alloc, text),
+                        else => unreachable,
+                    };
+                    defer alloc.free(transformed);
+                    break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
+                },
+                else => return error.UnsupportedSqlShape,
+            }
+        },
+        .concat => blk: {
+            if (expression.operands.len == 0) return error.UnsupportedSqlShape;
+            var joined = std.ArrayListUnmanaged(u8).empty;
+            defer joined.deinit(alloc);
+            for (expression.operands) |operand| {
+                const value_json = try selectorExpressionValueJsonAlloc(alloc, operand, values);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+                defer parsed.deinit();
+                if (parsed.value == .null) continue;
+                const text = try selectorScalarJsonValueTextAlloc(alloc, parsed.value);
+                defer alloc.free(text);
+                try joined.appendSlice(alloc, text);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
+        },
+        .concat_ws => blk: {
+            if (expression.operands.len < 2) return error.UnsupportedSqlShape;
+            const separator_json = try selectorExpressionValueJsonAlloc(alloc, expression.operands[0], values);
+            defer alloc.free(separator_json);
+            var parsed_separator = std.json.parseFromSlice(std.json.Value, alloc, separator_json, .{}) catch return error.UnsupportedSqlShape;
+            defer parsed_separator.deinit();
+            if (parsed_separator.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_separator.value != .string) return error.UnsupportedSqlShape;
+
+            var joined = std.ArrayListUnmanaged(u8).empty;
+            defer joined.deinit(alloc);
+            var emitted = false;
+            for (expression.operands[1..]) |operand| {
+                const value_json = try selectorExpressionValueJsonAlloc(alloc, operand, values);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+                defer parsed.deinit();
+                if (parsed.value == .null) continue;
+                if (parsed.value != .string) return error.UnsupportedSqlShape;
+                if (emitted) try joined.appendSlice(alloc, parsed_separator.value.string);
+                try joined.appendSlice(alloc, parsed.value.string);
+                emitted = true;
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+pub fn fieldValueJsonFor(values: anytype, field: []const u8) ?[]const u8 {
+    for (values) |value| {
+        if (std.mem.eql(u8, value.field, field)) return value.value_json;
+    }
+    return null;
+}
+
+pub fn fieldValuesContain(values: anytype, field: []const u8) bool {
+    return fieldValueJsonFor(values, field) != null;
+}
+
+pub fn fieldValuesMatchColumns(values: anytype, columns: []const []const u8) bool {
+    if (values.len != columns.len) return false;
+    for (columns) |column| {
+        if (fieldValueJsonFor(values, column) == null) return false;
+    }
+    return true;
+}
+
+pub fn writeFieldValuesObjectJson(
+    writer: *std.Io.Writer,
+    values: anytype,
+    columns: []const []const u8,
+) !void {
+    try writer.writeByte('{');
+    for (columns, 0..) |column, i| {
+        const value_json = fieldValueJsonFor(values, column) orelse return error.UnsupportedSqlShape;
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(column, .{})});
+        try writer.writeAll(value_json);
+    }
+    try writer.writeByte('}');
+}
+
+pub fn writeAllFieldValuesObjectJson(
+    writer: *std.Io.Writer,
+    values: anytype,
+) !void {
+    try writer.writeByte('{');
+    for (values, 0..) |value, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(value.field, .{})});
+        try writer.writeAll(value.value_json);
+    }
+    try writer.writeByte('}');
+}
+
+fn selectorScalarJsonValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .string => |text| try alloc.dupe(u8, text),
+        .integer => |integer| try std.fmt.allocPrint(alloc, "{d}", .{integer}),
+        .float => |float| try std.fmt.allocPrint(alloc, "{d}", .{float}),
+        .number_string => |text| try alloc.dupe(u8, text),
+        .bool => |enabled| try alloc.dupe(u8, if (enabled) "true" else "false"),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn selectorMd5HexTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    const digest = std.crypto.hash.Md5.hashResult(text);
+    const out = try alloc.alloc(u8, 32);
+    for (digest, 0..) |byte, i| {
+        out[i * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[i * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+fn selectorInitcapTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try alloc.dupe(u8, text);
+    var at_word_start = true;
+    for (out) |*byte| {
+        if (std.ascii.isAlphanumeric(byte.*)) {
+            byte.* = if (at_word_start) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
+            at_word_start = false;
+        } else {
+            at_word_start = true;
+        }
+    }
+    return out;
+}
+
+pub fn selectorJsonValuesEqual(a: std.json.Value, b: std.json.Value) bool {
+    if (a == .null or b == .null) return a == .null and b == .null;
+    if (a == .bool and b == .bool) return a.bool == b.bool;
+    if (a == .string and b == .string) return std.mem.eql(u8, a.string, b.string);
+    if (selectorJsonNumber(a)) |left| {
+        if (selectorJsonNumber(b)) |right| return left == right;
+    }
+    return false;
+}
+
+pub const SelectorJsonOrder = enum { lt, eq, gt };
+
+pub fn selectorCompareJsonScalars(a: std.json.Value, b: std.json.Value) ?SelectorJsonOrder {
+    if (selectorJsonNumber(a)) |left| {
+        if (selectorJsonNumber(b)) |right| {
+            if (left < right) return .lt;
+            if (left > right) return .gt;
+            return .eq;
+        }
+    }
+    if (a == .string and b == .string) {
+        const order = std.mem.order(u8, a.string, b.string);
+        return switch (order) {
+            .lt => .lt,
+            .eq => .eq,
+            .gt => .gt,
+        };
+    }
+    return null;
+}
+
+fn selectorJsonNumber(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
+        else => null,
+    };
+}
+
 pub fn uniqueConstraintReferencesAny(
     constraint: runtime_schema.UniqueConstraint,
     fields: []const []const u8,
@@ -1913,6 +2195,95 @@ test "sql adapter lower expr detects catalog expression references" {
     const different_unique_expressions = [_]runtime_schema.UniqueExpression{.{ .op = .lower, .field = "tenant_id" }};
     try std.testing.expect(uniqueExpressionsEqual(&same_unique_expressions, &equal_unique_expressions));
     try std.testing.expect(!uniqueExpressionsEqual(&same_unique_expressions, &different_unique_expressions));
+
+    const SelectorValue = struct {
+        field: []const u8,
+        value_json: []const u8,
+    };
+    const selector_values = [_]SelectorValue{
+        .{ .field = "status", .value_json = "\"Active User\"" },
+        .{ .field = "tenant_id", .value_json = "\"tenant-a\"" },
+        .{ .field = "amount", .value_json = "42" },
+    };
+    const lower_selector: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{.{ .kind = .field, .field = "status", .field_source = .row }},
+    };
+    const lower_json = try selectorExpressionValueJsonAlloc(std.testing.allocator, lower_selector, &selector_values);
+    defer std.testing.allocator.free(lower_json);
+    try std.testing.expectEqualStrings("\"active user\"", lower_json);
+
+    const concat_selector: runtime_schema.RelationalRowsExpression = .{
+        .kind = .concat_ws,
+        .operands = &.{
+            .{ .kind = .value, .value_json = "\"/\"" },
+            .{ .kind = .field, .field = "tenant_id", .field_source = .row },
+            .{ .kind = .field, .field = "status", .field_source = .row },
+        },
+    };
+    const concat_json = try selectorExpressionValueJsonAlloc(std.testing.allocator, concat_selector, &selector_values);
+    defer std.testing.allocator.free(concat_json);
+    try std.testing.expectEqualStrings("\"tenant-a/Active User\"", concat_json);
+    try std.testing.expectEqualStrings("\"Active User\"", fieldValueJsonFor(&selector_values, "status").?);
+    try std.testing.expect(fieldValuesContain(&selector_values, "tenant_id"));
+    try std.testing.expect(!fieldValuesContain(&selector_values, "missing"));
+    try std.testing.expect(fieldValuesMatchColumns(&selector_values, &.{ "status", "tenant_id", "amount" }));
+    try std.testing.expect(!fieldValuesMatchColumns(&selector_values, &.{ "status", "tenant_id" }));
+
+    var selected_fields: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer selected_fields.deinit();
+    try writeFieldValuesObjectJson(&selected_fields.writer, &selector_values, &.{ "tenant_id", "status" });
+    const selected_json = try selected_fields.toOwnedSlice();
+    defer std.testing.allocator.free(selected_json);
+    try std.testing.expectEqualStrings("{\"tenant_id\":\"tenant-a\",\"status\":\"Active User\"}", selected_json);
+
+    var all_fields: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer all_fields.deinit();
+    try writeAllFieldValuesObjectJson(&all_fields.writer, &selector_values);
+    const all_json = try all_fields.toOwnedSlice();
+    defer std.testing.allocator.free(all_json);
+    try std.testing.expectEqualStrings("{\"status\":\"Active User\",\"tenant_id\":\"tenant-a\",\"amount\":42}", all_json);
+
+    var left_number = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "42", .{});
+    defer left_number.deinit();
+    var right_number = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "43", .{});
+    defer right_number.deinit();
+    try std.testing.expectEqual(SelectorJsonOrder.lt, selectorCompareJsonScalars(left_number.value, right_number.value) orelse return error.TestUnexpectedResult);
+    try std.testing.expect(selectorJsonValuesEqual(left_number.value, left_number.value));
+
+    try std.testing.expect(isCaseFoldExpressionOp(.lower));
+    try std.testing.expect(isCaseFoldExpressionOp(.upper));
+    try std.testing.expect(isCaseFoldExpressionOp(.md5));
+    try std.testing.expect(!isCaseFoldExpressionOp(.expression));
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, relationalGeneratedOpForUniqueExpressionOp(.lower));
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, relationalGeneratedOpForUniqueExpressionOp(.upper));
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.md5, relationalGeneratedOpForUniqueExpressionOp(.md5));
+    try std.testing.expectEqualStrings("expression", uniqueExpressionOpToken(.expression));
+    try std.testing.expectEqualStrings("eq", uniquePredicateOpToken(.eq));
+    try std.testing.expectEqualStrings("is_not_null", uniquePredicateOpToken(.is_not_null));
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, uniquePredicateAsRelationalCheckOp(.ne));
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, uniquePredicateAsRelationalCheckOp(.is_null));
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, relationalCheckOpFromUniquePredicateToken("eq").?);
+    try std.testing.expect(relationalCheckOpFromUniquePredicateToken("missing") == null);
+    try std.testing.expect(tokenKindIsJsonExtractOperator(.arrow_json));
+    try std.testing.expect(tokenKindIsJsonExtractOperator(.path_arrow_text));
+    try std.testing.expect(tokenKindIsJsonExtractTextOperator(.arrow_text));
+    try std.testing.expect(!tokenKindIsJsonExtractTextOperator(.arrow_json));
+    try std.testing.expect(tokenKindIsJsonExtractPathOperator(.path_arrow_json));
+    try std.testing.expect(!tokenKindIsJsonExtractPathOperator(.arrow_json));
+
+    const generated_columns = [_]runtime_schema.RelationalColumn{
+        .{
+            .name = "status_lower",
+            .path = "status_lower",
+            .field_type = .keyword,
+            .generated = .{ .op = .lower, .field = "status" },
+        },
+    };
+    const generated_schema: runtime_schema.TableSchema = .{ .relational_columns = &generated_columns };
+    try std.testing.expectEqualStrings("status_lower", generatedUnaryTextColumnForField(generated_schema, .lower, "status").?.name);
+    try std.testing.expect(generatedUnaryTextColumnForField(generated_schema, .upper, "status") == null);
+    try std.testing.expect(generatedUnaryTextColumnForField(generated_schema, .concat, "status") == null);
 }
 
 test "sql adapter lower expr compares query projection and set operation surfaces" {

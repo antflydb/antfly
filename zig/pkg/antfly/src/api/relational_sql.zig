@@ -69,6 +69,9 @@ const ddlForeignKeyTimingFromSyntax = sql_adapter.ddlForeignKeyTimingFromSyntax;
 const expressionConditionReferencesField = sql_adapter.expressionConditionReferencesField;
 const expressionReferencesField = sql_adapter.expressionReferencesField;
 const expressionProjectionFromCoalesceAlloc = sql_adapter.expressionProjectionFromCoalesceAlloc;
+const fieldValueJsonFor = sql_adapter.fieldValueJsonFor;
+const fieldValuesContain = sql_adapter.fieldValuesContain;
+const fieldValuesMatchColumns = sql_adapter.fieldValuesMatchColumns;
 const freeAccessPredicateGroup = sql_adapter.freeAccessPredicateGroup;
 const freeAccessPredicateGroups = sql_adapter.freeAccessPredicateGroups;
 const freeArrayLengthProjections = sql_adapter.freeArrayLengthProjections;
@@ -106,7 +109,9 @@ const freeTextPatterns = sql_adapter.freeTextPatterns;
 const freeTokens = sql_adapter.freeTokens;
 const freeWindowSpec = sql_adapter.freeWindowSpec;
 const freeWindowSpecs = sql_adapter.freeWindowSpecs;
+const generatedUnaryTextColumnForField = sql_adapter.generatedUnaryTextColumnForField;
 const generatedColumnReferencesAny = sql_adapter.generatedColumnReferencesAny;
+const isCaseFoldExpressionOp = sql_adapter.isCaseFoldExpressionOp;
 const jsonValueIsValid = sql_adapter.jsonValueIsValid;
 const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
 const ns_per_day: u64 = 86_400 * std.time.ns_per_s;
@@ -135,7 +140,9 @@ const relationalColumnHasIndexName = sql_adapter.relationalColumnHasIndexName;
 const relationalColumnIndex = sql_adapter.relationalColumnIndex;
 const relationalColumnIndexForIndexName = sql_adapter.relationalColumnIndexForIndexName;
 const relationalConstraintNameExists = sql_adapter.relationalConstraintNameExists;
+const relationalCheckOpFromUniquePredicateToken = sql_adapter.relationalCheckOpFromUniquePredicateToken;
 const relationalFieldTypeSupportsCollation = sql_adapter.relationalFieldTypeSupportsCollation;
+const relationalGeneratedOpForUniqueExpressionOp = sql_adapter.relationalGeneratedOpForUniqueExpressionOp;
 const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
 const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
@@ -152,13 +159,22 @@ const transactionModeStarterToSyntax = sql_adapter.transactionModeStarterToSynta
 const sqlIntervalLiteral = sql_adapter.sqlIntervalLiteral;
 const setOperationColumnsCompatible = sql_adapter.setOperationColumnsCompatible;
 const simpleSelectProjectionsEqual = sql_adapter.simpleSelectProjectionsEqual;
+const selectorCompareJsonScalars = sql_adapter.selectorCompareJsonScalars;
+const selectorExpressionValueJsonAlloc = sql_adapter.selectorExpressionValueJsonAlloc;
+const selectorJsonValuesEqual = sql_adapter.selectorJsonValuesEqual;
 const sqlArrayItemValueMatches = sql_adapter.sqlArrayItemValueMatches;
 const sqlScalarValueMatches = sql_adapter.sqlScalarValueMatches;
 const sqlStringIsJsonNumber = sql_adapter.sqlStringIsJsonNumber;
+const tokenKindIsJsonExtractOperator = sql_adapter.tokenKindIsJsonExtractOperator;
+const tokenKindIsJsonExtractPathOperator = sql_adapter.tokenKindIsJsonExtractPathOperator;
+const tokenKindIsJsonExtractTextOperator = sql_adapter.tokenKindIsJsonExtractTextOperator;
 const tokenizeAlloc = sql_adapter.tokenizeAlloc;
 const uniqueConstraintNameExists = sql_adapter.uniqueConstraintNameExists;
 const uniqueConstraintReferencesAny = sql_adapter.uniqueConstraintReferencesAny;
+const uniqueExpressionOpToken = sql_adapter.uniqueExpressionOpToken;
 const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
+const uniquePredicateAsRelationalCheckOp = sql_adapter.uniquePredicateAsRelationalCheckOp;
+const uniquePredicateOpToken = sql_adapter.uniquePredicateOpToken;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
 const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
@@ -178,6 +194,8 @@ const validateUniqueConstraintCatalog = sql_adapter.validateUniqueConstraintCata
 const validateUniqueConstraintForColumns = sql_adapter.validateUniqueConstraintForColumns;
 const validateUniquePredicatesForColumns = sql_adapter.validateUniquePredicatesForColumns;
 const validateUniquePredicateExpressionsForColumns = sql_adapter.validateUniquePredicateExpressionsForColumns;
+const writeAllFieldValuesObjectJson = sql_adapter.writeAllFieldValuesObjectJson;
+const writeFieldValuesObjectJson = sql_adapter.writeFieldValuesObjectJson;
 const ScalarOrCheckBranch = std.ArrayListUnmanaged(runtime_schema.RelationalCheck);
 const AccessPredicateBranch = struct {
     predicates: std.ArrayListUnmanaged(runtime_schema.RelationalCheck) = .empty,
@@ -3889,31 +3907,6 @@ fn alterTablePlanWorkFlagsForSchemaJson(root: *std.json.ObjectMap, plan: AlterTa
         }
     }
     return flags;
-}
-
-fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {
-    return switch (op) {
-        .lower, .upper, .md5 => true,
-        .expression => false,
-    };
-}
-
-fn relationalGeneratedOpForUniqueExpressionOp(op: runtime_schema.UniqueExpressionOp) runtime_schema.RelationalGeneratedOp {
-    return switch (op) {
-        .lower => .lower,
-        .upper => .upper,
-        .md5 => .md5,
-        .expression => unreachable,
-    };
-}
-
-fn uniqueExpressionOpToken(op: runtime_schema.UniqueExpressionOp) []const u8 {
-    return switch (op) {
-        .lower => "lower",
-        .upper => "upper",
-        .md5 => "md5",
-        .expression => "expression",
-    };
 }
 
 fn applyCreateIndexPlanAlloc(
@@ -35171,18 +35164,6 @@ fn initcapTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     return out;
 }
 
-fn tokenKindIsJsonExtractOperator(kind: TokenKind) bool {
-    return kind == .arrow_json or kind == .arrow_text or kind == .path_arrow_json or kind == .path_arrow_text;
-}
-
-fn tokenKindIsJsonExtractTextOperator(kind: TokenKind) bool {
-    return kind == .arrow_text or kind == .path_arrow_text;
-}
-
-fn tokenKindIsJsonExtractPathOperator(kind: TokenKind) bool {
-    return kind == .path_arrow_json or kind == .path_arrow_text;
-}
-
 fn findCteByName(ctes: []const db_mod.types.RelationalRowsCte, name: []const u8) ?db_mod.types.RelationalRowsCte {
     for (ctes) |cte| {
         if (std.mem.eql(u8, cte.name, name)) return cte;
@@ -35203,75 +35184,6 @@ fn windowOutputFieldIsUnique(
         if (std.mem.eql(u8, window.output, field)) matches += 1;
     }
     return matches == 1;
-}
-
-fn generatedUnaryTextColumnForField(
-    schema: runtime_schema.TableSchema,
-    op: runtime_schema.RelationalGeneratedOp,
-    field: []const u8,
-) ?runtime_schema.RelationalColumn {
-    switch (op) {
-        .lower, .upper, .md5 => {},
-        .concat, .concat_ws, .expression => return null,
-    }
-    for (schema.relational_columns) |column| {
-        const generated = column.generated orelse continue;
-        if (generated.op != op) continue;
-        const generated_field = generated.field orelse continue;
-        if (std.mem.eql(u8, generated_field, field)) return column;
-    }
-    return null;
-}
-
-fn generatedConcatColumnAt(
-    schema: runtime_schema.TableSchema,
-    tokens: []const Token,
-    pos: usize,
-) ?runtime_schema.RelationalColumn {
-    for (schema.relational_columns) |column| {
-        const generated = column.generated orelse continue;
-        if (generated.op != .concat and generated.op != .concat_ws) continue;
-        if (concatCallMatchesGenerated(tokens, pos, generated)) return column;
-    }
-    return null;
-}
-
-fn concatCallMatchesGenerated(
-    tokens: []const Token,
-    pos: usize,
-    generated: runtime_schema.RelationalGeneratedValue,
-) bool {
-    if (generated.fields.len == 0) return false;
-    if (pos + 2 >= tokens.len) return false;
-    if (tokens[pos].kind != .identifier) return false;
-    if (generated.op == .concat and !std.ascii.eqlIgnoreCase(tokens[pos].text, "concat")) return false;
-    if (generated.op == .concat_ws and !std.ascii.eqlIgnoreCase(tokens[pos].text, "concat_ws")) return false;
-    if (tokens[pos + 1].kind != .lparen) return false;
-    var i: usize = pos + 2;
-    if (generated.op == .concat_ws) {
-        if (i >= tokens.len or tokens[i].kind != .string) return false;
-        if (!std.mem.eql(u8, tokens[i].text, generated.separator)) return false;
-        i += 1;
-        if (i >= tokens.len or tokens[i].kind != .comma) return false;
-        i += 1;
-    }
-    for (generated.fields, 0..) |field, field_index| {
-        if (i >= tokens.len or tokens[i].kind != .identifier) return false;
-        if (!std.mem.eql(u8, tokens[i].text, field)) return false;
-        i += 1;
-        if (field_index + 1 < generated.fields.len) {
-            if (i >= tokens.len or tokens[i].kind != .comma) return false;
-            i += 1;
-            if (generated.op == .concat) {
-                if (i >= tokens.len or tokens[i].kind != .string) return false;
-                if (!std.mem.eql(u8, tokens[i].text, generated.separator)) return false;
-                i += 1;
-                if (i >= tokens.len or tokens[i].kind != .comma) return false;
-                i += 1;
-            }
-        }
-    }
-    return i < tokens.len and tokens[i].kind == .rparen;
 }
 
 fn findUniqueConstraintByColumnsAndExpressions(
@@ -35382,14 +35294,6 @@ fn relationalChecksFromUniqueWhereJsonAlloc(
     return out;
 }
 
-fn relationalCheckOpFromUniquePredicateToken(token: []const u8) ?runtime_schema.RelationalCheckOp {
-    if (std.mem.eql(u8, token, "is_null")) return .is_null;
-    if (std.mem.eql(u8, token, "is_not_null")) return .is_not_null;
-    if (std.mem.eql(u8, token, "eq")) return .eq;
-    if (std.mem.eql(u8, token, "ne")) return .ne;
-    return null;
-}
-
 fn findUniqueConstraintByColumnSet(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
@@ -35410,7 +35314,7 @@ fn uniqueConstraintMatchesPointSelector(
 ) bool {
     if (constraint.where.len == 0 and constraint.where_expressions.len == 0) return fieldValuesMatchColumns(values, constraint.columns);
     for (constraint.columns) |column| {
-        if (fieldValueFor(values, column) == null) return false;
+        if (fieldValueJsonFor(values, column) == null) return false;
     }
     for (values) |value| {
         if (!uniqueConstraintAllowsPointSelectorField(constraint, value.field)) return false;
@@ -35436,15 +35340,15 @@ fn uniqueConstraintAllowsPointSelectorField(constraint: runtime_schema.UniqueCon
 }
 
 fn uniquePredicateProvenByFieldValues(predicate: runtime_schema.UniquePredicate, values: []const Parser.FieldJsonValue) bool {
-    const value = fieldValueFor(values, predicate.field) orelse return false;
+    const value_json = fieldValueJsonFor(values, predicate.field) orelse return false;
     return switch (predicate.op) {
-        .eq => if (predicate.value_json) |expected| std.mem.eql(u8, value.value_json, expected) else false,
+        .eq => if (predicate.value_json) |expected| std.mem.eql(u8, value_json, expected) else false,
         .ne => if (predicate.value_json) |forbidden|
-            !std.mem.eql(u8, value.value_json, "null") and !std.mem.eql(u8, value.value_json, forbidden)
+            !std.mem.eql(u8, value_json, "null") and !std.mem.eql(u8, value_json, forbidden)
         else
             false,
-        .is_not_null => !std.mem.eql(u8, value.value_json, "null"),
-        .is_null => std.mem.eql(u8, value.value_json, "null"),
+        .is_not_null => !std.mem.eql(u8, value_json, "null"),
+        .is_null => std.mem.eql(u8, value_json, "null"),
     };
 }
 
@@ -35492,136 +35396,6 @@ fn uniqueExpressionPredicateProvenByFieldValues(
     };
 }
 
-fn selectorExpressionValueJsonAlloc(
-    alloc: std.mem.Allocator,
-    expression: db_mod.types.RelationalRowsExpression,
-    values: []const Parser.FieldJsonValue,
-) ![]u8 {
-    return switch (expression.kind) {
-        .field => blk: {
-            if (expression.field_source != .row) return error.UnsupportedSqlShape;
-            const value = fieldValueFor(values, expression.field) orelse return error.UnsupportedSqlShape;
-            break :blk try alloc.dupe(u8, value.value_json);
-        },
-        .value => try alloc.dupe(u8, expression.value_json),
-        .lower, .upper, .initcap, .md5 => blk: {
-            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
-            const value_json = try selectorExpressionValueJsonAlloc(alloc, expression.operands[0], values);
-            defer alloc.free(value_json);
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-            defer parsed.deinit();
-            switch (parsed.value) {
-                .null => break :blk try alloc.dupe(u8, "null"),
-                .string => |text| {
-                    const transformed = switch (expression.kind) {
-                        .lower => try std.ascii.allocLowerString(alloc, text),
-                        .upper => try std.ascii.allocUpperString(alloc, text),
-                        .initcap => try initcapTextAlloc(alloc, text),
-                        .md5 => try md5HexTextAlloc(alloc, text),
-                        else => unreachable,
-                    };
-                    defer alloc.free(transformed);
-                    break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
-                },
-                else => return error.UnsupportedSqlShape,
-            }
-        },
-        .concat => blk: {
-            if (expression.operands.len == 0) return error.UnsupportedSqlShape;
-            var joined = std.ArrayListUnmanaged(u8).empty;
-            defer joined.deinit(alloc);
-            for (expression.operands) |operand| {
-                const value_json = try selectorExpressionValueJsonAlloc(alloc, operand, values);
-                defer alloc.free(value_json);
-                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-                defer parsed.deinit();
-                if (parsed.value == .null) continue;
-                const text = try selectorScalarJsonValueTextAlloc(alloc, parsed.value);
-                defer alloc.free(text);
-                try joined.appendSlice(alloc, text);
-            }
-            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
-        },
-        .concat_ws => blk: {
-            if (expression.operands.len < 2) return error.UnsupportedSqlShape;
-            const separator_json = try selectorExpressionValueJsonAlloc(alloc, expression.operands[0], values);
-            defer alloc.free(separator_json);
-            var parsed_separator = std.json.parseFromSlice(std.json.Value, alloc, separator_json, .{}) catch return error.UnsupportedSqlShape;
-            defer parsed_separator.deinit();
-            if (parsed_separator.value == .null) break :blk try alloc.dupe(u8, "null");
-            if (parsed_separator.value != .string) return error.UnsupportedSqlShape;
-
-            var joined = std.ArrayListUnmanaged(u8).empty;
-            defer joined.deinit(alloc);
-            var emitted = false;
-            for (expression.operands[1..]) |operand| {
-                const value_json = try selectorExpressionValueJsonAlloc(alloc, operand, values);
-                defer alloc.free(value_json);
-                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-                defer parsed.deinit();
-                if (parsed.value == .null) continue;
-                if (parsed.value != .string) return error.UnsupportedSqlShape;
-                if (emitted) try joined.appendSlice(alloc, parsed_separator.value.string);
-                try joined.appendSlice(alloc, parsed.value.string);
-                emitted = true;
-            }
-            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
-        },
-        else => error.UnsupportedSqlShape,
-    };
-}
-
-fn selectorScalarJsonValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    return switch (value) {
-        .string => |text| try alloc.dupe(u8, text),
-        .integer => |integer| try std.fmt.allocPrint(alloc, "{d}", .{integer}),
-        .float => |float| try std.fmt.allocPrint(alloc, "{d}", .{float}),
-        .number_string => |text| try alloc.dupe(u8, text),
-        .bool => |enabled| try alloc.dupe(u8, if (enabled) "true" else "false"),
-        else => error.UnsupportedSqlShape,
-    };
-}
-
-fn selectorJsonValuesEqual(a: std.json.Value, b: std.json.Value) bool {
-    if (a == .null or b == .null) return a == .null and b == .null;
-    if (a == .bool and b == .bool) return a.bool == b.bool;
-    if (a == .string and b == .string) return std.mem.eql(u8, a.string, b.string);
-    if (selectorJsonNumber(a)) |left| {
-        if (selectorJsonNumber(b)) |right| return left == right;
-    }
-    return false;
-}
-
-const SelectorJsonOrder = enum { lt, eq, gt };
-
-fn selectorCompareJsonScalars(a: std.json.Value, b: std.json.Value) ?SelectorJsonOrder {
-    if (selectorJsonNumber(a)) |left| {
-        if (selectorJsonNumber(b)) |right| {
-            if (left < right) return .lt;
-            if (left > right) return .gt;
-            return .eq;
-        }
-    }
-    if (a == .string and b == .string) {
-        const order = std.mem.order(u8, a.string, b.string);
-        return switch (order) {
-            .lt => .lt,
-            .eq => .eq,
-            .gt => .gt,
-        };
-    }
-    return null;
-}
-
-fn selectorJsonNumber(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |integer| @floatFromInt(integer),
-        .float => |float| float,
-        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
-        else => null,
-    };
-}
-
 fn conflictInsertedValueForColumn(insert_columns: []const []const u8, row: []const []const u8, column: []const u8) ?[]const u8 {
     if (insert_columns.len != row.len) return null;
     for (insert_columns, row) |insert_column, value_json| {
@@ -35650,53 +35424,6 @@ fn stringSlicesIntersect(a: []const []const u8, b: []const []const u8) bool {
         if (stringSlicesContains(b, value)) return true;
     }
     return false;
-}
-
-fn fieldValuesContain(values: []const Parser.FieldJsonValue, field: []const u8) bool {
-    return fieldValueFor(values, field) != null;
-}
-
-fn fieldValueFor(values: []const Parser.FieldJsonValue, field: []const u8) ?Parser.FieldJsonValue {
-    for (values) |value| {
-        if (std.mem.eql(u8, value.field, field)) return value;
-    }
-    return null;
-}
-
-fn fieldValuesMatchColumns(values: []const Parser.FieldJsonValue, columns: []const []const u8) bool {
-    if (values.len != columns.len) return false;
-    for (columns) |column| {
-        if (fieldValueFor(values, column) == null) return false;
-    }
-    return true;
-}
-
-fn writeFieldValuesObjectJson(
-    writer: *std.Io.Writer,
-    values: []const Parser.FieldJsonValue,
-    columns: []const []const u8,
-) !void {
-    try writer.writeByte('{');
-    for (columns, 0..) |column, i| {
-        const value = fieldValueFor(values, column) orelse return error.UnsupportedSqlShape;
-        if (i != 0) try writer.writeByte(',');
-        try writer.print("{f}:", .{std.json.fmt(column, .{})});
-        try writer.writeAll(value.value_json);
-    }
-    try writer.writeByte('}');
-}
-
-fn writeAllFieldValuesObjectJson(
-    writer: *std.Io.Writer,
-    values: []const Parser.FieldJsonValue,
-) !void {
-    try writer.writeByte('{');
-    for (values, 0..) |value, i| {
-        if (i != 0) try writer.writeByte(',');
-        try writer.print("{f}:", .{std.json.fmt(value.field, .{})});
-        try writer.writeAll(value.value_json);
-    }
-    try writer.writeByte('}');
 }
 
 fn columnsMatchPrimaryKey(primary_key: runtime_schema.PrimaryKey, columns: []const []const u8) bool {
@@ -38650,24 +38377,6 @@ fn conflictActionToken(action: Parser.ConflictAction) []const u8 {
     return switch (action) {
         .nothing => "nothing",
         .update => "update",
-    };
-}
-
-fn uniquePredicateOpToken(op: runtime_schema.UniquePredicateOp) []const u8 {
-    return switch (op) {
-        .is_null => "is_null",
-        .is_not_null => "is_not_null",
-        .eq => "eq",
-        .ne => "ne",
-    };
-}
-
-fn uniquePredicateAsRelationalCheckOp(op: runtime_schema.UniquePredicateOp) runtime_schema.RelationalCheckOp {
-    return switch (op) {
-        .is_null => .is_null,
-        .is_not_null => .is_not_null,
-        .eq => .eq,
-        .ne => .ne,
     };
 }
 
