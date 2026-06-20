@@ -5857,6 +5857,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(plain_path);
     const invalid_lite_path = try tempTestPath(alloc, "capi-lite-invalid");
     defer alloc.free(invalid_lite_path);
+    const short_lite_path = try tempTestAflitePath(alloc, "capi-lite-short");
+    defer alloc.free(short_lite_path);
     const src_path = try tempTestAflitePath(alloc, "capi-lite-src");
     defer alloc.free(src_path);
     const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
@@ -5867,12 +5869,14 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(invalid_snapshot_path);
     cleanupTestDir(plain_path);
     cleanupTestFile(invalid_lite_path);
+    cleanupTestFile(short_lite_path);
     cleanupTestFile(src_path);
     cleanupTestFile(dst_path);
     cleanupTestFile(snapshot_path);
     cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestDir(plain_path);
     defer cleanupTestFile(invalid_lite_path);
+    defer cleanupTestFile(short_lite_path);
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(snapshot_path);
@@ -5885,6 +5889,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "writer") != null);
     try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.UnsupportedNativeFormatVersion));
 
     var plain_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(plain_path, &plain_handle));
@@ -5897,6 +5903,15 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var invalid_lite_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(invalid_lite_path, &invalid_lite_handle));
     defer antfly_db_close(invalid_lite_handle);
+
+    {
+        var short_file = try std.Io.Dir.cwd().createFile(std.testing.io, short_lite_path, .{});
+        defer short_file.close(std.testing.io);
+        try short_file.writePositionalAll(std.testing.io, "short native lite header", 0);
+    }
+    var short_lite_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_readonly(short_lite_path, &short_lite_handle));
+    defer antfly_db_close(short_lite_handle);
 
     var src_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
