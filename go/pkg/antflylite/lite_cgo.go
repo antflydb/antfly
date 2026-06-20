@@ -44,9 +44,22 @@ const (
 
 // OpenOptions configures OpenWithOptions.
 type OpenOptions struct {
-	Mode    OpenMode
-	Profile Profile
-	NoSync  bool
+	Mode       OpenMode
+	Profile    Profile
+	NoSync     bool
+	MapSize    uint64
+	TTLCleanup *TTLCleanupOptions
+}
+
+// TTLCleanupOptions configures the optional Lite TTL cleanup runtime.
+type TTLCleanupOptions struct {
+	Enabled       bool
+	LeaseOwned    bool
+	OwnerID       string
+	LeaseTTLMS    uint64
+	IntervalMS    uint64
+	BatchSize     uint32
+	GracePeriodNS uint64
 }
 
 // WriteIntent is a single key/value write or delete in a Lite batch.
@@ -115,8 +128,21 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 	}
 	cOpts.open_mode = C.uint32_t(opts.Mode)
 	cOpts.profile = C.uint32_t(opts.Profile)
+	cOpts.map_size = C.uint64_t(opts.MapSize)
 	if opts.NoSync {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_NO_SYNC
+	}
+	if opts.TTLCleanup != nil {
+		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP
+		cOpts.ttl_cleanup_enabled = C.bool(opts.TTLCleanup.Enabled)
+		cOpts.ttl_cleanup_lease_owned = C.bool(opts.TTLCleanup.LeaseOwned)
+		cOpts.ttl_cleanup_lease_ttl_ms = C.uint64_t(opts.TTLCleanup.LeaseTTLMS)
+		cOpts.ttl_cleanup_interval_ms = C.uint64_t(opts.TTLCleanup.IntervalMS)
+		cOpts.ttl_cleanup_batch_size = C.uint32_t(opts.TTLCleanup.BatchSize)
+		cOpts.ttl_cleanup_grace_period_ns = C.uint64_t(opts.TTLCleanup.GracePeriodNS)
+		ownerID, cleanupOwnerID := makeCStringSlice([]byte(opts.TTLCleanup.OwnerID))
+		defer cleanupOwnerID()
+		cOpts.ttl_cleanup_owner_id = ownerID
 	}
 
 	var handle unsafe.Pointer

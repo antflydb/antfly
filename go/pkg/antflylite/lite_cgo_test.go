@@ -169,6 +169,36 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("malformed restore left target behind: %v", err)
 	}
 
+	ttlPath := filepath.Join(t.TempDir(), "go-ttl.aflite")
+	ttlDB, err := OpenWithOptions(ttlPath, OpenOptions{
+		Mode:    OpenModeWriter,
+		Profile: ProfileNative,
+		NoSync:  true,
+		MapSize: 64 * 1024 * 1024,
+		TTLCleanup: &TTLCleanupOptions{
+			Enabled:       true,
+			LeaseOwned:    true,
+			OwnerID:       "go-lite-ttl",
+			LeaseTTLMS:    100,
+			IntervalMS:    10,
+			BatchSize:     4,
+			GracePeriodNS: 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open Lite database with TTL cleanup options: %v", err)
+	}
+	ttlStats, err := ttlDB.StatsJSON()
+	if err != nil {
+		t.Fatalf("ttl stats: %v", err)
+	}
+	if !bytes.Contains(ttlStats, []byte(`"ttl_cleanup"`)) || !bytes.Contains(ttlStats, []byte(`"enabled":true`)) {
+		t.Fatalf("ttl stats JSON %q did not include enabled TTL cleanup", ttlStats)
+	}
+	if err := ttlDB.Close(); err != nil {
+		t.Fatalf("close TTL Lite database: %v", err)
+	}
+
 	hostedPath := filepath.Join(t.TempDir(), "go-hosted.aflite")
 	hosted, err := OpenHosted(hostedPath)
 	if err != nil {
@@ -193,5 +223,19 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if !hostedStatus.Capabilities.HostedProfile || !hostedStatus.Capabilities.ManualMaintenance {
 		t.Fatalf("hosted status should include hosted capabilities: %#v", hostedStatus.Capabilities)
+	}
+
+	hostedTTLPath := filepath.Join(t.TempDir(), "go-hosted-ttl.aflite")
+	hostedWithTTL, err := OpenWithOptions(hostedTTLPath, OpenOptions{
+		Mode:       OpenModeWriter,
+		Profile:    ProfileHosted,
+		TTLCleanup: &TTLCleanupOptions{Enabled: true},
+	})
+	if err == nil {
+		defer hostedWithTTL.Close()
+		t.Fatalf("hosted Lite database unexpectedly accepted TTL cleanup options")
+	}
+	if err != InvalidArgument {
+		t.Fatalf("hosted TTL open error = %v, want %v", err, InvalidArgument)
 	}
 }

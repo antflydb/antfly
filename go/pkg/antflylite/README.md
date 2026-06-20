@@ -28,6 +28,8 @@ maintenance reports while keeping the raw JSON methods available.
 Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
 handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application
 wants hosted/manual maintenance and will call `RunUntilIdle` itself.
+Use `OpenWithOptions` for advanced settings such as map size and native-profile
+TTL cleanup.
 
 Use `BackupToFile` to write a portable `.afb` archive from an open Lite handle.
 Use `RestoreBackupFile` or `RestoreBackup` to stage a portable backup into a
