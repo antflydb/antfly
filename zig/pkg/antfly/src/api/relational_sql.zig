@@ -53,20 +53,48 @@ const cloneExpressionConditionsAlloc = sql_adapter.cloneExpressionConditionsAllo
 const cloneExpressionConditionsConcatAlloc = sql_adapter.cloneExpressionConditionsConcatAlloc;
 const cloneExpressionPredicateGroupsAlloc = sql_adapter.cloneExpressionPredicateGroupsAlloc;
 const cloneExpressionProjection = sql_adapter.cloneExpressionProjection;
+const cloneInPredicateAlloc = sql_adapter.cloneInPredicateAlloc;
+const cloneInPredicatesAlloc = sql_adapter.cloneInPredicatesAlloc;
+const cloneInPredicatesConcatAlloc = sql_adapter.cloneInPredicatesConcatAlloc;
+const cloneOrderByAlloc = sql_adapter.cloneOrderByAlloc;
+const cloneQueryRelationalCheckAlloc = sql_adapter.cloneQueryRelationalCheckAlloc;
+const cloneQueryRelationalChecksAlloc = sql_adapter.cloneQueryRelationalChecksAlloc;
+const cloneQueryRelationalChecksConcatAlloc = sql_adapter.cloneQueryRelationalChecksConcatAlloc;
 const cloneSelectOutputsAlloc = sql_adapter.cloneSelectOutputsAlloc;
 const cursorFetchDirectionFromSyntax = sql_adapter.cursorFetchDirectionFromSyntax;
 const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const ddlForeignKeyActionFromSyntax = sql_adapter.ddlForeignKeyActionFromSyntax;
 const ddlForeignKeyMatchFromSyntax = sql_adapter.ddlForeignKeyMatchFromSyntax;
 const ddlForeignKeyTimingFromSyntax = sql_adapter.ddlForeignKeyTimingFromSyntax;
+const freeAccessPredicateGroup = sql_adapter.freeAccessPredicateGroup;
+const freeAccessPredicateGroups = sql_adapter.freeAccessPredicateGroups;
+const freeArrayAny = sql_adapter.freeArrayAny;
+const freeArrayContains = sql_adapter.freeArrayContains;
+const freeArrayEq = sql_adapter.freeArrayEq;
 const freeExpression = sql_adapter.freeExpression;
+const freeExpressionArrayContains = sql_adapter.freeExpressionArrayContains;
+const freeExpressionArrayContainsOne = sql_adapter.freeExpressionArrayContainsOne;
+const freeExpressionCaseBranch = sql_adapter.freeExpressionCaseBranch;
 const freeExpressionCondition = sql_adapter.freeExpressionCondition;
 const freeExpressionConditions = sql_adapter.freeExpressionConditions;
+const freeExpressionPredicateGroup = sql_adapter.freeExpressionPredicateGroup;
 const freeExpressionPredicateGroups = sql_adapter.freeExpressionPredicateGroups;
 const freeExpressionProjection = sql_adapter.freeExpressionProjection;
 const freeExpressionProjections = sql_adapter.freeExpressionProjections;
 const freeExpressionSlice = sql_adapter.freeExpressionSlice;
+const freeInPredicates = sql_adapter.freeInPredicates;
+const freeJsonContains = sql_adapter.freeJsonContains;
+const freeJsonPathEq = sql_adapter.freeJsonPathEq;
+const freeJsonPathExists = sql_adapter.freeJsonPathExists;
+const freeOrderBy = sql_adapter.freeOrderBy;
+const freePredicateGroup = sql_adapter.freePredicateGroup;
+const freePredicateGroups = sql_adapter.freePredicateGroups;
+const freeRelationalCheck = sql_adapter.freeRelationalCheck;
+const freeRelationalChecks = sql_adapter.freeRelationalChecks;
+const freeTextPatterns = sql_adapter.freeTextPatterns;
 const freeTokens = sql_adapter.freeTokens;
+const freeWindowSpec = sql_adapter.freeWindowSpec;
+const freeWindowSpecs = sql_adapter.freeWindowSpecs;
 const generatedColumnReferencesAny = sql_adapter.generatedColumnReferencesAny;
 const jsonValueIsValid = sql_adapter.jsonValueIsValid;
 const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
@@ -3032,6 +3060,64 @@ pub const OwnedSqlCatalogSession = struct {
     }
 };
 
+pub fn parseSqlStatementTimeoutNs(value: []const u8) !u64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidRoleSetting;
+
+    var digit_count: usize = 0;
+    while (digit_count < trimmed.len and std.ascii.isDigit(trimmed[digit_count])) : (digit_count += 1) {}
+    if (digit_count == 0) return error.InvalidRoleSetting;
+    const amount = std.fmt.parseUnsigned(u64, trimmed[0..digit_count], 10) catch return error.InvalidRoleSetting;
+    const unit = trimmed[digit_count..];
+
+    const multiplier: u64 = if (unit.len == 0 or std.mem.eql(u8, unit, "ms"))
+        std.time.ns_per_ms
+    else if (std.mem.eql(u8, unit, "us"))
+        std.time.ns_per_us
+    else if (std.mem.eql(u8, unit, "s"))
+        std.time.ns_per_s
+    else if (std.mem.eql(u8, unit, "min"))
+        60 * std.time.ns_per_s
+    else if (std.mem.eql(u8, unit, "h"))
+        60 * 60 * std.time.ns_per_s
+    else
+        return error.InvalidRoleSetting;
+    return std.math.mul(u64, amount, multiplier) catch return error.InvalidRoleSetting;
+}
+
+pub fn sqlStatementTimeoutNsFromSession(session: catalog_resources.SqlCatalogSession) !?u64 {
+    const raw = session.settingValue("statement_timeout") orelse return null;
+    const timeout_ns = try parseSqlStatementTimeoutNs(raw);
+    if (timeout_ns == 0) return null;
+    return timeout_ns;
+}
+
+pub fn sqlStatementTimeoutExpired(timeout_ns: ?u64, start_ns: u64, now_ns: u64) bool {
+    const limit = timeout_ns orelse return false;
+    return now_ns -| start_ns >= limit;
+}
+
+pub fn enforceSqlStatementTimeoutAt(session: catalog_resources.SqlCatalogSession, start_ns: u64, now_ns: u64) !void {
+    if (sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(session), start_ns, now_ns)) return error.StatementTimeout;
+}
+
+fn validateSqlRuntimeSessionSettingValue(name: []const u8, value: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(name, "statement_timeout")) {
+        _ = try parseSqlStatementTimeoutNs(value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "timezone")) {
+        if (value.len == 0) return error.InvalidRoleSetting;
+        for (value) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '/' or ch == '+' or ch == '-' or ch == ':' or ch == '.')) {
+                return error.InvalidRoleSetting;
+            }
+        }
+        return;
+    }
+    return error.UnsupportedRoleSetting;
+}
+
 fn replaceSessionSettingAlloc(
     alloc: std.mem.Allocator,
     settings: []const catalog_resources.SqlSessionSetting,
@@ -3136,6 +3222,10 @@ pub fn applySessionCatalogPlanAlloc(
             return updated;
         },
         .set_setting => |set| {
+            switch (set.kind) {
+                .app => if (set.value.len == 0) return error.InvalidRoleSetting,
+                .runtime => try validateSqlRuntimeSessionSettingValue(set.name, set.value),
+            }
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
             errdefer updated.deinit(alloc);
             const settings = try replaceSessionSettingAlloc(alloc, updated.settings, set.name, set.value);
@@ -39124,56 +39214,6 @@ fn freeJsonSetParsedValue(alloc: std.mem.Allocator, value: Parser.JsonSetParsedV
     if (value.expression) |expression| freeExpression(alloc, expression);
 }
 
-fn freeArrayContains(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayContainsPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.value_json);
-    }
-}
-
-fn freeArrayAny(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayAnyPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.value_json);
-    }
-}
-
-fn freeArrayEq(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayEqPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.value_json);
-    }
-}
-
-fn freeExpressionArrayContainsOne(
-    alloc: std.mem.Allocator,
-    value: db_mod.types.RelationalRowsExpressionArrayContainsPredicate,
-) void {
-    freeExpression(alloc, value.expression);
-    alloc.free(value.value_json);
-}
-
-fn freeExpressionArrayContains(
-    alloc: std.mem.Allocator,
-    values: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate,
-) void {
-    for (values) |value| freeExpressionArrayContainsOne(alloc, value);
-}
-
-fn freeInPredicates(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsInPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.values_json);
-    }
-}
-
-fn freeTextPatterns(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsTextPatternPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.pattern);
-    }
-}
-
 fn freeConflictTarget(alloc: std.mem.Allocator, target: Parser.ConflictTarget) void {
     switch (target) {
         .primary => {},
@@ -39246,131 +39286,6 @@ fn freeSelectItem(alloc: std.mem.Allocator, item: Parser.SelectItem) void {
             alloc.free(projection.field);
         },
     }
-}
-
-fn freeRelationalCheck(alloc: std.mem.Allocator, value: runtime_schema.RelationalCheck) void {
-    std.debug.assert(value.name.len == 0);
-    alloc.free(value.field);
-    if (value.value_json) |json| alloc.free(json);
-    if (value.expression) |expression| freeExpressionCondition(alloc, expression);
-}
-
-fn freeRelationalChecks(alloc: std.mem.Allocator, values: []const runtime_schema.RelationalCheck) void {
-    for (values) |value| freeRelationalCheck(alloc, value);
-}
-
-fn cloneQueryRelationalCheckAlloc(alloc: std.mem.Allocator, value: runtime_schema.RelationalCheck) !runtime_schema.RelationalCheck {
-    const field = try alloc.dupe(u8, value.field);
-    errdefer alloc.free(field);
-    const value_json = if (value.value_json) |json| try alloc.dupe(u8, json) else null;
-    errdefer if (value_json) |json| alloc.free(json);
-    return .{
-        .name = "",
-        .field = field,
-        .op = value.op,
-        .value_json = value_json,
-        .validation_state = value.validation_state,
-        .expression = if (value.expression) |expression| try cloneExpressionConditionAlloc(alloc, expression) else null,
-    };
-}
-
-fn cloneQueryRelationalChecksAlloc(
-    alloc: std.mem.Allocator,
-    values: []const runtime_schema.RelationalCheck,
-) ![]const runtime_schema.RelationalCheck {
-    if (values.len == 0) return &.{};
-    const out = try alloc.alloc(runtime_schema.RelationalCheck, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeRelationalChecks(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (values, 0..) |value, i| {
-        out[i] = try cloneQueryRelationalCheckAlloc(alloc, value);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneInPredicatesAlloc(
-    alloc: std.mem.Allocator,
-    values: []const db_mod.types.RelationalRowsInPredicate,
-) ![]const db_mod.types.RelationalRowsInPredicate {
-    if (values.len == 0) return &.{};
-    const out = try alloc.alloc(db_mod.types.RelationalRowsInPredicate, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeInPredicates(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (values, 0..) |value, i| {
-        out[i] = try cloneInPredicateAlloc(alloc, value);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneInPredicateAlloc(
-    alloc: std.mem.Allocator,
-    value: db_mod.types.RelationalRowsInPredicate,
-) !db_mod.types.RelationalRowsInPredicate {
-    const field = try alloc.dupe(u8, value.field);
-    var field_transferred = false;
-    errdefer if (!field_transferred) alloc.free(field);
-    const values_json = try alloc.dupe(u8, value.values_json);
-    var values_transferred = false;
-    errdefer if (!values_transferred) alloc.free(values_json);
-    field_transferred = true;
-    values_transferred = true;
-    return .{
-        .field = field,
-        .values_json = values_json,
-        .negated = value.negated,
-    };
-}
-
-fn cloneInPredicatesConcatAlloc(
-    alloc: std.mem.Allocator,
-    lhs: []const db_mod.types.RelationalRowsInPredicate,
-    rhs: []const db_mod.types.RelationalRowsInPredicate,
-) ![]const db_mod.types.RelationalRowsInPredicate {
-    const out = try alloc.alloc(db_mod.types.RelationalRowsInPredicate, lhs.len + rhs.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeInPredicates(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (lhs) |value| {
-        out[initialized] = try cloneInPredicateAlloc(alloc, value);
-        initialized += 1;
-    }
-    for (rhs) |value| {
-        out[initialized] = try cloneInPredicateAlloc(alloc, value);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneQueryRelationalChecksConcatAlloc(
-    alloc: std.mem.Allocator,
-    lhs: []const runtime_schema.RelationalCheck,
-    rhs: []const runtime_schema.RelationalCheck,
-) ![]const runtime_schema.RelationalCheck {
-    const out = try alloc.alloc(runtime_schema.RelationalCheck, lhs.len + rhs.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeRelationalChecks(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (lhs) |value| {
-        out[initialized] = try cloneQueryRelationalCheckAlloc(alloc, value);
-        initialized += 1;
-    }
-    for (rhs) |value| {
-        out[initialized] = try cloneQueryRelationalCheckAlloc(alloc, value);
-        initialized += 1;
-    }
-    return out;
 }
 
 fn queryHasNoSimpleSetPredicates(query: db_mod.types.RelationalRowsQueryRequest) bool {
@@ -40047,64 +39962,6 @@ fn expressionConditionsFromSimpleExpressionSetQueryBranchAlloc(
     return error.UnsupportedSqlShape;
 }
 
-fn freePredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsPredicateGroup) void {
-    for (values) |value| {
-        freePredicateGroup(alloc, value);
-    }
-}
-
-fn freePredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsPredicateGroup) void {
-    freeRelationalChecks(alloc, value.predicates);
-    if (value.predicates.len > 0) alloc.free(value.predicates);
-}
-
-fn freeAccessPredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsAccessPredicateGroup) void {
-    freeRelationalChecks(alloc, value.predicates);
-    if (value.predicates.len > 0) alloc.free(value.predicates);
-    freeArrayAny(alloc, value.array_any);
-    if (value.array_any.len > 0) alloc.free(value.array_any);
-    freeArrayContains(alloc, value.array_contains);
-    if (value.array_contains.len > 0) alloc.free(value.array_contains);
-    freeArrayEq(alloc, value.array_eq);
-    if (value.array_eq.len > 0) alloc.free(value.array_eq);
-    freeInPredicates(alloc, value.in_predicates);
-    if (value.in_predicates.len > 0) alloc.free(value.in_predicates);
-    freeJsonContains(alloc, value.json_contains);
-    if (value.json_contains.len > 0) alloc.free(value.json_contains);
-    freeJsonPathEq(alloc, value.json_path_eq);
-    if (value.json_path_eq.len > 0) alloc.free(value.json_path_eq);
-    freeJsonPathExists(alloc, value.json_path_exists);
-    if (value.json_path_exists.len > 0) alloc.free(value.json_path_exists);
-    freeTextPatterns(alloc, value.text_patterns);
-    if (value.text_patterns.len > 0) alloc.free(value.text_patterns);
-}
-
-fn freeAccessPredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsAccessPredicateGroup) void {
-    for (values) |value| freeAccessPredicateGroup(alloc, value);
-}
-
-fn freeJsonContains(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonContainsPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.value_json);
-    }
-}
-
-fn freeJsonPathEq(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonPathEqPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.path);
-        alloc.free(value.value_json);
-    }
-}
-
-fn freeJsonPathExists(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonPathExistsPredicate) void {
-    for (values) |value| {
-        alloc.free(value.field);
-        alloc.free(value.path);
-    }
-}
-
 fn freeJsonExtract(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonExtractProjection) void {
     for (values) |value| {
         alloc.free(value.output);
@@ -40178,29 +40035,6 @@ fn expressionProjectionFromCoalesceAlloc(
     };
 }
 
-fn cloneOrderByAlloc(
-    alloc: std.mem.Allocator,
-    values: []const db_mod.types.RelationalRowsQueryOrder,
-) ![]const db_mod.types.RelationalRowsQueryOrder {
-    if (values.len == 0) return &.{};
-    const out = try alloc.alloc(db_mod.types.RelationalRowsQueryOrder, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeOrderBy(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (values, 0..) |value, i| {
-        out[i] = .{
-            .direction = value.direction,
-            .null_test = value.null_test,
-        };
-        if (value.field.len > 0) out[i].field = try alloc.dupe(u8, value.field);
-        if (value.expression) |expression| out[i].expression = try cloneExpressionAlloc(alloc, expression);
-        initialized += 1;
-    }
-    return out;
-}
-
 fn cloneNamedWindowDefinitionAlloc(
     alloc: std.mem.Allocator,
     value: Parser.NamedWindowSpec,
@@ -40224,228 +40058,12 @@ fn cloneNamedWindowDefinitionAlloc(
     };
 }
 
-fn rewriteExpressionFieldsToSource(value: *db_mod.types.RelationalRowsExpression) void {
-    if (value.kind == .field) value.field_source = .source;
-    for (@constCast(value.operands)) |*operand| rewriteExpressionFieldsToSource(operand);
-    for (@constCast(value.case_branches)) |*branch| {
-        rewriteExpressionConditionFieldsToSource(&branch.when);
-        rewriteExpressionFieldsToSource(&branch.then);
-    }
-    for (@constCast(value.case_else)) |*fallback| rewriteExpressionFieldsToSource(fallback);
-}
-
-fn rewriteExpressionConditionFieldsToSource(value: *db_mod.types.RelationalRowsExpressionCondition) void {
-    rewriteExpressionFieldsToSource(&value.lhs);
-    for (@constCast(value.rhs)) |*rhs| rewriteExpressionFieldsToSource(rhs);
-}
-
-fn cloneSelectOutputsAlloc(
-    alloc: std.mem.Allocator,
-    values: []const SelectOutputRef,
-) ![]const SelectOutputRef {
-    if (values.len == 0) return &.{};
-    return try alloc.dupe(SelectOutputRef, values);
-}
-
-fn cloneExpressionProjection(
-    alloc: std.mem.Allocator,
-    value: db_mod.types.RelationalRowsExpressionProjection,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const output = try alloc.dupe(u8, value.output);
-    var output_transferred = false;
-    errdefer if (!output_transferred) alloc.free(output);
-    const expression = try cloneExpressionAlloc(alloc, value.expression);
-    output_transferred = true;
-    return .{
-        .output = output,
-        .expression = expression,
-    };
-}
-
-fn cloneExpressionCaseBranchAlloc(
-    alloc: std.mem.Allocator,
-    value: db_mod.types.RelationalRowsExpressionCaseBranch,
-) anyerror!db_mod.types.RelationalRowsExpressionCaseBranch {
-    const when = try cloneExpressionConditionAlloc(alloc, value.when);
-    var when_transferred = false;
-    errdefer if (!when_transferred) freeExpressionCondition(alloc, when);
-    const then_expression = try cloneExpressionAlloc(alloc, value.then);
-    when_transferred = true;
-    return .{
-        .when = when,
-        .then = then_expression,
-    };
-}
-
-fn cloneExpressionConditionAlloc(
-    alloc: std.mem.Allocator,
-    value: db_mod.types.RelationalRowsExpressionCondition,
-) anyerror!db_mod.types.RelationalRowsExpressionCondition {
-    const lhs = try cloneExpressionAlloc(alloc, value.lhs);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
-
-    const rhs = if (value.rhs.len > 0) blk: {
-        const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.rhs.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |expression| freeExpression(alloc, expression);
-            alloc.free(out);
-        }
-        for (value.rhs, 0..) |expression, i| {
-            out[i] = try cloneExpressionAlloc(alloc, expression);
-            initialized += 1;
-        }
-        break :blk out;
-    } else &.{};
-
-    lhs_transferred = true;
-    return .{
-        .lhs = lhs,
-        .op = value.op,
-        .rhs = rhs,
-    };
-}
-
-fn cloneExpressionConditionsAlloc(
-    alloc: std.mem.Allocator,
-    values: []const db_mod.types.RelationalRowsExpressionCondition,
-) anyerror![]db_mod.types.RelationalRowsExpressionCondition {
-    if (values.len == 0) return &.{};
-    const out = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |condition| freeExpressionCondition(alloc, condition);
-        alloc.free(out);
-    }
-    for (values) |condition| {
-        out[initialized] = try cloneExpressionConditionAlloc(alloc, condition);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneExpressionPredicateGroupsAlloc(
-    alloc: std.mem.Allocator,
-    values: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
-) anyerror![]db_mod.types.RelationalRowsExpressionPredicateGroup {
-    if (values.len == 0) return &.{};
-    const out = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |group| freeExpressionPredicateGroup(alloc, group);
-        alloc.free(out);
-    }
-    for (values) |group| {
-        out[initialized] = .{ .conditions = try cloneExpressionConditionsAlloc(alloc, group.conditions) };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneExpressionConditionsConcatAlloc(
-    alloc: std.mem.Allocator,
-    lhs: []const db_mod.types.RelationalRowsExpressionCondition,
-    rhs: []const db_mod.types.RelationalRowsExpressionCondition,
-) anyerror![]db_mod.types.RelationalRowsExpressionCondition {
-    const out = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, lhs.len + rhs.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |condition| freeExpressionCondition(alloc, condition);
-        alloc.free(out);
-    }
-    for (lhs) |condition| {
-        out[initialized] = try cloneExpressionConditionAlloc(alloc, condition);
-        initialized += 1;
-    }
-    for (rhs) |condition| {
-        out[initialized] = try cloneExpressionConditionAlloc(alloc, condition);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn freeExpressionCaseBranch(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCaseBranch) void {
-    freeExpressionCondition(alloc, value.when);
-    freeExpression(alloc, value.then);
-}
-
-fn freeExpressionCondition(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCondition) void {
-    freeExpression(alloc, value.lhs);
-    for (value.rhs) |rhs| freeExpression(alloc, rhs);
-    if (value.rhs.len > 0) alloc.free(value.rhs);
-}
-
-fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionCondition) void {
-    for (values) |value| freeExpressionCondition(alloc, value);
-}
-
-fn freeExpressionPredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionPredicateGroup) void {
-    freeExpressionConditions(alloc, value.conditions);
-    if (value.conditions.len > 0) alloc.free(value.conditions);
-}
-
-fn freeExpressionPredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
-    for (values) |group| {
-        freeExpressionPredicateGroup(alloc, group);
-    }
-}
-
-fn freeExpressionProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionProjection) void {
-    alloc.free(value.output);
-    freeExpression(alloc, value.expression);
-}
-
-fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionProjection) void {
-    for (values) |value| freeExpressionProjection(alloc, value);
-    if (values.len > 0) alloc.free(values);
-}
-
 fn freeFieldAliasProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsFieldAliasProjection) void {
     for (values) |value| {
         alloc.free(value.output);
         alloc.free(value.field);
     }
     if (values.len > 0) alloc.free(values);
-}
-
-fn freeWindowSpec(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsWindowSpec) void {
-    alloc.free(value.output);
-    freeStringSlice(alloc, value.partition_by);
-    freeOrderBy(alloc, value.order_by);
-    if (value.order_by.len > 0) alloc.free(value.order_by);
-    if (value.value_expression) |expression| freeExpression(alloc, expression);
-    if (value.default_json.len > 0) alloc.free(value.default_json);
-    freeRelationalChecks(alloc, value.filter_predicates);
-    if (value.filter_predicates.len > 0) alloc.free(value.filter_predicates);
-    freeArrayAny(alloc, value.filter_array_any);
-    if (value.filter_array_any.len > 0) alloc.free(value.filter_array_any);
-    freeArrayContains(alloc, value.filter_array_contains);
-    if (value.filter_array_contains.len > 0) alloc.free(value.filter_array_contains);
-    freeArrayEq(alloc, value.filter_array_eq);
-    if (value.filter_array_eq.len > 0) alloc.free(value.filter_array_eq);
-    freeInPredicates(alloc, value.filter_in_predicates);
-    if (value.filter_in_predicates.len > 0) alloc.free(value.filter_in_predicates);
-    freeJsonContains(alloc, value.filter_json_contains);
-    if (value.filter_json_contains.len > 0) alloc.free(value.filter_json_contains);
-    freeJsonPathEq(alloc, value.filter_json_path_eq);
-    if (value.filter_json_path_eq.len > 0) alloc.free(value.filter_json_path_eq);
-    freeJsonPathExists(alloc, value.filter_json_path_exists);
-    if (value.filter_json_path_exists.len > 0) alloc.free(value.filter_json_path_exists);
-    freeTextPatterns(alloc, value.filter_text_patterns);
-    if (value.filter_text_patterns.len > 0) alloc.free(value.filter_text_patterns);
-    freeExpressionConditions(alloc, value.filter_expressions);
-    if (value.filter_expressions.len > 0) alloc.free(value.filter_expressions);
-    freeExpressionArrayContains(alloc, value.filter_expression_array_contains);
-    if (value.filter_expression_array_contains.len > 0) alloc.free(value.filter_expression_array_contains);
-    freeExpressionPredicateGroups(alloc, value.filter_any);
-    if (value.filter_any.len > 0) alloc.free(value.filter_any);
-    freeExpressionPredicateGroups(alloc, value.filter_not);
-    if (value.filter_not.len > 0) alloc.free(value.filter_not);
-}
-
-fn freeWindowSpecs(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsWindowSpec) void {
-    for (values) |value| freeWindowSpec(alloc, value);
 }
 
 fn freeNamedWindowDefinition(alloc: std.mem.Allocator, value: Parser.NamedWindowDefinition) void {
@@ -40464,13 +40082,6 @@ fn freeNamedWindowSpec(alloc: std.mem.Allocator, value: Parser.NamedWindowSpec) 
 fn freeNamedWindowSpecs(alloc: std.mem.Allocator, values: []const Parser.NamedWindowSpec) void {
     for (values) |value| freeNamedWindowSpec(alloc, value);
     if (values.len > 0) alloc.free(values);
-}
-
-fn freeOrderBy(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsQueryOrder) void {
-    for (values) |value| {
-        if (value.field.len > 0) alloc.free(value.field);
-        if (value.expression) |expression| freeExpression(alloc, expression);
-    }
 }
 
 test "postgres sql adapter lowers create table ddl into typed schema plan" {
@@ -46690,6 +46301,39 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer runtime_setting_session.deinit(alloc);
     try std.testing.expectEqualStrings("1ms", runtime_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("tenant-a", runtime_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), try parseSqlStatementTimeoutNs("1"));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), try parseSqlStatementTimeoutNs("1ms"));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_us), try parseSqlStatementTimeoutNs("1us"));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), try parseSqlStatementTimeoutNs("1s"));
+    try std.testing.expectEqual(@as(u64, 60 * std.time.ns_per_s), try parseSqlStatementTimeoutNs("1min"));
+    try std.testing.expectEqual(@as(u64, 60 * 60 * std.time.ns_per_s), try parseSqlStatementTimeoutNs("1h"));
+    try std.testing.expectError(error.InvalidRoleSetting, parseSqlStatementTimeoutNs(""));
+    try std.testing.expectError(error.InvalidRoleSetting, parseSqlStatementTimeoutNs("five"));
+    try std.testing.expectError(error.InvalidRoleSetting, parseSqlStatementTimeoutNs("5fortnights"));
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_ms), try sqlStatementTimeoutNsFromSession(runtime_setting_session.session()));
+    try std.testing.expect(sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(runtime_setting_session.session()), 1_000, 1_000 + std.time.ns_per_ms));
+    try std.testing.expect(!sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(runtime_setting_session.session()), 1_000, 1_000 + std.time.ns_per_ms - 1));
+    try enforceSqlStatementTimeoutAt(runtime_setting_session.session(), 1_000, 1_000 + std.time.ns_per_ms - 1);
+    try std.testing.expectError(error.StatementTimeout, enforceSqlStatementTimeoutAt(runtime_setting_session.session(), 1_000, 1_000 + std.time.ns_per_ms));
+
+    var disable_timeout = try lowerDdlPlanAlloc(alloc, "SET statement_timeout = '0';");
+    defer disable_timeout.deinit(alloc);
+    const disable_timeout_plan = switch (disable_timeout) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var disabled_timeout_session = try applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), disable_timeout_plan);
+    defer disabled_timeout_session.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, null), try sqlStatementTimeoutNsFromSession(disabled_timeout_session.session()));
+    try std.testing.expect(!sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(disabled_timeout_session.session()), 1_000, std.math.maxInt(u64)));
+
+    var invalid_timeout = try lowerDdlPlanAlloc(alloc, "SET statement_timeout = 'five';");
+    defer invalid_timeout.deinit(alloc);
+    const invalid_timeout_plan = switch (invalid_timeout) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectError(error.InvalidRoleSetting, applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), invalid_timeout_plan));
 
     var reset_app_setting = try lowerDdlPlanAlloc(alloc, "RESET app.tenant_id;");
     defer reset_app_setting.deinit(alloc);

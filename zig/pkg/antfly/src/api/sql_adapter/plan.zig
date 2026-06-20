@@ -491,7 +491,7 @@ pub fn cloneExpressionAlloc(
 }
 
 pub fn rewriteExpressionFieldsToSource(value: *db_mod.types.RelationalRowsExpression) void {
-    if (value.kind == .field) value.field_source = .source;
+    if (value.field.len > 0) value.field_source = .source;
     for (@constCast(value.operands)) |*operand| rewriteExpressionFieldsToSource(operand);
     for (@constCast(value.case_branches)) |*branch| {
         rewriteExpressionConditionFieldsToSource(&branch.when);
@@ -631,6 +631,29 @@ pub fn cloneExpressionConditionsConcatAlloc(
     return out;
 }
 
+pub fn cloneOrderByAlloc(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.types.RelationalRowsQueryOrder,
+) ![]const db_mod.types.RelationalRowsQueryOrder {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsQueryOrder, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeOrderBy(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = .{
+            .direction = value.direction,
+            .null_test = value.null_test,
+        };
+        if (value.field.len > 0) out[i].field = try alloc.dupe(u8, value.field);
+        if (value.expression) |expression| out[i].expression = try cloneExpressionAlloc(alloc, expression);
+        initialized += 1;
+    }
+    return out;
+}
+
 pub fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpression) void {
     if (value.field.len > 0) alloc.free(value.field);
     if (value.value_json.len > 0) alloc.free(value.value_json);
@@ -680,6 +703,283 @@ pub fn freeExpressionProjection(alloc: std.mem.Allocator, value: db_mod.types.Re
 pub fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionProjection) void {
     for (values) |value| freeExpressionProjection(alloc, value);
     if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeOrderBy(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsQueryOrder) void {
+    for (values) |value| {
+        if (value.field.len > 0) alloc.free(value.field);
+        if (value.expression) |expression| freeExpression(alloc, expression);
+    }
+}
+
+pub fn freeRelationalCheck(alloc: std.mem.Allocator, value: runtime_schema.RelationalCheck) void {
+    std.debug.assert(value.name.len == 0);
+    alloc.free(value.field);
+    if (value.value_json) |json| alloc.free(json);
+    if (value.expression) |expression| freeExpressionCondition(alloc, expression);
+}
+
+pub fn freeRelationalChecks(alloc: std.mem.Allocator, values: []const runtime_schema.RelationalCheck) void {
+    for (values) |value| freeRelationalCheck(alloc, value);
+}
+
+pub fn freeArrayContains(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayContainsPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.value_json);
+    }
+}
+
+pub fn freeArrayAny(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayAnyPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.value_json);
+    }
+}
+
+pub fn freeArrayEq(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayEqPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.value_json);
+    }
+}
+
+pub fn freeExpressionArrayContainsOne(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpressionArrayContainsPredicate,
+) void {
+    freeExpression(alloc, value.expression);
+    alloc.free(value.value_json);
+}
+
+pub fn freeExpressionArrayContains(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate,
+) void {
+    for (values) |value| freeExpressionArrayContainsOne(alloc, value);
+}
+
+pub fn freeInPredicates(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsInPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.values_json);
+    }
+}
+
+pub fn freeTextPatterns(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsTextPatternPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.pattern);
+    }
+}
+
+pub fn freeJsonContains(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonContainsPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.value_json);
+    }
+}
+
+pub fn freeJsonPathEq(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonPathEqPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.path);
+        alloc.free(value.value_json);
+    }
+}
+
+pub fn freeJsonPathExists(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonPathExistsPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.path);
+    }
+}
+
+pub fn freePredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsPredicateGroup) void {
+    freeRelationalChecks(alloc, value.predicates);
+    if (value.predicates.len > 0) alloc.free(value.predicates);
+}
+
+pub fn freePredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsPredicateGroup) void {
+    for (values) |value| freePredicateGroup(alloc, value);
+}
+
+pub fn freeAccessPredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsAccessPredicateGroup) void {
+    freeRelationalChecks(alloc, value.predicates);
+    if (value.predicates.len > 0) alloc.free(value.predicates);
+    freeArrayAny(alloc, value.array_any);
+    if (value.array_any.len > 0) alloc.free(value.array_any);
+    freeArrayContains(alloc, value.array_contains);
+    if (value.array_contains.len > 0) alloc.free(value.array_contains);
+    freeArrayEq(alloc, value.array_eq);
+    if (value.array_eq.len > 0) alloc.free(value.array_eq);
+    freeInPredicates(alloc, value.in_predicates);
+    if (value.in_predicates.len > 0) alloc.free(value.in_predicates);
+    freeJsonContains(alloc, value.json_contains);
+    if (value.json_contains.len > 0) alloc.free(value.json_contains);
+    freeJsonPathEq(alloc, value.json_path_eq);
+    if (value.json_path_eq.len > 0) alloc.free(value.json_path_eq);
+    freeJsonPathExists(alloc, value.json_path_exists);
+    if (value.json_path_exists.len > 0) alloc.free(value.json_path_exists);
+    freeTextPatterns(alloc, value.text_patterns);
+    if (value.text_patterns.len > 0) alloc.free(value.text_patterns);
+}
+
+pub fn freeAccessPredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsAccessPredicateGroup) void {
+    for (values) |value| freeAccessPredicateGroup(alloc, value);
+}
+
+pub fn freeWindowSpec(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsWindowSpec) void {
+    alloc.free(value.output);
+    freeStringSlice(alloc, value.partition_by);
+    freeOrderBy(alloc, value.order_by);
+    if (value.order_by.len > 0) alloc.free(value.order_by);
+    if (value.value_expression) |expression| freeExpression(alloc, expression);
+    if (value.default_json.len > 0) alloc.free(value.default_json);
+    freeRelationalChecks(alloc, value.filter_predicates);
+    if (value.filter_predicates.len > 0) alloc.free(value.filter_predicates);
+    freeArrayAny(alloc, value.filter_array_any);
+    if (value.filter_array_any.len > 0) alloc.free(value.filter_array_any);
+    freeArrayContains(alloc, value.filter_array_contains);
+    if (value.filter_array_contains.len > 0) alloc.free(value.filter_array_contains);
+    freeArrayEq(alloc, value.filter_array_eq);
+    if (value.filter_array_eq.len > 0) alloc.free(value.filter_array_eq);
+    freeInPredicates(alloc, value.filter_in_predicates);
+    if (value.filter_in_predicates.len > 0) alloc.free(value.filter_in_predicates);
+    freeJsonContains(alloc, value.filter_json_contains);
+    if (value.filter_json_contains.len > 0) alloc.free(value.filter_json_contains);
+    freeJsonPathEq(alloc, value.filter_json_path_eq);
+    if (value.filter_json_path_eq.len > 0) alloc.free(value.filter_json_path_eq);
+    freeJsonPathExists(alloc, value.filter_json_path_exists);
+    if (value.filter_json_path_exists.len > 0) alloc.free(value.filter_json_path_exists);
+    freeTextPatterns(alloc, value.filter_text_patterns);
+    if (value.filter_text_patterns.len > 0) alloc.free(value.filter_text_patterns);
+    freeExpressionConditions(alloc, value.filter_expressions);
+    if (value.filter_expressions.len > 0) alloc.free(value.filter_expressions);
+    freeExpressionArrayContains(alloc, value.filter_expression_array_contains);
+    if (value.filter_expression_array_contains.len > 0) alloc.free(value.filter_expression_array_contains);
+    freeExpressionPredicateGroups(alloc, value.filter_any);
+    if (value.filter_any.len > 0) alloc.free(value.filter_any);
+    freeExpressionPredicateGroups(alloc, value.filter_not);
+    if (value.filter_not.len > 0) alloc.free(value.filter_not);
+}
+
+pub fn freeWindowSpecs(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsWindowSpec) void {
+    for (values) |value| freeWindowSpec(alloc, value);
+}
+
+pub fn cloneQueryRelationalCheckAlloc(alloc: std.mem.Allocator, value: runtime_schema.RelationalCheck) !runtime_schema.RelationalCheck {
+    const field = try alloc.dupe(u8, value.field);
+    errdefer alloc.free(field);
+    const value_json = if (value.value_json) |json| try alloc.dupe(u8, json) else null;
+    errdefer if (value_json) |json| alloc.free(json);
+    return .{
+        .name = "",
+        .field = field,
+        .op = value.op,
+        .value_json = value_json,
+        .validation_state = value.validation_state,
+        .expression = if (value.expression) |expression| try cloneExpressionConditionAlloc(alloc, expression) else null,
+    };
+}
+
+pub fn cloneQueryRelationalChecksAlloc(
+    alloc: std.mem.Allocator,
+    values: []const runtime_schema.RelationalCheck,
+) ![]const runtime_schema.RelationalCheck {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeRelationalChecks(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try cloneQueryRelationalCheckAlloc(alloc, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneQueryRelationalChecksConcatAlloc(
+    alloc: std.mem.Allocator,
+    lhs: []const runtime_schema.RelationalCheck,
+    rhs: []const runtime_schema.RelationalCheck,
+) ![]const runtime_schema.RelationalCheck {
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, lhs.len + rhs.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeRelationalChecks(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (lhs) |value| {
+        out[initialized] = try cloneQueryRelationalCheckAlloc(alloc, value);
+        initialized += 1;
+    }
+    for (rhs) |value| {
+        out[initialized] = try cloneQueryRelationalCheckAlloc(alloc, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneInPredicateAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsInPredicate,
+) !db_mod.types.RelationalRowsInPredicate {
+    const field = try alloc.dupe(u8, value.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const values_json = try alloc.dupe(u8, value.values_json);
+    var values_transferred = false;
+    errdefer if (!values_transferred) alloc.free(values_json);
+    field_transferred = true;
+    values_transferred = true;
+    return .{
+        .field = field,
+        .values_json = values_json,
+        .negated = value.negated,
+    };
+}
+
+pub fn cloneInPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.types.RelationalRowsInPredicate,
+) ![]const db_mod.types.RelationalRowsInPredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsInPredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeInPredicates(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try cloneInPredicateAlloc(alloc, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneInPredicatesConcatAlloc(
+    alloc: std.mem.Allocator,
+    lhs: []const db_mod.types.RelationalRowsInPredicate,
+    rhs: []const db_mod.types.RelationalRowsInPredicate,
+) ![]const db_mod.types.RelationalRowsInPredicate {
+    const out = try alloc.alloc(db_mod.types.RelationalRowsInPredicate, lhs.len + rhs.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeInPredicates(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (lhs) |value| {
+        out[initialized] = try cloneInPredicateAlloc(alloc, value);
+        initialized += 1;
+    }
+    for (rhs) |value| {
+        out[initialized] = try cloneInPredicateAlloc(alloc, value);
+        initialized += 1;
+    }
+    return out;
 }
 
 pub fn freeMergeFieldMappingValues(alloc: std.mem.Allocator, values: []const MergeFieldMapping) void {
@@ -760,6 +1060,251 @@ pub fn freeMergeArmPredicateValue(alloc: std.mem.Allocator, value: MergeArmPredi
 fn freeMergeArmPredicates(alloc: std.mem.Allocator, values: []const MergeArmPredicate) void {
     freeMergeArmPredicateValues(alloc, values);
     if (values.len > 0) alloc.free(values);
+}
+
+test "sql adapter plan clones and frees row expressions" {
+    const alloc = std.testing.allocator;
+
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+    operands[0] = .{
+        .kind = .field,
+        .field = try alloc.dupe(u8, "tenant_id"),
+        .field_source = .row,
+    };
+    operands[1] = .{
+        .kind = .value,
+        .value_json = try alloc.dupe(u8, "\"tenant-a\""),
+    };
+
+    const branch_rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    branch_rhs[0] = .{
+        .kind = .value,
+        .value_json = try alloc.dupe(u8, "\"active\""),
+    };
+
+    const branches = try alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, 1);
+    branches[0] = .{
+        .when = .{
+            .lhs = .{
+                .kind = .field,
+                .field = try alloc.dupe(u8, "status"),
+                .field_source = .row,
+            },
+            .op = .eq,
+            .rhs = branch_rhs,
+        },
+        .then = .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, "payload"),
+            .json_path = try alloc.dupe(u8, "$.tier"),
+            .json_as_text = true,
+        },
+    };
+
+    const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    fallback[0] = .{
+        .kind = .value,
+        .value_json = try alloc.dupe(u8, "\"unknown\""),
+    };
+
+    const expression: db_mod.types.RelationalRowsExpression = .{
+        .kind = .case,
+        .operands = operands,
+        .case_branches = branches,
+        .case_else = fallback,
+    };
+    defer freeExpression(alloc, expression);
+
+    var cloned = try cloneExpressionAlloc(alloc, expression);
+    defer freeExpression(alloc, cloned);
+
+    try std.testing.expect(cloned.operands.ptr != expression.operands.ptr);
+    try std.testing.expect(cloned.case_branches.ptr != expression.case_branches.ptr);
+    try std.testing.expect(cloned.case_else.ptr != expression.case_else.ptr);
+    try std.testing.expectEqualStrings("tenant_id", cloned.operands[0].field);
+    try std.testing.expectEqualStrings("$.tier", cloned.case_branches[0].then.json_path);
+
+    rewriteExpressionFieldsToSource(&cloned);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, cloned.operands[0].field_source);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, cloned.case_branches[0].when.lhs.field_source);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, cloned.case_branches[0].then.field_source);
+
+    const order_by = try alloc.alloc(db_mod.types.RelationalRowsQueryOrder, 2);
+    defer {
+        freeOrderBy(alloc, order_by);
+        alloc.free(order_by);
+    }
+    order_by[0] = .{
+        .field = try alloc.dupe(u8, "created_at"),
+        .direction = .desc,
+        .null_test = .is_not_null,
+    };
+    order_by[1] = .{
+        .expression = .{
+            .kind = .lower,
+            .operands = try alloc.dupe(db_mod.types.RelationalRowsExpression, &[_]db_mod.types.RelationalRowsExpression{.{
+                .kind = .field,
+                .field = try alloc.dupe(u8, "email"),
+            }}),
+        },
+    };
+
+    const cloned_order_by = try cloneOrderByAlloc(alloc, order_by);
+    defer {
+        freeOrderBy(alloc, cloned_order_by);
+        alloc.free(cloned_order_by);
+    }
+
+    try std.testing.expect(cloned_order_by.ptr != order_by.ptr);
+    try std.testing.expectEqualStrings("created_at", cloned_order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, cloned_order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_not_null, cloned_order_by[0].null_test.?);
+    try std.testing.expect(cloned_order_by[1].expression != null);
+    try std.testing.expect(cloned_order_by[1].expression.?.operands.ptr != order_by[1].expression.?.operands.ptr);
+    try std.testing.expectEqualStrings("email", cloned_order_by[1].expression.?.operands[0].field);
+}
+
+test "sql adapter plan frees predicate and window ownership containers" {
+    const alloc = std.testing.allocator;
+
+    const access_group = db_mod.types.RelationalRowsAccessPredicateGroup{
+        .predicates = try alloc.dupe(runtime_schema.RelationalCheck, &[_]runtime_schema.RelationalCheck{.{
+            .name = "",
+            .field = try alloc.dupe(u8, "tenant_id"),
+            .op = .eq,
+            .value_json = try alloc.dupe(u8, "\"tenant-a\""),
+        }}),
+        .array_contains = try alloc.dupe(db_mod.types.RelationalRowsArrayContainsPredicate, &[_]db_mod.types.RelationalRowsArrayContainsPredicate{.{
+            .field = try alloc.dupe(u8, "tags"),
+            .value_json = try alloc.dupe(u8, "[\"vip\"]"),
+        }}),
+        .in_predicates = try alloc.dupe(db_mod.types.RelationalRowsInPredicate, &[_]db_mod.types.RelationalRowsInPredicate{.{
+            .field = try alloc.dupe(u8, "status"),
+            .values_json = try alloc.dupe(u8, "[\"active\",\"trial\"]"),
+        }}),
+        .json_path_eq = try alloc.dupe(db_mod.types.RelationalRowsJsonPathEqPredicate, &[_]db_mod.types.RelationalRowsJsonPathEqPredicate{.{
+            .field = try alloc.dupe(u8, "payload"),
+            .path = try alloc.dupe(u8, "$.region"),
+            .value_json = try alloc.dupe(u8, "\"us\""),
+        }}),
+        .text_patterns = try alloc.dupe(db_mod.types.RelationalRowsTextPatternPredicate, &[_]db_mod.types.RelationalRowsTextPatternPredicate{.{
+            .field = try alloc.dupe(u8, "email"),
+            .pattern = try alloc.dupe(u8, "%@example.com"),
+            .case_insensitive = true,
+        }}),
+    };
+    freeAccessPredicateGroup(alloc, access_group);
+
+    const window_order = try alloc.dupe(db_mod.types.RelationalRowsQueryOrder, &[_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = try alloc.dupe(u8, "created_at"),
+        .direction = .desc,
+    }});
+
+    const window = db_mod.types.RelationalRowsWindowSpec{
+        .output = try alloc.dupe(u8, "ranked"),
+        .function = .row_number,
+        .partition_by = try alloc.dupe([]const u8, &[_][]const u8{try alloc.dupe(u8, "tenant_id")}),
+        .order_by = window_order,
+        .value_expression = .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, "amount"),
+        },
+        .default_json = try alloc.dupe(u8, "0"),
+        .filter_predicates = try alloc.dupe(runtime_schema.RelationalCheck, &[_]runtime_schema.RelationalCheck{.{
+            .name = "",
+            .field = try alloc.dupe(u8, "amount"),
+            .op = .gte,
+            .value_json = try alloc.dupe(u8, "0"),
+        }}),
+        .filter_json_contains = try alloc.dupe(db_mod.types.RelationalRowsJsonContainsPredicate, &[_]db_mod.types.RelationalRowsJsonContainsPredicate{.{
+            .field = try alloc.dupe(u8, "payload"),
+            .value_json = try alloc.dupe(u8, "{\"kind\":\"invoice\"}"),
+        }}),
+        .filter_expression_array_contains = try alloc.dupe(db_mod.types.RelationalRowsExpressionArrayContainsPredicate, &[_]db_mod.types.RelationalRowsExpressionArrayContainsPredicate{.{
+            .expression = .{
+                .kind = .field,
+                .field = try alloc.dupe(u8, "tags"),
+            },
+            .value_json = try alloc.dupe(u8, "\"paid\""),
+        }}),
+        .filter_expressions = try alloc.dupe(db_mod.types.RelationalRowsExpressionCondition, &[_]db_mod.types.RelationalRowsExpressionCondition{.{
+            .lhs = .{
+                .kind = .field,
+                .field = try alloc.dupe(u8, "status"),
+            },
+            .op = .eq,
+            .rhs = try alloc.dupe(db_mod.types.RelationalRowsExpression, &[_]db_mod.types.RelationalRowsExpression{.{
+                .kind = .value,
+                .value_json = try alloc.dupe(u8, "\"active\""),
+            }}),
+        }}),
+    };
+    freeWindowSpec(alloc, window);
+}
+
+test "sql adapter plan clones query predicates" {
+    const alloc = std.testing.allocator;
+
+    const lhs_checks = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "tenant_id",
+        .op = .eq,
+        .value_json = "\"tenant-a\"",
+        .validation_state = .enforced,
+    }};
+    const rhs_expression_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "10",
+    }};
+    const rhs_checks = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "amount",
+        .op = .gte,
+        .expression = .{
+            .lhs = .{
+                .kind = .field,
+                .field = "amount",
+            },
+            .op = .gte,
+            .rhs = &rhs_expression_rhs,
+        },
+    }};
+
+    const cloned_checks = try cloneQueryRelationalChecksConcatAlloc(alloc, &lhs_checks, &rhs_checks);
+    defer {
+        freeRelationalChecks(alloc, cloned_checks);
+        alloc.free(cloned_checks);
+    }
+    try std.testing.expectEqual(@as(usize, 2), cloned_checks.len);
+    try std.testing.expectEqualStrings("tenant_id", cloned_checks[0].field);
+    try std.testing.expect(cloned_checks[0].field.ptr != lhs_checks[0].field.ptr);
+    try std.testing.expect(cloned_checks[0].value_json != null);
+    try std.testing.expect(cloned_checks[0].value_json.?.ptr != lhs_checks[0].value_json.?.ptr);
+    try std.testing.expect(cloned_checks[1].expression != null);
+    try std.testing.expectEqualStrings("amount", cloned_checks[1].expression.?.lhs.field);
+    try std.testing.expect(cloned_checks[1].expression.?.lhs.field.ptr != rhs_checks[0].expression.?.lhs.field.ptr);
+
+    const lhs_in = [_]db_mod.types.RelationalRowsInPredicate{.{
+        .field = "status",
+        .values_json = "[\"active\"]",
+    }};
+    const rhs_in = [_]db_mod.types.RelationalRowsInPredicate{.{
+        .field = "region",
+        .values_json = "[\"us\",\"eu\"]",
+        .negated = true,
+    }};
+
+    const cloned_in = try cloneInPredicatesConcatAlloc(alloc, &lhs_in, &rhs_in);
+    defer {
+        freeInPredicates(alloc, cloned_in);
+        alloc.free(cloned_in);
+    }
+    try std.testing.expectEqual(@as(usize, 2), cloned_in.len);
+    try std.testing.expectEqualStrings("status", cloned_in[0].field);
+    try std.testing.expect(cloned_in[0].field.ptr != lhs_in[0].field.ptr);
+    try std.testing.expectEqualStrings("[\"us\",\"eu\"]", cloned_in[1].values_json);
+    try std.testing.expect(cloned_in[1].values_json.ptr != rhs_in[0].values_json.ptr);
+    try std.testing.expect(cloned_in[1].negated);
 }
 
 test "sql adapter lowered read plans own nested storage plan memory" {

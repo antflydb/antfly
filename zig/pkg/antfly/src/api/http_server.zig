@@ -2727,9 +2727,17 @@ pub const ApiHttpServer = struct {
         return self.ensureSqlNotificationSessionId(session);
     }
 
+    fn enforceSqlStatementTimeout(_: *ApiHttpServer, statement_timeout_ns: ?u64, statement_start_ns: u64) !void {
+        if (relational_sql.sqlStatementTimeoutExpired(statement_timeout_ns, statement_start_ns, platform_time.monotonicNs())) return error.StatementTimeout;
+    }
+
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *relational_sql.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try relational_sql.sqlStatementTimeoutNsFromSession(session.session());
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var plan = try relational_sql.lowerDdlPlanAlloc(self.alloc, sql);
         defer plan.deinit(self.alloc);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         switch (plan) {
             .session_catalog => |session_plan| {
                 const notification_session_id = session.notification_session_id;
@@ -2747,32 +2755,44 @@ pub const ApiHttpServer = struct {
                 session.* = updated;
                 var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                 applied.noop = true;
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
                 return applied;
             },
             .prepared_transaction => |prepared_plan| {
                 _ = try self.source.applyPreparedTransactionPlan(self.alloc, prepared_plan, sqlDdlTimestampNs());
-                return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return applied;
             },
             .prepared_statement => |prepared_statement_plan| {
                 const session_id = self.ensureSqlProtocolSessionId(session);
                 try self.sql_prepared_statement_runtime.apply(prepared_statement_plan, session_id);
                 var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                 applied.noop = true;
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
                 return applied;
             },
             .notification_channel => |notification_plan| {
                 const session_id = self.ensureSqlNotificationSessionId(session);
                 _ = try self.sql_notification_runtime.apply(notification_plan, session_id, sqlDdlTimestampNs());
-                return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return applied;
             },
             .function_catalog => |function_plan| {
                 try self.sql_routine_runtime.apply(function_plan);
-                return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return applied;
             },
             .extension_catalog => {
                 var applied = try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
                 errdefer applied.deinit(self.alloc);
                 try self.refreshSqlExtensionQueryFunctions();
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
                 return applied;
             },
             else => {},
@@ -2781,11 +2801,17 @@ pub const ApiHttpServer = struct {
         if (self.cfg.user_manager) |manager| {
             var catalog = try self.sqlAuthCatalogForDdlWithSession(sql, session.session());
             defer catalog.deinit(self.alloc);
-            if (try auth_sql_adapter.executeRelationalSqlDdlOnUserManagerWithCatalog(manager, self.alloc, sql, catalog.value)) |applied| {
+            if (try auth_sql_adapter.executeRelationalSqlDdlOnUserManagerWithCatalog(manager, self.alloc, sql, catalog.value)) |applied_value| {
+                var applied = applied_value;
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
                 return applied;
             }
         }
-        return try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
+        var applied = try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
+        errdefer applied.deinit(self.alloc);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return applied;
     }
 
     fn refreshSqlExtensionQueryFunctions(self: *ApiHttpServer) !void {
@@ -2825,6 +2851,9 @@ pub const ApiHttpServer = struct {
         session: catalog_resources.SqlCatalogSession,
         authenticated_identity: ?*const AuthenticatedIdentity,
     ) !relational_rows_api.OwnedRowsBatchRequest {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try relational_sql.sqlStatementTimeoutNsFromSession(session);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var ddl_plan = try relational_sql.lowerDdlPlanAlloc(self.alloc, sql);
         defer ddl_plan.deinit(self.alloc);
         const bulk_plan = switch (ddl_plan) {
@@ -2839,7 +2868,10 @@ pub const ApiHttpServer = struct {
             return error.UnsupportedSqlShape;
         }
 
-        return try self.executeBulkSqlImportPlanFromStdin(execution_plan, stdin_payload, session, authenticated_identity);
+        var rows = try self.executeBulkSqlImportPlanFromStdin(execution_plan, stdin_payload, session, authenticated_identity);
+        errdefer rows.deinit(self.alloc);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return rows;
     }
 
     pub fn executeBulkSqlWithSession(
@@ -2849,6 +2881,9 @@ pub const ApiHttpServer = struct {
         session: catalog_resources.SqlCatalogSession,
         authenticated_identity: ?*const AuthenticatedIdentity,
     ) !BulkSqlExecutionResult {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try relational_sql.sqlStatementTimeoutNsFromSession(session);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var ddl_plan = try relational_sql.lowerDdlPlanAlloc(self.alloc, sql);
         defer ddl_plan.deinit(self.alloc);
         const bulk_plan = switch (ddl_plan) {
@@ -2856,7 +2891,7 @@ pub const ApiHttpServer = struct {
             else => return error.UnsupportedSqlShape,
         };
         const execution_plan = try relational_sql.bulkSqlIoExecutionPlanFromDdlPlan(bulk_plan);
-        return switch (execution_plan.operation) {
+        var result: BulkSqlExecutionResult = switch (execution_plan.operation) {
             .import_rows => blk: {
                 if (execution_plan.native_route != .rows_batch or execution_plan.stream != .stdin) return error.UnsupportedSqlShape;
                 const payload = stdin_payload orelse return error.InvalidRowsRequest;
@@ -2872,6 +2907,9 @@ pub const ApiHttpServer = struct {
                 };
             },
         };
+        errdefer result.deinit(self.alloc);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return result;
     }
 
     pub fn executeBulkSqlCopyToStdoutWithSession(
@@ -2880,6 +2918,9 @@ pub const ApiHttpServer = struct {
         session: catalog_resources.SqlCatalogSession,
         authenticated_identity: ?*const AuthenticatedIdentity,
     ) ![]u8 {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try relational_sql.sqlStatementTimeoutNsFromSession(session);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         var ddl_plan = try relational_sql.lowerDdlPlanAlloc(self.alloc, sql);
         defer ddl_plan.deinit(self.alloc);
         const bulk_plan = switch (ddl_plan) {
@@ -2894,7 +2935,10 @@ pub const ApiHttpServer = struct {
             return error.UnsupportedSqlShape;
         }
 
-        return try self.executeBulkSqlExportPlanToStdout(execution_plan, session, authenticated_identity);
+        const exported = try self.executeBulkSqlExportPlanToStdout(execution_plan, session, authenticated_identity);
+        errdefer self.alloc.free(exported);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return exported;
     }
 
     fn executeBulkSqlImportPlanFromStdin(
@@ -19442,6 +19486,67 @@ test "api http server applies SQL DDL with explicit catalog session" {
     try std.testing.expect(set_local.noop);
     try std.testing.expectEqualStrings("public", session.search_path[0]);
     try std.testing.expect(session.transaction_local_search_path);
+}
+
+test "api http server enforces SQL statement timeout on session-backed DDL" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl_with_session = applyRelationalSqlDdlWithSession,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdlWithSession(
+            ptr: *anyopaque,
+            alloc_arg: std.mem.Allocator,
+            _: []const u8,
+            session: catalog_resources.SqlCatalogSession,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const expected_timeout: []const u8 = if (self.calls == 0) "100ms" else "0";
+            try std.testing.expectEqualStrings(expected_timeout, session.settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+            self.calls += 1;
+            sleepNs(120 * std.time.ns_per_ms);
+            return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc_arg);
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var set_timeout = try server.applyRelationalSqlDdlWithSession("SET statement_timeout = '100ms';", &session);
+    defer set_timeout.deinit(alloc);
+    try std.testing.expect(set_timeout.noop);
+    try std.testing.expectEqualStrings("100ms", session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+
+    try std.testing.expectError(
+        error.StatementTimeout,
+        server.applyRelationalSqlDdlWithSession("ALTER TABLE events DROP COLUMN IF EXISTS stale;", &session),
+    );
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    var disable_timeout = try server.applyRelationalSqlDdlWithSession("SET statement_timeout = '0';", &session);
+    defer disable_timeout.deinit(alloc);
+    var applied = try server.applyRelationalSqlDdlWithSession("ALTER TABLE events DROP COLUMN IF EXISTS stale;", &session);
+    defer applied.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
 }
 
 test "api http server routes prepared transaction SQL DDL to coordinator recovery" {

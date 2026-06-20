@@ -999,7 +999,9 @@ moves behind a `api/sql_adapter/` package:
 - `mod.zig`: public facade for the existing SQL lowering entrypoints and shared
   deinit helpers.
 - `plan.zig`: adapter public plan structs, fingerprints, and ownership helpers
-  that callers already consume.
+  that callers already consume, including shared row-expression clone, rewrite,
+  query-order clone, predicate clone/deinit, window deinit, and deinit helpers
+  used by read, write, DDL, and compatibility wrappers.
 - `ddl_plan.zig`: adapter public DDL/catalog plan containers and ownership
   helpers, including table, partition, index, relation-lifetime, identity
   allocator, domain, and catalog plans, plus grammar-syntax to plan-enum
@@ -1390,8 +1392,11 @@ parsing for `SELECT INTO` and
 write-plan, explain-plan, write-plan option, merge-arm, returning-projection,
 and relation-population containers that wrap Antfly-native typed query,
 aggregate, join, lateral, window, CTE, insert, update/delete, insert-source,
-mutation-source, joined-mutation-source, and merge mutation plans while
-preserving the existing public entrypoints through facade aliases;
+mutation-source, joined-mutation-source, and merge mutation plans, plus shared
+row-expression clone, source-rewrite, query-order clone, predicate-group,
+access-predicate-group, query-predicate clone, window-spec, and deinit helpers
+used across parser cleanup paths and lowered-plan ownership, while preserving
+the existing public entrypoints through facade aliases;
 `api/sql_adapter/ddl_plan.zig` owns the adapter-noop DDL, enum-type catalog,
 domain catalog, identity-allocator catalog,
 schema-namespace catalog, extension catalog, function/routine catalog, and
@@ -5138,7 +5143,9 @@ matching `RESET app.<key>` lower to typed session catalog plans, and
 `ALTER ROLE ... SET app.<key> = current_setting('app.<key>')` stores the current
 typed session value through the same auth execution boundary. Arbitrary
 expression-valued role defaults still fail closed until they have explicit
-native semantics.
+native semantics. SQL DDL and `COPY` execution read the effective
+`statement_timeout` once at statement start, fail expired statements before
+dispatch, and re-check after typed execution before returning owned results.
 
 `COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
 to typed bulk import/export intent that captures table identity, selected
