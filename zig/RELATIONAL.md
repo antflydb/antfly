@@ -5192,14 +5192,20 @@ accepted, and default replacement is valid only for imports. Import-side
 `COPY FROM ... WHERE` admits a conservative scalar `field <op> literal`
 conjunction subset and stores it as shared `RelationalRowsExpressionCondition`
 metadata, so later row decoding can evaluate filters without carrying SQL text.
-`relational_sql.bulkSqlIoExecutionPlanFromDdlPlan` now maps supported stream
-`COPY` plans into an explicit Antfly execution contract: `COPY FROM STDIN`
-requires a write permission on the table, audits as `copy_from`, and routes to
-the row-batch import surface; `COPY TO STDOUT` requires a read permission,
-audits as `copy_to`, and routes to the row-query export surface. The bridge also
-marks both directions as requiring an external SQL protocol stream so the SQL
-text cannot masquerade as payload. `COPY FROM STDIN` has an initial native CSV
-executor that converts the supplied stream into the row-batch API, and
+`relational_sql.bulkSqlIoExecutionPlanFromDdlPlan` now maps supported stream,
+file, and program `COPY` plans into an explicit Antfly execution contract:
+`COPY FROM STDIN` requires a write permission on the table, audits as
+`copy_from`, and routes to the row-batch import surface; `COPY TO STDOUT`
+requires a read permission, audits as `copy_to`, and routes to the row-query
+export surface. File endpoints use an optional embedding-provided file adapter,
+and `PROGRAM` endpoints use an optional embedding-provided program adapter;
+both remain fail-closed when the adapter is absent. Antfly never executes shell
+commands directly for `PROGRAM`; the adapter owns command allowlisting,
+sandboxing, and byte production/consumption while Antfly still owns SQL target
+resolution, auth, row-filter enforcement, and audit. The bridge also marks
+STDIN/STDOUT as requiring an external SQL protocol stream so the SQL text cannot
+masquerade as payload. `COPY FROM STDIN` has an initial native CSV executor that
+converts the supplied stream into the row-batch API, and
 `ApiHttpServer.executeBulkSqlWithSession` is the production SQL bulk-I/O
 entrypoint. It dispatches typed `COPY FROM STDIN` plans to an owned import
 result after resolving the SQL target through the current catalog session,
@@ -5231,21 +5237,19 @@ selected import/export columns must be unique and existing, `COPY FROM` cannot
 target generated columns, `FORCE_QUOTE` / `FORCE_NULL` / `FORCE_NOT_NULL`
 columns must be unique, existing, and part of the selected copy column set, and
 `COPY ... WHERE` expressions may only reference row fields owned by that table.
-The remaining production layer is the broader streaming executor contract
-around those paths: chunked protocol backpressure, 2PC staging, retryable range
-routing, deterministic reject-limit accounting, and snapshot-stable export
-streaming. PostgreSQL
-`COPY` syntax is therefore an adapter frontend for those
-contracts, but it must not bypass row-batch, mutation-source, or routed read
-semantics. Until server-file, `PROGRAM`, alternate stream endpoints, binary
-format, legacy OID options, and broader row-filtered `COPY FROM ... WHERE`
-predicate families have native bulk-I/O endpoint and validation contracts, the
-source parity corpus requires them to fail closed under `bulk_io_plan` or at the
-execution-bridge boundary. The generated fixture can pin either a concrete
-`bulk_sql_io` execution fingerprint or an execution-stage unsupported
-fingerprint, so parseable PostgreSQL syntax such as `COPY ... WITH (FORMAT
-binary)` remains visible as typed bulk-I/O intent while the bridge rejects it
-before storage can receive bytes.
+The remaining production layer is the broader streaming executor contract around
+those paths: chunked protocol backpressure, 2PC staging, retryable range routing,
+deterministic reject-limit accounting, and snapshot-stable export streaming.
+PostgreSQL `COPY` syntax is therefore an adapter frontend for those contracts,
+but it must not bypass row-batch, mutation-source, or routed read semantics.
+Until alternate stream endpoints, binary format, legacy OID options, and broader
+row-filtered `COPY FROM ... WHERE` predicate families have native bulk-I/O
+endpoint and validation contracts, the source parity corpus requires them to
+fail closed under `bulk_io_plan` or at the execution-bridge boundary. The
+generated fixture can pin either a concrete `bulk_sql_io` execution fingerprint
+or an execution-stage unsupported fingerprint, so parseable PostgreSQL syntax
+such as `COPY ... WITH (FORMAT binary)` remains visible as typed bulk-I/O intent
+while the bridge rejects it before storage can receive bytes.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,

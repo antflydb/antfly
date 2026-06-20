@@ -4352,7 +4352,7 @@
       "sql": "COPY usage_records (id, status) FROM '/tmp/usage.csv' WITH (FORMAT csv)"
     },
     {
-      "name": "unsupported copy from program endpoint",
+      "name": "copy from program endpoint bulk import ddl",
       "family": "ddl",
       "summary": {
         "ddl_tag": "copy_from",
@@ -4360,8 +4360,20 @@
         "operations": 2
       },
       "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=cat /tmp/usage.csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
-      "execution_plan": "unsupported:ddl:requires=bulk_io_plan",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=program:codec=postgres_text:endpoint_kind=program:endpoint=cat /tmp/usage.csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=false",
       "sql": "COPY usage_records (id, status) FROM PROGRAM 'cat /tmp/usage.csv'"
+    },
+    {
+      "name": "copy to program endpoint bulk export ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_to",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=cat > /tmp/usage.csv:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=export_rows:native=rows_query:stream=program:codec=csv:endpoint_kind=program:endpoint=cat > /tmp/usage.csv:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=false",
+      "sql": "COPY usage_records (id, status) TO PROGRAM 'cat > /tmp/usage.csv' WITH (FORMAT csv)"
     },
     {
       "name": "unsupported copy wrong stream endpoint",

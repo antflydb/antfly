@@ -275,6 +275,20 @@ pub const SqlBulkIoFileIo = struct {
     }
 };
 
+pub const SqlBulkIoProgramIo = struct {
+    ptr: *anyopaque,
+    read_import: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, command: []const u8) anyerror![]u8,
+    write_export: *const fn (ptr: *anyopaque, command: []const u8, payload: []const u8) anyerror!void,
+
+    pub fn readImport(self: @This(), alloc: std.mem.Allocator, command: []const u8) ![]u8 {
+        return try self.read_import(self.ptr, alloc, command);
+    }
+
+    pub fn writeExport(self: @This(), command: []const u8, payload: []const u8) !void {
+        return try self.write_export(self.ptr, command, payload);
+    }
+};
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     ard_base_url: ?[]const u8 = null,
@@ -338,8 +352,12 @@ pub const ApiHttpServerConfig = struct {
     sql_bulk_io_audit_sink: ?SqlBulkIoAuditSink = null,
     /// Optional SQL COPY file adapter. SQL file endpoints are unsupported unless
     /// the embedding process installs an explicit adapter with its own path
-    /// policy. PROGRAM endpoints remain fail-closed and never execute commands.
+    /// policy.
     sql_bulk_io_file_io: ?SqlBulkIoFileIo = null,
+    /// Optional SQL COPY PROGRAM adapter. Antfly never executes shell commands
+    /// directly; embeddings must install an adapter that applies its own command
+    /// allowlist/sandbox and returns or consumes bytes for the SQL bulk route.
+    sql_bulk_io_program_io: ?SqlBulkIoProgramIo = null,
 };
 
 const RowsUniqueSelectorResolverContext = struct {
@@ -3172,6 +3190,12 @@ pub const ApiHttpServer = struct {
                             .import_rows = try self.executeBulkSqlImportPlanFromFile(execution_plan, session, authenticated_identity),
                         };
                     },
+                    .program => {
+                        if (stdin_payload != null) return error.InvalidRowsRequest;
+                        break :blk .{
+                            .import_rows = try self.executeBulkSqlImportPlanFromProgram(execution_plan, session, authenticated_identity),
+                        };
+                    },
                     .stdout => return error.UnsupportedSqlShape,
                 }
             },
@@ -3184,6 +3208,10 @@ pub const ApiHttpServer = struct {
                     },
                     .file => {
                         try self.executeBulkSqlExportPlanToFile(execution_plan, session, authenticated_identity);
+                        break :blk .{ .export_file = {} };
+                    },
+                    .program => {
+                        try self.executeBulkSqlExportPlanToProgram(execution_plan, session, authenticated_identity);
                         break :blk .{ .export_file = {} };
                     },
                     .stdin => return error.UnsupportedSqlShape,
@@ -3260,6 +3288,19 @@ pub const ApiHttpServer = struct {
         return try self.executeBulkSqlImportPlanFromStdin(execution_plan, payload, session, authenticated_identity);
     }
 
+    fn executeBulkSqlImportPlanFromProgram(
+        self: *ApiHttpServer,
+        execution_plan: relational_sql.BulkSqlIoExecutionPlan,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !relational_rows_api.OwnedRowsBatchRequest {
+        if (execution_plan.stream != .program or execution_plan.endpoint_kind != .program) return error.UnsupportedSqlShape;
+        const program_io = self.cfg.sql_bulk_io_program_io orelse return error.UnsupportedOperation;
+        const payload = try program_io.readImport(self.alloc, execution_plan.endpoint);
+        defer self.alloc.free(payload);
+        return try self.executeBulkSqlImportPlanFromStdin(execution_plan, payload, session, authenticated_identity);
+    }
+
     fn executeBulkSqlExportPlanToStdout(
         self: *ApiHttpServer,
         execution_plan: relational_sql.BulkSqlIoExecutionPlan,
@@ -3289,6 +3330,20 @@ pub const ApiHttpServer = struct {
         const exported = try self.executeBulkSqlExportPlanBytes(execution_plan, session, authenticated_identity);
         defer self.alloc.free(exported.payload);
         try file_io.writeExport(execution_plan.endpoint, exported.payload);
+        try self.recordSqlBulkIoAudit(execution_plan, exported.target, exported.row_count, authenticated_identity);
+    }
+
+    fn executeBulkSqlExportPlanToProgram(
+        self: *ApiHttpServer,
+        execution_plan: relational_sql.BulkSqlIoExecutionPlan,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !void {
+        if (execution_plan.stream != .program or execution_plan.endpoint_kind != .program) return error.UnsupportedSqlShape;
+        const program_io = self.cfg.sql_bulk_io_program_io orelse return error.UnsupportedOperation;
+        const exported = try self.executeBulkSqlExportPlanBytes(execution_plan, session, authenticated_identity);
+        defer self.alloc.free(exported.payload);
+        try program_io.writeExport(execution_plan.endpoint, exported.payload);
         try self.recordSqlBulkIoAudit(execution_plan, exported.target, exported.row_count, authenticated_identity);
     }
 
@@ -21511,18 +21566,60 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             self.last_export_payload = try std.testing.allocator.dupe(u8, payload);
         }
     };
+    const FakeProgramIo = struct {
+        import_payload: []const u8,
+        last_import_command: []u8 = &.{},
+        last_export_command: []u8 = &.{},
+        last_export_payload: []u8 = &.{},
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.last_import_command.len > 0) allocator.free(self.last_import_command);
+            if (self.last_export_command.len > 0) allocator.free(self.last_export_command);
+            if (self.last_export_payload.len > 0) allocator.free(self.last_export_payload);
+        }
+
+        fn iface(self: *@This()) SqlBulkIoProgramIo {
+            return .{
+                .ptr = self,
+                .read_import = readImport,
+                .write_export = writeExport,
+            };
+        }
+
+        fn readImport(ptr: *anyopaque, allocator: std.mem.Allocator, command: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.last_import_command.len > 0) allocator.free(self.last_import_command);
+            self.last_import_command = try allocator.dupe(u8, command);
+            return try allocator.dupe(u8, self.import_payload);
+        }
+
+        fn writeExport(ptr: *anyopaque, command: []const u8, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.last_export_command.len > 0) std.testing.allocator.free(self.last_export_command);
+            if (self.last_export_payload.len > 0) std.testing.allocator.free(self.last_export_payload);
+            self.last_export_command = try std.testing.allocator.dupe(u8, command);
+            self.last_export_payload = try std.testing.allocator.dupe(u8, payload);
+        }
+    };
 
     var source = FakeSource{};
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var audit = FakeAudit{ .alloc = alloc };
     var file_io = FakeFileIo{ .import_payload = "id,status\nu_file,Ready\n" };
+    var program_io = FakeProgramIo{ .import_payload = "id,status\nu_program,Ready\n" };
     defer audit.deinit();
+    defer program_io.deinit(alloc);
     defer file_io.deinit(alloc);
     defer writes.deinit(alloc);
     var server = ApiHttpServer.init(
         alloc,
-        .{ .auth_enabled = true, .sql_bulk_io_audit_sink = audit.sink(), .sql_bulk_io_file_io = file_io.iface() },
+        .{
+            .auth_enabled = true,
+            .sql_bulk_io_audit_sink = audit.sink(),
+            .sql_bulk_io_file_io = file_io.iface(),
+            .sql_bulk_io_program_io = program_io.iface(),
+        },
         source.iface(),
         reads.source(),
         writes.source(),
@@ -21754,6 +21851,63 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[5].required_permission);
     try std.testing.expectEqual(@as(usize, 1), audit.events[5].row_count);
 
+    const configured_program_io = server.cfg.sql_bulk_io_program_io;
+    server.cfg.sql_bulk_io_program_io = null;
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        server.executeBulkSqlWithSession(
+            "COPY events (id, status) FROM PROGRAM 'cat /tmp/events.csv' WITH (FORMAT csv, HEADER true);",
+            null,
+            session,
+            &identity,
+        ),
+    );
+    server.cfg.sql_bulk_io_program_io = configured_program_io;
+    try std.testing.expectEqual(@as(usize, 3), writes.calls);
+    try std.testing.expectEqual(@as(usize, 6), audit.count);
+
+    var copied_program_result = try server.executeBulkSqlWithSession(
+        "COPY events (id, status) FROM PROGRAM 'cat /tmp/events.csv' WITH (FORMAT csv, HEADER true);",
+        null,
+        session,
+        &identity,
+    );
+    defer copied_program_result.deinit(alloc);
+    try std.testing.expectEqualStrings("cat /tmp/events.csv", program_io.last_import_command);
+    try std.testing.expectEqual(@as(usize, 4), writes.calls);
+    switch (copied_program_result) {
+        .import_rows => |copied| try std.testing.expectEqual(@as(usize, 1), copied.writes.len),
+        .export_stdout, .export_file => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 7), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[6].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[6].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[6].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.program, audit.events[6].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[6].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[6].row_count);
+
+    var exported_program_result = try server.executeBulkSqlWithSession(
+        "COPY events (id, status) TO PROGRAM 'cat > /tmp/events.csv' WITH (FORMAT csv, HEADER true);",
+        null,
+        session,
+        &identity,
+    );
+    defer exported_program_result.deinit(alloc);
+    switch (exported_program_result) {
+        .export_file => {},
+        .import_rows, .export_stdout => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings("cat > /tmp/events.csv", program_io.last_export_command);
+    try std.testing.expectEqualStrings("id,status\nu1,Ready\n", program_io.last_export_payload);
+    try std.testing.expectEqual(@as(usize, 8), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[7].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[7].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[7].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.program, audit.events[7].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[7].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[7].row_count);
+
     try std.testing.expectError(
         error.InvalidRowsRequest,
         server.executeBulkSqlWithSession(
@@ -21790,15 +21944,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             &identity,
         ),
     );
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        server.executeBulkSqlWithSession(
-            "COPY events FROM PROGRAM 'cat /tmp/events.csv';",
-            null,
-            session,
-            &identity,
-        ),
-    );
+    try std.testing.expectEqual(@as(usize, 8), audit.count);
 }
 
 test "api http server serves api key and row filter routes" {

@@ -199,7 +199,6 @@ const freeConflictClauses = sql_adapter.freeConflictClauses;
 const freeConflictTarget = sql_adapter.freeConflictTarget;
 const freeFieldExpressionValues = sql_adapter.freeFieldExpressionValues;
 const freeFieldJsonValues = sql_adapter.freeFieldJsonValues;
-const freeFieldPredicates = sql_adapter.freeFieldPredicates;
 const freeInsertValueRows = sql_adapter.freeInsertValueRows;
 const freeJoinedMutationSourceAssignments = sql_adapter.freeJoinedMutationSourceAssignments;
 const freeJsonSetParsedValue = sql_adapter.freeJsonSetParsedValue;
@@ -349,7 +348,6 @@ const uniqueConstraintReferencesAny = sql_adapter.uniqueConstraintReferencesAny;
 const uniqueConstraintValidationStateString = sql_adapter.uniqueConstraintValidationStateString;
 const uniqueExpressionOpToken = sql_adapter.uniqueExpressionOpToken;
 const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
-const uniquePredicateOpToken = sql_adapter.uniquePredicateOpToken;
 const updateWillLookupExistingRow = sql_adapter.updateWillLookupExistingRow;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
 const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
@@ -462,7 +460,6 @@ const ConflictTarget = sql_adapter.ConflictTarget;
 const conflictActionToken = sql_adapter.conflictActionToken;
 const FieldExpressionValue = sql_adapter.FieldExpressionValue;
 const FieldJsonValue = sql_adapter.FieldJsonValue;
-const FieldPredicate = sql_adapter.FieldPredicate;
 const InsertColumnSpec = sql_adapter.InsertColumnSpec;
 const InsertValueRows = sql_adapter.InsertValueRows;
 const JoinedMutationExpressionSide = sql_adapter.JoinedMutationExpressionSide;
@@ -2732,7 +2729,7 @@ const Parser = struct {
             operations.deinit(self.alloc);
         }
         while (true) {
-            try self.parseAlterTableOperation(&operations);
+            try sql_adapter.parseAlterTableOperationAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks(), &operations);
             if (self.match(.comma) == null) break;
         }
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
@@ -2751,157 +2748,6 @@ const Parser = struct {
             .if_exists = header.if_exists,
             .operations = owned_operations,
         };
-    }
-
-    fn parseAlterTableOperation(
-        self: *@This(),
-        operations: *std.ArrayListUnmanaged(AlterTableOperation),
-    ) !void {
-        if (try sql_adapter.parseAlterTablePrefixOperationAlloc(self.alloc, self.tokens, &self.pos)) |operation| {
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, operation);
-            return;
-        }
-
-        const add_column_start = self.pos;
-        if (sql_adapter.parseAlterTableAddColumnHeader(self.tokens, &self.pos)) |syntax| {
-            try self.parseAlterTableAddColumnOperation(operations, syntax.if_not_exists);
-            return;
-        } else |err| switch (err) {
-            error.UnsupportedSqlShape => self.pos = add_column_start,
-        }
-
-        var add_prefix = try sql_adapter.parseAlterTableAddOperationPrefixAlloc(self.alloc, self.tokens, &self.pos);
-        defer add_prefix.deinit(self.alloc);
-        const constraint_name = add_prefix.constraint_name;
-        if (add_prefix.kind == .period) {
-            const period = try sql_adapter.parseDdlPeriodConstraintPlanAlloc(self.alloc, self.tokens, &self.pos);
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddPeriodOperation(period));
-            return;
-        }
-        if (add_prefix.kind == .primary_key and self.matchKeyword("primary")) {
-            try self.expectKeyword("key");
-            const columns = try sql_adapter.parseDdlUniqueTemporalColumnListAlloc(self.alloc, self.tokens, &self.pos);
-            defer columns.deinit(self.alloc);
-            const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, columns.columns);
-            defer freeStringSlice(self.alloc, include_columns);
-            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-            const primary_key = try sql_adapter.makeDdlPrimaryKeyAlloc(self.alloc, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddPrimaryKeyOperation(primary_key));
-            return;
-        }
-        if (add_prefix.kind == .unique and self.matchKeyword("unique")) {
-            const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
-            const columns = try sql_adapter.parseDdlUniqueTemporalColumnListAlloc(self.alloc, self.tokens, &self.pos);
-            defer columns.deinit(self.alloc);
-            const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, columns.columns);
-            defer freeStringSlice(self.alloc, include_columns);
-            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-            var constraint = try sql_adapter.makeDdlUniqueConstraintAlloc(self.alloc, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
-            constraint.validation_state = .unvalidated;
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddUniqueConstraintOperation(constraint));
-            return;
-        }
-        if (add_prefix.kind == .foreign_key and self.matchKeyword("foreign")) {
-            var foreign_key = try sql_adapter.parseDdlForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, constraint_name);
-            foreign_key.validation_state = if (sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos)) .unvalidated else .unvalidated;
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddForeignKeyOperation(foreign_key));
-            return;
-        }
-        if (add_prefix.kind == .check and self.matchKeyword("check")) {
-            var check = try self.parseDdlCheckConstraint(constraint_name);
-            _ = sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos);
-            check.validation_state = .unvalidated;
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddCheckOperation(check));
-            return;
-        }
-
-        return error.UnsupportedSqlShape;
-    }
-
-    fn parseAlterTableAddColumnOperation(
-        self: *@This(),
-        operations: *std.ArrayListUnmanaged(AlterTableOperation),
-        if_not_exists: bool,
-    ) !void {
-        const column = try sql_adapter.parseDdlColumnDefinitionStandaloneAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
-        var column_transferred = false;
-        errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
-
-        var unique_constraints = std.ArrayListUnmanaged(runtime_schema.UniqueConstraint).empty;
-        errdefer {
-            clearDdlUniqueConstraints(self.alloc, unique_constraints.items);
-            unique_constraints.deinit(self.alloc);
-        }
-        var foreign_keys = std.ArrayListUnmanaged(runtime_schema.ForeignKey).empty;
-        errdefer {
-            clearDdlForeignKeys(self.alloc, foreign_keys.items);
-            foreign_keys.deinit(self.alloc);
-        }
-        var checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
-        errdefer {
-            clearDdlRelationalChecks(self.alloc, checks.items);
-            checks.deinit(self.alloc);
-        }
-
-        while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.semicolon)) {
-            var constraint_prefix = try sql_adapter.parseCreateTableColumnConstraintPrefixAlloc(self.alloc, self.tokens, &self.pos);
-            defer constraint_prefix.deinit(self.alloc);
-            const constraint_name = constraint_prefix.constraint_name;
-            if (constraint_prefix.kind == .primary_key) {
-                return error.UnsupportedSqlShape;
-            } else if (constraint_prefix.kind == .unique and self.matchKeyword("unique")) {
-                const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
-                const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, &.{column.name});
-                defer freeStringSlice(self.alloc, include_columns);
-                const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-                var constraint = try sql_adapter.makeDdlUniqueConstraintAlloc(self.alloc, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
-                var constraint_transferred = false;
-                errdefer if (!constraint_transferred) freeDdlUniqueConstraint(self.alloc, constraint);
-                constraint.validation_state = .unvalidated;
-                try unique_constraints.append(self.alloc, constraint);
-                constraint_transferred = true;
-            } else if (constraint_prefix.kind == .check and self.matchKeyword("check")) {
-                var check = try self.parseDdlCheckConstraint(constraint_name);
-                var check_transferred = false;
-                errdefer if (!check_transferred) freeDdlRelationalCheck(self.alloc, check);
-                _ = sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos);
-                check.validation_state = .unvalidated;
-                try checks.append(self.alloc, check);
-                check_transferred = true;
-            } else if (constraint_prefix.kind == .references and self.matchKeyword("references")) {
-                var foreign_key = try sql_adapter.parseDdlInlineForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, column.name, constraint_name);
-                var foreign_key_transferred = false;
-                errdefer if (!foreign_key_transferred) freeDdlForeignKey(self.alloc, foreign_key);
-                _ = sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos);
-                foreign_key.validation_state = .unvalidated;
-                try foreign_keys.append(self.alloc, foreign_key);
-                foreign_key_transferred = true;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        }
-
-        const owned_unique_constraints = try unique_constraints.toOwnedSlice(self.alloc);
-        var unique_transferred = false;
-        errdefer if (!unique_transferred) freeDdlUniqueConstraints(self.alloc, owned_unique_constraints);
-        const owned_foreign_keys = try foreign_keys.toOwnedSlice(self.alloc);
-        var foreign_transferred = false;
-        errdefer if (!foreign_transferred) freeDdlForeignKeys(self.alloc, owned_foreign_keys);
-        const owned_checks = try checks.toOwnedSlice(self.alloc);
-        var checks_transferred = false;
-        errdefer if (!checks_transferred) freeDdlRelationalChecks(self.alloc, owned_checks);
-
-        try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddColumnOperationFromParts(
-            column,
-            if_not_exists,
-            owned_unique_constraints,
-            owned_foreign_keys,
-            owned_checks,
-        ));
-        column_transferred = true;
-        unique_transferred = true;
-        foreign_transferred = true;
-        checks_transferred = true;
     }
 
     fn parseCreateIndexDdl(self: *@This(), unique: bool) !CreateIndexPlan {
@@ -3154,9 +3000,9 @@ const Parser = struct {
             defer element_prefix.deinit(self.alloc);
 
             if (element_prefix.kind == .column) {
-                try self.parseDdlColumnDefinition(&columns, &periods, &primary_key, &unique_constraints, &foreign_keys, &checks);
+                try sql_adapter.parseDdlColumnDefinitionAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks(), &columns, &periods, &primary_key, &unique_constraints, &foreign_keys, &checks);
             } else {
-                try self.parseDdlTableConstraint(element_prefix.constraint_name, &primary_key, &periods, &unique_constraints, &foreign_keys, &checks);
+                try sql_adapter.parseDdlTableConstraintAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks(), element_prefix.constraint_name, &primary_key, &periods, &unique_constraints, &foreign_keys, &checks);
             }
 
             if (self.match(.comma) == null) break;
@@ -3196,6 +3042,7 @@ const Parser = struct {
             .ptr = self,
             .parse_default_value = parseDdlDefaultValueHook,
             .parse_generated_value = parseDdlGeneratedValueHook,
+            .parse_check_constraint = parseDdlCheckConstraintHook,
         };
     }
 
@@ -3209,81 +3056,9 @@ const Parser = struct {
         return try self.parseDdlGeneratedValue();
     }
 
-    fn parseDdlColumnDefinition(
-        self: *@This(),
-        columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
-        periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
-        primary_key: *?runtime_schema.PrimaryKey,
-        unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
-        foreign_keys: *std.ArrayListUnmanaged(runtime_schema.ForeignKey),
-        checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
-    ) !void {
-        if (sql_adapter.peekDdlRangeColumnDefinition(self.tokens, self.pos)) {
-            try sql_adapter.appendDdlRangeColumnDefinitionAlloc(self.alloc, self.tokens, &self.pos, columns, periods);
-            return;
-        }
-
-        var column = try sql_adapter.parseDdlColumnDefinitionStandaloneAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
-        var column_transferred = false;
-        errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
-        if (sql_adapter.findDdlColumn(columns.items, column.name) != null) return error.UnsupportedSqlShape;
-        while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.rparen) and !self.peekKind(.semicolon)) {
-            if (try sql_adapter.parseOptionalSupportedDdlCollationAlloc(self.alloc, self.tokens, &self.pos, column.field_type)) |collation| {
-                if (column.collation != null) {
-                    self.alloc.free(collation);
-                    return error.UnsupportedSqlShape;
-                }
-                column.collation = collation;
-                continue;
-            } else if (self.matchKeyword("not")) {
-                try self.expectKeyword("null");
-                column.nullable = false;
-            } else if (self.matchKeyword("null")) {
-                column.nullable = true;
-            } else if (self.matchKeyword("default")) {
-                if (column.default_value != null) return error.UnsupportedSqlShape;
-                if (column.generated != null) return error.UnsupportedSqlShape;
-                column.default_value = try self.parseDdlDefaultValue(column.field_type);
-            } else if (self.matchKeyword("generated")) {
-                if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
-                column.generated = try self.parseDdlGeneratedValue();
-            } else {
-                var constraint_prefix = try sql_adapter.parseCreateTableColumnConstraintPrefixAlloc(self.alloc, self.tokens, &self.pos);
-                defer constraint_prefix.deinit(self.alloc);
-                const constraint_name = constraint_prefix.constraint_name;
-                if (constraint_prefix.kind == .primary_key and self.matchKeyword("primary")) {
-                    try self.expectKeyword("key");
-                    column.nullable = false;
-                    const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, &.{column.name});
-                    defer freeStringSlice(self.alloc, include_columns);
-                    const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-                    try sql_adapter.installDdlPrimaryKeyAlloc(self.alloc, primary_key, constraint_name, &.{column.name}, include_columns, null, timing);
-                } else if (constraint_prefix.kind == .unique and self.matchKeyword("unique")) {
-                    const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
-                    const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, &.{column.name});
-                    defer freeStringSlice(self.alloc, include_columns);
-                    const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-                    try sql_adapter.appendDdlUniqueConstraintBuilderAlloc(self.alloc, unique_constraints, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
-                } else if (constraint_prefix.kind == .check and self.matchKeyword("check")) {
-                    const check = try self.parseDdlCheckConstraint(constraint_name);
-                    var check_transferred = false;
-                    errdefer if (!check_transferred) freeDdlRelationalCheck(self.alloc, check);
-                    try checks.append(self.alloc, check);
-                    check_transferred = true;
-                } else if (constraint_prefix.kind == .references and self.matchKeyword("references")) {
-                    const foreign_key = try sql_adapter.parseDdlInlineForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, column.name, constraint_name);
-                    var foreign_key_transferred = false;
-                    errdefer if (!foreign_key_transferred) freeDdlForeignKey(self.alloc, foreign_key);
-                    try foreign_keys.append(self.alloc, foreign_key);
-                    foreign_key_transferred = true;
-                } else {
-                    return error.UnsupportedSqlShape;
-                }
-            }
-        }
-
-        try columns.append(self.alloc, column);
-        column_transferred = true;
+    fn parseDdlCheckConstraintHook(ptr: *anyopaque, constraint_name: ?[]const u8) anyerror!runtime_schema.RelationalCheck {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseDdlCheckConstraint(constraint_name);
     }
 
     fn parseDdlGeneratedValue(self: *@This()) !runtime_schema.RelationalGeneratedValue {
@@ -3314,55 +3089,6 @@ const Parser = struct {
             self.pos = start;
         }
         return sql_adapter.parseDdlStoredGeneratedValueAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDdlTableConstraint(
-        self: *@This(),
-        constraint_name: ?[]const u8,
-        primary_key: *?runtime_schema.PrimaryKey,
-        periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
-        unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
-        foreign_keys: *std.ArrayListUnmanaged(runtime_schema.ForeignKey),
-        checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
-    ) !void {
-        if (self.matchKeyword("primary")) {
-            try self.expectKeyword("key");
-            const columns = try sql_adapter.parseDdlUniqueTemporalColumnListAlloc(self.alloc, self.tokens, &self.pos);
-            defer columns.deinit(self.alloc);
-            const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, columns.columns);
-            defer freeStringSlice(self.alloc, include_columns);
-            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-            try sql_adapter.installDdlPrimaryKeyAlloc(self.alloc, primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
-        } else if (self.matchKeyword("unique")) {
-            const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
-            const columns = try sql_adapter.parseDdlUniqueTemporalColumnListAlloc(self.alloc, self.tokens, &self.pos);
-            defer columns.deinit(self.alloc);
-            const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, columns.columns);
-            defer freeStringSlice(self.alloc, include_columns);
-            const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-            try sql_adapter.appendDdlUniqueConstraintBuilderAlloc(self.alloc, unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
-        } else if (self.matchKeyword("foreign")) {
-            const foreign_key = try sql_adapter.parseDdlForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, constraint_name);
-            var transferred = false;
-            errdefer if (!transferred) freeDdlForeignKey(self.alloc, foreign_key);
-            try foreign_keys.append(self.alloc, foreign_key);
-            transferred = true;
-        } else if (self.matchKeyword("check")) {
-            const check = try self.parseDdlCheckConstraint(constraint_name);
-            var transferred = false;
-            errdefer if (!transferred) freeDdlRelationalCheck(self.alloc, check);
-            try checks.append(self.alloc, check);
-            transferred = true;
-        } else if (self.matchKeyword("period")) {
-            if (constraint_name != null) return error.UnsupportedSqlShape;
-            const period = try sql_adapter.parseDdlPeriodConstraintPlanAlloc(self.alloc, self.tokens, &self.pos);
-            var transferred = false;
-            errdefer if (!transferred) freeDdlPeriod(self.alloc, period);
-            try periods.append(self.alloc, period);
-            transferred = true;
-        } else {
-            return error.UnsupportedSqlShape;
-        }
     }
 
     fn parseDdlDefaultValue(self: *@This(), field_type: runtime_schema.AntflyType) !runtime_schema.RelationalDefaultValue {
@@ -12169,7 +11895,7 @@ const Parser = struct {
         }
         if (self.matchKeyword("where")) {
             const where_start = self.pos;
-            where_json = self.parseUniquePredicateWhereJsonAlloc() catch |err| switch (err) {
+            where_json = sql_adapter.parseDdlUniquePredicateWhereJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema.relational_columns) catch |err| switch (err) {
                 error.UnsupportedSqlShape, error.InvalidSqlCatalog => blk: {
                     self.pos = where_start;
                     break :blk "";
@@ -12294,25 +12020,7 @@ const Parser = struct {
         self: *@This(),
         predicates: []const runtime_schema.UniquePredicate,
     ) ![]const u8 {
-        if (predicates.len == 0) return "";
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        try writer.writeAll("{\"all\":[");
-        for (predicates, 0..) |predicate, i| {
-            if (i != 0) try writer.writeByte(',');
-            try writer.print("{{\"field\":{f},\"op\":{f}", .{
-                std.json.fmt(predicate.field, .{}),
-                std.json.fmt(uniquePredicateOpToken(predicate.op), .{}),
-            });
-            if (predicate.value_json) |value_json| {
-                try writer.writeAll(",\"value\":");
-                try writer.writeAll(value_json);
-            }
-            try writer.writeByte('}');
-        }
-        try writer.writeAll("]}");
-        return try out.toOwnedSlice();
+        return try sql_adapter.uniquePredicateWhereJsonAlloc(self.alloc, predicates);
     }
 
     fn rejectDuplicateConflictUpdateTargets(
@@ -15011,54 +14719,6 @@ const Parser = struct {
         });
         field_transferred = true;
         value_transferred = true;
-    }
-
-    fn parseUniquePredicateWhereJsonAlloc(self: *@This()) ![]const u8 {
-        var predicates = std.ArrayListUnmanaged(FieldPredicate).empty;
-        defer {
-            freeFieldPredicates(self.alloc, predicates.items);
-            predicates.deinit(self.alloc);
-        }
-        while (true) {
-            const field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(field);
-            _ = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
-            if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{ .allow_distinct = false })) |is_tail| {
-                const op: runtime_schema.UniquePredicateOp = switch (is_tail.op) {
-                    .is_null => .is_null,
-                    .is_not_null => .is_not_null,
-                    else => return error.UnsupportedSqlShape,
-                };
-                try predicates.append(self.alloc, .{ .field = field, .op = op });
-                field_transferred = true;
-            } else {
-                const op: runtime_schema.UniquePredicateOp = if (self.match(.eq) != null) .eq else if (self.match(.neq) != null) .ne else return error.UnsupportedSqlShape;
-                const value_json = try self.parseJsonValueAlloc();
-                var value_transferred = false;
-                errdefer if (!value_transferred) self.alloc.free(value_json);
-                try predicates.append(self.alloc, .{ .field = field, .op = op, .value_json = value_json });
-                field_transferred = true;
-                value_transferred = true;
-            }
-            if (!self.matchKeyword("and")) break;
-        }
-
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        try writer.writeAll("{\"all\":[");
-        for (predicates.items, 0..) |predicate, i| {
-            if (i != 0) try writer.writeByte(',');
-            try writer.print("{{\"field\":{f},\"op\":{f}", .{ std.json.fmt(predicate.field, .{}), std.json.fmt(uniquePredicateOpToken(predicate.op), .{}) });
-            if (predicate.value_json) |value_json| {
-                try writer.writeAll(",\"value\":");
-                try writer.writeAll(value_json);
-            }
-            try writer.writeByte('}');
-        }
-        try writer.writeAll("]}");
-        return try out.toOwnedSlice();
     }
 
     fn parseUpdateAssignment(
@@ -26442,14 +26102,36 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(BulkIoEndpointKind.file, copy_to_file_execution.endpoint_kind);
     try std.testing.expect(!copy_to_file_execution.requires_external_stream);
 
-    var copy_from_program = try lowerDdlPlanAlloc(alloc, "COPY usage_records FROM PROGRAM 'cat /tmp/usage.csv';");
+    var copy_from_program = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM PROGRAM 'cat /tmp/usage.csv';");
     defer copy_from_program.deinit(alloc);
     const copy_from_program_plan = switch (copy_from_program) {
         .bulk_io => |plan| plan,
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(BulkIoEndpointKind.program, copy_from_program_plan.endpoint_kind);
-    try std.testing.expectError(error.UnsupportedSqlShape, bulkSqlIoExecutionPlanFromDdlPlan(copy_from_program_plan));
+    const copy_from_program_execution = try bulkSqlIoExecutionPlanFromDdlPlan(copy_from_program_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.import_rows, copy_from_program_execution.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_batch, copy_from_program_execution.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.program, copy_from_program_execution.stream);
+    try std.testing.expectEqual(BulkIoEndpointKind.program, copy_from_program_execution.endpoint_kind);
+    try std.testing.expect(!copy_from_program_execution.requires_external_stream);
+    const copy_from_program_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_from_program_execution);
+    defer alloc.free(copy_from_program_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=program:codec=postgres_text:endpoint_kind=program:endpoint=cat /tmp/usage.csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=false", copy_from_program_execution_fingerprint);
+
+    var copy_to_program = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) TO PROGRAM 'cat > /tmp/usage.csv' WITH (FORMAT csv);");
+    defer copy_to_program.deinit(alloc);
+    const copy_to_program_plan = switch (copy_to_program) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(BulkIoEndpointKind.program, copy_to_program_plan.endpoint_kind);
+    const copy_to_program_execution = try bulkSqlIoExecutionPlanFromDdlPlan(copy_to_program_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.export_rows, copy_to_program_execution.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_query, copy_to_program_execution.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.program, copy_to_program_execution.stream);
+    try std.testing.expectEqual(BulkIoEndpointKind.program, copy_to_program_execution.endpoint_kind);
+    try std.testing.expect(!copy_to_program_execution.requires_external_stream);
 
     const csv_columns = [_]runtime_schema.RelationalColumn{
         .{ .name = "id", .path = "id", .field_type = .text, .nullable = false },

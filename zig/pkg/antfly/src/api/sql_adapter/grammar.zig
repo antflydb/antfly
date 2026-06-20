@@ -6759,6 +6759,73 @@ pub fn parseDdlUniquePredicatesAlloc(
     return try predicates.toOwnedSlice(alloc);
 }
 
+pub fn uniquePredicateWhereJsonAlloc(
+    alloc: std.mem.Allocator,
+    predicates: []const runtime_schema.UniquePredicate,
+) ![]const u8 {
+    if (predicates.len == 0) return "";
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"all\":[");
+    for (predicates, 0..) |predicate, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"op\":{f}", .{
+            std.json.fmt(predicate.field, .{}),
+            std.json.fmt(lower_expr.uniquePredicateOpToken(predicate.op), .{}),
+        });
+        if (predicate.value_json) |value_json| {
+            try writer.writeAll(",\"value\":");
+            try writer.writeAll(value_json);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn parseDdlUniquePredicateWhereJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    columns: []const runtime_schema.RelationalColumn,
+) ![]const u8 {
+    var predicates = std.ArrayListUnmanaged(runtime_schema.UniquePredicate).empty;
+    defer {
+        for (predicates.items) |predicate| freeDdlUniquePredicate(alloc, predicate);
+        predicates.deinit(alloc);
+    }
+    while (true) {
+        const atom_start = pos.*;
+        var depth: usize = 0;
+        while (pos.* < tokens.len) {
+            const token = tokens[pos.*];
+            if (depth == 0 and token.kind == .identifier and
+                (std.ascii.eqlIgnoreCase(token.text, "and") or std.ascii.eqlIgnoreCase(token.text, "do"))) break;
+            if (depth == 0 and token.kind == .semicolon) break;
+            switch (token.kind) {
+                .lparen => depth += 1,
+                .rparen => {
+                    if (depth == 0) return error.UnsupportedSqlShape;
+                    depth -= 1;
+                },
+                else => {},
+            }
+            pos.* += 1;
+        }
+        if (depth != 0 or atom_start == pos.*) return error.UnsupportedSqlShape;
+
+        const predicate = try parseDdlUniquePredicateAtomAlloc(alloc, tokens[atom_start..pos.*]);
+        var predicate_transferred = false;
+        errdefer if (!predicate_transferred) freeDdlUniquePredicate(alloc, predicate);
+        try predicates.append(alloc, predicate);
+        predicate_transferred = true;
+        if (!parser.matchKeyword(tokens, pos, "and")) break;
+    }
+    try lower_expr.validateUniquePredicatesForColumns(columns, predicates.items);
+    return try uniquePredicateWhereJsonAlloc(alloc, predicates.items);
+}
+
 fn parseDdlUniquePredicateAtomAlloc(
     alloc: std.mem.Allocator,
     raw_tokens: []const Token,
@@ -9314,6 +9381,28 @@ test "sql adapter grammar parses ddl generated expressions" {
     defer lexer.freeTokens(alloc, &volatile_tokens);
     var volatile_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, volatile_tokens.items, &volatile_pos));
+}
+
+test "sql adapter grammar parses conflict-target unique predicate JSON" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword },
+    };
+
+    var tokens = try lexer.tokenizeAlloc(alloc, "status = 'active' AND tenant_id IS NOT NULL DO UPDATE");
+    defer lexer.freeTokens(alloc, &tokens);
+    var pos: usize = 0;
+    const where_json = try parseDdlUniquePredicateWhereJsonAlloc(alloc, tokens.items, &pos, &columns);
+    defer alloc.free(where_json);
+    try std.testing.expectEqualStrings("{\"all\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"},{\"field\":\"tenant_id\",\"op\":\"is_not_null\"}]}", where_json);
+    try std.testing.expect(pos < tokens.items.len);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(tokens.items[pos].text, "do"));
+
+    var invalid_tokens = try lexer.tokenizeAlloc(alloc, "missing = 'active' DO UPDATE");
+    defer lexer.freeTokens(alloc, &invalid_tokens);
+    var invalid_pos: usize = 0;
+    try std.testing.expectError(error.InvalidSqlCatalog, parseDdlUniquePredicateWhereJsonAlloc(alloc, invalid_tokens.items, &invalid_pos, &columns));
 }
 
 test "sql adapter grammar parses ddl unique expressions" {

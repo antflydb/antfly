@@ -34,6 +34,7 @@ pub const BulkSqlIoStream = enum {
     stdin,
     stdout,
     file,
+    program,
 };
 
 pub const BulkSqlIoCodec = enum {
@@ -92,7 +93,7 @@ pub fn executionPlanFromDdlPlan(plan: ddl_plan.BulkIoPlan) !BulkSqlIoExecutionPl
                     break :blk BulkSqlIoStream.stdin;
                 },
                 .file => BulkSqlIoStream.file,
-                .program => return error.UnsupportedSqlShape,
+                .program => BulkSqlIoStream.program,
             };
             return .{
                 .operation = .import_rows,
@@ -131,7 +132,7 @@ pub fn executionPlanFromDdlPlan(plan: ddl_plan.BulkIoPlan) !BulkSqlIoExecutionPl
                     break :blk BulkSqlIoStream.stdout;
                 },
                 .file => BulkSqlIoStream.file,
-                .program => return error.UnsupportedSqlShape,
+                .program => BulkSqlIoStream.program,
             };
             return .{
                 .operation = .export_rows,
@@ -257,9 +258,10 @@ pub fn importRowsBatchFromStdinAlloc(
     plan: BulkSqlIoExecutionPlan,
     stdin_payload: []const u8,
 ) !relational_rows.OwnedRowsBatchRequest {
-    if (plan.operation != .import_rows or plan.native_route != .rows_batch or (plan.endpoint_kind != .stream and plan.endpoint_kind != .file)) return error.UnsupportedSqlShape;
+    if (plan.operation != .import_rows or plan.native_route != .rows_batch or (plan.endpoint_kind != .stream and plan.endpoint_kind != .file and plan.endpoint_kind != .program)) return error.UnsupportedSqlShape;
     if (plan.endpoint_kind == .stream and plan.stream != .stdin) return error.UnsupportedSqlShape;
     if (plan.endpoint_kind == .file and plan.stream != .file) return error.UnsupportedSqlShape;
+    if (plan.endpoint_kind == .program and plan.stream != .program) return error.UnsupportedSqlShape;
     if (plan.columns.len == 0) return error.UnsupportedSqlShape;
     try validateCodecOptions(plan);
     try validatePlanForSchema(alloc, schema, plan);
@@ -313,7 +315,7 @@ pub fn exportRowsCsvToStdoutAlloc(
     plan: BulkSqlIoExecutionPlan,
     result: db_mod.types.RelationalRowsQueryResult,
 ) ![]u8 {
-    if (plan.operation != .export_rows or plan.native_route != .rows_query or (plan.stream != .stdout and plan.stream != .file)) return error.UnsupportedSqlShape;
+    if (plan.operation != .export_rows or plan.native_route != .rows_query or (plan.stream != .stdout and plan.stream != .file and plan.stream != .program)) return error.UnsupportedSqlShape;
     try validateCodecOptions(plan);
     try validatePlanForSchema(alloc, schema, plan);
     if (plan.encoding) |encoding| {

@@ -3686,6 +3686,165 @@ pub fn parseAlterTablePrefixOperationAlloc(
     return operation;
 }
 
+pub fn parseAlterTableAddColumnOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+    operations: *std.ArrayListUnmanaged(AlterTableOperation),
+    if_not_exists: bool,
+) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const column = try parseDdlColumnDefinitionStandaloneAlloc(alloc, tokens, pos, hooks);
+    var column_transferred = false;
+    errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
+
+    var unique_constraints = std.ArrayListUnmanaged(runtime_schema.UniqueConstraint).empty;
+    errdefer {
+        clearDdlUniqueConstraints(alloc, unique_constraints.items);
+        unique_constraints.deinit(alloc);
+    }
+    var foreign_keys = std.ArrayListUnmanaged(runtime_schema.ForeignKey).empty;
+    errdefer {
+        clearDdlForeignKeys(alloc, foreign_keys.items);
+        foreign_keys.deinit(alloc);
+    }
+    var checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+    errdefer {
+        clearDdlRelationalChecks(alloc, checks.items);
+        checks.deinit(alloc);
+    }
+
+    while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.semicolon)) {
+        var constraint_prefix = try grammar.parseCreateTableColumnConstraintPrefixAlloc(alloc, tokens, pos);
+        defer constraint_prefix.deinit(alloc);
+        const constraint_name = constraint_prefix.constraint_name;
+        if (constraint_prefix.kind == .primary_key) {
+            return error.UnsupportedSqlShape;
+        } else if (constraint_prefix.kind == .unique and cursor.matchKeyword("unique")) {
+            const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
+            const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name});
+            defer freeStringSlice(alloc, include_columns);
+            const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+            var constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
+            var constraint_transferred = false;
+            errdefer if (!constraint_transferred) freeDdlUniqueConstraint(alloc, constraint);
+            constraint.validation_state = .unvalidated;
+            try unique_constraints.append(alloc, constraint);
+            constraint_transferred = true;
+        } else if (constraint_prefix.kind == .check and cursor.matchKeyword("check")) {
+            var check = try hooks.parse_check_constraint(hooks.ptr, constraint_name);
+            var check_transferred = false;
+            errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
+            _ = grammar.consumeOptionalDdlNotValid(tokens, pos);
+            check.validation_state = .unvalidated;
+            try checks.append(alloc, check);
+            check_transferred = true;
+        } else if (constraint_prefix.kind == .references and cursor.matchKeyword("references")) {
+            var foreign_key = try parseDdlInlineForeignKeyConstraintAlloc(alloc, tokens, pos, column.name, constraint_name);
+            var foreign_key_transferred = false;
+            errdefer if (!foreign_key_transferred) freeDdlForeignKey(alloc, foreign_key);
+            _ = grammar.consumeOptionalDdlNotValid(tokens, pos);
+            foreign_key.validation_state = .unvalidated;
+            try foreign_keys.append(alloc, foreign_key);
+            foreign_key_transferred = true;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    const owned_unique_constraints = try unique_constraints.toOwnedSlice(alloc);
+    var unique_transferred = false;
+    errdefer if (!unique_transferred) freeDdlUniqueConstraints(alloc, owned_unique_constraints);
+    const owned_foreign_keys = try foreign_keys.toOwnedSlice(alloc);
+    var foreign_transferred = false;
+    errdefer if (!foreign_transferred) freeDdlForeignKeys(alloc, owned_foreign_keys);
+    const owned_checks = try checks.toOwnedSlice(alloc);
+    var checks_transferred = false;
+    errdefer if (!checks_transferred) freeDdlRelationalChecks(alloc, owned_checks);
+
+    try appendAlterTableOperation(alloc, operations, alterTableAddColumnOperationFromParts(
+        column,
+        if_not_exists,
+        owned_unique_constraints,
+        owned_foreign_keys,
+        owned_checks,
+    ));
+    column_transferred = true;
+    unique_transferred = true;
+    foreign_transferred = true;
+    checks_transferred = true;
+}
+
+pub fn parseAlterTableOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+    operations: *std.ArrayListUnmanaged(AlterTableOperation),
+) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (try parseAlterTablePrefixOperationAlloc(alloc, tokens, pos)) |operation| {
+        try appendAlterTableOperation(alloc, operations, operation);
+        return;
+    }
+
+    const add_column_start = pos.*;
+    if (grammar.parseAlterTableAddColumnHeader(tokens, pos)) |syntax| {
+        try parseAlterTableAddColumnOperationAlloc(alloc, tokens, pos, hooks, operations, syntax.if_not_exists);
+        return;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = add_column_start,
+    }
+
+    var add_prefix = try grammar.parseAlterTableAddOperationPrefixAlloc(alloc, tokens, pos);
+    defer add_prefix.deinit(alloc);
+    const constraint_name = add_prefix.constraint_name;
+    if (add_prefix.kind == .period) {
+        const period = try parseDdlPeriodConstraintPlanAlloc(alloc, tokens, pos);
+        try appendAlterTableOperation(alloc, operations, alterTableAddPeriodOperation(period));
+        return;
+    }
+    if (add_prefix.kind == .primary_key and cursor.matchKeyword("primary")) {
+        try cursor.expectKeyword("key");
+        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        defer columns.deinit(alloc);
+        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        defer freeStringSlice(alloc, include_columns);
+        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        const primary_key = try makeDdlPrimaryKeyAlloc(alloc, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
+        try appendAlterTableOperation(alloc, operations, alterTableAddPrimaryKeyOperation(primary_key));
+        return;
+    }
+    if (add_prefix.kind == .unique and cursor.matchKeyword("unique")) {
+        const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
+        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        defer columns.deinit(alloc);
+        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        defer freeStringSlice(alloc, include_columns);
+        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        var constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
+        constraint.validation_state = .unvalidated;
+        try appendAlterTableOperation(alloc, operations, alterTableAddUniqueConstraintOperation(constraint));
+        return;
+    }
+    if (add_prefix.kind == .foreign_key and cursor.matchKeyword("foreign")) {
+        var foreign_key = try parseDdlForeignKeyConstraintAlloc(alloc, tokens, pos, constraint_name);
+        foreign_key.validation_state = if (grammar.consumeOptionalDdlNotValid(tokens, pos)) .unvalidated else .unvalidated;
+        try appendAlterTableOperation(alloc, operations, alterTableAddForeignKeyOperation(foreign_key));
+        return;
+    }
+    if (add_prefix.kind == .check and cursor.matchKeyword("check")) {
+        var check = try hooks.parse_check_constraint(hooks.ptr, constraint_name);
+        _ = grammar.consumeOptionalDdlNotValid(tokens, pos);
+        check.validation_state = .unvalidated;
+        try appendAlterTableOperation(alloc, operations, alterTableAddCheckOperation(check));
+        return;
+    }
+
+    return error.UnsupportedSqlShape;
+}
+
 pub fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(extension_name, "pgcrypto") or
         std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp");
@@ -4865,6 +5024,7 @@ pub const DdlColumnDefinitionHooks = struct {
     ptr: *anyopaque,
     parse_default_value: *const fn (*anyopaque, runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue,
     parse_generated_value: *const fn (*anyopaque) anyerror!runtime_schema.RelationalGeneratedValue,
+    parse_check_constraint: *const fn (*anyopaque, ?[]const u8) anyerror!runtime_schema.RelationalCheck,
 };
 
 pub fn parseDdlColumnDefinitionStandaloneAlloc(
@@ -4921,6 +5081,140 @@ pub fn parseDdlColumnDefinitionStandaloneAlloc(
 
     column_transferred = true;
     return column;
+}
+
+pub fn parseDdlColumnDefinitionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+    columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
+    periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
+    primary_key: *?runtime_schema.PrimaryKey,
+    unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
+    foreign_keys: *std.ArrayListUnmanaged(runtime_schema.ForeignKey),
+    checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (grammar.peekDdlRangeColumnDefinition(tokens, pos.*)) {
+        try appendDdlRangeColumnDefinitionAlloc(alloc, tokens, pos, columns, periods);
+        return;
+    }
+
+    var column = try parseDdlColumnDefinitionStandaloneAlloc(alloc, tokens, pos, hooks);
+    var column_transferred = false;
+    errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
+    if (findDdlColumn(columns.items, column.name) != null) return error.UnsupportedSqlShape;
+    while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon)) {
+        if (try parseOptionalSupportedDdlCollationAlloc(alloc, tokens, pos, column.field_type)) |collation| {
+            if (column.collation != null) {
+                alloc.free(collation);
+                return error.UnsupportedSqlShape;
+            }
+            column.collation = collation;
+            continue;
+        } else if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("null");
+            column.nullable = false;
+        } else if (cursor.matchKeyword("null")) {
+            column.nullable = true;
+        } else if (cursor.matchKeyword("default")) {
+            if (column.default_value != null) return error.UnsupportedSqlShape;
+            if (column.generated != null) return error.UnsupportedSqlShape;
+            column.default_value = try hooks.parse_default_value(hooks.ptr, column.field_type);
+        } else if (cursor.matchKeyword("generated")) {
+            if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
+            column.generated = try hooks.parse_generated_value(hooks.ptr);
+        } else {
+            var constraint_prefix = try grammar.parseCreateTableColumnConstraintPrefixAlloc(alloc, tokens, pos);
+            defer constraint_prefix.deinit(alloc);
+            const constraint_name = constraint_prefix.constraint_name;
+            if (constraint_prefix.kind == .primary_key and cursor.matchKeyword("primary")) {
+                try cursor.expectKeyword("key");
+                column.nullable = false;
+                const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name});
+                defer freeStringSlice(alloc, include_columns);
+                const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+                try installDdlPrimaryKeyAlloc(alloc, primary_key, constraint_name, &.{column.name}, include_columns, null, timing);
+            } else if (constraint_prefix.kind == .unique and cursor.matchKeyword("unique")) {
+                const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
+                const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name});
+                defer freeStringSlice(alloc, include_columns);
+                const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+                try appendDdlUniqueConstraintBuilderAlloc(alloc, unique_constraints, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
+            } else if (constraint_prefix.kind == .check and cursor.matchKeyword("check")) {
+                const check = try hooks.parse_check_constraint(hooks.ptr, constraint_name);
+                var check_transferred = false;
+                errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
+                try checks.append(alloc, check);
+                check_transferred = true;
+            } else if (constraint_prefix.kind == .references and cursor.matchKeyword("references")) {
+                const foreign_key = try parseDdlInlineForeignKeyConstraintAlloc(alloc, tokens, pos, column.name, constraint_name);
+                var foreign_key_transferred = false;
+                errdefer if (!foreign_key_transferred) freeDdlForeignKey(alloc, foreign_key);
+                try foreign_keys.append(alloc, foreign_key);
+                foreign_key_transferred = true;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        }
+    }
+
+    try columns.append(alloc, column);
+    column_transferred = true;
+}
+
+pub fn parseDdlTableConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+    constraint_name: ?[]const u8,
+    primary_key: *?runtime_schema.PrimaryKey,
+    periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
+    unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
+    foreign_keys: *std.ArrayListUnmanaged(runtime_schema.ForeignKey),
+    checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("primary")) {
+        try cursor.expectKeyword("key");
+        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        defer columns.deinit(alloc);
+        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        defer freeStringSlice(alloc, include_columns);
+        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        try installDdlPrimaryKeyAlloc(alloc, primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
+    } else if (cursor.matchKeyword("unique")) {
+        const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
+        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        defer columns.deinit(alloc);
+        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        defer freeStringSlice(alloc, include_columns);
+        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        try appendDdlUniqueConstraintBuilderAlloc(alloc, unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
+    } else if (cursor.matchKeyword("foreign")) {
+        const foreign_key = try parseDdlForeignKeyConstraintAlloc(alloc, tokens, pos, constraint_name);
+        var transferred = false;
+        errdefer if (!transferred) freeDdlForeignKey(alloc, foreign_key);
+        try foreign_keys.append(alloc, foreign_key);
+        transferred = true;
+    } else if (cursor.matchKeyword("check")) {
+        const check = try hooks.parse_check_constraint(hooks.ptr, constraint_name);
+        var transferred = false;
+        errdefer if (!transferred) freeDdlRelationalCheck(alloc, check);
+        try checks.append(alloc, check);
+        transferred = true;
+    } else if (cursor.matchKeyword("period")) {
+        if (constraint_name != null) return error.UnsupportedSqlShape;
+        const period = try parseDdlPeriodConstraintPlanAlloc(alloc, tokens, pos);
+        var transferred = false;
+        errdefer if (!transferred) freeDdlPeriod(alloc, period);
+        try periods.append(alloc, period);
+        transferred = true;
+    } else {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 pub fn makeDdlForeignKeyAlloc(

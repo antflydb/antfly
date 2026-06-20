@@ -4328,7 +4328,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_log_verbosity: bool = false,
     ddl_copy_null_marker: bool = false,
     ddl_copy_on_error_ignore: bool = false,
-    ddl_copy_program_execution_unsupported: bool = false,
+    ddl_copy_program_endpoint: bool = false,
     ddl_copy_reject_limit: bool = false,
     ddl_copy_quote: bool = false,
     ddl_copy_to: bool = false,
@@ -6047,9 +6047,10 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_log_verbosity = self.ddl_copy_log_verbosity or sql_adapter.planHasExactStringToken(entry.plan, ":log_verbosity=", "verbose");
                     self.ddl_copy_null_marker = self.ddl_copy_null_marker or sql_adapter.planHasExactStringToken(entry.plan, ":null_marker_hex=", "empty");
                     self.ddl_copy_on_error_ignore = self.ddl_copy_on_error_ignore or sql_adapter.planHasExactStringToken(entry.plan, ":on_error=", "ignore");
-                    self.ddl_copy_program_execution_unsupported = self.ddl_copy_program_execution_unsupported or
+                    self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
                         std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null and
-                            sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
+                            std.mem.indexOf(u8, entry.execution_plan, ":stream=program:") != null and
+                            std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=program:") != null;
                     self.ddl_copy_reject_limit = self.ddl_copy_reject_limit or sql_adapter.planHasExactUsizeToken(entry.plan, ":reject_limit=", 10);
                     self.ddl_copy_quote = self.ddl_copy_quote or sql_adapter.planHasExactStringToken(entry.plan, ":quote_hex=", "22");
                     self.ddl_copy_where_expression = self.ddl_copy_where_expression or sql_adapter.planHasExactUsizeToken(entry.plan, ":where_expressions=", 1);
@@ -6064,6 +6065,10 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_to_text_execution_contract = self.ddl_copy_to_text_execution_contract or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
                             std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_text:") != null);
+                    self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
+                        std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null and
+                            std.mem.indexOf(u8, entry.execution_plan, ":stream=program:") != null and
+                            std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=program:") != null;
                     self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");
                 },
                 .create_partitioned_table => self.ddl_partition_create_parent = true,
