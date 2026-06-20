@@ -25,14 +25,15 @@ mode, caller-supplied artifact support, and distributed-only capability flags.
 Use constants such as `InferenceModeCallerSuppliedArtifacts`,
 `InferenceModeManualMaintenance`, and `InferenceModeDisabledDeferred` when
 branching on inference status or capabilities.
-Typed `Check`, `Vacuum`, and `CopyStableSnapshot` helpers cover the stable Lite
-maintenance reports while keeping the raw JSON methods available.
+Typed `PendingWorkStats`, `RunUntilIdleStatus`, `Check`, `Vacuum`, and
+`CopyStableSnapshot` helpers cover the stable Lite maintenance reports while
+keeping the raw JSON methods available.
 
 Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
 handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application
 wants hosted/manual maintenance and will call `RunUntilIdle` itself. Use
-`RunUntilIdleJSON` when the application also wants the post-drain pending-work
-readiness document.
+`RunUntilIdleStatus` when the application also wants the typed post-drain
+pending-work readiness document.
 Use `OpenWithOptions` for advanced settings such as map size and native-profile
 TTL cleanup.
 

@@ -75,15 +75,27 @@ type Capabilities struct {
 	ObjectStoragePrimary               bool     `json:"object_storage_primary"`
 }
 
-// Status is the typed form of StatusJSON. Stats and PendingWork are retained as
-// raw JSON because their internal shape is broader than the stable Lite control
-// fields bindings need for feature branching.
+// PendingWorkStatus describes the stable Lite readiness fields for derived
+// work. The nested maintenance telemetry is intentionally retained as raw JSON
+// because it is operational detail rather than control-plane contract.
+type PendingWorkStatus struct {
+	DerivedTargetSequence uint64          `json:"derived_target_sequence"`
+	HasAsyncIndexes       bool            `json:"has_async_indexes"`
+	Enrichment            json.RawMessage `json:"enrichment"`
+	Resolution            json.RawMessage `json:"resolution"`
+	Promotion             json.RawMessage `json:"promotion"`
+	TextMerge             json.RawMessage `json:"text_merge"`
+}
+
+// Status is the typed form of StatusJSON. Stats is retained as raw JSON because
+// its internal shape is broader than the stable Lite control fields bindings
+// need for feature branching.
 type Status struct {
-	Storage      StorageStatus   `json:"storage"`
-	Stats        json.RawMessage `json:"stats"`
-	PendingWork  json.RawMessage `json:"pending_work"`
-	Inference    InferenceStatus `json:"inference"`
-	Capabilities Capabilities    `json:"capabilities"`
+	Storage      StorageStatus     `json:"storage"`
+	Stats        json.RawMessage   `json:"stats"`
+	PendingWork  PendingWorkStatus `json:"pending_work"`
+	Inference    InferenceStatus   `json:"inference"`
+	Capabilities Capabilities      `json:"capabilities"`
 }
 
 // Status returns the typed Lite status document for the database.
@@ -97,6 +109,33 @@ func (db *DB) Status() (*Status, error) {
 		return nil, err
 	}
 	return &status, nil
+}
+
+// PendingWorkStats returns the typed Lite pending-work readiness document.
+func (db *DB) PendingWorkStats() (*PendingWorkStatus, error) {
+	body, err := db.PendingWorkStatsJSON()
+	if err != nil {
+		return nil, err
+	}
+	var pending PendingWorkStatus
+	if err := json.Unmarshal(body, &pending); err != nil {
+		return nil, err
+	}
+	return &pending, nil
+}
+
+// RunUntilIdleStatus drains pending enrichment and index work and returns the
+// typed post-drain readiness document.
+func (db *DB) RunUntilIdleStatus() (*PendingWorkStatus, error) {
+	body, err := db.RunUntilIdleJSON()
+	if err != nil {
+		return nil, err
+	}
+	var pending PendingWorkStatus
+	if err := json.Unmarshal(body, &pending); err != nil {
+		return nil, err
+	}
+	return &pending, nil
 }
 
 // Capabilities returns the typed Lite capability document for the database.

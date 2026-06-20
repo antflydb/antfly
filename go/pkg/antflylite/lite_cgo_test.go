@@ -184,19 +184,26 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("batch searchable document: %v", err)
 	}
-	idle, err := db.RunUntilIdleJSON()
+	idleStatus, err := db.RunUntilIdleStatus()
 	if err != nil {
-		t.Fatalf("run until idle json: %v", err)
+		t.Fatalf("run until idle status: %v", err)
 	}
-	if !bytes.Contains(idle, []byte("has_async_indexes")) {
-		t.Fatalf("run-until-idle JSON %q did not include async index status", idle)
+	if idleStatus.DerivedTargetSequence == 0 || !idleStatus.HasAsyncIndexes || len(idleStatus.TextMerge) == 0 {
+		t.Fatalf("run-until-idle status missing readiness fields: %#v", idleStatus)
 	}
-	pending, err := db.PendingWorkStatsJSON()
+	pending, err := db.PendingWorkStats()
 	if err != nil {
 		t.Fatalf("pending work stats: %v", err)
 	}
-	if !bytes.Contains(pending, []byte("has_async_indexes")) {
-		t.Fatalf("pending work JSON %q did not include async index status", pending)
+	if pending.DerivedTargetSequence == 0 || !pending.HasAsyncIndexes || len(pending.Enrichment) == 0 {
+		t.Fatalf("pending work status missing readiness fields: %#v", pending)
+	}
+	pendingJSON, err := db.PendingWorkStatsJSON()
+	if err != nil {
+		t.Fatalf("pending work stats json: %v", err)
+	}
+	if !bytes.Contains(pendingJSON, []byte("has_async_indexes")) {
+		t.Fatalf("pending work JSON %q did not include async index status", pendingJSON)
 	}
 	scan, err := db.ScanJSON([]byte(`{"from":"doc:go-","to":"doc:go~","include_documents":true,"limit":10}`))
 	if err != nil {
@@ -258,6 +265,9 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if !typedStatus.Inference.CallerSuppliedArtifacts || !typedStatus.Inference.NoInferenceConfiguredOK {
 		t.Fatalf("fresh Lite database should accept caller-supplied or deferred inference: %#v", typedStatus.Inference)
+	}
+	if typedStatus.PendingWork.DerivedTargetSequence == 0 || !typedStatus.PendingWork.HasAsyncIndexes {
+		t.Fatalf("typed status pending work = %#v", typedStatus.PendingWork)
 	}
 
 	caps, err := db.CapabilitiesJSON()
