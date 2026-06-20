@@ -20410,6 +20410,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     };
     const FakeWrites = struct {
         calls: usize = 0,
+        last_row_count: usize = 0,
         first_row_json: []u8 = &.{},
 
         fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -20435,10 +20436,11 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             try std.testing.expectEqualStrings("tenant_ops", target.database_name);
             try std.testing.expectEqualStrings("analytics", target.namespace_name);
             try std.testing.expectEqualStrings("events", target.table_name);
-            try std.testing.expectEqual(@as(usize, 2), req.writes.len);
+            try std.testing.expect(req.writes.len > 0);
             try std.testing.expectEqual(@as(usize, 0), req.deletes.len);
             if (self.first_row_json.len > 0) allocator.free(self.first_row_json);
             self.first_row_json = try allocator.dupe(u8, req.writes[0].value);
+            self.last_row_count = req.writes.len;
             self.calls += 1;
             return {};
         }
@@ -20506,6 +20508,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             operation: relational_sql.BulkSqlIoOperation,
             native_route: relational_sql.BulkSqlIoNativeRoute,
             stream: relational_sql.BulkSqlIoStream,
+            codec: relational_sql.BulkSqlIoCodec,
             required_permission: usermgr.PermissionType,
             authenticated_subject: ?[]u8 = null,
             database_name: []u8,
@@ -20523,7 +20526,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         };
 
         alloc: std.mem.Allocator,
-        events: [4]Captured = undefined,
+        events: [6]Captured = undefined,
         count: usize = 0,
 
         fn deinit(self: *@This()) void {
@@ -20542,6 +20545,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
                 .operation = event.operation,
                 .native_route = event.native_route,
                 .stream = event.stream,
+                .codec = event.codec,
                 .required_permission = event.required_permission,
                 .authenticated_subject = if (event.authenticated_subject) |subject| try self.alloc.dupe(u8, subject) else null,
                 .database_name = try self.alloc.dupe(u8, event.target.database_name),
@@ -20620,12 +20624,40 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[0].operation);
     try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[0].native_route);
     try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdin, audit.events[0].stream);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.csv, audit.events[0].codec);
     try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[0].required_permission);
     try std.testing.expectEqualStrings("alice", audit.events[0].authenticated_subject orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("tenant_ops", audit.events[0].database_name);
     try std.testing.expectEqualStrings("analytics", audit.events[0].namespace_name);
     try std.testing.expectEqualStrings("events", audit.events[0].table_name);
     try std.testing.expectEqual(@as(usize, 2), audit.events[0].row_count);
+
+    var copied_text_result = try server.executeBulkSqlWithSession(
+        "COPY events (id, status) FROM STDIN WITH (FORMAT text);",
+        "u_text\tLine\\nBreak\n",
+        session,
+        &identity,
+    );
+    defer copied_text_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), writes.calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.last_row_count);
+    switch (copied_text_result) {
+        .import_rows => |copied| try std.testing.expectEqual(@as(usize, 1), copied.writes.len),
+        .export_stdout => return error.TestUnexpectedResult,
+    }
+    var first_text_row = try std.json.parseFromSlice(std.json.Value, alloc, writes.first_row_json, .{});
+    defer first_text_row.deinit();
+    try std.testing.expectEqualStrings("u_text", first_text_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("Line\nBreak", first_text_row.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("line\nbreak", first_text_row.value.object.get("status_key").?.string);
+    try std.testing.expectEqual(@as(usize, 2), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[1].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[1].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[1].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdin, audit.events[1].stream);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.postgres_text, audit.events[1].codec);
+    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[1].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[1].row_count);
 
     const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
     var row_filters_transferred = false;
@@ -20648,8 +20680,8 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             &identity,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 1), writes.calls);
-    try std.testing.expectEqual(@as(usize, 1), audit.count);
+    try std.testing.expectEqual(@as(usize, 2), writes.calls);
+    try std.testing.expectEqual(@as(usize, 2), audit.count);
 
     var exported_result = try server.executeBulkSqlWithSession(
         "COPY events (id, status) TO STDOUT WITH (FORMAT csv, HEADER true, FORCE_QUOTE *);",

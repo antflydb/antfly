@@ -1386,12 +1386,6 @@ pub fn lowerMergeMutationPlanAlloc(
     return try parser.parseMergeMutationPlan();
 }
 
-pub const MergeExecutionTargetRow = struct {
-    key: []const u8,
-    json: []const u8,
-    version: u64,
-};
-
 pub fn buildMergeMutationBatchFromDbAlloc(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -1477,454 +1471,6 @@ fn mergeSourceRowsFromPreimagesAlloc(
     errdefer alloc.free(source_rows);
     for (source_preimages, 0..) |row, i| source_rows[i] = row.json;
     return source_rows;
-}
-
-pub fn buildMergeMutationBatchAlloc(
-    alloc: std.mem.Allocator,
-    target_schema: runtime_schema.TableSchema,
-    source_schema: runtime_schema.TableSchema,
-    plan: LoweredMergeMutationPlan,
-    target_rows: []const MergeExecutionTargetRow,
-    source_rows: []const []const u8,
-) !relational_rows.OwnedRowsBatchRequest {
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational) return error.InvalidSqlCatalog;
-
-    var target_parsed = std.ArrayListUnmanaged(std.json.Parsed(std.json.Value)).empty;
-    defer {
-        for (target_parsed.items) |*parsed| parsed.deinit();
-        target_parsed.deinit(alloc);
-    }
-    try target_parsed.ensureUnusedCapacity(alloc, target_rows.len);
-    for (target_rows) |row| {
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row.json, .{}) catch return error.InvalidRowsRequest;
-        errdefer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidRowsRequest;
-        target_parsed.appendAssumeCapacity(parsed);
-    }
-
-    var source_parsed = std.ArrayListUnmanaged(std.json.Parsed(std.json.Value)).empty;
-    defer {
-        for (source_parsed.items) |*parsed| parsed.deinit();
-        source_parsed.deinit(alloc);
-    }
-    try source_parsed.ensureUnusedCapacity(alloc, source_rows.len);
-    for (source_rows) |row| {
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row, .{}) catch return error.InvalidRowsRequest;
-        errdefer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidRowsRequest;
-        source_parsed.appendAssumeCapacity(parsed);
-    }
-
-    var matched_target_keys = std.StringHashMapUnmanaged(void).empty;
-    defer matched_target_keys.deinit(alloc);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll("{\"operations\":[");
-    var wrote_operation = false;
-
-    for (source_parsed.items) |source| {
-        var matched_index: ?usize = null;
-        for (target_parsed.items, 0..) |target, target_index| {
-            if (try mergeRowsMatch(source.value, target.value, plan.match_fields)) {
-                if (matched_index != null) return error.InvalidRowsRequest;
-                matched_index = target_index;
-            }
-        }
-
-        if (matched_index) |target_index| {
-            const target = target_parsed.items[target_index].value;
-            const arm = (try selectMergeMatchedArm(alloc, target, source.value, plan.matched_arms)) orelse continue;
-            if (arm.do_nothing) continue;
-            if (arm.update.len == 0 and arm.update_expressions.len == 0 and !arm.delete) continue;
-            const gop = try matched_target_keys.getOrPut(alloc, target_rows[target_index].key);
-            if (gop.found_existing) return error.InvalidRowsRequest;
-            if (wrote_operation) try writer.writeByte(',');
-            wrote_operation = true;
-            if (arm.delete) {
-                try writer.writeAll("{\"op\":\"delete\",\"where\":");
-                try writeMergePrimaryWhereJson(writer, target_schema, target);
-                try writer.print(",\"expected_version\":{d}", .{target_rows[target_index].version});
-                try writeMergeReturningProjectionJson(writer, plan.returning);
-                try writer.writeByte('}');
-            } else {
-                try writer.writeAll("{\"op\":\"update\",\"where\":");
-                try writeMergePrimaryWhereJson(writer, target_schema, target);
-                try writer.print(",\"expected_version\":{d},\"patch\":{{", .{target_rows[target_index].version});
-                var wrote_patch_field = false;
-                for (arm.update) |mapping| {
-                    if (wrote_patch_field) try writer.writeByte(',');
-                    wrote_patch_field = true;
-                    try writer.print("{f}:", .{std.json.fmt(mapping.target_field, .{})});
-                    try std.json.Stringify.value(try mergeObjectField(source.value, mapping.source_field), .{}, writer);
-                }
-                for (arm.update_expressions) |assignment| {
-                    if (wrote_patch_field) try writer.writeByte(',');
-                    wrote_patch_field = true;
-                    const value_json = try relational_rows.expressionValueJsonWithTargetSourceAlloc(alloc, target, source.value, assignment.expression);
-                    defer alloc.free(value_json);
-                    try writer.print("{f}:{s}", .{ std.json.fmt(assignment.target_field, .{}), value_json });
-                }
-                try writer.writeByte('}');
-                try writeMergeReturningProjectionJson(writer, plan.returning);
-                try writer.writeByte('}');
-            }
-        } else {
-            const arm = (try selectMergeNotMatchedArm(alloc, source.value, plan.not_matched_arms)) orelse continue;
-            if (arm.do_nothing or (arm.insert.len == 0 and arm.insert_expressions.len == 0)) continue;
-            if (wrote_operation) try writer.writeByte(',');
-            wrote_operation = true;
-            try writer.writeAll("{\"op\":\"insert\",\"row\":{");
-            var wrote_insert_field = false;
-            for (arm.insert) |mapping| {
-                if (wrote_insert_field) try writer.writeByte(',');
-                wrote_insert_field = true;
-                try writer.print("{f}:", .{std.json.fmt(mapping.target_field, .{})});
-                try std.json.Stringify.value(try mergeObjectField(source.value, mapping.source_field), .{}, writer);
-            }
-            for (arm.insert_expressions) |assignment| {
-                if (wrote_insert_field) try writer.writeByte(',');
-                wrote_insert_field = true;
-                const value_json = try relational_rows.expressionValueJsonWithTargetSourceAlloc(alloc, source.value, source.value, assignment.expression);
-                defer alloc.free(value_json);
-                try writer.print("{f}:{s}", .{ std.json.fmt(assignment.target_field, .{}), value_json });
-            }
-            try writer.writeByte('}');
-            try writeMergeReturningProjectionJson(writer, plan.returning);
-            try writer.writeByte('}');
-        }
-    }
-
-    try writer.writeAll("]}");
-    const body_json = try out.toOwnedSlice();
-    defer alloc.free(body_json);
-
-    var resolver_ctx = MergeBatchResolverContext{
-        .table_name = plan.target_table_name,
-        .schema = target_schema,
-        .rows = target_rows,
-    };
-    return try relational_rows.parseRowsBatchRequestWithResolver(
-        alloc,
-        plan.target_table_name,
-        body_json,
-        target_schema,
-        resolver_ctx.resolver(),
-    );
-}
-
-const MergeBatchResolverContext = struct {
-    table_name: []const u8,
-    schema: runtime_schema.TableSchema,
-    rows: []const MergeExecutionTargetRow,
-
-    fn resolver(self: *@This()) relational_rows.UniqueSelectorResolver {
-        return .{
-            .ptr = self,
-            .resolve = resolveUnique,
-            .resolve_temporal = resolveTemporalUnique,
-            .resolve_primary = primaryExists,
-            .lookup_primary = lookupPrimary,
-        };
-    }
-
-    fn resolveUnique(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !?[]u8 {
-        return null;
-    }
-
-    fn resolveTemporalUnique(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        constraint_name: []const u8,
-        encoded_value: []const u8,
-        encoded_point: []const u8,
-    ) !?[]u8 {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        if (!std.mem.eql(u8, constraint_name, db_mod.relational_store.primary_key_constraint_name)) return null;
-        var found: ?[]const u8 = null;
-        for (self.rows) |row| {
-            if (!try relational_rows.temporalPrimaryKeyRowContainsPointAlloc(alloc, self.schema, row.json, encoded_value, encoded_point)) continue;
-            if (found) |existing| {
-                if (!std.mem.eql(u8, existing, row.key)) return error.UniqueConstraintViolation;
-                continue;
-            }
-            found = row.key;
-        }
-        return if (found) |key| try alloc.dupe(u8, key) else null;
-    }
-
-    fn primaryExists(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, physical_key: []const u8) !bool {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, table_name, self.table_name)) return false;
-        for (self.rows) |row| {
-            if (std.mem.eql(u8, row.key, physical_key)) return true;
-        }
-        return false;
-    }
-
-    fn lookupPrimary(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, physical_key: []const u8) !?relational_rows.ResolvedPrimaryRow {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        for (self.rows) |row| {
-            if (!std.mem.eql(u8, row.key, physical_key)) continue;
-            return .{
-                .json = try alloc.dupe(u8, row.json),
-                .version = row.version,
-            };
-        }
-        return null;
-    }
-};
-
-fn mergeRowsMatch(
-    source: std.json.Value,
-    target: std.json.Value,
-    mappings: []const MergeFieldMapping,
-) !bool {
-    for (mappings) |mapping| {
-        if (!mergeJsonValuesEqual(try mergeObjectField(target, mapping.target_field), try mergeObjectField(source, mapping.source_field))) return false;
-    }
-    return true;
-}
-
-fn mergePredicatesMatch(
-    alloc: std.mem.Allocator,
-    target: std.json.Value,
-    source: std.json.Value,
-    predicates: []const MergeArmPredicate,
-) !bool {
-    for (predicates) |predicate| {
-        const row = switch (predicate.side) {
-            .target => target,
-            .source => source,
-        };
-        if (!try mergePredicateMatches(alloc, row, predicate)) return false;
-    }
-    return true;
-}
-
-fn selectMergeMatchedArm(
-    alloc: std.mem.Allocator,
-    target: std.json.Value,
-    source: std.json.Value,
-    arms: []const MergeMatchedArm,
-) !?MergeMatchedArm {
-    for (arms) |arm| {
-        if (!try mergePredicatesMatch(alloc, target, source, arm.predicates)) continue;
-        if (!try mergeExpressionPredicatesMatch(
-            alloc,
-            target,
-            source,
-            arm.expression_predicates,
-            arm.expression_or_predicates,
-            arm.expression_not_predicates,
-        )) continue;
-        return arm;
-    }
-    return null;
-}
-
-fn selectMergeNotMatchedArm(
-    alloc: std.mem.Allocator,
-    source: std.json.Value,
-    arms: []const MergeNotMatchedArm,
-) !?MergeNotMatchedArm {
-    for (arms) |arm| {
-        if (!try mergePredicatesMatch(alloc, .{ .null = {} }, source, arm.predicates)) continue;
-        if (!try mergeExpressionPredicatesMatch(
-            alloc,
-            source,
-            source,
-            arm.expression_predicates,
-            arm.expression_or_predicates,
-            arm.expression_not_predicates,
-        )) continue;
-        return arm;
-    }
-    return null;
-}
-
-fn mergeExpressionPredicatesMatch(
-    alloc: std.mem.Allocator,
-    target: std.json.Value,
-    source: std.json.Value,
-    predicates: []const db_mod.types.RelationalRowsExpressionCondition,
-    or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
-    not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
-) !bool {
-    for (predicates) |predicate| {
-        if (!try relational_rows.expressionConditionMatchesWithTargetSource(alloc, target, source, predicate)) return false;
-    }
-    if (!try mergeExpressionOrPredicateGroupsMatch(alloc, target, source, or_predicates)) return false;
-    if (!try mergeExpressionNotPredicateGroupsMatch(alloc, target, source, not_predicates)) return false;
-    return true;
-}
-
-fn mergeExpressionOrPredicateGroupsMatch(
-    alloc: std.mem.Allocator,
-    target: std.json.Value,
-    source: std.json.Value,
-    groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
-) !bool {
-    if (groups.len == 0) return true;
-    for (groups) |group| {
-        var group_matches = true;
-        for (group.conditions) |condition| {
-            if (!try relational_rows.expressionConditionMatchesWithTargetSource(alloc, target, source, condition)) {
-                group_matches = false;
-                break;
-            }
-        }
-        if (group_matches) return true;
-    }
-    return false;
-}
-
-fn mergeExpressionNotPredicateGroupsMatch(
-    alloc: std.mem.Allocator,
-    target: std.json.Value,
-    source: std.json.Value,
-    groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
-) !bool {
-    for (groups) |group| {
-        var group_matches = true;
-        for (group.conditions) |condition| {
-            if (!try relational_rows.expressionConditionMatchesWithTargetSource(alloc, target, source, condition)) {
-                group_matches = false;
-                break;
-            }
-        }
-        if (group_matches) return false;
-    }
-    return true;
-}
-
-fn mergePredicateMatches(alloc: std.mem.Allocator, row: std.json.Value, predicate: MergeArmPredicate) !bool {
-    if (predicate.op == .is_null) return row == .object and mergeObjectFieldOrNull(row, predicate.field) == null;
-    if (predicate.op == .is_not_null) return row == .object and mergeObjectFieldOrNull(row, predicate.field) != null;
-    const actual = try mergeObjectField(row, predicate.field);
-    const value_json = predicate.value_json orelse return error.InvalidRowsRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
-    defer parsed.deinit();
-    if (predicate.op == .is_distinct or predicate.op == .is_not_distinct) {
-        const equal = mergeJsonValuesNotDistinct(actual, parsed.value);
-        return if (predicate.op == .is_distinct) !equal else equal;
-    }
-    const cmp = mergeJsonCompare(actual, parsed.value) orelse return false;
-    return switch (predicate.op) {
-        .eq => cmp == .eq,
-        .ne => cmp != .eq,
-        .gt => cmp == .gt,
-        .gte => cmp == .gt or cmp == .eq,
-        .lt => cmp == .lt,
-        .lte => cmp == .lt or cmp == .eq,
-        .is_distinct, .is_not_distinct => unreachable,
-        .is_null, .is_not_null => unreachable,
-    };
-}
-
-const MergeScalarComparison = enum { lt, eq, gt };
-
-fn mergeJsonValuesEqual(left: std.json.Value, right: std.json.Value) bool {
-    const cmp = mergeJsonCompare(left, right) orelse return false;
-    return cmp == .eq;
-}
-
-fn mergeJsonValuesNotDistinct(left: std.json.Value, right: std.json.Value) bool {
-    if (left == .null and right == .null) return true;
-    if (left == .null or right == .null) return false;
-    return mergeJsonValuesEqual(left, right);
-}
-
-fn mergeJsonCompare(left: std.json.Value, right: std.json.Value) ?MergeScalarComparison {
-    if (mergeJsonNumericValue(left)) |left_num| {
-        const right_num = mergeJsonNumericValue(right) orelse return null;
-        if (left_num < right_num) return .lt;
-        if (left_num > right_num) return .gt;
-        return .eq;
-    }
-    if (left == .string and right == .string) {
-        return switch (std.mem.order(u8, left.string, right.string)) {
-            .lt => .lt,
-            .eq => .eq,
-            .gt => .gt,
-        };
-    }
-    if (left == .bool and right == .bool) {
-        if (left.bool == right.bool) return .eq;
-        return if (!left.bool and right.bool) .lt else .gt;
-    }
-    return null;
-}
-
-fn mergeJsonNumericValue(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |integer| @floatFromInt(integer),
-        .float => |float| float,
-        else => null,
-    };
-}
-
-fn mergeObjectField(value: std.json.Value, field: []const u8) !std.json.Value {
-    if (value != .object) return error.InvalidRowsRequest;
-    return mergeObjectFieldOrNull(value, field) orelse return error.InvalidRowsRequest;
-}
-
-fn mergeObjectFieldOrNull(value: std.json.Value, field: []const u8) ?std.json.Value {
-    if (value != .object) return null;
-    return value.object.get(field);
-}
-
-fn writeMergePrimaryWhereJson(
-    writer: *std.Io.Writer,
-    schema: runtime_schema.TableSchema,
-    row: std.json.Value,
-) !void {
-    const primary_key = schema.primary_key orelse return error.InvalidRowsRequest;
-    if (primary_key.without_overlaps_period) |period_name| {
-        const period = relationalPeriodForDdl(schema.periods, period_name) orelse return error.InvalidRowsRequest;
-        try writer.writeAll("{\"primary\":{\"values\":{");
-        for (primary_key.columns, 0..) |column, i| {
-            if (i != 0) try writer.writeByte(',');
-            try writer.print("{f}:", .{std.json.fmt(column, .{})});
-            try std.json.Stringify.value(try mergeObjectField(row, column), .{}, writer);
-        }
-        try writer.print("}},\"period\":{{\"name\":{f},\"at\":", .{std.json.fmt(period.name, .{})});
-        try std.json.Stringify.value(try mergeObjectField(row, period.start_column), .{}, writer);
-        try writer.writeAll("}}}");
-        return;
-    }
-    try writer.writeAll("{\"primary\":{");
-    for (primary_key.columns, 0..) |column, i| {
-        if (i != 0) try writer.writeByte(',');
-        try writer.print("{f}:", .{std.json.fmt(column, .{})});
-        try std.json.Stringify.value(try mergeObjectField(row, column), .{}, writer);
-    }
-    try writer.writeAll("}}");
-}
-
-fn writeMergeReturningProjectionJson(writer: *std.Io.Writer, returning: ReturningProjection) !void {
-    if (returning.fields.len > 0) {
-        try writer.writeAll(",\"returning\":[");
-        for (returning.fields, 0..) |field, i| {
-            if (i != 0) try writer.writeByte(',');
-            try writer.print("{f}", .{std.json.fmt(field, .{})});
-        }
-        try writer.writeByte(']');
-    }
-    if (returning.expressions.len == 0) return;
-    try writer.writeAll(",\"returning_expressions\":[");
-    for (returning.expressions, 0..) |projection, i| {
-        if (i != 0) try writer.writeByte(',');
-        try writer.print("{{\"as\":{f},\"expr\":", .{std.json.fmt(projection.output, .{})});
-        try writeRowExpressionJson(writer, projection.expression);
-        try writer.writeByte('}');
-    }
-    try writer.writeByte(']');
 }
 
 pub fn lowerUpdateJoinedMutationSourceAlloc(
@@ -42545,6 +42091,17 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_from_execution_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, copy_from));
 
+    var copy_from_text = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN;");
+    defer copy_from_text.deinit(alloc);
+    const copy_from_text_execution = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_from_text) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(BulkSqlIoCodec.postgres_text, copy_from_text_execution.codec);
+    const copy_from_text_execution_fingerprint = try bulkSqlIoExecutionFingerprintAlloc(alloc, copy_from_text_execution);
+    defer alloc.free(copy_from_text_execution_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=postgres_text:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_from_text_execution_fingerprint);
+
     var copy_from_header = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');");
     defer copy_from_header.deinit(alloc);
     const copy_from_header_plan = switch (copy_from_header) {
@@ -42618,6 +42175,28 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqual(@as(i64, 42), copy_import_row.value.object.get("amount").?.integer);
     try std.testing.expect(copy_import_row.value.object.get("active").?.bool);
     try std.testing.expectEqualStrings("copy", copy_import_row.value.object.get("metadata").?.object.get("source").?.string);
+
+    var copy_import_text = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount, active, metadata) FROM STDIN WITH (FORMAT text, DEFAULT 'DEFAULT') WHERE status = 'line\nbreak';");
+    defer copy_import_text.deinit(alloc);
+    const copy_import_text_plan = try bulkSqlIoExecutionPlanFromDdlPlan(switch (copy_import_text) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    });
+    var copy_import_text_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(
+        alloc,
+        copy_runtime_schema,
+        copy_import_text_plan,
+        "u_text_1\tline\\nbreak\t7\ttrue\t{\"source\":\"copy_text\"}\nu_text_2\tclosed\tDEFAULT\tfalse\t\\N\n\\.\n",
+    );
+    defer copy_import_text_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), copy_import_text_batch.writes.len);
+    var copy_import_text_row = try std.json.parseFromSlice(std.json.Value, alloc, copy_import_text_batch.writes[0].value, .{});
+    defer copy_import_text_row.deinit();
+    try std.testing.expectEqualStrings("u_text_1", copy_import_text_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("line\nbreak", copy_import_text_row.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 7), copy_import_text_row.value.object.get("amount").?.integer);
+    try std.testing.expect(copy_import_text_row.value.object.get("active").?.bool);
+    try std.testing.expectEqualStrings("copy_text", copy_import_text_row.value.object.get("metadata").?.object.get("source").?.string);
 
     var copy_import_nulls = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status, amount) FROM STDIN WITH (FORMAT csv, NULL '');");
     defer copy_import_nulls.deinit(alloc);
@@ -42854,6 +42433,43 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer forced_csv_batch.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), forced_csv_batch.writes.len);
     try std.testing.expectEqualStrings("{\"id\":\"r2\",\"status\":\"\",\"note\":null}", forced_csv_batch.writes[0].value);
+
+    const text_plan = BulkSqlIoExecutionPlan{
+        .operation = .import_rows,
+        .native_route = .rows_batch,
+        .stream = .stdin,
+        .codec = .postgres_text,
+        .table_name = "usage_records",
+        .columns = csv_plan_columns[0..],
+        .required_permission = .write,
+        .audit_action = .copy_from,
+    };
+    var text_batch = try bulkSqlIoImportRowsBatchFromStdinAlloc(alloc, csv_schema, text_plan, "r3\t\\N\tliteral\\\\N\nr4\tline\\nbreak\tplain\\ttab\n");
+    defer text_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), text_batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"r3\",\"status\":null,\"note\":\"literal\\\\N\"}", text_batch.writes[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"r4\",\"status\":\"line\\nbreak\",\"note\":\"plain\\ttab\"}", text_batch.writes[1].value);
+
+    var text_export_rows = [_][]const u8{
+        "{\"id\":\"r3\",\"status\":null,\"note\":\"literal\\\\N\"}",
+        "{\"id\":\"r4\",\"status\":\"line\\nbreak\",\"note\":\"plain\\ttab\"}",
+    };
+    const text_export_plan = BulkSqlIoExecutionPlan{
+        .operation = .export_rows,
+        .native_route = .rows_query,
+        .stream = .stdout,
+        .codec = .postgres_text,
+        .table_name = "usage_records",
+        .columns = csv_plan_columns[0..],
+        .required_permission = .read,
+        .audit_action = .copy_to,
+    };
+    const text_export = try bulkSqlIoExportRowsCsvToStdoutAlloc(alloc, csv_schema, text_export_plan, .{
+        .rows = text_export_rows[0..],
+        .total = 2,
+    });
+    defer alloc.free(text_export);
+    try std.testing.expectEqualStrings("r3\t\\N\tliteral\\\\N\nr4\tline\\nbreak\tplain\\ttab\n", text_export);
 
     var create_partitioned_table = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
     defer create_partitioned_table.deinit(alloc);
@@ -63886,32 +63502,6 @@ test "postgres sql adapter merge mutation batch executes through relational stor
     try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"updated\",\"organization_id\":\"org:1\"}", rows.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"t_skip\",\"status\":\"closed\",\"organization_id\":\"org:1\"}", rows.rows[2]);
 
-    var distinct_row = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"open\",\"optional\":null}", .{});
-    defer distinct_row.deinit();
-    try std.testing.expect(try mergePredicateMatches(alloc, distinct_row.value, .{
-        .side = .source,
-        .field = "status",
-        .op = .is_distinct,
-        .value_json = "\"closed\"",
-    }));
-    try std.testing.expect(!try mergePredicateMatches(alloc, distinct_row.value, .{
-        .side = .source,
-        .field = "status",
-        .op = .is_not_distinct,
-        .value_json = "\"closed\"",
-    }));
-    try std.testing.expect(!try mergePredicateMatches(alloc, distinct_row.value, .{
-        .side = .source,
-        .field = "optional",
-        .op = .is_distinct,
-        .value_json = "null",
-    }));
-    try std.testing.expect(try mergePredicateMatches(alloc, distinct_row.value, .{
-        .side = .source,
-        .field = "optional",
-        .op = .is_not_distinct,
-        .value_json = "null",
-    }));
 }
 
 test "postgres sql adapter merge mutation batch applies default expressions" {
