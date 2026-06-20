@@ -1812,12 +1812,35 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
     return .ok;
 }
 
+fn liteImportTargetIsEmpty(handle: *Handle) !bool {
+    if (try handle.db.primaryDocCount(handle.alloc) != 0) return false;
+    if (handle.db.core.indexCount() != 0) return false;
+
+    const enrichments = try handle.db.listEnrichments(handle.alloc);
+    defer db_mod.types.freeEnrichmentConfigs(handle.alloc, enrichments);
+    if (enrichments.len != 0) return false;
+
+    const resolvers = try handle.db.listResolvers(handle.alloc);
+    defer {
+        for (resolvers) |*resolver| resolver.deinit(handle.alloc);
+        if (resolvers.len > 0) handle.alloc.free(resolvers);
+    }
+    if (resolvers.len != 0) return false;
+
+    if (try handle.db.getSchemaJson(handle.alloc)) |schema_json| {
+        handle.alloc.free(schema_json);
+        return false;
+    }
+
+    return true;
+}
+
 pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
-    if (handle.db.core.indexCount() != 0) return .invalid_argument;
+    if (!(liteImportTargetIsEmpty(handle) catch |err| return capi.mapError(err))) return .invalid_argument;
     const bytes = backup.bytes();
     portable_backup.validatePortable(handle.alloc, bytes) catch |err| return capi.mapError(err);
     portable_backup.importPortable(handle.alloc, handle.db.core.store, bytes) catch |err| return capi.mapError(err);
@@ -6144,6 +6167,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(dst_path);
     const bad_dst_path = try tempTestAflitePath(alloc, "capi-lite-bad-dst");
     defer alloc.free(bad_dst_path);
+    const schema_dst_path = try tempTestAflitePath(alloc, "capi-lite-schema-dst");
+    defer alloc.free(schema_dst_path);
     const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
     const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
@@ -6158,6 +6183,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(src_path);
     cleanupTestFile(dst_path);
     cleanupTestFile(bad_dst_path);
+    cleanupTestFile(schema_dst_path);
     cleanupTestFile(snapshot_path);
     cleanupTestFile(restore_path);
     cleanupTestFile(restore_malformed_path);
@@ -6168,6 +6194,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(bad_dst_path);
+    defer cleanupTestFile(schema_dst_path);
     defer cleanupTestFile(snapshot_path);
     defer cleanupTestFile(restore_path);
     defer cleanupTestFile(restore_malformed_path);
@@ -6505,6 +6532,35 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, &target_lookup));
     defer antfly_db_buffer_free(target_lookup.ptr, target_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, target_lookup.ptr.?[0..target_lookup.len], "\"target survives bad capi import\"") != null);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(bad_dst_handle, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }));
+
+    var target_after_valid_rejected: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(bad_dst_handle, .{
+        .ptr = "doc:capi-import-target",
+        .len = "doc:capi-import-target".len,
+    }, &target_after_valid_rejected));
+    defer antfly_db_buffer_free(target_after_valid_rejected.ptr, target_after_valid_rejected.len);
+    try std.testing.expect(std.mem.indexOf(u8, target_after_valid_rejected.ptr.?[0..target_after_valid_rejected.len], "\"target survives bad capi import\"") != null);
+
+    var schema_dst_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(schema_dst_path, &schema_dst_handle));
+    defer antfly_db_close(schema_dst_handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(schema_dst_handle, .{
+        .ptr = schema_json,
+        .len = schema_json.len,
+    }));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(schema_dst_handle, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }));
+    var schema_after_valid_rejected: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(schema_dst_handle, &schema_after_valid_rejected));
+    defer antfly_db_buffer_free(schema_after_valid_rejected.ptr, schema_after_valid_rejected.len);
+    try std.testing.expectEqualStrings(schema_json, schema_after_valid_rejected.ptr.?[0..schema_after_valid_rejected.len]);
 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import_backup(dst_handle, .{
         .ptr = backup.ptr,
