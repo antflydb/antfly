@@ -39,6 +39,8 @@ Antfly Lite.
   Antfly cluster on day one.
 - Antfly Lite should not silently emulate distributed behavior in ways that make
   later promotion surprising.
+- Antfly Lite v1 does not need legacy fallback code for pre-release `.aflite`
+  experiments. Unknown versions and invalid headers should fail explicitly.
 
 ## Existing Starting Point
 
@@ -145,6 +147,8 @@ the v1 target, not a v2 candidate.
 Directory-backed LSM storage should remain available as an internal development,
 debug, and conformance-test profile. LSM-container storage should be treated the
 same way. Neither should be the public Lite v1 contract.
+
+### Compatibility Policy
 
 Because this is new, unreleased code, v1 should not carry a legacy fallback or
 pre-release importer. `.aflite` readers should accept the documented v1 format
