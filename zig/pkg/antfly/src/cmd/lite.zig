@@ -573,8 +573,9 @@ fn restoreFromSourceFile(
 ) !void {
     try requireRestoreSourcePath(source_path);
     try requireAflitePath(out_path);
-    if (std.mem.eql(u8, source_path, out_path)) {
-        cli.fatal("source and output database paths must be different: {s}", .{source_path});
+    if (std.mem.eql(u8, source_path, out_path) or try pathsReferToSameExistingFile(allocator, io, source_path, out_path)) {
+        std.debug.print("error: source and output database paths must be different: {s}\n", .{source_path});
+        return error.InvalidArguments;
     }
 
     const target_exists = pathExists(io, out_path);
@@ -1066,6 +1067,29 @@ fn pathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
+fn pathsReferToSameExistingFile(allocator: Allocator, io: std.Io, a: []const u8, b: []const u8) !bool {
+    const a_real = realPathExistingAlloc(allocator, io, a) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(a_real);
+
+    const b_real = realPathExistingAlloc(allocator, io, b) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(b_real);
+
+    return std.mem.eql(u8, a_real, b_real);
+}
+
+fn realPathExistingAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+    }
+    return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+}
+
 fn deleteFileIfExists(io: std.Io, path: []const u8) !void {
     deleteFilePath(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
@@ -1478,6 +1502,40 @@ test "lite restore replace fails before truncating active writer target" {
     const reopened_json = try lookupJson(allocator, &reopened.db, "doc:target", "");
     defer allocator.free(reopened_json);
     try std.testing.expect(std.mem.indexOf(u8, reopened_json, "\"target survives\"") != null);
+}
+
+test "lite restore rejects same existing aflite through different path spelling" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-self.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const nested_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested", .{tmp.sub_path});
+    defer allocator.free(nested_dir);
+    const alias_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested/../restore-self.aflite", .{tmp.sub_path});
+    defer allocator.free(alias_path);
+
+    try fs_paths.createDirPathPortable(io, nested_dir);
+    {
+        var source = try LiteDb.create(allocator, src_path, true);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:self\":{\"title\":\"self restore rejected\"}}}");
+        defer allocator.free(json);
+    }
+
+    try std.testing.expectError(error.InvalidArguments, restoreFromSourceFile(allocator, io, src_path, alias_path, true));
+
+    var reopened = try LiteDb.open(allocator, src_path, .query_readonly);
+    defer reopened.close();
+    const json = try lookupJson(allocator, &reopened.db, "doc:self", "");
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"self restore rejected\"") != null);
 }
 
 test "lite restore malformed backup leaves target untouched" {
