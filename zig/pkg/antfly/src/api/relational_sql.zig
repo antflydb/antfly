@@ -4545,7 +4545,7 @@ const Parser = struct {
             var syntax = try sql_adapter.parseAlterTableValidateConstraintOperationAlloc(self.alloc, self.tokens, &self.pos);
             var syntax_transferred = false;
             errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-            try self.appendAlterTableOperation(operations, .{ .validate_constraint = syntax.constraint_name });
+            try self.appendAlterTableOperation(operations, sql_adapter.alterTableValidateConstraintOperationFromSyntax(&syntax));
             syntax_transferred = true;
             return;
         }
@@ -4554,17 +4554,7 @@ const Parser = struct {
             var syntax = try sql_adapter.parseAlterTableRenameOperationAlloc(self.alloc, self.tokens, &self.pos);
             var syntax_transferred = false;
             errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-            if (syntax.target == .constraint) {
-                try self.appendAlterTableOperation(operations, .{ .rename_constraint = .{
-                    .old_name = syntax.old_name,
-                    .new_name = syntax.new_name,
-                } });
-            } else {
-                try self.appendAlterTableOperation(operations, .{ .rename_column = .{
-                    .old_name = syntax.old_name,
-                    .new_name = syntax.new_name,
-                } });
-            }
+            try self.appendAlterTableOperation(operations, sql_adapter.alterTableRenameOperationFromSyntax(&syntax));
             syntax_transferred = true;
             return;
         }
@@ -4573,19 +4563,7 @@ const Parser = struct {
             var syntax = try sql_adapter.parseAlterTableDropOperationAlloc(self.alloc, self.tokens, &self.pos);
             var syntax_transferred = false;
             errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-            if (syntax.target == .constraint) {
-                try self.appendAlterTableOperation(operations, .{ .drop_constraint = .{
-                    .name = syntax.name,
-                    .if_exists = syntax.if_exists,
-                    .dependency_mode = syntax.dependency_mode,
-                } });
-            } else {
-                try self.appendAlterTableOperation(operations, .{ .drop_column = .{
-                    .name = syntax.name,
-                    .if_exists = syntax.if_exists,
-                    .dependency_mode = syntax.dependency_mode,
-                } });
-            }
+            try self.appendAlterTableOperation(operations, sql_adapter.alterTableDropOperationFromSyntax(&syntax));
             syntax_transferred = true;
             return;
         }
@@ -4596,10 +4574,7 @@ const Parser = struct {
                 var syntax = syntax_value;
                 var syntax_transferred = false;
                 errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-                try self.appendAlterTableOperation(operations, .{ .alter_column_nullability = .{
-                    .column_name = syntax.column_name,
-                    .nullable = syntax.nullable,
-                } });
+                try self.appendAlterTableOperation(operations, sql_adapter.alterTableColumnNullabilityOperationFromSyntax(&syntax));
                 syntax_transferred = true;
                 return;
             } else |err| switch (err) {

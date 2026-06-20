@@ -3148,6 +3148,63 @@ pub fn dropRowSecurityPolicyPlanFromSyntax(syntax: *grammar.DropRowSecurityPolic
     };
 }
 
+pub fn alterTableValidateConstraintOperationFromSyntax(
+    syntax: *grammar.AlterTableValidateConstraintSyntax,
+) AlterTableOperation {
+    const constraint_name = syntax.constraint_name;
+    syntax.constraint_name = "";
+    return .{ .validate_constraint = constraint_name };
+}
+
+pub fn alterTableRenameOperationFromSyntax(
+    syntax: *grammar.AlterTableRenameOperationSyntax,
+) AlterTableOperation {
+    const old_name = syntax.old_name;
+    const new_name = syntax.new_name;
+    syntax.old_name = "";
+    syntax.new_name = "";
+    return switch (syntax.target) {
+        .column => .{ .rename_column = .{
+            .old_name = old_name,
+            .new_name = new_name,
+        } },
+        .constraint => .{ .rename_constraint = .{
+            .old_name = old_name,
+            .new_name = new_name,
+        } },
+    };
+}
+
+pub fn alterTableDropOperationFromSyntax(
+    syntax: *grammar.AlterTableDropOperationSyntax,
+) AlterTableOperation {
+    const name = syntax.name;
+    syntax.name = "";
+    return switch (syntax.target) {
+        .column => .{ .drop_column = .{
+            .name = name,
+            .if_exists = syntax.if_exists,
+            .dependency_mode = syntax.dependency_mode,
+        } },
+        .constraint => .{ .drop_constraint = .{
+            .name = name,
+            .if_exists = syntax.if_exists,
+            .dependency_mode = syntax.dependency_mode,
+        } },
+    };
+}
+
+pub fn alterTableColumnNullabilityOperationFromSyntax(
+    syntax: *grammar.AlterTableColumnNullabilitySyntax,
+) AlterTableOperation {
+    const column_name = syntax.column_name;
+    syntax.column_name = "";
+    return .{ .alter_column_nullability = .{
+        .column_name = column_name,
+        .nullable = syntax.nullable,
+    } };
+}
+
 pub fn routineKindFromSyntax(syntax: grammar.RoutineKindSyntax) RoutineKind {
     return switch (syntax) {
         .function => .function,
@@ -3479,6 +3536,62 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqual(AdvisoryLockAction.lock, advisory_lock.action);
     try std.testing.expectEqual(@as(i64, 42), advisory_lock.key1);
     try std.testing.expectEqual(@as(i64, 7), advisory_lock.key2.?);
+
+    var validate_syntax: grammar.AlterTableValidateConstraintSyntax = .{
+        .constraint_name = try alloc.dupe(u8, "usage_amount_check"),
+    };
+    const validate_operation = alterTableValidateConstraintOperationFromSyntax(&validate_syntax);
+    defer freeAlterTableOperation(alloc, validate_operation);
+    switch (validate_operation) {
+        .validate_constraint => |constraint_name| try std.testing.expectEqualStrings("usage_amount_check", constraint_name),
+        else => return error.TestExpectedEqual,
+    }
+
+    var rename_syntax: grammar.AlterTableRenameOperationSyntax = .{
+        .target = .constraint,
+        .old_name = try alloc.dupe(u8, "usage_amount_check"),
+        .new_name = try alloc.dupe(u8, "usage_amount_positive"),
+    };
+    const rename_operation = alterTableRenameOperationFromSyntax(&rename_syntax);
+    defer freeAlterTableOperation(alloc, rename_operation);
+    switch (rename_operation) {
+        .rename_constraint => |rename| {
+            try std.testing.expectEqualStrings("usage_amount_check", rename.old_name);
+            try std.testing.expectEqualStrings("usage_amount_positive", rename.new_name);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var drop_syntax: grammar.AlterTableDropOperationSyntax = .{
+        .target = .column,
+        .name = try alloc.dupe(u8, "legacy_amount"),
+        .if_exists = true,
+        .dependency_mode = .restrict,
+    };
+    const drop_operation = alterTableDropOperationFromSyntax(&drop_syntax);
+    defer freeAlterTableOperation(alloc, drop_operation);
+    switch (drop_operation) {
+        .drop_column => |drop| {
+            try std.testing.expectEqualStrings("legacy_amount", drop.name);
+            try std.testing.expect(drop.if_exists);
+            try std.testing.expectEqual(DropDependencyMode.restrict, drop.dependency_mode);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var nullability_syntax: grammar.AlterTableColumnNullabilitySyntax = .{
+        .column_name = try alloc.dupe(u8, "amount"),
+        .nullable = false,
+    };
+    const nullability_operation = alterTableColumnNullabilityOperationFromSyntax(&nullability_syntax);
+    defer freeAlterTableOperation(alloc, nullability_operation);
+    switch (nullability_operation) {
+        .alter_column_nullability => |nullability| {
+            try std.testing.expectEqualStrings("amount", nullability.column_name);
+            try std.testing.expect(!nullability.nullable);
+        },
+        else => return error.TestExpectedEqual,
+    }
 
     var sequence_syntax: grammar.CreateSequenceSyntax = .{
         .sequence_name = try alloc.dupe(u8, "usage_seq"),
