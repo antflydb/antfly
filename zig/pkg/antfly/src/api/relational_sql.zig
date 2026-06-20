@@ -382,12 +382,7 @@ const sqlKeywordIsJsonArrayLengthFunction = sql_adapter.sqlKeywordIsJsonArrayLen
 const sqlKeywordIsJsonTypeofFunction = sql_adapter.sqlKeywordIsJsonTypeofFunction;
 const sqlKeywordIsLengthFunction = sql_adapter.sqlKeywordIsLengthFunction;
 const sqlKeywordIsOctetLengthFunction = sql_adapter.sqlKeywordIsOctetLengthFunction;
-const sqlKeywordIsOverlayFunction = sql_adapter.sqlKeywordIsOverlayFunction;
-const sqlKeywordIsPadFunction = sql_adapter.sqlKeywordIsPadFunction;
-const sqlKeywordIsSplitPartFunction = sql_adapter.sqlKeywordIsSplitPartFunction;
 const stableSecondaryIndexGeneration = sql_adapter.stableSecondaryIndexGeneration;
-const sqlKeywordIsStrposFunction = sql_adapter.sqlKeywordIsStrposFunction;
-const sqlKeywordIsSubstringFunction = sql_adapter.sqlKeywordIsSubstringFunction;
 const sqlKeywordIsTrimVariantFunction = sql_adapter.sqlKeywordIsTrimVariantFunction;
 const sqlKeywordIsUuidV4Function = sql_adapter.sqlKeywordIsUuidV4Function;
 const sqlKeywordStartsScalarPredicate = sql_adapter.sqlKeywordStartsScalarPredicate;
@@ -3383,6 +3378,7 @@ const Parser = struct {
         return .{
             .ptr = self,
             .parse_expression = parseFixedUnaryRowExpressionOperandHook,
+            .parse_operand = parseNullifRowExpressionOperandHook,
         };
     }
 
@@ -15445,55 +15441,7 @@ const Parser = struct {
     }
 
     fn parseSubstringRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsSubstringFunction);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const text_operand = try self.parseRowExpressionAlloc();
-        var text_transferred = false;
-        errdefer if (!text_transferred) freeExpression(self.alloc, text_operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(text_operand);
-        try operands.append(self.alloc, text_operand);
-        text_transferred = true;
-
-        if (self.match(.comma) != null) {
-            const start_operand = try self.parseRowExpressionAlloc();
-            var start_transferred = false;
-            errdefer if (!start_transferred) freeExpression(self.alloc, start_operand);
-            try self.rowExpressionTypeContext().validateNumericRowExpression(start_operand);
-            try operands.append(self.alloc, start_operand);
-            start_transferred = true;
-
-            if (self.match(.comma) != null) {
-                const length_operand = try self.parseRowExpressionAlloc();
-                var length_transferred = false;
-                errdefer if (!length_transferred) freeExpression(self.alloc, length_operand);
-                try self.rowExpressionTypeContext().validateNumericRowExpression(length_operand);
-                try operands.append(self.alloc, length_operand);
-                length_transferred = true;
-            }
-        } else if (self.matchKeyword("from")) {
-            const start_operand = try self.parseRowExpressionAlloc();
-            var start_transferred = false;
-            errdefer if (!start_transferred) freeExpression(self.alloc, start_operand);
-            try self.rowExpressionTypeContext().validateNumericRowExpression(start_operand);
-            try operands.append(self.alloc, start_operand);
-            start_transferred = true;
-
-            if (self.matchKeyword("for")) {
-                const length_operand = try self.parseRowExpressionAlloc();
-                var length_transferred = false;
-                errdefer if (!length_transferred) freeExpression(self.alloc, length_operand);
-                try self.rowExpressionTypeContext().validateNumericRowExpression(length_operand);
-                try operands.append(self.alloc, length_operand);
-                length_transferred = true;
-            }
-        } else return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .substring, &operands);
+        return try sql_adapter.parseSubstringRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseOverlayExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15505,47 +15453,7 @@ const Parser = struct {
     }
 
     fn parseOverlayRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsOverlayFunction);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const source_operand = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source_operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source_operand);
-        try operands.append(self.alloc, source_operand);
-        source_transferred = true;
-
-        try self.expectKeyword("placing");
-        const replacement_operand = try self.parseRowExpressionAlloc();
-        var replacement_transferred = false;
-        errdefer if (!replacement_transferred) freeExpression(self.alloc, replacement_operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(replacement_operand);
-        try operands.append(self.alloc, replacement_operand);
-        replacement_transferred = true;
-
-        try self.expectKeyword("from");
-        const start_operand = try self.parseRowExpressionAlloc();
-        var start_transferred = false;
-        errdefer if (!start_transferred) freeExpression(self.alloc, start_operand);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(start_operand);
-        try operands.append(self.alloc, start_operand);
-        start_transferred = true;
-
-        if (self.matchKeyword("for")) {
-            const length_operand = try self.parseRowExpressionAlloc();
-            var length_transferred = false;
-            errdefer if (!length_transferred) freeExpression(self.alloc, length_operand);
-            try self.rowExpressionTypeContext().validateNumericRowExpression(length_operand);
-            try operands.append(self.alloc, length_operand);
-            length_transferred = true;
-        }
-
-        try self.expect(.rparen);
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .overlay, &operands);
+        return try sql_adapter.parseOverlayRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseSplitPartExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15557,27 +15465,7 @@ const Parser = struct {
     }
 
     fn parseSplitPartRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsSplitPartFunction);
-        const source = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const delimiter = try self.parseRowExpressionAlloc();
-        var delimiter_transferred = false;
-        errdefer if (!delimiter_transferred) freeExpression(self.alloc, delimiter);
-        try self.rowExpressionTypeContext().validateTextRowExpression(delimiter);
-        try self.expect(.comma);
-        const position = try self.parseRowExpressionAlloc();
-        var position_transferred = false;
-        errdefer if (!position_transferred) freeExpression(self.alloc, position);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(position);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildTernaryFunctionExpressionAlloc(self.alloc, .split_part, source, delimiter, position);
-        source_transferred = true;
-        delimiter_transferred = true;
-        position_transferred = true;
-        return expression;
+        return try sql_adapter.parseSplitPartRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseStrposExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15589,39 +15477,7 @@ const Parser = struct {
     }
 
     fn parseStrposRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        if (sql_adapter.matchFunctionKeyword(self.tokens, &self.pos, sqlKeywordIsStrposFunction)) {
-            try self.expect(.lparen);
-            const source = try self.parseRowExpressionAlloc();
-            var source_transferred = false;
-            errdefer if (!source_transferred) freeExpression(self.alloc, source);
-            try self.rowExpressionTypeContext().validateTextRowExpression(source);
-            try self.expect(.comma);
-            const needle = try self.parseRowExpressionAlloc();
-            var needle_transferred = false;
-            errdefer if (!needle_transferred) freeExpression(self.alloc, needle);
-            try self.rowExpressionTypeContext().validateTextRowExpression(needle);
-            try self.expect(.rparen);
-            const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .strpos, source, needle);
-            source_transferred = true;
-            needle_transferred = true;
-            return expression;
-        } else if (self.matchKeyword("position")) {
-            try self.expect(.lparen);
-            const needle = try self.parseRowExpressionOperandAlloc();
-            var needle_transferred = false;
-            errdefer if (!needle_transferred) freeExpression(self.alloc, needle);
-            try self.rowExpressionTypeContext().validateTextRowExpression(needle);
-            try self.expectKeyword("in");
-            const source = try self.parseRowExpressionAlloc();
-            var source_transferred = false;
-            errdefer if (!source_transferred) freeExpression(self.alloc, source);
-            try self.rowExpressionTypeContext().validateTextRowExpression(source);
-            try self.expect(.rparen);
-            const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .strpos, source, needle);
-            source_transferred = true;
-            needle_transferred = true;
-            return expression;
-        } else return error.UnsupportedSqlShape;
+        return try sql_adapter.parseStrposRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseLeftRightExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15645,39 +15501,7 @@ const Parser = struct {
     }
 
     fn parsePadRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        const kind = sql_adapter.matchPadFunctionKind(self.tokens, &self.pos) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const source = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try operands.append(self.alloc, source);
-        source_transferred = true;
-        try self.expect(.comma);
-
-        const target = try self.parseRowExpressionAlloc();
-        var target_transferred = false;
-        errdefer if (!target_transferred) freeExpression(self.alloc, target);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(target);
-        try operands.append(self.alloc, target);
-        target_transferred = true;
-
-        if (self.match(.comma) != null) {
-            const fill = try self.parseRowExpressionAlloc();
-            var fill_transferred = false;
-            errdefer if (!fill_transferred) freeExpression(self.alloc, fill);
-            try self.rowExpressionTypeContext().validateTextRowExpression(fill);
-            try operands.append(self.alloc, fill);
-            fill_transferred = true;
-        }
-        try self.expect(.rparen);
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
+        return try sql_adapter.parsePadRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseRepeatExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {

@@ -5301,7 +5301,12 @@ optional planner support-function identity (`SUPPORT function_name`), optional
 transform type metadata (`TRANSFORM FOR TYPE type_name[, ...]`), optional
 routine-local setting metadata (`SET setting TO value[, ...]`, `SET setting =
 value[, ...]`, or `SET setting FROM CURRENT`) as ordered name/value or `FROM
-CURRENT` declarations, and drop dependency metadata such as `CASCADE`. Routine lifecycle
+CURRENT` declarations, and drop dependency metadata such as `CASCADE`. When
+`ApiHttpServer` applies routine catalog DDL, `SET search_path FROM CURRENT`
+freezes the current ordered SQL session search path into durable routine
+metadata, and other `FROM CURRENT` routine settings freeze the current value
+only when it exists in the typed SQL session setting map; absent or unsupported
+settings fail closed before the routine record is stored. Routine lifecycle
 tails parse in
 `api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
