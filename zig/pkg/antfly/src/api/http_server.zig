@@ -20403,10 +20403,18 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
 test "api http server applies prepared statement SQL plans to session runtime" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
-                .vtable = &.{},
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
             };
         }
     };
@@ -20668,10 +20676,18 @@ test "api http server applies SQL routine catalog plans through native runtime" 
 test "api http server recovers durable SQL routine catalog" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
-                .vtable = &.{},
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
             };
         }
     };

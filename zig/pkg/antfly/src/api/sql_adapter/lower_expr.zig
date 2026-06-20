@@ -179,6 +179,7 @@ pub const ExpressionIsTailKind = enum {
 };
 
 pub const ExpressionIsTailOptions = struct {
+    allow_distinct: bool = true,
     allow_boolean_unknown: bool = false,
     allow_boolean_literal: bool = false,
     allow_boolean_literal_negation: bool = false,
@@ -199,6 +200,7 @@ pub fn parseExpressionIsTailIf(
     if (!parser.matchKeyword(tokens, pos, "is")) return null;
     const not = parser.matchKeyword(tokens, pos, "not");
     if (parser.matchKeyword(tokens, pos, "distinct")) {
+        if (!options.allow_distinct) return error.UnsupportedSqlShape;
         try parser.expectKeyword(tokens, pos, "from");
         return .{
             .op = if (not) .is_not_distinct else .is_distinct,
@@ -9941,6 +9943,8 @@ test "sql adapter expression keyword predicates classify function and tail token
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_distinct, is_distinct_tail.op);
     try std.testing.expectEqual(ExpressionIsTailKind.distinct_comparison, is_distinct_tail.kind);
     try std.testing.expectEqual(@as(usize, 3), is_distinct_pos);
+    is_distinct_pos = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseExpressionIsTailIf(is_distinct_tokens[0..], &is_distinct_pos, .{ .allow_distinct = false }));
 
     const is_unknown_tokens = [_]Token{
         .{ .kind = .identifier, .text = "is" },

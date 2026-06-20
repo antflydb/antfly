@@ -8032,32 +8032,36 @@ const Parser = struct {
             },
         };
 
-        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
-            const not = self.matchKeyword("not");
-            if (try sql_adapter.parseSqlBooleanIsUnknown(self.tokens, &self.pos, column)) {
-                break :blk if (not) .is_not_null else .is_null;
+        const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{
+            .allow_distinct = false,
+            .allow_boolean_unknown = true,
+            .allow_boolean_literal = true,
+        })) |is_tail| blk: {
+            switch (is_tail.kind) {
+                .distinct_comparison => unreachable,
+                .null_test => {},
+                .boolean_unknown => {
+                    if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                    break :blk is_tail.op;
+                },
+                .boolean_literal => {
+                    if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                    const value_json = try self.alloc.dupe(u8, sql_adapter.booleanJson(is_tail.boolean_value));
+                    errdefer self.alloc.free(value_json);
+                    const field = try self.alloc.dupe(u8, lhs.field);
+                    var field_transferred = false;
+                    errdefer if (!field_transferred) self.alloc.free(field);
+                    field_transferred = true;
+                    return MergeArmPredicate{
+                        .side = side,
+                        .field = field,
+                        .op = .eq,
+                        .value_json = value_json,
+                    };
+                },
             }
-            if (try sql_adapter.parseSqlBooleanIsValueAlloc(self.alloc, self.tokens, &self.pos, column, not)) |value_json| {
-                errdefer self.alloc.free(value_json);
-                const field = try self.alloc.dupe(u8, lhs.field);
-                var field_transferred = false;
-                errdefer if (!field_transferred) self.alloc.free(field);
-                field_transferred = true;
-                return .{
-                    .side = side,
-                    .field = field,
-                    .op = .eq,
-                    .value_json = value_json,
-                };
-            }
-            if (not) {
-                try self.expectKeyword("null");
-                break :blk .is_not_null;
-            }
-            try self.expectKeyword("null");
-            break :blk .is_null;
+            break :blk is_tail.op;
         } else try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
-
         const value_json = if (op == .is_null or op == .is_not_null)
             null
         else
@@ -8069,7 +8073,7 @@ const Parser = struct {
         errdefer if (!field_transferred) self.alloc.free(field);
         field_transferred = true;
         value_transferred = true;
-        return .{
+        return MergeArmPredicate{
             .side = side,
             .field = field,
             .op = op,
@@ -11257,34 +11261,39 @@ const Parser = struct {
             const lhs_side = try joinSideForQualifier(lhs.qualifier, left_alias, right_alias);
             const lhs_column = try sql_adapter.joinColumnForSide(self.schema, self.joined_source_schema, lhs_side, lhs.field);
             const target_predicates = if (lhs_side == .left) left_predicates else right_predicates;
-            const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
-                const not = self.matchKeyword("not");
-                if (try sql_adapter.parseSqlBooleanIsUnknown(self.tokens, &self.pos, lhs_column)) {
-                    break :blk if (not) .is_not_null else .is_null;
+            const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{
+                .allow_distinct = false,
+                .allow_boolean_unknown = true,
+                .allow_boolean_literal = true,
+            })) |is_tail| blk: {
+                switch (is_tail.kind) {
+                    .distinct_comparison => unreachable,
+                    .null_test => {},
+                    .boolean_unknown => {
+                        if (lhs_column.field_type != .boolean) return error.InvalidSqlCatalog;
+                        break :blk is_tail.op;
+                    },
+                    .boolean_literal => {
+                        if (lhs_column.field_type != .boolean) return error.InvalidSqlCatalog;
+                        const value_json = try self.alloc.dupe(u8, sql_adapter.booleanJson(is_tail.boolean_value));
+                        var value_transferred = false;
+                        errdefer if (!value_transferred) self.alloc.free(value_json);
+                        try sql_adapter.appendJoinOnScalarPredicateAlloc(
+                            self.alloc,
+                            target_predicates,
+                            on_expression_predicates,
+                            join_type,
+                            lhs_side,
+                            lhs.field,
+                            .eq,
+                            value_json,
+                        );
+                        value_transferred = true;
+                        if (!self.matchKeyword("and")) break;
+                        continue;
+                    },
                 }
-                if (try sql_adapter.parseSqlBooleanIsValueAlloc(self.alloc, self.tokens, &self.pos, lhs_column, not)) |value_json| {
-                    var value_transferred = false;
-                    errdefer if (!value_transferred) self.alloc.free(value_json);
-                    try sql_adapter.appendJoinOnScalarPredicateAlloc(
-                        self.alloc,
-                        target_predicates,
-                        on_expression_predicates,
-                        join_type,
-                        lhs_side,
-                        lhs.field,
-                        .eq,
-                        value_json,
-                    );
-                    value_transferred = true;
-                    if (!self.matchKeyword("and")) break;
-                    continue;
-                }
-                if (not) {
-                    try self.expectKeyword("null");
-                    break :blk .is_not_null;
-                }
-                try self.expectKeyword("null");
-                break :blk .is_null;
+                break :blk is_tail.op;
             } else try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
             if (op == .eq and self.peekKind(.identifier) and identifierContainsQualifier(self.tokens[self.pos].text)) {
                 const rhs = try sql_adapter.parseQualifiedFieldAlloc(self.alloc, self.tokens, &self.pos);
@@ -11471,44 +11480,43 @@ const Parser = struct {
                 if (!self.matchKeyword("and")) break;
                 continue;
             }
-            const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
-                const not = self.matchKeyword("not");
-                if (self.matchKeyword("distinct")) {
-                    try self.expectKeyword("from");
-                    break :blk if (not) .is_not_distinct else .is_distinct;
+            const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{
+                .allow_boolean_unknown = true,
+                .allow_boolean_literal = true,
+                .allow_boolean_literal_negation = true,
+            })) |is_tail| blk: {
+                switch (is_tail.kind) {
+                    .distinct_comparison, .null_test => {},
+                    .boolean_unknown => {
+                        if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                        break :blk is_tail.op;
+                    },
+                    .boolean_literal => {
+                        if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                        if (is_tail.boolean_negated) {
+                            try sql_adapter.appendBooleanIsNotExpressionGroups(self.alloc, target_expression_or_predicates, source.field, is_tail.boolean_value);
+                            if (!self.matchKeyword("and")) break;
+                            continue;
+                        }
+                        const value_json = try self.alloc.dupe(u8, sql_adapter.booleanJson(is_tail.boolean_value));
+                        var value_transferred = false;
+                        errdefer if (!value_transferred) self.alloc.free(value_json);
+                        const field = try self.alloc.dupe(u8, source.field);
+                        var field_transferred = false;
+                        errdefer if (!field_transferred) self.alloc.free(field);
+                        try target.append(self.alloc, .{
+                            .name = "",
+                            .field = field,
+                            .op = .eq,
+                            .value_json = value_json,
+                        });
+                        field_transferred = true;
+                        value_transferred = true;
+                        if (!self.matchKeyword("and")) break;
+                        continue;
+                    },
                 }
-                if (try sql_adapter.parseSqlBooleanIsUnknown(self.tokens, &self.pos, column)) {
-                    break :blk if (not) .is_not_null else .is_null;
-                }
-                if (not and (self.peekKeyword("true") or self.peekKeyword("false"))) {
-                    const value = (try sql_adapter.parseSqlBooleanIsValue(self.tokens, &self.pos, column)) orelse return error.UnsupportedSqlShape;
-                    try sql_adapter.appendBooleanIsNotExpressionGroups(self.alloc, target_expression_or_predicates, source.field, value);
-                    if (!self.matchKeyword("and")) break;
-                    continue;
-                }
-                if (try sql_adapter.parseSqlBooleanIsValueAlloc(self.alloc, self.tokens, &self.pos, column, not)) |value_json| {
-                    var value_transferred = false;
-                    errdefer if (!value_transferred) self.alloc.free(value_json);
-                    const field = try self.alloc.dupe(u8, source.field);
-                    var field_transferred = false;
-                    errdefer if (!field_transferred) self.alloc.free(field);
-                    try target.append(self.alloc, .{
-                        .name = "",
-                        .field = field,
-                        .op = .eq,
-                        .value_json = value_json,
-                    });
-                    field_transferred = true;
-                    value_transferred = true;
-                    if (!self.matchKeyword("and")) break;
-                    continue;
-                }
-                if (not) {
-                    try self.expectKeyword("null");
-                    break :blk .is_not_null;
-                }
-                try self.expectKeyword("null");
-                break :blk .is_null;
+                break :blk is_tail.op;
             } else try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
             if (op == .eq and sql_adapter.matchAnyOrSomeKeyword(self.tokens, &self.pos)) {
                 if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
@@ -17030,45 +17038,6 @@ const Parser = struct {
                 },
             }
             break :blk is_tail.op;
-        } else if (sql_adapter.matchPostfixNullTest(self.tokens, &self.pos)) |postfix_null_test|
-            postfix_null_test
-        else
-            try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
-
-        if (op == .eq and sql_adapter.matchAnyOrSomeKeyword(self.tokens, &self.pos)) {
-            try self.expect(.lparen);
-            const values_json = try self.parseJsonArrayValueAlloc();
-            defer self.alloc.free(values_json);
-            try self.expect(.rparen);
-            try sql_adapter.appendExpressionValuesJsonOrGroups(self.alloc, self.rowExpressionTypeContext(), expression_or_predicates, lhs, values_json);
-            freeExpression(self.alloc, lhs);
-            lhs_transferred = true;
-            return;
-        }
-                try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                try expression_predicates.append(self.alloc, sql_adapter.expressionNullTestCondition(lhs, if (not) .is_not_null else .is_null));
-                lhs_transferred = true;
-                return;
-            }
-            if (self.matchKeyword("true") or self.matchKeyword("false")) {
-                const value = std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "true");
-                try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                if (not) {
-                    try sql_adapter.appendExpressionBooleanIsNotGroups(self.alloc, expression_or_predicates, lhs, value);
-                    freeExpression(self.alloc, lhs);
-                    lhs_transferred = true;
-                    return;
-                }
-                const condition = try sql_adapter.expressionBooleanComparisonConditionAlloc(self.alloc, lhs, .eq, value);
-                var condition_transferred = false;
-                errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
-                try expression_predicates.append(self.alloc, condition);
-                condition_transferred = true;
-                lhs_transferred = true;
-                return;
-            }
-            try self.expectKeyword("null");
-            break :blk if (not) .is_not_null else .is_null;
         } else if (sql_adapter.matchPostfixNullTest(self.tokens, &self.pos)) |postfix_null_test|
             postfix_null_test
         else

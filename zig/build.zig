@@ -3915,6 +3915,9 @@ pub fn build(b: *std.Build) void {
             "sql adapter grammar parses table partition catalog tails",
             "sql adapter grammar parses view catalog tails",
             "sql adapter grammar parses truncate mutation-source syntax",
+            "sql routine runtime",
+            "api http server recovers durable SQL routine catalog",
+            "api http server exposes SQL routine bindings to catalog read planning",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.
@@ -3931,7 +3934,10 @@ pub fn build(b: *std.Build) void {
             "external embeddings index readiness",
             "embeddings index status",
             "embeddings index replay completion",
-            "managed embeddings",
+            "managed embeddings readiness prefers replay completion once docs are indexed",
+            "managed embeddings readiness does not require table doc count once replay is complete",
+            "managed embedder translates managed embeddings config into db generator config",
+            "managed embedder translates managed embeddings config with probed dimension",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

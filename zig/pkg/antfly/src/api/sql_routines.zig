@@ -313,17 +313,26 @@ pub const Runtime = struct {
         const opened = self.opened_store orelse return;
         const key = try routineRecordKeyAlloc(self.alloc, record.kind, record.name, record.argument_count);
         defer self.alloc.free(key);
-        try opened.docstore.delete(key);
+        opened.docstore.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
     }
 
     fn recoverPersistedRoutinesLocked(self: *@This(), opened: *OpenedStore) !void {
         const results = try opened.docstore.scanPrefix(self.alloc, routine_key_prefix);
         defer docstore_mod.DocStore.freeResults(self.alloc, results);
         for (results) |kv| {
-            var parsed = std.json.parseFromSlice(PersistedRoutineRecord, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
+            var parsed = std.json.parseFromSlice(PersistedRoutineRecord, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidRoutineStore,
+            };
             defer parsed.deinit();
-            if (parsed.value.version != 1 or parsed.value.origin != .catalog) continue;
-            var record = clonePersistedRoutineRecordAlloc(self.alloc, parsed.value) catch continue;
+            if (parsed.value.version != 1 or parsed.value.origin != .catalog) return error.InvalidRoutineStore;
+            var record = clonePersistedRoutineRecordAlloc(self.alloc, parsed.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidRoutineStore,
+            };
             errdefer record.deinit(self.alloc);
             if (self.findRoutineIndexLocked(record.kind, record.name, record.argument_count)) |existing| {
                 var removed = self.routines.orderedRemove(existing);
@@ -623,7 +632,7 @@ fn routineRecordKeyAlloc(
     hasher.update(arity);
     var digest: [Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ routine_key_prefix, std.fmt.fmtSliceHexLower(&digest) });
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ routine_key_prefix, std.fmt.bytesToHex(digest, .lower) });
 }
 
 const routine_key_prefix = "__api_sql_routines__:";
@@ -718,6 +727,30 @@ test "sql routine runtime persists catalog routines across reopen" {
         try runtime.attachOpenedStore(opened);
         try std.testing.expectEqual(@as(usize, 0), runtime.routineCountForTest());
     }
+}
+
+test "sql routine runtime fails closed on corrupt durable catalog records" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-routines-corrupt", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const opened = try alloc.create(OpenedStore);
+    errdefer alloc.destroy(opened);
+    opened.* = try OpenedStore.open(alloc, path);
+    errdefer opened.deinit();
+
+    const key = try routineRecordKeyAlloc(alloc, .function, "broken", 0);
+    defer alloc.free(key);
+    try opened.docstore.put(key, "{not-json");
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try std.testing.expectError(error.InvalidRoutineStore, runtime.attachOpenedStore(opened));
+
+    opened.deinit();
+    alloc.destroy(opened);
 }
 
 test "sql routine runtime executes bounded multi argument expression bodies" {
