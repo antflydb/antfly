@@ -201,7 +201,8 @@ pub fn mapError(err: anyerror) ErrorCode {
     return switch (err) {
         error.VersionConflict => .version_conflict,
         error.IntentConflict, error.DecisionConflict => .intent_conflict,
-        error.TxnNotFound, error.NotFound => .txn_not_found,
+        error.TxnNotFound => .txn_not_found,
+        error.NotFound => .not_found,
         error.InvalidArgument,
         error.InvalidQueryRequest,
         error.UnsupportedQueryRequest,

@@ -5973,6 +5973,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "writer") != null);
     try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
+    try std.testing.expectEqual(capi.ErrorCode.not_found, capi.mapError(error.NotFound));
+    try std.testing.expectEqual(capi.ErrorCode.txn_not_found, capi.mapError(error.TxnNotFound));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.UnsupportedNativeFormatVersion));
 
