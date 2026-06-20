@@ -138,6 +138,10 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
 fn initLite(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
+    requireNoMoreArgs(args);
+    if (initTargetExists(io, path)) {
+        cli.fatal("database already exists: {s}", .{path});
+    }
 
     var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
@@ -927,6 +931,10 @@ fn requireNoMoreArgs(args: *std.process.Args.Iterator) void {
     if (args.next()) |arg| cli.fatal("unknown argument: {s}", .{arg});
 }
 
+fn initTargetExists(io: std.Io, path: []const u8) bool {
+    return pathExists(io, path);
+}
+
 fn requireAflitePath(path: []const u8) !void {
     if (!std.mem.endsWith(u8, path, ".aflite")) {
         std.debug.print("error: Antfly Lite database paths must end in .aflite: {s}\n", .{path});
@@ -1074,6 +1082,27 @@ test "lite read file parser accepts explicit readonly flag" {
     const argv = [_][*:0]const u8{ "--readonly", "--file", "query.json" };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expectEqualStrings("query.json", parseReadFileFlag(&args));
+}
+
+test "lite init target check treats existing aflite as occupied" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/init-existing.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    try std.testing.expect(!initTargetExists(io, path));
+    {
+        var lite = try LiteDb.open(allocator, path, .writer);
+        defer lite.close();
+    }
+    try std.testing.expect(initTargetExists(io, path));
 }
 
 test "lite backup writer handles absolute output paths" {
