@@ -56,6 +56,11 @@ const document_delete_flag: u8 = 1 << 0;
 const document_external_value_flag: u8 = 1 << 1;
 const value_page_header_size: usize = 8;
 
+const CatalogRoot = enum {
+    metadata,
+    index,
+};
+
 pub const CatalogEntry = struct {
     previous_page: u64,
     key: []const u8,
@@ -231,6 +236,9 @@ pub const NativeFile = struct {
         const catalog_records = self.countChainPages(.catalog, checkpoint.catalog_root_page) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
+        const index_catalog_records = self.countChainPages(.catalog, checkpoint.index_catalog_root_page) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
         const document_records = self.countChainPages(.document, checkpoint.document_root_page) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
@@ -239,7 +247,7 @@ pub const NativeFile = struct {
         };
 
         var valid = report;
-        valid.record_count = catalog_records + document_records;
+        valid.record_count = catalog_records + index_catalog_records + document_records;
         valid.live_file_count = live.record_count;
         valid.live_bytes = live.bytes;
         valid.compact_size = live.compact_size;
@@ -284,12 +292,28 @@ pub const NativeFile = struct {
     }
 
     pub fn putCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
+        return try self.putCatalogBatchForRoot(.metadata, mutations);
+    }
+
+    pub fn putIndexCatalogRecord(self: *NativeFile, key: []const u8, value: []const u8) !void {
+        try self.putIndexCatalogBatch(&.{.{ .key = key, .value = value }});
+    }
+
+    pub fn deleteIndexCatalogRecord(self: *NativeFile, key: []const u8) !void {
+        try self.putIndexCatalogBatch(&.{.{ .key = key, .is_delete = true }});
+    }
+
+    pub fn putIndexCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
+        return try self.putCatalogBatchForRoot(.index, mutations);
+    }
+
+    fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation) !void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| try self.validateCatalogMutation(mutation);
 
         const previous = self.activeCheckpoint();
-        var next_root_page = previous.catalog_root_page;
+        var next_root_page = catalogRootPage(previous, root);
         var next_page_id = previous.page_count;
 
         for (mutations) |mutation| {
@@ -318,13 +342,26 @@ pub const NativeFile = struct {
 
         var next = previous;
         next.commit_sequence += 1;
-        next.catalog_root_page = next_root_page;
+        setCatalogRootPage(&next, root, next_root_page);
         next.page_count = next_page_id;
         try self.publishCheckpoint(next);
     }
 
     pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
-        var page_id = self.activeCheckpoint().catalog_root_page;
+        return try self.getCatalogRecordFromRootAlloc(allocator, .metadata, key);
+    }
+
+    pub fn getIndexCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
+        return try self.getCatalogRecordFromRootAlloc(allocator, .index, key);
+    }
+
+    fn getCatalogRecordFromRootAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+    ) !?[]u8 {
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
         while (page_id != 0) {
             const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
             defer allocator.free(payload);
@@ -339,6 +376,14 @@ pub const NativeFile = struct {
     }
 
     pub fn snapshotCatalogRecordsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedCatalogRecord {
+        return try self.snapshotCatalogRecordsFromRootAlloc(allocator, .metadata);
+    }
+
+    pub fn snapshotIndexCatalogRecordsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedCatalogRecord {
+        return try self.snapshotCatalogRecordsFromRootAlloc(allocator, .index);
+    }
+
+    fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {
         var map = std.StringHashMapUnmanaged(?[]u8).empty;
         defer {
             var it = map.iterator();
@@ -349,7 +394,7 @@ pub const NativeFile = struct {
             map.deinit(allocator);
         }
 
-        var page_id = self.activeCheckpoint().catalog_root_page;
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
         while (page_id != 0) {
             const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
             defer allocator.free(payload);
@@ -534,6 +579,9 @@ pub const NativeFile = struct {
         const catalog_records = try self.snapshotCatalogRecordsAlloc(self.allocator);
         defer freeSnapshotCatalogRecords(self.allocator, catalog_records);
 
+        const index_catalog_records = try self.snapshotIndexCatalogRecordsAlloc(self.allocator);
+        defer freeSnapshotCatalogRecords(self.allocator, index_catalog_records);
+
         const docs = try self.snapshotDocumentsAlloc(self.allocator);
         defer freeSnapshotDocuments(self.allocator, docs);
 
@@ -546,6 +594,7 @@ pub const NativeFile = struct {
 
         var next_page_id: u64 = 1;
         var catalog_root_page: u64 = 0;
+        var index_catalog_root_page: u64 = 0;
         var document_root_page: u64 = 0;
         var live_bytes: u64 = 0;
 
@@ -564,6 +613,24 @@ pub const NativeFile = struct {
                 .external_value_root_page = external_value_root_page,
             });
             catalog_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .catalog, payload.items);
+            live_bytes +|= record.key.len + record.value.len;
+        }
+
+        for (index_catalog_records) |record| {
+            const external_value_root_page = if (record.value.len == 0 or self.catalogEntryFitsInline(record.key, record.value))
+                0
+            else
+                try appendValuePagesToImage(self.allocator, &image, page_size, self.maxValuePagePayloadBytes(), &next_page_id, record.value);
+
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntry(self.allocator, &payload, .{
+                .previous_page = index_catalog_root_page,
+                .key = record.key,
+                .value = record.value,
+                .external_value_root_page = external_value_root_page,
+            });
+            index_catalog_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .catalog, payload.items);
             live_bytes +|= record.key.len + record.value.len;
         }
 
@@ -589,7 +656,7 @@ pub const NativeFile = struct {
             .commit_sequence = previous.commit_sequence + 1,
             .catalog_root_page = catalog_root_page,
             .document_root_page = document_root_page,
-            .index_catalog_root_page = 0,
+            .index_catalog_root_page = index_catalog_root_page,
             .free_map_root_page = 0,
             .page_count = next_page_id,
         };
@@ -611,7 +678,7 @@ pub const NativeFile = struct {
             .before_size = before_size,
             .after_size = after_size,
             .reclaimed_bytes = if (before_size > after_size) before_size - after_size else 0,
-            .live_file_count = @intCast(catalog_records.len + docs.len),
+            .live_file_count = @intCast(catalog_records.len + index_catalog_records.len + docs.len),
             .live_bytes = live_bytes,
         };
     }
@@ -785,6 +852,9 @@ pub const NativeFile = struct {
         const catalog_records = try self.snapshotCatalogRecordsAlloc(self.allocator);
         defer freeSnapshotCatalogRecords(self.allocator, catalog_records);
 
+        const index_catalog_records = try self.snapshotIndexCatalogRecordsAlloc(self.allocator);
+        defer freeSnapshotCatalogRecords(self.allocator, index_catalog_records);
+
         const docs = try self.snapshotDocumentsAlloc(self.allocator);
         defer freeSnapshotDocuments(self.allocator, docs);
 
@@ -792,6 +862,14 @@ pub const NativeFile = struct {
         var compact_pages: u64 = 1;
 
         for (catalog_records) |record| {
+            live_bytes +|= record.key.len + record.value.len;
+            compact_pages += 1;
+            if (record.value.len != 0 and !self.catalogEntryFitsInline(record.key, record.value)) {
+                compact_pages += self.valuePageCount(record.value.len);
+            }
+        }
+
+        for (index_catalog_records) |record| {
             live_bytes +|= record.key.len + record.value.len;
             compact_pages += 1;
             if (record.value.len != 0 and !self.catalogEntryFitsInline(record.key, record.value)) {
@@ -808,7 +886,7 @@ pub const NativeFile = struct {
         }
 
         return .{
-            .record_count = @intCast(catalog_records.len + docs.len),
+            .record_count = @intCast(catalog_records.len + index_catalog_records.len + docs.len),
             .bytes = live_bytes,
             .compact_size = compact_pages * @as(u64, self.header.page_size),
         };
@@ -898,6 +976,20 @@ fn appendValuePagesToImage(
     }
 
     return root_page_id;
+}
+
+fn catalogRootPage(slot: CheckpointSlot, root: CatalogRoot) u64 {
+    return switch (root) {
+        .metadata => slot.catalog_root_page,
+        .index => slot.index_catalog_root_page,
+    };
+}
+
+fn setCatalogRootPage(slot: *CheckpointSlot, root: CatalogRoot, page_id: u64) void {
+    switch (root) {
+        .metadata => slot.catalog_root_page = page_id,
+        .index => slot.index_catalog_root_page = page_id,
+    }
 }
 
 fn rewriteOpenFile(file: std.Io.File, io: std.Io, contents: []const u8) !void {

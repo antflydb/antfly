@@ -12,12 +12,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! LSM `Storage` adapter backed by native `.aflite` catalog records.
+//! LSM `Storage` adapter backed by native `.aflite` index catalog records.
 //!
 //! This is an incremental Lite-native index backend: existing Antfly index
 //! implementations can still use their LSM storage contract, but their logical
-//! files are stored in the native `.aflite` page format rather than in the
-//! legacy bridge container.
+//! files are stored under the dedicated native `.aflite` index checkpoint root
+//! rather than in the legacy bridge container.
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
@@ -28,8 +28,6 @@ const storage_io = @import("../lsm_backend/storage_io.zig");
 const Allocator = std.mem.Allocator;
 const AtomicWriteSink = storage_io.AtomicWriteSink;
 const StorageIo = storage_io.Storage;
-
-const key_prefix = "idx\x00";
 
 pub const Store = struct {
     allocator: Allocator,
@@ -75,18 +73,6 @@ fn lockStore(store: *docstore.Store) void {
     platform_sync.lockYielding(&store.mutex);
 }
 
-fn catalogKey(allocator: Allocator, path: []const u8) ![]u8 {
-    const key = try allocator.alloc(u8, key_prefix.len + path.len);
-    @memcpy(key[0..key_prefix.len], key_prefix);
-    @memcpy(key[key_prefix.len..], path);
-    return key;
-}
-
-fn pathFromCatalogKey(key: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, key, key_prefix)) return null;
-    return key[key_prefix.len..];
-}
-
 fn pathContains(prefix: []const u8, path: []const u8) bool {
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     if (path.len == prefix.len) return true;
@@ -95,13 +81,10 @@ fn pathContains(prefix: []const u8, path: []const u8) bool {
 
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    const key = try catalogKey(self.allocator, path);
-    defer self.allocator.free(key);
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getCatalogRecordAlloc(allocator, key)) orelse return error.FileNotFound;
+    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(allocator, path)) orelse return error.FileNotFound;
     errdefer allocator.free(stored);
     if (stored.len > max_bytes) return error.FileTooBig;
     return stored;
@@ -109,13 +92,10 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
 
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    const key = try catalogKey(self.allocator, path);
-    defer self.allocator.free(key);
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getCatalogRecordAlloc(allocator, key)) orelse return error.FileNotFound;
+    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(allocator, path)) orelse return error.FileNotFound;
     defer allocator.free(stored);
     if (offset > std.math.maxInt(usize)) return error.EndOfStream;
     const start: usize = @intCast(offset);
@@ -125,26 +105,20 @@ fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, o
 
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    const key = try catalogKey(self.allocator, path);
-    defer self.allocator.free(key);
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getCatalogRecordAlloc(self.allocator, key)) orelse return error.FileNotFound;
+    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(self.allocator, path)) orelse return error.FileNotFound;
     defer self.allocator.free(stored);
     return stored.len;
 }
 
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    const key = try catalogKey(self.allocator, path);
-    defer self.allocator.free(key);
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getCatalogRecordAlloc(allocator, key)) orelse return error.FileNotFound;
+    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(allocator, path)) orelse return error.FileNotFound;
     defer allocator.free(stored);
     if (stored.len < len) return error.EndOfStream;
     return try allocator.dupe(u8, stored[stored.len - len ..]);
@@ -153,35 +127,31 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try ensureWritable(self);
-    const key = try catalogKey(self.allocator, path);
-    defer self.allocator.free(key);
 
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
-    try self.docs.file.putCatalogRecord(key, contents);
+    try self.docs.file.putIndexCatalogRecord(path, contents);
 }
 
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     _ = sync;
     const self: *Store = @ptrCast(@alignCast(ptr));
     try ensureWritable(self);
-    const key = try catalogKey(self.allocator, path);
-    defer self.allocator.free(key);
 
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const existing = try self.docs.file.getCatalogRecordAlloc(self.allocator, key);
+    const existing = try self.docs.file.getIndexCatalogRecordAlloc(self.allocator, path);
     defer if (existing) |bytes| self.allocator.free(bytes);
     if (existing) |old| {
         const joined = try self.allocator.alloc(u8, old.len + contents.len);
         defer self.allocator.free(joined);
         @memcpy(joined[0..old.len], old);
         @memcpy(joined[old.len..], contents);
-        try self.docs.file.putCatalogRecord(key, joined);
+        try self.docs.file.putIndexCatalogRecord(path, joined);
         return;
     }
-    try self.docs.file.putCatalogRecord(key, contents);
+    try self.docs.file.putIndexCatalogRecord(path, contents);
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -193,31 +163,25 @@ fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !At
 fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try ensureWritable(self);
-    const old_key = try catalogKey(self.allocator, old_path);
-    defer self.allocator.free(old_key);
-    const new_key = try catalogKey(self.allocator, new_path);
-    defer self.allocator.free(new_key);
 
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getCatalogRecordAlloc(self.allocator, old_key)) orelse return;
+    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(self.allocator, old_path)) orelse return;
     defer self.allocator.free(stored);
-    try self.docs.file.putCatalogBatch(&.{
-        .{ .key = new_key, .value = stored },
-        .{ .key = old_key, .is_delete = true },
+    try self.docs.file.putIndexCatalogBatch(&.{
+        .{ .key = new_path, .value = stored },
+        .{ .key = old_path, .is_delete = true },
     });
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try ensureWritable(self);
-    const key = try catalogKey(self.allocator, path);
-    defer self.allocator.free(key);
 
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
-    try self.docs.file.deleteCatalogRecord(key);
+    try self.docs.file.deleteIndexCatalogRecord(path);
 }
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
@@ -227,8 +191,8 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const records = try self.docs.file.snapshotCatalogRecordsAlloc(self.allocator);
-    defer native.NativeFile.freeSnapshotCatalogRecords(self.allocator, records);
+    const index_records = try self.docs.file.snapshotIndexCatalogRecordsAlloc(self.allocator);
+    defer native.NativeFile.freeSnapshotCatalogRecords(self.allocator, index_records);
 
     var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
     defer {
@@ -236,15 +200,14 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
         mutations.deinit(self.allocator);
     }
 
-    for (records) |record| {
-        const logical_path = pathFromCatalogKey(record.key) orelse continue;
-        if (!pathContains(path, logical_path)) continue;
+    for (index_records) |record| {
+        if (!pathContains(path, record.key)) continue;
         const key = try self.allocator.dupe(u8, record.key);
         errdefer self.allocator.free(key);
         try mutations.append(self.allocator, .{ .key = key, .is_delete = true });
     }
 
-    try self.docs.file.putCatalogBatch(mutations.items);
+    try self.docs.file.putIndexCatalogBatch(mutations.items);
 }
 
 fn nowNs(_: *anyopaque) u64 {
@@ -350,6 +313,13 @@ test "lite native index storage persists logical files across reopen" {
         try writer.writeAt(3, "def");
         try std.testing.expectEqual(std.hash.Crc32.hash("abcdef__"), try writer.crc32Prefix(writer.len()));
         try writer.finish();
+
+        const checkpoint = docs.file.activeCheckpoint();
+        try std.testing.expectEqual(@as(u64, 0), checkpoint.catalog_root_page);
+        try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+        const records = try docs.file.snapshotIndexCatalogRecordsAlloc(allocator);
+        defer native.NativeFile.freeSnapshotCatalogRecords(allocator, records);
+        try std.testing.expectEqual(@as(usize, 2), records.len);
     }
 
     {
