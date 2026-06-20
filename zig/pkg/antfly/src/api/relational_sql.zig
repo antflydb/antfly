@@ -3091,6 +3091,39 @@ const Parser = struct {
         return try self.parseJsonValueAlloc();
     }
 
+    fn conflictIncrementParserHooks(
+        self: *@This(),
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) sql_adapter.ConflictIncrementParserHooks {
+        return .{
+            .ptr = self,
+            .insert_columns = insert_columns,
+            .insert_values = insert_values,
+            .parse_coalesce_expression = parseConflictIncrementCoalesceExpressionHook,
+            .parse_value_json = parseConflictIncrementValueJsonHook,
+        };
+    }
+
+    fn parseConflictIncrementCoalesceExpressionHook(
+        ptr: *anyopaque,
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, column.field_type);
+    }
+
+    fn parseConflictIncrementValueJsonHook(
+        ptr: *anyopaque,
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseConflictValueJsonAlloc(column, insert_columns, insert_values);
+    }
+
     fn parseDdlDefaultValueHook(ptr: *anyopaque, field_type: runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try sql_adapter.parseDdlDefaultValueAlloc(self.alloc, self.tokens, &self.pos, field_type, self.ddlExpressionHooks());
@@ -12726,50 +12759,7 @@ const Parser = struct {
         increment: *std.ArrayListUnmanaged(FieldJsonValue),
         increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
     ) !void {
-        if (column.field_type != .numeric) return error.InvalidSqlCatalog;
-        const source = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-        defer self.alloc.free(source);
-        if (!std.mem.eql(u8, source, field)) return error.UnsupportedSqlShape;
-        const negated = if (self.match(.plus) != null)
-            false
-        else if (self.match(.minus) != null)
-            true
-        else
-            return error.UnsupportedSqlShape;
-        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
-            const expression = try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, column.field_type);
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            const owned_field = try self.alloc.dupe(u8, field);
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(owned_field);
-            const final_expression = if (negated) try self.negateNumericExpressionAlloc(expression) else expression;
-            var final_expression_transferred = !negated;
-            errdefer if (!final_expression_transferred) freeExpression(self.alloc, final_expression);
-            if (negated) expression_transferred = true;
-            try increment_expr.append(self.alloc, .{
-                .field = owned_field,
-                .expression = final_expression,
-            });
-            field_transferred = true;
-            final_expression_transferred = true;
-            return;
-        }
-
-        const raw_value_json = try self.parseConflictValueJsonAlloc(column, insert_columns, insert_values);
-        defer self.alloc.free(raw_value_json);
-        const value_json = try sql_adapter.normalizedIncrementJsonAlloc(self.alloc, raw_value_json, negated);
-        var value_transferred = false;
-        errdefer if (!value_transferred) self.alloc.free(value_json);
-        const owned_field = try self.alloc.dupe(u8, field);
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(owned_field);
-        try increment.append(self.alloc, .{
-            .field = owned_field,
-            .value_json = value_json,
-        });
-        field_transferred = true;
-        value_transferred = true;
+        return try sql_adapter.parseConflictIncrementAssignmentAlloc(self.alloc, self.tokens, &self.pos, field, column, increment, increment_expr, self.conflictIncrementParserHooks(insert_columns, insert_values));
     }
 
     fn parseIncrementAssignment(

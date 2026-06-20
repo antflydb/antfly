@@ -849,6 +849,62 @@ pub fn parseConflictArrayElementValueJsonAlloc(
     return value_json;
 }
 
+pub fn parseConflictIncrementAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    hooks: ConflictIncrementParserHooks,
+) !void {
+    if (column.field_type != .numeric) return error.InvalidSqlCatalog;
+    const source = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(source);
+    if (!std.mem.eql(u8, source, field)) return error.UnsupportedSqlShape;
+    const negated = if (parser.matchToken(tokens, pos, .plus) != null)
+        false
+    else if (parser.matchToken(tokens, pos, .minus) != null)
+        true
+    else
+        return error.UnsupportedSqlShape;
+    if (lower_expr.peekCoalesceFunctionCall(tokens, pos.*)) {
+        const expression = try hooks.parse_coalesce_expression(hooks.ptr, column, hooks.insert_columns);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        const owned_field = try alloc.dupe(u8, field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(owned_field);
+        const final_expression = if (negated) try lower_expr.buildUnaryNegativeExpressionAlloc(alloc, expression) else expression;
+        var final_expression_transferred = !negated;
+        errdefer if (!final_expression_transferred) freeExpression(alloc, final_expression);
+        if (negated) expression_transferred = true;
+        try increment_expr.append(alloc, .{
+            .field = owned_field,
+            .expression = final_expression,
+        });
+        field_transferred = true;
+        final_expression_transferred = true;
+        return;
+    }
+
+    const raw_value_json = try hooks.parse_value_json(hooks.ptr, column, hooks.insert_columns, hooks.insert_values);
+    defer alloc.free(raw_value_json);
+    const value_json = try normalizedIncrementJsonAlloc(alloc, raw_value_json, negated);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    const owned_field = try alloc.dupe(u8, field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(owned_field);
+    try increment.append(alloc, .{
+        .field = owned_field,
+        .value_json = value_json,
+    });
+    field_transferred = true;
+    value_transferred = true;
+}
+
 pub fn insertSourceUniquePredicatesFromConstraintAlloc(
     alloc: std.mem.Allocator,
     predicates: []const runtime_schema.UniquePredicate,
