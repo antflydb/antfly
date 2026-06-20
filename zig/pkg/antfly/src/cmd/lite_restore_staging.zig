@@ -421,15 +421,28 @@ fn freeManifest(allocator: Allocator, manifest: backups_api.TableBackupManifest)
 fn indexesObjectJson(allocator: Allocator, db: *db_mod.DB) ![]u8 {
     const configs = try db.listIndexes(allocator);
     defer db_types.freeIndexConfigs(allocator, configs);
+    const enrichments = try db.listEnrichments(allocator);
+    defer db_types.freeEnrichmentConfigs(allocator, enrichments);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
     try out.append(allocator, '{');
-    for (configs, 0..) |cfg, i| {
-        if (i > 0) try out.append(allocator, ',');
+    var first = true;
+    for (configs) |cfg| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
         try appendJsonString(allocator, &out, cfg.name);
         try out.append(allocator, ':');
         const encoded = try std.json.Stringify.valueAlloc(allocator, cfg, .{});
+        defer allocator.free(encoded);
+        try out.appendSlice(allocator, encoded);
+    }
+    if (enrichments.len > 0) {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try appendJsonString(allocator, &out, "enrichments");
+        try out.append(allocator, ':');
+        const encoded = try std.json.Stringify.valueAlloc(allocator, enrichments, .{});
         defer allocator.free(encoded);
         try out.appendSlice(allocator, encoded);
     }
@@ -543,4 +556,80 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
     try std.testing.expect(enrichments == .array);
     try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);
+}
+
+test "lite restore staging accepts aflite input for normal restore" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/normal-restore-src.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/normal-restore-backups", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(backup_root);
+    const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
+    defer allocator.free(location);
+
+    const default_backup_id = try defaultBackupIdAlloc(allocator, src_path);
+    defer allocator.free(default_backup_id);
+    try std.testing.expectEqualStrings("lite-normal-restore-src", default_backup_id);
+
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    const enrichment_json = "{\"name\":\"restore_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":256,\"chunk_overlap\":32}";
+    const index_json = "{\"name\":\"restore_ft_body\",\"kind\":\"full_text\",\"config_json\":\"{\\\"chunk_name\\\":\\\"restore_chunks_v1\\\"}\"}";
+
+    {
+        var source = try LiteDb.open(allocator, src_path, .writer);
+        defer source.close();
+
+        try source.db.setSchemaJson(allocator, schema_json);
+
+        var enrichment = try std.json.parseFromSlice(db_types.EnrichmentConfig, allocator, enrichment_json, .{
+            .ignore_unknown_fields = true,
+        });
+        defer enrichment.deinit();
+        try source.db.addEnrichment(enrichment.value);
+
+        var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
+            .ignore_unknown_fields = true,
+        });
+        defer index.deinit();
+        try source.db.addIndex(index.value);
+    }
+
+    var staged = try stageInputRestoreBackup(allocator, src_path, "docs", default_backup_id, location);
+    defer staged.deinit(allocator);
+
+    try std.testing.expectEqualStrings(default_backup_id, staged.backup_id);
+    try std.testing.expectEqualStrings(location, staged.location);
+    try std.testing.expectEqualStrings("docs", staged.table_name);
+    try std.testing.expectEqualStrings("lite-normal-restore-src.afb", staged.snapshot_path);
+
+    var backup_location = try backups_api.openBackupLocation(allocator, location);
+    defer backup_location.deinit(allocator);
+    var manifest = try backups_api.readManifestFromLocation(allocator, &backup_location, default_backup_id);
+    defer manifest.deinit(allocator);
+
+    try std.testing.expectEqualStrings(schema_json, manifest.schema_json);
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqualStrings(default_backup_id, manifest.backup_id);
+    try std.testing.expectEqualStrings(staged.snapshot_path, manifest.shards[0].snapshot_path);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_ft_body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_chunks_v1\"") != null);
+
+    const afb_path = try std.fmt.allocPrint(allocator, "{s}/{s}.afb", .{ backup_root, default_backup_id });
+    defer allocator.free(afb_path);
+    const portable = try readFileAlloc(allocator, afb_path, max_afb_file_bytes);
+    defer allocator.free(portable);
+    try std.testing.expect(portable.len > 0);
 }
