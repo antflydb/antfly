@@ -705,6 +705,101 @@ pub fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mo
     if (values.len > 0) alloc.free(values);
 }
 
+pub fn freeJsonExtract(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonExtractProjection) void {
+    for (values) |value| {
+        alloc.free(value.output);
+        alloc.free(value.field);
+        alloc.free(value.path);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeArrayLengthProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayLengthProjection) void {
+    for (values) |value| {
+        alloc.free(value.output);
+        alloc.free(value.field);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeFieldAliasProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsFieldAliasProjection) void {
+    for (values) |value| {
+        alloc.free(value.output);
+        alloc.free(value.field);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeCoalesceOperand(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsCoalesceOperand) void {
+    switch (value.kind) {
+        .field => if (value.field.len > 0) alloc.free(value.field),
+        .value => if (value.value_json.len > 0) alloc.free(value.value_json),
+    }
+}
+
+pub fn freeCoalesceProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsCoalesceProjection) void {
+    alloc.free(value.output);
+    for (value.operands) |operand| freeCoalesceOperand(alloc, operand);
+    if (value.operands.len > 0) alloc.free(value.operands);
+}
+
+pub fn freeCoalesceProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsCoalesceProjection) void {
+    for (values) |value| freeCoalesceProjection(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn expressionProjectionFromCoalesceAlloc(
+    alloc: std.mem.Allocator,
+    projection: db_mod.types.RelationalRowsCoalesceProjection,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const output = try alloc.dupe(u8, projection.output);
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, projection.operands.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (operands[0..initialized]) |operand| freeExpression(alloc, operand);
+        alloc.free(operands);
+    }
+    for (projection.operands) |operand| {
+        operands[initialized] = switch (operand.kind) {
+            .field => .{
+                .kind = .field,
+                .field = try alloc.dupe(u8, operand.field),
+            },
+            .value => .{
+                .kind = .value,
+                .value_json = try alloc.dupe(u8, operand.value_json),
+            },
+        };
+        initialized += 1;
+    }
+
+    output_transferred = true;
+    return .{
+        .output = output,
+        .expression = .{
+            .kind = .coalesce,
+            .operands = operands,
+        },
+    };
+}
+
+pub fn freeJoinOn(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJoinOn) void {
+    for (values) |value| {
+        alloc.free(value.left_field);
+        alloc.free(value.right_field);
+    }
+}
+
+pub fn freeJoinProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJoinProjection) void {
+    for (values) |value| {
+        alloc.free(value.output);
+        alloc.free(value.field);
+    }
+}
+
 pub fn freeOrderBy(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsQueryOrder) void {
     for (values) |value| {
         if (value.field.len > 0) alloc.free(value.field);
