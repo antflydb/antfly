@@ -429,7 +429,209 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
-fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpression) void {
+pub fn cloneExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpression,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    var cloned: db_mod.types.RelationalRowsExpression = .{
+        .kind = value.kind,
+        .field_source = value.field_source,
+        .cast_type = value.cast_type,
+        .json_as_text = value.json_as_text,
+    };
+    errdefer freeExpression(alloc, cloned);
+
+    if (value.field.len > 0) cloned.field = try alloc.dupe(u8, value.field);
+    if (value.value_json.len > 0) cloned.value_json = try alloc.dupe(u8, value.value_json);
+    if (value.json_path.len > 0) cloned.json_path = try alloc.dupe(u8, value.json_path);
+
+    if (value.operands.len > 0) {
+        const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.operands.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (operands[0..initialized]) |operand| freeExpression(alloc, operand);
+            alloc.free(operands);
+        }
+        for (value.operands, 0..) |operand, i| {
+            operands[i] = try cloneExpressionAlloc(alloc, operand);
+            initialized += 1;
+        }
+        cloned.operands = operands;
+    }
+
+    if (value.case_branches.len > 0) {
+        const branches = try alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, value.case_branches.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (branches[0..initialized]) |branch| freeExpressionCaseBranch(alloc, branch);
+            alloc.free(branches);
+        }
+        for (value.case_branches, 0..) |branch, i| {
+            branches[i] = try cloneExpressionCaseBranchAlloc(alloc, branch);
+            initialized += 1;
+        }
+        cloned.case_branches = branches;
+    }
+
+    if (value.case_else.len > 0) {
+        const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.case_else.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (fallback[0..initialized]) |expression| freeExpression(alloc, expression);
+            alloc.free(fallback);
+        }
+        for (value.case_else, 0..) |expression, i| {
+            fallback[i] = try cloneExpressionAlloc(alloc, expression);
+            initialized += 1;
+        }
+        cloned.case_else = fallback;
+    }
+
+    return cloned;
+}
+
+pub fn rewriteExpressionFieldsToSource(value: *db_mod.types.RelationalRowsExpression) void {
+    if (value.kind == .field) value.field_source = .source;
+    for (@constCast(value.operands)) |*operand| rewriteExpressionFieldsToSource(operand);
+    for (@constCast(value.case_branches)) |*branch| {
+        rewriteExpressionConditionFieldsToSource(&branch.when);
+        rewriteExpressionFieldsToSource(&branch.then);
+    }
+    for (@constCast(value.case_else)) |*fallback| rewriteExpressionFieldsToSource(fallback);
+}
+
+pub fn rewriteExpressionConditionFieldsToSource(value: *db_mod.types.RelationalRowsExpressionCondition) void {
+    rewriteExpressionFieldsToSource(&value.lhs);
+    for (@constCast(value.rhs)) |*rhs| rewriteExpressionFieldsToSource(rhs);
+}
+
+pub fn cloneSelectOutputsAlloc(
+    alloc: std.mem.Allocator,
+    values: []const SelectOutputRef,
+) ![]const SelectOutputRef {
+    if (values.len == 0) return &.{};
+    return try alloc.dupe(SelectOutputRef, values);
+}
+
+pub fn cloneExpressionProjection(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpressionProjection,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const output = try alloc.dupe(u8, value.output);
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+    const expression = try cloneExpressionAlloc(alloc, value.expression);
+    output_transferred = true;
+    return .{
+        .output = output,
+        .expression = expression,
+    };
+}
+
+pub fn cloneExpressionCaseBranchAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpressionCaseBranch,
+) anyerror!db_mod.types.RelationalRowsExpressionCaseBranch {
+    const when = try cloneExpressionConditionAlloc(alloc, value.when);
+    var when_transferred = false;
+    errdefer if (!when_transferred) freeExpressionCondition(alloc, when);
+    const then_expression = try cloneExpressionAlloc(alloc, value.then);
+    when_transferred = true;
+    return .{
+        .when = when,
+        .then = then_expression,
+    };
+}
+
+pub fn cloneExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpressionCondition,
+) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+    const lhs = try cloneExpressionAlloc(alloc, value.lhs);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+
+    const rhs = if (value.rhs.len > 0) blk: {
+        const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.rhs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |expression| freeExpression(alloc, expression);
+            alloc.free(out);
+        }
+        for (value.rhs, 0..) |expression, i| {
+            out[i] = try cloneExpressionAlloc(alloc, expression);
+            initialized += 1;
+        }
+        break :blk out;
+    } else &.{};
+
+    lhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = value.op,
+        .rhs = rhs,
+    };
+}
+
+pub fn cloneExpressionConditionsAlloc(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.types.RelationalRowsExpressionCondition,
+) anyerror![]db_mod.types.RelationalRowsExpressionCondition {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |condition| freeExpressionCondition(alloc, condition);
+        alloc.free(out);
+    }
+    for (values) |condition| {
+        out[initialized] = try cloneExpressionConditionAlloc(alloc, condition);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneExpressionPredicateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+) anyerror![]db_mod.types.RelationalRowsExpressionPredicateGroup {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |group| freeExpressionPredicateGroup(alloc, group);
+        alloc.free(out);
+    }
+    for (values) |group| {
+        out[initialized] = .{ .conditions = try cloneExpressionConditionsAlloc(alloc, group.conditions) };
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneExpressionConditionsConcatAlloc(
+    alloc: std.mem.Allocator,
+    lhs: []const db_mod.types.RelationalRowsExpressionCondition,
+    rhs: []const db_mod.types.RelationalRowsExpressionCondition,
+) anyerror![]db_mod.types.RelationalRowsExpressionCondition {
+    const out = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, lhs.len + rhs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |condition| freeExpressionCondition(alloc, condition);
+        alloc.free(out);
+    }
+    for (lhs) |condition| {
+        out[initialized] = try cloneExpressionConditionAlloc(alloc, condition);
+        initialized += 1;
+    }
+    for (rhs) |condition| {
+        out[initialized] = try cloneExpressionConditionAlloc(alloc, condition);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpression) void {
     if (value.field.len > 0) alloc.free(value.field);
     if (value.value_json.len > 0) alloc.free(value.value_json);
     if (value.json_path.len > 0) alloc.free(value.json_path);
@@ -441,7 +643,12 @@ fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsEx
     if (value.case_else.len > 0) alloc.free(value.case_else);
 }
 
-fn freeExpressionCaseBranch(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCaseBranch) void {
+pub fn freeExpressionSlice(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpression) void {
+    for (values) |value| freeExpression(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeExpressionCaseBranch(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCaseBranch) void {
     freeExpressionCondition(alloc, value.when);
     freeExpression(alloc, value.then);
 }
@@ -452,25 +659,25 @@ pub fn freeExpressionCondition(alloc: std.mem.Allocator, value: db_mod.types.Rel
     if (value.rhs.len > 0) alloc.free(value.rhs);
 }
 
-fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionCondition) void {
+pub fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionCondition) void {
     for (values) |value| freeExpressionCondition(alloc, value);
 }
 
-fn freeExpressionPredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionPredicateGroup) void {
+pub fn freeExpressionPredicateGroup(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionPredicateGroup) void {
     freeExpressionConditions(alloc, value.conditions);
     if (value.conditions.len > 0) alloc.free(value.conditions);
 }
 
-fn freeExpressionPredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
+pub fn freeExpressionPredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
     for (values) |group| freeExpressionPredicateGroup(alloc, group);
 }
 
-fn freeExpressionProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionProjection) void {
+pub fn freeExpressionProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionProjection) void {
     alloc.free(value.output);
     freeExpression(alloc, value.expression);
 }
 
-fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionProjection) void {
+pub fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionProjection) void {
     for (values) |value| freeExpressionProjection(alloc, value);
     if (values.len > 0) alloc.free(values);
 }

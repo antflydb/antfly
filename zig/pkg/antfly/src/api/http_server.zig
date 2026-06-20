@@ -442,6 +442,7 @@ pub const AuthenticatedIdentity = struct {
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
     role_settings: []usermgr.RoleSetting = &.{},
+    role_runtime_settings: []usermgr.RoleSetting = &.{},
 
     pub fn deinit(self: *AuthenticatedIdentity, alloc: std.mem.Allocator) void {
         alloc.free(self.username);
@@ -454,6 +455,8 @@ pub const AuthenticatedIdentity = struct {
         if (self.roles.len > 0) alloc.free(self.roles);
         for (self.role_settings) |*setting| setting.deinit(alloc);
         if (self.role_settings.len > 0) alloc.free(self.role_settings);
+        for (self.role_runtime_settings) |*setting| setting.deinit(alloc);
+        if (self.role_runtime_settings.len > 0) alloc.free(self.role_runtime_settings);
         self.* = undefined;
     }
 };
@@ -467,6 +470,7 @@ fn delegatedIdentityView(identity: ?AuthenticatedIdentity) ?protocol_adapters.De
         .metadata_json = value.metadata_json,
         .roles = value.roles,
         .role_settings = value.role_settings,
+        .role_runtime_settings = value.role_runtime_settings,
     };
 }
 
@@ -2684,6 +2688,34 @@ pub const ApiHttpServer = struct {
         return try self.applyRelationalSqlDdlWithSession(sql, &session);
     }
 
+    pub fn sqlCatalogSessionForAuthenticatedIdentityDatabaseAlloc(
+        self: *ApiHttpServer,
+        identity: ?*const AuthenticatedIdentity,
+        database_name: []const u8,
+    ) !relational_sql.OwnedSqlCatalogSession {
+        var runtime_settings: []usermgr.RoleSetting = &.{};
+        var owns_runtime_settings = false;
+        defer if (owns_runtime_settings) {
+            for (runtime_settings) |*setting| setting.deinit(self.alloc);
+            if (runtime_settings.len > 0) self.alloc.free(runtime_settings);
+        };
+
+        if (identity) |active_identity| {
+            if (self.cfg.user_manager) |manager| {
+                if (manager.hasUser(active_identity.username)) {
+                    runtime_settings = try manager.getEffectiveRoleRuntimeSettingsForDatabase(active_identity.username, database_name);
+                    owns_runtime_settings = true;
+                } else {
+                    runtime_settings = active_identity.role_runtime_settings;
+                }
+            } else {
+                runtime_settings = active_identity.role_runtime_settings;
+            }
+        }
+
+        return try ownedSqlCatalogSessionFromRuntimeSettingsAlloc(self.alloc, database_name, runtime_settings);
+    }
+
     fn ensureSqlNotificationSessionId(self: *ApiHttpServer, session: *relational_sql.OwnedSqlCatalogSession) u64 {
         if (session.notification_session_id == 0) {
             session.notification_session_id = self.sql_notification_runtime.allocateSessionId();
@@ -3112,6 +3144,7 @@ pub const ApiHttpServer = struct {
                 .metadata_json = try self.alloc.dupe(u8, user.metadata_json),
                 .roles = try manager.getRolesForUser(user.username),
                 .role_settings = try manager.getEffectiveRoleSettings(user.username),
+                .role_runtime_settings = try manager.getEffectiveRoleRuntimeSettings(user.username),
             };
         }
 
@@ -3130,6 +3163,7 @@ pub const ApiHttpServer = struct {
                 .metadata_json = validated.metadata_json,
                 .roles = validated.roles,
                 .role_settings = validated.role_settings,
+                .role_runtime_settings = validated.role_runtime_settings,
             };
         }
 
@@ -3204,10 +3238,16 @@ pub const ApiHttpServer = struct {
             for (role_settings) |*setting| setting.deinit(self.alloc);
             if (role_settings.len > 0) self.alloc.free(role_settings);
         }
+        var role_runtime_settings: []usermgr.RoleSetting = &.{};
+        errdefer {
+            for (role_runtime_settings) |*setting| setting.deinit(self.alloc);
+            if (role_runtime_settings.len > 0) self.alloc.free(role_runtime_settings);
+        }
         if (self.cfg.user_manager) |manager| {
             if (manager.hasUser(subject)) {
                 roles = try manager.getRolesForUser(subject);
                 role_settings = try manager.getEffectiveRoleSettings(subject);
+                role_runtime_settings = try manager.getEffectiveRoleRuntimeSettings(subject);
             }
         }
 
@@ -3221,6 +3261,7 @@ pub const ApiHttpServer = struct {
             .metadata_json = metadata_json,
             .roles = roles,
             .role_settings = role_settings,
+            .role_runtime_settings = role_runtime_settings,
         };
     }
 
@@ -13026,6 +13067,93 @@ pub const ApiHttpServer = struct {
         }
     }
 };
+
+fn ownedSqlCatalogSessionFromRuntimeSettingsAlloc(
+    alloc: std.mem.Allocator,
+    database_name: []const u8,
+    runtime_settings: []const usermgr.RoleSetting,
+) !relational_sql.OwnedSqlCatalogSession {
+    var search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+    var owns_search_path = false;
+    defer if (owns_search_path) freeStringSliceConst(alloc, search_path);
+
+    var session_setting_count: usize = 0;
+    for (runtime_settings) |setting| {
+        if (std.ascii.eqlIgnoreCase(setting.name, "search_path")) {
+            if (owns_search_path) freeStringSliceConst(alloc, search_path);
+            search_path = try parseRuntimeSearchPathSettingAlloc(alloc, setting.value);
+            owns_search_path = true;
+        } else {
+            session_setting_count += 1;
+        }
+    }
+
+    const session_settings = try alloc.alloc(catalog_resources.SqlSessionSetting, session_setting_count);
+    defer if (session_settings.len > 0) alloc.free(session_settings);
+    var index: usize = 0;
+    for (runtime_settings) |setting| {
+        if (std.ascii.eqlIgnoreCase(setting.name, "search_path")) continue;
+        session_settings[index] = .{
+            .name = setting.name,
+            .value = setting.value,
+        };
+        index += 1;
+    }
+
+    return try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
+        .current_database_name = database_name,
+        .search_path = search_path,
+        .settings = session_settings,
+    });
+}
+
+fn parseRuntimeSearchPathSettingAlloc(alloc: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    var parts = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (parts.items) |part| alloc.free(part);
+        parts.deinit(alloc);
+    }
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw_part| {
+        const trimmed = std.mem.trim(u8, raw_part, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidRoleSetting;
+        const normalized = if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
+            trimmed[1 .. trimmed.len - 1]
+        else
+            trimmed;
+        if (normalized.len == 0) return error.InvalidRoleSetting;
+        try parts.append(alloc, try alloc.dupe(u8, normalized));
+    }
+    if (parts.items.len == 0) return error.InvalidRoleSetting;
+    return try parts.toOwnedSlice(alloc);
+}
+
+fn freeStringSliceConst(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(@constCast(values));
+}
+
+test "api http server maps runtime role settings into SQL catalog session defaults" {
+    const alloc = std.testing.allocator;
+    var settings = try alloc.alloc(usermgr.RoleSetting, 3);
+    defer {
+        for (settings) |*setting| setting.deinit(alloc);
+        alloc.free(settings);
+    }
+    settings[0] = try usermgr.RoleSetting.initOwned(alloc, "statement_timeout", "5s");
+    settings[1] = try usermgr.RoleSetting.initOwned(alloc, "search_path", "analytics, public");
+    settings[2] = try usermgr.RoleSetting.initOwned(alloc, "timezone", "UTC");
+
+    var session = try ownedSqlCatalogSessionFromRuntimeSettingsAlloc(alloc, "tenant_ops", settings);
+    defer session.deinit(alloc);
+
+    try std.testing.expectEqualStrings("tenant_ops", session.session().currentDatabase());
+    try std.testing.expectEqual(@as(usize, 2), session.search_path.len);
+    try std.testing.expectEqualStrings("analytics", session.search_path[0]);
+    try std.testing.expectEqualStrings("public", session.search_path[1]);
+    try std.testing.expectEqualStrings("5s", session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("UTC", session.session().settingValue("timezone") orelse return error.TestUnexpectedResult);
+}
 
 fn sqlDdlTimestampNs() u64 {
     return platform_time.realtimeNs();

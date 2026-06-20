@@ -226,8 +226,53 @@ pub fn validateRuntimeRoleSettingName(name: []const u8) !void {
     return error.UnsupportedRoleSetting;
 }
 
-pub fn validateRuntimeRoleSettingValue(value: []const u8) !void {
+pub fn validateRuntimeRoleSettingValue(name: []const u8, value: []const u8) !void {
     if (value.len == 0) return error.InvalidRoleSetting;
+    if (std.mem.eql(u8, name, "statement_timeout")) return try validateStatementTimeoutSettingValue(value);
+    if (std.mem.eql(u8, name, "search_path")) return try validateSearchPathSettingValue(value);
+    if (std.mem.eql(u8, name, "timezone")) return try validateTimezoneSettingValue(value);
+    return error.UnsupportedRoleSetting;
+}
+
+fn validateStatementTimeoutSettingValue(value: []const u8) !void {
+    var digit_count: usize = 0;
+    while (digit_count < value.len and std.ascii.isDigit(value[digit_count])) : (digit_count += 1) {}
+    if (digit_count == 0) return error.InvalidRoleSetting;
+    _ = std.fmt.parseUnsigned(u64, value[0..digit_count], 10) catch return error.InvalidRoleSetting;
+    const unit = value[digit_count..];
+    if (unit.len == 0) return;
+    if (std.mem.eql(u8, unit, "us")) return;
+    if (std.mem.eql(u8, unit, "ms")) return;
+    if (std.mem.eql(u8, unit, "s")) return;
+    if (std.mem.eql(u8, unit, "min")) return;
+    if (std.mem.eql(u8, unit, "h")) return;
+    return error.InvalidRoleSetting;
+}
+
+fn validateSearchPathSettingValue(value: []const u8) !void {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    var count: usize = 0;
+    while (iter.next()) |part| : (count += 1) {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidRoleSetting;
+        const normalized = if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
+            trimmed[1 .. trimmed.len - 1]
+        else
+            trimmed;
+        if (normalized.len == 0) return error.InvalidRoleSetting;
+        for (normalized) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '_' or c == '$') continue;
+            return error.InvalidRoleSetting;
+        }
+    }
+    if (count == 0) return error.InvalidRoleSetting;
+}
+
+fn validateTimezoneSettingValue(value: []const u8) !void {
+    for (value) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '/' or c == '+' or c == '-' or c == ':' or c == '.') continue;
+        return error.InvalidRoleSetting;
+    }
 }
 
 pub const AuthSubjectKind = enum {
@@ -358,6 +403,7 @@ pub const ValidatedApiKey = struct {
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
     role_settings: []RoleSetting = &.{},
+    role_runtime_settings: []RoleSetting = &.{},
 
     pub fn deinit(self: *ValidatedApiKey, alloc: Allocator) void {
         alloc.free(self.username);
@@ -369,6 +415,8 @@ pub const ValidatedApiKey = struct {
         freeOwnedStrings(alloc, self.roles);
         for (self.role_settings) |*setting| setting.deinit(alloc);
         if (self.role_settings.len > 0) alloc.free(self.role_settings);
+        for (self.role_runtime_settings) |*setting| setting.deinit(alloc);
+        if (self.role_runtime_settings.len > 0) alloc.free(self.role_runtime_settings);
         self.* = undefined;
     }
 };
@@ -1123,7 +1171,7 @@ pub const UserManager = struct {
         if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
         if (database_name) |db| if (db.len == 0 or std.mem.eql(u8, db, global_runtime_role_setting_database)) return error.InvalidRoleSetting;
         try validateRuntimeRoleSettingName(setting_name);
-        try validateRuntimeRoleSettingValue(setting_value);
+        try validateRuntimeRoleSettingValue(setting_name, setting_value);
         const database_key = runtimeRoleSettingDatabaseKey(database_name);
 
         const existing_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p5", 0, &.{ role_subject, database_key, setting_name });
@@ -1179,6 +1227,26 @@ pub const UserManager = struct {
         const database_key = runtimeRoleSettingDatabaseKey(database_name);
         const removed = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{ role_subject, database_key, setting_name });
         if (!removed) return error.RoleSettingNotFound;
+    }
+
+    pub fn listRoleRuntimeSettingsForSubject(self: *const UserManager, subject: []const u8, database_name: ?[]const u8) ![]RoleSetting {
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+        if (database_name) |db| try validateRoleSettingDatabaseName(db);
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p5", 0, &.{ subject, database_key });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 4) continue;
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, rule.fields[2], rule.fields[3]));
+        }
+        return try out.toOwnedSlice(self.alloc);
     }
 
     pub fn listRoleSettingsForSubject(self: *const UserManager, subject: []const u8) ![]RoleSetting {
@@ -1271,6 +1339,55 @@ pub const UserManager = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    pub fn getEffectiveRoleRuntimeSettings(self: *const UserManager, username: []const u8) ![]RoleSetting {
+        return try self.getEffectiveRoleRuntimeSettingsForDatabase(username, null);
+    }
+
+    pub fn getEffectiveRoleRuntimeSettingsForDatabase(self: *const UserManager, username: []const u8, database_name: ?[]const u8) ![]RoleSetting {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        if (database_name) |db| try validateRoleSettingDatabaseName(db);
+        const roles = try self.getRolesForUser(username);
+        defer freeOwnedStrings(self.alloc, roles);
+        const direct_settings = try self.listRoleRuntimeSettingsForSubject(username, null);
+        defer {
+            for (direct_settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(direct_settings);
+        }
+        const direct_database_settings: []RoleSetting = if (database_name) |db|
+            try self.listRoleRuntimeSettingsForSubject(username, db)
+        else
+            &.{};
+        defer {
+            for (direct_database_settings) |*setting| setting.deinit(self.alloc);
+            if (direct_database_settings.len > 0) self.alloc.free(direct_database_settings);
+        }
+
+        var merged = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = merged.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            merged.deinit(self.alloc);
+        }
+
+        for (roles) |role| try self.mergeInheritedRuntimeRoleSettingsForSubject(&merged, role, direct_settings, direct_database_settings, database_name);
+        for (direct_settings) |setting| try putRoleSetting(&merged, self.alloc, setting.name, setting.value, .replace);
+        for (direct_database_settings) |setting| try putRoleSetting(&merged, self.alloc, setting.name, setting.value, .replace);
+
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var it = merged.iterator();
+        while (it.next()) |entry| {
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, entry.key_ptr.*, entry.value_ptr.*));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
     const RoleSettingMergeMode = enum {
         require_same_value,
         replace,
@@ -1305,6 +1422,51 @@ pub const UserManager = struct {
         }
         if (database_name) |db| {
             const database_settings = try self.listRoleDatabaseSettingsForSubject(subject, db);
+            defer {
+                for (database_settings) |*setting| setting.deinit(self.alloc);
+                self.alloc.free(database_settings);
+            }
+            for (database_settings) |setting| {
+                if (roleSettingsContainName(direct_settings, setting.name) or roleSettingsContainName(direct_database_settings, setting.name)) continue;
+                try putRoleSetting(&subject_settings, self.alloc, setting.name, setting.value, .replace);
+            }
+        }
+
+        var it = subject_settings.iterator();
+        while (it.next()) |entry| {
+            try putRoleSetting(merged, self.alloc, entry.key_ptr.*, entry.value_ptr.*, .require_same_value);
+        }
+    }
+
+    fn mergeInheritedRuntimeRoleSettingsForSubject(
+        self: *const UserManager,
+        merged: *std.StringArrayHashMapUnmanaged([]u8),
+        subject: []const u8,
+        direct_settings: []const RoleSetting,
+        direct_database_settings: []const RoleSetting,
+        database_name: ?[]const u8,
+    ) !void {
+        var subject_settings = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = subject_settings.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            subject_settings.deinit(self.alloc);
+        }
+
+        const settings = try self.listRoleRuntimeSettingsForSubject(subject, null);
+        defer {
+            for (settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(settings);
+        }
+        for (settings) |setting| {
+            if (roleSettingsContainName(direct_settings, setting.name) or roleSettingsContainName(direct_database_settings, setting.name)) continue;
+            try putRoleSetting(&subject_settings, self.alloc, setting.name, setting.value, .replace);
+        }
+        if (database_name) |db| {
+            const database_settings = try self.listRoleRuntimeSettingsForSubject(subject, db);
             defer {
                 for (database_settings) |*setting| setting.deinit(self.alloc);
                 self.alloc.free(database_settings);
@@ -1785,6 +1947,7 @@ pub const UserManager = struct {
             .metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}"),
             .roles = try self.getRolesForUser(record.key.username),
             .role_settings = try self.getEffectiveRoleSettings(record.key.username),
+            .role_runtime_settings = try self.getEffectiveRoleRuntimeSettings(record.key.username),
         };
     }
 
@@ -2332,12 +2495,18 @@ test "usermgr runtime role settings are native role defaults with optional datab
     try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "unknown_guc", "on"));
     try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", "", "statement_timeout", "5s"));
     try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", "*", "statement_timeout", "5s"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "five seconds"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "5fortnights"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "search_path", "public,,analytics"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "timezone", "UTC;DROP"));
 
     try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "5s");
     try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "10s");
     const global_setting = try manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout");
     defer alloc.free(global_setting);
     try std.testing.expectEqualStrings("10s", global_setting);
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "timezone", "America/Los_Angeles");
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "search_path", "analytics, public");
 
     try manager.setRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout", "1ms");
     const scoped_setting = try manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
@@ -2349,6 +2518,64 @@ test "usermgr runtime role settings are native role defaults with optional datab
     const scoped_after_global_reset = try manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
     defer alloc.free(scoped_after_global_reset);
     try std.testing.expectEqualStrings("1ms", scoped_after_global_reset);
+}
+
+test "usermgr effective runtime role settings merge direct database overrides and inherited conflicts" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var user = try manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+    try manager.createRoleSubject("role:app_writer");
+    try manager.createRoleSubject("role:app_reader");
+    try manager.addRoleToUser("alice", "role:app_writer");
+    try manager.addRoleToUser("alice", "role:app_reader");
+
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "5s");
+    try manager.setRoleRuntimeSetting("role:app_reader", null, "statement_timeout", "5s");
+    const inherited = try manager.getEffectiveRoleRuntimeSettings("alice");
+    defer {
+        for (inherited) |*setting| setting.deinit(alloc);
+        alloc.free(inherited);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inherited.len);
+    try std.testing.expectEqualStrings("statement_timeout", inherited[0].name);
+    try std.testing.expectEqualStrings("5s", inherited[0].value);
+
+    try manager.setRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout", "1ms");
+    try manager.setRoleRuntimeSetting("role:app_reader", "appdb", "statement_timeout", "1ms");
+    const scoped = try manager.getEffectiveRoleRuntimeSettingsForDatabase("alice", "appdb");
+    defer {
+        for (scoped) |*setting| setting.deinit(alloc);
+        alloc.free(scoped);
+    }
+    try std.testing.expectEqual(@as(usize, 1), scoped.len);
+    try std.testing.expectEqualStrings("statement_timeout", scoped[0].name);
+    try std.testing.expectEqualStrings("1ms", scoped[0].value);
+
+    try manager.setRoleRuntimeSetting("alice", "appdb", "statement_timeout", "500us");
+    const direct_scoped = try manager.getEffectiveRoleRuntimeSettingsForDatabase("alice", "appdb");
+    defer {
+        for (direct_scoped) |*setting| setting.deinit(alloc);
+        alloc.free(direct_scoped);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_scoped.len);
+    try std.testing.expectEqualStrings("500us", direct_scoped[0].value);
+
+    try manager.removeRoleRuntimeSetting("alice", "appdb", "statement_timeout");
+    try manager.setRoleRuntimeSetting("role:app_reader", "appdb", "statement_timeout", "2ms");
+    try std.testing.expectError(error.RoleSettingConflict, manager.getEffectiveRoleRuntimeSettingsForDatabase("alice", "appdb"));
 }
 
 test "usermgr permissions and row filters mirror go semantics" {

@@ -86,7 +86,8 @@ pub fn encodeEdgeValue(buf: []u8, weight: f64, created_at: u64, updated_at: u64,
 }
 
 /// Decode edge value from binary format.
-pub fn decodeEdgeValue(data: []const u8) struct { weight: f64, created_at: u64, updated_at: u64, metadata: []const u8 } {
+pub fn decodeEdgeValue(data: []const u8) !struct { weight: f64, created_at: u64, updated_at: u64, metadata: []const u8 } {
+    if (data.len < 24) return error.InvalidGraphEdgeValue;
     const weight_bits = std.mem.readInt(u64, data[0..8], .little);
     const weight: f64 = @bitCast(weight_bits);
     const created_at = std.mem.readInt(u64, data[8..16], .little);
@@ -3816,7 +3817,7 @@ pub const GraphIndex = struct {
         for (pairs) |pair| {
             var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
             defer parsed.deinit(alloc);
-            const decoded = decodeEdgeValue(pair.value);
+            const decoded = try decodeEdgeValue(pair.value);
             try results.append(alloc, .{
                 .source = try alloc.dupe(u8, parsed.source),
                 .target = try alloc.dupe(u8, parsed.target),
@@ -3866,7 +3867,7 @@ pub const GraphIndex = struct {
     }
 
     fn appendParsedEdge(alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), parsed: ParsedGraphEdgeKey, value: []const u8) !void {
-        const decoded = decodeEdgeValue(value);
+        const decoded = try decodeEdgeValue(value);
         try results.append(alloc, .{
             .source = try alloc.dupe(u8, parsed.source),
             .target = try alloc.dupe(u8, parsed.target),
@@ -22951,12 +22952,13 @@ test "graph batchApply applies writes and deletes together" {
 test "graph edge encoding round-trip" {
     var buf: [256]u8 = undefined;
     const encoded = encodeEdgeValue(&buf, 0.75, 1234567890, 1234567891, "{\"key\":\"val\"}");
-    const decoded = decodeEdgeValue(encoded);
+    const decoded = try decodeEdgeValue(encoded);
 
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), decoded.weight, 0.001);
     try std.testing.expectEqual(@as(u64, 1234567890), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 1234567891), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"key\":\"val\"}", decoded.metadata);
+    try std.testing.expectError(error.InvalidGraphEdgeValue, decodeEdgeValue(encoded[0..23]));
 }
 
 test "graph getEdges with edge type filter" {

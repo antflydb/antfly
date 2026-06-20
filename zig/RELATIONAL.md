@@ -1002,9 +1002,11 @@ moves behind a `api/sql_adapter/` package:
   that callers already consume.
 - `ddl_plan.zig`: adapter public DDL/catalog plan containers and ownership
   helpers, including table, partition, index, relation-lifetime, identity
-  allocator, domain, and catalog plans. These stay split from read/write
-  execution plans so catalog evolution can move behind the adapter facade
-  without growing the main lowerer file.
+  allocator, domain, and catalog plans, plus grammar-syntax to plan-enum
+  conversion helpers for cursor, prepared-statement, transaction, lock,
+  foreign-key option, maintenance, bulk I/O, and routine DDL metadata. These
+  stay split from read/write execution plans so catalog evolution can move
+  behind the adapter facade without growing the main lowerer file.
 - `token.zig`: token kinds, token source spans, keyword helpers, and simple
   token predicates.
 - `lexer.zig`: PostgreSQL lexical handling for whitespace, comments, quoted
@@ -1023,8 +1025,9 @@ moves behind a `api/sql_adapter/` package:
 - `binder.zig`: schema/catalog lookup, parameter binding, catalog-backed name
   resolution, output-column inference, and type validation.
 - `lower_expr.zig`: shared expression lowering into Antfly row-expression,
-  check, index-predicate, default, conflict-action, and returning-expression
-  ASTs.
+  check, index-predicate, default, conflict-action, returning-expression ASTs,
+  query predicate-surface checks, and set-operation projection/column
+  compatibility and predicate-disjointness proof helpers.
 - `lower_select.zig`, `lower_dml.zig`, and `lower_ddl.zig`: statement-family
   lowering into Antfly typed read plans, write plans, and catalog/schema plans.
 - `diagnostics.zig`: span-aware unsupported-shape diagnostics and stable

@@ -5457,7 +5457,9 @@ The graph metric framework should be considered production-complete when:
   queue keyed by eligible cleanup time.
 - The v1 deferred cleanup fallback uses an internal 60 second delay.
 - Direct graph metric endpoints always return metric status.
-- Graph traversal and graph search return metric status only when
-  `include_metric_status` is set.
+- Graph traversal and graph search execution carries metric status for every
+  projected, ordered, and filtered metric dependency so fan-in can prove
+  generation/freshness compatibility. Clients should set `include_metric_status`
+  when they need that status as an explicit response field.
 - `metric_status` is a map keyed by metric name.
 - Retention controls are future debug/admin options, not v1 user-facing config.

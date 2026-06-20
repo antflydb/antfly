@@ -2207,6 +2207,177 @@ pub const AdvisoryLockAction = enum {
     unlock,
 };
 
+pub fn cursorScrollModeFromSyntax(syntax: grammar.CursorScrollSyntax) CursorScrollMode {
+    return switch (syntax) {
+        .default => .default,
+        .scroll => .scroll,
+        .no_scroll => .no_scroll,
+    };
+}
+
+pub fn cursorFetchDirectionFromSyntax(syntax: grammar.CursorFetchDirectionSyntax) CursorFetchDirection {
+    return switch (syntax) {
+        .next => .next,
+        .prior => .prior,
+        .first => .first,
+        .last => .last,
+        .absolute => .absolute,
+        .relative => .relative,
+        .forward => .forward,
+        .backward => .backward,
+        .all => .all,
+    };
+}
+
+pub fn preparedStatementSubjectKindFromSyntax(syntax: grammar.PreparedStatementSubjectSyntax) PreparedStatementSubjectKind {
+    return switch (syntax) {
+        .read => .read,
+        .write => .write,
+        .ddl => .ddl,
+    };
+}
+
+pub fn preparedStatementStatementKindFromSyntax(syntax: grammar.PreparedStatementStatementSyntax) PreparedStatementStatementKind {
+    return switch (syntax) {
+        .read => .read,
+        .insert => .insert,
+        .insert_source => .insert_source,
+        .update => .update,
+        .delete => .delete,
+        .truncate => .truncate,
+        .merge => .merge,
+        .ddl => .ddl,
+    };
+}
+
+pub fn tableLockModeFromSyntax(syntax: grammar.TableLockModeSyntax) TableLockMode {
+    return switch (syntax) {
+        .access_share => .access_share,
+        .row_share => .row_share,
+        .row_exclusive => .row_exclusive,
+        .share_update_exclusive => .share_update_exclusive,
+        .share => .share,
+        .share_row_exclusive => .share_row_exclusive,
+        .exclusive => .exclusive,
+        .access_exclusive => .access_exclusive,
+    };
+}
+
+pub fn constraintCheckModeFromSyntax(syntax: grammar.ConstraintCheckModeSyntax) ConstraintCheckMode {
+    return switch (syntax) {
+        .immediate => .immediate,
+        .deferred => .deferred,
+    };
+}
+
+pub fn ddlForeignKeyActionFromSyntax(action: grammar.DdlForeignKeyActionSyntax) runtime_schema.ForeignKeyAction {
+    return switch (action) {
+        .restrict => .restrict,
+        .cascade => .cascade,
+        .no_action => .no_action,
+        .set_null => .set_null,
+    };
+}
+
+pub fn ddlForeignKeyTimingFromSyntax(timing: grammar.DdlForeignKeyTimingSyntax) runtime_schema.ForeignKeyTiming {
+    return switch (timing) {
+        .immediate => .immediate,
+        .deferred => .deferred,
+    };
+}
+
+pub fn ddlForeignKeyMatchFromSyntax(match_syntax: grammar.DdlForeignKeyMatchSyntax) runtime_schema.ForeignKeyMatch {
+    return switch (match_syntax) {
+        .simple => .simple,
+        .full => .full,
+    };
+}
+
+pub fn transactionModeStarterToSyntax(starter: TransactionModeStarter) grammar.TransactionModeStarterSyntax {
+    return switch (starter) {
+        .set_transaction => .set_transaction,
+        .start_transaction => .start_transaction,
+        .begin => .begin,
+    };
+}
+
+pub fn transactionModeStarterFromSyntax(syntax: grammar.TransactionModeStarterSyntax) TransactionModeStarter {
+    return switch (syntax) {
+        .set_transaction => .set_transaction,
+        .start_transaction => .start_transaction,
+        .begin => .begin,
+    };
+}
+
+pub fn transactionIsolationLevelFromSyntax(syntax: ?grammar.TransactionIsolationLevelSyntax) ?TransactionIsolationLevel {
+    return switch (syntax orelse return null) {
+        .serializable => .serializable,
+        .repeatable_read => .repeatable_read,
+        .read_committed => .read_committed,
+        .read_uncommitted => .read_uncommitted,
+    };
+}
+
+pub fn transactionAccessModeFromSyntax(syntax: ?grammar.TransactionAccessModeSyntax) ?TransactionAccessMode {
+    return switch (syntax orelse return null) {
+        .read_only => .read_only,
+        .read_write => .read_write,
+    };
+}
+
+pub fn advisoryLockActionFromSyntax(syntax: grammar.AdvisoryLockActionSyntax) AdvisoryLockAction {
+    return switch (syntax) {
+        .lock => .lock,
+        .unlock => .unlock,
+    };
+}
+
+pub fn reindexMaintenanceTargetFromSyntax(syntax: grammar.ReindexMaintenanceTargetSyntax) ReindexMaintenanceTarget {
+    return switch (syntax) {
+        .index => .index,
+        .table => .table,
+        .schema => .schema,
+        .database => .database,
+        .system => .system,
+    };
+}
+
+pub fn bulkIoDirectionFromSyntax(syntax: grammar.BulkIoDirectionSyntax) BulkIoDirection {
+    return switch (syntax) {
+        .from => .from,
+        .to => .to,
+    };
+}
+
+pub fn routineKindFromSyntax(syntax: grammar.RoutineKindSyntax) RoutineKind {
+    return switch (syntax) {
+        .function => .function,
+        .procedure => .procedure,
+    };
+}
+
+test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
+    try std.testing.expectEqual(CursorScrollMode.no_scroll, cursorScrollModeFromSyntax(.no_scroll));
+    try std.testing.expectEqual(CursorFetchDirection.backward, cursorFetchDirectionFromSyntax(.backward));
+    try std.testing.expectEqual(PreparedStatementSubjectKind.write, preparedStatementSubjectKindFromSyntax(.write));
+    try std.testing.expectEqual(PreparedStatementStatementKind.insert_source, preparedStatementStatementKindFromSyntax(.insert_source));
+    try std.testing.expectEqual(TableLockMode.share_row_exclusive, tableLockModeFromSyntax(.share_row_exclusive));
+    try std.testing.expectEqual(ConstraintCheckMode.deferred, constraintCheckModeFromSyntax(.deferred));
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, ddlForeignKeyActionFromSyntax(.cascade));
+    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, ddlForeignKeyTimingFromSyntax(.deferred));
+    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, ddlForeignKeyMatchFromSyntax(.full));
+    try std.testing.expectEqual(grammar.TransactionModeStarterSyntax.begin, transactionModeStarterToSyntax(.begin));
+    try std.testing.expectEqual(TransactionModeStarter.start_transaction, transactionModeStarterFromSyntax(.start_transaction));
+    try std.testing.expectEqual(TransactionIsolationLevel.repeatable_read, transactionIsolationLevelFromSyntax(.repeatable_read).?);
+    try std.testing.expectEqual(@as(?TransactionIsolationLevel, null), transactionIsolationLevelFromSyntax(null));
+    try std.testing.expectEqual(TransactionAccessMode.read_write, transactionAccessModeFromSyntax(.read_write).?);
+    try std.testing.expectEqual(@as(?TransactionAccessMode, null), transactionAccessModeFromSyntax(null));
+    try std.testing.expectEqual(AdvisoryLockAction.unlock, advisoryLockActionFromSyntax(.unlock));
+    try std.testing.expectEqual(ReindexMaintenanceTarget.system, reindexMaintenanceTargetFromSyntax(.system));
+    try std.testing.expectEqual(BulkIoDirection.to, bulkIoDirectionFromSyntax(.to));
+    try std.testing.expectEqual(RoutineKind.procedure, routineKindFromSyntax(.procedure));
+}
+
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);

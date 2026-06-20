@@ -47,8 +47,25 @@ const TokenKind = sql_adapter.TokenKind;
 const aggregateSpecsEquivalent = sql_adapter.aggregateSpecsEquivalent;
 const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
 const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
+const cloneExpressionAlloc = sql_adapter.cloneExpressionAlloc;
+const cloneExpressionConditionAlloc = sql_adapter.cloneExpressionConditionAlloc;
+const cloneExpressionConditionsAlloc = sql_adapter.cloneExpressionConditionsAlloc;
+const cloneExpressionConditionsConcatAlloc = sql_adapter.cloneExpressionConditionsConcatAlloc;
+const cloneExpressionPredicateGroupsAlloc = sql_adapter.cloneExpressionPredicateGroupsAlloc;
+const cloneExpressionProjection = sql_adapter.cloneExpressionProjection;
+const cloneSelectOutputsAlloc = sql_adapter.cloneSelectOutputsAlloc;
 const cursorFetchDirectionFromSyntax = sql_adapter.cursorFetchDirectionFromSyntax;
 const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
+const ddlForeignKeyActionFromSyntax = sql_adapter.ddlForeignKeyActionFromSyntax;
+const ddlForeignKeyMatchFromSyntax = sql_adapter.ddlForeignKeyMatchFromSyntax;
+const ddlForeignKeyTimingFromSyntax = sql_adapter.ddlForeignKeyTimingFromSyntax;
+const freeExpression = sql_adapter.freeExpression;
+const freeExpressionCondition = sql_adapter.freeExpressionCondition;
+const freeExpressionConditions = sql_adapter.freeExpressionConditions;
+const freeExpressionPredicateGroups = sql_adapter.freeExpressionPredicateGroups;
+const freeExpressionProjection = sql_adapter.freeExpressionProjection;
+const freeExpressionProjections = sql_adapter.freeExpressionProjections;
+const freeExpressionSlice = sql_adapter.freeExpressionSlice;
 const freeTokens = sql_adapter.freeTokens;
 const generatedColumnReferencesAny = sql_adapter.generatedColumnReferencesAny;
 const jsonValueIsValid = sql_adapter.jsonValueIsValid;
@@ -65,6 +82,8 @@ const foreignKeyNameExists = sql_adapter.foreignKeyNameExists;
 const preparedStatementStatementKindFromSyntax = sql_adapter.preparedStatementStatementKindFromSyntax;
 const preparedStatementSubjectKindFromSyntax = sql_adapter.preparedStatementSubjectKindFromSyntax;
 const primaryKeyNameEquals = sql_adapter.primaryKeyNameEquals;
+const queryHasOnlySimpleIntersectExceptPredicateSurface = sql_adapter.queryHasOnlySimpleIntersectExceptPredicateSurface;
+const queryHasOnlySimpleUnionPredicateSurface = sql_adapter.queryHasOnlySimpleUnionPredicateSurface;
 const reindexMaintenanceTargetFromSyntax = sql_adapter.reindexMaintenanceTargetFromSyntax;
 const relationalCheckNameExists = sql_adapter.relationalCheckNameExists;
 const relationalColumnForDdl = sql_adapter.relationalColumnForDdl;
@@ -78,6 +97,8 @@ const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
 const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
 const relationalPeriodNameExists = sql_adapter.relationalPeriodNameExists;
+const rewriteExpressionConditionFieldsToSource = sql_adapter.rewriteExpressionConditionFieldsToSource;
+const rewriteExpressionFieldsToSource = sql_adapter.rewriteExpressionFieldsToSource;
 const routineKindFromSyntax = sql_adapter.routineKindFromSyntax;
 const tableSchemaCatalogExists = sql_adapter.tableSchemaCatalogExists;
 const tableLockModeFromSyntax = sql_adapter.tableLockModeFromSyntax;
@@ -86,6 +107,8 @@ const transactionIsolationLevelFromSyntax = sql_adapter.transactionIsolationLeve
 const transactionModeStarterFromSyntax = sql_adapter.transactionModeStarterFromSyntax;
 const transactionModeStarterToSyntax = sql_adapter.transactionModeStarterToSyntax;
 const sqlIntervalLiteral = sql_adapter.sqlIntervalLiteral;
+const setOperationColumnsCompatible = sql_adapter.setOperationColumnsCompatible;
+const simpleSelectProjectionsEqual = sql_adapter.simpleSelectProjectionsEqual;
 const sqlArrayItemValueMatches = sql_adapter.sqlArrayItemValueMatches;
 const sqlScalarValueMatches = sql_adapter.sqlScalarValueMatches;
 const sqlStringIsJsonNumber = sql_adapter.sqlStringIsJsonNumber;
@@ -4104,132 +4127,6 @@ fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpu
     }
 }
 
-fn cursorScrollModeFromSyntax(syntax: sql_adapter.CursorScrollSyntax) CursorScrollMode {
-    return switch (syntax) {
-        .default => .default,
-        .scroll => .scroll,
-        .no_scroll => .no_scroll,
-    };
-}
-
-fn cursorFetchDirectionFromSyntax(syntax: sql_adapter.CursorFetchDirectionSyntax) CursorFetchDirection {
-    return switch (syntax) {
-        .next => .next,
-        .prior => .prior,
-        .first => .first,
-        .last => .last,
-        .absolute => .absolute,
-        .relative => .relative,
-        .forward => .forward,
-        .backward => .backward,
-        .all => .all,
-    };
-}
-
-fn preparedStatementSubjectKindFromSyntax(syntax: sql_adapter.PreparedStatementSubjectSyntax) PreparedStatementSubjectKind {
-    return switch (syntax) {
-        .read => .read,
-        .write => .write,
-        .ddl => .ddl,
-    };
-}
-
-fn preparedStatementStatementKindFromSyntax(syntax: sql_adapter.PreparedStatementStatementSyntax) PreparedStatementStatementKind {
-    return switch (syntax) {
-        .read => .read,
-        .insert => .insert,
-        .insert_source => .insert_source,
-        .update => .update,
-        .delete => .delete,
-        .truncate => .truncate,
-        .merge => .merge,
-        .ddl => .ddl,
-    };
-}
-
-fn tableLockModeFromSyntax(syntax: sql_adapter.TableLockModeSyntax) TableLockMode {
-    return switch (syntax) {
-        .access_share => .access_share,
-        .row_share => .row_share,
-        .row_exclusive => .row_exclusive,
-        .share_update_exclusive => .share_update_exclusive,
-        .share => .share,
-        .share_row_exclusive => .share_row_exclusive,
-        .exclusive => .exclusive,
-        .access_exclusive => .access_exclusive,
-    };
-}
-
-fn constraintCheckModeFromSyntax(syntax: sql_adapter.ConstraintCheckModeSyntax) ConstraintCheckMode {
-    return switch (syntax) {
-        .immediate => .immediate,
-        .deferred => .deferred,
-    };
-}
-
-fn transactionModeStarterToSyntax(starter: TransactionModeStarter) sql_adapter.TransactionModeStarterSyntax {
-    return switch (starter) {
-        .set_transaction => .set_transaction,
-        .start_transaction => .start_transaction,
-        .begin => .begin,
-    };
-}
-
-fn transactionModeStarterFromSyntax(syntax: sql_adapter.TransactionModeStarterSyntax) TransactionModeStarter {
-    return switch (syntax) {
-        .set_transaction => .set_transaction,
-        .start_transaction => .start_transaction,
-        .begin => .begin,
-    };
-}
-
-fn transactionIsolationLevelFromSyntax(syntax: ?sql_adapter.TransactionIsolationLevelSyntax) ?TransactionIsolationLevel {
-    return switch (syntax orelse return null) {
-        .serializable => .serializable,
-        .repeatable_read => .repeatable_read,
-        .read_committed => .read_committed,
-        .read_uncommitted => .read_uncommitted,
-    };
-}
-
-fn transactionAccessModeFromSyntax(syntax: ?sql_adapter.TransactionAccessModeSyntax) ?TransactionAccessMode {
-    return switch (syntax orelse return null) {
-        .read_only => .read_only,
-        .read_write => .read_write,
-    };
-}
-
-fn advisoryLockActionFromSyntax(syntax: sql_adapter.AdvisoryLockActionSyntax) AdvisoryLockAction {
-    return switch (syntax) {
-        .lock => .lock,
-        .unlock => .unlock,
-    };
-}
-
-fn reindexMaintenanceTargetFromSyntax(syntax: sql_adapter.ReindexMaintenanceTargetSyntax) ReindexMaintenanceTarget {
-    return switch (syntax) {
-        .index => .index,
-        .table => .table,
-        .schema => .schema,
-        .database => .database,
-        .system => .system,
-    };
-}
-
-fn bulkIoDirectionFromSyntax(syntax: sql_adapter.BulkIoDirectionSyntax) BulkIoDirection {
-    return switch (syntax) {
-        .from => .from,
-        .to => .to,
-    };
-}
-
-fn routineKindFromSyntax(syntax: sql_adapter.RoutineKindSyntax) RoutineKind {
-    return switch (syntax) {
-        .function => .function,
-        .procedure => .procedure,
-    };
-}
-
 fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) sql_adapter.PrivilegeChangeActionSyntax {
     return switch (action) {
         .grant => .grant,
@@ -7252,29 +7149,6 @@ const Parser = struct {
             .deferrable = options.deferrable,
             .timing = ddlForeignKeyTimingFromSyntax(options.timing),
             .match = ddlForeignKeyMatchFromSyntax(options.match),
-        };
-    }
-
-    fn ddlForeignKeyActionFromSyntax(action: sql_adapter.DdlForeignKeyActionSyntax) runtime_schema.ForeignKeyAction {
-        return switch (action) {
-            .restrict => .restrict,
-            .cascade => .cascade,
-            .no_action => .no_action,
-            .set_null => .set_null,
-        };
-    }
-
-    fn ddlForeignKeyTimingFromSyntax(timing: sql_adapter.DdlForeignKeyTimingSyntax) runtime_schema.ForeignKeyTiming {
-        return switch (timing) {
-            .immediate => .immediate,
-            .deferred => .deferred,
-        };
-    }
-
-    fn ddlForeignKeyMatchFromSyntax(match_syntax: sql_adapter.DdlForeignKeyMatchSyntax) runtime_schema.ForeignKeyMatch {
-        return switch (match_syntax) {
-            .simple => .simple,
-            .full => .full,
         };
     }
 
@@ -39588,18 +39462,18 @@ fn simpleSetQueriesProvablyDisjoint(
 
     for (lhs.predicates) |left| {
         for (rhs.predicates) |right| {
-            if (relationalChecksProvablyDisjoint(left, right)) return true;
+            if (sql_adapter.relationalChecksProvablyDisjoint(left, right)) return true;
         }
         for (rhs.expression_predicates) |right| {
-            if (relationalCheckAndExpressionConditionProvablyDisjoint(left, right)) return true;
+            if (sql_adapter.relationalCheckAndExpressionConditionProvablyDisjoint(left, right)) return true;
         }
     }
     for (lhs.expression_predicates) |left| {
         for (rhs.predicates) |right| {
-            if (relationalCheckAndExpressionConditionProvablyDisjoint(right, left)) return true;
+            if (sql_adapter.relationalCheckAndExpressionConditionProvablyDisjoint(right, left)) return true;
         }
         for (rhs.expression_predicates) |right| {
-            if (expressionConditionsProvablyDisjoint(left, right)) return true;
+            if (sql_adapter.expressionConditionsProvablyDisjoint(left, right)) return true;
         }
     }
     return false;
@@ -39662,7 +39536,7 @@ fn relationalCheckBranchesProvablyDisjoint(
     if (lhs.len == 0 or rhs.len == 0) return false;
     for (lhs) |left| {
         for (rhs) |right| {
-            if (relationalChecksProvablyDisjoint(left, right)) return true;
+            if (sql_adapter.relationalChecksProvablyDisjoint(left, right)) return true;
         }
     }
     return false;
@@ -39675,7 +39549,7 @@ fn expressionConditionBranchesProvablyDisjoint(
     if (lhs.len == 0 or rhs.len == 0) return false;
     for (lhs) |left| {
         for (rhs) |right| {
-            if (expressionConditionsProvablyDisjoint(left, right)) return true;
+            if (sql_adapter.expressionConditionsProvablyDisjoint(left, right)) return true;
         }
     }
     return false;
@@ -39724,7 +39598,7 @@ fn simpleAccessSetBranchesProvablyDisjoint(
 
     for (lhs.predicates) |left| {
         for (rhs.predicates) |right| {
-            if (relationalChecksProvablyDisjoint(left, right)) return true;
+            if (sql_adapter.relationalChecksProvablyDisjoint(left, right)) return true;
         }
         for (rhs.in_predicates) |right| {
             if (try inPredicateAndRelationalCheckProvablyDisjoint(alloc, right, left)) return true;
@@ -39793,7 +39667,7 @@ fn inPredicateValuesContainJsonLiteralProof(
     value_json: []const u8,
 ) !InPredicateContainmentProof {
     if (predicate.negated) return .unknown;
-    if (!jsonIsSafeDisjointProofLiteral(value_json) and !jsonIsJsonNumberLiteral(value_json)) return .unknown;
+    if (!sql_adapter.jsonIsSafeDisjointProofLiteral(value_json) and !sql_adapter.jsonIsJsonNumberLiteral(value_json)) return .unknown;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, predicate.values_json, .{}) catch return .unknown;
     defer parsed.deinit();
@@ -39809,7 +39683,7 @@ fn inPredicateValuesContainJsonLiteralProof(
 
 fn jsonValueScalarProofLiteralAlloc(alloc: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
     const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    if (jsonIsSafeDisjointProofLiteral(value_json) or jsonIsJsonNumberLiteral(value_json)) return value_json;
+    if (sql_adapter.jsonIsSafeDisjointProofLiteral(value_json) or sql_adapter.jsonIsJsonNumberLiteral(value_json)) return value_json;
     alloc.free(value_json);
     return null;
 }
@@ -40075,254 +39949,6 @@ fn expressionGroupsFromSimpleUnionQueryAlloc(
     return groups;
 }
 
-fn relationalChecksProvablyDisjoint(
-    lhs: runtime_schema.RelationalCheck,
-    rhs: runtime_schema.RelationalCheck,
-) bool {
-    if (lhs.expression) |left| {
-        if (rhs.expression) |right| return expressionConditionsProvablyDisjoint(left, right);
-        return relationalCheckAndExpressionConditionProvablyDisjoint(rhs, left);
-    }
-    if (rhs.expression) |right| return relationalCheckAndExpressionConditionProvablyDisjoint(lhs, right);
-    if (!std.mem.eql(u8, lhs.field, rhs.field)) return false;
-    return simplePredicateOpsProvablyDisjoint(lhs.op, lhs.value_json, rhs.op, rhs.value_json);
-}
-
-fn relationalCheckAndExpressionConditionProvablyDisjoint(
-    check: runtime_schema.RelationalCheck,
-    condition: db_mod.types.RelationalRowsExpressionCondition,
-) bool {
-    if (check.expression) |check_condition| return expressionConditionsProvablyDisjoint(check_condition, condition);
-    if (!expressionIsRowField(condition.lhs, check.field)) return false;
-    return simplePredicateOpsProvablyDisjoint(check.op, check.value_json, condition.op, expressionConditionSingleValueJson(condition));
-}
-
-fn expressionConditionsProvablyDisjoint(
-    lhs: db_mod.types.RelationalRowsExpressionCondition,
-    rhs: db_mod.types.RelationalRowsExpressionCondition,
-) bool {
-    if (!sql_adapter.relationalRowsExpressionEqual(lhs.lhs, rhs.lhs)) return false;
-    return simplePredicateOpsProvablyDisjoint(lhs.op, expressionConditionSingleValueJson(lhs), rhs.op, expressionConditionSingleValueJson(rhs));
-}
-
-fn expressionIsRowField(expression: db_mod.types.RelationalRowsExpression, field: []const u8) bool {
-    return expression.kind == .field and
-        expression.field_source == .row and
-        std.mem.eql(u8, expression.field, field);
-}
-
-fn expressionConditionSingleValueJson(condition: db_mod.types.RelationalRowsExpressionCondition) ?[]const u8 {
-    if (condition.rhs.len != 1) return null;
-    if (condition.rhs[0].kind != .value) return null;
-    return condition.rhs[0].value_json;
-}
-
-fn simplePredicateOpsProvablyDisjoint(
-    lhs_op: runtime_schema.RelationalCheckOp,
-    lhs_value_json: ?[]const u8,
-    rhs_op: runtime_schema.RelationalCheckOp,
-    rhs_value_json: ?[]const u8,
-) bool {
-    if (lhs_op == .eq and rhs_op == .eq) return jsonScalarLiteralsDefinitelyDistinct(lhs_value_json, rhs_value_json);
-    if (jsonScalarLiteralsExactlyEqualForComplement(lhs_value_json, rhs_value_json)) {
-        if ((lhs_op == .eq and rhs_op == .ne) or (lhs_op == .ne and rhs_op == .eq)) return true;
-        if ((lhs_op == .eq and rhs_op == .is_distinct) or (lhs_op == .is_distinct and rhs_op == .eq)) return true;
-        if ((lhs_op == .is_not_distinct and rhs_op == .is_distinct) or (lhs_op == .is_distinct and rhs_op == .is_not_distinct)) return true;
-        if (jsonScalarLiteralDefinitelyNonNull(lhs_value_json) and
-            ((lhs_op == .is_not_distinct and rhs_op == .ne) or (lhs_op == .ne and rhs_op == .is_not_distinct)))
-        {
-            return true;
-        }
-    }
-    if (lhs_op == .is_null and rhs_op == .is_not_null) return true;
-    if (lhs_op == .is_not_null and rhs_op == .is_null) return true;
-    if (lhs_op == .is_null and rhs_op == .eq) return jsonScalarLiteralDefinitelyNonNull(rhs_value_json);
-    if (lhs_op == .eq and rhs_op == .is_null) return jsonScalarLiteralDefinitelyNonNull(lhs_value_json);
-    if (numericRangePredicatesProvablyDisjoint(lhs_op, lhs_value_json, rhs_op, rhs_value_json)) return true;
-    return false;
-}
-
-const SimpleNumericBound = struct {
-    value: f64,
-    inclusive: bool,
-};
-
-fn numericRangePredicatesProvablyDisjoint(
-    lhs_op: runtime_schema.RelationalCheckOp,
-    lhs_value_json: ?[]const u8,
-    rhs_op: runtime_schema.RelationalCheckOp,
-    rhs_value_json: ?[]const u8,
-) bool {
-    if (upperNumericBound(lhs_op, lhs_value_json)) |left_upper| {
-        if (lowerNumericBound(rhs_op, rhs_value_json)) |right_lower| {
-            return numericUpperLowerBoundsProvablyDisjoint(left_upper, right_lower);
-        }
-    }
-    if (lowerNumericBound(lhs_op, lhs_value_json)) |left_lower| {
-        if (upperNumericBound(rhs_op, rhs_value_json)) |right_upper| {
-            return numericUpperLowerBoundsProvablyDisjoint(right_upper, left_lower);
-        }
-    }
-    return false;
-}
-
-fn upperNumericBound(op: runtime_schema.RelationalCheckOp, value_json: ?[]const u8) ?SimpleNumericBound {
-    return switch (op) {
-        .lt => .{ .value = jsonNumberLiteralValue(value_json) orelse return null, .inclusive = false },
-        .lte => .{ .value = jsonNumberLiteralValue(value_json) orelse return null, .inclusive = true },
-        else => null,
-    };
-}
-
-fn lowerNumericBound(op: runtime_schema.RelationalCheckOp, value_json: ?[]const u8) ?SimpleNumericBound {
-    return switch (op) {
-        .gt => .{ .value = jsonNumberLiteralValue(value_json) orelse return null, .inclusive = false },
-        .gte => .{ .value = jsonNumberLiteralValue(value_json) orelse return null, .inclusive = true },
-        else => null,
-    };
-}
-
-fn numericUpperLowerBoundsProvablyDisjoint(upper: SimpleNumericBound, lower: SimpleNumericBound) bool {
-    if (lower.value > upper.value) return true;
-    if (lower.value < upper.value) return false;
-    return !(upper.inclusive and lower.inclusive);
-}
-
-fn jsonScalarLiteralsDefinitelyDistinct(lhs: ?[]const u8, rhs: ?[]const u8) bool {
-    const left = lhs orelse return false;
-    const right = rhs orelse return false;
-    if (!jsonIsSafeDisjointProofLiteral(left) or !jsonIsSafeDisjointProofLiteral(right)) return false;
-    return !std.mem.eql(u8, left, right);
-}
-
-fn jsonScalarLiteralsDefinitelyEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
-    const left = lhs orelse return false;
-    const right = rhs orelse return false;
-    if (!jsonIsSafeDisjointProofLiteral(left) or !jsonIsSafeDisjointProofLiteral(right)) return false;
-    return std.mem.eql(u8, left, right);
-}
-
-fn jsonScalarLiteralsExactlyEqualForComplement(lhs: ?[]const u8, rhs: ?[]const u8) bool {
-    const left = lhs orelse return false;
-    const right = rhs orelse return false;
-    if (!std.mem.eql(u8, left, right)) return false;
-    return jsonIsSafeDisjointProofLiteral(left) or jsonIsJsonNumberLiteral(left);
-}
-
-fn jsonIsSafeDisjointProofLiteral(value: []const u8) bool {
-    return (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') or
-        std.mem.eql(u8, value, "true") or
-        std.mem.eql(u8, value, "false") or
-        std.mem.eql(u8, value, "null");
-}
-
-fn jsonScalarLiteralDefinitelyNonNull(value: ?[]const u8) bool {
-    const json = value orelse return false;
-    return (jsonIsSafeDisjointProofLiteral(json) and !std.mem.eql(u8, json, "null")) or jsonIsJsonNumberLiteral(json);
-}
-
-fn jsonIsJsonNumberLiteral(value: []const u8) bool {
-    if (value.len == 0) return false;
-    var index: usize = 0;
-    if (value[index] == '-') {
-        index += 1;
-        if (index == value.len) return false;
-    }
-
-    if (value[index] == '0') {
-        index += 1;
-    } else if (std.ascii.isDigit(value[index]) and value[index] != '0') {
-        while (index < value.len and std.ascii.isDigit(value[index])) index += 1;
-    } else {
-        return false;
-    }
-
-    if (index < value.len and value[index] == '.') {
-        index += 1;
-        const start = index;
-        while (index < value.len and std.ascii.isDigit(value[index])) index += 1;
-        if (index == start) return false;
-    }
-
-    if (index < value.len and (value[index] == 'e' or value[index] == 'E')) {
-        index += 1;
-        if (index < value.len and (value[index] == '+' or value[index] == '-')) index += 1;
-        const start = index;
-        while (index < value.len and std.ascii.isDigit(value[index])) index += 1;
-        if (index == start) return false;
-    }
-
-    return index == value.len;
-}
-
-fn jsonNumberLiteralValue(value: ?[]const u8) ?f64 {
-    const json = value orelse return null;
-    if (!jsonIsJsonNumberLiteral(json)) return null;
-    const parsed = std.fmt.parseFloat(f64, json) catch return null;
-    if (!std.math.isFinite(parsed)) return null;
-    return parsed;
-}
-
-fn queryHasOnlySimpleUnionPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
-    if (query.array_any.len != 0 or
-        query.array_contains.len != 0 or
-        query.array_eq.len != 0 or
-        query.json_contains.len != 0 or
-        query.json_path_eq.len != 0 or
-        query.json_path_exists.len != 0 or
-        query.text_patterns.len != 0 or
-        query.not_predicates.len != 0 or
-        query.access_or_predicates.len != 0 or
-        query.access_not_predicates.len != 0 or
-        query.expression_not_predicates.len != 0 or
-        query.expression_array_contains.len != 0 or
-        query.json_extract.len != 0 or
-        query.array_length.len != 0 or
-        query.coalesce.len != 0 or
-        query.field_aliases.len != 0 or
-        query.distinct_on.len != 0 or
-        query.distinct_on_expressions.len != 0 or
-        query.order_by.len != 0 or
-        query.row_claim != null or
-        query.doc_key_range != null or
-        query.limit != null or
-        query.offset != 0)
-    {
-        return false;
-    }
-    return true;
-}
-
-fn queryHasOnlySimpleIntersectExceptPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
-    if (query.array_any.len != 0 or
-        query.array_contains.len != 0 or
-        query.array_eq.len != 0 or
-        query.json_contains.len != 0 or
-        query.json_path_eq.len != 0 or
-        query.json_path_exists.len != 0 or
-        query.text_patterns.len != 0 or
-        query.not_predicates.len != 0 or
-        query.access_or_predicates.len != 0 or
-        query.access_not_predicates.len != 0 or
-        query.expression_not_predicates.len != 0 or
-        query.expression_array_contains.len != 0 or
-        query.json_extract.len != 0 or
-        query.array_length.len != 0 or
-        query.coalesce.len != 0 or
-        query.field_aliases.len != 0 or
-        query.distinct_on.len != 0 or
-        query.distinct_on_expressions.len != 0 or
-        query.order_by.len != 0 or
-        query.row_claim != null or
-        query.doc_key_range != null or
-        query.limit != null or
-        query.offset != 0)
-    {
-        return false;
-    }
-    return true;
-}
-
 fn expressionConditionFromRelationalCheckAlloc(
     alloc: std.mem.Allocator,
     value: runtime_schema.RelationalCheck,
@@ -40419,47 +40045,6 @@ fn expressionConditionsFromSimpleExpressionSetQueryBranchAlloc(
         return try expressionConditionsFromSimpleSetQueryAlloc(alloc, query);
     }
     return error.UnsupportedSqlShape;
-}
-
-fn simpleSelectProjectionsEqual(
-    lhs: db_mod.types.RelationalRowsQueryRequest,
-    rhs: db_mod.types.RelationalRowsQueryRequest,
-    lhs_outputs: []const SelectOutputRef,
-    rhs_outputs: []const SelectOutputRef,
-) bool {
-    if (lhs.select_all != rhs.select_all) return false;
-    if (!stringSlicesEqual(lhs.select, rhs.select)) return false;
-    if (!expressionProjectionsEqual(lhs.expressions, rhs.expressions)) return false;
-    if (lhs_outputs.len != rhs_outputs.len) return false;
-    for (lhs_outputs, rhs_outputs) |left, right| {
-        if (left.kind != right.kind or left.index != right.index) return false;
-    }
-    return true;
-}
-
-fn setOperationColumnsCompatible(
-    lhs: []const runtime_schema.RelationalColumn,
-    rhs: []const runtime_schema.RelationalColumn,
-) bool {
-    if (lhs.len == 0 or lhs.len != rhs.len) return false;
-    for (lhs, rhs) |left, right| {
-        if (!std.mem.eql(u8, left.name, right.name)) return false;
-        if (left.field_type != right.field_type) return false;
-        if (left.array_item_type != right.array_item_type) return false;
-    }
-    return true;
-}
-
-fn expressionProjectionsEqual(
-    lhs: []const db_mod.types.RelationalRowsExpressionProjection,
-    rhs: []const db_mod.types.RelationalRowsExpressionProjection,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |left, right| {
-        if (!std.mem.eql(u8, left.output, right.output)) return false;
-        if (!sql_adapter.relationalRowsExpressionEqual(left.expression, right.expression)) return false;
-    }
-    return true;
 }
 
 fn freePredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsPredicateGroup) void {
@@ -40591,84 +40176,6 @@ fn expressionProjectionFromCoalesceAlloc(
             .operands = operands,
         },
     };
-}
-
-fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpression) void {
-    if (value.field.len > 0) alloc.free(value.field);
-    if (value.value_json.len > 0) alloc.free(value.value_json);
-    if (value.json_path.len > 0) alloc.free(value.json_path);
-    for (value.operands) |operand| freeExpression(alloc, operand);
-    if (value.operands.len > 0) alloc.free(value.operands);
-    for (value.case_branches) |branch| freeExpressionCaseBranch(alloc, branch);
-    if (value.case_branches.len > 0) alloc.free(value.case_branches);
-    for (value.case_else) |fallback| freeExpression(alloc, fallback);
-    if (value.case_else.len > 0) alloc.free(value.case_else);
-}
-
-fn freeExpressionSlice(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpression) void {
-    for (values) |value| freeExpression(alloc, value);
-    if (values.len > 0) alloc.free(values);
-}
-
-fn cloneExpressionAlloc(
-    alloc: std.mem.Allocator,
-    value: db_mod.types.RelationalRowsExpression,
-) anyerror!db_mod.types.RelationalRowsExpression {
-    var cloned: db_mod.types.RelationalRowsExpression = .{
-        .kind = value.kind,
-        .field_source = value.field_source,
-        .cast_type = value.cast_type,
-        .json_as_text = value.json_as_text,
-    };
-    errdefer freeExpression(alloc, cloned);
-
-    if (value.field.len > 0) cloned.field = try alloc.dupe(u8, value.field);
-    if (value.value_json.len > 0) cloned.value_json = try alloc.dupe(u8, value.value_json);
-    if (value.json_path.len > 0) cloned.json_path = try alloc.dupe(u8, value.json_path);
-
-    if (value.operands.len > 0) {
-        const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.operands.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (operands[0..initialized]) |operand| freeExpression(alloc, operand);
-            alloc.free(operands);
-        }
-        for (value.operands, 0..) |operand, i| {
-            operands[i] = try cloneExpressionAlloc(alloc, operand);
-            initialized += 1;
-        }
-        cloned.operands = operands;
-    }
-
-    if (value.case_branches.len > 0) {
-        const branches = try alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, value.case_branches.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (branches[0..initialized]) |branch| freeExpressionCaseBranch(alloc, branch);
-            alloc.free(branches);
-        }
-        for (value.case_branches, 0..) |branch, i| {
-            branches[i] = try cloneExpressionCaseBranchAlloc(alloc, branch);
-            initialized += 1;
-        }
-        cloned.case_branches = branches;
-    }
-
-    if (value.case_else.len > 0) {
-        const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.case_else.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (fallback[0..initialized]) |expression| freeExpression(alloc, expression);
-            alloc.free(fallback);
-        }
-        for (value.case_else, 0..) |expression, i| {
-            fallback[i] = try cloneExpressionAlloc(alloc, expression);
-            initialized += 1;
-        }
-        cloned.case_else = fallback;
-    }
-
-    return cloned;
 }
 
 fn cloneOrderByAlloc(

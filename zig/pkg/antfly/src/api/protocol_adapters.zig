@@ -32,6 +32,7 @@ pub const DelegatedIdentity = struct {
     metadata_json: []const u8 = &.{},
     roles: []const []const u8 = &.{},
     role_settings: []const usermgr.RoleSetting = &.{},
+    role_runtime_settings: []const usermgr.RoleSetting = &.{},
 };
 
 const McpToolKind = enum {
@@ -632,6 +633,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
                 .metadata_json = identity.metadata_json,
                 .roles = identity.roles,
                 .role_settings = identity.role_settings,
+                .role_runtime_settings = identity.role_runtime_settings,
             } else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
