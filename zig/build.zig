@@ -2054,6 +2054,25 @@ pub fn build(b: *std.Build) void {
     lite_capi_step.dependOn(&install_lite_capi_lib.step);
     lite_capi_step.dependOn(&install_lite_capi_header.step);
 
+    const lite_capi_smoke_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_capi_smoke_mod.link_libc = true;
+    lite_capi_smoke_mod.addIncludePath(b.path("pkg/antfly/include"));
+    lite_capi_smoke_mod.addCSourceFile(.{
+        .file = b.path("examples/antfly_lite_c_smoke.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const lite_capi_smoke = b.addExecutable(.{
+        .name = "antfly-lite-c-smoke",
+        .root_module = lite_capi_smoke_mod,
+    });
+    lite_capi_smoke.root_module.linkLibrary(lite_capi_lib);
+    const run_lite_capi_smoke = b.addRunArtifact(lite_capi_smoke);
+    const lite_capi_smoke_step = b.step("lite-capi-smoke", "Compile and run a C consumer smoke test for libantflylite");
+    lite_capi_smoke_step.dependOn(&run_lite_capi_smoke.step);
+
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",
@@ -6326,6 +6345,7 @@ pub fn build(b: *std.Build) void {
     lite_core_step.dependOn(&install_lite_capi_lib.step);
     lite_core_step.dependOn(&install_lite_capi_header.step);
     lite_core_step.dependOn(&run_lite_core_main_tests.step);
+    lite_core_step.dependOn(&run_lite_capi_smoke.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, embedded package check, and libantflylite C ABI");
@@ -6335,6 +6355,7 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&run_antfly_main_tests.step);
     lite_full_step.dependOn(&run_lite_cli_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
+    lite_full_step.dependOn(&run_lite_capi_smoke.step);
     lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);
