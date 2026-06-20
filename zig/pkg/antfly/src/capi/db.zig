@@ -1798,6 +1798,7 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(handle.alloc);
     portable_backup.exportPortable(handle.alloc, handle.db.core.store, &out) catch |err| return capi.mapError(err);
+    portable_backup.validatePortable(handle.alloc, out.items) catch |err| return capi.mapError(err);
     const bytes = out.toOwnedSlice(handle.alloc) catch return .internal;
     out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;

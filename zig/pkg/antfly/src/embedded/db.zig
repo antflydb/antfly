@@ -217,6 +217,7 @@ pub const DB = struct {
 
     pub fn exportPortable(self: *DB, alloc: Allocator, out: *std.ArrayList(u8)) !void {
         try support.portable_backup.exportPortable(alloc, self.inner.core.store, out);
+        try support.portable_backup.validatePortable(alloc, out.items);
     }
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
