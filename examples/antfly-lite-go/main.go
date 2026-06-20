@@ -65,11 +65,17 @@ func main() {
 	}
 	fmt.Printf("lookup: %s\n", lookup)
 
-	status, err := db.StatusJSON()
+	status, err := db.Status()
 	if err != nil {
 		log.Fatalf("read status: %v", err)
 	}
-	fmt.Printf("status: %s\n", status)
+	fmt.Printf(
+		"status: storage=%s/%s inference=%s configured=%t\n",
+		status.Storage.Format,
+		status.Storage.Engine,
+		status.Inference.Mode,
+		status.Inference.Configured,
+	)
 
 	backup, err := db.Backup()
 	if err != nil {

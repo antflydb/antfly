@@ -56,11 +56,39 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("status JSON %q did not describe native aflite storage", status)
 	}
 
+	typedStatus, err := db.Status()
+	if err != nil {
+		t.Fatalf("typed status: %v", err)
+	}
+	if typedStatus.Storage.Format != "aflite" || typedStatus.Storage.Engine != "native_single_file" {
+		t.Fatalf("typed status storage = %#v", typedStatus.Storage)
+	}
+	if typedStatus.Inference.Mode != "caller_supplied_or_disabled" {
+		t.Fatalf("typed status inference mode = %q", typedStatus.Inference.Mode)
+	}
+	if typedStatus.Inference.Configured || typedStatus.Inference.RemoteProviderConfigured || typedStatus.Inference.LocalRuntimeConfigured {
+		t.Fatalf("fresh Lite database should not report configured inference: %#v", typedStatus.Inference)
+	}
+	if !typedStatus.Inference.CallerSuppliedArtifacts || !typedStatus.Inference.NoInferenceConfiguredOK {
+		t.Fatalf("fresh Lite database should accept caller-supplied or deferred inference: %#v", typedStatus.Inference)
+	}
+
 	caps, err := db.CapabilitiesJSON()
 	if err != nil {
 		t.Fatalf("capabilities: %v", err)
 	}
 	if !bytes.Contains(caps, []byte("inference")) {
 		t.Fatalf("capabilities JSON %q did not include inference fields", caps)
+	}
+
+	typedCaps, err := db.Capabilities()
+	if err != nil {
+		t.Fatalf("typed capabilities: %v", err)
+	}
+	if typedCaps.InferenceMode != "caller_supplied_or_disabled" || !typedCaps.CallerSuppliedArtifacts || !typedCaps.NoInferenceConfiguredOK {
+		t.Fatalf("typed capabilities inference fields = %#v", typedCaps)
+	}
+	if typedCaps.RaftReplication || typedCaps.ClusterPlacement || typedCaps.DistributedTransactionCoordination {
+		t.Fatalf("typed capabilities should not advertise distributed features: %#v", typedCaps)
 	}
 }
