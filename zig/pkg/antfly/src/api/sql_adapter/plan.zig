@@ -304,6 +304,7 @@ pub const LoweredRecursiveCtePlan = struct {
     operation: SelectSetOperation,
     anchor: LoweredQueryPlan,
     recursive_member: LoweredRecursiveCteMemberPlan,
+    final_query: db_mod.types.RelationalRowsQueryRequest = .{},
     output_columns: []const runtime_schema.RelationalColumn = &.{},
     recursive_member_references_cte: bool = false,
     max_rows: ?u32 = db_mod.types.default_relational_rows_cte_max_rows,
@@ -314,6 +315,7 @@ pub const LoweredRecursiveCtePlan = struct {
         alloc.free(self.cte_name);
         self.anchor.deinit(alloc);
         self.recursive_member.deinit(alloc);
+        self.final_query.deinit(alloc);
         freeSetOperationOutputColumns(alloc, self.output_columns);
         self.* = undefined;
     }

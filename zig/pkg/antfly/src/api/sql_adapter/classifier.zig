@@ -88,9 +88,12 @@ pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize)
 pub fn classifyPreparedStatementStatementKind(tokens: []const Token, start: usize) ?SqlPreparedStatementStatementKind {
     if (statementStartsAt(tokens, start, "select")) return .read;
     if (statementStartsAt(tokens, start, "with")) {
-        const final_index = withFinalStatementIndex(tokens[start..]) orelse return null;
-        if (std.ascii.eqlIgnoreCase(tokens[start + final_index].text, "select")) return .read;
-        if (withFinalStatementWriteKind(tokens[start + final_index].text)) |kind| return preparedStatementKindFromWriteKind(kind);
+        const with_tokens = tokens[start..];
+        const recursive = withStatementIsRecursive(with_tokens);
+        const final_index = withFinalStatementIndex(with_tokens, .{ .allow_recursive = true }) orelse return null;
+        if (std.ascii.eqlIgnoreCase(with_tokens[final_index].text, "select")) return .read;
+        if (recursive) return null;
+        if (withFinalStatementWriteKind(with_tokens[final_index].text)) |kind| return preparedStatementKindFromWriteKind(kind);
         return null;
     }
     if (statementStartsAt(tokens, start, "insert")) return .insert;
@@ -133,13 +136,17 @@ fn preparedStatementKindFromWriteKind(kind: SqlWriteStatementKind) SqlPreparedSt
 }
 
 fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
-    const index = withFinalStatementIndex(tokens) orelse return null;
+    const index = withFinalStatementIndex(tokens, .{}) orelse return null;
     return withFinalStatementWriteKind(tokens[index].text);
 }
 
-fn withFinalStatementIndex(tokens: []const Token) ?usize {
+const WithFinalStatementOptions = struct {
+    allow_recursive: bool = false,
+};
+
+fn withFinalStatementIndex(tokens: []const Token, options: WithFinalStatementOptions) ?usize {
     var index: usize = 1;
-    if (parser.matchKeyword(tokens, &index, "recursive")) return null;
+    if (parser.matchKeyword(tokens, &index, "recursive") and !options.allow_recursive) return null;
 
     while (true) {
         if (index >= tokens.len or tokens[index].kind != .identifier) return null;
@@ -160,6 +167,12 @@ fn withFinalStatementIndex(tokens: []const Token) ?usize {
 
     if (index >= tokens.len or tokens[index].kind != .identifier) return null;
     return index;
+}
+
+fn withStatementIsRecursive(tokens: []const Token) bool {
+    return tokens.len > 1 and
+        tokens[1].kind == .identifier and
+        std.ascii.eqlIgnoreCase(tokens[1].text, "recursive");
 }
 
 fn withFinalStatementWriteKind(keyword: []const u8) ?SqlWriteStatementKind {
@@ -238,6 +251,7 @@ test "sql adapter classifier identifies prepared statement subject families" {
     }{
         .{ .sql = "PREPARE usage_plan AS SELECT id FROM usage_records", .start_keyword = "select", .expected = .read },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .start_keyword = "with", .expected = .read },
+        .{ .sql = "PREPARE usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows", .start_keyword = "with", .expected = .read },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archived_records(id) SELECT id FROM source_rows", .start_keyword = "with", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)", .start_keyword = "with", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)", .start_keyword = "with", .expected = .write },

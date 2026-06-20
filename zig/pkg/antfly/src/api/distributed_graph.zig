@@ -255,6 +255,7 @@ pub const GraphExpandRequest = struct {
     params: graph_query_mod.QueryParams,
     metrics: []graph_query_mod.GraphMetricRead = &.{},
     include_metric_status: bool = false,
+    defer_result_limit: bool = false,
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
@@ -450,6 +451,7 @@ const GraphExpandRequestJson = struct {
     target_constraint_keys: []const []const u8 = &.{},
     metrics: []const GraphMetricReadJson = &.{},
     include_metric_status: bool = false,
+    defer_result_limit: bool = false,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
@@ -2980,6 +2982,7 @@ fn makeGraphExpandRequestWithAlgebraicModeAndTargetConstraints(
         .params = params,
         .metrics = execution_metrics,
         .include_metric_status = execution_metrics.len > 0,
+        .defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(named_query.query),
         .tensor_access_path = tensor_access_path,
         .tensor_program = tensor_program,
     };
@@ -3033,6 +3036,7 @@ pub fn frontierItemToSearchRequest(
     var params = req.params;
     params.edge_types = try dupConstStrings(alloc, req.params.edge_types);
     errdefer freeConstStrings(alloc, params.edge_types);
+    if (req.defer_result_limit) params.max_results = 0;
 
     const name = try alloc.dupe(u8, req.name);
     errdefer alloc.free(name);
@@ -3299,6 +3303,7 @@ pub fn encodeGraphExpandRequest(alloc: std.mem.Allocator, req: GraphExpandReques
         .target_constraint_keys = req.target_constraint_keys,
         .metrics = metrics,
         .include_metric_status = req.include_metric_status,
+        .defer_result_limit = req.defer_result_limit,
         .topology_epoch = req.topology_epoch,
         .identity_read_generation = req.identity_read_generation,
         .params = .{
@@ -3407,6 +3412,7 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
         .target_constraint_keys = target_constraint_keys,
         .metrics = try parseGraphMetricReads(alloc, parsed.value.metrics),
         .include_metric_status = parsed.value.include_metric_status,
+        .defer_result_limit = parsed.value.defer_result_limit,
         .topology_epoch = parsed.value.topology_epoch,
         .identity_read_generation = identity_read_generation,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
@@ -5203,6 +5209,52 @@ test "distributed graph expand request carries constrained semiring target progr
 
     parsed.params.algebraic_semiring = false;
     try std.testing.expectError(error.InvalidQueryRequest, validateGraphExpandTensorAccessPath(alloc, parsed));
+}
+
+test "distributed graph expand request defers worker result limit for metric post processing" {
+    const alloc = std.testing.allocator;
+    var frontier = [_]FrontierState{.{
+        .key = try alloc.dupe(u8, "doc:a"),
+    }};
+    defer frontier[0].deinit(alloc);
+    const frontier_ids = [_]u32{0};
+
+    var req = try makeGraphExpandRequest(alloc, .{
+        .name = "walk",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{
+                .edge_types = &.{"links"},
+                .max_depth = 3,
+                .max_results = 1,
+            },
+            .order_by = &.{.{
+                .name = "pagerank",
+                .direction = .desc,
+                .freshness = .published,
+            }},
+        },
+    }, frontier[0..], frontier_ids[0..], &.{}, &.{}, false);
+    defer req.deinit(alloc);
+    try std.testing.expect(req.defer_result_limit);
+    try std.testing.expect(req.include_metric_status);
+    try std.testing.expectEqual(@as(u32, 1), req.params.max_results);
+
+    const encoded = try encodeGraphExpandRequest(alloc, req);
+    defer alloc.free(encoded);
+    var parsed = try parseGraphExpandRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.defer_result_limit);
+    try std.testing.expectEqual(@as(u32, 1), parsed.params.max_results);
+
+    const search_req = try frontierItemToSearchRequest(alloc, parsed, parsed.frontier[0]);
+    defer freeExpandSearchRequest(alloc, search_req);
+    try std.testing.expectEqual(@as(u32, 0), search_req.graph_queries[0].query.params.max_results);
+    try std.testing.expect(search_req.graph_queries[0].query.include_metric_status);
+    try std.testing.expectEqual(@as(usize, 1), search_req.graph_queries[0].query.metrics.len);
+    try std.testing.expectEqualStrings("pagerank", search_req.graph_queries[0].query.metrics[0].name);
 }
 
 test "distributed graph detects semiring-enabled graph index config" {

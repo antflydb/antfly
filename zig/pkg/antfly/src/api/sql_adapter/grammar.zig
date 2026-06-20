@@ -6480,6 +6480,12 @@ pub fn peekArrayTransformSelfAssignment(tokens: []const Token, pos: usize, field
         tokens[pos + 3].kind == .comma;
 }
 
+pub fn matchArrayTransformUpdateOp(tokens: []const Token, pos: *usize) ?db_mod.types.TransformOpType {
+    if (parser.matchKeyword(tokens, pos, "array_append")) return .push;
+    if (parser.matchKeyword(tokens, pos, "array_remove")) return .pull;
+    return null;
+}
+
 pub fn peekDdlRangeColumnDefinition(tokens: []const Token, pos: usize) bool {
     if (pos + 1 >= tokens.len) return false;
     return tokens[pos].kind == .identifier and
@@ -11119,6 +11125,15 @@ test "sql adapter grammar peeks joined mutation and assignment syntax" {
     defer lexer.freeTokens(alloc, &array_append);
     try std.testing.expect(peekArrayTransformSelfAssignment(array_append.items, 0, "tags"));
     try std.testing.expect(!peekArrayTransformSelfAssignment(array_append.items, 0, "labels"));
+    var array_append_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.TransformOpType.push, matchArrayTransformUpdateOp(array_append.items, &array_append_pos).?);
+    try std.testing.expectEqual(@as(usize, 1), array_append_pos);
+
+    var array_remove = try lexer.tokenizeAlloc(alloc, "array_remove(tags, 'stale')");
+    defer lexer.freeTokens(alloc, &array_remove);
+    var array_remove_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.TransformOpType.pull, matchArrayTransformUpdateOp(array_remove.items, &array_remove_pos).?);
+    try std.testing.expectEqual(@as(usize, 1), array_remove_pos);
 }
 
 test "sql adapter grammar parses owned identifiers and normalized object lists" {

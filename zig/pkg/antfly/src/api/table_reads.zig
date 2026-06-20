@@ -141,6 +141,7 @@ pub const BackgroundTextStatsResponse = struct {
 pub const LoweredSqlReadPlanResult = union(enum) {
     query: db_mod.types.RelationalRowsQueryResult,
     set_operation: db_mod.types.RelationalRowsQueryResult,
+    recursive_cte: db_mod.types.RelationalRowsQueryResult,
     aggregate: db_mod.types.RelationalRowsAggregateResult,
     window: db_mod.types.RelationalRowsWindowResult,
     join: db_mod.types.RelationalRowsJoinResult,
@@ -150,6 +151,7 @@ pub const LoweredSqlReadPlanResult = union(enum) {
         switch (self.*) {
             .query => |*result| result.deinit(alloc),
             .set_operation => |*result| result.deinit(alloc),
+            .recursive_cte => |*result| result.deinit(alloc),
             .aggregate => |*result| result.deinit(alloc),
             .window => |*result| result.deinit(alloc),
             .join => |*result| result.deinit(alloc),
@@ -4643,7 +4645,19 @@ pub fn executeLoweredSqlReadPlanAlloc(
             errdefer result.deinit(alloc);
             break :blk .{ .set_operation = result };
         },
-        .recursive_cte => return error.UnsupportedRowsQuery,
+        .recursive_cte => |lowered| blk: {
+            var result = (try executeLoweredSqlRecursiveCtePlanAlloc(
+                alloc,
+                source,
+                catalog,
+                default_table_name,
+                default_schema,
+                lowered,
+                consistency,
+            )) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .recursive_cte = result };
+        },
         .aggregate => |lowered| blk: {
             const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
             defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
@@ -4779,6 +4793,11 @@ fn takeLoweredSqlReadRows(result: *LoweredSqlReadPlanResult) TakenLoweredSqlRead
             query.rows = &.{};
             break :blk .{ .rows = rows, .total = query.total };
         },
+        .recursive_cte => |*query| blk: {
+            const rows = query.rows;
+            query.rows = &.{};
+            break :blk .{ .rows = rows, .total = query.total };
+        },
         .aggregate => |*aggregate| blk: {
             const rows = aggregate.rows;
             aggregate.rows = &.{};
@@ -4800,6 +4819,175 @@ fn takeLoweredSqlReadRows(result: *LoweredSqlReadPlanResult) TakenLoweredSqlRead
             break :blk .{ .rows = rows, .total = lateral.total_rows };
         },
     };
+}
+
+fn executeLoweredSqlRecursiveCtePlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    lowered: relational_sql_api.LoweredRecursiveCtePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (lowered.output_columns.len == 0) return error.UnsupportedRowsQuery;
+    const join_member = switch (lowered.recursive_member) {
+        .join => |join| join,
+    };
+    const left_is_cte = std.mem.eql(u8, join_member.left_table_name, lowered.cte_name);
+    const right_is_cte = std.mem.eql(u8, join_member.right_table_name, lowered.cte_name);
+    if (left_is_cte == right_is_cte or join_member.join_type != .inner) return error.UnsupportedRowsQuery;
+    const base_table_name = if (left_is_cte) join_member.right_table_name else join_member.left_table_name;
+
+    const owned_anchor_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.anchor.table_name);
+    defer if (owned_anchor_schema) |schema| storage_schema.freeSchema(alloc, schema);
+    const owned_base_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, base_table_name);
+    defer if (owned_base_schema) |schema| storage_schema.freeSchema(alloc, schema);
+    const anchor_schema = owned_anchor_schema orelse default_schema;
+    const base_schema = owned_base_schema orelse default_schema;
+
+    const anchor_target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.anchor.table_name);
+    var anchor = (try source.rowsQueryPlanCatalog(alloc, anchor_target, anchor_schema, lowered.anchor.plan, consistency)) orelse return null;
+    defer anchor.deinit(alloc);
+
+    const base_target = try catalogTargetForLoweredSqlTable(default_table_name, base_table_name);
+    var base = (try source.rowsQueryPlanCatalog(alloc, base_target, base_schema, .{ .query = .{ .select_all = true } }, consistency)) orelse return null;
+    defer base.deinit(alloc);
+
+    var materialized = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer deinitRecursiveCteRows(alloc, &materialized);
+    var frontier = std.ArrayListUnmanaged([]const u8).empty;
+    defer frontier.deinit(alloc);
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    const distinct = lowered.operation == .union_distinct;
+
+    for (anchor.rows) |row| {
+        const owned = try alloc.dupe(u8, row);
+        errdefer alloc.free(owned);
+        if (distinct) {
+            if (seen.contains(owned)) continue;
+            try seen.put(owned, {});
+        }
+        try materialized.append(alloc, owned);
+        try frontier.append(alloc, owned);
+    }
+    try admitRecursiveCteRows(lowered, materialized.items);
+
+    while (frontier.items.len != 0) {
+        var next_frontier = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer next_frontier.deinit(alloc);
+        for (base.rows) |base_row| {
+            for (frontier.items) |cte_row| {
+                if (!try recursiveCteJoinRowsMatchAlloc(alloc, base_row, cte_row, join_member, !left_is_cte)) continue;
+                const projected = try recursiveCteProjectedRowJsonAlloc(alloc, base_row, cte_row, join_member.projections);
+                errdefer alloc.free(projected);
+                if (distinct) {
+                    if (seen.contains(projected)) {
+                        alloc.free(projected);
+                        continue;
+                    }
+                    try seen.put(projected, {});
+                }
+                try materialized.append(alloc, projected);
+                try next_frontier.append(alloc, projected);
+                try admitRecursiveCteRows(lowered, materialized.items);
+            }
+        }
+        frontier.deinit(alloc);
+        frontier = next_frontier;
+    }
+
+    var cte_schema = default_schema;
+    cte_schema.relational_columns = lowered.output_columns;
+    cte_schema.primary_key = null;
+    var final_query = lowered.final_query;
+    final_query.source_cte = "";
+    var final = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, final_query, materialized.items);
+    errdefer final.deinit(alloc);
+    deinitRecursiveCteRows(alloc, &materialized);
+    return final;
+}
+
+fn deinitRecursiveCteRows(alloc: std.mem.Allocator, rows: *std.ArrayListUnmanaged([]const u8)) void {
+    for (rows.items) |row| alloc.free(@constCast(row));
+    rows.deinit(alloc);
+}
+
+fn admitRecursiveCteRows(
+    lowered: relational_sql_api.LoweredRecursiveCtePlan,
+    rows: []const []const u8,
+) !void {
+    const materialized_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(rows) orelse return error.UnsupportedRowsQuery;
+    const cte: db_mod.types.RelationalRowsCte = .{
+        .name = lowered.cte_name,
+        .query = lowered.anchor.plan.query,
+        .max_rows = lowered.max_rows,
+        .max_bytes = lowered.max_bytes,
+        .spill_after_bytes = lowered.spill_after_bytes,
+    };
+    switch (db_mod.types.relationalRowsCteMaterializationDecision(cte, rows.len, materialized_bytes)) {
+        .memory => {},
+        .spill, .reject => return error.UnsupportedRowsQuery,
+    }
+}
+
+fn recursiveCteJoinRowsMatchAlloc(
+    alloc: std.mem.Allocator,
+    base_row_json: []const u8,
+    cte_row_json: []const u8,
+    join: relational_sql_api.LoweredRecursiveCteJoinMemberPlan,
+    base_on_left: bool,
+) !bool {
+    var parsed_base = std.json.parseFromSlice(std.json.Value, alloc, base_row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed_base.deinit();
+    var parsed_cte = std.json.parseFromSlice(std.json.Value, alloc, cte_row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed_cte.deinit();
+
+    for (join.on) |on| {
+        const base_field = if (base_on_left) on.left_field else on.right_field;
+        const cte_field = if (base_on_left) on.right_field else on.left_field;
+        const base_value = try rowObjectFieldJsonAlloc(alloc, parsed_base.value, base_field);
+        defer alloc.free(base_value);
+        const cte_value = try rowObjectFieldJsonAlloc(alloc, parsed_cte.value, cte_field);
+        defer alloc.free(cte_value);
+        if (!std.mem.eql(u8, base_value, cte_value)) return false;
+    }
+    return true;
+}
+
+fn rowObjectFieldJsonAlloc(alloc: std.mem.Allocator, row: std.json.Value, field: []const u8) ![]u8 {
+    if (row != .object) return error.InvalidRowsRequest;
+    const value = row.object.get(field) orelse return try alloc.dupe(u8, "null");
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+fn recursiveCteProjectedRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    base_row_json: []const u8,
+    cte_row_json: []const u8,
+    projections: []const db_mod.types.RelationalRowsExpressionProjection,
+) ![]u8 {
+    var parsed_base = std.json.parseFromSlice(std.json.Value, alloc, base_row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed_base.deinit();
+    var parsed_cte = std.json.parseFromSlice(std.json.Value, alloc, cte_row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed_cte.deinit();
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    for (projections, 0..) |projection, i| {
+        if (i != 0) try out.append(alloc, ',');
+        const output_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(projection.output, .{})});
+        defer alloc.free(output_json);
+        try out.appendSlice(alloc, output_json);
+        try out.append(alloc, ':');
+        const value_json = try relational_rows_api.expressionValueJsonWithTargetSourceAlloc(alloc, parsed_base.value, parsed_cte.value, projection.expression);
+        defer alloc.free(value_json);
+        try out.appendSlice(alloc, value_json);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 fn executeLoweredSqlSetOperationPlanAlloc(
@@ -7997,6 +8185,94 @@ fn graphHydrateResolvedDocSetIncludes(set: *const doc_set.ResolvedDocSet, key: [
     };
 }
 
+const GraphMetricFanInShardRequest = struct {
+    req: db_mod.types.SearchRequest,
+    graph_queries: []db_mod.types.NamedGraphQuery = &.{},
+
+    fn deinit(self: *GraphMetricFanInShardRequest, alloc: std.mem.Allocator) void {
+        if (self.graph_queries.len > 0) alloc.free(self.graph_queries);
+        self.* = undefined;
+    }
+};
+
+fn graphSearchQueryNeedsInternalMetricStatus(query: graph_query_mod.GraphQuery) bool {
+    return query.metrics.len > 0 or query.order_by.len > 0 or query.where_metric.len > 0;
+}
+
+fn searchRequestNeedsInternalGraphMetricStatus(req: db_mod.types.SearchRequest) bool {
+    for (req.graph_queries) |query| {
+        if (!query.query.include_metric_status and graphSearchQueryNeedsInternalMetricStatus(query.query)) return true;
+    }
+    return false;
+}
+
+fn prepareGraphMetricFanInShardRequest(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+) !GraphMetricFanInShardRequest {
+    if (!searchRequestNeedsInternalGraphMetricStatus(req)) {
+        return .{ .req = req };
+    }
+
+    const graph_queries = try alloc.alloc(db_mod.types.NamedGraphQuery, req.graph_queries.len);
+    @memcpy(graph_queries, req.graph_queries);
+    for (graph_queries) |*query| {
+        if (graphSearchQueryNeedsInternalMetricStatus(query.query)) {
+            query.query.include_metric_status = true;
+        }
+    }
+
+    var out = req;
+    out.graph_queries = graph_queries;
+    return .{
+        .req = out,
+        .graph_queries = graph_queries,
+    };
+}
+
+test "graph metric fan-in shard request carries internal status without mutating public request" {
+    const alloc = std.testing.allocator;
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{
+        .{
+            .name = "ranked",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .order_by = &.{.{
+                    .name = "pagerank",
+                    .direction = .desc,
+                    .freshness = .published,
+                }},
+                .include_metric_status = false,
+            },
+        },
+        .{
+            .name = "plain",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .include_metric_status = false,
+            },
+        },
+    };
+    const req = db_mod.types.SearchRequest{
+        .query = .{ .match_all = {} },
+        .graph_queries = &graph_queries,
+    };
+
+    var shard_req = try prepareGraphMetricFanInShardRequest(alloc, req);
+    defer shard_req.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), shard_req.req.graph_queries.len);
+    try std.testing.expect(shard_req.req.graph_queries.ptr != req.graph_queries.ptr);
+    try std.testing.expect(shard_req.req.graph_queries[0].query.include_metric_status);
+    try std.testing.expect(!shard_req.req.graph_queries[1].query.include_metric_status);
+    try std.testing.expect(!req.graph_queries[0].query.include_metric_status);
+    try std.testing.expect(!req.graph_queries[1].query.include_metric_status);
+}
+
 fn queryProvisionedAcrossGroups(
     self: *ProvisionedTableReadSource,
     alloc: std.mem.Allocator,
@@ -8017,11 +8293,13 @@ fn queryProvisionedAcrossGroups(
         copy.distributed_text_stats = distributed_text_stats;
         break :blk copy;
     };
+    var fan_in_shard_req = try prepareGraphMetricFanInShardRequest(alloc, shard_req);
+    defer fan_in_shard_req.deinit(alloc);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
     if (plan.parallel) {
-        return try queryProvisionedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &shard_req, req, table_name, consistency);
+        return try queryProvisionedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &fan_in_shard_req.req, req, table_name, consistency);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.query);
 
@@ -8033,7 +8311,7 @@ fn queryProvisionedAcrossGroups(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, shard_req, consistency);
+        shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, fan_in_shard_req.req, consistency);
         initialized += 1;
     }
     return try query_api.mergeSearchResults(alloc, req, shard_results[0..initialized], req.offset, req.limit);
@@ -8060,11 +8338,13 @@ fn queryHostedAcrossGroups(
         copy.distributed_text_stats = distributed_text_stats;
         break :blk copy;
     };
+    var fan_in_shard_req = try prepareGraphMetricFanInShardRequest(alloc, shard_req);
+    defer fan_in_shard_req.deinit(alloc);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
     if (plan.parallel) {
-        return try queryHostedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &shard_req, req, table_name, consistency);
+        return try queryHostedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &fan_in_shard_req.req, req, table_name, consistency);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.query);
 
@@ -8079,8 +8359,8 @@ fn queryHostedAcrossGroups(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, null, null, null, table_name, shard_req, consistency),
-            .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, shard_req),
+            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, null, null, null, table_name, fan_in_shard_req.req, consistency),
+            .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, fan_in_shard_req.req),
         };
         initialized += 1;
     }
@@ -20157,6 +20437,159 @@ test "lowered sql cross-table read plans execute through routed scans" {
             try std.testing.expectEqual(@as(usize, 2), join_result.rows.len);
             try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", join_result.rows[0]);
             try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Grace\"}", join_result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowered sql recursive cte plans execute bounded materialization" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"depth":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const FakeCatalog = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeSource = struct {
+        calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan_catalog = rowsQueryPlanCatalog,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            return null;
+        }
+
+        fn rowsQueryPlanCatalog(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
+            try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqualStrings("nodes", target.table_name);
+            self.calls += 1;
+            const rows = [_][]const u8{
+                "{\"id\":\"a\",\"parent_id\":\"root\",\"depth\":1}",
+                "{\"id\":\"b\",\"parent_id\":\"root\",\"depth\":1}",
+                "{\"id\":\"c\",\"parent_id\":\"a\",\"depth\":0}",
+                "{\"id\":\"d\",\"parent_id\":\"c\",\"depth\":0}",
+                "{\"id\":\"outside\",\"parent_id\":\"other\",\"depth\":0}",
+            };
+            return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(plan_alloc, runtime_schema, plan, rows[0..]);
+        }
+    };
+
+    var lowered = try relational_sql_api.lowerReadPlanAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk WHERE depth > 1 ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+    switch (lowered) {
+        .recursive_cte => |recursive| {
+            try std.testing.expectEqualStrings("walk", recursive.final_query.source_cte);
+            try std.testing.expectEqual(@as(usize, 1), recursive.final_query.select.len);
+            try std.testing.expectEqualStrings("id", recursive.final_query.select[0]);
+            try std.testing.expectEqual(@as(usize, 1), recursive.final_query.predicates.len);
+            try std.testing.expectEqualStrings("depth", recursive.final_query.predicates[0].field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var catalog = FakeCatalog{};
+    var fake = FakeSource{};
+    var result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake.source(),
+        catalog.iface(),
+        "nodes",
+        schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    switch (result) {
+        .recursive_cte => |query_result| {
+            try std.testing.expectEqual(@as(u32, 2), query_result.total);
+            try std.testing.expectEqual(@as(usize, 2), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"c\"}", query_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"d\"}", query_result.rows[1]);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -4416,6 +4416,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_prepare_statement_delete_family: bool = false,
     ddl_prepare_statement_merge_family: bool = false,
     ddl_prepare_cte_write_statement: bool = false,
+    ddl_prepare_recursive_cte_read_statement: bool = false,
     ddl_prepared_transaction_commit: bool = false,
     ddl_prepared_transaction_prepare: bool = false,
     ddl_prepared_transaction_recovery_contract: bool = false,
@@ -6200,6 +6201,11 @@ pub const AppParityCorpusCoverage = struct {
                         std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                             std.mem.indexOf(u8, entry.sql, " AS WITH ") != null and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
+                    self.ddl_prepare_recursive_cte_read_statement = self.ddl_prepare_recursive_cte_read_statement or
+                        std.mem.startsWith(u8, entry.sql, "PREPARE ") and
+                            std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "read") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "read");
                 },
                 .prepare_transaction => {
                     self.ddl_prepared_transaction_prepare = true;

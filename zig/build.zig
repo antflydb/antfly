@@ -2766,6 +2766,7 @@ pub fn build(b: *std.Build) void {
         "query merge rejects ambiguous graph search fan-in metric status",
         "query merge preserves failed graph search metric status across shards",
         "query merge enforces graph search order and filter metric generations across shards",
+        "lowered sql recursive cte plans execute bounded materialization",
         "query profile reports merged graph search metric generation",
         "query merge requires comparable graph metric rerank generations across shards",
         "query merge rejects malformed graph metric rerank score details",

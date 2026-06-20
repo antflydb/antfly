@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "74588481ad56a998cdbaf9da1cfe161f300ab658ae5cdedfcfc041a5fb5f173a",
-  "source_entry_count": 997,
-  "entry_count": 997,
+  "source_sha256": "a510bf0b6548f3e25d085cc495dce3e39ccf9b0c949eded98eb181bae71a1a1f",
+  "source_entry_count": 998,
+  "entry_count": 998,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -94,6 +94,17 @@
       },
       "plan": "ddl:prepare_statement:name=cte_merge_plan:params=0:subject=write:statement=merge",
       "sql": "PREPARE cte_merge_plan AS WITH source_rows AS (SELECT id, status FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
+    },
+    {
+      "name": "prepare recursive cte read statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "recursive_usage_read_plan",
+        "operations": 0
+      },
+      "plan": "ddl:prepare_statement:name=recursive_usage_read_plan:params=0:subject=read:statement=read",
+      "sql": "PREPARE recursive_usage_read_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows"
     },
     {
       "name": "unsupported recursive cte prepared statement protocol plan",

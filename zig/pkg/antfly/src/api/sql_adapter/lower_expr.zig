@@ -7508,6 +7508,64 @@ pub fn parseGreatestLeastFunctionCallStart(tokens: []const Token, pos: *usize) !
     return kind;
 }
 
+pub fn parseCaseFoldFunctionCallStart(tokens: []const Token, pos: *usize) !db_mod.types.RelationalRowsExpressionKind {
+    const kind = matchCaseFoldFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    return kind;
+}
+
+pub fn matchCaseFoldFunctionKind(tokens: []const Token, pos: *usize) ?db_mod.types.RelationalRowsExpressionKind {
+    if (pos.* >= tokens.len) return null;
+    const token = tokens[pos.*];
+    if (token.kind != .identifier) return null;
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (std.ascii.eqlIgnoreCase(token.text, "lower"))
+        .lower
+    else if (std.ascii.eqlIgnoreCase(token.text, "upper"))
+        .upper
+    else if (sqlKeywordIsInitcapFunction(token.text))
+        .initcap
+    else if (std.ascii.eqlIgnoreCase(token.text, "trim"))
+        .trim
+    else if (sqlKeywordIsTrimVariantFunction(token.text))
+        if (std.ascii.eqlIgnoreCase(token.text, "ltrim")) .ltrim else .rtrim
+    else
+        return null;
+    pos.* += 1;
+    return kind;
+}
+
+pub fn parseConcatFunctionCallStart(tokens: []const Token, pos: *usize) !db_mod.types.RelationalRowsExpressionKind {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (cursor.matchKeyword("concat_ws"))
+        .concat_ws
+    else if (cursor.matchKeyword("concat"))
+        .concat
+    else
+        return error.UnsupportedSqlShape;
+    try cursor.expectToken(.lparen);
+    return kind;
+}
+
+pub fn parseCoalesceFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "coalesce");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseNullifFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "nullif");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseReplaceFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "replace");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseRegexpReplaceFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "regexp_replace");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
 pub fn parseJsonArrayLengthFunctionCallStart(tokens: []const Token, pos: *usize) !void {
     _ = matchFunctionKeywordText(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) orelse return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .lparen);
@@ -9686,6 +9744,14 @@ test "sql adapter expression keyword predicates classify function and tail token
     try std.testing.expectEqual(@as(usize, 2), greatest_pos);
     try std.testing.expect(peekGreatestLeastFunctionCall(greatest_tokens[0..], 0));
 
+    const case_fold_start_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "ltrim" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var case_fold_start_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ltrim, try parseCaseFoldFunctionCallStart(case_fold_start_tokens[0..], &case_fold_start_pos));
+    try std.testing.expectEqual(@as(usize, 2), case_fold_start_pos);
+
     const case_fold_tokens = [_]Token{
         .{ .kind = .identifier, .text = "upper" },
         .{ .kind = .lparen, .text = "(" },
@@ -9722,13 +9788,43 @@ test "sql adapter expression keyword predicates classify function and tail token
         .{ .kind = .identifier, .text = "concat_ws" },
         .{ .kind = .lparen, .text = "(" },
     };
+    var concat_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat_ws, try parseConcatFunctionCallStart(concat_tokens[0..], &concat_pos));
+    try std.testing.expectEqual(@as(usize, 2), concat_pos);
     try std.testing.expect(peekConcatFunctionCall(concat_tokens[0..], 0));
 
     const coalesce_tokens = [_]Token{
         .{ .kind = .identifier, .text = "coalesce" },
         .{ .kind = .lparen, .text = "(" },
     };
+    var coalesce_pos: usize = 0;
+    try parseCoalesceFunctionCallStart(coalesce_tokens[0..], &coalesce_pos);
+    try std.testing.expectEqual(@as(usize, 2), coalesce_pos);
     try std.testing.expect(peekCoalesceFunctionCall(coalesce_tokens[0..], 0));
+
+    const nullif_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "nullif" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var nullif_pos: usize = 0;
+    try parseNullifFunctionCallStart(nullif_tokens[0..], &nullif_pos);
+    try std.testing.expectEqual(@as(usize, 2), nullif_pos);
+
+    const replace_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "replace" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var replace_pos: usize = 0;
+    try parseReplaceFunctionCallStart(replace_tokens[0..], &replace_pos);
+    try std.testing.expectEqual(@as(usize, 2), replace_pos);
+
+    const regexp_replace_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "regexp_replace" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var regexp_replace_pos: usize = 0;
+    try parseRegexpReplaceFunctionCallStart(regexp_replace_tokens[0..], &regexp_replace_pos);
+    try std.testing.expectEqual(@as(usize, 2), regexp_replace_pos);
 
     const array_transform_tokens = [_]Token{
         .{ .kind = .identifier, .text = "array_remove" },

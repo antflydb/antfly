@@ -4501,6 +4501,22 @@ const Parser = struct {
         if (!self.peekKeyword("select")) return error.UnsupportedSqlShape;
         if (!finalRecursiveCteSelectReferencesName(self.tokens[self.pos..], cte_name)) return error.UnsupportedSqlShape;
 
+        const final_ctes = [_]db_mod.types.RelationalRowsCte{.{
+            .name = cte_name,
+            .query = anchor.query,
+        }};
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = final_ctes[0..];
+        defer self.available_ctes = previous_available_ctes;
+        var final = try self.parseSelectWithSetBoundary(true);
+        errdefer final.deinit(self.alloc);
+        var final_base_table_name: ?[]const u8 = null;
+        defer if (final_base_table_name) |name| self.alloc.free(name);
+        try sql_adapter.resolveSelectSourceForPlanAlloc(self.alloc, &final, final_ctes[0..], &final_base_table_name);
+        if (!std.mem.eql(u8, final.query.source_cte, cte_name)) return error.UnsupportedSqlShape;
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+
         const anchor_table_name = anchor.table_name;
         anchor.table_name = "";
         anchor.clearSelectOutputs(self.alloc);
@@ -4511,6 +4527,13 @@ const Parser = struct {
         anchor.query = .{};
         errdefer anchor_plan.deinit(self.alloc);
 
+        var final_query = final.query;
+        final.query = .{};
+        final.clearSelectOutputs(self.alloc);
+        self.alloc.free(final.table_name);
+        final.table_name = "";
+        errdefer final_query.deinit(self.alloc);
+
         cte_name_transferred = true;
         output_columns_transferred = true;
         return .{
@@ -4518,6 +4541,7 @@ const Parser = struct {
             .operation = operation,
             .anchor = anchor_plan,
             .recursive_member = recursive_member,
+            .final_query = final_query,
             .output_columns = output_columns,
             .recursive_member_references_cte = recursive_member_references_cte,
             .max_rows = db_mod.types.default_relational_rows_cte_max_rows,
@@ -13370,8 +13394,8 @@ const Parser = struct {
             value_transferred = true;
             return;
         }
-        if (sql_adapter.peekArrayTransformSelfAssignment(self.tokens, self.pos, field) and (self.matchKeyword("array_append") or self.matchKeyword("array_remove"))) {
-            const op: db_mod.types.TransformOpType = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "array_append")) .push else .pull;
+        if (sql_adapter.peekArrayTransformSelfAssignment(self.tokens, self.pos, field)) {
+            const op = sql_adapter.matchArrayTransformUpdateOp(self.tokens, &self.pos) orelse unreachable;
             if (column.field_type != .array) return error.InvalidSqlCatalog;
             try self.expect(.lparen);
             const array_field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
@@ -13592,8 +13616,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         insert_values: []const []const u8,
     ) ![]const u8 {
-        try self.expectKeyword("coalesce");
-        try self.expect(.lparen);
+        try sql_adapter.parseCoalesceFunctionCallStart(self.tokens, &self.pos);
 
         var selected: ?[]const u8 = null;
         errdefer if (selected) |value| self.alloc.free(value);
@@ -14398,19 +14421,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("lower"))
-            .lower
-        else if (self.matchKeyword("upper"))
-            .upper
-        else if (sql_adapter.matchFunctionKeyword(self.tokens, &self.pos, sqlKeywordIsInitcapFunction))
-            .initcap
-        else if (self.matchKeyword("trim"))
-            .trim
-        else if (sql_adapter.matchTrimVariantFunctionKind(self.tokens, &self.pos)) |trim_kind|
-            trim_kind
-        else
-            return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseCaseFoldFunctionCallStart(self.tokens, &self.pos);
         if (try self.parsePeriodBoundRowExpressionAlloc(kind)) |expression| return expression;
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
@@ -14447,13 +14458,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("concat_ws"))
-            .concat_ws
-        else if (self.matchKeyword("concat"))
-            .concat
-        else
-            return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseConcatFunctionCallStart(self.tokens, &self.pos);
 
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
@@ -14482,8 +14487,7 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("nullif");
-        try self.expect(.lparen);
+        try sql_adapter.parseNullifFunctionCallStart(self.tokens, &self.pos);
         const lhs = try self.parseConflictExpressionAlloc(column, insert_columns);
         var lhs_transferred = false;
         errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
@@ -14506,8 +14510,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
-        const kind = sql_adapter.matchTextLengthFunctionKind(self.tokens, &self.pos) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseTextLengthFunctionCallStart(self.tokens, &self.pos);
         const operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
         var operand_transferred = false;
         errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
@@ -14526,8 +14529,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
-        try self.expectKeyword("ascii");
-        try self.expect(.lparen);
+        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .ascii);
         const operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
         var operand_transferred = false;
         errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
@@ -14546,8 +14548,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try self.expectKeyword("chr");
-        try self.expect(.lparen);
+        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .chr);
         const operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
         var operand_transferred = false;
         errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
@@ -14566,8 +14567,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try self.expectKeyword("replace");
-        try self.expect(.lparen);
+        try sql_adapter.parseReplaceFunctionCallStart(self.tokens, &self.pos);
         const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
         var source_transferred = false;
         errdefer if (!source_transferred) freeExpression(self.alloc, source);
@@ -14597,8 +14597,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try self.expectKeyword("regexp_replace");
-        try self.expect(.lparen);
+        try sql_adapter.parseRegexpReplaceFunctionCallStart(self.tokens, &self.pos);
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
             for (operands.items) |operand| freeExpression(self.alloc, operand);
@@ -15660,8 +15659,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("coalesce");
-        try self.expect(.lparen);
+        try sql_adapter.parseCoalesceFunctionCallStart(self.tokens, &self.pos);
 
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
@@ -15869,8 +15867,7 @@ const Parser = struct {
             value_transferred = true;
             return;
         }
-        if (self.matchKeyword("array_append") or self.matchKeyword("array_remove")) {
-            const op: db_mod.types.TransformOpType = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "array_append")) .push else .pull;
+        if (sql_adapter.matchArrayTransformUpdateOp(self.tokens, &self.pos)) |op| {
             if (column.field_type != .array) return error.InvalidSqlCatalog;
             try self.expect(.lparen);
             const array_field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
@@ -19640,8 +19637,7 @@ const Parser = struct {
     }
 
     fn parseReplaceRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("replace");
-        try self.expect(.lparen);
+        try sql_adapter.parseReplaceFunctionCallStart(self.tokens, &self.pos);
         const source = try self.parseRowExpressionAlloc();
         var source_transferred = false;
         errdefer if (!source_transferred) freeExpression(self.alloc, source);
@@ -19673,8 +19669,7 @@ const Parser = struct {
     }
 
     fn parseRegexpReplaceRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("regexp_replace");
-        try self.expect(.lparen);
+        try sql_adapter.parseRegexpReplaceFunctionCallStart(self.tokens, &self.pos);
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
             for (operands.items) |operand| freeExpression(self.alloc, operand);
@@ -20348,13 +20343,7 @@ const Parser = struct {
     }
 
     fn parseConcatExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("concat_ws"))
-            .concat_ws
-        else if (self.matchKeyword("concat"))
-            .concat
-        else
-            return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseConcatFunctionCallStart(self.tokens, &self.pos);
 
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
@@ -21099,19 +21088,7 @@ const Parser = struct {
     }
 
     fn parseCaseFoldRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("lower"))
-            .lower
-        else if (self.matchKeyword("upper"))
-            .upper
-        else if (sql_adapter.matchFunctionKeyword(self.tokens, &self.pos, sqlKeywordIsInitcapFunction))
-            .initcap
-        else if (self.matchKeyword("trim"))
-            .trim
-        else if (sql_adapter.matchTrimVariantFunctionKind(self.tokens, &self.pos)) |trim_kind|
-            trim_kind
-        else
-            return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseCaseFoldFunctionCallStart(self.tokens, &self.pos);
         if (try self.parsePeriodBoundRowExpressionAlloc(kind)) |expression| return expression;
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
@@ -21177,8 +21154,7 @@ const Parser = struct {
     }
 
     fn parseCoalesceRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("coalesce");
-        try self.expect(.lparen);
+        try sql_adapter.parseCoalesceFunctionCallStart(self.tokens, &self.pos);
 
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
@@ -21203,8 +21179,7 @@ const Parser = struct {
     }
 
     fn parseNullifRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("nullif");
-        try self.expect(.lparen);
+        try sql_adapter.parseNullifFunctionCallStart(self.tokens, &self.pos);
         const lhs = try self.parseRowExpressionOperandAlloc();
         var lhs_transferred = false;
         errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
@@ -21749,8 +21724,7 @@ const Parser = struct {
     }
 
     fn parseCoalesceProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsCoalesceProjection {
-        try self.expectKeyword("coalesce");
-        try self.expect(.lparen);
+        try sql_adapter.parseCoalesceFunctionCallStart(self.tokens, &self.pos);
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCoalesceOperand).empty;
         errdefer {
             for (operands.items) |operand| {
@@ -28322,6 +28296,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(prepare_statement_fingerprint);
     try std.testing.expectEqualStrings("ddl:prepare_statement:name=usage_plan:params=1:subject=read:statement=read", prepare_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_statement));
+
+    var prepare_recursive_read_statement = try lowerDdlPlanAlloc(alloc, "PREPARE recursive_usage_read_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows;");
+    defer prepare_recursive_read_statement.deinit(alloc);
+    const prepare_recursive_read_statement_fingerprint = try ddlFingerprintAlloc(alloc, prepare_recursive_read_statement);
+    defer alloc.free(prepare_recursive_read_statement_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepare_statement:name=recursive_usage_read_plan:params=0:subject=read:statement=read", prepare_recursive_read_statement_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_recursive_read_statement));
 
     var prepare_merge_statement = try lowerDdlPlanAlloc(alloc, "PREPARE merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
     defer prepare_merge_statement.deinit(alloc);

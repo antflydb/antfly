@@ -259,6 +259,7 @@
     "ddl_partition_create_parent",
     "ddl_partition_detach",
     "ddl_prepare_cte_write_statement",
+    "ddl_prepare_recursive_cte_read_statement",
     "ddl_prepare_statement",
     "ddl_prepare_statement_ddl_family",
     "ddl_prepare_statement_delete_family",
