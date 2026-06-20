@@ -221,6 +221,7 @@ pub const DB = struct {
     }
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
+        try support.portable_backup.validatePortable(alloc, backup);
         try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
     }
 

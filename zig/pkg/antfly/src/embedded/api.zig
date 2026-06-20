@@ -18,6 +18,7 @@ const support = @import("embedded_support");
 const batch_api = support.batch;
 const query_api = support.query;
 const query_contract = support.query_contract;
+const backup_codec = support.backup_codec;
 
 const Allocator = std.mem.Allocator;
 
@@ -869,6 +870,8 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     defer alloc.free(src_path);
     const dst_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-dst.aflite", .{tmp.sub_path});
     defer alloc.free(dst_path);
+    const malformed_dst_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-malformed-dst.aflite", .{tmp.sub_path});
+    defer alloc.free(malformed_dst_path);
     const roundtrip_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-roundtrip.aflite", .{tmp.sub_path});
     defer alloc.free(roundtrip_path);
     const snapshot_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-snapshot.aflite", .{tmp.sub_path});
@@ -1014,6 +1017,41 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         const lookup_json = try snapshot.lookupJson(alloc, "doc:a", "{}");
         defer alloc.free(lookup_json);
         try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"second\"") != null);
+    }
+
+    {
+        var malformed_target = try Api.openLite(alloc, malformed_dst_path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer malformed_target.close();
+
+        const target_batch = try malformed_target.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:malformed-target\":{\"title\":\"target survives malformed embedded import\"}}}",
+        );
+        defer alloc.free(target_batch);
+
+        var malformed = std.ArrayList(u8).empty;
+        defer malformed.deinit(alloc);
+        try backup_codec.writeHeader(&malformed, alloc, .{
+            .format_version = backup_codec.format_version,
+            .flags = 0,
+            .created_at_ns = 0,
+            .backup_id = [_]u8{0} ** 16,
+            .table_count = 1,
+            .shard_count = 1,
+        });
+        const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
+        try backup_codec.writeBlock(&malformed, alloc, .document_batch, &malformed_doc_payload);
+
+        try std.testing.expectError(error.Truncated, malformed_target.importPortable(alloc, malformed.items));
+
+        const target_lookup = try malformed_target.lookupJson(alloc, "doc:malformed-target", "{}");
+        defer alloc.free(target_lookup);
+        try std.testing.expect(std.mem.indexOf(u8, target_lookup, "\"target survives malformed embedded import\"") != null);
     }
 
     {
