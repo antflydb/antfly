@@ -954,7 +954,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         const vector_batch = try api.batchJson(
             alloc,
-            "{\"inserts\":{\"doc:vec:a\":{\"title\":\"vector alpha\",\"_embeddings\":{\"dv_v1\":[1,0,0],\"sv_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:vec:c\",\"weight\":1.0}]}}},\"doc:vec:b\":{\"title\":\"vector beta\",\"_embeddings\":{\"dv_v1\":[0,1,0],\"sv_v1\":{\"indices\":[99],\"values\":[2.0]}}},\"doc:vec:c\":{\"title\":\"graph target\"}},\"sync_level\":\"full_index\"}",
+            "{\"inserts\":{\"doc:vec:a\":{\"title\":\"vector alpha\",\"body\":\"native lite hybrid alpha\",\"_embeddings\":{\"dv_v1\":[1,0,0],\"sv_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:vec:c\",\"weight\":1.0}]}}},\"doc:vec:b\":{\"title\":\"vector beta\",\"body\":\"native lite hybrid beta\",\"_embeddings\":{\"dv_v1\":[0,1,0],\"sv_v1\":{\"indices\":[99],\"values\":[2.0]}}},\"doc:vec:c\":{\"title\":\"graph target\"}},\"sync_level\":\"full_index\"}",
         );
         defer alloc.free(vector_batch);
         try std.testing.expect(std.mem.indexOf(u8, vector_batch, "\"inserted\":3") != null);
@@ -979,6 +979,13 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         );
         defer alloc.free(graph_before);
         try std.testing.expect(std.mem.indexOf(u8, graph_before, "\"doc:vec:c\"") != null);
+
+        const hybrid_before = try api.searchJson(
+            alloc,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"ft_body\",\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+        );
+        defer alloc.free(hybrid_before);
+        try std.testing.expect(std.mem.indexOf(u8, hybrid_before, "\"doc:vec:a\"") != null);
 
         const check_before = try api.checkLiteJson(alloc);
         defer alloc.free(check_before);
@@ -1124,6 +1131,13 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         defer alloc.free(graph_after);
         try std.testing.expect(std.mem.indexOf(u8, graph_after, "\"doc:vec:c\"") != null);
 
+        const hybrid_after = try restored.searchJson(
+            alloc,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"ft_body\",\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+        );
+        defer alloc.free(hybrid_after);
+        try std.testing.expect(std.mem.indexOf(u8, hybrid_after, "\"doc:vec:a\"") != null);
+
         try restored.exportPortable(alloc, &roundtrip_backup);
         try std.testing.expect(roundtrip_backup.items.len > 0);
     }
@@ -1179,5 +1193,12 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         );
         defer alloc.free(graph_after);
         try std.testing.expect(std.mem.indexOf(u8, graph_after, "\"doc:vec:c\"") != null);
+
+        const hybrid_after = try roundtrip.searchJson(
+            alloc,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"ft_body\",\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+        );
+        defer alloc.free(hybrid_after);
+        try std.testing.expect(std.mem.indexOf(u8, hybrid_after, "\"doc:vec:a\"") != null);
     }
 }
