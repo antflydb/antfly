@@ -1823,6 +1823,32 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     return .ok;
 }
 
+const LiteRestoreReport = struct {
+    format: []const u8 = "aflite",
+    path: []const u8,
+};
+
+pub export fn antfly_lite_restore_backup_json(
+    dest_path: ?[*:0]const u8,
+    backup: capi.Slice,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const path = cStringSpan(dest_path) orelse return .invalid_argument;
+    if (backup.len == 0) return .invalid_argument;
+    if (backup.ptr == null and backup.len != 0) return .invalid_argument;
+
+    const alloc = std.heap.c_allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    restorePortableBackupToLiteFile(alloc, io_impl.io(), path, backup.bytes(), replace) catch |err| return capi.mapError(err);
+    const report = LiteRestoreReport{ .path = path };
+    out.* = stringifyJson(report) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
@@ -1857,6 +1883,85 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
         return .ok;
     }
     return .invalid_argument;
+}
+
+fn restorePortableBackupToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    dest_path: []const u8,
+    backup: []const u8,
+    replace: bool,
+) !void {
+    if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
+    if (backup.len == 0) return error.InvalidArgument;
+    try portable_backup.validatePortable(alloc, backup);
+
+    try preflightLiteRestoreTarget(alloc, io, dest_path, replace);
+
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{dest_path});
+    defer alloc.free(tmp_path);
+    try liteCapiDeleteFileIfExists(io, tmp_path);
+    errdefer liteCapiDeleteFilePath(io, tmp_path) catch {};
+
+    {
+        var backend = try lite_backend.Handle.create(alloc, tmp_path, true);
+        defer backend.deinit();
+
+        var opts = db_mod.OpenOptions{
+            .open_mode = .writer,
+            .external_derived_checkpoints = false,
+        };
+        try backend.configureDbOpenOptions(&opts);
+
+        var db = try db_mod.DB.open(alloc, tmp_path, opts);
+        defer db.close();
+        try portable_backup.importPortable(alloc, db.core.store, backup);
+    }
+
+    try preflightLiteRestoreTarget(alloc, io, dest_path, replace);
+    liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
+        liteCapiDeleteFilePath(io, tmp_path) catch {};
+        return err;
+    };
+}
+
+fn preflightLiteRestoreTarget(alloc: Allocator, io: std.Io, dest_path: []const u8, replace: bool) !void {
+    if (!liteCapiPathExists(io, dest_path)) return;
+    if (!replace) return error.PathAlreadyExists;
+    var probe = try lite_backend.Handle.open(alloc, dest_path, .{});
+    probe.deinit();
+}
+
+fn liteCapiPathExists(io: std.Io, path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    }
+    return true;
+}
+
+fn liteCapiDeleteFileIfExists(io: std.Io, path: []const u8) !void {
+    liteCapiDeleteFilePath(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn liteCapiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(old_path) or std.fs.path.isAbsolute(new_path)) {
+        try std.Io.Dir.renameAbsolute(old_path, new_path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io);
+    }
+}
+
+fn liteCapiDeleteFilePath(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
+    }
 }
 
 pub export fn antfly_db_set_readable_lease_hook(
@@ -6015,6 +6120,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(bad_dst_path);
     const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
+    const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
+    defer alloc.free(restore_path);
+    const restore_malformed_path = try tempTestAflitePath(alloc, "capi-lite-restore-malformed");
+    defer alloc.free(restore_malformed_path);
     const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
     defer alloc.free(invalid_snapshot_path);
     cleanupTestDir(plain_path);
@@ -6024,6 +6133,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(dst_path);
     cleanupTestFile(bad_dst_path);
     cleanupTestFile(snapshot_path);
+    cleanupTestFile(restore_path);
+    cleanupTestFile(restore_malformed_path);
     cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestDir(plain_path);
     defer cleanupTestFile(invalid_lite_path);
@@ -6032,6 +6143,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(bad_dst_path);
     defer cleanupTestFile(snapshot_path);
+    defer cleanupTestFile(restore_path);
+    defer cleanupTestFile(restore_malformed_path);
     defer cleanupTestFile(invalid_snapshot_path);
 
     try std.testing.expectEqual(@as(u32, 1), antfly_lite_abi_version());
@@ -6382,6 +6495,46 @@ test "capi lite opens exports imports checks and vacuums aflite" {
 
     antfly_db_close(dst_handle);
     dst_handle = null;
+
+    var restore_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_restore_backup_json(restore_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &restore_report));
+    defer antfly_db_buffer_free(restore_report.ptr, restore_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, restore_report.ptr.?[0..restore_report.len], "\"format\":\"aflite\"") != null);
+
+    var restored_file_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_path, &restored_file_handle));
+    defer antfly_db_close(restored_file_handle);
+    var restored_file_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(restored_file_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &restored_file_lookup));
+    defer antfly_db_buffer_free(restored_file_lookup.ptr, restored_file_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, restored_file_lookup.ptr.?[0..restored_file_lookup.len], "\"second\"") != null);
+
+    var restore_existing: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_restore_backup_json(restore_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &restore_existing));
+    try std.testing.expect(restore_existing.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), restore_existing.len);
+
+    var malformed_restore_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_restore_backup_json(restore_malformed_path, .{
+        .ptr = malformed.items.ptr,
+        .len = malformed.items.len,
+    }, false, &malformed_restore_report));
+    try std.testing.expect(malformed_restore_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), malformed_restore_report.len);
+    {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        try std.testing.expect(!liteCapiPathExists(io_impl.io(), restore_malformed_path));
+    }
 
     var readonly_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(dst_path, &readonly_handle));

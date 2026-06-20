@@ -48,77 +48,7 @@ func RestoreBackup(path string, backup []byte, replace bool) error {
 	if !strings.HasSuffix(path, ".aflite") || len(backup) == 0 {
 		return InvalidArgument
 	}
-	if err := preflightRestoreTarget(path, replace); err != nil {
-		return err
-	}
-
-	tmpPath, err := reserveTempAflitePath(path)
-	if err != nil {
-		return err
-	}
-	cleanupTmp := true
-	defer func() {
-		if cleanupTmp {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	db, err := Open(tmpPath)
-	if err != nil {
-		return err
-	}
-	if err := db.ImportBackup(backup); err != nil {
-		_ = db.Close()
-		return err
-	}
-	if err := db.Close(); err != nil {
-		return err
-	}
-
-	if err := preflightRestoreTarget(path, replace); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	cleanupTmp = false
-	return nil
-}
-
-func preflightRestoreTarget(path string, replace bool) error {
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if !replace {
-		return fs.ErrExist
-	}
-	db, err := Open(path)
-	if err != nil {
-		return err
-	}
-	return db.Close()
-}
-
-func reserveTempAflitePath(path string) (string, error) {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	file, err := os.CreateTemp(dir, "."+base+".*.restore-tmp.aflite")
-	if err != nil {
-		return "", err
-	}
-	tmpPath := file.Name()
-	closeErr := file.Close()
-	removeErr := os.Remove(tmpPath)
-	if closeErr != nil {
-		return "", closeErr
-	}
-	if removeErr != nil {
-		return "", removeErr
-	}
-	return tmpPath, nil
+	return restoreBackupToFile(path, backup, replace)
 }
 
 func writeFileAtomically(path string, data []byte, perm fs.FileMode) error {
