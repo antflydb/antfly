@@ -377,13 +377,10 @@ const sqlKeywordIsChrFunction = sql_adapter.sqlKeywordIsChrFunction;
 const sqlKeywordIsDateBinFunction = sql_adapter.sqlKeywordIsDateBinFunction;
 const sqlKeywordIsDatePartFunction = sql_adapter.sqlKeywordIsDatePartFunction;
 const sqlKeywordIsDateTruncFunction = sql_adapter.sqlKeywordIsDateTruncFunction;
-const sqlKeywordIsEndsWithFunction = sql_adapter.sqlKeywordIsEndsWithFunction;
 const sqlKeywordIsInitcapFunction = sql_adapter.sqlKeywordIsInitcapFunction;
 const sqlKeywordIsJsonArrayLengthFunction = sql_adapter.sqlKeywordIsJsonArrayLengthFunction;
 const sqlKeywordIsJsonTypeofFunction = sql_adapter.sqlKeywordIsJsonTypeofFunction;
-const sqlKeywordIsLeftRightFunction = sql_adapter.sqlKeywordIsLeftRightFunction;
 const sqlKeywordIsLengthFunction = sql_adapter.sqlKeywordIsLengthFunction;
-const sqlKeywordIsMd5Function = sql_adapter.sqlKeywordIsMd5Function;
 const sqlKeywordIsOctetLengthFunction = sql_adapter.sqlKeywordIsOctetLengthFunction;
 const sqlKeywordIsOverlayFunction = sql_adapter.sqlKeywordIsOverlayFunction;
 const sqlKeywordIsPadFunction = sql_adapter.sqlKeywordIsPadFunction;
@@ -391,11 +388,8 @@ const sqlKeywordIsRegexpCountFunction = sql_adapter.sqlKeywordIsRegexpCountFunct
 const sqlKeywordIsRegexpInstrFunction = sql_adapter.sqlKeywordIsRegexpInstrFunction;
 const sqlKeywordIsRegexpMatchFunction = sql_adapter.sqlKeywordIsRegexpMatchFunction;
 const sqlKeywordIsRegexpSubstrFunction = sql_adapter.sqlKeywordIsRegexpSubstrFunction;
-const sqlKeywordIsRepeatFunction = sql_adapter.sqlKeywordIsRepeatFunction;
-const sqlKeywordIsReverseFunction = sql_adapter.sqlKeywordIsReverseFunction;
 const sqlKeywordIsSplitPartFunction = sql_adapter.sqlKeywordIsSplitPartFunction;
 const stableSecondaryIndexGeneration = sql_adapter.stableSecondaryIndexGeneration;
-const sqlKeywordIsStartsWithFunction = sql_adapter.sqlKeywordIsStartsWithFunction;
 const sqlKeywordIsStrposFunction = sql_adapter.sqlKeywordIsStrposFunction;
 const sqlKeywordIsSubstringFunction = sql_adapter.sqlKeywordIsSubstringFunction;
 const sqlKeywordIsTranslateFunction = sql_adapter.sqlKeywordIsTranslateFunction;
@@ -15766,22 +15760,7 @@ const Parser = struct {
     }
 
     fn parseLeftRightRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        const kind = sql_adapter.matchLeftRightFunctionKind(self.tokens, &self.pos) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        const source = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const count = try self.parseRowExpressionAlloc();
-        var count_transferred = false;
-        errdefer if (!count_transferred) freeExpression(self.alloc, count);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(count);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, source, count);
-        source_transferred = true;
-        count_transferred = true;
-        return expression;
+        return try sql_adapter.parseLeftRightRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parsePadExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15837,21 +15816,7 @@ const Parser = struct {
     }
 
     fn parseRepeatRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsRepeatFunction);
-        const source = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const count = try self.parseRowExpressionAlloc();
-        var count_transferred = false;
-        errdefer if (!count_transferred) freeExpression(self.alloc, count);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(count);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .repeat, source, count);
-        source_transferred = true;
-        count_transferred = true;
-        return expression;
+        return try sql_adapter.parseRepeatRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parseReverseExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15863,15 +15828,7 @@ const Parser = struct {
     }
 
     fn parseReverseRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsReverseFunction);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(operand);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .reverse, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .reverse, self.rowExpressionTypeContext(), .text, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseMd5ExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15883,15 +15840,7 @@ const Parser = struct {
     }
 
     fn parseMd5RowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsMd5Function);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(operand);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .md5, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .md5, self.rowExpressionTypeContext(), .text, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseStartsWithExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15903,21 +15852,7 @@ const Parser = struct {
     }
 
     fn parseStartsWithRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsStartsWithFunction);
-        const source = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const prefix = try self.parseRowExpressionAlloc();
-        var prefix_transferred = false;
-        errdefer if (!prefix_transferred) freeExpression(self.alloc, prefix);
-        try self.rowExpressionTypeContext().validateTextRowExpression(prefix);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .starts_with, source, prefix);
-        source_transferred = true;
-        prefix_transferred = true;
-        return expression;
+        return try sql_adapter.parseTextBinaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .starts_with, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parseEndsWithExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15929,21 +15864,7 @@ const Parser = struct {
     }
 
     fn parseEndsWithRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsEndsWithFunction);
-        const source = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const suffix = try self.parseRowExpressionAlloc();
-        var suffix_transferred = false;
-        errdefer if (!suffix_transferred) freeExpression(self.alloc, suffix);
-        try self.rowExpressionTypeContext().validateTextRowExpression(suffix);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .ends_with, source, suffix);
-        source_transferred = true;
-        suffix_transferred = true;
-        return expression;
+        return try sql_adapter.parseTextBinaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .ends_with, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parseDateTruncExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
