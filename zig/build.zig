@@ -6327,6 +6327,15 @@ pub fn build(b: *std.Build) void {
     lite_core_step.dependOn(&run_lite_core_main_tests.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
+    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, embedded package check, and libantflylite C ABI");
+    lite_full_step.dependOn(&install_antfly.step);
+    lite_full_step.dependOn(&install_lite_capi_lib.step);
+    lite_full_step.dependOn(&install_lite_capi_header.step);
+    lite_full_step.dependOn(&run_antfly_main_tests.step);
+    lite_full_step.dependOn(&run_lite_cli_tests.step);
+    lite_full_step.dependOn(&run_lite_native_tests.step);
+    lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
         run_antfly.addArgs(args);
