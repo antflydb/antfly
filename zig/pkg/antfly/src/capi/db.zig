@@ -1663,9 +1663,10 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
 fn openLiteHandle(
     path: []const u8,
     resolved: LiteResolvedOpenOptions,
-    out_handle: *?*anyopaque,
+    out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
-    out_handle.* = null;
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
     const alloc = std.heap.c_allocator;
     const handle = alloc.create(Handle) catch return .internal;
     errdefer alloc.destroy(handle);
@@ -1697,42 +1698,49 @@ fn openLiteHandle(
         .owned_lite_backend = backend,
         .lite_profile = resolved.profile,
     };
-    out_handle.* = handle;
+    out.* = handle;
     return .ok;
 }
 
-pub export fn antfly_lite_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+pub export fn antfly_lite_open(path: [*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
     return openLiteHandle(std.mem.span(path), .{}, out_handle);
 }
 
-pub export fn antfly_lite_open_with_options(path: [*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: *?*anyopaque) capi.ErrorCode {
-    out_handle.* = null;
+pub export fn antfly_lite_open_with_options(path: [*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
     const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
-    return openLiteHandle(std.mem.span(path), resolved, out_handle);
+    return openLiteHandle(std.mem.span(path), resolved, out);
 }
 
-pub export fn antfly_lite_open_hosted(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+pub export fn antfly_lite_open_hosted(path: [*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
     return openLiteHandle(std.mem.span(path), .{ .profile = .hosted }, out_handle);
 }
 
-pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
     return openLiteHandle(std.mem.span(path), .{ .open_mode = .query_readonly }, out_handle);
 }
 
-pub export fn antfly_lite_open_status_only(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+pub export fn antfly_lite_open_status_only(path: [*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
     return openLiteHandle(std.mem.span(path), .{ .open_mode = .status_only }, out_handle);
 }
 
-pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
-    out_buf.* = .{};
+fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
+    const out = out_buf orelse return null;
+    out.* = .{};
+    return out;
+}
+
+pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    out_buf.* = stringifyJson(lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native)) catch return .internal;
+    out.* = stringifyJson(lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native)) catch return .internal;
     return .ok;
 }
 
-pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
-    out_buf.* = .{};
+pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
 
@@ -1750,12 +1758,12 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: *capi.Bu
     };
 
     const bytes = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(status, .{})}) catch return .internal;
-    out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
 
-pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
-    out_buf.* = .{};
+pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out_buf_ptr = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
 
@@ -1763,7 +1771,7 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer)
     errdefer out.deinit(handle.alloc);
     portable_backup.exportPortable(handle.alloc, handle.db.core.store, &out) catch |err| return capi.mapError(err);
     const bytes = out.toOwnedSlice(handle.alloc) catch return .internal;
-    out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
 
@@ -1774,11 +1782,11 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     return .ok;
 }
 
-pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
-    out_buf.* = .{};
+pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend) |*backend| {
-        out_buf.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
+        out.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
     }
     return .invalid_argument;
@@ -1788,22 +1796,22 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     handle_ptr: ?*anyopaque,
     dest_path: [*:0]const u8,
     replace: bool,
-    out_buf: *capi.Buffer,
+    out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    out_buf.* = .{};
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend) |*backend| {
-        out_buf.* = stringifyJson(backend.copyStableSnapshot(std.mem.span(dest_path), replace) catch |err| return capi.mapError(err)) catch return .internal;
+        out.* = stringifyJson(backend.copyStableSnapshot(std.mem.span(dest_path), replace) catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
     }
     return .invalid_argument;
 }
 
-pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
-    out_buf.* = .{};
+pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend) |*backend| {
-        out_buf.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
+        out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
     }
     return .invalid_argument;
@@ -5977,6 +5985,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.txn_not_found, capi.mapError(error.TxnNotFound));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.UnsupportedNativeFormatVersion));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(src_path, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(src_path, null, null));
 
     var plain_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(plain_path, &plain_handle));
@@ -6015,6 +6025,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var src_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
     defer antfly_db_close(src_handle);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_backup(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, snapshot_path, false, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_vacuum_json(src_handle, null));
 
     var status: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(src_handle, &status));
