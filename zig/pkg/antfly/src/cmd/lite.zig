@@ -575,16 +575,31 @@ fn restoreFromSourceFile(
         cli.fatal("source and output database paths must be different: {s}", .{source_path});
     }
 
+    const target_exists = pathExists(io, out_path);
+    if (target_exists and !replace) cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
+    if (target_exists) {
+        var target_probe = try LiteDb.open(allocator, out_path, .writer);
+        target_probe.close();
+    }
+
     const body = try readPortableRestoreSourceAlloc(allocator, io, source_path);
     defer allocator.free(body);
 
-    const target_exists = pathExists(io, out_path);
-    if (target_exists and !replace) cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
+    const tmp_path = try restoreTempPathAlloc(allocator, out_path);
+    defer allocator.free(tmp_path);
+    try deleteFileIfExists(io, tmp_path);
+    errdefer deleteFilePath(io, tmp_path) catch {};
 
-    var lite = try LiteDb.create(allocator, out_path, !replace);
-    defer lite.close();
+    {
+        var lite = try LiteDb.create(allocator, tmp_path, true);
+        defer lite.close();
+        try portable_backup.importPortable(allocator, lite.db.core.store, body);
+    }
 
-    try portable_backup.importPortable(allocator, lite.db.core.store, body);
+    renameFilePath(io, tmp_path, out_path) catch |err| {
+        deleteFilePath(io, tmp_path) catch {};
+        return err;
+    };
 
     cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
     try writeJsonString(allocator, io, out_path);
@@ -1035,6 +1050,10 @@ fn writeFileAtomically(allocator: Allocator, io: std.Io, path: []const u8, conte
     };
 }
 
+fn restoreTempPathAlloc(allocator: Allocator, out_path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}.restore-tmp.aflite", .{out_path});
+}
+
 fn pathExists(io: std.Io, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
@@ -1042,6 +1061,13 @@ fn pathExists(io: std.Io, path: []const u8) bool {
         std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     }
     return true;
+}
+
+fn deleteFileIfExists(io: std.Io, path: []const u8) !void {
+    deleteFilePath(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn renameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
@@ -1326,6 +1352,51 @@ test "lite restore replace fails before truncating active writer target" {
     const reopened_json = try lookupJson(allocator, &reopened.db, "doc:target", "");
     defer allocator.free(reopened_json);
     try std.testing.expect(std.mem.indexOf(u8, reopened_json, "\"target survives\"") != null);
+}
+
+test "lite restore malformed backup leaves target untouched" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const backup_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/malformed.afb", .{tmp.sub_path});
+    defer allocator.free(backup_path);
+    const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-malformed-dst.aflite", .{tmp.sub_path});
+    defer allocator.free(dst_path);
+    const missing_dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-malformed-missing.aflite", .{tmp.sub_path});
+    defer allocator.free(missing_dst_path);
+    const dst_tmp_path = try restoreTempPathAlloc(allocator, dst_path);
+    defer allocator.free(dst_tmp_path);
+    const missing_tmp_path = try restoreTempPathAlloc(allocator, missing_dst_path);
+    defer allocator.free(missing_tmp_path);
+
+    try writeFileAtomically(allocator, io, backup_path, "not an afb");
+    {
+        var target = try LiteDb.create(allocator, dst_path, true);
+        defer target.close();
+        const json = try batchJson(allocator, &target.db, "{\"inserts\":{\"doc:target\":{\"title\":\"target survives malformed restore\"}}}");
+        defer allocator.free(json);
+    }
+
+    try std.testing.expectError(error.EndOfStream, restoreFromSourceFile(allocator, io, backup_path, dst_path, true));
+    try std.testing.expect(!pathExists(io, dst_tmp_path));
+
+    {
+        var reopened = try LiteDb.open(allocator, dst_path, .query_readonly);
+        defer reopened.close();
+        const json = try lookupJson(allocator, &reopened.db, "doc:target", "");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"target survives malformed restore\"") != null);
+    }
+
+    try std.testing.expectError(error.EndOfStream, restoreFromSourceFile(allocator, io, backup_path, missing_dst_path, false));
+    try std.testing.expect(!pathExists(io, missing_dst_path));
+    try std.testing.expect(!pathExists(io, missing_tmp_path));
 }
 
 test "lite status json includes pending work" {
