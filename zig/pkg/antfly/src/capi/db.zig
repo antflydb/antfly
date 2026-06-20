@@ -1602,6 +1602,7 @@ fn openLiteHandle(
     profile: lite_backend.Profile,
     out_handle: *?*anyopaque,
 ) capi.ErrorCode {
+    out_handle.* = null;
     const alloc = std.heap.c_allocator;
     const handle = alloc.create(Handle) catch return .internal;
     errdefer alloc.destroy(handle);
@@ -1650,6 +1651,7 @@ pub export fn antfly_lite_open_status_only(path: [*:0]const u8, out_handle: *?*a
 }
 
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    out_buf.* = .{};
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     out_buf.* = stringifyJson(lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native)) catch return .internal;
@@ -1657,6 +1659,7 @@ pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *c
 }
 
 pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    out_buf.* = .{};
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
 
@@ -1679,6 +1682,7 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: *capi.Bu
 }
 
 pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    out_buf.* = .{};
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
 
@@ -1698,6 +1702,7 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
 }
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    out_buf.* = .{};
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend) |*backend| {
         out_buf.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
@@ -1712,6 +1717,7 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     replace: bool,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    out_buf.* = .{};
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend) |*backend| {
         out_buf.* = stringifyJson(backend.copyStableSnapshot(std.mem.span(dest_path), replace) catch |err| return capi.mapError(err)) catch return .internal;
@@ -1721,6 +1727,7 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
 }
 
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
+    out_buf.* = .{};
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend) |*backend| {
         out_buf.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
@@ -5899,13 +5906,24 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var plain_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(plain_path, &plain_handle));
     defer antfly_db_close(plain_handle);
-    var invalid_caps: capi.Buffer = .{};
+    var scratch: [1]u8 = .{0xaa};
+    var invalid_caps: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(plain_handle, &invalid_caps));
-    var invalid_status: capi.Buffer = .{};
+    try std.testing.expect(invalid_caps.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_caps.len);
+    var invalid_status: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(plain_handle, &invalid_status));
+    try std.testing.expect(invalid_status.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_status.len);
+    var invalid_backup: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_backup(plain_handle, &invalid_backup));
+    try std.testing.expect(invalid_backup.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_backup.len);
 
-    var invalid_lite_handle: ?*anyopaque = null;
+    var invalid_lite_sentinel: u8 = 0;
+    var invalid_lite_handle: ?*anyopaque = &invalid_lite_sentinel;
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(invalid_lite_path, &invalid_lite_handle));
+    try std.testing.expect(invalid_lite_handle == null);
     defer antfly_db_close(invalid_lite_handle);
 
     {
@@ -5913,8 +5931,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         defer short_file.close(std.testing.io);
         try short_file.writePositionalAll(std.testing.io, "short native lite header", 0);
     }
-    var short_lite_handle: ?*anyopaque = null;
+    var short_lite_sentinel: u8 = 0;
+    var short_lite_handle: ?*anyopaque = &short_lite_sentinel;
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_readonly(short_lite_path, &short_lite_handle));
+    try std.testing.expect(short_lite_handle == null);
     defer antfly_db_close(short_lite_handle);
 
     var src_handle: ?*anyopaque = null;
@@ -6072,8 +6092,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
-    var blocked_vacuum: capi.Buffer = .{};
+    var blocked_vacuum: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_vacuum_json(src_handle, &blocked_vacuum));
+    try std.testing.expect(blocked_vacuum.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), blocked_vacuum.len);
     antfly_db_close(concurrent_status_handle);
     concurrent_status_handle = null;
     antfly_db_close(concurrent_readonly_handle);
@@ -6094,8 +6116,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         try file.writePositionalAll(io, "tail", source_size);
     }
 
-    var invalid_snapshot_report: capi.Buffer = .{};
+    var invalid_snapshot_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, invalid_snapshot_path, false, &invalid_snapshot_report));
+    try std.testing.expect(invalid_snapshot_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_snapshot_report.len);
 
     var snapshot_report: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_json(src_handle, snapshot_path, false, &snapshot_report));
