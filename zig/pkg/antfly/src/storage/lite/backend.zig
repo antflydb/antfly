@@ -36,6 +36,38 @@ pub const Profile = enum {
     hosted,
 };
 
+pub const supported_inference_modes = [_][]const u8{
+    "caller_supplied_artifacts",
+    "remote_provider",
+    "local_embedded",
+    "manual_maintenance",
+    "disabled_deferred",
+};
+
+const native_available_inference_modes = [_][]const u8{
+    "caller_supplied_artifacts",
+    "remote_provider",
+    "disabled_deferred",
+};
+
+const native_freestanding_available_inference_modes = [_][]const u8{
+    "caller_supplied_artifacts",
+    "disabled_deferred",
+};
+
+const hosted_available_inference_modes = [_][]const u8{
+    "caller_supplied_artifacts",
+    "remote_provider",
+    "manual_maintenance",
+    "disabled_deferred",
+};
+
+const hosted_freestanding_available_inference_modes = [_][]const u8{
+    "caller_supplied_artifacts",
+    "manual_maintenance",
+    "disabled_deferred",
+};
+
 pub const Capabilities = struct {
     freestanding_build: bool = builtin.os.tag == .freestanding,
     hosted_profile: bool = false,
@@ -47,6 +79,8 @@ pub const Capabilities = struct {
     remote_template_rendering: bool = true,
     remote_template_host_callbacks: bool = false,
     inference_mode: []const u8 = "caller_supplied_or_disabled",
+    supported_inference_modes: []const []const u8 = &supported_inference_modes,
+    available_inference_modes: []const []const u8 = &native_available_inference_modes,
     inference_required: bool = false,
     no_inference_configured_ok: bool = true,
     caller_supplied_artifacts: bool = true,
@@ -69,6 +103,7 @@ pub const Capabilities = struct {
 
 pub const InferenceStatus = struct {
     mode: []const u8 = "caller_supplied_or_disabled",
+    available_modes: []const []const u8 = &native_available_inference_modes,
     configured: bool = false,
     remote_provider_configured: bool = false,
     local_runtime_configured: bool = false,
@@ -80,6 +115,12 @@ pub const InferenceStatus = struct {
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
     const freestanding = builtin.os.tag == .freestanding;
     const hosted = profile == .hosted;
+    const available_modes: []const []const u8 = if (hosted)
+        if (freestanding) &hosted_freestanding_available_inference_modes else &hosted_available_inference_modes
+    else if (freestanding)
+        &native_freestanding_available_inference_modes
+    else
+        &native_available_inference_modes;
     return .{
         .hosted_profile = hosted,
         .manual_maintenance = hosted,
@@ -90,6 +131,8 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
         .remote_template_rendering = !freestanding,
         .remote_template_host_callbacks = freestanding,
         .inference_mode = "caller_supplied_or_disabled",
+        .supported_inference_modes = &supported_inference_modes,
+        .available_inference_modes = available_modes,
         .inference_required = false,
         .no_inference_configured_ok = true,
         .caller_supplied_artifacts = true,
@@ -115,6 +158,7 @@ pub fn inferenceStatusForProfile(profile: Profile) InferenceStatus {
     const caps = capabilitiesForProfile(profile);
     return .{
         .mode = caps.inference_mode,
+        .available_modes = caps.available_inference_modes,
         .configured = false,
         .remote_provider_configured = false,
         .local_runtime_configured = false,
@@ -481,6 +525,8 @@ test "lite backend capabilities contract is stable" {
         "remote_template_rendering",
         "remote_template_host_callbacks",
         "inference_mode",
+        "supported_inference_modes",
+        "available_inference_modes",
         "inference_required",
         "no_inference_configured_ok",
         "caller_supplied_artifacts",
@@ -511,13 +557,21 @@ test "lite backend capabilities contract is stable" {
     const freestanding = builtin.os.tag == .freestanding;
     const native_json = try std.json.Stringify.valueAlloc(allocator, capabilitiesForProfile(.native), .{});
     defer allocator.free(native_json);
-    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const native_available_modes =
+        if (freestanding)
+            "[\"caller_supplied_artifacts\",\"disabled_deferred\"]"
+        else
+            "[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]";
+    const supported_modes_json = "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"manual_maintenance\",\"disabled_deferred\"]";
+    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         !freestanding,
         !freestanding,
         !freestanding,
         freestanding,
+        supported_modes_json,
+        native_available_modes,
         !freestanding,
     });
     defer allocator.free(expected_native);
@@ -525,10 +579,17 @@ test "lite backend capabilities contract is stable" {
 
     const hosted_json = try std.json.Stringify.valueAlloc(allocator, capabilitiesForProfile(.hosted), .{});
     defer allocator.free(hosted_json);
-    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const hosted_available_modes =
+        if (freestanding)
+            "[\"caller_supplied_artifacts\",\"manual_maintenance\",\"disabled_deferred\"]"
+        else
+            "[\"caller_supplied_artifacts\",\"remote_provider\",\"manual_maintenance\",\"disabled_deferred\"]";
+    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         freestanding,
+        supported_modes_json,
+        hosted_available_modes,
         !freestanding,
     });
     defer allocator.free(expected_hosted);
@@ -538,6 +599,7 @@ test "lite backend capabilities contract is stable" {
 test "lite backend inference status reports disabled as clean state" {
     const expected_fields = [_][]const u8{
         "mode",
+        "available_modes",
         "configured",
         "remote_provider_configured",
         "local_runtime_configured",
@@ -554,6 +616,8 @@ test "lite backend inference status reports disabled as clean state" {
 
     const status = inferenceStatusForProfile(.native);
     try std.testing.expectEqualStrings("caller_supplied_or_disabled", status.mode);
+    try std.testing.expect(std.mem.eql(u8, status.available_modes[0], "caller_supplied_artifacts"));
+    try std.testing.expect(std.mem.eql(u8, status.available_modes[status.available_modes.len - 1], "disabled_deferred"));
     try std.testing.expect(!status.configured);
     try std.testing.expect(!status.remote_provider_configured);
     try std.testing.expect(!status.local_runtime_configured);
@@ -563,6 +627,11 @@ test "lite backend inference status reports disabled as clean state" {
 
     const hosted = inferenceStatusForProfile(.hosted);
     try std.testing.expectEqualStrings("caller_supplied_or_disabled", hosted.mode);
+    var hosted_has_manual = false;
+    for (hosted.available_modes) |mode| {
+        if (std.mem.eql(u8, mode, "manual_maintenance")) hosted_has_manual = true;
+    }
+    try std.testing.expect(hosted_has_manual);
     try std.testing.expect(!hosted.configured);
     try std.testing.expect(hosted.no_inference_configured_ok);
 }

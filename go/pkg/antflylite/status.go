@@ -27,45 +27,48 @@ type StorageStatus struct {
 // handle. A fresh core Lite database normally reports Configured=false and
 // NoInferenceConfiguredOK=true.
 type InferenceStatus struct {
-	Mode                     string `json:"mode"`
-	Configured               bool   `json:"configured"`
-	RemoteProviderConfigured bool   `json:"remote_provider_configured"`
-	LocalRuntimeConfigured   bool   `json:"local_runtime_configured"`
-	LocalRuntimeAvailable    bool   `json:"local_runtime_available"`
-	CallerSuppliedArtifacts  bool   `json:"caller_supplied_artifacts"`
-	NoInferenceConfiguredOK  bool   `json:"no_inference_configured_ok"`
+	Mode                     string   `json:"mode"`
+	AvailableModes           []string `json:"available_modes"`
+	Configured               bool     `json:"configured"`
+	RemoteProviderConfigured bool     `json:"remote_provider_configured"`
+	LocalRuntimeConfigured   bool     `json:"local_runtime_configured"`
+	LocalRuntimeAvailable    bool     `json:"local_runtime_available"`
+	CallerSuppliedArtifacts  bool     `json:"caller_supplied_artifacts"`
+	NoInferenceConfiguredOK  bool     `json:"no_inference_configured_ok"`
 }
 
 // Capabilities describes the Lite feature contract advertised by a handle.
 type Capabilities struct {
-	FreestandingBuild                  bool   `json:"freestanding_build"`
-	HostedProfile                      bool   `json:"hosted_profile"`
-	ManualMaintenance                  bool   `json:"manual_maintenance"`
-	BackgroundEnrichmentRuntime        bool   `json:"background_enrichment_runtime"`
-	TTLCleanupRuntime                  bool   `json:"ttl_cleanup_runtime"`
-	TransactionRecoveryRuntime         bool   `json:"transaction_recovery_runtime"`
-	LocalTemplateRendering             bool   `json:"local_template_rendering"`
-	RemoteTemplateRendering            bool   `json:"remote_template_rendering"`
-	RemoteTemplateHostCallbacks        bool   `json:"remote_template_host_callbacks"`
-	InferenceMode                      string `json:"inference_mode"`
-	InferenceRequired                  bool   `json:"inference_required"`
-	NoInferenceConfiguredOK            bool   `json:"no_inference_configured_ok"`
-	CallerSuppliedArtifacts            bool   `json:"caller_supplied_artifacts"`
-	RemoteInferenceProviders           bool   `json:"remote_inference_providers"`
-	LocalInferenceRuntime              bool   `json:"local_inference_runtime"`
-	GeneratedEnrichmentPlanning        bool   `json:"generated_enrichment_planning"`
-	DenseVectorSearch                  bool   `json:"dense_vector_search"`
-	SparseVectorSearch                 bool   `json:"sparse_vector_search"`
-	DistributedShardOwnership          bool   `json:"distributed_shard_ownership"`
-	RaftReplication                    bool   `json:"raft_replication"`
-	ClusterPlacement                   bool   `json:"cluster_placement"`
-	CrossNodeJoins                     bool   `json:"cross_node_joins"`
-	RemoteShardFanout                  bool   `json:"remote_shard_fanout"`
-	DistributedTransactionCoordination bool   `json:"distributed_transaction_coordination"`
-	ClusterHeartbeatStatusAggregation  bool   `json:"cluster_heartbeat_status_aggregation"`
-	ServerSideAutoscaling              bool   `json:"server_side_autoscaling"`
-	KubernetesOperator                 bool   `json:"kubernetes_operator"`
-	ObjectStoragePrimary               bool   `json:"object_storage_primary"`
+	FreestandingBuild                  bool     `json:"freestanding_build"`
+	HostedProfile                      bool     `json:"hosted_profile"`
+	ManualMaintenance                  bool     `json:"manual_maintenance"`
+	BackgroundEnrichmentRuntime        bool     `json:"background_enrichment_runtime"`
+	TTLCleanupRuntime                  bool     `json:"ttl_cleanup_runtime"`
+	TransactionRecoveryRuntime         bool     `json:"transaction_recovery_runtime"`
+	LocalTemplateRendering             bool     `json:"local_template_rendering"`
+	RemoteTemplateRendering            bool     `json:"remote_template_rendering"`
+	RemoteTemplateHostCallbacks        bool     `json:"remote_template_host_callbacks"`
+	InferenceMode                      string   `json:"inference_mode"`
+	SupportedInferenceModes            []string `json:"supported_inference_modes"`
+	AvailableInferenceModes            []string `json:"available_inference_modes"`
+	InferenceRequired                  bool     `json:"inference_required"`
+	NoInferenceConfiguredOK            bool     `json:"no_inference_configured_ok"`
+	CallerSuppliedArtifacts            bool     `json:"caller_supplied_artifacts"`
+	RemoteInferenceProviders           bool     `json:"remote_inference_providers"`
+	LocalInferenceRuntime              bool     `json:"local_inference_runtime"`
+	GeneratedEnrichmentPlanning        bool     `json:"generated_enrichment_planning"`
+	DenseVectorSearch                  bool     `json:"dense_vector_search"`
+	SparseVectorSearch                 bool     `json:"sparse_vector_search"`
+	DistributedShardOwnership          bool     `json:"distributed_shard_ownership"`
+	RaftReplication                    bool     `json:"raft_replication"`
+	ClusterPlacement                   bool     `json:"cluster_placement"`
+	CrossNodeJoins                     bool     `json:"cross_node_joins"`
+	RemoteShardFanout                  bool     `json:"remote_shard_fanout"`
+	DistributedTransactionCoordination bool     `json:"distributed_transaction_coordination"`
+	ClusterHeartbeatStatusAggregation  bool     `json:"cluster_heartbeat_status_aggregation"`
+	ServerSideAutoscaling              bool     `json:"server_side_autoscaling"`
+	KubernetesOperator                 bool     `json:"kubernetes_operator"`
+	ObjectStoragePrimary               bool     `json:"object_storage_primary"`
 }
 
 // Status is the typed form of StatusJSON. Stats and PendingWork are retained as

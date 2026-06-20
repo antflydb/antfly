@@ -39,6 +39,15 @@ func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
 	}
 }
 
+func containsString(values []string, value string) bool {
+	for _, item := range values {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
 func TestLiteCAPI(t *testing.T) {
 	if got := ABIVersion(); got != 1 {
 		t.Fatalf("ABI version = %d, want 1", got)
@@ -187,6 +196,10 @@ func TestLiteCAPI(t *testing.T) {
 	if typedStatus.Inference.Mode != "caller_supplied_or_disabled" {
 		t.Fatalf("typed status inference mode = %q", typedStatus.Inference.Mode)
 	}
+	if !containsString(typedStatus.Inference.AvailableModes, "caller_supplied_artifacts") ||
+		!containsString(typedStatus.Inference.AvailableModes, "disabled_deferred") {
+		t.Fatalf("typed status inference available modes = %#v", typedStatus.Inference.AvailableModes)
+	}
 	if typedStatus.Inference.Configured || typedStatus.Inference.RemoteProviderConfigured || typedStatus.Inference.LocalRuntimeConfigured {
 		t.Fatalf("fresh Lite database should not report configured inference: %#v", typedStatus.Inference)
 	}
@@ -208,6 +221,11 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if typedCaps.InferenceMode != "caller_supplied_or_disabled" || !typedCaps.CallerSuppliedArtifacts || !typedCaps.NoInferenceConfiguredOK {
 		t.Fatalf("typed capabilities inference fields = %#v", typedCaps)
+	}
+	if !containsString(typedCaps.SupportedInferenceModes, "local_embedded") ||
+		!containsString(typedCaps.AvailableInferenceModes, "caller_supplied_artifacts") ||
+		!containsString(typedCaps.AvailableInferenceModes, "disabled_deferred") {
+		t.Fatalf("typed capabilities inference modes = supported=%#v available=%#v", typedCaps.SupportedInferenceModes, typedCaps.AvailableInferenceModes)
 	}
 	if typedCaps.RaftReplication || typedCaps.ClusterPlacement || typedCaps.DistributedTransactionCoordination {
 		t.Fatalf("typed capabilities should not advertise distributed features: %#v", typedCaps)
@@ -373,6 +391,9 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if !hostedCaps.HostedProfile || !hostedCaps.ManualMaintenance {
 		t.Fatalf("hosted capabilities should report manual maintenance: %#v", hostedCaps)
+	}
+	if !containsString(hostedCaps.AvailableInferenceModes, "manual_maintenance") {
+		t.Fatalf("hosted capabilities should advertise manual maintenance inference mode: %#v", hostedCaps.AvailableInferenceModes)
 	}
 	if hostedCaps.BackgroundEnrichmentRuntime || hostedCaps.TTLCleanupRuntime || hostedCaps.TransactionRecoveryRuntime {
 		t.Fatalf("hosted capabilities should not report background runtimes: %#v", hostedCaps)
