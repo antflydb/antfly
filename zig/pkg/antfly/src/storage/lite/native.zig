@@ -276,12 +276,21 @@ pub const NativeFile = struct {
     }
 
     pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
+        if (self.read_only) return error.ReadOnly;
         const previous = self.activeCheckpoint();
         const page_id = previous.page_count;
+        var next_page_id = page_id;
+        try self.writePage(page_id, .data, contents);
+        next_page_id += 1;
+        const free_map_root_page = try self.appendFreeMapPageForCommit(&next_page_id);
+        try self.file.sync(self.io_impl.io());
+
         var next = previous;
         next.commit_sequence += 1;
-        next.page_count = page_id + 1;
-        return try self.appendPage(.data, contents, next);
+        next.free_map_root_page = free_map_root_page;
+        next.page_count = next_page_id;
+        try self.publishCheckpoint(next);
+        return page_id;
     }
 
     pub fn readPageAlloc(self: *NativeFile, allocator: Allocator, page_id: u64) ![]u8 {
@@ -357,11 +366,13 @@ pub const NativeFile = struct {
             next_page_id += 1;
         }
 
+        const free_map_root_page = try self.appendFreeMapPageForCommit(&next_page_id);
         try self.file.sync(self.io_impl.io());
 
         var next = previous;
         next.commit_sequence += 1;
         setCatalogRootPage(&next, root, next_root_page);
+        next.free_map_root_page = free_map_root_page;
         next.page_count = next_page_id;
         try self.publishCheckpoint(next);
     }
@@ -503,11 +514,13 @@ pub const NativeFile = struct {
             next_page_id += 1;
         }
 
+        const free_map_root_page = try self.appendFreeMapPageForCommit(&next_page_id);
         try self.file.sync(self.io_impl.io());
 
         var next = previous;
         next.commit_sequence += 1;
         next.document_root_page = next_root_page;
+        next.free_map_root_page = free_map_root_page;
         next.page_count = next_page_id;
         try self.publishCheckpoint(next);
     }
@@ -848,19 +861,6 @@ pub const NativeFile = struct {
         return count;
     }
 
-    fn appendPage(self: *NativeFile, kind: PageKind, contents: []const u8, checkpoint: CheckpointSlot) !u64 {
-        if (self.read_only) return error.ReadOnly;
-
-        const previous = self.activeCheckpoint();
-        const page_id = previous.page_count;
-        if (checkpoint.page_count != page_id + 1) return error.InvalidNativeCheckpoint;
-
-        try self.writePage(page_id, kind, contents);
-        try self.file.sync(self.io_impl.io());
-        try self.publishCheckpoint(checkpoint);
-        return page_id;
-    }
-
     fn writeValuePages(self: *NativeFile, first_page_id: u64, value: []const u8) !u64 {
         if (value.len == 0) return error.InvalidNativeValueChain;
         const chunk_size = self.maxValuePagePayloadBytes();
@@ -885,6 +885,19 @@ pub const NativeFile = struct {
         }
 
         return page_id;
+    }
+
+    fn appendFreeMapPageForCommit(self: *NativeFile, next_page_id: *u64) !u64 {
+        const free_map_root_page = next_page_id.*;
+        try self.writeFreeMapPage(free_map_root_page, free_map_root_page + 1);
+        next_page_id.* += 1;
+        return free_map_root_page;
+    }
+
+    fn writeFreeMapPage(self: *NativeFile, page_id: u64, covered_page_count: u64) !void {
+        var payload: [free_map_header_size]u8 = undefined;
+        encodeFreeMap(&payload, covered_page_count, 0);
+        try self.writePage(page_id, .free_map, &payload);
     }
 
     fn readValuePagesAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize) ![]u8 {
@@ -1611,7 +1624,7 @@ fn decodeFreeMap(raw: []const u8, checkpoint_page_count: u64) !void {
     if (version != free_map_format_version) return error.InvalidNativeFreeMap;
     const free_page_count = std.mem.readInt(u32, raw[4..8], .little);
     const covered_page_count = std.mem.readInt(u64, raw[8..16], .little);
-    if (covered_page_count > checkpoint_page_count) return error.InvalidNativeFreeMap;
+    if (covered_page_count != checkpoint_page_count) return error.InvalidNativeFreeMap;
     if (free_page_count != 0) return error.UnsupportedNativeFreeMap;
     if (raw.len != free_map_header_size) return error.UnsupportedNativeFreeMap;
 }
@@ -1835,7 +1848,8 @@ test "lite native file appends page and publishes checkpoint" {
         const page_id = try file.allocatePage("hello native page");
         try std.testing.expectEqual(@as(u64, 1), page_id);
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, 3), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().free_map_root_page);
 
         const page = try file.readPagePayloadAlloc(allocator, page_id);
         defer allocator.free(page);
@@ -1845,7 +1859,7 @@ test "lite native file appends page and publishes checkpoint" {
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
-    try std.testing.expectEqual(@as(u64, 2), report.page_count);
+    try std.testing.expectEqual(@as(u64, 3), report.page_count);
 }
 
 test "lite native file reopens allocated pages" {
@@ -1866,7 +1880,7 @@ test "lite native file reopens allocated pages" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(@as(u64, 2), reopened.activeCheckpoint().page_count);
+    try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
     const page = try reopened.readPagePayloadAlloc(allocator, 1);
     defer allocator.free(page);
     try std.testing.expectEqualStrings("persisted", page);
@@ -1903,7 +1917,7 @@ test "lite native file publishes checkpoint without rewriting static header" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(@as(u64, 2), reopened.activeCheckpoint().page_count);
+    try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
 }
 
 test "lite native file permits concurrent readers" {
@@ -1927,8 +1941,8 @@ test "lite native file permits concurrent readers" {
     var reader_b = try NativeFile.open(allocator, path, true);
     defer reader_b.close();
 
-    try std.testing.expectEqual(@as(u64, 2), reader_a.activeCheckpoint().page_count);
-    try std.testing.expectEqual(@as(u64, 2), reader_b.activeCheckpoint().page_count);
+    try std.testing.expectEqual(@as(u64, 3), reader_a.activeCheckpoint().page_count);
+    try std.testing.expectEqual(@as(u64, 3), reader_b.activeCheckpoint().page_count);
 }
 
 test "lite native file active writer blocks other opens" {
@@ -2144,7 +2158,7 @@ test "lite native document store spills large values into value pages" {
         defer file.close();
         const value_pages = std.math.divCeil(usize, large.len, file.maxValuePagePayloadBytes()) catch unreachable;
         try file.putDocument("doc:large", large);
-        try std.testing.expectEqual(@as(u64, @intCast(2 + value_pages)), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, @intCast(3 + value_pages)), file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -2266,7 +2280,7 @@ test "lite native document batch publishes one checkpoint" {
             .{ .key = "doc:c", .is_delete = true },
         });
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(@as(u64, 6), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, 7), file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -2334,10 +2348,10 @@ test "lite native check validates committed root chains" {
     try std.testing.expectEqual(@as(u64, 2), report.record_count);
     try std.testing.expectEqual(@as(u64, 2), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 3), report.file_size);
-    try std.testing.expectEqual(report.file_size, report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 4), report.compact_size);
     try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
-    try std.testing.expectEqual(@as(u64, 0), report.reclaimable_bytes);
+    try std.testing.expectEqual(@as(u64, default_page_size), report.reclaimable_bytes);
 }
 
 test "lite native check validates committed index catalog root chain" {
@@ -2367,8 +2381,9 @@ test "lite native check validates committed index catalog root chain" {
     try std.testing.expectEqual(@as(u64, 3), report.record_count);
     try std.testing.expectEqual(@as(u64, 3), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 4), report.file_size);
-    try std.testing.expectEqual(report.file_size, report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 7), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 2), report.reclaimable_bytes);
 
     const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
     defer allocator.free(index_file);
