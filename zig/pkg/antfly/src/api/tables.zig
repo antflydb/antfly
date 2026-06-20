@@ -3665,11 +3665,24 @@ fn databaseSettingsJsonAfterAlterAlloc(
         switch (operation) {
             .set_parameter => |set| {
                 const value = try std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), set.value_json, .{});
+                const setting_value = try sqlDatabaseSettingTextFromJsonValueAlloc(alloc, value);
+                defer alloc.free(setting_value);
+                try relational_sql.validateSqlDatabaseSettingValue(set.name, setting_value);
                 try parsed.value.object.put(parsed.arena.allocator(), try parsed.arena.allocator().dupe(u8, set.name), value);
             },
         }
     }
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+fn sqlDatabaseSettingTextFromJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .string => |text| try alloc.dupe(u8, text),
+        .integer => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .float => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .bool => |enabled| try alloc.dupe(u8, if (enabled) "true" else "false"),
+        else => error.InvalidRoleSetting,
+    };
 }
 
 pub fn validateRelationalTableDropAllowed(

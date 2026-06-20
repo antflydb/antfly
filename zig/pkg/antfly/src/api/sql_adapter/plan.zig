@@ -1461,7 +1461,7 @@ test "sql adapter plan owns projection helpers" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, expression_projection.expression.kind);
     try std.testing.expectEqual(@as(usize, 2), expression_projection.expression.operands.len);
     try std.testing.expectEqualStrings("nickname", expression_projection.expression.operands[0].field);
-    try std.testing.expect(expression_projection.expression.operands.ptr != coalesce_projection.operands.ptr);
+    try std.testing.expect(@intFromPtr(expression_projection.expression.operands.ptr) != @intFromPtr(coalesce_projection.operands.ptr));
 
     freeCoalesceProjection(alloc, coalesce_projection);
 }

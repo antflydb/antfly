@@ -3110,7 +3110,26 @@ pub fn enforceSqlStatementTimeoutAt(session: catalog_resources.SqlCatalogSession
     if (sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(session), start_ns, now_ns)) return error.StatementTimeout;
 }
 
-fn validateSqlRuntimeSessionSettingValue(name: []const u8, value: []const u8) !void {
+pub fn validateSqlRuntimeSettingValue(name: []const u8, value: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(name, "search_path")) {
+        var iter = std.mem.splitScalar(u8, value, ',');
+        var count: usize = 0;
+        while (iter.next()) |part| : (count += 1) {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
+            if (trimmed.len == 0) return error.InvalidRoleSetting;
+            const normalized = if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
+                trimmed[1 .. trimmed.len - 1]
+            else
+                trimmed;
+            if (normalized.len == 0) return error.InvalidRoleSetting;
+            for (normalized) |ch| {
+                if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '$') continue;
+                return error.InvalidRoleSetting;
+            }
+        }
+        if (count == 0) return error.InvalidRoleSetting;
+        return;
+    }
     if (std.ascii.eqlIgnoreCase(name, "statement_timeout")) {
         _ = try parseSqlStatementTimeoutNs(value);
         return;
@@ -3125,6 +3144,15 @@ fn validateSqlRuntimeSessionSettingValue(name: []const u8, value: []const u8) !v
         return;
     }
     return error.UnsupportedRoleSetting;
+}
+
+pub fn validateSqlDatabaseSettingValue(name: []const u8, value: []const u8) !void {
+    if (std.mem.startsWith(u8, name, "app.")) {
+        usermgr.validateRoleSettingName(name) catch return error.UnsupportedRoleSetting;
+        if (value.len == 0) return error.InvalidRoleSetting;
+        return;
+    }
+    return try validateSqlRuntimeSettingValue(name, value);
 }
 
 fn replaceSessionSettingAlloc(
@@ -3233,7 +3261,7 @@ pub fn applySessionCatalogPlanAlloc(
         .set_setting => |set| {
             switch (set.kind) {
                 .app => if (set.value.len == 0) return error.InvalidRoleSetting,
-                .runtime => try validateSqlRuntimeSessionSettingValue(set.name, set.value),
+                .runtime => try validateSqlRuntimeSettingValue(set.name, set.value),
             }
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
             errdefer updated.deinit(alloc);
