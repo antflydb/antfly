@@ -48,6 +48,55 @@ func containsString(values []string, value string) bool {
 	return false
 }
 
+func TestLiteOpenModeConcurrency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "go-open-modes.aflite")
+
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer writer.Close()
+
+	if _, err := Open(path); err != Busy {
+		t.Fatalf("second writer error = %v, want %v", err, Busy)
+	}
+
+	readonly, err := OpenReadonly(path)
+	if err != nil {
+		t.Fatalf("open readonly while writer exists: %v", err)
+	}
+	if _, err := readonly.Status(); err != nil {
+		readonly.Close()
+		t.Fatalf("readonly status: %v", err)
+	}
+	if err := readonly.Close(); err != nil {
+		t.Fatalf("close readonly: %v", err)
+	}
+
+	statusOnly, err := OpenStatusOnly(path)
+	if err != nil {
+		t.Fatalf("open status-only while writer exists: %v", err)
+	}
+	if _, err := statusOnly.Status(); err != nil {
+		statusOnly.Close()
+		t.Fatalf("status-only status: %v", err)
+	}
+	if err := statusOnly.Close(); err != nil {
+		t.Fatalf("close status-only: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen writer after close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened writer: %v", err)
+	}
+}
+
 func TestLiteCAPI(t *testing.T) {
 	if got := ABIVersion(); got != 1 {
 		t.Fatalf("ABI version = %d, want 1", got)
