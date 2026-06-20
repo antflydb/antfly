@@ -82,6 +82,11 @@ const LiteDb = struct {
     }
 };
 
+const CompactReport = struct {
+    compacted: bool,
+    vacuum: antfly.lite.backend.VacuumReport,
+};
+
 const ParsedLookupRequest = struct {
     fields: ?[]const []const u8 = null,
 };
@@ -149,7 +154,8 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "import")) return try importBackup(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "promote")) return try promote(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "check")) return try check(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "compact") or std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "compact")) return try compact(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "serve")) return try serve(init.gpa, init.io, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
@@ -721,6 +727,30 @@ fn vacuum(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
+}
+
+fn compact(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    requireNoMoreArgs(args);
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    const report = try compactLite(&lite);
+    const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn compactLite(lite: *LiteDb) !CompactReport {
+    try lite.db.maintenanceDriver().runUntilIdle();
+    try lite.db.forceCompactTextIndexes();
+    try lite.db.drainScheduledTextMerges();
+    return .{
+        .compacted = true,
+        .vacuum = try lite.backend.vacuum(),
+    };
 }
 
 const ServeOptions = struct {
@@ -1697,6 +1727,48 @@ test "lite full text query survives writer close and readonly reopen" {
         );
         defer allocator.free(query_response);
         try std.testing.expect(std.mem.indexOf(u8, query_response, "\"doc:query-reopen\"") != null);
+    }
+}
+
+test "lite compact drains text merges before vacuuming aflite file" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/compact-text.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    {
+        var lite = try LiteDb.create(allocator, path, true);
+        defer lite.close();
+
+        try lite.db.addIndex(.{
+            .name = "ft_body",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const batch_response = try batchJson(allocator, &lite.db,
+            \\{"inserts":{"doc:compact:a":{"body":"native lite compact alpha"},"doc:compact:b":{"body":"native lite compact beta"}},"sync_level":"full_index"}
+        );
+        defer allocator.free(batch_response);
+        try std.testing.expect(std.mem.indexOf(u8, batch_response, "\"inserted\":2") != null);
+
+        const report = try compactLite(&lite);
+        try std.testing.expect(report.compacted);
+        try std.testing.expect(report.vacuum.after_size <= report.vacuum.before_size);
+    }
+
+    {
+        var reopened = try LiteDb.open(allocator, path, .query_readonly);
+        defer reopened.close();
+
+        const query_response = try searchJson(allocator, &reopened.db,
+            \\{"full_text_search":{"match":{"field":"body","text":"compact alpha"}},"limit":1}
+        );
+        defer allocator.free(query_response);
+        try std.testing.expect(std.mem.indexOf(u8, query_response, "\"doc:compact:a\"") != null);
     }
 }
 
