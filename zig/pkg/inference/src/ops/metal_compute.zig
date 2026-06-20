@@ -3031,13 +3031,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const key = dynamicLinearSlotKey(weight, bias, in_dim, out_dim);
         if (self.dynamic_linear_slots.get(key)) |slot| return slot;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        const weight_buf = toBuf(weight);
+        const retain_dense_fallback = weight_buf.quantized_storage != null or weight_buf.runtime_quantized_storage != null;
         if (!(try decoderRuntimePrepareLinearOp(self, &.{
             .slot = slot,
             .weight = weight,
             .bias = bias,
             .in_dim = in_dim,
             .out_dim = out_dim,
-            .retain_dense_fallback = true,
+            .retain_dense_fallback = retain_dense_fallback,
         }))) return null;
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;

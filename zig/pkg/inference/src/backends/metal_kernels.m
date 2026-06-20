@@ -772,11 +772,11 @@ typedef struct termite_metal_attention_gated_block_timing {
     uint32_t failure_stage;
     int32_t failure_code;
     uint64_t attention_f32_kernels;
-    uint64_t q8_0_linear_kernels;
-    uint64_t q8_0_attention_linear_kernels;
-    uint64_t q8_0_ffn_down_linear_kernels;
-    uint64_t q8_0_ple_linear_kernels;
-    uint64_t q8_0_pair_activation_kernels;
+    uint64_t quant_linear_kernels;
+    uint64_t quant_attention_linear_kernels;
+    uint64_t quant_ffn_down_linear_kernels;
+    uint64_t quant_ple_linear_kernels;
+    uint64_t quant_gate_up_pair_kernels;
     uint64_t rms_norm_kernels;
     uint64_t rms_norm_add_kernels;
     uint64_t layer_norm_kernels;
@@ -20205,14 +20205,18 @@ static int termite_metal_encode_ple_residual_q8_0_device(
     if (runtime == NULL || command_buffer == nil || hidden_handle == NULL || ple_handle == NULL || output_handle == NULL) return -1;
     const bool block_q8_0 = ple_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0;
     const bool block_q4_k = ple_quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_K;
-    if (!block_q8_0 && !block_q4_k) return -2;
+    const bool block_q5_k = ple_quant_format == TERMITE_METAL_QUANT_FORMAT_Q5_K;
+    const bool block_q6_k = ple_quant_format == TERMITE_METAL_QUANT_FORMAT_Q6_K;
+    if (!block_q8_0 && !block_q4_k && !block_q5_k && !block_q6_k) return -2;
     if (runtime->activation_multiply_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->add_pipeline == nil) return -2;
     if (block_q8_0 && runtime->q8_0_pipeline == nil) return -2;
     if (block_q4_k && runtime->q4_k_pipeline == nil) return -2;
+    if (block_q5_k && runtime->q5_k_pipeline == nil) return -2;
+    if (block_q6_k && runtime->q6_k_pipeline == nil) return -2;
     if (output_scale_present != 0 && (runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil)) return -2;
     if (gate_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || proj_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || post_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -3;
     if (rows == 0 || hidden_size == 0 || ple_hidden_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX || ple_hidden_size > UINT32_MAX) return -4;
-    const size_t block_values_per_block = block_q4_k ? 256u : 32u;
+    const size_t block_values_per_block = (block_q4_k || block_q5_k || block_q6_k) ? 256u : 32u;
     if (hidden_size % block_values_per_block != 0 || ple_hidden_size % block_values_per_block != 0) return -5;
     termite_metal_quant_linear_slot_view gate_view;
     termite_metal_quant_linear_slot_view proj_view;
@@ -20310,7 +20314,7 @@ static int termite_metal_encode_ple_residual_q8_0_device(
                     .format = ple_quant_format,
                     .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
                     .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
-                    .fallback_pipeline = runtime->q4_k_pipeline,
+                    .fallback_pipeline = gate_view.pipeline,
                     .input_buffer = hidden_buffer,
                     .input_offset = hidden_offset,
                     .weight_buffer = gate_view.weight_buffer,
@@ -20419,7 +20423,7 @@ static int termite_metal_encode_ple_residual_q8_0_device(
                 .format = ple_quant_format,
                 .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
                 .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
-                .fallback_pipeline = runtime->q4_k_pipeline,
+                .fallback_pipeline = proj_view.pipeline,
                 .input_buffer = gated_buffer,
                 .weight_buffer = proj_view.weight_buffer,
                 .output_buffer = projected_buffer,
@@ -23915,8 +23919,9 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
     }
 }
 
-static int termite_metal_decode_runtime_encode_attention_quantized_residual_q4_k_slot(
+static int termite_metal_decode_runtime_encode_attention_quantized_residual_k_slot(
     termite_metal_decode_runtime *runtime,
+    uint32_t attention_quant_format,
     id<MTLCommandBuffer> command_buffer,
     id<MTLBuffer> input_buffer,
     size_t attention_pre_linear_rms_norm_slot,
@@ -23931,12 +23936,15 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q4_k
     id<MTLBuffer> output_buffer
 ) {
     if (runtime == NULL || command_buffer == nil || input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -1;
-    if (runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->add_pipeline == nil) return -2;
+    if (runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->add_pipeline == nil) return -2;
+    if (attention_quant_format != TERMITE_METAL_QUANT_FORMAT_Q4_K &&
+        attention_quant_format != TERMITE_METAL_QUANT_FORMAT_Q5_K &&
+        attention_quant_format != TERMITE_METAL_QUANT_FORMAT_Q6_K) return -2;
     if (rows == 0 || rows > UINT32_MAX || attention_input_size == 0 || attention_input_size > UINT32_MAX || hidden_size == 0 || hidden_size > UINT32_MAX) return -3;
     if (attention_input_size % 256u != 0) return -4;
     if (attention_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -5;
     termite_metal_quant_linear_slot_view attention_view;
-    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, TERMITE_METAL_QUANT_FORMAT_Q4_K, attention_linear_slot, attention_input_size, hidden_size, &attention_view) != 0) return -6;
+    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime, attention_quant_format, attention_linear_slot, attention_input_size, hidden_size, &attention_view) != 0) return -6;
     if (attention_pre_linear_rms_norm_slot != SIZE_MAX) {
         if (attention_pre_linear_rms_norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -7;
         if (runtime->rms_norm_slot_prepared[attention_pre_linear_rms_norm_slot] == 0 || runtime->rms_norm_hidden_sizes[attention_pre_linear_rms_norm_slot] != attention_input_size) return -8;
@@ -23990,10 +23998,10 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q4_k
         {
             termite_metal_quant_matmul_descriptor descriptor = {
                 .slot = attention_linear_slot,
-                .format = TERMITE_METAL_QUANT_FORMAT_Q4_K,
+                .format = attention_quant_format,
                 .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
                 .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
-                .fallback_pipeline = runtime->q4_k_pipeline,
+                .fallback_pipeline = attention_view.pipeline,
                 .input_buffer = current_buffer,
                 .weight_buffer = attention_view.weight_buffer,
                 .output_buffer = projected_buffer,
@@ -24055,6 +24063,38 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q4_k
         }
         return 0;
     }
+}
+
+static int termite_metal_decode_runtime_encode_attention_quantized_residual_q4_k_slot(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t attention_pre_linear_rms_norm_slot,
+    size_t attention_linear_slot,
+    size_t attention_post_linear_rms_norm_slot,
+    id<MTLBuffer> residual_buffer,
+    size_t residual_offset,
+    size_t rows,
+    size_t attention_input_size,
+    size_t hidden_size,
+    float eps,
+    id<MTLBuffer> output_buffer
+) {
+    return termite_metal_decode_runtime_encode_attention_quantized_residual_k_slot(
+        runtime,
+        TERMITE_METAL_QUANT_FORMAT_Q4_K,
+        command_buffer,
+        input_buffer,
+        attention_pre_linear_rms_norm_slot,
+        attention_linear_slot,
+        attention_post_linear_rms_norm_slot,
+        residual_buffer,
+        residual_offset,
+        rows,
+        attention_input_size,
+        hidden_size,
+        eps,
+        output_buffer);
 }
 
 static int termite_metal_decode_runtime_encode_attention_quantized_residual_q5_k_slot(
@@ -27197,13 +27237,17 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
     if (runtime == NULL || input_handle == NULL || residual_handle == NULL || output_handle == NULL) return -1;
     const bool block_q8_0 = gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0;
     const bool block_q4_k = gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_K;
+    const bool block_q5_k = gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q5_K;
+    const bool block_q6_k = gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q6_K;
     const bool down_q8_0 = down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0;
-    if (!block_q8_0 && !block_q4_k) return -2;
+    if (!block_q8_0 && !block_q4_k && !block_q5_k && !block_q6_k) return -2;
     if (runtime->rms_norm_rows_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->add_pipeline == nil) return -2;
     if (block_q8_0 && (runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil)) return -2;
     if (block_q4_k && (runtime->q4_k_pipeline == nil || runtime->q4_k_pair_pipeline == nil)) return -2;
+    if (block_q5_k && runtime->q5_k_pipeline == nil) return -2;
+    if (block_q6_k && (runtime->q6_k_pipeline == nil || runtime->q6_k_pair_pipeline == nil)) return -2;
     if (rows == 0 || hidden_size == 0 || intermediate_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX || intermediate_size > UINT32_MAX) return -3;
-    const size_t block_values_per_block = block_q4_k ? 256u : 32u;
+    const size_t block_values_per_block = (block_q4_k || block_q5_k || block_q6_k) ? 256u : 32u;
     if (hidden_size % block_values_per_block != 0 || intermediate_size % block_values_per_block != 0) return -4;
     if (gate_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || up_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -5;
     termite_metal_quant_linear_slot_view gate_view;
@@ -27441,13 +27485,13 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 descriptor.planned_dispatch = TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN;
                 gate_up_status = termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
             }
-        } else if (!pre_gate_pair_done && !split_gate_up_linear) {
+        } else if (!pre_gate_pair_done && !split_gate_up_linear && (block_q4_k || block_q6_k)) {
             termite_metal_quant_matmul_descriptor descriptor = {
                 .slot = gate_linear_slot,
                 .format = gate_up_quant_format,
                 .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
                 .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR,
-                .fallback_pipeline = block_q4_k ? runtime->q4_k_pair_pipeline : runtime->q8_0_pair_pipeline,
+                .fallback_pipeline = block_q4_k ? runtime->q4_k_pair_pipeline : runtime->q6_k_pair_pipeline,
                 .input_buffer = gate_input_buffer,
                 .input_offset = gate_input_offset,
                 .weight_buffer = gate_view.weight_buffer,
@@ -27507,13 +27551,13 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                         hidden_size,
                         intermediate_size,
                         -16) != 0) return -16;
-            } else if (!gate_up_pair_done) {
+            } else if (!gate_up_pair_done && (block_q4_k || block_q6_k)) {
                 termite_metal_quant_matmul_descriptor descriptor = {
                     .slot = gate_linear_slot,
                     .format = gate_up_quant_format,
                     .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
                     .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR,
-                    .fallback_pipeline = block_q4_k ? runtime->q4_k_pair_pipeline : runtime->q8_0_pair_pipeline,
+                    .fallback_pipeline = block_q4_k ? runtime->q4_k_pair_pipeline : runtime->q6_k_pair_pipeline,
                     .input_buffer = gate_input_buffer,
                     .input_offset = gate_input_offset,
                     .weight_buffer = gate_view.weight_buffer,
@@ -27528,6 +27572,43 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                     .failure_code = -16,
                 };
                 if (termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor) != 0) return -16;
+            } else if (!gate_up_pair_done) {
+                termite_metal_quant_matmul_descriptor gate_descriptor = {
+                    .slot = gate_linear_slot,
+                    .format = gate_up_quant_format,
+                    .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+                    .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
+                    .fallback_pipeline = gate_view.pipeline,
+                    .input_buffer = gate_input_buffer,
+                    .input_offset = gate_input_offset,
+                    .weight_buffer = gate_view.weight_buffer,
+                    .output_buffer = gate_output_buffer,
+                    .rows = rows,
+                    .in_dim = hidden_size,
+                    .out_dim = intermediate_size,
+                    .values_per_block = gate_view.values_per_block,
+                    .bytes_per_block = gate_view.bytes_per_block,
+                    .failure_code = -16,
+                };
+                if (termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &gate_descriptor) != 0) return -16;
+                termite_metal_quant_matmul_descriptor up_descriptor = {
+                    .slot = up_linear_slot,
+                    .format = gate_up_quant_format,
+                    .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+                    .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
+                    .fallback_pipeline = up_view.pipeline,
+                    .input_buffer = gate_input_buffer,
+                    .input_offset = gate_input_offset,
+                    .weight_buffer = up_view.weight_buffer,
+                    .output_buffer = up_output_buffer,
+                    .rows = rows,
+                    .in_dim = hidden_size,
+                    .out_dim = intermediate_size,
+                    .values_per_block = up_view.values_per_block,
+                    .bytes_per_block = up_view.bytes_per_block,
+                    .failure_code = -16,
+                };
+                if (termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &up_descriptor) != 0) return -16;
             }
 
             id<MTLComputeCommandEncoder> gated_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_FFN);
@@ -32093,11 +32174,13 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
     if (use_paged_kv && suffix_tokens != 0 && (k_handle == NULL || v_handle == NULL)) return -1;
     const bool attention_q8_0 = attention_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0;
     const bool attention_q4_k = attention_quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_K;
+    const bool attention_q5_k = attention_quant_format == TERMITE_METAL_QUANT_FORMAT_Q5_K;
+    const bool attention_q6_k = attention_quant_format == TERMITE_METAL_QUANT_FORMAT_Q6_K;
     const bool all_block_q8_0 = attention_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
         ffn_gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
         ffn_down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
         (ple_quant_format == TERMITE_METAL_QUANT_FORMAT_UNSUPPORTED || ple_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0);
-    if (!attention_q8_0 && !attention_q4_k) return -1;
+    if (!attention_q8_0 && !attention_q4_k && !attention_q5_k && !attention_q6_k) return -1;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     if (runtime->attention_f32_pipeline == nil) return -2;
     if (q_len == 0 || kv_tokens == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0) return -3;
@@ -32234,11 +32317,11 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                 ffn_ple_done = true;
                 if (timing != NULL) {
                     if (!use_paged_kv) timing->attention_f32_kernels += 1;
-                    timing->q8_0_linear_kernels += 4;
-                    timing->q8_0_attention_linear_kernels += 1;
-                    timing->q8_0_ffn_down_linear_kernels += 1;
-                    timing->q8_0_ple_linear_kernels += 2;
-                    timing->q8_0_pair_activation_kernels += 1;
+                    timing->quant_linear_kernels += 4;
+                    timing->quant_attention_linear_kernels += 1;
+                    timing->quant_ffn_down_linear_kernels += 1;
+                    timing->quant_ple_linear_kernels += 2;
+                    timing->quant_gate_up_pair_kernels += 1;
                     timing->rms_norm_add_kernels += 3;
                     timing->gated_ffn_residual_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
                 }
@@ -32295,8 +32378,8 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                     attention_residual_done = true;
                     if (timing != NULL) {
                         timing->attention_f32_kernels += 1;
-                        timing->q8_0_linear_kernels += 1;
-                        timing->q8_0_attention_linear_kernels += 1;
+                        timing->quant_linear_kernels += 1;
+                        timing->quant_attention_linear_kernels += 1;
                         timing->rms_norm_add_kernels += 1;
                         timing->attention_span_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
                     }
@@ -32482,8 +32565,9 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                     attn_added_buffer
                 );
             } else {
-                rc = termite_metal_decode_runtime_encode_attention_quantized_residual_q4_k_slot(
+                rc = termite_metal_decode_runtime_encode_attention_quantized_residual_k_slot(
                     runtime,
+                    attention_quant_format,
                     command_buffer,
                     attention_output_buffer,
                     attention_pre_linear_rms_norm_slot,
@@ -32505,8 +32589,8 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
             }
             if (rc == 0 && timing != NULL) {
                 if (attention_pre_linear_rms_norm_slot != SIZE_MAX) timing->rms_norm_kernels += 1;
-                timing->q8_0_linear_kernels += 1;
-                timing->q8_0_attention_linear_kernels += 1;
+                timing->quant_linear_kernels += 1;
+                timing->quant_attention_linear_kernels += 1;
                 if (attention_post_linear_rms_norm_slot != SIZE_MAX) {
                     timing->rms_norm_add_kernels += 1;
                 } else {
@@ -32587,10 +32671,10 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
             if (rc == 0) {
                 ffn_ple_done = true;
                 if (timing != NULL) {
-                    timing->q8_0_pair_activation_kernels += 1;
-                    timing->q8_0_linear_kernels += 3;
-                    timing->q8_0_ffn_down_linear_kernels += 1;
-                    timing->q8_0_ple_linear_kernels += 2;
+                    timing->quant_gate_up_pair_kernels += 1;
+                    timing->quant_linear_kernels += 3;
+                    timing->quant_ffn_down_linear_kernels += 1;
+                    timing->quant_ple_linear_kernels += 2;
                     timing->rms_norm_add_kernels += 2;
                     timing->gated_ffn_residual_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
                 }
@@ -32635,10 +32719,20 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                 timing->failure_code = rc;
             }
             if (rc == 0 && timing != NULL) {
-                timing->q8_0_pair_activation_kernels += 1;
+                const bool ffn_split_gate_up_linear =
+                    ffn_gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q5_K ||
+                    (ffn_gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
+                        q_len >= 9u &&
+                        runtime->q8_0_pair_activation_mm_pipeline == nil &&
+                        runtime->q8_0_mm_pipeline != nil);
+                if (ffn_split_gate_up_linear) {
+                    timing->quant_linear_kernels += 3;
+                } else {
+                    timing->quant_gate_up_pair_kernels += 1;
+                    timing->quant_linear_kernels += 1;
+                }
                 if (ffn_post_gate_rms_norm_slot != SIZE_MAX) timing->rms_norm_kernels += 1;
-                timing->q8_0_linear_kernels += 1;
-                timing->q8_0_ffn_down_linear_kernels += 1;
+                timing->quant_ffn_down_linear_kernels += 1;
                 if (ffn_post_down_rms_norm_slot != SIZE_MAX) {
                     timing->rms_norm_add_kernels += 1;
                 } else {
@@ -32678,8 +32772,8 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                 timing->failure_code = rc;
             }
             if (rc == 0 && timing != NULL) {
-                timing->q8_0_linear_kernels += 2;
-                timing->q8_0_ple_linear_kernels += 2;
+                timing->quant_linear_kernels += 2;
+                timing->quant_ple_linear_kernels += 2;
                 timing->rms_norm_add_kernels += 1;
             }
         }
