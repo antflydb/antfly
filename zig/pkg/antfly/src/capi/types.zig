@@ -188,6 +188,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.FileNotFound => .not_found,
         error.WouldBlock,
         error.WriterLocked,
+        error.FileBusy,
         => .busy,
         else => .internal,
     };

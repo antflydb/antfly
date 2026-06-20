@@ -253,7 +253,8 @@ Antfly Lite should match the familiar embedded database model:
 - Multiple concurrent readers where backend snapshots support it.
 - Cross-process locking for the database path.
 - Read-only opens for tooling and inspection.
-- Clear errors when another process owns the writer lock.
+- Clear `ANTFLY_BUSY` errors when another process or in-process write handle
+  owns the writer lock.
 
 The CLI should expose this plainly:
 
