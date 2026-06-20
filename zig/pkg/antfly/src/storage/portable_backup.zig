@@ -39,6 +39,23 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     const pairs = try store.scanRange(alloc, "", "");
     defer DocStore.freeResults(alloc, pairs);
 
+    var document_timestamps = std.StringHashMapUnmanaged(u64).empty;
+    defer {
+        var it = document_timestamps.iterator();
+        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+        document_timestamps.deinit(alloc);
+    }
+    for (pairs) |kv| {
+        if (!internal_keys.isTtlKey(kv.key) or kv.value.len < 8) continue;
+        const doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, kv.key)) orelse continue;
+        errdefer alloc.free(doc_key);
+        const gop = try document_timestamps.getOrPut(alloc, doc_key);
+        if (gop.found_existing) {
+            alloc.free(doc_key);
+        }
+        gop.value_ptr.* = std.mem.readInt(u64, kv.value[0..8], .little);
+    }
+
     // Write file header
     const backup_id = [_]u8{0} ** 16; // zero UUID for now
     try backup_codec.writeHeader(out, alloc, .{
@@ -151,7 +168,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
                     .key = try alloc.dupe(u8, user_key),
                     .value_flags = 0,
                     .value = try alloc.dupe(u8, kv.value),
-                    .timestamp_ns = 0,
+                    .timestamp_ns = document_timestamps.get(user_key) orelse 0,
                 });
                 doc_batch_bytes += user_key.len + kv.value.len;
 
@@ -392,6 +409,12 @@ fn flushDocBatch(
         alloc.free(e.value);
     }
     batch.clearRetainingCapacity();
+}
+
+fn timestampValueAlloc(alloc: Allocator, timestamp_ns: u64) ![]u8 {
+    const value = try alloc.alloc(u8, 8);
+    std.mem.writeInt(u64, value[0..8], timestamp_ns, .little);
+    return value;
 }
 
 fn flushIdentityBatch(
@@ -670,6 +693,13 @@ fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
             try alloc.dupe(u8, e.value);
         try owned_keys.append(alloc, value);
         try writes.append(alloc, .{ .key = store_key, .value = value });
+        if (e.timestamp_ns != 0) {
+            const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, e.key);
+            try owned_keys.append(alloc, timestamp_key);
+            const timestamp_value = try timestampValueAlloc(alloc, e.timestamp_ns);
+            try owned_keys.append(alloc, timestamp_value);
+            try writes.append(alloc, .{ .key = timestamp_key, .value = timestamp_value });
+        }
     }
 
     if (writes.items.len > 0) {
@@ -1057,6 +1087,66 @@ test "export and import documents round trip" {
         defer alloc.free(val);
         try std.testing.expectEqualStrings(expected, val);
     }
+}
+
+test "export and import documents preserve timestamps" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_key = "doc:ttl";
+    const timestamp_ns: u64 = 1_700_000_000_000_000_123;
+    const store_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(store_key);
+    const ttl_key = try internal_keys.ttlKeyAlloc(alloc, doc_key);
+    defer alloc.free(ttl_key);
+    const ttl_value = try timestampValueAlloc(alloc, timestamp_ns);
+    defer alloc.free(ttl_value);
+    try src.putBatch(&.{
+        .{ .key = store_key, .value = "{\"id\":\"doc:ttl\"}" },
+        .{ .key = ttl_key, .value = ttl_value },
+    }, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var saw_timestamp = false;
+    var reader = backup_codec.SliceReader.init(out.items);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .document_batch) continue;
+        const entries = try backup_codec.decodeDocumentBatch(alloc, block.payload);
+        defer {
+            for (entries) |entry| {
+                alloc.free(entry.key);
+                alloc.free(entry.value);
+            }
+            alloc.free(entries);
+        }
+        for (entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, doc_key)) continue;
+            try std.testing.expectEqual(timestamp_ns, entry.timestamp_ns);
+            saw_timestamp = true;
+        }
+    }
+    try std.testing.expect(saw_timestamp);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const restored_ttl = try dst.get(alloc, ttl_key);
+    defer alloc.free(restored_ttl);
+    try std.testing.expectEqual(@as(usize, 8), restored_ttl.len);
+    try std.testing.expectEqual(timestamp_ns, std.mem.readInt(u64, restored_ttl[0..8], .little));
 }
 
 test "export and import preserves doc identity metadata" {
