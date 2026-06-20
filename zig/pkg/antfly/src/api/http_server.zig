@@ -20695,17 +20695,39 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         .import_rows => return error.TestUnexpectedResult,
         .export_stdout => |exported| try std.testing.expectEqualStrings("id,status\n\"u1\",\"Ready\"\n", exported),
     }
-    try std.testing.expectEqual(@as(usize, 2), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[1].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[1].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[1].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdout, audit.events[1].stream);
-    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[1].required_permission);
-    try std.testing.expectEqualStrings("alice", audit.events[1].authenticated_subject orelse return error.TestUnexpectedResult);
-    try std.testing.expectEqualStrings("tenant_ops", audit.events[1].database_name);
-    try std.testing.expectEqualStrings("analytics", audit.events[1].namespace_name);
-    try std.testing.expectEqualStrings("events", audit.events[1].table_name);
-    try std.testing.expectEqual(@as(usize, 1), audit.events[1].row_count);
+    try std.testing.expectEqual(@as(usize, 3), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[2].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[2].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[2].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdout, audit.events[2].stream);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.csv, audit.events[2].codec);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[2].required_permission);
+    try std.testing.expectEqualStrings("alice", audit.events[2].authenticated_subject orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("tenant_ops", audit.events[2].database_name);
+    try std.testing.expectEqualStrings("analytics", audit.events[2].namespace_name);
+    try std.testing.expectEqualStrings("events", audit.events[2].table_name);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[2].row_count);
+
+    var exported_text_result = try server.executeBulkSqlWithSession(
+        "COPY events (id, status) TO STDOUT WITH (FORMAT text);",
+        null,
+        session,
+        &identity,
+    );
+    defer exported_text_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.calls);
+    switch (exported_text_result) {
+        .import_rows => return error.TestUnexpectedResult,
+        .export_stdout => |exported| try std.testing.expectEqualStrings("u1\tReady\n", exported),
+    }
+    try std.testing.expectEqual(@as(usize, 4), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[3].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[3].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[3].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdout, audit.events[3].stream);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.postgres_text, audit.events[3].codec);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[3].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[3].row_count);
 
     try std.testing.expectError(
         error.InvalidRowsRequest,

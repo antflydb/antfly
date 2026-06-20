@@ -279,7 +279,10 @@ pub fn exportRowsCsvToStdoutAlloc(
     const columns = try exportColumnsAlloc(alloc, schema, plan);
     defer alloc.free(columns);
 
-    const delimiter = try singleByteOption(plan.delimiter, ',');
+    const delimiter = try singleByteOption(plan.delimiter, switch (plan.codec) {
+        .csv => ',',
+        .postgres_text => '\t',
+    });
     const quote = try singleByteOption(plan.quote, '"');
     const escape = try singleByteOption(plan.escape, quote);
 

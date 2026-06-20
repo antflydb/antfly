@@ -63501,7 +63501,6 @@ test "postgres sql adapter merge mutation batch executes through relational stor
     try std.testing.expectEqualStrings("{\"id\":\"new1\",\"status\":\"INSERTED\",\"organization_id\":\"org:2\"}", rows.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"updated\",\"organization_id\":\"org:1\"}", rows.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"t_skip\",\"status\":\"closed\",\"organization_id\":\"org:1\"}", rows.rows[2]);
-
 }
 
 test "postgres sql adapter merge mutation batch applies default expressions" {

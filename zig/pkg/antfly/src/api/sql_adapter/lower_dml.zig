@@ -698,6 +698,7 @@ test "sql adapter lower dml detects json set path conflicts" {
 }
 
 test "sql adapter lower dml detects merge target row usage" {
+    const alloc = std.testing.allocator;
     const source_field = runtime_schema.RelationalRowsExpression{
         .kind = .field,
         .field = "status",
@@ -725,4 +726,31 @@ test "sql adapter lower dml detects merge target row usage" {
     try std.testing.expect(mergeExpressionUsesTargetRow(target_field));
     try std.testing.expect(!mergeExpressionPredicateGroupsUseTargetRow(&source_groups));
     try std.testing.expect(mergeExpressionPredicateGroupsUseTargetRow(&target_groups));
+
+    var distinct_row = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":\"open\",\"optional\":null}", .{});
+    defer distinct_row.deinit();
+    try std.testing.expect(try mergePredicateMatches(alloc, distinct_row.value, .{
+        .side = .source,
+        .field = "status",
+        .op = .is_distinct,
+        .value_json = "\"closed\"",
+    }));
+    try std.testing.expect(!try mergePredicateMatches(alloc, distinct_row.value, .{
+        .side = .source,
+        .field = "status",
+        .op = .is_not_distinct,
+        .value_json = "\"closed\"",
+    }));
+    try std.testing.expect(!try mergePredicateMatches(alloc, distinct_row.value, .{
+        .side = .source,
+        .field = "optional",
+        .op = .is_distinct,
+        .value_json = "null",
+    }));
+    try std.testing.expect(try mergePredicateMatches(alloc, distinct_row.value, .{
+        .side = .source,
+        .field = "optional",
+        .op = .is_not_distinct,
+        .value_json = "null",
+    }));
 }
