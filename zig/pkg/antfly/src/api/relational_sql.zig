@@ -3387,6 +3387,13 @@ const Parser = struct {
         };
     }
 
+    fn booleanExpressionParserHooks(self: *@This()) sql_adapter.BooleanExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseNullifRowExpressionOperandHook,
+        };
+    }
+
     fn jsonBuildObjectRowExpressionParserHooks(self: *@This()) sql_adapter.JsonBuildObjectRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -15732,35 +15739,7 @@ const Parser = struct {
         lhs: db_mod.types.RelationalRowsExpression,
         min_precedence: u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-        var current = lhs;
-        var current_owned = true;
-        errdefer if (current_owned) freeExpression(self.alloc, current);
-
-        while (sql_adapter.peekBooleanOperator(self.tokens, self.pos)) |op| {
-            if (op.precedence < min_precedence) break;
-            if (!self.matchKeyword(op.keyword)) unreachable;
-            var rhs = try self.parseRowExpressionOperandAlloc();
-            var rhs_owned = true;
-            errdefer if (rhs_owned) freeExpression(self.alloc, rhs);
-            try self.rowExpressionTypeContext().validateBooleanRowExpression(rhs);
-
-            while (sql_adapter.peekBooleanOperator(self.tokens, self.pos)) |next_op| {
-                if (next_op.precedence <= op.precedence) break;
-                rhs_owned = false;
-                rhs = try self.parseBooleanExpressionRestAlloc(rhs, next_op.precedence);
-                rhs_owned = true;
-            }
-
-            const expression = try sql_adapter.buildBinaryExpressionAlloc(self.alloc, op.kind, current, rhs);
-            current_owned = false;
-            rhs_owned = false;
-            current = expression;
-            current_owned = true;
-        }
-
-        current_owned = false;
-        return current;
+        return try sql_adapter.parseBooleanExpressionRestAlloc(self.alloc, self.tokens, &self.pos, lhs, min_precedence, self.rowExpressionTypeContext(), self.booleanExpressionParserHooks());
     }
 
     fn parsePipeConcatExpressionRestAlloc(
