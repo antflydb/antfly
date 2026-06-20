@@ -171,7 +171,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("indexes JSON %q did not contain configured index", indexes)
 	}
 
-	denseIndex := []byte(`{"name":"dv_embedding_v1","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}"}`)
+	denseIndex := []byte(`{"name":"dv_embedding_v1","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}"}`)
 	if err := db.AddIndexJSON(denseIndex); err != nil {
 		t.Fatalf("add dense index: %v", err)
 	}
@@ -183,10 +183,32 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("indexes JSON %q did not contain configured dense index", indexes)
 	}
 
-	err = db.Batch([]WriteIntent{{
-		Key:   "doc:go-search",
-		Value: []byte(`{"title":"searchable","body":"go binding full text search","embedding":[1.0,0.0]}`),
-	}}, 2)
+	sparseIndex := []byte(`{"name":"sv_embedding_v1","kind":"sparse_vector","config_json":"{\"field\":\"sparse_embedding\",\"external\":true}"}`)
+	if err := db.AddIndexJSON(sparseIndex); err != nil {
+		t.Fatalf("add sparse index: %v", err)
+	}
+	graphIndex := []byte(`{"name":"gr_links_v1","kind":"graph","config_json":"{}"}`)
+	if err := db.AddIndexJSON(graphIndex); err != nil {
+		t.Fatalf("add graph index: %v", err)
+	}
+	indexes, err = db.IndexesJSON()
+	if err != nil {
+		t.Fatalf("list indexes after retrieval indexes: %v", err)
+	}
+	if !bytes.Contains(indexes, []byte("sv_embedding_v1")) || !bytes.Contains(indexes, []byte("gr_links_v1")) {
+		t.Fatalf("indexes JSON %q did not contain configured sparse and graph indexes", indexes)
+	}
+
+	err = db.Batch([]WriteIntent{
+		{
+			Key:   "doc:go-search",
+			Value: []byte(`{"title":"searchable","body":"go binding full text search hybrid alpha","_embeddings":{"dv_embedding_v1":[1.0,0.0],"sv_embedding_v1":{"indices":[7,42],"values":[1.5,0.5]}},"_edges":{"gr_links_v1":{"links":[{"target":"doc:go-related","weight":1.0}]}}}`),
+		},
+		{
+			Key:   "doc:go-related",
+			Value: []byte(`{"title":"related","body":"go graph target"}`),
+		},
+	}, 2)
 	if err != nil {
 		t.Fatalf("batch searchable document: %v", err)
 	}
@@ -218,20 +240,26 @@ func TestLiteCAPI(t *testing.T) {
 	if !bytes.Contains(scan, []byte("go binding full text search")) {
 		t.Fatalf("scan JSON %q did not contain searchable document", scan)
 	}
-	search, err := db.SearchJSON([]byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`))
-	if err != nil {
-		t.Fatalf("search: %v", err)
+	fullTextQuery := []byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`)
+	denseQuery := []byte(`{"embeddings":{"dv_embedding_v1":[1.0,0.0]},"indexes":["dv_embedding_v1"],"limit":1}`)
+	sparseQuery := []byte(`{"embeddings":{"sv_embedding_v1":{"indices":[7,42],"values":[1.5,0.5]}},"indexes":["sv_embedding_v1"],"limit":1}`)
+	graphQuery := []byte(`{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"gr_links_v1","start_nodes":{"keys":["doc:go-search"]},"params":{"edge_types":["links"]}}},"limit":10}`)
+	hybridQuery := []byte(`{"full_text_search":{"match":{"field":"body","text":"hybrid alpha"}},"embeddings":{"dv_embedding_v1":[1.0,0.0]},"indexes":["dv_embedding_v1"],"merge_config":{"strategy":"rrf"},"limit":3}`)
+	assertSearchContains := func(handle *DB, label string, request []byte, want string) {
+		t.Helper()
+		result, err := handle.SearchJSON(request)
+		if err != nil {
+			t.Fatalf("%s search: %v", label, err)
+		}
+		if !bytes.Contains(result, []byte(want)) {
+			t.Fatalf("%s search JSON %q did not contain %q", label, result, want)
+		}
 	}
-	if !bytes.Contains(search, []byte("go binding full text search")) {
-		t.Fatalf("search JSON %q did not contain searchable document", search)
-	}
-	denseSearch, err := db.SearchJSON([]byte(`{"mode":"dense","index_name":"dv_embedding_v1","vector":[1.0,0.0],"k":1,"limit":1}`))
-	if err != nil {
-		t.Fatalf("dense search: %v", err)
-	}
-	if !bytes.Contains(denseSearch, []byte("go binding full text search")) {
-		t.Fatalf("dense search JSON %q did not contain caller-supplied embedding document", denseSearch)
-	}
+	assertSearchContains(db, "full-text", fullTextQuery, "go binding full text search")
+	assertSearchContains(db, "dense", denseQuery, "doc:go-search")
+	assertSearchContains(db, "sparse", sparseQuery, "doc:go-search")
+	assertSearchContains(db, "graph", graphQuery, "doc:go-related")
+	assertSearchContains(db, "hybrid", hybridQuery, "doc:go-search")
 
 	if deleted, err := db.DeleteIndex("missing-index"); err != nil {
 		t.Fatalf("delete missing index: %v", err)
@@ -357,20 +385,11 @@ func TestLiteCAPI(t *testing.T) {
 	if !bytes.Contains(restoredLookup, []byte("go api lite")) {
 		t.Fatalf("restored lookup JSON %q did not contain written document", restoredLookup)
 	}
-	restoredSearch, err := restored.SearchJSON([]byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`))
-	if err != nil {
-		t.Fatalf("search restored document: %v", err)
-	}
-	if !bytes.Contains(restoredSearch, []byte("go binding full text search")) {
-		t.Fatalf("restored search JSON %q did not contain searchable document", restoredSearch)
-	}
-	restoredDenseSearch, err := restored.SearchJSON([]byte(`{"mode":"dense","index_name":"dv_embedding_v1","vector":[1.0,0.0],"k":1,"limit":1}`))
-	if err != nil {
-		t.Fatalf("dense search restored document: %v", err)
-	}
-	if !bytes.Contains(restoredDenseSearch, []byte("go binding full text search")) {
-		t.Fatalf("restored dense search JSON %q did not contain caller-supplied embedding document", restoredDenseSearch)
-	}
+	assertSearchContains(restored, "restored full-text", fullTextQuery, "go binding full text search")
+	assertSearchContains(restored, "restored dense", denseQuery, "doc:go-search")
+	assertSearchContains(restored, "restored sparse", sparseQuery, "doc:go-search")
+	assertSearchContains(restored, "restored graph", graphQuery, "doc:go-related")
+	assertSearchContains(restored, "restored hybrid", hybridQuery, "doc:go-search")
 	if err := restored.Close(); err != nil {
 		t.Fatalf("close restored Lite database: %v", err)
 	}
@@ -395,20 +414,11 @@ func TestLiteCAPI(t *testing.T) {
 	if err := imported.ImportBackup(backupBytes); err != nil {
 		t.Fatalf("import backup bytes: %v", err)
 	}
-	importedSearch, err := imported.SearchJSON([]byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`))
-	if err != nil {
-		t.Fatalf("search imported document: %v", err)
-	}
-	if !bytes.Contains(importedSearch, []byte("go binding full text search")) {
-		t.Fatalf("imported search JSON %q did not contain searchable document", importedSearch)
-	}
-	importedDenseSearch, err := imported.SearchJSON([]byte(`{"mode":"dense","index_name":"dv_embedding_v1","vector":[1.0,0.0],"k":1,"limit":1}`))
-	if err != nil {
-		t.Fatalf("dense search imported document: %v", err)
-	}
-	if !bytes.Contains(importedDenseSearch, []byte("go binding full text search")) {
-		t.Fatalf("imported dense search JSON %q did not contain caller-supplied embedding document", importedDenseSearch)
-	}
+	assertSearchContains(imported, "imported full-text", fullTextQuery, "go binding full text search")
+	assertSearchContains(imported, "imported dense", denseQuery, "doc:go-search")
+	assertSearchContains(imported, "imported sparse", sparseQuery, "doc:go-search")
+	assertSearchContains(imported, "imported graph", graphQuery, "doc:go-related")
+	assertSearchContains(imported, "imported hybrid", hybridQuery, "doc:go-search")
 	if err := imported.Close(); err != nil {
 		t.Fatalf("close imported Lite database: %v", err)
 	}

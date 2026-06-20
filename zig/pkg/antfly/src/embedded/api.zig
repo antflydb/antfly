@@ -982,7 +982,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         const hybrid_before = try api.searchJson(
             alloc,
-            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"ft_body\",\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
         );
         defer alloc.free(hybrid_before);
         try std.testing.expect(std.mem.indexOf(u8, hybrid_before, "\"doc:vec:a\"") != null);
@@ -1133,7 +1133,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         const hybrid_after = try restored.searchJson(
             alloc,
-            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"ft_body\",\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
         );
         defer alloc.free(hybrid_after);
         try std.testing.expect(std.mem.indexOf(u8, hybrid_after, "\"doc:vec:a\"") != null);
@@ -1196,7 +1196,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         const hybrid_after = try roundtrip.searchJson(
             alloc,
-            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"ft_body\",\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"dv_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
         );
         defer alloc.free(hybrid_after);
         try std.testing.expect(std.mem.indexOf(u8, hybrid_after, "\"doc:vec:a\"") != null);

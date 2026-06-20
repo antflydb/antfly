@@ -8028,6 +8028,34 @@ pub const DB = struct {
         return rebuilt;
     }
 
+    pub fn rebuildSparseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+
+        for (self.core.index_manager.sparse_indexes.items) |*entry| {
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+
+        var rebuilt: usize = 0;
+        for (names.items) |name| {
+            rebuilt += try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, name, 2048);
+        }
+        return rebuilt;
+    }
+
+    pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
+        try applySplitGraphArtifactsInRange(
+            alloc,
+            "",
+            "",
+            self.core.store,
+            self.core.index_manager,
+        );
+    }
+
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
@@ -8068,6 +8096,14 @@ pub const DB = struct {
             if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
             if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
             if (write.vector.len > 0) alloc.free(write.vector);
+        }
+        writes.clearRetainingCapacity();
+    }
+
+    fn freeSparseArtifactRebuildWrites(alloc: Allocator, writes: *std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite)) void {
+        for (writes.items) |write| {
+            alloc.free(write.doc_key);
+            if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
         }
         writes.clearRetainingCapacity();
     }
@@ -23293,6 +23329,88 @@ fn rebuildDenseIndexForTargetCoverageContext(
         return try rebuildDenseIndexFromPrimaryVectorsContext(ctx, index_name, rebuild_chunk_size);
     }
     return try rebuildDenseIndexFromStoredEmbeddingArtifactsContext(ctx, index_name, rebuild_chunk_size);
+}
+
+fn flushSparseArtifactRebuildChunkContext(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    writes: *std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite),
+) !void {
+    defer DB.freeSparseArtifactRebuildWrites(ctx.alloc, writes);
+    if (writes.items.len == 0) return;
+    try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(
+        ctx.store,
+        index_name,
+        writes.items,
+        .{ .mode = .bulk_ingest },
+    );
+}
+
+fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    rebuild_chunk_size: usize,
+) !usize {
+    const expected_name = ctx.index_manager.sparseEmbeddingName(index_name) orelse index_name;
+
+    const lower = try documentRangeLowerAlloc(ctx.alloc, "");
+    defer ctx.alloc.free(lower);
+
+    const ScanState = struct {
+        ctx: *AsyncContext,
+        index_name: []const u8,
+        expected_name: []const u8,
+        rebuild_chunk_size: usize,
+        writes: std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite) = .empty,
+        rebuilt: usize = 0,
+
+        fn deinit(state: *@This()) void {
+            DB.freeSparseArtifactRebuildWrites(state.ctx.alloc, &state.writes);
+            state.writes.deinit(state.ctx.alloc);
+        }
+
+        fn flush(state: *@This()) !void {
+            try flushSparseArtifactRebuildChunkContext(state.ctx, state.index_name, &state.writes);
+        }
+
+        fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+            if (!internal_keys.isInternalUserKey(key)) return .@"continue";
+
+            const identity = (try internal_keys.parseEmbeddingArtifactKeyView(key)) orelse return .@"continue";
+            if (!std.mem.eql(u8, identity.artifact_name, state.expected_name)) return .@"continue";
+
+            var sparse = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(state.ctx.alloc, value) catch |err| {
+                if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
+                return err;
+            };
+            sparse.deinit(state.ctx.alloc);
+
+            try state.writes.append(state.ctx.alloc, .{
+                .index_name = @constCast(state.index_name),
+                .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
+                .artifact_key = try state.ctx.alloc.dupe(u8, key),
+                .indices = &.{},
+                .values = &.{},
+            });
+            state.rebuilt += 1;
+
+            if (state.writes.items.len >= state.rebuild_chunk_size) try state.flush();
+            return .@"continue";
+        }
+    };
+
+    var state = ScanState{
+        .ctx = ctx,
+        .index_name = index_name,
+        .expected_name = expected_name,
+        .rebuild_chunk_size = rebuild_chunk_size,
+    };
+    defer state.deinit();
+
+    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    if (state.writes.items.len > 0) try state.flush();
+    return state.rebuilt;
 }
 
 fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {

@@ -32,6 +32,7 @@ const geo_mod = antfly.geo;
 const lite_backend = antfly.lite.backend;
 const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
+const query_api = antfly.public_api.query;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -1846,6 +1847,8 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     portable_backup.importPortable(handle.alloc, handle.db.core.store, bytes) catch |err| return capi.mapError(err);
     handle.db.core.loadIndexes() catch |err| return capi.mapError(err);
     _ = handle.db.rebuildDenseIndexesForTargetCoverage(handle.alloc) catch |err| return capi.mapError(err);
+    _ = handle.db.rebuildSparseIndexesForTargetCoverage(handle.alloc) catch |err| return capi.mapError(err);
+    handle.db.rebuildGraphIndexesForTargetCoverage(handle.alloc) catch |err| return capi.mapError(err);
     _ = handle.db.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
     handle.db.runUntilIdle() catch |err| return capi.mapError(err);
     handle.db.sync(true) catch |err| return capi.mapError(err);
@@ -1946,6 +1949,8 @@ fn restorePortableBackupToLiteFile(
         var db = try db_mod.DB.open(alloc, tmp_path, opts);
         defer db.close();
         try portable_backup.importPortable(alloc, db.core.store, backup);
+        try db.sync(true);
+        try db.syncIndexes(true);
     }
 
     {
@@ -1961,6 +1966,8 @@ fn restorePortableBackupToLiteFile(
         var db = try db_mod.DB.open(alloc, tmp_path, opts);
         defer db.close();
         _ = try db.rebuildDenseIndexesForTargetCoverage(alloc);
+        _ = try db.rebuildSparseIndexesForTargetCoverage(alloc);
+        try db.rebuildGraphIndexesForTargetCoverage(alloc);
         _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
         try db.runUntilIdle();
         try db.sync(true);
@@ -3485,12 +3492,52 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
     };
 }
 
+fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
+    return std.mem.indexOf(u8, bytes, "\"full_text_search\"") != null or
+        std.mem.indexOf(u8, bytes, "\"embeddings\"") != null or
+        std.mem.indexOf(u8, bytes, "\"graph_searches\"") != null or
+        std.mem.indexOf(u8, bytes, "\"merge_config\"") != null or
+        std.mem.indexOf(u8, bytes, "\"indexes\"") != null or
+        std.mem.indexOf(u8, bytes, "\"query\"") != null;
+}
+
+fn searchPublicQueryJson(handle: *Handle, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
+    var owned = query_api.parsePublicQueryRequest(
+        handle.alloc,
+        null,
+        "docs",
+        request_json.bytes(),
+    ) catch |err| return capi.mapError(err);
+    defer owned.deinit(handle.alloc);
+
+    stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err| return capi.mapError(err);
+    handle.prepareSearchRequest(owned.req) catch |err| return capi.mapError(err);
+
+    var result = handle.db.search(handle.alloc, owned.req) catch |err| return capi.mapError(err);
+    defer result.deinit();
+
+    var response = query_api.encodeQueryResponses(
+        handle.alloc,
+        "docs",
+        owned.req,
+        .{},
+        result,
+    ) catch |err| return capi.mapError(err);
+    defer response.deinit(handle.alloc);
+
+    out_buf.* = dupBytes(response.json) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_db_search_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (requestLooksLikePublicQueryJson(request_json.bytes())) {
+        return searchPublicQueryJson(handle, request_json, out_buf);
+    }
     const Request = struct {
         mode: []const u8,
         index_name: []const u8 = "",
