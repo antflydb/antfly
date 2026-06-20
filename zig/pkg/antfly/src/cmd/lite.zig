@@ -1311,6 +1311,44 @@ test "lite restore source can be an aflite database" {
     }
 }
 
+test "lite restore publishes staged aflite from aflite source" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-publish-source.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-publish-dst.aflite", .{tmp.sub_path});
+    defer allocator.free(dst_path);
+    const tmp_path = try restoreTempPathAlloc(allocator, dst_path);
+    defer allocator.free(tmp_path);
+
+    {
+        var source = try LiteDb.create(allocator, src_path, true);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:publish\":{\"title\":\"published from staged restore\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+
+    try restoreFromSourceFile(allocator, io, src_path, dst_path, false);
+    try std.testing.expect(pathExists(io, dst_path));
+    try std.testing.expect(!pathExists(io, tmp_path));
+
+    {
+        var restored = try LiteDb.open(allocator, dst_path, .query_readonly);
+        defer restored.close();
+        const json = try lookupJson(allocator, &restored.db, "doc:publish", "");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"published from staged restore\"") != null);
+    }
+}
+
 test "lite restore replace fails before truncating active writer target" {
     const allocator = std.testing.allocator;
 
