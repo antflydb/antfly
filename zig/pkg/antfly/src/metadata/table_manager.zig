@@ -197,9 +197,12 @@ pub const SchemaRewriteExpression = struct {
 pub const SchemaRewriteJobRecord = struct {
     job_id: u64,
     table_id: u64,
+    group_id: u64,
     schema_generation: u64,
     action: []const u8,
     reason: []const u8,
+    start_row_key: []const u8,
+    end_row_key: ?[]const u8 = null,
     state: []const u8 = schema_rewrite_declared,
     target_column: []const u8 = "",
     expression: ?runtime_schema.RelationalRowsExpression = null,
@@ -826,12 +829,16 @@ pub const TableManager = struct {
     }
 
     pub fn upsertSchemaRewriteJob(self: *TableManager, record: SchemaRewriteJobRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
         if (!self.tables.contains(record.table_id)) return error.UnknownTable;
         if (record.job_id == 0) return error.InvalidSchemaRewriteJob;
         if (record.schema_generation == 0) return error.InvalidSchemaRewriteGeneration;
         if (record.action.len == 0 or record.reason.len == 0) return error.InvalidSchemaRewriteJob;
         if (!schemaRewriteJobStateValid(record.state)) return error.InvalidSchemaRewriteJobState;
         if (record.expression != null and record.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
+        if (record.end_row_key) |end_row_key| {
+            if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidSchemaRewriteJobRange;
+        }
 
         const owned = try cloneSchemaRewriteJob(self.alloc, record);
         errdefer freeSchemaRewriteJob(self.alloc, owned);
@@ -2321,6 +2328,10 @@ pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobR
     errdefer alloc.free(action);
     const reason = try alloc.dupe(u8, record.reason);
     errdefer alloc.free(reason);
+    const start_row_key = try alloc.dupe(u8, record.start_row_key);
+    errdefer alloc.free(start_row_key);
+    const end_row_key = if (record.end_row_key) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (end_row_key) |value| alloc.free(value);
     const state = try alloc.dupe(u8, record.state);
     errdefer alloc.free(state);
     const target_column = try alloc.dupe(u8, record.target_column);
@@ -2336,9 +2347,12 @@ pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobR
     return .{
         .job_id = record.job_id,
         .table_id = record.table_id,
+        .group_id = record.group_id,
         .schema_generation = record.schema_generation,
         .action = action,
         .reason = reason,
+        .start_row_key = start_row_key,
+        .end_row_key = end_row_key,
         .state = state,
         .target_column = target_column,
         .expression = expression,
@@ -2354,6 +2368,8 @@ pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobR
 pub fn freeSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobRecord) void {
     alloc.free(record.action);
     alloc.free(record.reason);
+    alloc.free(record.start_row_key);
+    freeOwnedOptional(alloc, record.end_row_key);
     alloc.free(record.state);
     alloc.free(record.target_column);
     if (record.expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
@@ -3462,9 +3478,12 @@ test "table manager owns schema rewrite jobs" {
     try manager.upsertSchemaRewriteJob(.{
         .job_id = 9101,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = 42,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = "m",
         .target_column = "status_norm",
         .expression = status_expr,
         .lease_owner = "worker-a",
@@ -3473,9 +3492,12 @@ test "table manager owns schema rewrite jobs" {
     try manager.upsertSchemaRewriteJob(.{
         .job_id = 9102,
         .table_id = 7,
+        .group_id = 9002,
         .schema_generation = 42,
         .action = "validate",
         .reason = "constraints",
+        .start_row_key = "m",
+        .end_row_key = null,
         .state = schema_rewrite_ready,
         .completed_row_count = 12,
         .progress_row_key = "order:z",
@@ -3483,47 +3505,60 @@ test "table manager owns schema rewrite jobs" {
     try std.testing.expectError(error.UnknownTable, manager.upsertSchemaRewriteJob(.{
         .job_id = 9199,
         .table_id = 99,
+        .group_id = 9001,
         .schema_generation = 42,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
     }));
     try std.testing.expectError(error.InvalidSchemaRewriteJob, manager.upsertSchemaRewriteJob(.{
         .job_id = 0,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = 42,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
     }));
     try std.testing.expectError(error.InvalidSchemaRewriteGeneration, manager.upsertSchemaRewriteJob(.{
         .job_id = 9103,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = 0,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
     }));
     try std.testing.expectError(error.InvalidSchemaRewriteJobState, manager.upsertSchemaRewriteJob(.{
         .job_id = 9103,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = 42,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
         .state = "unknown",
     }));
     try std.testing.expectError(error.InvalidSchemaRewriteExpression, manager.upsertSchemaRewriteJob(.{
         .job_id = 9103,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = 42,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
         .expression = status_expr,
     }));
 
     try manager.upsertSchemaRewriteJob(.{
         .job_id = 9101,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = 43,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = "m",
         .state = schema_rewrite_invalid,
         .target_column = "status_norm",
         .expression = status_expr,
@@ -3572,9 +3607,12 @@ test "table manager applies schema rewrite job lifecycle operations" {
     try manager.upsertSchemaRewriteJob(.{
         .job_id = 9101,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = 42,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
     });
 
     try std.testing.expectError(error.InvalidSchemaRewriteJobLease, manager.beginSchemaRewriteJob(.{
@@ -3663,9 +3701,12 @@ test "table manager applies schema rewrite job lifecycle operations" {
     try manager.upsertSchemaRewriteJob(.{
         .job_id = 9102,
         .table_id = 7,
+        .group_id = 9002,
         .schema_generation = 42,
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "m",
+        .end_row_key = null,
     });
     try manager.beginSchemaRewriteJob(.{
         .job_id = 9102,

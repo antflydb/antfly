@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const binder = @import("binder.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const parser = @import("parser.zig");
 const runtime_schema = @import("../../storage/schema.zig");
@@ -321,6 +322,516 @@ pub fn relationalRowsExpressionConditionEqual(
         if (!relationalRowsExpressionEqual(lhs_rhs, rhs_rhs)) return false;
     }
     return true;
+}
+
+pub fn rowExpressionDeterministic(expression: runtime_schema.RelationalRowsExpression) bool {
+    if (expression.field_source != .row) return false;
+    if (expression.kind == .now or expression.kind == .uuid_v4) return false;
+    for (expression.operands) |operand| {
+        if (!rowExpressionDeterministic(operand)) return false;
+    }
+    for (expression.case_branches) |branch| {
+        if (!rowExpressionConditionDeterministic(branch.when)) return false;
+        if (!rowExpressionDeterministic(branch.then)) return false;
+    }
+    for (expression.case_else) |case_else| {
+        if (!rowExpressionDeterministic(case_else)) return false;
+    }
+    return true;
+}
+
+pub fn rowExpressionConditionDeterministic(condition: runtime_schema.RelationalRowsExpressionCondition) bool {
+    if (!rowExpressionDeterministic(condition.lhs)) return false;
+    for (condition.rhs) |rhs| {
+        if (!rowExpressionDeterministic(rhs)) return false;
+    }
+    return true;
+}
+
+pub fn validateCheckExpressionConditionForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    condition: runtime_schema.RelationalRowsExpressionCondition,
+) anyerror!void {
+    switch (condition.op) {
+        .is_null, .is_not_null => if (condition.rhs.len != 0) return error.InvalidSqlCatalog,
+        .eq, .ne, .is_distinct, .is_not_distinct, .gt, .gte, .lt, .lte => if (condition.rhs.len != 1) return error.InvalidSqlCatalog,
+    }
+    const lhs_type = try checkExpressionTypeForColumns(columns, condition.lhs);
+    if (condition.rhs.len == 0) return;
+    const rhs_type = try checkExpressionTypeForColumns(columns, condition.rhs[0]);
+    if (!checkExpressionTypesComparable(lhs_type, rhs_type)) return error.InvalidSqlCatalog;
+    switch (condition.op) {
+        .gt, .gte, .lt, .lte => if (!checkExpressionTypeOrderable(lhs_type) or !checkExpressionTypeOrderable(rhs_type)) return error.InvalidSqlCatalog,
+        else => {},
+    }
+}
+
+pub fn validateCheckExpressionForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    expression: runtime_schema.RelationalRowsExpression,
+) anyerror!void {
+    _ = try checkExpressionTypeForColumns(columns, expression);
+}
+
+pub const CheckExpressionType = union(enum) {
+    type: runtime_schema.AntflyType,
+    null,
+};
+
+fn checkExpressionContainsInterval(expression: runtime_schema.RelationalRowsExpression) bool {
+    if (expression.kind == .interval_ns or expression.kind == .interval_months) return true;
+    for (expression.operands) |operand| {
+        if (checkExpressionContainsInterval(operand)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (checkExpressionContainsInterval(branch.then)) return true;
+        if (checkExpressionContainsInterval(branch.when.lhs)) return true;
+        for (branch.when.rhs) |rhs| {
+            if (checkExpressionContainsInterval(rhs)) return true;
+        }
+    }
+    for (expression.case_else) |case_else| {
+        if (checkExpressionContainsInterval(case_else)) return true;
+    }
+    return false;
+}
+
+fn validateDateBinStrideExpressionForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    expression: runtime_schema.RelationalRowsExpression,
+) anyerror!void {
+    switch (expression.kind) {
+        .interval_ns => {
+            if (expression.operands.len != 1) return error.InvalidSqlCatalog;
+            if (checkExpressionContainsInterval(expression.operands[0])) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .numeric)) return error.InvalidSqlCatalog;
+        },
+        .interval_months => return error.InvalidSqlCatalog,
+        else => {
+            if (checkExpressionContainsInterval(expression)) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression), .numeric)) return error.InvalidSqlCatalog;
+        },
+    }
+}
+
+pub fn checkExpressionTypeForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    expression: runtime_schema.RelationalRowsExpression,
+) anyerror!CheckExpressionType {
+    if (expression.kind == .field) {
+        if (expression.field_source != .row) return error.InvalidSqlCatalog;
+        const column = binder.relationalColumnForDdl(columns, expression.field) orelse return error.InvalidSqlCatalog;
+        return .{ .type = column.field_type };
+    }
+    if (expression.kind == .value) return checkExpressionLiteralType(expression.value_json);
+
+    for (expression.case_branches) |branch| try validateCheckExpressionConditionForColumns(columns, branch.when);
+
+    switch (expression.kind) {
+        .field, .value => unreachable,
+        .now => return .{ .type = .datetime },
+        .uuid_v4 => return .{ .type = .text },
+        .regexp_replace, .regexp_substr => {
+            if (expression.kind == .regexp_replace and expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidSqlCatalog;
+            if (expression.kind == .regexp_substr and expression.operands.len != 2) return error.InvalidSqlCatalog;
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .text };
+        },
+        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .concat, .concat_ws => {
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .text };
+        },
+        .length, .octet_length, .bit_length, .ascii, .strpos => {
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .numeric };
+        },
+        .regexp_count, .regexp_instr => {
+            if (expression.operands.len != 2) return error.InvalidSqlCatalog;
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .numeric };
+        },
+        .starts_with, .ends_with, .like, .ilike => {
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .boolean };
+        },
+        .regexp_match => {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidSqlCatalog;
+            for (expression.operands[0..2]) |operand| {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
+            }
+            if (expression.operands.len == 3 and !checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[2]), .boolean)) return error.InvalidSqlCatalog;
+            return .{ .type = .boolean };
+        },
+        .bool_and, .bool_or, .bool_not => {
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, operand), .boolean)) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .boolean };
+        },
+        .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .interval_ns, .interval_months => {
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, operand), .numeric)) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .numeric };
+        },
+        .add, .sub => {
+            var saw_datetime = false;
+            for (expression.operands) |operand| {
+                const operand_type = try checkExpressionTypeForColumns(columns, operand);
+                switch (operand_type) {
+                    .type => |field_type| {
+                        if (field_type == .datetime) saw_datetime = true else if (field_type != .numeric) return error.InvalidSqlCatalog;
+                    },
+                    .null => return error.InvalidSqlCatalog,
+                }
+            }
+            return .{ .type = if (saw_datetime) .datetime else .numeric };
+        },
+        .date_trunc => {
+            if (expression.operands.len != 2) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, expression.operands[0]))) return error.InvalidSqlCatalog;
+            const value_type = try checkExpressionTypeForColumns(columns, expression.operands[1]);
+            if (!checkExpressionTypeEquals(value_type, .datetime) and !checkExpressionTypeEquals(value_type, .numeric)) return error.InvalidSqlCatalog;
+            return .{ .type = .datetime };
+        },
+        .date_bin => {
+            if (expression.operands.len != 3) return error.InvalidSqlCatalog;
+            try validateDateBinStrideExpressionForColumns(columns, expression.operands[0]);
+            const source_type = try checkExpressionTypeForColumns(columns, expression.operands[1]);
+            if (!checkExpressionTypeEquals(source_type, .datetime) and !checkExpressionTypeEquals(source_type, .numeric)) return error.InvalidSqlCatalog;
+            const origin_type = try checkExpressionTypeForColumns(columns, expression.operands[2]);
+            if (!checkExpressionTypeEquals(origin_type, .datetime) and !checkExpressionTypeEquals(origin_type, .numeric)) return error.InvalidSqlCatalog;
+            return .{ .type = .datetime };
+        },
+        .date_part => {
+            if (expression.operands.len != 2) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, expression.operands[0]))) return error.InvalidSqlCatalog;
+            const value_type = try checkExpressionTypeForColumns(columns, expression.operands[1]);
+            if (!checkExpressionTypeEquals(value_type, .datetime) and !checkExpressionTypeEquals(value_type, .numeric)) return error.InvalidSqlCatalog;
+            return .{ .type = .numeric };
+        },
+        .cast => return .{ .type = switch (expression.cast_type orelse return error.InvalidSqlCatalog) {
+            .text => .text,
+            .numeric => .numeric,
+            .bool => .boolean,
+            .datetime => .datetime,
+        } },
+        .json_extract => {
+            if (expression.operands.len != 1) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .json)) return error.InvalidSqlCatalog;
+            return .{ .type = if (expression.json_as_text) .text else .json };
+        },
+        .json_path_exists => {
+            if (expression.operands.len != 1 or expression.json_path.len == 0) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .json)) return error.InvalidSqlCatalog;
+            return .{ .type = .boolean };
+        },
+        .json_typeof => {
+            if (expression.operands.len != 1) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .json)) return error.InvalidSqlCatalog;
+            return .{ .type = .text };
+        },
+        .json_array_length => {
+            if (expression.operands.len != 1) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .json)) return error.InvalidSqlCatalog;
+            return .{ .type = .numeric };
+        },
+        .json_build_object => {
+            if (expression.operands.len % 2 != 0) return error.InvalidSqlCatalog;
+            var index: usize = 0;
+            while (index < expression.operands.len) : (index += 2) {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, expression.operands[index]))) return error.InvalidSqlCatalog;
+                _ = try checkExpressionTypeForColumns(columns, expression.operands[index + 1]);
+            }
+            return .{ .type = .json };
+        },
+        .to_jsonb => {
+            if (expression.operands.len != 1) return error.InvalidSqlCatalog;
+            _ = try checkExpressionTypeForColumns(columns, expression.operands[0]);
+            return .{ .type = .json };
+        },
+        .array_length => {
+            if (expression.operands.len != 1) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .array)) return error.InvalidSqlCatalog;
+            return .{ .type = .numeric };
+        },
+        .array_position => {
+            if (expression.operands.len != 2) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .array)) return error.InvalidSqlCatalog;
+            _ = try checkExpressionTypeForColumns(columns, expression.operands[1]);
+            return .{ .type = .numeric };
+        },
+        .array_positions => {
+            if (expression.operands.len != 2) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .array)) return error.InvalidSqlCatalog;
+            _ = try checkExpressionTypeForColumns(columns, expression.operands[1]);
+            return .{ .type = .array };
+        },
+        .array_append, .array_prepend, .array_remove => {
+            if (expression.operands.len != 2) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .array)) return error.InvalidSqlCatalog;
+            _ = try checkExpressionTypeForColumns(columns, expression.operands[1]);
+            return .{ .type = .array };
+        },
+        .array_replace => {
+            if (expression.operands.len != 3) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .array)) return error.InvalidSqlCatalog;
+            _ = try checkExpressionTypeForColumns(columns, expression.operands[1]);
+            _ = try checkExpressionTypeForColumns(columns, expression.operands[2]);
+            return .{ .type = .array };
+        },
+        .array_cat => {
+            if (expression.operands.len != 2) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .array)) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[1]), .array)) return error.InvalidSqlCatalog;
+            return .{ .type = .array };
+        },
+        .array_to_string => {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeEquals(try checkExpressionTypeForColumns(columns, expression.operands[0]), .array)) return error.InvalidSqlCatalog;
+            if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, expression.operands[1]))) return error.InvalidSqlCatalog;
+            if (expression.operands.len == 3 and !checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, expression.operands[2]))) return error.InvalidSqlCatalog;
+            return .{ .type = .text };
+        },
+        .string_to_array => {
+            for (expression.operands) |operand| {
+                if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
+            }
+            return .{ .type = .array };
+        },
+        .coalesce, .nullif, .greatest, .least => return try checkExpressionCommonType(columns, expression.operands),
+        .case => {
+            if (expression.case_else.len != 1) return error.InvalidSqlCatalog;
+            var candidate = try checkExpressionTypeForColumns(columns, expression.case_else[0]);
+            for (expression.case_branches) |branch| {
+                const branch_type = try checkExpressionTypeForColumns(columns, branch.then);
+                if (!checkExpressionTypesComparable(candidate, branch_type)) return error.InvalidSqlCatalog;
+                if (candidate == .null) candidate = branch_type;
+            }
+            return candidate;
+        },
+    }
+}
+
+fn checkExpressionCommonType(
+    columns: []const runtime_schema.RelationalColumn,
+    expressions: []const runtime_schema.RelationalRowsExpression,
+) anyerror!CheckExpressionType {
+    if (expressions.len == 0) return error.InvalidSqlCatalog;
+    var candidate = try checkExpressionTypeForColumns(columns, expressions[0]);
+    for (expressions[1..]) |expression| {
+        const expression_type = try checkExpressionTypeForColumns(columns, expression);
+        if (!checkExpressionTypesComparable(candidate, expression_type)) return error.InvalidSqlCatalog;
+        if (candidate == .null) candidate = expression_type;
+    }
+    return candidate;
+}
+
+pub fn checkExpressionLiteralType(value_json: []const u8) !CheckExpressionType {
+    if (std.mem.eql(u8, value_json, "null")) return .null;
+    if (std.mem.eql(u8, value_json, "true") or std.mem.eql(u8, value_json, "false")) return .{ .type = .boolean };
+    if (value_json.len == 0) return error.InvalidSqlCatalog;
+    return switch (value_json[0]) {
+        '"' => .{ .type = .text },
+        '[' => .{ .type = .array },
+        '{' => .{ .type = .json },
+        '-', '0'...'9' => .{ .type = .numeric },
+        else => error.InvalidSqlCatalog,
+    };
+}
+
+pub fn checkExpressionTypesComparable(lhs: CheckExpressionType, rhs: CheckExpressionType) bool {
+    if (lhs == .null or rhs == .null) return true;
+    if (checkExpressionTypeTextLike(lhs) and checkExpressionTypeTextLike(rhs)) return true;
+    return switch (lhs) {
+        .null => true,
+        .type => |lhs_type| switch (rhs) {
+            .null => true,
+            .type => |rhs_type| (lhs_type == .datetime and rhs_type == .numeric) or
+                (lhs_type == .numeric and rhs_type == .datetime) or
+                lhs_type == rhs_type,
+        },
+    };
+}
+
+pub fn checkExpressionTypeEquals(value: CheckExpressionType, expected: runtime_schema.AntflyType) bool {
+    return switch (value) {
+        .null => false,
+        .type => |actual| actual == expected,
+    };
+}
+
+pub fn checkExpressionTypeTextLike(value: CheckExpressionType) bool {
+    return switch (value) {
+        .null => false,
+        .type => |field_type| switch (field_type) {
+            .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => true,
+            else => false,
+        },
+    };
+}
+
+pub fn checkExpressionTypeOrderable(value: CheckExpressionType) bool {
+    return checkExpressionTypeTextLike(value) or
+        checkExpressionTypeEquals(value, .numeric) or
+        checkExpressionTypeEquals(value, .datetime) or
+        checkExpressionTypeEquals(value, .boolean);
+}
+
+pub fn validateGeneratedColumnExpressionForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    generated_column_name: []const u8,
+    expression: runtime_schema.RelationalRowsExpression,
+) error{InvalidSqlCatalog}!void {
+    if (expression.kind == .field) {
+        if (std.mem.eql(u8, expression.field, generated_column_name)) return error.InvalidSqlCatalog;
+        _ = binder.relationalColumnForDdl(columns, expression.field) orelse return error.InvalidSqlCatalog;
+    }
+    for (expression.operands) |operand| try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, operand);
+    for (expression.case_branches) |branch| {
+        try validateGeneratedColumnExpressionConditionForColumns(columns, generated_column_name, branch.when);
+        try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, case_else);
+}
+
+fn validateGeneratedColumnExpressionConditionForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    generated_column_name: []const u8,
+    condition: runtime_schema.RelationalRowsExpressionCondition,
+) error{InvalidSqlCatalog}!void {
+    try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, condition.lhs);
+    for (condition.rhs) |rhs| try validateGeneratedColumnExpressionForColumns(columns, generated_column_name, rhs);
+}
+
+pub fn validateUniquePredicateExpressionsForColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    conditions: []const runtime_schema.RelationalRowsExpressionCondition,
+) !void {
+    for (conditions) |condition| {
+        try validateCheckExpressionConditionForColumns(columns, condition);
+        if (!rowExpressionDeterministic(condition.lhs)) return error.InvalidSqlCatalog;
+        for (condition.rhs) |rhs| {
+            if (!rowExpressionDeterministic(rhs)) return error.InvalidSqlCatalog;
+        }
+    }
+}
+
+pub fn validateCheckForColumns(columns: []const runtime_schema.RelationalColumn, check: runtime_schema.RelationalCheck) !void {
+    if (check.expression) |condition| {
+        if (check.field.len != 0 or check.value_json != null) return error.InvalidSqlCatalog;
+        return validateCheckExpressionConditionForColumns(columns, condition);
+    }
+    const column = binder.relationalColumnForDdl(columns, check.field) orelse return error.InvalidSqlCatalog;
+    switch (check.op) {
+        .is_null, .is_not_null => if (check.value_json != null) return error.InvalidSqlCatalog,
+        .eq, .ne, .is_distinct, .is_not_distinct, .gt, .gte, .lt, .lte => {
+            const value_json = check.value_json orelse return error.InvalidSqlCatalog;
+            const field_type: CheckExpressionType = .{ .type = column.field_type };
+            const value_type = try checkExpressionLiteralType(value_json);
+            if (!checkExpressionTypesComparable(field_type, value_type)) return error.InvalidSqlCatalog;
+            switch (check.op) {
+                .gt, .gte, .lt, .lte => if (!checkExpressionTypeOrderable(field_type) or !checkExpressionTypeOrderable(value_type)) return error.InvalidSqlCatalog,
+                else => {},
+            }
+        },
+    }
+}
+
+pub fn validateGeneratedColumnForColumns(columns: []const runtime_schema.RelationalColumn, column: runtime_schema.RelationalColumn) !void {
+    const generated = column.generated orelse return;
+    switch (generated.op) {
+        .lower, .upper, .md5 => {
+            const field = generated.field orelse return error.InvalidSqlCatalog;
+            if (std.mem.eql(u8, field, column.name)) return error.InvalidSqlCatalog;
+            const source = binder.relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
+            if (source.field_type == .json or source.field_type == .array) return error.InvalidSqlCatalog;
+        },
+        .concat => {
+            if (generated.fields.len == 0) return error.InvalidSqlCatalog;
+            for (generated.fields) |field| {
+                if (std.mem.eql(u8, field, column.name)) return error.InvalidSqlCatalog;
+                const source = binder.relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
+                if (source.field_type == .json or source.field_type == .array) return error.InvalidSqlCatalog;
+            }
+        },
+        .concat_ws => {
+            if (generated.fields.len == 0) return error.InvalidSqlCatalog;
+            for (generated.fields) |field| {
+                if (std.mem.eql(u8, field, column.name)) return error.InvalidSqlCatalog;
+                const source = binder.relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
+                if (!checkExpressionTypeTextLike(.{ .type = source.field_type })) return error.InvalidSqlCatalog;
+            }
+        },
+        .expression => {
+            const expression = generated.expression orelse return error.InvalidSqlCatalog;
+            try validateGeneratedColumnExpressionForColumns(columns, column.name, expression);
+        },
+    }
+}
+
+pub fn validateCreateIndexIncludeColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    key_columns: []const []const u8,
+    include_columns: []const []const u8,
+) !void {
+    for (include_columns) |column| {
+        if (stringSlicesContains(key_columns, column)) return error.InvalidSqlCatalog;
+        const found = binder.relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+    }
+}
+
+pub fn validateUniquePredicatesForColumns(columns: []const runtime_schema.RelationalColumn, predicates: []const runtime_schema.UniquePredicate) !void {
+    for (predicates) |predicate| {
+        const found = binder.relationalColumnForDdl(columns, predicate.field) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+    }
+}
+
+pub fn validateUniqueConstraintForColumns(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod, constraint: runtime_schema.UniqueConstraint) !void {
+    if (constraint.columns.len == 0 and constraint.expressions.len == 0) return error.InvalidSqlCatalog;
+    if (constraint.without_overlaps_period) |period| {
+        _ = binder.relationalPeriodForDdl(periods, period) orelse return error.InvalidSqlCatalog;
+    }
+    for (constraint.columns) |column| {
+        const found = binder.relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+    }
+    for (constraint.expressions) |expression| {
+        switch (expression.op) {
+            .lower, .upper, .md5 => {
+                const found = binder.relationalColumnForDdl(columns, expression.field) orelse return error.InvalidSqlCatalog;
+                if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+            },
+            .expression => {
+                const row_expression = expression.expression orelse return error.InvalidSqlCatalog;
+                try validateCheckExpressionForColumns(columns, row_expression);
+                if (!rowExpressionDeterministic(row_expression)) return error.InvalidSqlCatalog;
+                if (!checkExpressionTypeOrderable(try checkExpressionTypeForColumns(columns, row_expression))) return error.InvalidSqlCatalog;
+            },
+        }
+    }
+    try validateCreateIndexIncludeColumns(columns, constraint.columns, constraint.include_columns);
+    try validateUniquePredicatesForColumns(columns, constraint.where);
+    try validateUniquePredicateExpressionsForColumns(columns, constraint.where_expressions);
+}
+
+fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
+    for (values) |candidate| {
+        if (std.mem.eql(u8, candidate, value)) return true;
+    }
+    return false;
 }
 
 pub fn validateSqlUniqueExpressionListUnique(expressions: []const runtime_schema.UniqueExpression) !void {
@@ -703,5 +1214,120 @@ test "sql adapter lower expr validates unique expression lists" {
     try std.testing.expectError(error.UnsupportedSqlShape, validateSqlUniqueExpressionListUnique(&.{
         .{ .op = .expression, .expression = lower_status },
         .{ .op = .expression, .expression = lower_status },
+    }));
+}
+
+test "sql adapter lower expr detects deterministic row expressions" {
+    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
+    const literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "\"open\"" };
+    const source_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status", .field_source = .source };
+    const now_expression: runtime_schema.RelationalRowsExpression = .{ .kind = .now };
+    const condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{literal},
+    };
+    const nondeterministic_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{now_expression},
+    };
+
+    try std.testing.expect(rowExpressionDeterministic(status_field));
+    try std.testing.expect(!rowExpressionDeterministic(source_field));
+    try std.testing.expect(!rowExpressionDeterministic(now_expression));
+    try std.testing.expect(rowExpressionConditionDeterministic(condition));
+    try std.testing.expect(!rowExpressionConditionDeterministic(nondeterministic_condition));
+}
+
+test "sql adapter lower expr validates catalog check expression types" {
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "metadata", .path = "metadata", .field_type = .json },
+    };
+    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
+    const amount_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "amount" };
+    const metadata_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "metadata" };
+    const numeric_literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "10" };
+    const now_expression: runtime_schema.RelationalRowsExpression = .{ .kind = .now };
+    const lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{status_field},
+    };
+    const valid_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = amount_field,
+        .op = .gt,
+        .rhs = &.{numeric_literal},
+    };
+    const incomparable_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{metadata_field},
+    };
+    const nondeterministic_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = amount_field,
+        .op = .eq,
+        .rhs = &.{now_expression},
+    };
+
+    try validateCheckExpressionForColumns(&columns, lower_status);
+    try validateCheckExpressionConditionForColumns(&columns, valid_condition);
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCheckExpressionConditionForColumns(&columns, incomparable_condition));
+    try validateGeneratedColumnExpressionForColumns(&columns, "status_lower", lower_status);
+    try std.testing.expectError(error.InvalidSqlCatalog, validateGeneratedColumnExpressionForColumns(&columns, "status", status_field));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniquePredicateExpressionsForColumns(&columns, &.{nondeterministic_condition}));
+}
+
+test "sql adapter lower expr validates DDL expression catalog constraints" {
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
+        .{ .name = "updated_at", .path = "updated_at", .field_type = .datetime },
+        .{ .name = "metadata", .path = "metadata", .field_type = .json },
+    };
+    const periods = [_]runtime_schema.RelationalPeriod{.{ .name = "valid_at", .start_column = "created_at", .end_column = "updated_at" }};
+    const lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    };
+
+    try validateCheckForColumns(&columns, .{ .name = "amount_positive", .field = "amount", .op = .gt, .value_json = "0" });
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCheckForColumns(&columns, .{ .name = "bad_json_order", .field = "metadata", .op = .gt, .value_json = "{}" }));
+
+    try validateGeneratedColumnForColumns(&columns, .{
+        .name = "status_lower",
+        .path = "status_lower",
+        .field_type = .keyword,
+        .generated = .{ .op = .expression, .expression = lower_status },
+    });
+    try std.testing.expectError(error.InvalidSqlCatalog, validateGeneratedColumnForColumns(&columns, .{
+        .name = "status",
+        .path = "status",
+        .field_type = .keyword,
+        .generated = .{ .op = .lower, .field = "status" },
+    }));
+
+    try validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"amount"});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"status"}));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"metadata"}));
+
+    try validateUniquePredicatesForColumns(&columns, &.{.{ .field = "status", .op = .eq, .value_json = "\"open\"" }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniquePredicatesForColumns(&columns, &.{.{ .field = "metadata", .op = .is_not_null }}));
+
+    try validateUniqueConstraintForColumns(&columns, &periods, .{
+        .name = "status_key",
+        .columns = &.{"status"},
+        .expressions = &.{.{ .op = .expression, .expression = lower_status }},
+        .include_columns = &.{"amount"},
+        .without_overlaps_period = "valid_at",
+    });
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniqueConstraintForColumns(&columns, &periods, .{
+        .name = "metadata_key",
+        .columns = &.{"metadata"},
+    }));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniqueConstraintForColumns(&columns, &periods, .{
+        .name = "empty_key",
     }));
 }

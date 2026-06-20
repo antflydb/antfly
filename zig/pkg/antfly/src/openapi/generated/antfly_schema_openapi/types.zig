@@ -215,12 +215,12 @@ pub const RowsExpression = union(enum) {
     rows_expression_value: *RowsExpressionValue,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -256,6 +256,11 @@ pub const RowsExpression = union(enum) {
             if (try parseStructuralVariant(RowsExpressionValue, allocator, source, options)) |parsed| return .{ .rows_expression_value = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {

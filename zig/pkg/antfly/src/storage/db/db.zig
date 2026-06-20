@@ -6445,6 +6445,7 @@ pub const DB = struct {
 
     pub const SchemaRewriteJobDrainOptions = struct {
         worker_id: []const u8 = "antfly-schema-rewrite-worker",
+        group_id: ?u64 = null,
         now_ms: ?u64 = null,
         lease_ttl_ms: u64 = 60_000,
         max_jobs: usize = 1,
@@ -6485,6 +6486,9 @@ pub const DB = struct {
         var progressed: usize = 0;
         for (jobs) |job| {
             if (progressed >= options.max_jobs) break;
+            if (options.group_id) |group_id| {
+                if (job.group_id != group_id) continue;
+            }
             if (!schemaRewriteJobClaimableForDrain(job, now_ms)) continue;
 
             try service.beginSchemaRewriteJob(.{
@@ -6533,6 +6537,10 @@ pub const DB = struct {
         if (job.lease_owner.len == 0) return error.SchemaRewriteJobLeaseMismatch;
         if (job.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
         const expression = job.expression orelse return error.InvalidSchemaRewriteExpression;
+        const local_range = self.getRange();
+        if (!std.mem.eql(u8, job.start_row_key, local_range.start) or !optionalStringsEqual(job.end_row_key, if (local_range.end.len == 0) null else local_range.end)) {
+            return error.SchemaRewriteJobRangeMismatch;
+        }
 
         lockApply(self);
         defer self.core.unlockApply();
@@ -6550,7 +6558,7 @@ pub const DB = struct {
         const target_column = relationalRowsFindColumn(runtime_schema.relational_columns, job.target_column) orelse return error.InvalidSchemaRewriteExpression;
         try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
 
-        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, self.getRange().start, self.getRange().end);
+        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, local_range.start, local_range.end);
         defer relational_store_mod.freeRows(alloc, rows);
 
         var report: relational_store_mod.RowRewriteReport = .{ .scanned_rows = @intCast(rows.len) };
@@ -6595,7 +6603,7 @@ pub const DB = struct {
         }
 
         if (writes.items.len > 0 or deletes.items.len > 0) try self.core.store.putBatch(writes.items, deletes.items);
-        const progress_row_key = try alloc.dupe(u8, self.getRange().end);
+        const progress_row_key = try alloc.dupe(u8, local_range.end);
         return .{ .report = report, .progress_row_key = progress_row_key };
     }
 
@@ -44666,9 +44674,12 @@ test "db executes claimed schema rewrite job expressions over relational rows" {
     const job = metadata_table_manager.SchemaRewriteJobRecord{
         .job_id = 44,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
         .state = metadata_table_manager.schema_rewrite_running,
         .target_column = "status_key",
         .expression = expression,
@@ -44764,9 +44775,12 @@ test "db drains metadata schema rewrite jobs through claim and finish lifecycle"
     try service.manager.upsertSchemaRewriteJob(.{
         .job_id = 44,
         .table_id = 7,
+        .group_id = 9001,
         .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
         .action = "rewrite",
         .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
         .target_column = "status_key",
         .expression = .{
             .kind = .lower,
@@ -44779,12 +44793,14 @@ test "db drains metadata schema rewrite jobs through claim and finish lifecycle"
 
     try std.testing.expectEqual(@as(usize, 1), try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
         .worker_id = "worker-a",
+        .group_id = 9001,
         .now_ms = 1000,
         .lease_ttl_ms = 5000,
         .max_jobs = 4,
     }));
     try std.testing.expectEqual(@as(usize, 0), try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
         .worker_id = "worker-a",
+        .group_id = 9001,
         .now_ms = 2000,
         .lease_ttl_ms = 5000,
         .max_jobs = 4,

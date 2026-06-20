@@ -4574,12 +4574,12 @@ pub const RowsCoalesceOperand = union(enum) {
     rows_coalesce_value_operand: *RowsCoalesceValueOperand,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -4603,6 +4603,11 @@ pub const RowsCoalesceOperand = union(enum) {
             if (try parseStructuralVariant(RowsCoalesceValueOperand, allocator, source, options)) |parsed| return .{ .rows_coalesce_value_operand = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -5865,12 +5870,12 @@ pub const RowsWhereBranch = union(enum) {
     rows_where_branch_all: *RowsWhereBranchAll,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -5900,6 +5905,11 @@ pub const RowsWhereBranch = union(enum) {
             if (try parseStructuralVariant(RowsWhereBranchAll, allocator, source, options)) |parsed| return .{ .rows_where_branch_all = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -6148,18 +6158,23 @@ pub const IndexStats = union(enum) {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValue(FullTextIndexStats, allocator, source, options) };
+            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValue(EmbeddingsIndexStats, allocator, source, options) };
+            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValue(GraphIndexStats, allocator, source, options) };
+            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValue(AlgebraicIndexStats, allocator, source, options) };
+            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -6488,12 +6503,12 @@ pub const ContentPart = union(enum) {
     text_content_part: *TextContentPart,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -6526,6 +6541,11 @@ pub const ContentPart = union(enum) {
             if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -6759,12 +6779,12 @@ pub const RowsGetResultSet = struct {
 /// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
 pub const RowsWhere = union(enum) {
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -6778,6 +6798,11 @@ pub const RowsWhere = union(enum) {
     pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(_: @This(), _: anytype) !void {}
@@ -7630,12 +7655,12 @@ pub const RowsQueryOrder = union(enum) {
     rows_query_order_field: *RowsQueryOrderField,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -7665,6 +7690,11 @@ pub const RowsQueryOrder = union(enum) {
         return error.UnexpectedToken;
     }
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .rows_query_order_expression => |v| try jw.write(v.*),
@@ -7687,12 +7717,12 @@ pub const RowsExpression = union(enum) {
     rows_expression_value: *RowsExpressionValue,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -7728,6 +7758,11 @@ pub const RowsExpression = union(enum) {
             if (try parseStructuralVariant(RowsExpressionValue, allocator, source, options)) |parsed| return .{ .rows_expression_value = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -7955,12 +7990,12 @@ pub const RowsPlanRequest = union(enum) {
     rows_window_plan_request: *RowsWindowPlanRequest,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -8015,6 +8050,11 @@ pub const RowsPlanRequest = union(enum) {
             if (try parseStructuralVariant(RowsWindowPlanRequest, allocator, source, options)) |parsed| return .{ .rows_window_plan_request = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -8517,12 +8557,12 @@ pub const Query = union(enum) {
     query_string_query: *QueryStringQuery,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -8710,6 +8750,11 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(QueryStringQuery, allocator, source, options)) |parsed| return .{ .query_string_query = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {

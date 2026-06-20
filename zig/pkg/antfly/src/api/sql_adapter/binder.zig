@@ -43,6 +43,154 @@ pub fn relationalColumnForField(
     return null;
 }
 
+pub fn tableSchemaCatalogExists(current: runtime_schema.TableSchema) bool {
+    return current.storage_mode == .relational or
+        current.dynamic_templates.len != 0 or
+        current.full_text_documents.len != 0 or
+        current.relational_columns.len != 0 or
+        current.primary_key != null or
+        current.periods.len != 0 or
+        current.foreign_keys.len != 0 or
+        current.unique_constraints.len != 0 or
+        current.checks.len != 0;
+}
+
+pub fn relationalIndexNameExists(schema: runtime_schema.TableSchema, index_name: []const u8) bool {
+    return uniqueConstraintNameExists(schema.unique_constraints, index_name) or
+        relationalColumnIndexForIndexName(schema.relational_columns, index_name) != null;
+}
+
+pub fn relationalConstraintNameExists(schema: runtime_schema.TableSchema, table_name: []const u8, name: []const u8) bool {
+    return primaryKeyNameEquals(schema.primary_key, table_name, name) or
+        uniqueConstraintNameExists(schema.unique_constraints, name) or
+        foreignKeyNameExists(schema.foreign_keys, name) or
+        relationalCheckNameExists(schema.checks, name);
+}
+
+pub fn primaryKeyNameEquals(primary_key: ?runtime_schema.PrimaryKey, table_name: []const u8, name: []const u8) bool {
+    const key = primary_key orelse return false;
+    if (key.name) |key_name| return std.mem.eql(u8, key_name, name);
+    return defaultPrimaryKeyNameEquals(table_name, name);
+}
+
+pub fn defaultPrimaryKeyNameEquals(table_name: []const u8, name: []const u8) bool {
+    const suffix = "_pkey";
+    return name.len == table_name.len + suffix.len and
+        std.mem.startsWith(u8, name, table_name) and
+        std.mem.endsWith(u8, name, suffix);
+}
+
+pub fn relationalColumnForDdl(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+pub fn relationalColumnIndex(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?usize {
+    for (columns, 0..) |column, i| {
+        if (std.mem.eql(u8, column.name, name)) return i;
+    }
+    return null;
+}
+
+pub fn relationalColumnIndexForIndexName(columns: []const runtime_schema.RelationalColumn, index_name: []const u8) ?usize {
+    for (columns, 0..) |column, i| {
+        if (relationalColumnHasIndexName(column, index_name)) return i;
+    }
+    return null;
+}
+
+pub fn relationalColumnHasDeclaredIndexName(column: runtime_schema.RelationalColumn, index_name: []const u8) bool {
+    const declared_index_name = column.index_name orelse return false;
+    return std.mem.eql(u8, declared_index_name, index_name);
+}
+
+pub fn relationalColumnHasIndexName(column: runtime_schema.RelationalColumn, index_name: []const u8) bool {
+    const declared_index_name = column.index_name orelse column.name;
+    return std.mem.eql(u8, declared_index_name, index_name);
+}
+
+pub fn uniqueConstraintNameExists(constraints: []const runtime_schema.UniqueConstraint, name: []const u8) bool {
+    for (constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, name)) return true;
+    }
+    return false;
+}
+
+pub fn foreignKeyNameExists(foreign_keys: []const runtime_schema.ForeignKey, name: []const u8) bool {
+    for (foreign_keys) |foreign_key| {
+        if (std.mem.eql(u8, foreign_key.name, name)) return true;
+    }
+    return false;
+}
+
+pub fn relationalCheckNameExists(checks: []const runtime_schema.RelationalCheck, name: []const u8) bool {
+    for (checks) |check| {
+        if (std.mem.eql(u8, check.name, name)) return true;
+    }
+    return false;
+}
+
+pub fn relationalPeriodColumnType(field_type: runtime_schema.AntflyType) bool {
+    return field_type == .numeric or field_type == .datetime;
+}
+
+pub fn relationalPeriodForDdl(periods: []const runtime_schema.RelationalPeriod, name: []const u8) ?runtime_schema.RelationalPeriod {
+    for (periods) |period| {
+        if (std.mem.eql(u8, period.name, name)) return period;
+    }
+    return null;
+}
+
+pub fn relationalPeriodNameExists(periods: []const runtime_schema.RelationalPeriod, name: []const u8) bool {
+    return relationalPeriodForDdl(periods, name) != null;
+}
+
+pub fn validateRelationalPeriodCatalog(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod) !void {
+    for (periods, 0..) |period, i| {
+        if (relationalPeriodNameExists(periods[0..i], period.name)) return error.InvalidSqlCatalog;
+        if (std.mem.eql(u8, period.start_column, period.end_column)) return error.InvalidSqlCatalog;
+        const start_column = relationalColumnForDdl(columns, period.start_column) orelse return error.InvalidSqlCatalog;
+        const end_column = relationalColumnForDdl(columns, period.end_column) orelse return error.InvalidSqlCatalog;
+        if (!relationalPeriodColumnType(start_column.field_type) or !relationalPeriodColumnType(end_column.field_type)) return error.InvalidSqlCatalog;
+        if (start_column.field_type != end_column.field_type) return error.InvalidSqlCatalog;
+        if (period.range_type) |range_type| {
+            switch (range_type) {
+                .numrange => if (start_column.field_type != .numeric) return error.InvalidSqlCatalog,
+                .daterange, .tsrange, .tstzrange => if (start_column.field_type != .datetime) return error.InvalidSqlCatalog,
+            }
+        }
+    }
+}
+
+pub fn validatePrimaryKeyTemporalCatalog(periods: []const runtime_schema.RelationalPeriod, primary_key: runtime_schema.PrimaryKey) !void {
+    if (primary_key.without_overlaps_period) |period| {
+        _ = relationalPeriodForDdl(periods, period) orelse return error.InvalidSqlCatalog;
+    }
+}
+
+pub fn validateForeignKeyForColumns(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod, foreign_key: runtime_schema.ForeignKey) !void {
+    if (foreign_key.child_columns.len == 0 or foreign_key.child_columns.len != foreign_key.parent_columns.len) return error.InvalidSqlCatalog;
+    if ((foreign_key.child_period == null) != (foreign_key.parent_period == null)) return error.InvalidSqlCatalog;
+    if (foreign_key.child_period) |period| {
+        if (!foreignKeyActionSupportsTemporalUpdate(foreign_key.on_update)) return error.InvalidSqlCatalog;
+        _ = relationalPeriodForDdl(periods, period) orelse return error.InvalidSqlCatalog;
+    }
+    for (foreign_key.child_columns) |column| {
+        const found = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+    }
+}
+
+pub fn foreignKeyActionIsRestrictive(action: runtime_schema.ForeignKeyAction) bool {
+    return action == .restrict or action == .no_action;
+}
+
+pub fn foreignKeyActionSupportsTemporalUpdate(action: runtime_schema.ForeignKeyAction) bool {
+    return foreignKeyActionIsRestrictive(action) or action == .set_null;
+}
+
 pub fn runtimeSchemaForCatalogTableAlloc(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -683,6 +831,69 @@ test "sql adapter binder rejects ambiguous physical cte read source tables" {
             "WITH mixed AS (SELECT o.id FROM orders AS o JOIN customers AS c ON o.customer_id = c.id) SELECT mixed.id, s.id FROM mixed JOIN shipments AS s ON mixed.id = s.order_id",
         ),
     );
+}
+
+test "sql adapter binder validates relational catalog lookups" {
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword },
+        .{ .name = "email", .path = "email", .field_type = .keyword, .index_name = "users_email_idx" },
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+    };
+    const primary_key = runtime_schema.PrimaryKey{ .columns = &.{"id"} };
+    const uniques = [_]runtime_schema.UniqueConstraint{.{ .name = "users_email_key", .columns = &.{"email"} }};
+    const foreign_keys = [_]runtime_schema.ForeignKey{.{ .name = "users_org_fkey", .parent_table = "orgs" }};
+    const checks = [_]runtime_schema.RelationalCheck{.{ .name = "users_status_check", .field = "status" }};
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+        .primary_key = primary_key,
+        .unique_constraints = &uniques,
+        .foreign_keys = &foreign_keys,
+        .checks = &checks,
+    };
+
+    try std.testing.expect(tableSchemaCatalogExists(schema));
+    try std.testing.expect(relationalColumnForDdl(&columns, "email") != null);
+    try std.testing.expectEqual(@as(?usize, 1), relationalColumnIndexForIndexName(&columns, "users_email_idx"));
+    try std.testing.expect(relationalIndexNameExists(schema, "users_email_key"));
+    try std.testing.expect(relationalIndexNameExists(schema, "users_email_idx"));
+    try std.testing.expect(relationalConstraintNameExists(schema, "users", "users_pkey"));
+    try std.testing.expect(relationalConstraintNameExists(schema, "users", "users_status_check"));
+    try std.testing.expect(!relationalConstraintNameExists(schema, "users", "missing_check"));
+
+    const period_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword },
+        .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
+        .{ .name = "updated_at", .path = "updated_at", .field_type = .datetime },
+        .{ .name = "payload", .path = "payload", .field_type = .json },
+    };
+    const periods = [_]runtime_schema.RelationalPeriod{.{
+        .name = "valid_at",
+        .start_column = "created_at",
+        .end_column = "updated_at",
+        .range_type = .tstzrange,
+    }};
+    try validateRelationalPeriodCatalog(&period_columns, &periods);
+    try std.testing.expect(relationalPeriodColumnType(.datetime));
+    try std.testing.expect(relationalPeriodForDdl(&periods, "valid_at") != null);
+    try std.testing.expect(relationalPeriodNameExists(&periods, "valid_at"));
+    try validatePrimaryKeyTemporalCatalog(&periods, .{ .columns = &.{"id"}, .without_overlaps_period = "valid_at" });
+    try validateForeignKeyForColumns(&period_columns, &periods, .{
+        .name = "events_parent_fkey",
+        .parent_table = "parent_events",
+        .child_columns = &.{"id"},
+        .parent_columns = &.{"id"},
+        .child_period = "valid_at",
+        .parent_period = "valid_at",
+        .on_update = .set_null,
+    });
+    try std.testing.expect(foreignKeyActionSupportsTemporalUpdate(.restrict));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateForeignKeyForColumns(&period_columns, &periods, .{
+        .name = "events_payload_fkey",
+        .parent_table = "parent_events",
+        .child_columns = &.{"payload"},
+        .parent_columns = &.{"payload"},
+    }));
 }
 
 const TestCatalog = struct {

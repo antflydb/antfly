@@ -399,6 +399,32 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         return try http_route_helpers.jsonResponse(ctx.alloc, result);
     }
+    if (routes.Routes.matchGroupSchemaRewrite(path)) |rewrite_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(table_writes.SchemaRewriteGroupRequest, ctx.alloc, req.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid schema rewrite request");
+        defer parsed.deinit();
+        if (parsed.value.worker_id.len == 0 or parsed.value.lease_ms == 0 or parsed.value.record.group_id != rewrite_route.group_id) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid schema rewrite request");
+        }
+        const result = (writes.schemaRewriteGroupLocal(
+            ctx.alloc,
+            rewrite_route.group_id,
+            rewrite_route.table_name,
+            parsed.value.record,
+            parsed.value.worker_id,
+            parsed.value.lease_ms,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.InvalidSchemaRewriteJob, error.InvalidSchemaRewriteJobRange, error.InvalidSchemaRewriteExpression => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid schema rewrite request"),
+            error.SchemaRewriteJobClaimBusy => return try http_route_helpers.textResponse(ctx.alloc, 409, "schema rewrite claim busy"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, result);
+    }
     if (routes.Routes.matchGroupForeignKeyRefChildren(path)) |fk_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var scan_req = distributed_txn.parseForeignKeyRefChildrenRequest(ctx.alloc, if (req.body.len == 0) "{}" else req.body) catch {

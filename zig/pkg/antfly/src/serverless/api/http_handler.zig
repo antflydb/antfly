@@ -6017,7 +6017,7 @@ test "typed index status response rejects extended variant fields but raw json p
     ;
 
     try std.testing.expectError(
-        error.UnknownField,
+        error.MissingField,
         typedJsonResponse(metadata_openapi.IndexStatus, alloc, 200, body),
     );
 

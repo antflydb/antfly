@@ -107,6 +107,7 @@ pub const Routes = struct {
     pub const foreign_key_integrity_suffix = "/foreign-key-integrity";
     pub const unique_integrity_suffix = "/unique-integrity";
     pub const secondary_index_rebuild_suffix = "/secondary-index-rebuild";
+    pub const schema_rewrite_suffix = "/schema-rewrite";
     pub const foreign_key_ref_children_suffix = "/foreign-key-ref-children";
     pub const foreign_key_action_job_suffix = "/foreign-key-action-job";
     pub const foreign_key_action_job_progress_suffix = "/foreign-key-action-job-progress";
@@ -450,6 +451,11 @@ pub const Routes = struct {
     };
 
     pub const GroupSecondaryIndexRebuild = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupSchemaRewrite = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -1304,6 +1310,16 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, secondary_index_rebuild_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - secondary_index_rebuild_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupSchemaRewrite(path: []const u8) ?GroupSchemaRewrite {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, schema_rewrite_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - schema_rewrite_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }

@@ -1271,19 +1271,30 @@ fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
         .pointer => |pointer| pointer.child,
         else => ServiceType,
     };
+    if (!@hasDecl(ServiceDeclType, "adminSnapshot") or
+        !@hasDecl(ServiceDeclType, "freeAdminSnapshot") or
+        !@hasDecl(ServiceDeclType, "upsertSchemaRewriteJob"))
+    {
+        return error.UnsupportedOperation;
+    }
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
     var ordinal: u32 = 0;
     for (applied.work_items) |item| {
         if (item.action != .rewrite) continue;
         ordinal += 1;
-        if (!@hasDecl(ServiceDeclType, "upsertSchemaRewriteJob")) return error.UnsupportedOperation;
-        const job = schemaRewriteJobForAppliedDdlWorkItem(applied.table, item, ordinal);
-        try svc.upsertSchemaRewriteJob(job);
+        for (snapshot.ranges) |range| {
+            if (range.table_id != applied.table.table_id) continue;
+            const job = schemaRewriteJobForAppliedDdlWorkItem(applied.table, range, item, ordinal);
+            try svc.upsertSchemaRewriteJob(job);
+        }
     }
     _ = alloc;
 }
 
 fn schemaRewriteJobForAppliedDdlWorkItem(
     table: metadata_table_manager.TableRecord,
+    range: metadata_table_manager.RangeRecord,
     item: relational_sql.AppliedDdlWorkItem,
     ordinal: u32,
 ) metadata_table_manager.SchemaRewriteJobRecord {
@@ -1296,15 +1307,24 @@ fn schemaRewriteJobForAppliedDdlWorkItem(
     hasher.update(&[_]u8{0});
     hasher.update(@tagName(item.reason));
     hasher.update(&[_]u8{0});
+    hasher.update(std.mem.asBytes(&range.group_id));
+    hasher.update(&[_]u8{0});
+    hasher.update(range.start_key);
+    hasher.update(&[_]u8{0});
+    if (range.end_key) |end_key| hasher.update(end_key);
+    hasher.update(&[_]u8{0});
     hasher.update(std.mem.asBytes(&ordinal));
     const job_id = nonZeroId(hasher.final());
     const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
     return .{
         .job_id = job_id,
         .table_id = table.table_id,
+        .group_id = range.group_id,
         .schema_generation = schema_generation,
         .action = @tagName(item.action),
         .reason = @tagName(item.reason),
+        .start_row_key = range.start_key,
+        .end_row_key = range.end_key,
         .target_column = if (item.rewrite_expression) |rewrite| rewrite.target_column else "",
         .expression = if (item.rewrite_expression) |rewrite| rewrite.expression else null,
     };
@@ -1372,16 +1392,37 @@ test "api http server sql ddl drop table record carries catalog work items" {
 test "api http server schedules typed schema rewrite jobs from applied SQL DDL work" {
     const alloc = std.testing.allocator;
     const FakeService = struct {
-        job: ?metadata_table_manager.SchemaRewriteJobRecord = null,
+        ranges: [2]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 9001, .range_id = 9101, .table_id = 77, .start_key = "", .end_key = "m" },
+            .{ .group_id = 9002, .range_id = 9102, .table_id = 77, .start_key = "m", .end_key = null },
+        },
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord) = .empty,
 
         fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            if (self.job) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            for (self.jobs.items) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            self.jobs.deinit(allocator);
             self.* = undefined;
         }
 
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
         fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
-            if (self.job) |existing| metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, existing);
-            self.job = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+            try self.jobs.append(
+                std.testing.allocator,
+                try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record),
+            );
         }
     };
 
@@ -1419,16 +1460,23 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
     applied.deinit(alloc);
 
-    const job = service.job orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), service.jobs.items.len);
+    const job = service.jobs.items[0];
     try std.testing.expectEqual(@as(u64, 77), job.table_id);
+    try std.testing.expectEqual(@as(u64, 9001), job.group_id);
     try std.testing.expect(job.job_id != 0);
     try std.testing.expect(job.schema_generation != 0);
+    try std.testing.expectEqualStrings("", job.start_row_key);
+    try std.testing.expectEqualStrings("m", job.end_row_key.?);
     try std.testing.expectEqualStrings("rewrite", job.action);
     try std.testing.expectEqualStrings("row_images", job.reason);
     try std.testing.expectEqualStrings("status_key", job.target_column);
     const job_expression = job.expression orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.lower, job_expression.kind);
     try std.testing.expectEqualStrings("status", job_expression.operands[0].field);
+    try std.testing.expectEqual(@as(u64, 9002), service.jobs.items[1].group_id);
+    try std.testing.expectEqualStrings("m", service.jobs.items[1].start_row_key);
+    try std.testing.expect(service.jobs.items[1].end_row_key == null);
 }
 
 fn applyDatabaseCatalogPlanOnService(
@@ -5527,7 +5575,7 @@ pub const ApiHttpServer = struct {
         }
         if (std.mem.eql(u8, suffix, "rows/batch")) {
             if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
-            return try self.handlePublicCatalogTableRowsBatch(target, req.body);
+            return try self.handlePublicCatalogTableRowsBatch(target, req.body, authenticated_identity);
         }
         if (std.mem.eql(u8, suffix, "indexes")) {
             if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
@@ -6412,7 +6460,7 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsBatch(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsBatch(rows_route.table_name, req.body);
+                return try self.handlePublicTableRowsBatch(rows_route.table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
@@ -6757,6 +6805,79 @@ pub const ApiHttpServer = struct {
         if (row_filter_json == null) return true;
         const source = self.table_reads orelse return false;
         return try self.docMatchesRowFilter(source, table_name, key, row_filter_json.?);
+    }
+
+    fn requireRowsBatchSatisfiesEffectiveFilterForDatabase(
+        self: *ApiHttpServer,
+        database_name: []const u8,
+        table_name: []const u8,
+        catalog_target: ?catalog_resources.TableTarget,
+        rows_req: relational_rows_api.OwnedRowsBatchRequest,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, database_name, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const filter = row_filter_json orelse return;
+
+        const source = self.table_reads orelse return error.PermissionDenied;
+        for (rows_req.writes) |write| {
+            try self.requireExistingRowVisibleIfPresent(source, table_name, catalog_target, write.key, filter);
+            if (!(try self.docJsonMatchesRowFilter(write.key, write.value, filter))) return error.PermissionDenied;
+        }
+        for (rows_req.relational_identity_rewrites) |rewrite| {
+            try self.requireExistingRowVisible(source, table_name, catalog_target, rewrite.old_key, filter);
+            if (!(try self.docJsonMatchesRowFilter(rewrite.new_key, rewrite.value, filter))) return error.PermissionDenied;
+        }
+        for (rows_req.deletes) |key| {
+            try self.requireExistingRowVisible(source, table_name, catalog_target, key, filter);
+        }
+        for (rows_req.transforms) |transform| {
+            var lookup = (try self.lookupRowForFilter(source, table_name, catalog_target, transform.key)) orelse return error.PermissionDenied;
+            defer lookup.deinit(self.alloc);
+            if (!(try self.docJsonMatchesRowFilter(transform.key, lookup.json, filter))) return error.PermissionDenied;
+            const projected = (try db_mod.transform.resolveDocumentTransform(self.alloc, lookup.json, transform)) orelse return error.PermissionDenied;
+            defer self.alloc.free(projected);
+            if (!(try self.docJsonMatchesRowFilter(transform.key, projected, filter))) return error.PermissionDenied;
+        }
+    }
+
+    fn requireExistingRowVisibleIfPresent(
+        self: *ApiHttpServer,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        catalog_target: ?catalog_resources.TableTarget,
+        key: []const u8,
+        row_filter_json: []const u8,
+    ) !void {
+        var lookup = (try self.lookupRowForFilter(source, table_name, catalog_target, key)) orelse return;
+        defer lookup.deinit(self.alloc);
+        if (!(try self.docJsonMatchesRowFilter(key, lookup.json, row_filter_json))) return error.PermissionDenied;
+    }
+
+    fn requireExistingRowVisible(
+        self: *ApiHttpServer,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        catalog_target: ?catalog_resources.TableTarget,
+        key: []const u8,
+        row_filter_json: []const u8,
+    ) !void {
+        var lookup = (try self.lookupRowForFilter(source, table_name, catalog_target, key)) orelse return error.PermissionDenied;
+        defer lookup.deinit(self.alloc);
+        if (!(try self.docJsonMatchesRowFilter(key, lookup.json, row_filter_json))) return error.PermissionDenied;
+    }
+
+    fn lookupRowForFilter(
+        self: *ApiHttpServer,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        catalog_target: ?catalog_resources.TableTarget,
+        key: []const u8,
+    ) !?table_reads.LookupResponse {
+        if (catalog_target) |target| {
+            return try source.lookupCatalog(self.alloc, target, key, .{}, .read_index);
+        }
+        return try source.lookup(self.alloc, table_name, key, .{}, .read_index);
     }
 
     pub fn documentArtifactManifestOptionsForRequest(
@@ -9320,7 +9441,12 @@ pub const ApiHttpServer = struct {
         return try jsonResponseWithStatus(self.alloc, 201, parsed);
     }
 
-    pub fn handlePublicTableRowsBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicTableRowsBatch(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
         const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -9344,6 +9470,11 @@ pub const ApiHttpServer = struct {
             defer self.alloc.free(response_body);
             return try jsonBodyResponseWithStatus(self.alloc, 201, response_body);
         }
+
+        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(tables_api.default_database_name, table_name, null, rows_req, authenticated_identity) catch |err| switch (err) {
+            error.PermissionDenied => return try textResponse(self.alloc, 403, "row filter rejected rows batch"),
+            else => return err,
+        };
 
         var committed_via_txn = false;
         if (schema.storage_mode == .relational) {
@@ -9398,7 +9529,12 @@ pub const ApiHttpServer = struct {
         return try jsonBodyResponseWithStatus(self.alloc, 201, response_body);
     }
 
-    pub fn handlePublicCatalogTableRowsBatch(self: *ApiHttpServer, target: catalog_resources.TableTarget, body: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicCatalogTableRowsBatch(
+        self: *ApiHttpServer,
+        target: catalog_resources.TableTarget,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
         const schema = self.runtimeSchemaForCatalogRows(target) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -9422,6 +9558,13 @@ pub const ApiHttpServer = struct {
             defer self.alloc.free(response_body);
             return try jsonBodyResponseWithStatus(self.alloc, 201, response_body);
         }
+
+        const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
+        defer self.alloc.free(resource_name);
+        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(target.database_name, resource_name, target, rows_req, authenticated_identity) catch |err| switch (err) {
+            error.PermissionDenied => return try textResponse(self.alloc, 403, "row filter rejected rows batch"),
+            else => return err,
+        };
 
         _ = (source.batchCatalog(self.alloc, target, rows_req.req) catch |err| switch (err) {
             error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),

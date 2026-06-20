@@ -1932,6 +1932,36 @@ pub const SecondaryIndexRebuildGroupRequest = struct {
     lease_ms: u64 = 60_000,
 };
 
+pub const SchemaRewriteWorkerResult = struct {
+    group_id: u64,
+    table_id: u64,
+    job_id: u64,
+    claimed: bool = false,
+    completed: bool = false,
+    invalidated: bool = false,
+};
+
+pub const SchemaRewriteWorkerPassResult = struct {
+    complete: bool = true,
+    jobs_scanned: u64 = 0,
+    jobs_claimed: u64 = 0,
+    jobs_completed: u64 = 0,
+    jobs_invalidated: u64 = 0,
+    jobs_busy: u64 = 0,
+    groups: []SchemaRewriteWorkerResult = &.{},
+
+    pub fn deinit(self: *SchemaRewriteWorkerPassResult, alloc: std.mem.Allocator) void {
+        if (self.groups.len > 0) alloc.free(self.groups);
+        self.* = undefined;
+    }
+};
+
+pub const SchemaRewriteGroupRequest = struct {
+    record: metadata_table_manager.SchemaRewriteJobRecord,
+    worker_id: []const u8,
+    lease_ms: u64 = 60_000,
+};
+
 fn mergeSecondaryIndexRebuildReport(
     aggregate: *db_mod.relational_store.SecondaryIndexRebuildReport,
     next: db_mod.relational_store.SecondaryIndexRebuildReport,
@@ -2138,6 +2168,150 @@ fn runSecondaryIndexRebuildWorkerPassForCatalog(
     }
 
     result.indexes_promoted = try promoteReadySecondaryIndexesForCatalog(alloc, catalog, table_name);
+    result.groups = try groups.toOwnedSlice(alloc);
+    return result;
+}
+
+fn schemaRewriteRecordPending(record: metadata_table_manager.SchemaRewriteJobRecord) bool {
+    return std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_declared) or
+        std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_running);
+}
+
+fn findSchemaRewriteJobById(
+    records: []const metadata_table_manager.SchemaRewriteJobRecord,
+    job_id: u64,
+) ?metadata_table_manager.SchemaRewriteJobRecord {
+    for (records) |record| {
+        if (record.job_id == job_id) return record;
+    }
+    return null;
+}
+
+fn schemaRewriteJobResultState(
+    catalog: table_catalog.CatalogSource,
+    result: *SchemaRewriteWorkerResult,
+) !void {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const record = findSchemaRewriteJobById(snapshot.schema_rewrite_jobs, result.job_id) orelse return;
+    result.completed = std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_ready);
+    result.invalidated = std.mem.eql(u8, record.state, metadata_table_manager.schema_rewrite_invalid);
+}
+
+const SingleSchemaRewriteJobCatalogService = struct {
+    catalog: table_catalog.CatalogSource,
+    record: metadata_table_manager.SchemaRewriteJobRecord,
+
+    pub fn listProjectedSchemaRewriteJobs(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+        const out = try alloc.alloc(metadata_table_manager.SchemaRewriteJobRecord, 1);
+        errdefer alloc.free(out);
+        out[0] = try metadata_table_manager.cloneSchemaRewriteJob(alloc, self.record);
+        return out;
+    }
+
+    pub fn freeProjectedSchemaRewriteJobs(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+        for (records) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+        return try self.catalog.beginSchemaRewriteJob(request);
+    }
+
+    pub fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+        return try self.catalog.finishSchemaRewriteJob(request);
+    }
+
+    pub fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+        return try self.catalog.invalidateSchemaRewriteJob(request);
+    }
+};
+
+fn runSchemaRewriteJobGroupLocal(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    catalog: table_catalog.CatalogSource,
+    record: metadata_table_manager.SchemaRewriteJobRecord,
+    worker_id: []const u8,
+    now_ms: u64,
+    lease_ms: u64,
+) !SchemaRewriteWorkerResult {
+    if (worker_id.len == 0 or lease_ms == 0) return error.InvalidSchemaRewriteJobLease;
+    var result = SchemaRewriteWorkerResult{
+        .group_id = record.group_id,
+        .table_id = record.table_id,
+        .job_id = record.job_id,
+    };
+    var service = SingleSchemaRewriteJobCatalogService{ .catalog = catalog, .record = record };
+    const progressed = try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
+        .worker_id = worker_id,
+        .group_id = record.group_id,
+        .now_ms = now_ms,
+        .lease_ttl_ms = lease_ms,
+        .max_jobs = 1,
+    });
+    result.claimed = progressed != 0;
+    try schemaRewriteJobResultState(catalog, &result);
+    return result;
+}
+
+fn runSchemaRewriteWorkerPassForCatalog(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    worker_id: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+) !SchemaRewriteWorkerPassResult {
+    if (worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidSchemaRewriteJobLease;
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{};
+
+    var groups = std.ArrayListUnmanaged(SchemaRewriteWorkerResult).empty;
+    errdefer groups.deinit(alloc);
+
+    var result: SchemaRewriteWorkerPassResult = .{};
+    for (snapshot.schema_rewrite_jobs) |record| {
+        if (record.table_id != table.table_id) continue;
+        if (!schemaRewriteRecordPending(record)) continue;
+        result.jobs_scanned += 1;
+        if (result.jobs_claimed >= max_work_units) {
+            result.complete = false;
+            continue;
+        }
+
+        const one = (try source.schemaRewriteGroupLocal(
+            alloc,
+            record.group_id,
+            table_name,
+            record,
+            worker_id,
+            lease_ms,
+        )) orelse {
+            result.complete = false;
+            continue;
+        };
+        if (!one.claimed) {
+            result.jobs_busy += 1;
+            result.complete = false;
+            try groups.append(alloc, one);
+            continue;
+        }
+
+        result.jobs_claimed += 1;
+        if (one.completed) {
+            result.jobs_completed += 1;
+        } else if (one.invalidated) {
+            result.jobs_invalidated += 1;
+            result.complete = false;
+        } else {
+            result.complete = false;
+        }
+        try groups.append(alloc, one);
+    }
+
     result.groups = try groups.toOwnedSlice(alloc);
     return result;
 }
@@ -3320,6 +3494,23 @@ pub const TableWriteSource = struct {
             worker_id: []const u8,
             lease_ms: u64,
         ) anyerror!?SecondaryIndexRebuildWorkerResult = null,
+        schema_rewrite_worker_pass: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?SchemaRewriteWorkerPassResult = null,
+        schema_rewrite_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            record: metadata_table_manager.SchemaRewriteJobRecord,
+            worker_id: []const u8,
+            lease_ms: u64,
+        ) anyerror!?SchemaRewriteWorkerResult = null,
         foreign_key_integrity_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -4037,6 +4228,31 @@ pub const TableWriteSource = struct {
         lease_ms: u64,
     ) !?SecondaryIndexRebuildWorkerResult {
         const fn_ptr = self.vtable.secondary_index_rebuild_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, record, worker_id, lease_ms);
+    }
+
+    pub fn schemaRewriteWorkerPass(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?SchemaRewriteWorkerPassResult {
+        const fn_ptr = self.vtable.schema_rewrite_worker_pass orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    pub fn schemaRewriteGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SchemaRewriteJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SchemaRewriteWorkerResult {
+        const fn_ptr = self.vtable.schema_rewrite_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
@@ -10933,6 +11149,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
                 .secondary_index_rebuild_worker_pass = secondaryIndexRebuildWorkerPass,
                 .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
+                .schema_rewrite_worker_pass = ProvisionedTableWriteSource.schemaRewriteWorkerPass,
+                .schema_rewrite_group_local = ProvisionedTableWriteSource.schemaRewriteGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = ProvisionedTableWriteSource.foreignKeyIntegrityWorkUnitGroupLocal,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
@@ -12407,6 +12625,31 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?SecondaryIndexRebuildWorkerResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runProvisionedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
+    }
+
+    fn schemaRewriteWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?SchemaRewriteWorkerPassResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runSchemaRewriteWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn schemaRewriteGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SchemaRewriteJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SchemaRewriteWorkerResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runProvisionedSchemaRewriteGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     fn uniqueConstraintIntegrity(
@@ -14015,6 +14258,50 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn runProvisionedSchemaRewriteGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SchemaRewriteJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SchemaRewriteWorkerResult {
+        if (record.group_id != group_id) return error.InvalidSchemaRewriteJobRange;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            const result = try runSchemaRewriteJobGroupLocal(alloc, cached.db, self.catalog, record, worker_id, now_ms, lease_ms);
+            if (result.claimed) {
+                try drainManagedDbBeforeClose(cached.db);
+                lockAtomic(&self.local_db_mutex);
+                self.markWriteCacheDirty(table_name);
+                self.invalidateReadCache(table_name);
+                self.local_db_mutex.unlock();
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+                self.notifyLocalChange(table_name, .data);
+            }
+            return result;
+        }
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        defer db.close();
+        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+        const result = try runSchemaRewriteJobGroupLocal(alloc, &db, self.catalog, record, worker_id, now_ms, lease_ms);
+        if (result.claimed) {
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            self.notifyLocalChange(table_name, .data);
+        }
+        return result;
+    }
+
     fn collectRuntimeStatusLeasesFromWriteCacheLocked(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -14541,6 +14828,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
                 .secondary_index_rebuild_worker_pass = secondaryIndexRebuildWorkerPass,
                 .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
+                .schema_rewrite_worker_pass = HostedProvisionedTableWriteSource.schemaRewriteWorkerPass,
+                .schema_rewrite_group_local = HostedProvisionedTableWriteSource.schemaRewriteGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
@@ -14605,6 +14894,63 @@ pub const HostedProvisionedTableWriteSource = struct {
             else => return err,
         };
         return try runHostedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
+    }
+
+    fn schemaRewriteWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?SchemaRewriteWorkerPassResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runSchemaRewriteWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn schemaRewriteGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SchemaRewriteJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SchemaRewriteWorkerResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (record.group_id != group_id) return error.InvalidSchemaRewriteJobRange;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => return try runHostedSchemaRewriteGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms),
+                .remote => |remote| {
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    const body = try std.json.Stringify.valueAlloc(alloc, SchemaRewriteGroupRequest{
+                        .record = record,
+                        .worker_id = worker_id,
+                        .lease_ms = lease_ms,
+                    }, .{});
+                    defer alloc.free(body);
+                    var response = try client.fetchGroupSchemaRewrite(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    var parsed = try std.json.parseFromSlice(SchemaRewriteWorkerResult, alloc, response.body, .{
+                        .ignore_unknown_fields = true,
+                    });
+                    defer parsed.deinit();
+                    return parsed.value;
+                },
+            }
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try runHostedSchemaRewriteGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     fn foreignKeyIntegrityWorkerPass(
@@ -17050,6 +17396,27 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer cached.deinit(hosted_cache.write_cache.alloc);
         const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
         const result = try runSecondaryIndexRebuildRangeGroupLocal(cached.db, self.catalog, record, worker_id, now_ms, lease_ms);
+        if (result.claimed) try drainManagedDbBeforeClose(cached.db);
+        return result;
+    }
+
+    fn runHostedSchemaRewriteGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SchemaRewriteJobRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SchemaRewriteWorkerResult {
+        if (record.group_id != group_id) return error.InvalidSchemaRewriteJobRange;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
+        const result = try runSchemaRewriteJobGroupLocal(alloc, cached.db, self.catalog, record, worker_id, now_ms, lease_ms);
         if (result.claimed) try drainManagedDbBeforeClose(cached.db);
         return result;
     }
@@ -20352,6 +20719,148 @@ test "provisioned secondary index rebuild worker pass repairs projected catalog 
     const inactive_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:inactive");
     defer alloc.free(inactive_amount_key);
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, inactive_amount_key));
+}
+
+test "provisioned schema rewrite worker pass drains projected catalog range job" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-schema-rewrite-root", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 9001);
+    defer alloc.free(db_path);
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+
+    const range: metadata_table_manager.RangeRecord = .{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    const namespace: doc_identity.Namespace = .{
+        .table_id = 77,
+        .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+        .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+    };
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace });
+        defer db.close();
+        try db.applyTableSchemaJson(alloc, schema_v1, .{});
+        try db.batch(.{ .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }} });
+        try db.applyTableSchemaJson(alloc, schema_v2, .{});
+    }
+
+    const Catalog = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "events",
+            .placement_role = "data",
+            .indexes_json = "{}",
+            .schema_json = schema_v2,
+        },
+        range: metadata_table_manager.RangeRecord = range,
+        job: metadata_table_manager.SchemaRewriteJobRecord = .{
+            .job_id = 8101,
+            .table_id = 77,
+            .group_id = 9001,
+            .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "",
+            .end_row_key = null,
+            .target_column = "status_key",
+            .expression = .{
+                .kind = .lower,
+                .operands = &.{.{ .kind = .field, .field = "status" }},
+            },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_schema_rewrite_job = beginSchemaRewriteJob,
+                    .finish_schema_rewrite_job = finishSchemaRewriteJob,
+                    .invalidate_schema_rewrite_job = invalidateSchemaRewriteJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range))[0..1],
+                .schema_rewrite_jobs = @as([*]metadata_table_manager.SchemaRewriteJobRecord, @ptrCast(&self.job))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.job_id != self.job.job_id) return error.UnknownSchemaRewriteJob;
+            if (!std.mem.eql(u8, self.job.state, metadata_table_manager.schema_rewrite_declared)) return error.SchemaRewriteJobClaimBusy;
+            self.job.state = metadata_table_manager.schema_rewrite_running;
+            self.job.lease_owner = request.lease_owner;
+            self.job.lease_expires_at_ms = request.lease_expires_at_ms;
+            self.job.attempts += 1;
+        }
+
+        fn finishSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.job_id != self.job.job_id) return error.UnknownSchemaRewriteJob;
+            if (!std.mem.eql(u8, self.job.lease_owner, request.lease_owner)) return error.SchemaRewriteJobLeaseMismatch;
+            self.job.state = metadata_table_manager.schema_rewrite_ready;
+            self.job.lease_owner = "";
+            self.job.lease_expires_at_ms = 0;
+            self.job.completed_row_count = request.completed_row_count;
+            self.job.progress_row_key = "";
+        }
+
+        fn invalidateSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.job_id != self.job.job_id) return error.UnknownSchemaRewriteJob;
+            self.job.state = metadata_table_manager.schema_rewrite_invalid;
+            self.job.lease_owner = "";
+            self.job.lease_expires_at_ms = 0;
+            self.job.last_error = request.last_error;
+        }
+    };
+
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
+
+    var pass = (try source.source().schemaRewriteWorkerPass(alloc, "events", "worker-a", 500, 1)).?;
+    defer pass.deinit(alloc);
+    try std.testing.expect(pass.complete);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_claimed);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_completed);
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_ready, catalog.job.state);
+    try std.testing.expectEqual(@as(u64, 1), catalog.job.completed_row_count);
+
+    var reopened = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace, .prefer_existing_identity_namespace = true });
+    defer reopened.close();
+    const materialized = (try reopened.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
 }
 
 test "secondary index promotion ignores stale ready rebuild generation" {

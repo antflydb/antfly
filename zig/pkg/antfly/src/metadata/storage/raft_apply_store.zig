@@ -5341,9 +5341,12 @@ fn appendSchemaRewriteJobRecord(
 ) !void {
     try appendInt(alloc, out, u64, record.job_id);
     try appendInt(alloc, out, u64, record.table_id);
+    try appendInt(alloc, out, u64, record.group_id);
     try appendInt(alloc, out, u64, record.schema_generation);
     try appendRequiredString(alloc, out, record.action);
     try appendRequiredString(alloc, out, record.reason);
+    try appendRequiredString(alloc, out, record.start_row_key);
+    try appendOptionalString(alloc, out, record.end_row_key);
     try appendRequiredString(alloc, out, record.state);
     try appendRequiredString(alloc, out, record.target_column);
     if (record.expression) |expression| {
@@ -5841,6 +5844,19 @@ fn appendRequiredString(
     try out.appendSlice(alloc, value);
 }
 
+fn appendOptionalString(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: ?[]const u8,
+) !void {
+    if (value) |text| {
+        try out.append(alloc, 1);
+        try appendRequiredString(alloc, out, text);
+    } else {
+        try out.append(alloc, 0);
+    }
+}
+
 fn appendJsonRecord(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), record: anytype) !void {
     const json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
     defer alloc.free(json);
@@ -6216,11 +6232,16 @@ fn readSchemaRewriteJobRecord(
 ) !metadata.SchemaRewriteJobRecord {
     const job_id = try readInt(encoded, pos, u64);
     const table_id = try readInt(encoded, pos, u64);
+    const group_id = try readInt(encoded, pos, u64);
     const schema_generation = try readInt(encoded, pos, u64);
     const action = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(action);
     const reason = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(reason);
+    const start_row_key = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(start_row_key);
+    const end_row_key = try readOptionalString(alloc, encoded, pos);
+    errdefer if (end_row_key) |value| alloc.free(value);
     const state = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(state);
     const target_column = try readRequiredString(alloc, encoded, pos);
@@ -6246,9 +6267,12 @@ fn readSchemaRewriteJobRecord(
     return .{
         .job_id = job_id,
         .table_id = table_id,
+        .group_id = group_id,
         .schema_generation = schema_generation,
         .action = action,
         .reason = reason,
+        .start_row_key = start_row_key,
+        .end_row_key = end_row_key,
         .state = state,
         .target_column = target_column,
         .expression = expression,
@@ -7531,9 +7555,12 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         .upsert_schema_rewrite_job = .{
             .job_id = 9101,
             .table_id = 41,
+            .group_id = 9001,
             .schema_generation = 42,
             .action = "rewrite",
             .reason = "row_images",
+            .start_row_key = "",
+            .end_row_key = null,
             .target_column = "status_norm",
             .expression = status_expr,
         },
@@ -7561,9 +7588,12 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         .upsert_schema_rewrite_job = .{
             .job_id = 9102,
             .table_id = 41,
+            .group_id = 9002,
             .schema_generation = 42,
             .action = "validate",
             .reason = "constraints",
+            .start_row_key = "",
+            .end_row_key = null,
         },
     });
     defer std.testing.allocator.free(removed_cmd);
@@ -7575,9 +7605,12 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         .upsert_schema_rewrite_job = .{
             .job_id = 9103,
             .table_id = 41,
+            .group_id = 9003,
             .schema_generation = 42,
             .action = "validate",
             .reason = "constraints",
+            .start_row_key = "",
+            .end_row_key = null,
         },
     });
     defer std.testing.allocator.free(invalidated_cmd);
@@ -7678,9 +7711,12 @@ test "metadata raft apply store rejects stale schema rewrite lease owners" {
         .upsert_schema_rewrite_job = .{
             .job_id = 9101,
             .table_id = 41,
+            .group_id = 9001,
             .schema_generation = 42,
             .action = "rewrite",
             .reason = "row_images",
+            .start_row_key = "",
+            .end_row_key = null,
         },
     });
     defer std.testing.allocator.free(rewrite_cmd);
@@ -7893,9 +7929,12 @@ test "metadata raft apply store gates table schema compare and swap on rewrite j
         .upsert_schema_rewrite_job = .{
             .job_id = 9101,
             .table_id = 61,
+            .group_id = 9001,
             .schema_generation = rewrite_generation,
             .action = "rewrite",
             .reason = "row_images",
+            .start_row_key = "",
+            .end_row_key = null,
             .target_column = "status_norm",
             .expression = .{
                 .kind = .lower,

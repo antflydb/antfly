@@ -44,6 +44,18 @@ pub const CatalogSource = struct {
             ptr: *anyopaque,
             request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
         ) anyerror!void = null,
+        begin_schema_rewrite_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SchemaRewriteJobBeginRequest,
+        ) anyerror!void = null,
+        finish_schema_rewrite_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SchemaRewriteJobFinishRequest,
+        ) anyerror!void = null,
+        invalidate_schema_rewrite_job: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
+        ) anyerror!void = null,
         promote_secondary_index_ready: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -89,6 +101,30 @@ pub const CatalogSource = struct {
         return try fn_ptr(self.ptr, request);
     }
 
+    pub fn beginSchemaRewriteJob(
+        self: CatalogSource,
+        request: metadata_table_manager.SchemaRewriteJobBeginRequest,
+    ) !void {
+        const fn_ptr = self.vtable.begin_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn finishSchemaRewriteJob(
+        self: CatalogSource,
+        request: metadata_table_manager.SchemaRewriteJobFinishRequest,
+    ) !void {
+        const fn_ptr = self.vtable.finish_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn invalidateSchemaRewriteJob(
+        self: CatalogSource,
+        request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
+    ) !void {
+        const fn_ptr = self.vtable.invalidate_schema_rewrite_job orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
     pub fn promoteSecondaryIndexReady(
         self: CatalogSource,
         alloc: std.mem.Allocator,
@@ -117,6 +153,9 @@ pub const CatalogSource = struct {
                 .begin_secondary_index_rebuild_range = metadataServiceBeginSecondaryIndexRebuildRange,
                 .finish_secondary_index_rebuild_range = metadataServiceFinishSecondaryIndexRebuildRange,
                 .invalidate_secondary_index_rebuild_range = metadataServiceInvalidateSecondaryIndexRebuildRange,
+                .begin_schema_rewrite_job = metadataServiceBeginSchemaRewriteJob,
+                .finish_schema_rewrite_job = metadataServiceFinishSchemaRewriteJob,
+                .invalidate_schema_rewrite_job = metadataServiceInvalidateSchemaRewriteJob,
                 .promote_secondary_index_ready = metadataServicePromoteSecondaryIndexReady,
                 .compare_and_swap_table_schema = metadataServiceCompareAndSwapTableSchema,
             },
@@ -132,6 +171,9 @@ pub const CatalogSource = struct {
                 .begin_secondary_index_rebuild_range = metadataHttpServiceBeginSecondaryIndexRebuildRange,
                 .finish_secondary_index_rebuild_range = metadataHttpServiceFinishSecondaryIndexRebuildRange,
                 .invalidate_secondary_index_rebuild_range = metadataHttpServiceInvalidateSecondaryIndexRebuildRange,
+                .begin_schema_rewrite_job = metadataHttpServiceBeginSchemaRewriteJob,
+                .finish_schema_rewrite_job = metadataHttpServiceFinishSchemaRewriteJob,
+                .invalidate_schema_rewrite_job = metadataHttpServiceInvalidateSchemaRewriteJob,
                 .promote_secondary_index_ready = metadataHttpServicePromoteSecondaryIndexReady,
                 .compare_and_swap_table_schema = metadataHttpServiceCompareAndSwapTableSchema,
             },
@@ -612,6 +654,30 @@ fn metadataServiceInvalidateSecondaryIndexRebuildRange(
     return try svc.invalidateSecondaryIndexRebuildRange(request);
 }
 
+fn metadataServiceBeginSchemaRewriteJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SchemaRewriteJobBeginRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.beginSchemaRewriteJob(request);
+}
+
+fn metadataServiceFinishSchemaRewriteJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SchemaRewriteJobFinishRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.finishSchemaRewriteJob(request);
+}
+
+fn metadataServiceInvalidateSchemaRewriteJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.invalidateSchemaRewriteJob(request);
+}
+
 fn metadataServiceCompareAndSwapTableSchema(
     ptr: *anyopaque,
     request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
@@ -729,6 +795,30 @@ fn metadataHttpServiceInvalidateSecondaryIndexRebuildRange(
 ) !void {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.invalidateSecondaryIndexRebuildRange(request);
+}
+
+fn metadataHttpServiceBeginSchemaRewriteJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SchemaRewriteJobBeginRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.beginSchemaRewriteJob(request);
+}
+
+fn metadataHttpServiceFinishSchemaRewriteJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SchemaRewriteJobFinishRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.finishSchemaRewriteJob(request);
+}
+
+fn metadataHttpServiceInvalidateSchemaRewriteJob(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SchemaRewriteJobInvalidateRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.invalidateSchemaRewriteJob(request);
 }
 
 fn metadataHttpServiceCompareAndSwapTableSchema(

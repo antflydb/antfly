@@ -1067,11 +1067,26 @@ also live in `lower_dml.zig`, so source-only clauses fail closed through
 adapter-owned DML rules instead of parser-local recursion. Basic runtime-column
 lookup moves to `api/sql_adapter/binder.zig` so parser validation, DML lowering,
 and later catalog binding use the same column-name and type matching helper.
+Relational catalog-existence checks, DDL column lookup, declared index-name
+lookup, primary/unique/foreign-key/check constraint-name lookup, and default
+primary-key naming rules also move into `binder.zig`, leaving schema mutation
+code in `relational_sql.zig` to apply typed operations rather than own catalog
+name-resolution primitives. Temporal period lookup/type checks, period catalog
+validation, primary-key `WITHOUT OVERLAPS` validation, and foreign-key
+column/temporal-action validation follow the same binder boundary because they
+bind typed catalog metadata to existing relational columns and periods.
 Row-expression equality and unique-expression duplicate validation move into
 `api/sql_adapter/lower_expr.zig`, so DDL index parsing, conflict-target parsing,
 and plan/fingerprint comparisons use one adapter-owned expression comparison
-surface. The future larger slice can move the full row-expression parser once
-this contract is stable.
+surface. Row-expression determinism and catalog check-expression type validation
+also live in `lower_expr.zig`, so partial indexes, generated columns, and
+expression checks share the same definition of catalog-safe deterministic and
+type-compatible expression trees. Expression-backed DDL catalog validation for
+`CHECK`, generated columns, unique constraints, index `INCLUDE` columns, and
+field-based unique predicates is adapter-owned as well: `relational_sql.zig`
+asks `lower_expr.zig` to validate the typed catalog metadata instead of
+retaining parallel schema-specific helpers beside the parser. The future larger slice can
+move the full row-expression parser once this contract is stable.
 
 The internal flow is always:
 
@@ -1279,9 +1294,13 @@ catalog records must preserve the full typed plan metadata, including
 overload arity, return type, language, volatility, security, null-input policy,
 parallel safety, leakproof/window flags, support/transform metadata, settings,
 cost/rows hints, and the shared expression AST for executable safe bodies. The
-runtime path may execute only typed expression-body plans; procedural bodies,
-PL bodies, cascaded routine drops, and unsupported expression forms fail closed
-until they have native typed execution contracts.
+runtime path may execute only typed expression-body plans, and
+`ApiHttpServer.lowerRelationalSqlReadPlanWithRoutineBindingsAlloc` exports the
+current routine runtime bindings into catalog-aware SQL read planning so
+`CREATE FUNCTION ... LANGUAGE sql AS 'SELECT ...'` bodies can be used by the
+ordinary row-expression lowerer. Procedural bodies, PL bodies, cascaded routine
+drops, and unsupported expression forms fail closed until they have native typed
+execution contracts.
 sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`, including idempotent create, `IF EXISTS` alter, owned-by/type
 metadata, and drop dependency metadata,
@@ -4487,17 +4506,22 @@ Current PR status:
   defaults plus safely backfillable stored generated columns through that row
   rewrite primitive before constraint validation and schema promotion; and
   SQL DDL application now schedules table-update rewrite work as raft-backed
-  `SchemaRewriteJobRecord` metadata with the target table, schema generation,
-  action/reason, target column, and cloned typed row-expression AST so
-  `ALTER TABLE ... USING` rewrite intent is durable catalog state rather than
-  SQL text or request-local metadata; and owner-local DB maintenance exposes a
-  bounded schema-rewrite drain that lists projected metadata jobs, claims
-  declared or expired work through the catalog lifecycle, executes the typed
-  row-expression rewrite against local owner rows, then finishes or invalidates
-  the job through the same metadata lease owner.
+  range-scoped `SchemaRewriteJobRecord` metadata with the target table,
+  current owner `group_id`, row-key bounds, schema generation, action/reason,
+  target column, and cloned typed row-expression AST so `ALTER TABLE ... USING`
+  rewrite intent is durable catalog state rather than SQL text or
+  request-local metadata; and owner-local DB maintenance exposes a bounded
+  schema-rewrite drain that lists projected metadata jobs, claims declared or
+  expired work through the catalog lifecycle, verifies that the job bounds
+  match the opened local range, executes the typed row-expression rewrite
+  against local owner rows, then finishes or invalidates the job through the
+  same metadata lease owner. Provisioned and hosted table-write sources expose
+  a schema-rewrite worker pass that scans projected catalog jobs, routes each
+  range-scoped job by `group_id` through local/remote group-owner routing,
+  drains the owner DB, and aggregates completion/busy/invalid progress.
 - Remaining: non-additive migration-equivalence compilation, broader
   trigger/function pattern compilation beyond updated-at policies,
-  routed/background schema-rewrite workers for provisioned and hosted ranges,
+  background controller scheduling of schema-rewrite worker passes,
   schema-promotion gates, type-cast row transforms, ordered generated-column
   dependency rewrites beyond the local append-only safe-source case, and
   unique/FK repair orchestration around row rewrites; full typed scalar
@@ -6622,14 +6646,19 @@ columns, non-nullable null results, and unsupported expression shapes fail
 closed before any batch commit.
 The DB-level drain wraps that primitive in the metadata lifecycle: it lists
 projected schema rewrite jobs from an injected metadata service, claims
-declared or expired jobs with a bounded lease, executes the typed local
-rewrite, finishes successful jobs with row-count/progress metadata, and marks
-failed jobs invalid with the stable execution error token so bad catalog work
-does not spin indefinitely. Storage still does not store or interpret SQL text;
-only `SchemaRewriteJobRecord` metadata and shared row-expression ASTs cross
-the boundary. The remaining production step is wiring that drain into
-provisioned/hosted background workers that route each range-local job to the
-current owner and then trigger schema compare-and-swap promotion once every
+declared or expired jobs with a bounded lease, checks the job `group_id` and
+row-key bounds before touching local storage, executes the typed local rewrite,
+finishes successful jobs with row-count/progress metadata, and marks failed
+jobs invalid with the stable execution error token so bad catalog work does
+not spin indefinitely. Storage still does not store or interpret SQL text; only
+`SchemaRewriteJobRecord` metadata and shared row-expression ASTs cross the
+boundary. The provisioned/hosted table-write source boundary now exposes a
+schema-rewrite worker pass plus group-local internal route: catalog scans
+select range-scoped jobs, hosted routing forwards remote owner work through the
+internal group route, local owners open the current range DB, and completed or
+invalid metadata state is observed through the same catalog lifecycle. The
+remaining production step is controller orchestration that schedules these
+passes continuously and triggers schema compare-and-swap promotion once every
 required rewrite, rebuild, and validation record is complete.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer

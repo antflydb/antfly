@@ -512,13 +512,16 @@ pub const TypeGenerator = struct {
             for (variants.items) |v| {
                 try self.w.line("if (std.mem.eql(u8, disc_str, \"{s}\")) {{", .{v.disc_value});
                 self.w.indent();
-                try self.w.line("return .{{ .{s} = try std.json.parseFromValue({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
+                try self.w.line("return .{{ .{s} = try std.json.parseFromValueLeaky({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
                 self.w.dedent();
                 try self.w.line("}}", .{});
             }
             try self.w.line("return error.UnexpectedToken;", .{});
             self.w.dedent();
             try self.w.line("}}", .{});
+
+            try self.w.blank();
+            try self.emitUnionJsonParseFromTokenSource();
 
             try self.w.blank();
 
@@ -619,14 +622,14 @@ pub const TypeGenerator = struct {
 
         try self.w.line("fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {{", .{});
         self.w.indent();
-        try self.w.line("const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {{", .{});
+        try self.w.line("const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {{", .{});
         self.w.indent();
         try self.w.line("error.OutOfMemory => return err,", .{});
         try self.w.line("else => return null,", .{});
         self.w.dedent();
         try self.w.line("}};", .{});
         try self.w.line("const value = try allocator.create(T);", .{});
-        try self.w.line("value.* = parsed.value;", .{});
+        try self.w.line("value.* = parsed;", .{});
         try self.w.line("return value;", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
@@ -677,6 +680,9 @@ pub const TypeGenerator = struct {
             try self.w.line("}}", .{});
 
             try self.w.blank();
+            try self.emitUnionJsonParseFromTokenSource();
+
+            try self.w.blank();
 
             try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
             self.w.indent();
@@ -705,8 +711,20 @@ pub const TypeGenerator = struct {
         try self.w.line("}}", .{});
 
         try self.w.blank();
+        try self.emitUnionJsonParseFromTokenSource();
+
+        try self.w.blank();
 
         try self.w.line("pub fn jsonStringify(_: @This(), _: anytype) !void {{", .{});
+        try self.w.line("}}", .{});
+    }
+
+    fn emitUnionJsonParseFromTokenSource(self: *TypeGenerator) !void {
+        try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("const value = try std.json.Value.jsonParse(allocator, source, options);", .{});
+        try self.w.line("return try jsonParseFromValue(allocator, value, options);", .{});
+        self.w.dedent();
         try self.w.line("}}", .{});
     }
 
@@ -921,6 +939,69 @@ test "inline index_type discriminator struct fields generate named enum types" {
     try std.testing.expect(std.mem.indexOf(u8, output, "index_type: []const u8,") == null);
 }
 
+test "discriminated oneOf generates parse from token source" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var cat_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try cat_props.put(arena, "kind", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"cat"},
+    } });
+    try cat_props.put(arena, "meows", .{ .schema = .{ .schema_type = .{ .single = "boolean" } } });
+
+    var dog_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try dog_props.put(arena, "kind", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"dog"},
+    } });
+    try dog_props.put(arena, "barks", .{ .schema = .{ .schema_type = .{ .single = "boolean" } } });
+
+    var mapping = std.StringArrayHashMapUnmanaged([]const u8){};
+    try mapping.put(arena, "cat", "#/components/schemas/Cat");
+    try mapping.put(arena, "dog", "#/components/schemas/Dog");
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Cat", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = cat_props,
+        .required = &.{"kind"},
+    } });
+    try schemas.put(arena, "Dog", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = dog_props,
+        .required = &.{"kind"},
+    } });
+    try schemas.put(arena, "Pet", .{ .schema = .{
+        .one_of = &.{
+            .{ .ref = .{ .ref_string = "#/components/schemas/Cat" } },
+            .{ .ref = .{ .ref_string = "#/components/schemas/Dog" } },
+        },
+        .discriminator = .{
+            .property_name = "kind",
+            .mapping = mapping,
+        },
+    } });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const Pet = union(enum) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "std.json.Value.jsonParse(allocator, source, options)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "return try jsonParseFromValue(allocator, value, options);") != null);
+}
+
 test "$ref with description sibling codegen" {
     const alloc = std.testing.allocator;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -1018,6 +1099,7 @@ test "undiscriminated recursive oneOf generates structural union" {
     try std.testing.expect(std.mem.indexOf(u8, output, "match_query: *MatchQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "boolean_query: *BooleanQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (objectHasAnyKey(source.object, &.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {") != null);
 }
 
 test "structural union uses field-only variants as selector keys" {
