@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const binder = @import("binder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
 const plan_mod = @import("plan.zig");
@@ -2515,6 +2516,388 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
+fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneEmptyRuntimeSchemaAlloc(alloc: std.mem.Allocator, current: runtime_schema.TableSchema) !runtime_schema.TableSchema {
+    const default_type = try alloc.dupe(u8, current.default_type);
+    const ttl_field = alloc.dupe(u8, current.ttl_field) catch |err| {
+        alloc.free(default_type);
+        return err;
+    };
+    return .{
+        .version = current.version,
+        .default_type = default_type,
+        .ttl_duration_ns = current.ttl_duration_ns,
+        .ttl_field = ttl_field,
+        .enforce_types = current.enforce_types,
+        .storage_mode = current.storage_mode,
+    };
+}
+
+pub fn cloneRelationalRuntimeSchemaAlloc(alloc: std.mem.Allocator, current: runtime_schema.TableSchema) !runtime_schema.TableSchema {
+    if (current.storage_mode != .relational) return error.InvalidSqlCatalog;
+    if (current.dynamic_templates.len != 0 or current.full_text_documents.len != 0) return error.UnsupportedSqlShape;
+
+    var schema = try cloneEmptyRuntimeSchemaAlloc(alloc, current);
+    errdefer runtime_schema.freeSchema(alloc, schema);
+    schema.relational_columns = try cloneDdlRelationalColumns(alloc, current.relational_columns);
+    schema.primary_key = try cloneDdlPrimaryKeyMaybe(alloc, current.primary_key);
+    schema.periods = try cloneDdlPeriods(alloc, current.periods);
+    schema.foreign_keys = try cloneDdlForeignKeys(alloc, current.foreign_keys);
+    schema.unique_constraints = try cloneDdlUniqueConstraints(alloc, current.unique_constraints);
+    schema.checks = try cloneDdlRelationalChecks(alloc, current.checks);
+    return schema;
+}
+
+pub fn appendRelationalColumnAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    column: runtime_schema.RelationalColumn,
+) !void {
+    if (binder.relationalColumnIndex(schema.relational_columns, column.name) != null) return error.InvalidSqlCatalog;
+    const len = schema.relational_columns.len;
+    const out = try alloc.alloc(runtime_schema.RelationalColumn, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.relational_columns);
+    out[len] = try cloneDdlRelationalColumn(alloc, column);
+    if (len > 0) alloc.free(schema.relational_columns);
+    schema.relational_columns = out;
+}
+
+pub fn appendUniqueConstraintAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    constraint: runtime_schema.UniqueConstraint,
+) !void {
+    if (binder.uniqueConstraintNameExists(schema.unique_constraints, constraint.name)) return error.InvalidSqlCatalog;
+    const len = schema.unique_constraints.len;
+    const out = try alloc.alloc(runtime_schema.UniqueConstraint, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.unique_constraints);
+    out[len] = try cloneDdlUniqueConstraint(alloc, constraint);
+    if (len > 0) alloc.free(schema.unique_constraints);
+    schema.unique_constraints = out;
+}
+
+pub fn appendForeignKeyAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    foreign_key: runtime_schema.ForeignKey,
+) !void {
+    if (binder.foreignKeyNameExists(schema.foreign_keys, foreign_key.name)) return error.InvalidSqlCatalog;
+    const len = schema.foreign_keys.len;
+    const out = try alloc.alloc(runtime_schema.ForeignKey, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.foreign_keys);
+    out[len] = try cloneDdlForeignKey(alloc, foreign_key);
+    if (len > 0) alloc.free(schema.foreign_keys);
+    schema.foreign_keys = out;
+}
+
+pub fn appendRelationalCheckAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    check: runtime_schema.RelationalCheck,
+) !void {
+    if (binder.relationalCheckNameExists(schema.checks, check.name)) return error.InvalidSqlCatalog;
+    const len = schema.checks.len;
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.checks);
+    out[len] = try cloneDdlRelationalCheck(alloc, check);
+    if (len > 0) alloc.free(schema.checks);
+    schema.checks = out;
+}
+
+pub fn cloneDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) !runtime_schema.RelationalColumn {
+    const name = try alloc.dupe(u8, column.name);
+    const path = alloc.dupe(u8, column.path) catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    var out: runtime_schema.RelationalColumn = .{
+        .name = name,
+        .path = path,
+        .field_type = column.field_type,
+        .array_item_type = column.array_item_type,
+        .nullable = column.nullable,
+        .indexed = column.indexed,
+        .index_lifecycle = column.index_lifecycle,
+        .index_generation = column.index_generation,
+    };
+    errdefer freeDdlRelationalColumn(alloc, out);
+    out.collation = if (column.collation) |collation| try alloc.dupe(u8, collation) else null;
+    out.index_name = if (column.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
+    out.index_include_columns = try cloneStringSlice(alloc, column.index_include_columns);
+    out.default_value = if (column.default_value) |value| try cloneDdlDefaultValue(alloc, value) else null;
+    out.on_update_value = if (column.on_update_value) |value| try cloneDdlDefaultValue(alloc, value) else null;
+    out.generated = if (column.generated) |generated| try cloneDdlGeneratedValue(alloc, generated) else null;
+    out.index_where = try cloneDdlUniquePredicates(alloc, column.index_where);
+    out.index_where_expressions = try plan_mod.cloneExpressionConditionsAlloc(alloc, column.index_where_expressions);
+    return out;
+}
+
+pub fn cloneDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) ![]const runtime_schema.RelationalColumn {
+    if (columns.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalColumn, columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |column| freeDdlRelationalColumn(alloc, column);
+        alloc.free(out);
+    }
+    for (columns, 0..) |column, i| {
+        out[i] = try cloneDdlRelationalColumn(alloc, column);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneDdlDefaultValue(alloc: std.mem.Allocator, value: runtime_schema.RelationalDefaultValue) !runtime_schema.RelationalDefaultValue {
+    return .{
+        .kind = value.kind,
+        .value_json = try alloc.dupe(u8, value.value_json),
+    };
+}
+
+pub fn cloneDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) !runtime_schema.RelationalGeneratedValue {
+    var out: runtime_schema.RelationalGeneratedValue = .{
+        .op = generated.op,
+        .separator = try alloc.dupe(u8, generated.separator),
+    };
+    errdefer freeDdlGeneratedValue(alloc, out);
+    out.field = if (generated.field) |field| try alloc.dupe(u8, field) else null;
+    out.fields = try cloneStringSlice(alloc, generated.fields);
+    out.expression = if (generated.expression) |expression| try plan_mod.cloneExpressionAlloc(alloc, expression) else null;
+    return out;
+}
+
+pub fn cloneDdlPrimaryKeyMaybe(alloc: std.mem.Allocator, primary_key: ?runtime_schema.PrimaryKey) !?runtime_schema.PrimaryKey {
+    return if (primary_key) |key| try cloneDdlPrimaryKey(alloc, key) else null;
+}
+
+pub fn cloneDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) !runtime_schema.PrimaryKey {
+    const name = if (primary_key.name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (name) |value| alloc.free(value);
+    const columns = try cloneStringSlice(alloc, primary_key.columns);
+    errdefer freeStringSlice(alloc, columns);
+    const include_columns = try cloneStringSlice(alloc, primary_key.include_columns);
+    errdefer freeStringSlice(alloc, include_columns);
+    const period = if (primary_key.without_overlaps_period) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .name = name,
+        .columns = columns,
+        .include_columns = include_columns,
+        .without_overlaps_period = period,
+        .deferrable = primary_key.deferrable,
+        .timing = primary_key.timing,
+    };
+}
+
+pub fn cloneDdlPeriod(alloc: std.mem.Allocator, period: runtime_schema.RelationalPeriod) !runtime_schema.RelationalPeriod {
+    return .{
+        .name = try alloc.dupe(u8, period.name),
+        .start_column = try alloc.dupe(u8, period.start_column),
+        .end_column = try alloc.dupe(u8, period.end_column),
+        .range_type = period.range_type,
+    };
+}
+
+pub fn cloneDdlPeriods(alloc: std.mem.Allocator, periods: []const runtime_schema.RelationalPeriod) ![]const runtime_schema.RelationalPeriod {
+    if (periods.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalPeriod, periods.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |period| freeDdlPeriod(alloc, period);
+        alloc.free(out);
+    }
+    for (periods, 0..) |period, i| {
+        out[i] = try cloneDdlPeriod(alloc, period);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) !runtime_schema.UniqueExpression {
+    const field = try alloc.dupe(u8, expression.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const row_expression = if (expression.expression) |value| try plan_mod.cloneExpressionAlloc(alloc, value) else null;
+    errdefer if (row_expression) |value| plan_mod.freeExpression(alloc, value);
+    field_transferred = true;
+    return .{
+        .op = expression.op,
+        .field = field,
+        .expression = row_expression,
+    };
+}
+
+pub fn cloneDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) ![]const runtime_schema.UniqueExpression {
+    if (expressions.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.UniqueExpression, expressions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| freeDdlUniqueExpression(alloc, expression);
+        alloc.free(out);
+    }
+    for (expressions, 0..) |expression, i| {
+        out[i] = try cloneDdlUniqueExpression(alloc, expression);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneDdlUniquePredicate(alloc: std.mem.Allocator, predicate: runtime_schema.UniquePredicate) !runtime_schema.UniquePredicate {
+    const field = try alloc.dupe(u8, predicate.field);
+    const value_json = if (predicate.value_json) |value|
+        alloc.dupe(u8, value) catch |err| {
+            alloc.free(field);
+            return err;
+        }
+    else
+        null;
+    return .{
+        .field = field,
+        .op = predicate.op,
+        .value_json = value_json,
+    };
+}
+
+pub fn cloneDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) ![]const runtime_schema.UniquePredicate {
+    if (predicates.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.UniquePredicate, predicates.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        alloc.free(out);
+    }
+    for (predicates, 0..) |predicate, i| {
+        out[i] = try cloneDdlUniquePredicate(alloc, predicate);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.UniqueConstraint) !runtime_schema.UniqueConstraint {
+    var out: runtime_schema.UniqueConstraint = .{
+        .name = try alloc.dupe(u8, constraint.name),
+    };
+    errdefer freeDdlUniqueConstraint(alloc, out);
+    out.columns = try cloneStringSlice(alloc, constraint.columns);
+    out.expressions = try cloneDdlUniqueExpressions(alloc, constraint.expressions);
+    out.include_columns = try cloneStringSlice(alloc, constraint.include_columns);
+    out.without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
+    out.nulls_not_distinct = constraint.nulls_not_distinct;
+    out.deferrable = constraint.deferrable;
+    out.timing = constraint.timing;
+    out.where = try cloneDdlUniquePredicates(alloc, constraint.where);
+    out.where_expressions = try plan_mod.cloneExpressionConditionsAlloc(alloc, constraint.where_expressions);
+    out.validation_state = constraint.validation_state;
+    return out;
+}
+
+pub fn cloneDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) ![]const runtime_schema.UniqueConstraint {
+    if (constraints.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.UniqueConstraint, constraints.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |constraint| freeDdlUniqueConstraint(alloc, constraint);
+        alloc.free(out);
+    }
+    for (constraints, 0..) |constraint, i| {
+        out[i] = try cloneDdlUniqueConstraint(alloc, constraint);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneDdlForeignKey(alloc: std.mem.Allocator, foreign_key: runtime_schema.ForeignKey) !runtime_schema.ForeignKey {
+    const name = try alloc.dupe(u8, foreign_key.name);
+    const parent_table = alloc.dupe(u8, foreign_key.parent_table) catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    var out: runtime_schema.ForeignKey = .{
+        .name = name,
+        .parent_table = parent_table,
+        .on_delete = foreign_key.on_delete,
+        .on_update = foreign_key.on_update,
+        .timing = foreign_key.timing,
+        .deferrable = foreign_key.deferrable,
+        .match = foreign_key.match,
+        .validation_state = foreign_key.validation_state,
+    };
+    errdefer freeDdlForeignKey(alloc, out);
+    out.child_period = if (foreign_key.child_period) |period| try alloc.dupe(u8, period) else null;
+    out.parent_period = if (foreign_key.parent_period) |period| try alloc.dupe(u8, period) else null;
+    out.child_columns = try cloneStringSlice(alloc, foreign_key.child_columns);
+    out.parent_columns = try cloneStringSlice(alloc, foreign_key.parent_columns);
+    return out;
+}
+
+pub fn cloneDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) ![]const runtime_schema.ForeignKey {
+    if (foreign_keys.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.ForeignKey, foreign_keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |foreign_key| freeDdlForeignKey(alloc, foreign_key);
+        alloc.free(out);
+    }
+    for (foreign_keys, 0..) |foreign_key, i| {
+        out[i] = try cloneDdlForeignKey(alloc, foreign_key);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneDdlRelationalCheck(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) !runtime_schema.RelationalCheck {
+    const name = try alloc.dupe(u8, check.name);
+    const field = alloc.dupe(u8, check.field) catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    var out: runtime_schema.RelationalCheck = .{
+        .name = name,
+        .field = field,
+        .op = check.op,
+        .validation_state = check.validation_state,
+    };
+    errdefer freeDdlRelationalCheck(alloc, out);
+    out.value_json = if (check.value_json) |value| try alloc.dupe(u8, value) else null;
+    out.expression = if (check.expression) |expression| try plan_mod.cloneExpressionConditionAlloc(alloc, expression) else null;
+    return out;
+}
+
+pub fn cloneDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) ![]const runtime_schema.RelationalCheck {
+    if (checks.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, checks.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |check| freeDdlRelationalCheck(alloc, check);
+        alloc.free(out);
+    }
+    for (checks, 0..) |check, i| {
+        out[i] = try cloneDdlRelationalCheck(alloc, check);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlterOperation) void {
     switch (operation) {
         .set_type => |type_name| alloc.free(type_name),
@@ -2655,11 +3038,13 @@ fn freeDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runti
     if (constraints.len > 0) alloc.free(constraints);
 }
 
+fn freeDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) void {
+    if (expression.field.len > 0) alloc.free(expression.field);
+    if (expression.expression) |row_expression| runtime_schema.freeRelationalRowsExpression(alloc, row_expression);
+}
+
 fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
-    for (expressions) |expression| {
-        if (expression.field.len > 0) alloc.free(expression.field);
-        if (expression.expression) |row_expression| runtime_schema.freeRelationalRowsExpression(alloc, row_expression);
-    }
+    for (expressions) |expression| freeDdlUniqueExpression(alloc, expression);
     if (expressions.len > 0) alloc.free(expressions);
 }
 

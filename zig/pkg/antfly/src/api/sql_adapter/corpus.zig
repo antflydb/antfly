@@ -4313,6 +4313,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_binary_execution_unsupported: bool = false,
     ddl_copy_from: bool = false,
     ddl_copy_from_execution_contract: bool = false,
+    ddl_copy_from_text_execution_contract: bool = false,
     ddl_copy_default_marker: bool = false,
     ddl_copy_header: bool = false,
     ddl_copy_delimiter: bool = false,
@@ -4329,6 +4330,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_quote: bool = false,
     ddl_copy_to: bool = false,
     ddl_copy_to_execution_contract: bool = false,
+    ddl_copy_to_text_execution_contract: bool = false,
     ddl_copy_where_expression: bool = false,
     ddl_partition_create_parent: bool = false,
     ddl_partition_create_child: bool = false,
@@ -6035,6 +6037,9 @@ pub const AppParityCorpusCoverage = struct {
                             sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
                     self.ddl_copy_from_execution_contract = self.ddl_copy_from_execution_contract or
                         std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:");
+                    self.ddl_copy_from_text_execution_contract = self.ddl_copy_from_text_execution_contract or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
+                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_text:") != null);
                     self.ddl_copy_default_marker = self.ddl_copy_default_marker or sql_adapter.planHasExactStringToken(entry.plan, ":default_marker_hex=", "6e2f61");
                     self.ddl_copy_header = self.ddl_copy_header or sql_adapter.planHasExactBoolToken(entry.plan, ":header=", true);
                     self.ddl_copy_delimiter = self.ddl_copy_delimiter or sql_adapter.planHasExactStringToken(entry.plan, ":delimiter_hex=", "2c");
@@ -6057,6 +6062,9 @@ pub const AppParityCorpusCoverage = struct {
                             sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
                     self.ddl_copy_to_execution_contract = self.ddl_copy_to_execution_contract or
                         std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:");
+                    self.ddl_copy_to_text_execution_contract = self.ddl_copy_to_text_execution_contract or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
+                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_text:") != null);
                     self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");
                 },
                 .create_partitioned_table => self.ddl_partition_create_parent = true,

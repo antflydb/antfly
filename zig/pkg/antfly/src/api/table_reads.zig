@@ -1355,6 +1355,14 @@ pub const TableReadSource = struct {
             plan: db_mod.types.RelationalRowsSetOperationPlan,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_set_operation_plan_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsSetOperationPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
         rows_aggregate_plan: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1699,6 +1707,18 @@ pub const TableReadSource = struct {
     ) !?db_mod.types.RelationalRowsQueryResult {
         const fn_ptr = self.vtable.rows_set_operation_plan orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsSetOperationPlanCatalog(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsSetOperationPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_set_operation_plan_catalog orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, runtime_schema, plan, consistency);
     }
 
     pub fn rowsAggregatePlan(
@@ -2946,6 +2966,7 @@ pub const ProvisionedTableReadSource = struct {
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = rowsQueryPlanCatalogNative,
                 .rows_set_operation_plan = rowsSetOperationPlan,
+                .rows_set_operation_plan_catalog = rowsSetOperationPlanCatalogNative,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
@@ -3367,6 +3388,20 @@ pub const ProvisionedTableReadSource = struct {
         return try rowsSetOperationPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
     }
 
+    fn rowsSetOperationPlanCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsSetOperationPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try rowsSetOperationPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
     fn rowsAggregatePlan(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3678,6 +3713,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = HostedProvisionedTableReadSource.rowsQueryPlanCatalogNative,
                 .rows_set_operation_plan = rowsSetOperationPlan,
+                .rows_set_operation_plan_catalog = HostedProvisionedTableReadSource.rowsSetOperationPlanCatalogNative,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
@@ -4016,6 +4052,20 @@ pub const HostedProvisionedTableReadSource = struct {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const routed_source = self.source();
         return try rowsSetOperationPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsSetOperationPlanCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsSetOperationPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try rowsSetOperationPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
     }
 
     fn rowsAggregatePlan(
@@ -4770,7 +4820,8 @@ fn executeLoweredSqlSetOperationPlanAlloc(
     const operation = loweredSqlSetOperationToRowsOperation(lowered.operation);
     const same_table = std.mem.eql(u8, lowered.left.table_name, lowered.right.table_name);
     if (same_table) {
-        return try source.rowsSetOperationPlan(alloc, lowered.left.table_name, left_schema, .{
+        const target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.left.table_name);
+        return try source.rowsSetOperationPlanCatalog(alloc, target, left_schema, .{
             .operation = operation,
             .left = lowered.left.plan,
             .right = lowered.right.plan,
@@ -4792,6 +4843,13 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         .limit = lowered.limit,
         .offset = lowered.offset,
     }, left.rows, right.rows);
+}
+
+fn catalogTargetForLoweredSqlTable(default_table_name: []const u8, table_name: []const u8) !catalog_resources.TableTarget {
+    if (std.mem.eql(u8, default_table_name, table_name)) {
+        return try catalog_resources.tableTargetFromOptional(null, null, table_name);
+    }
+    return try catalog_resources.SqlCatalogSession.default().tableTargetFromObjectName(table_name);
 }
 
 fn loweredSqlSetOperationToRowsOperation(operation: relational_sql_api.SelectSetOperation) db_mod.types.RelationalRowsSetOperation {
@@ -6262,6 +6320,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = rowsQueryPlanCatalog,
                 .rows_set_operation_plan = rowsSetOperationPlan,
+                .rows_set_operation_plan_catalog = rowsSetOperationPlanCatalog,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .lake_rows_scan = lakeRowsScan,
                 .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
@@ -6390,6 +6449,19 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         var left = (try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan.left, consistency)) orelse return null;
         defer left.deinit(alloc);
         var right = (try lake_source.source().rowsQueryPlan(alloc, table_name, runtime_schema, plan.right, consistency)) orelse return null;
+        defer right.deinit(alloc);
+        return try executeRelationalRowsSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
+    }
+
+    fn rowsSetOperationPlanCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source == null) return try self.base.rowsSetOperationPlanCatalog(alloc, target, runtime_schema, plan, consistency);
+        var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
+        defer lake_source.deinit();
+
+        var left = (try lake_source.source().rowsQueryPlan(alloc, target.table_name, runtime_schema, plan.left, consistency)) orelse return null;
+        defer left.deinit(alloc);
+        var right = (try lake_source.source().rowsQueryPlan(alloc, target.table_name, runtime_schema, plan.right, consistency)) orelse return null;
         defer right.deinit(alloc);
         return try executeRelationalRowsSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
     }
@@ -19966,6 +20038,7 @@ test "lowered sql cross-table read plans execute through routed scans" {
                     .scan = scan,
                     .query = query,
                     .rows_query_plan = rowsQueryPlan,
+                    .rows_set_operation_plan_catalog = rowsSetOperationPlanCatalog,
                 },
             };
         }
@@ -20025,6 +20098,20 @@ test "lowered sql cross-table read plans execute through routed scans" {
         ) !?db_mod.types.RelationalRowsQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsSetOperationPlanCatalog(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsSetOperationPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
+            try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsSetOperationPlanFromRoutedScansAlloc(plan_alloc, self.source(), target.table_name, runtime_schema, plan, consistency);
         }
     };
 
@@ -20168,6 +20255,20 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         ) !?db_mod.types.RelationalRowsQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsSetOperationPlanCatalog(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsSetOperationPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
+            try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsSetOperationPlanFromRoutedScansAlloc(plan_alloc, self.source(), target.table_name, runtime_schema, plan, consistency);
         }
     };
 

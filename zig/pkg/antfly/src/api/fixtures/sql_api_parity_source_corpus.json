@@ -4266,6 +4266,18 @@
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)"
     },
     {
+      "name": "copy from text bulk import ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=text:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=postgres_text:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT text)"
+    },
+    {
       "name": "copy from header freeze on error reject limit log verbosity force null delimiter escape null default encoding bulk import ddl",
       "family": "ddl",
       "summary": {
@@ -4288,6 +4300,18 @@
       "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
       "execution_plan": "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=csv:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true",
       "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *)"
+    },
+    {
+      "name": "copy to text bulk export ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_to",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=text:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=postgres_text:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true",
+      "sql": "COPY usage_records (id, status) TO STDOUT WITH (FORMAT text)"
     },
     {
       "name": "unsupported copy from server file endpoint",
