@@ -3205,6 +3205,35 @@ pub fn alterTableColumnNullabilityOperationFromSyntax(
     } };
 }
 
+pub fn alterTableColumnDefaultOperationFromSyntax(
+    syntax: *grammar.AlterTableColumnDefaultSyntax,
+    default_value: ?runtime_schema.RelationalDefaultValue,
+) AlterTableOperation {
+    const column_name = syntax.column_name;
+    syntax.column_name = "";
+    return .{ .alter_column_default = .{
+        .column_name = column_name,
+        .default_value = default_value,
+    } };
+}
+
+pub fn alterTableColumnTypeOperationFromSyntax(
+    syntax: *grammar.AlterTableColumnTypeHeaderSyntax,
+    ddl_type: grammar.DdlTypeSyntax,
+    collation: ?[]const u8,
+    rewrite_expression: ?AlterColumnRewriteExpression,
+) AlterTableOperation {
+    const column_name = syntax.column_name;
+    syntax.column_name = "";
+    return .{ .alter_column_type = .{
+        .column_name = column_name,
+        .field_type = ddl_type.field_type,
+        .array_item_type = ddl_type.array_item_type,
+        .collation = collation,
+        .rewrite_expression = rewrite_expression,
+    } };
+}
+
 pub fn routineKindFromSyntax(syntax: grammar.RoutineKindSyntax) RoutineKind {
     return switch (syntax) {
         .function => .function,
@@ -3589,6 +3618,42 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         .alter_column_nullability => |nullability| {
             try std.testing.expectEqualStrings("amount", nullability.column_name);
             try std.testing.expect(!nullability.nullable);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var default_syntax: grammar.AlterTableColumnDefaultSyntax = .{
+        .column_name = try alloc.dupe(u8, "amount"),
+        .action = .set,
+    };
+    const default_operation = alterTableColumnDefaultOperationFromSyntax(&default_syntax, .{
+        .kind = .literal,
+        .value_json = try alloc.dupe(u8, "0"),
+    });
+    defer freeAlterTableOperation(alloc, default_operation);
+    switch (default_operation) {
+        .alter_column_default => |default| {
+            try std.testing.expectEqualStrings("amount", default.column_name);
+            try std.testing.expectEqualStrings("0", default.default_value.?.value_json);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var type_syntax: grammar.AlterTableColumnTypeHeaderSyntax = .{
+        .column_name = try alloc.dupe(u8, "amount_text"),
+    };
+    const type_operation = alterTableColumnTypeOperationFromSyntax(
+        &type_syntax,
+        .{ .field_type = .text },
+        try alloc.dupe(u8, "C"),
+        null,
+    );
+    defer freeAlterTableOperation(alloc, type_operation);
+    switch (type_operation) {
+        .alter_column_type => |type_change| {
+            try std.testing.expectEqualStrings("amount_text", type_change.column_name);
+            try std.testing.expectEqual(runtime_schema.AntflyType.text, type_change.field_type);
+            try std.testing.expectEqualStrings("C", type_change.collation.?);
         },
         else => return error.TestExpectedEqual,
     }

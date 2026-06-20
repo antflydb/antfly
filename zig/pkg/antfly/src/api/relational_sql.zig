@@ -4592,10 +4592,7 @@ const Parser = struct {
                     errdefer self.alloc.free(value.value_json);
                     break :blk value;
                 } else null;
-                try self.appendAlterTableOperation(operations, .{ .alter_column_default = .{
-                    .column_name = syntax.column_name,
-                    .default_value = default_value,
-                } });
+                try self.appendAlterTableOperation(operations, sql_adapter.alterTableColumnDefaultOperationFromSyntax(&syntax, default_value));
                 syntax_transferred = true;
                 return;
             } else |err| switch (err) {
@@ -4613,16 +4610,11 @@ const Parser = struct {
             var rewrite_expression = try self.parseOptionalDdlAlterColumnRewriteExpressionAlloc(type_header.column_name);
             var rewrite_transferred = false;
             errdefer if (!rewrite_transferred) if (rewrite_expression) |*rewrite| rewrite.deinit(self.alloc);
-            try self.appendAlterTableOperation(operations, .{ .alter_column_type = .{
-                .column_name = type_header.column_name,
-                .field_type = ddl_type.field_type,
-                .array_item_type = ddl_type.array_item_type,
-                .collation = collation,
-                .rewrite_expression = rewrite_expression,
-            } });
+            const operation = sql_adapter.alterTableColumnTypeOperationFromSyntax(&type_header, ddl_type, collation, rewrite_expression);
             type_header_transferred = true;
             collation_transferred = true;
             rewrite_transferred = true;
+            try self.appendAlterTableOperation(operations, operation);
             return;
         }
 
