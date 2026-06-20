@@ -811,7 +811,7 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
 }
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
-    try validatePortableEnvelope(alloc, data);
+    try validatePortableImportBlocks(alloc, data, opts);
 
     var reader = backup_codec.SliceReader.init(data);
     _ = try reader.readHeader();
@@ -859,12 +859,124 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
     }
 }
 
-fn validatePortableEnvelope(alloc: Allocator, data: []const u8) !void {
+fn validatePortableImportBlocks(alloc: Allocator, data: []const u8, opts: ImportOptions) !void {
     var reader = backup_codec.SliceReader.init(data);
     _ = try reader.readHeader();
     while (reader.pos < reader.data.len) {
         const block = try reader.readBlock(alloc);
-        alloc.free(block.payload);
+        defer alloc.free(block.payload);
+        try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts);
+    }
+}
+
+fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec.BlockType, payload: []const u8, opts: ImportOptions) !void {
+    switch (block_type) {
+        .document_batch => try validateDocumentBatchPayload(alloc, payload),
+        .doc_identity_batch => try validateIdentityBatchPayload(alloc, payload),
+        .metadata_batch => try validateMetadataBatchPayload(alloc, payload),
+        .chunk_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .chunk),
+        .artifact_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .asset),
+        .resolution_batch => if (opts.import_derived_indexes) try validateResolutionArtifactBatchPayload(alloc, payload),
+        .embedding_batch => if (opts.import_derived_indexes) try validateEmbeddingBatchPayload(alloc, payload),
+        .sparse_batch => if (opts.import_derived_indexes) try validateSparseBatchPayload(alloc, payload),
+        .edge_batch => if (opts.import_derived_indexes) try validateEdgeBatchPayload(alloc, payload),
+        .shard_header => {
+            const header = try backup_codec.decodeShardHeader(alloc, payload);
+            alloc.free(header.table_name);
+            alloc.free(header.start_key);
+            alloc.free(header.end_key);
+        },
+        .shard_footer => _ = try backup_codec.decodeShardFooter(payload),
+        .file_footer => _ = try backup_codec.decodeFileFooter(payload),
+        .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
+        else => {},
+    }
+}
+
+fn validateDocumentBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
+    defer {
+        for (entries) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        }
+        alloc.free(entries);
+    }
+}
+
+fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        if (entry.key.len == 0 or entry.key[0] != internal_keys.identity_namespace) {
+            return error.InvalidDocIdentityBatch;
+        }
+    }
+}
+
+fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
+    }
+}
+
+fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, allowed_kind: db_types.ArtifactKind) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+        if (artifact_ref.kind != allowed_kind) return error.InvalidBackupRequest;
+    }
+}
+
+fn validateResolutionArtifactBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        var artifact_ref = (try decodeResolutionPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+    }
+}
+
+fn validateEmbeddingBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const result = try backup_codec.decodeEmbeddingBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |entry| {
+            alloc.free(entry.doc_key);
+            alloc.free(entry.vector);
+        }
+        alloc.free(result.entries);
+    }
+}
+
+fn validateSparseBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const result = try backup_codec.decodeSparseBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |entry| {
+            alloc.free(entry.doc_key);
+            alloc.free(entry.indices);
+            alloc.free(entry.values);
+        }
+        alloc.free(result.entries);
+    }
+}
+
+fn validateEdgeBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const result = try decodeEdgeBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |entry| {
+            alloc.free(entry.source_key);
+            alloc.free(entry.target_key);
+            alloc.free(entry.edge_type);
+            alloc.free(entry.value);
+        }
+        alloc.free(result.entries);
     }
 }
 
@@ -1478,6 +1590,45 @@ test "import preflights full portable envelope before mutating destination" {
     defer dst.close();
 
     try std.testing.expectError(error.EndOfStream, importPortable(alloc, &dst, truncated));
+    try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
+}
+
+test "import preflights logical block payloads before mutating destination" {
+    const alloc = std.testing.allocator;
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try backup_codec.writeHeader(&portable, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+
+    const good_doc = try backup_codec.encodeDocumentBatch(alloc, &.{
+        .{
+            .key = "doc:valid-before-malformed",
+            .value_flags = 0,
+            .value = "{\"title\":\"must not import\"}",
+            .timestamp_ns = 0,
+        },
+    });
+    defer alloc.free(good_doc);
+    try backup_codec.writeBlock(&portable, alloc, .document_batch, good_doc);
+
+    const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
+    try backup_codec.writeBlock(&portable, alloc, .document_batch, &malformed_doc_payload);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+
+    const store_key = try internal_keys.documentKeyAlloc(alloc, "doc:valid-before-malformed");
+    defer alloc.free(store_key);
+    try std.testing.expectError(error.Truncated, importPortable(alloc, &dst, portable.items));
     try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
 }
 
