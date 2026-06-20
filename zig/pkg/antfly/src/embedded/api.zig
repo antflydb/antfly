@@ -505,6 +505,10 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_inference_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_placement\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_shard_fanout\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"distributed_transaction_coordination\":false") != null);
 
     try std.testing.expectError(error.NotLiteDatabase, api.statusJson(alloc));
 
@@ -562,6 +566,10 @@ test "embedded api hosted profile drains derived indexing without native runtime
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_inference_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_placement\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_shard_fanout\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"distributed_transaction_coordination\":false") != null);
 
     const idle_json = try api.runUntilIdleJson(alloc);
     defer alloc.free(idle_json);

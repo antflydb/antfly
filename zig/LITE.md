@@ -469,7 +469,9 @@ single-node and local.
 - S3/object-storage native serving as the primary Lite file
 
 Some of these can still be simulated for testing, but they should not be
-presented as production Lite capabilities.
+presented as production Lite capabilities. Lite status and capabilities should
+advertise these distributed-only features as explicit `false` values so
+bindings do not have to infer cluster semantics from missing fields.
 
 ## CLI Details
 

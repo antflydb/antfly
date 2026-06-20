@@ -52,6 +52,14 @@ pub const Capabilities = struct {
     generated_enrichment_planning: bool = true,
     dense_vector_search: bool = true,
     sparse_vector_search: bool = true,
+    distributed_shard_ownership: bool = false,
+    raft_replication: bool = false,
+    cluster_placement: bool = false,
+    remote_shard_fanout: bool = false,
+    distributed_transaction_coordination: bool = false,
+    server_side_autoscaling: bool = false,
+    kubernetes_operator: bool = false,
+    object_storage_primary: bool = false,
 };
 
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
@@ -75,6 +83,14 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
         .generated_enrichment_planning = true,
         .dense_vector_search = true,
         .sparse_vector_search = true,
+        .distributed_shard_ownership = false,
+        .raft_replication = false,
+        .cluster_placement = false,
+        .remote_shard_fanout = false,
+        .distributed_transaction_coordination = false,
+        .server_side_autoscaling = false,
+        .kubernetes_operator = false,
+        .object_storage_primary = false,
     };
 }
 
@@ -309,6 +325,14 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     try std.testing.expect(native_caps.no_inference_configured_ok);
     try std.testing.expect(native_caps.caller_supplied_artifacts);
     try std.testing.expect(!native_caps.local_inference_runtime);
+    try std.testing.expect(!native_caps.distributed_shard_ownership);
+    try std.testing.expect(!native_caps.raft_replication);
+    try std.testing.expect(!native_caps.cluster_placement);
+    try std.testing.expect(!native_caps.remote_shard_fanout);
+    try std.testing.expect(!native_caps.distributed_transaction_coordination);
+    try std.testing.expect(!native_caps.server_side_autoscaling);
+    try std.testing.expect(!native_caps.kubernetes_operator);
+    try std.testing.expect(!native_caps.object_storage_primary);
 
     const hosted_caps = capabilitiesForProfile(.hosted);
     try std.testing.expect(hosted_caps.hosted_profile);
