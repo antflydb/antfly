@@ -244,6 +244,7 @@ pub const Handle = struct {
                 opts.index_backends.dense_lsm_options.storage = storage;
                 opts.index_backends.sparse_lsm_options.storage = storage;
                 opts.index_backends.graph_reverse_lsm_options.storage = storage;
+                opts.index_open_parallelism = 1;
                 opts.external_derived_checkpoints = false;
             },
         }
@@ -471,6 +472,7 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.index_backends.dense_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.sparse_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.graph_lsm_storage != null);
+    try std.testing.expectEqual(@as(?usize, 1), db_opts.index_open_parallelism);
 
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(report.file_size, vacuumed.before_size);

@@ -31,24 +31,47 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(db_path);
     const restored_path = try join(allocator, root, "restored.aflite");
     defer allocator.free(restored_path);
+    const restored_snapshot_path = try join(allocator, root, "restored-snapshot.aflite");
+    defer allocator.free(restored_snapshot_path);
     const backup_path = try join(allocator, root, "app.afb");
     defer allocator.free(backup_path);
-    const index_path = try join(allocator, root, "index.json");
-    defer allocator.free(index_path);
+    const text_index_path = try join(allocator, root, "text-index.json");
+    defer allocator.free(text_index_path);
+    const dense_index_path = try join(allocator, root, "dense-index.json");
+    defer allocator.free(dense_index_path);
+    const sparse_index_path = try join(allocator, root, "sparse-index.json");
+    defer allocator.free(sparse_index_path);
+    const graph_index_path = try join(allocator, root, "graph-index.json");
+    defer allocator.free(graph_index_path);
     const batch_path = try join(allocator, root, "batch.json");
     defer allocator.free(batch_path);
     const lookup_path = try join(allocator, root, "lookup.json");
     defer allocator.free(lookup_path);
     const scan_path = try join(allocator, root, "scan.json");
     defer allocator.free(scan_path);
-    const query_path = try join(allocator, root, "query.json");
-    defer allocator.free(query_path);
+    const text_query_path = try join(allocator, root, "text-query.json");
+    defer allocator.free(text_query_path);
+    const dense_query_path = try join(allocator, root, "dense-query.json");
+    defer allocator.free(dense_query_path);
+    const sparse_query_path = try join(allocator, root, "sparse-query.json");
+    defer allocator.free(sparse_query_path);
+    const graph_query_path = try join(allocator, root, "graph-query.json");
+    defer allocator.free(graph_query_path);
 
-    try writeFile(io, index_path,
+    try writeFile(io, text_index_path,
         \\{"name":"ft_body","kind":"full_text","config_json":"{}"}
     );
+    try writeFile(io, dense_index_path,
+        \\{"name":"dv_cli","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}"}
+    );
+    try writeFile(io, sparse_index_path,
+        \\{"name":"sv_cli","kind":"sparse_vector","config_json":"{\"field\":\"sparse_embedding\",\"external\":true}"}
+    );
+    try writeFile(io, graph_index_path,
+        \\{"name":"gr_cli","kind":"graph","config_json":"{}"}
+    );
     try writeFile(io, batch_path,
-        \\{"inserts":{"doc:cli-smoke":{"title":"CLI smoke","body":"native lite command smoke"}},"sync_level":"full_index"}
+        \\{"inserts":{"doc:cli-smoke":{"title":"CLI smoke","body":"native lite command smoke"},"doc:cli-vec-a":{"title":"vector alpha","body":"dense sparse graph source","_embeddings":{"dv_cli":[1,0,0],"sv_cli":{"indices":[7,42],"values":[1.5,0.5]}},"_edges":{"gr_cli":{"links":[{"target":"doc:cli-vec-c","weight":1.0}]}}},"doc:cli-vec-b":{"title":"vector beta","_embeddings":{"dv_cli":[0,1,0],"sv_cli":{"indices":[99],"values":[2.0]}}},"doc:cli-vec-c":{"title":"graph target"}},"sync_level":"full_index"}
     );
     try writeFile(io, lookup_path,
         \\{"fields":["title","body"]}
@@ -56,22 +79,40 @@ pub fn main(init: std.process.Init) !void {
     try writeFile(io, scan_path,
         \\{"from":"doc:","to":"doc;","include_documents":true,"limit":10}
     );
-    try writeFile(io, query_path,
+    try writeFile(io, text_query_path,
         \\{"full_text_search":{"match":{"field":"body","text":"command smoke"}},"limit":1}
+    );
+    try writeFile(io, dense_query_path,
+        \\{"embeddings":{"dv_cli":[1,0,0]},"indexes":["dv_cli"],"limit":1}
+    );
+    try writeFile(io, sparse_query_path,
+        \\{"embeddings":{"sv_cli":{"indices":[7,42],"values":[1.5,0.5]}},"indexes":["sv_cli"],"limit":1}
+    );
+    try writeFile(io, graph_query_path,
+        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"gr_cli","start_nodes":{"keys":["doc:cli-vec-a"]},"params":{"edge_types":["links"]}}},"limit":10}
     );
 
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "init", db_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "status", db_path }, "\"engine\":\"native_single_file\"");
-    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", index_path }, "\"created\":true");
-    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "batch", db_path, "--file", batch_path }, "\"inserted\":1");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", text_index_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", dense_index_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", sparse_index_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", graph_index_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "batch", db_path, "--file", batch_path }, "\"inserted\":4");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "run-until-idle", db_path }, "\"has_async_indexes\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", db_path, "--key", "doc:cli-smoke", "--file", lookup_path }, "native lite command smoke");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "scan", db_path, "--file", scan_path }, "doc:cli-smoke");
-    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", db_path, "--file", query_path }, "doc:cli-smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", db_path, "--file", text_query_path }, "doc:cli-smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", db_path, "--file", dense_query_path }, "doc:cli-vec-a");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", db_path, "--file", sparse_query_path }, "doc:cli-vec-a");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", db_path, "--file", graph_query_path }, "doc:cli-vec-c");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "check", db_path }, "\"valid\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "compact", db_path }, "\"compacted\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "backup", db_path, "--out", backup_path }, "\"format\":\"afb\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "restore", backup_path, "--out", restored_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", restored_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "restore", db_path, "--out", restored_snapshot_path }, "\"format\":\"aflite\"");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", restored_snapshot_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "vacuum", restored_path }, "\"after_size\":");
 }
 

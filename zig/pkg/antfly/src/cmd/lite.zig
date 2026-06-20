@@ -516,6 +516,13 @@ fn parseSnapshotOptions(args: *std.process.Args.Iterator) SnapshotOptions {
 }
 
 fn snapshotStableAflite(allocator: Allocator, io: std.Io, path: []const u8, out_path: []const u8, replace: bool) !void {
+    const report = try copyStableAfliteToPath(allocator, io, path, out_path, replace);
+    const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn copyStableAfliteToPath(allocator: Allocator, io: std.Io, path: []const u8, out_path: []const u8, replace: bool) !antfly.lite.backend.StableSnapshotReport {
     try requireAflitePath(path);
     try requireAflitePath(out_path);
     if (std.mem.eql(u8, path, out_path)) {
@@ -528,10 +535,7 @@ fn snapshotStableAflite(allocator: Allocator, io: std.Io, path: []const u8, out_
     var backend = try antfly.lite.backend.Handle.open(allocator, path, .{ .read_only = true });
     defer backend.deinit();
 
-    const report = try backend.copyStableSnapshot(out_path, replace);
-    const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
-    defer allocator.free(json);
-    writeJsonLine(io, json);
+    return try backend.copyStableSnapshot(out_path, replace);
 }
 
 fn restore(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -591,6 +595,24 @@ fn restoreFromSourceFile(
         target_probe.close();
     }
 
+    if (std.mem.endsWith(u8, source_path, ".aflite")) {
+        const tmp_path = try restoreTempPathAlloc(allocator, out_path);
+        defer allocator.free(tmp_path);
+        try deleteFileIfExists(io, tmp_path);
+        errdefer deleteFilePath(io, tmp_path) catch {};
+
+        _ = try copyStableAfliteToPath(allocator, io, source_path, tmp_path, true);
+        renameFilePath(io, tmp_path, out_path) catch |err| {
+            deleteFilePath(io, tmp_path) catch {};
+            return err;
+        };
+
+        cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
+        try writeJsonString(allocator, io, out_path);
+        cli.writeStdout(io, "}\n");
+        return;
+    }
+
     const body = try readPortableRestoreSourceAlloc(allocator, io, source_path);
     defer allocator.free(body);
     try portable_backup.validatePortable(allocator, body);
@@ -619,15 +641,6 @@ fn restoreFromSourceFile(
 fn readPortableRestoreSourceAlloc(allocator: Allocator, io: std.Io, source_path: []const u8) ![]u8 {
     if (std.mem.endsWith(u8, source_path, ".afb")) {
         return try cli.readFileAlloc(io, allocator, source_path, max_afb_file_bytes);
-    }
-    if (std.mem.endsWith(u8, source_path, ".aflite")) {
-        var source = try LiteDb.open(allocator, source_path, .query_readonly);
-        defer source.close();
-
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(allocator);
-        try portable_backup.exportPortable(allocator, source.db.core.store, &out);
-        return try out.toOwnedSlice(allocator);
     }
     return error.InvalidArguments;
 }
@@ -720,10 +733,7 @@ fn vacuum(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
-    defer lite.close();
-
-    const report = try lite.backend.vacuum();
+    const report = try vacuumAflitePath(allocator, path);
     const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
@@ -734,19 +744,37 @@ fn compact(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
-    defer lite.close();
+    {
+        var lite = try LiteDb.open(allocator, path, .writer);
+        defer lite.close();
+        try prepareCompactLite(&lite);
+    }
 
-    const report = try compactLite(&lite);
+    const report = CompactReport{
+        .compacted = true,
+        .vacuum = try vacuumAflitePath(allocator, path),
+    };
     const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
 }
 
-fn compactLite(lite: *LiteDb) !CompactReport {
+fn vacuumAflitePath(allocator: Allocator, path: []const u8) !antfly.lite.backend.VacuumReport {
+    var backend = try antfly.lite.backend.Handle.open(allocator, path, .{});
+    defer backend.deinit();
+    return try backend.vacuum();
+}
+
+fn prepareCompactLite(lite: *LiteDb) !void {
     try lite.db.maintenanceDriver().runUntilIdle();
     try lite.db.forceCompactTextIndexes();
     try lite.db.drainScheduledTextMerges();
+    try lite.db.sync(true);
+    try lite.db.syncIndexes(true);
+}
+
+fn compactLite(lite: *LiteDb) !CompactReport {
+    try prepareCompactLite(lite);
     return .{
         .compacted = true,
         .vacuum = try lite.backend.vacuum(),
@@ -1350,14 +1378,7 @@ test "lite restore source can be an aflite database" {
         try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
     }
 
-    const portable = try readPortableRestoreSourceAlloc(allocator, io, src_path);
-    defer allocator.free(portable);
-
-    {
-        var dest = try LiteDb.open(allocator, dst_path, .writer);
-        defer dest.close();
-        try portable_backup.importPortable(allocator, dest.db.core.store, portable);
-    }
+    try restoreFromSourceFile(allocator, io, src_path, dst_path, false);
 
     {
         var reopened = try LiteDb.open(allocator, dst_path, .query_readonly);

@@ -122,9 +122,6 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try self.docs.reserveWriterSlot();
-    defer self.docs.releaseWriterSlot();
-
     try writeFileReserved(self, path, contents);
 }
 
@@ -137,9 +134,6 @@ fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     _ = sync;
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try self.docs.reserveWriterSlot();
-    defer self.docs.releaseWriterSlot();
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -158,16 +152,11 @@ fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, s
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try self.docs.reserveWriterSlot();
-    errdefer self.docs.releaseWriterSlot();
-    return try NativeAtomicWriteSink.create(allocator, self, path, true);
+    return try NativeAtomicWriteSink.create(allocator, self, path);
 }
 
 fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try self.docs.reserveWriterSlot();
-    defer self.docs.releaseWriterSlot();
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -181,9 +170,6 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try self.docs.reserveWriterSlot();
-    defer self.docs.releaseWriterSlot();
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
     try self.docs.file.deleteIndexCatalogRecord(path);
@@ -191,9 +177,6 @@ fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try self.docs.reserveWriterSlot();
-    defer self.docs.releaseWriterSlot();
-
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -228,7 +211,6 @@ const NativeAtomicWriteSink = struct {
     storage: *Store,
     path: []u8,
     out: std.ArrayListUnmanaged(u8) = .empty,
-    writer_reserved: bool = false,
 
     const vtable: AtomicWriteSink.VTable = .{
         .len = len,
@@ -239,14 +221,13 @@ const NativeAtomicWriteSink = struct {
         .abort = abort,
     };
 
-    fn create(allocator: Allocator, storage: *Store, path: []const u8, writer_reserved: bool) !AtomicWriteSink {
+    fn create(allocator: Allocator, storage: *Store, path: []const u8) !AtomicWriteSink {
         const self = try allocator.create(NativeAtomicWriteSink);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .storage = storage,
             .path = try allocator.dupe(u8, path),
-            .writer_reserved = writer_reserved,
         };
         return .{
             .ptr = self,
@@ -285,20 +266,12 @@ const NativeAtomicWriteSink = struct {
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
-        defer self.releaseWriterSlot();
         try writeFileReserved(self.storage, self.path, self.out.items);
     }
 
     fn abort(ptr: *anyopaque) void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        self.releaseWriterSlot();
         self.deinit();
-    }
-
-    fn releaseWriterSlot(self: *NativeAtomicWriteSink) void {
-        if (!self.writer_reserved) return;
-        self.storage.docs.releaseWriterSlot();
-        self.writer_reserved = false;
     }
 };
 
@@ -472,7 +445,7 @@ test "lite native index storage recovers previous checkpoint after interrupted u
     }
 }
 
-test "lite native index storage participates in native writer reservation" {
+test "lite native index storage serializes physical writes without taking document writer slot" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -487,13 +460,12 @@ test "lite native index storage participates in native writer reservation" {
 
     var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/a.tbl");
     try writer.appendSlice("pending");
-    try std.testing.expectError(error.FileBusy, storage.writeFileAbsolute("/indexes/ft/b.tbl", "blocked"));
-    try std.testing.expectError(error.FileBusy, docs.beginWrite());
+
+    var doc_writer = try docs.beginWrite();
+    defer doc_writer.abort();
     writer.abort();
 
     try storage.writeFileAbsolute("/indexes/ft/b.tbl", "released");
 
-    var doc_writer = try docs.beginWrite();
-    defer doc_writer.abort();
-    try std.testing.expectError(error.FileBusy, storage.writeFileAbsolute("/indexes/ft/c.tbl", "blocked"));
+    try std.testing.expectError(error.FileBusy, docs.beginWrite());
 }

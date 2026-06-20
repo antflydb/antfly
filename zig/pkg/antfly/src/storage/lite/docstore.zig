@@ -15,7 +15,9 @@
 //! Runtime document-store adapter over native `.aflite` document pages.
 
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+const antfly_platform = @import("antfly_platform");
+const platform_sync = antfly_platform.sync;
+const platform_time = antfly_platform.time;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_erased = @import("../backend_erased.zig");
 const backend_types = @import("../backend_types.zig");
@@ -114,6 +116,20 @@ pub const Store = struct {
         self.writer_active = true;
     }
 
+    pub fn reserveWriterSlotYielding(self: *Store) !void {
+        if (self.read_only) return error.ReadOnly;
+        while (true) {
+            lockStore(self);
+            if (!self.writer_active) {
+                self.writer_active = true;
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+            platform_time.yieldBriefly();
+        }
+    }
+
     pub fn releaseWriterSlot(self: *Store) void {
         lockStore(self);
         defer self.mutex.unlock();
@@ -149,13 +165,27 @@ pub const Store = struct {
         return try Txn.openWrite(self);
     }
 
+    pub fn beginWriteYielding(self: *Store) !Txn {
+        if (self.read_only) return error.ReadOnly;
+        return try Txn.openWriteYielding(self);
+    }
+
     pub fn beginBatch(self: *Store) !Txn {
         return try self.beginWrite();
+    }
+
+    pub fn beginBatchYielding(self: *Store) !Txn {
+        return try self.beginWriteYielding();
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Txn {
         _ = options;
         return try self.beginBatch();
+    }
+
+    pub fn beginBatchWithOptionsYielding(self: *Store, options: backend_types.BatchOptions) !Txn {
+        _ = options;
+        return try self.beginBatchYielding();
     }
 
     pub fn lastReplaySequence(self: *Store, fallback_last: u64) u64 {
@@ -174,6 +204,14 @@ pub const Store = struct {
     pub fn appendReplayOpaque(self: *Store, alloc: Allocator, sequence: u64, payload: []const u8) !void {
         _ = alloc;
         var txn = try self.beginWrite();
+        errdefer txn.abort();
+        try txn.setReplayOpaque(sequence, payload);
+        try txn.commit();
+    }
+
+    pub fn appendReplayOpaqueYielding(self: *Store, alloc: Allocator, sequence: u64, payload: []const u8) !void {
+        _ = alloc;
+        var txn = try self.beginWriteYielding();
         errdefer txn.abort();
         try txn.setReplayOpaque(sequence, payload);
         try txn.commit();
@@ -272,6 +310,33 @@ pub const Store = struct {
         for (deletes.items) |key| try write.delete(key);
         try write.commit();
     }
+
+    pub fn truncateReplayUpToYielding(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
+        if (up_to_sequence == 0) return;
+
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+
+        {
+            var read = try self.beginRead();
+            defer read.abort();
+            _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return;
+
+            try collectReplayDeletes(alloc, &read, internal_keys.replay_all_kind, up_to_sequence, &deletes);
+            for (replay_hints) |hint| {
+                try collectReplayDeletes(alloc, &read, replayHintOrdinal(hint), up_to_sequence, &deletes);
+            }
+        }
+
+        if (deletes.items.len == 0) return;
+        var write = try self.beginWriteYielding();
+        errdefer write.abort();
+        for (deletes.items) |key| try write.delete(key);
+        try write.commit();
+    }
 };
 
 const RuntimeStore = struct {
@@ -286,15 +351,15 @@ const RuntimeStore = struct {
     }
 
     pub fn beginWrite(self: *RuntimeStore) !Txn {
-        return try self.store.beginWrite();
+        return try self.store.beginWriteYielding();
     }
 
     pub fn beginBatch(self: *RuntimeStore) !Txn {
-        return try self.store.beginBatch();
+        return try self.store.beginBatchYielding();
     }
 
     pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
-        return try self.store.beginBatchWithOptions(options);
+        return try self.store.beginBatchWithOptionsYielding(options);
     }
 
     pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
@@ -306,7 +371,7 @@ const RuntimeStore = struct {
     }
 
     pub fn appendReplayOpaque(self: *RuntimeStore, alloc: Allocator, sequence: u64, payload: []const u8) !void {
-        return try self.store.appendReplayOpaque(alloc, sequence, payload);
+        return try self.store.appendReplayOpaqueYielding(alloc, sequence, payload);
     }
 
     pub fn iterateReplayFrom(self: *RuntimeStore, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
@@ -325,7 +390,7 @@ const RuntimeStore = struct {
     }
 
     pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
-        return try self.store.truncateReplayUpTo(alloc, up_to_sequence);
+        return try self.store.truncateReplayUpToYielding(alloc, up_to_sequence);
     }
 };
 
@@ -354,6 +419,22 @@ pub const Txn = struct {
 
     pub fn openWrite(store: *Store) !Txn {
         try store.reserveWriterSlot();
+        errdefer store.releaseWriterSlot();
+
+        lockStore(store);
+        defer store.mutex.unlock();
+
+        return .{
+            .allocator = store.allocator,
+            .store = store,
+            .docs = try store.file.snapshotDocumentsAlloc(store.allocator),
+            .read_only = false,
+            .writer_reserved = true,
+        };
+    }
+
+    pub fn openWriteYielding(store: *Store) !Txn {
+        try store.reserveWriterSlotYielding();
         errdefer store.releaseWriterSlot();
 
         lockStore(store);

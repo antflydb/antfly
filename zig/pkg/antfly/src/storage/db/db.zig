@@ -5792,6 +5792,12 @@ pub const DB = struct {
         try self.core.syncStore(full);
     }
 
+    pub fn syncIndexes(self: *DB, force: bool) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.index_manager.syncAll(force);
+    }
+
     fn restoreSnapshotStoreTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions, restore_identity: ?RestoreIdentity) !void {
         if (restore_identity) |identity| try beginRestoreImport(alloc, path, snapshot_root, identity);
         var opened_primary = try openPrimaryStore(alloc, path, .{
