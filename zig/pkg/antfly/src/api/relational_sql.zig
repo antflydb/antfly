@@ -35280,66 +35280,6 @@ fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]con
     return out;
 }
 
-fn appendRelationalColumnAlloc(
-    alloc: std.mem.Allocator,
-    schema: *runtime_schema.TableSchema,
-    column: runtime_schema.RelationalColumn,
-) !void {
-    if (relationalColumnIndex(schema.relational_columns, column.name) != null) return error.InvalidSqlCatalog;
-    const len = schema.relational_columns.len;
-    const out = try alloc.alloc(runtime_schema.RelationalColumn, len + 1);
-    errdefer alloc.free(out);
-    @memcpy(out[0..len], schema.relational_columns);
-    out[len] = try cloneDdlRelationalColumn(alloc, column);
-    if (len > 0) alloc.free(schema.relational_columns);
-    schema.relational_columns = out;
-}
-
-fn appendUniqueConstraintAlloc(
-    alloc: std.mem.Allocator,
-    schema: *runtime_schema.TableSchema,
-    constraint: runtime_schema.UniqueConstraint,
-) !void {
-    if (uniqueConstraintNameExists(schema.unique_constraints, constraint.name)) return error.InvalidSqlCatalog;
-    const len = schema.unique_constraints.len;
-    const out = try alloc.alloc(runtime_schema.UniqueConstraint, len + 1);
-    errdefer alloc.free(out);
-    @memcpy(out[0..len], schema.unique_constraints);
-    out[len] = try cloneDdlUniqueConstraint(alloc, constraint);
-    if (len > 0) alloc.free(schema.unique_constraints);
-    schema.unique_constraints = out;
-}
-
-fn appendForeignKeyAlloc(
-    alloc: std.mem.Allocator,
-    schema: *runtime_schema.TableSchema,
-    foreign_key: runtime_schema.ForeignKey,
-) !void {
-    if (foreignKeyNameExists(schema.foreign_keys, foreign_key.name)) return error.InvalidSqlCatalog;
-    const len = schema.foreign_keys.len;
-    const out = try alloc.alloc(runtime_schema.ForeignKey, len + 1);
-    errdefer alloc.free(out);
-    @memcpy(out[0..len], schema.foreign_keys);
-    out[len] = try cloneDdlForeignKey(alloc, foreign_key);
-    if (len > 0) alloc.free(schema.foreign_keys);
-    schema.foreign_keys = out;
-}
-
-fn appendRelationalCheckAlloc(
-    alloc: std.mem.Allocator,
-    schema: *runtime_schema.TableSchema,
-    check: runtime_schema.RelationalCheck,
-) !void {
-    if (relationalCheckNameExists(schema.checks, check.name)) return error.InvalidSqlCatalog;
-    const len = schema.checks.len;
-    const out = try alloc.alloc(runtime_schema.RelationalCheck, len + 1);
-    errdefer alloc.free(out);
-    @memcpy(out[0..len], schema.checks);
-    out[len] = try cloneDdlRelationalCheck(alloc, check);
-    if (len > 0) alloc.free(schema.checks);
-    schema.checks = out;
-}
-
 fn renameRelationalColumnAlloc(
     alloc: std.mem.Allocator,
     schema: *runtime_schema.TableSchema,
