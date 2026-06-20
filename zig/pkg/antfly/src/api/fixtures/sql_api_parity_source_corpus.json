@@ -101,10 +101,14 @@
       "sql": "PREPARE recursive_usage_read_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows"
     },
     {
-      "name": "unsupported recursive cte prepared statement protocol plan",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
+      "name": "prepare recursive cte update statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "recursive_usage_plan",
+        "operations": 0
+      },
+      "plan": "ddl:prepare_statement:name=recursive_usage_plan:params=0:subject=write:statement=update",
       "sql": "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
     },
     {

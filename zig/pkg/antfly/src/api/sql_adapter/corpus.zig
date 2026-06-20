@@ -4417,6 +4417,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_prepare_statement_merge_family: bool = false,
     ddl_prepare_cte_write_statement: bool = false,
     ddl_prepare_recursive_cte_read_statement: bool = false,
+    ddl_prepare_recursive_cte_write_statement: bool = false,
     ddl_prepared_transaction_commit: bool = false,
     ddl_prepared_transaction_prepare: bool = false,
     ddl_prepared_transaction_recovery_contract: bool = false,
@@ -4531,7 +4532,6 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
-    unsupported_ddl_prepare_recursive_cte_statement: bool = false,
     unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
@@ -5801,10 +5801,6 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
                 (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
                     std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
-            self.unsupported_ddl_prepare_recursive_cte_statement = self.unsupported_ddl_prepare_recursive_cte_statement or
-                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
-                    std.mem.startsWith(u8, entry.sql, "PREPARE ") and
-                    std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null);
             self.unsupported_ddl_routine_function_body = self.unsupported_ddl_routine_function_body or
                 (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
@@ -6206,6 +6202,10 @@ pub const AppParityCorpusCoverage = struct {
                             std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "read") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "read");
+                    self.ddl_prepare_recursive_cte_write_statement = self.ddl_prepare_recursive_cte_write_statement or
+                        std.mem.startsWith(u8, entry.sql, "PREPARE ") and
+                            std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
                 },
                 .prepare_transaction => {
                     self.ddl_prepared_transaction_prepare = true;

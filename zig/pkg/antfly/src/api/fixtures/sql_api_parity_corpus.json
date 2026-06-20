@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "a510bf0b6548f3e25d085cc495dce3e39ccf9b0c949eded98eb181bae71a1a1f",
+  "source_sha256": "65bdd25027b3bc9c2a4d3240b7ab5e89d49eee7e955452a999c29601ff8a8e52",
   "source_entry_count": 998,
   "entry_count": 998,
   "skipped_entries": [
@@ -107,10 +107,14 @@
       "sql": "PREPARE recursive_usage_read_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows"
     },
     {
-      "name": "unsupported recursive cte prepared statement protocol plan",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
+      "name": "prepare recursive cte update statement protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "prepare_statement",
+        "table_name": "recursive_usage_plan",
+        "operations": 0
+      },
+      "plan": "ddl:prepare_statement:name=recursive_usage_plan:params=0:subject=write:statement=update",
       "sql": "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
     },
     {

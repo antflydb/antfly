@@ -89,10 +89,8 @@ pub fn classifyPreparedStatementStatementKind(tokens: []const Token, start: usiz
     if (statementStartsAt(tokens, start, "select")) return .read;
     if (statementStartsAt(tokens, start, "with")) {
         const with_tokens = tokens[start..];
-        const recursive = withStatementIsRecursive(with_tokens);
         const final_index = withFinalStatementIndex(with_tokens, .{ .allow_recursive = true }) orelse return null;
         if (std.ascii.eqlIgnoreCase(with_tokens[final_index].text, "select")) return .read;
-        if (recursive) return null;
         if (withFinalStatementWriteKind(with_tokens[final_index].text)) |kind| return preparedStatementKindFromWriteKind(kind);
         return null;
     }
@@ -167,12 +165,6 @@ fn withFinalStatementIndex(tokens: []const Token, options: WithFinalStatementOpt
 
     if (index >= tokens.len or tokens[index].kind != .identifier) return null;
     return index;
-}
-
-fn withStatementIsRecursive(tokens: []const Token) bool {
-    return tokens.len > 1 and
-        tokens[1].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[1].text, "recursive");
 }
 
 fn withFinalStatementWriteKind(keyword: []const u8) ?SqlWriteStatementKind {
@@ -254,6 +246,7 @@ test "sql adapter classifier identifies prepared statement subject families" {
         .{ .sql = "PREPARE usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows", .start_keyword = "with", .expected = .read },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archived_records(id) SELECT id FROM source_rows", .start_keyword = "with", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)", .start_keyword = "with", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)", .start_keyword = "with", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)", .start_keyword = "with", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status", .start_keyword = "with", .expected = .write },
         .{ .sql = "PREPARE usage_plan AS INSERT INTO usage_records(id) VALUES ($1)", .start_keyword = "insert", .expected = .write },
@@ -277,8 +270,8 @@ test "sql adapter classifier identifies prepared statement subject families" {
     const explain_start = parser.findTopLevelKeyword(explain_tokens.items, "explain").?;
     try std.testing.expect(classifyPreparedStatementSubjectKind(explain_tokens.items, explain_start) == null);
 
-    var recursive_tokens = try lexer.tokenizeAlloc(alloc, "PREPARE usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done'");
-    defer lexer.freeTokens(alloc, &recursive_tokens);
-    const recursive_start = parser.findTopLevelKeyword(recursive_tokens.items, "with").?;
-    try std.testing.expect(classifyPreparedStatementSubjectKind(recursive_tokens.items, recursive_start) == null);
+    var malformed_recursive_tokens = try lexer.tokenizeAlloc(alloc, "PREPARE usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records)");
+    defer lexer.freeTokens(alloc, &malformed_recursive_tokens);
+    const malformed_recursive_start = parser.findTopLevelKeyword(malformed_recursive_tokens.items, "with").?;
+    try std.testing.expect(classifyPreparedStatementSubjectKind(malformed_recursive_tokens.items, malformed_recursive_start) == null);
 }

@@ -7692,6 +7692,59 @@ pub fn matchFunctionKeywordText(
     return token.text;
 }
 
+pub fn parseFunctionCallStartIf(
+    tokens: []const Token,
+    pos: *usize,
+    comptime predicate: fn ([]const u8) bool,
+) !void {
+    _ = matchFunctionKeywordText(tokens, pos, predicate) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseBooleanNotExpressionStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "not");
+}
+
+pub fn parseCaseExpressionStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "case");
+}
+
+pub fn matchCaseExpressionWhen(tokens: []const Token, pos: *usize) bool {
+    return parser.matchKeyword(tokens, pos, "when");
+}
+
+pub fn parseCaseExpressionThen(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "then");
+}
+
+pub fn parseCaseExpressionElse(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "else");
+}
+
+pub fn parseCaseExpressionEnd(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "end");
+}
+
+pub fn parseCastExpressionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "cast");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseCastExpressionAs(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "as");
+}
+
+pub fn parseDatePartFunctionCallStart(tokens: []const Token, pos: *usize) !bool {
+    const extract_syntax = parser.matchKeyword(tokens, pos, "extract");
+    if (!extract_syntax and !parser.matchKeyword(tokens, pos, "date_part")) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    return extract_syntax;
+}
+
+pub fn parseDatePartExtractSeparator(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "from");
+}
+
 pub fn functionCallStartsAt(tokens: []const Token, index: usize, keyword: []const u8) bool {
     var pos: usize = 0;
     return parser.Cursor.init(tokens, &pos).functionCallStartsAt(index, keyword);
@@ -9760,19 +9813,45 @@ test "sql adapter expression keyword predicates classify function and tail token
 
     const case_tokens = [_]Token{
         .{ .kind = .identifier, .text = "case" },
+        .{ .kind = .identifier, .text = "when" },
+        .{ .kind = .identifier, .text = "then" },
+        .{ .kind = .identifier, .text = "else" },
+        .{ .kind = .identifier, .text = "end" },
     };
     try std.testing.expect(peekCaseExpressionSyntax(case_tokens[0..], 0));
+    var case_pos: usize = 0;
+    try parseCaseExpressionStart(case_tokens[0..], &case_pos);
+    try std.testing.expectEqual(@as(usize, 1), case_pos);
+    try std.testing.expect(matchCaseExpressionWhen(case_tokens[0..], &case_pos));
+    try std.testing.expectEqual(@as(usize, 2), case_pos);
+    try parseCaseExpressionThen(case_tokens[0..], &case_pos);
+    try std.testing.expectEqual(@as(usize, 3), case_pos);
+    try parseCaseExpressionElse(case_tokens[0..], &case_pos);
+    try std.testing.expectEqual(@as(usize, 4), case_pos);
+    try parseCaseExpressionEnd(case_tokens[0..], &case_pos);
+    try std.testing.expectEqual(@as(usize, 5), case_pos);
 
     const cast_tokens = [_]Token{
         .{ .kind = .identifier, .text = "cast" },
         .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "field" },
+        .{ .kind = .identifier, .text = "as" },
     };
     try std.testing.expect(peekCastExpressionSyntax(cast_tokens[0..], 0));
+    var cast_pos: usize = 0;
+    try parseCastExpressionCallStart(cast_tokens[0..], &cast_pos);
+    try std.testing.expectEqual(@as(usize, 2), cast_pos);
+    cast_pos = 3;
+    try parseCastExpressionAs(cast_tokens[0..], &cast_pos);
+    try std.testing.expectEqual(@as(usize, 4), cast_pos);
 
     const not_tokens = [_]Token{
         .{ .kind = .identifier, .text = "not" },
     };
     try std.testing.expect(peekBooleanNotExpressionSyntax(not_tokens[0..], 0));
+    var not_pos: usize = 0;
+    try parseBooleanNotExpressionStart(not_tokens[0..], &not_pos);
+    try std.testing.expectEqual(@as(usize, 1), not_pos);
 
     const grouped_tokens = [_]Token{
         .{ .kind = .lparen, .text = "(" },
@@ -9825,6 +9904,35 @@ test "sql adapter expression keyword predicates classify function and tail token
     var regexp_replace_pos: usize = 0;
     try parseRegexpReplaceFunctionCallStart(regexp_replace_tokens[0..], &regexp_replace_pos);
     try std.testing.expectEqual(@as(usize, 2), regexp_replace_pos);
+
+    const regexp_count_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "regexp_count" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var regexp_count_pos: usize = 0;
+    try parseFunctionCallStartIf(regexp_count_tokens[0..], &regexp_count_pos, sqlKeywordIsRegexpCountFunction);
+    try std.testing.expectEqual(@as(usize, 2), regexp_count_pos);
+
+    const extract_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "EXTRACT" },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "dow" },
+        .{ .kind = .identifier, .text = "FROM" },
+    };
+    var extract_pos: usize = 0;
+    try std.testing.expect(try parseDatePartFunctionCallStart(extract_tokens[0..], &extract_pos));
+    try std.testing.expectEqual(@as(usize, 2), extract_pos);
+    extract_pos = 3;
+    try parseDatePartExtractSeparator(extract_tokens[0..], &extract_pos);
+    try std.testing.expectEqual(@as(usize, 4), extract_pos);
+
+    const date_part_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "date_part" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var date_part_pos: usize = 0;
+    try std.testing.expect(!try parseDatePartFunctionCallStart(date_part_tokens[0..], &date_part_pos));
+    try std.testing.expectEqual(@as(usize, 2), date_part_pos);
 
     const array_transform_tokens = [_]Token{
         .{ .kind = .identifier, .text = "array_remove" },
