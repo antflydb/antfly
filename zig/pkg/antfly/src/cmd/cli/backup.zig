@@ -18,6 +18,7 @@ const cli = @import("mod.zig");
 const lite_restore_staging = @import("../lite_restore_staging.zig");
 
 const BackupArgs = struct {
+    help: bool = false,
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
@@ -29,6 +30,7 @@ const BackupArgs = struct {
 };
 
 const RestoreArgs = struct {
+    help: bool = false,
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
@@ -41,6 +43,10 @@ const RestoreArgs = struct {
 
 pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const opts = parseBackupArgs(args) catch cli.fatal("invalid backup arguments", .{});
+    if (opts.help) {
+        printBackupUsage();
+        return;
+    }
 
     if (opts.url) |value| try client.setBaseUrl(value);
 
@@ -95,6 +101,10 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
 
 pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const opts = parseRestoreArgs(args) catch cli.fatal("invalid restore arguments", .{});
+    if (opts.help) {
+        printRestoreUsage();
+        return;
+    }
 
     if (opts.url) |value| try client.setBaseUrl(value);
 
@@ -159,7 +169,9 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
 fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
     var out = BackupArgs{};
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
+            out.help = true;
+        } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             out.table_name = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--tables")) {
             out.tables_str = try nextRequired(args);
@@ -185,7 +197,9 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
 fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
     var out = RestoreArgs{};
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
+            out.help = true;
+        } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             out.table_name = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--tables")) {
             out.tables_str = try nextRequired(args);
@@ -208,8 +222,42 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
     return out;
 }
 
+fn printBackupUsage() void {
+    std.debug.print(
+        \\usage:
+        \\  antfly backup --table <name> --backup-id <id> [--location <uri>] [--format native] [--url <url>]
+        \\  antfly backup --tables <a,b> --backup-id <id> [--location <uri>] [--url <url>]
+        \\  antfly backup --list [--location <uri>] [--output json] [--url <url>]
+        \\
+        \\notes:
+        \\  Table backups are native. Portable Lite upgrade starts from `antfly restore --input`.
+        \\
+    , .{});
+}
+
+fn printRestoreUsage() void {
+    std.debug.print(
+        \\usage:
+        \\  antfly restore --table <name> --backup-id <id> [--location <uri>] [--format native|portable] [--url <url>]
+        \\  antfly restore --tables <a,b> --backup-id <id> [--location <uri>] [--mode <mode>] [--url <url>]
+        \\  antfly restore --input <db.aflite|backup.afb> --table <name> [--backup-id <id>] [--location <uri>] [--url <url>]
+        \\
+        \\notes:
+        \\  `--input db.aflite` stages an Antfly Lite database as a portable backup,
+        \\  then restores it through the normal Antfly table restore path.
+        \\
+    , .{});
+}
+
 fn nextRequired(args: *std.process.Args.Iterator) ![]const u8 {
     return args.next() orelse error.MissingArgument;
+}
+
+test "backup cli parser accepts help flag" {
+    var argv = [_][*:0]const u8{"--help"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseBackupArgs(&iter);
+    try std.testing.expect(opts.help);
 }
 
 test "backup cli parser rejects unknown arguments" {
@@ -238,6 +286,13 @@ test "restore cli parser accepts aflite input shape" {
     try std.testing.expectEqualStrings("portable", opts.format.?);
     try std.testing.expectEqualStrings("file:///tmp/backups", opts.location);
     try std.testing.expectEqualStrings("lite-app", opts.backup_id.?);
+}
+
+test "restore cli parser accepts help flag" {
+    var argv = [_][*:0]const u8{"help"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expect(opts.help);
 }
 
 test "restore cli parser rejects unknown arguments" {

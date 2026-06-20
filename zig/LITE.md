@@ -568,7 +568,13 @@ query-visible results should match within documented index rebuild semantics.
 - Add `antfly lite promote` as a wrapper around portable backup and normal
   restore.
 - Add normal Antfly restore support for `.aflite` input by opening it read-only
-  and producing the same portable logical restore stream as `.afb`.
+  and producing the same portable logical restore stream as `.afb`. The normal
+  CLI shape should be:
+
+  ```sh
+  antfly restore --input app.aflite --table docs --location file:///tmp/antfly_backups
+  ```
+
 - Extend portable backup coverage for schema, index definitions, enrichment
   definitions, and portable artifacts that are not yet included.
 

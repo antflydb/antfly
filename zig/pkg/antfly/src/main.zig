@@ -181,7 +181,7 @@ fn printUsage(argv0: []const u8) void {
         \\  delete         Delete a single document
         \\  agents         Run AI agents (retrieval, query-builder)
         \\  backup         Backup tables
-        \\  restore        Restore tables from backup
+        \\  restore        Restore tables from backup, including Lite *.aflite input
         \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI
