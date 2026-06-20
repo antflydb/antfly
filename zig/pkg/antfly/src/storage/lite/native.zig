@@ -951,9 +951,12 @@ pub const NativeFile = struct {
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
+        const free_pages = try self.readFreePagesAlloc(checkpoint);
+        errdefer self.allocator.free(free_pages);
+        try self.validateFreePagesSafeForCheckpointSlots(free_pages);
         return .{
             .file = self,
-            .free_pages = try self.readFreePagesAlloc(checkpoint),
+            .free_pages = free_pages,
             .next_page_id = checkpoint.page_count,
         };
     }
@@ -1010,6 +1013,23 @@ pub const NativeFile = struct {
         var it = checkpoint_pages.iterator();
         while (it.next()) |entry| {
             try out.put(self.allocator, entry.key_ptr.*, {});
+        }
+    }
+
+    fn collectAllValidCheckpointReachablePages(self: *NativeFile, out: *ReachablePageSet) !void {
+        for (self.header.checkpoints) |slot| {
+            if (!validCheckpointSlot(slot)) continue;
+            try self.collectCheckpointReachablePages(slot, out);
+        }
+    }
+
+    fn validateFreePagesSafeForCheckpointSlots(self: *NativeFile, free_pages: []const u64) !void {
+        var protected_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer protected_pages.deinit(self.allocator);
+
+        try self.collectAllValidCheckpointReachablePages(&protected_pages);
+        for (free_pages) |page_id| {
+            if (protected_pages.contains(page_id)) return error.InvalidNativeFreeMap;
         }
     }
 
@@ -1084,6 +1104,7 @@ pub const NativeFile = struct {
         for (free_map.free_pages) |page_id| {
             if (reachable_pages.contains(page_id)) return error.InvalidNativeFreeMap;
         }
+        try self.validateFreePagesSafeForCheckpointSlots(free_map.free_pages);
     }
 
     const LiveStats = struct {
@@ -2787,6 +2808,40 @@ test "lite native check validates committed free map root" {
     const report = try file.check();
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
+}
+
+test "lite native free map cannot reclaim fallback checkpoint pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-fallback-protected.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "v1");
+    try file.putDocument("doc:1", "v2");
+
+    const active = file.activeCheckpoint();
+    const fallback = file.header.checkpoints[if (file.header.active_checkpoint == 0) 1 else 0];
+    try std.testing.expect(active.free_map_root_page != 0);
+    try std.testing.expect(fallback.free_map_root_page != 0);
+    try std.testing.expect(active.free_map_root_page != fallback.free_map_root_page);
+
+    const payload = try encodeFreeMapAlloc(allocator, default_page_size, active.page_count, &.{fallback.free_map_root_page});
+    defer allocator.free(payload);
+    var page: [default_page_size]u8 = undefined;
+    encodePage(&page, .free_map, payload);
+    try file.file.writePositionalAll(file.io_impl.io(), &page, active.free_map_root_page * default_page_size);
+    try file.file.sync(file.io_impl.io());
+
+    const report = try file.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
+    try std.testing.expectError(error.InvalidNativeFreeMap, file.putDocument("doc:1", "v3"));
 }
 
 test "lite native check reports corrupted committed document page" {
