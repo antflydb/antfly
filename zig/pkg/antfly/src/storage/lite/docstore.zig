@@ -28,6 +28,7 @@ pub const Store = struct {
     file: native.NativeFile,
     read_only: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
+    writer_active: bool = false,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !Store {
         const file = native.NativeFile.open(allocator, path, read_only) catch |err| switch (err) {
@@ -118,6 +119,7 @@ pub const Txn = struct {
     docs: []native.OwnedDocument = &.{},
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
     read_only: bool = true,
+    writer_reserved: bool = false,
 
     pub fn openRead(store: *Store) !Txn {
         lockStore(store);
@@ -132,17 +134,24 @@ pub const Txn = struct {
     pub fn openWrite(store: *Store) !Txn {
         lockStore(store);
         defer store.mutex.unlock();
+
+        if (store.writer_active) return error.FileBusy;
+        store.writer_active = true;
+        errdefer store.writer_active = false;
+
         return .{
             .allocator = store.allocator,
             .store = store,
             .docs = try store.file.snapshotDocumentsAlloc(store.allocator),
             .read_only = false,
+            .writer_reserved = true,
         };
     }
 
     pub fn abort(self: *Txn) void {
         self.freePending();
         native.NativeFile.freeSnapshotDocuments(self.allocator, self.docs);
+        self.releaseWriterSlot();
         self.* = undefined;
     }
 
@@ -161,7 +170,17 @@ pub const Txn = struct {
 
         lockStore(store);
         defer store.mutex.unlock();
+        errdefer {
+            if (self.writer_reserved) {
+                store.writer_active = false;
+                self.writer_reserved = false;
+            }
+        }
         try store.file.putDocumentBatch(mutations);
+        if (self.writer_reserved) {
+            store.writer_active = false;
+            self.writer_reserved = false;
+        }
 
         self.freePending();
         native.NativeFile.freeSnapshotDocuments(self.allocator, self.docs);
@@ -210,6 +229,15 @@ pub const Txn = struct {
         }
         self.pending.deinit(self.allocator);
         self.pending = .empty;
+    }
+
+    fn releaseWriterSlot(self: *Txn) void {
+        if (!self.writer_reserved) return;
+        const store = self.store orelse return;
+        lockStore(store);
+        defer store.mutex.unlock();
+        store.writer_active = false;
+        self.writer_reserved = false;
     }
 };
 
@@ -374,4 +402,35 @@ test "lite native docstore runtime scans ordered snapshot" {
     try std.testing.expectEqualStrings("doc:b", next.key);
     const seek = (try cursor.seekAtOrAfter("doc:bb")).?;
     try std.testing.expectEqualStrings("doc:c", seek.key);
+}
+
+test "lite native docstore reserves one writer until abort or commit" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-single-writer.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.open(allocator, path, false);
+    defer store.close();
+
+    var writer = try store.beginWrite();
+    try writer.put("doc:a", "first");
+    try std.testing.expectError(error.FileBusy, store.beginWrite());
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("doc:a"));
+
+    writer.abort();
+
+    var committed = try store.beginWrite();
+    try committed.put("doc:a", "committed");
+    try committed.commit();
+
+    var next_writer = try store.beginWrite();
+    defer next_writer.abort();
+    try std.testing.expectEqualStrings("committed", try next_writer.get("doc:a"));
 }
