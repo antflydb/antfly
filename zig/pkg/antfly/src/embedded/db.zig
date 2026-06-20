@@ -21,6 +21,7 @@ const template_remote_host = support.template_remote_host;
 pub const lsm_storage = support.lsm_storage;
 pub const enrichment_runtime = support.enrichment_runtime;
 pub const enrichment_embedder = support.enrichment_embedder;
+pub const ttl_runtime = support.ttl_runtime;
 
 const Allocator = std.mem.Allocator;
 const IndexBackendOptions = @TypeOf((db_mod.OpenOptions{}).index_backends);
@@ -42,6 +43,7 @@ pub const OpenOptions = struct {
     storage: ?support.lsm_storage.Storage = null,
     index_backends: IndexBackendOptions = .{},
     enrichment: ?support.enrichment_runtime.Config = null,
+    ttl_cleanup: ttl_runtime.Config = .{},
 };
 
 pub const Profile = support.lite.backend.Profile;
@@ -260,6 +262,7 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         .primary_backend = opts.primary_backend,
         .storage = opts.storage,
         .index_backends = opts.index_backends,
+        .ttl_cleanup = opts.ttl_cleanup,
     };
     if (profile == .hosted) {
         resolved.executor = .{ .backend = .manual };
@@ -360,9 +363,61 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     try std.testing.expect(!status.pending_work.has_async_indexes);
     try std.testing.expect(status.capabilities.dense_vector_search);
     try std.testing.expect(status.capabilities.sparse_vector_search);
+    try std.testing.expect(status.capabilities.ttl_cleanup_runtime);
     try std.testing.expect(status.capabilities.no_inference_configured_ok);
     try std.testing.expect(!status.capabilities.raft_replication);
     try std.testing.expect(!status.capabilities.cluster_placement);
+}
+
+test "embedded db openLite can run ttl cleanup over aflite file" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite-ttl-cleanup.aflite");
+    defer alloc.free(path);
+
+    var db = try DB.openLite(alloc, path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .ttl_cleanup = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 1_000_000_000,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:expired",
+            .value = "{\"title\":\"gone\"}",
+        }},
+        .timestamp_ns = 1,
+        .sync_level = .write,
+    });
+
+    var stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var attempts: usize = 0;
+    while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        types.freeDBStats(alloc, stats);
+        stats = try db.stats(alloc);
+    }
+
+    try std.testing.expect(stats.ttl_cleanup.enabled);
+    try std.testing.expect(stats.ttl_cleanup.runs > 0);
+    try std.testing.expect(stats.ttl_cleanup.scanned_timestamps > 0);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
+    try std.testing.expect(stats.ttl_cleanup.last_run_ns > 0);
 }
 
 test "embedded db openLiteHosted exposes manual maintenance capabilities" {
