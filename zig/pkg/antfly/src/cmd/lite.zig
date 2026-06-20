@@ -113,7 +113,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     }
 
     if (std.mem.eql(u8, subcommand, "init")) return try initLite(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "status") or std.mem.eql(u8, subcommand, "info")) return try status(init.gpa, init.io, args);
+    if (isStatusSubcommand(subcommand)) return try status(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "batch")) return try batch(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return try lookup(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "scan")) return try scan(init.gpa, init.io, args);
@@ -133,6 +133,10 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+fn isStatusSubcommand(subcommand: []const u8) bool {
+    return std.mem.eql(u8, subcommand, "status") or std.mem.eql(u8, subcommand, "info");
 }
 
 fn initLite(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -1075,6 +1079,7 @@ fn printUsage(argv0: []const u8) void {
         \\subcommands:
         \\  init <db.aflite>
         \\  status <db.aflite>
+        \\  info <db.aflite> (alias for status)
         \\  batch <db.aflite> --file request.json
         \\  lookup <db.aflite> --key <key> [--file request.json] [--readonly]
         \\  scan <db.aflite> --file request.json [--readonly]
@@ -1099,6 +1104,12 @@ fn printUsage(argv0: []const u8) void {
         \\  vacuum <db.aflite>
         \\
     , .{argv0});
+}
+
+test "lite info subcommand aliases status" {
+    try std.testing.expect(isStatusSubcommand("status"));
+    try std.testing.expect(isStatusSubcommand("info"));
+    try std.testing.expect(!isStatusSubcommand("check"));
 }
 
 test "lite path validation requires aflite extension" {
