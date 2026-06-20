@@ -4532,7 +4532,7 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_copy_unsupported_options: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
-    unsupported_ddl_temporal_fk_update_action: bool = false,
+    ddl_temporal_fk_update_cascade_action: bool = false,
     unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
@@ -5796,9 +5796,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     std.mem.startsWith(u8, entry.sql, "COPY ") and
                     std.mem.indexOf(u8, entry.sql, "OIDS") != null);
-            self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
-                (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
-                    std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
             self.unsupported_ddl_routine_function_body = self.unsupported_ddl_routine_function_body or
                 (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
@@ -5854,6 +5851,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_temporal_fk_delete_cascade_action = self.ddl_temporal_fk_delete_cascade_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
                             std.mem.indexOf(u8, entry.sql, " ON DELETE CASCADE") != null);
+                    self.ddl_temporal_fk_update_cascade_action = self.ddl_temporal_fk_update_cascade_action or
+                        (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
+                            std.mem.indexOf(u8, entry.sql, " ON UPDATE CASCADE") != null);
                     self.ddl_replace_table = self.ddl_replace_table or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
                 },
                 .table_clone => self.ddl_table_clone = true,

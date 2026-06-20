@@ -636,7 +636,7 @@ pub fn foreignKeyActionIsRestrictive(action: runtime_schema.ForeignKeyAction) bo
 }
 
 pub fn foreignKeyActionSupportsTemporalUpdate(action: runtime_schema.ForeignKeyAction) bool {
-    return foreignKeyActionIsRestrictive(action) or action == .set_null;
+    return foreignKeyActionIsRestrictive(action) or action == .set_null or action == .cascade;
 }
 
 pub fn runtimeSchemaForCatalogTableAlloc(
@@ -1358,6 +1358,7 @@ test "sql adapter binder validates relational catalog lookups" {
         .on_update = .set_null,
     });
     try std.testing.expect(foreignKeyActionSupportsTemporalUpdate(.restrict));
+    try std.testing.expect(foreignKeyActionSupportsTemporalUpdate(.cascade));
     try std.testing.expectError(error.InvalidSqlCatalog, validateForeignKeyForColumns(&period_columns, &periods, .{
         .name = "events_payload_fkey",
         .parent_table = "parent_events",

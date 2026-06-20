@@ -3603,6 +3603,89 @@ pub fn parseAlterTablePartitionPlanTailAlloc(
     return try grammar.parseAlterTablePartitionCatalogTailAlloc(alloc, tokens, pos);
 }
 
+pub fn parseAlterTablePrefixOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !?AlterTableOperation {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.peekKeyword("validate")) {
+        var syntax = try grammar.parseAlterTableValidateConstraintOperationAlloc(alloc, tokens, pos);
+        var syntax_transferred = false;
+        errdefer if (!syntax_transferred) syntax.deinit(alloc);
+        const operation = alterTableValidateConstraintOperationFromSyntax(&syntax);
+        syntax_transferred = true;
+        return operation;
+    }
+
+    if (cursor.peekKeyword("rename")) {
+        var syntax = try grammar.parseAlterTableRenameOperationAlloc(alloc, tokens, pos);
+        var syntax_transferred = false;
+        errdefer if (!syntax_transferred) syntax.deinit(alloc);
+        const operation = alterTableRenameOperationFromSyntax(&syntax);
+        syntax_transferred = true;
+        return operation;
+    }
+
+    if (cursor.peekKeyword("drop")) {
+        var syntax = try grammar.parseAlterTableDropOperationAlloc(alloc, tokens, pos);
+        var syntax_transferred = false;
+        errdefer if (!syntax_transferred) syntax.deinit(alloc);
+        const operation = alterTableDropOperationFromSyntax(&syntax);
+        syntax_transferred = true;
+        return operation;
+    }
+
+    if (!cursor.peekKeyword("alter")) return null;
+
+    const nullability_start = pos.*;
+    if (grammar.parseAlterTableColumnNullabilityOperationAlloc(alloc, tokens, pos)) |syntax_value| {
+        var syntax = syntax_value;
+        var syntax_transferred = false;
+        errdefer if (!syntax_transferred) syntax.deinit(alloc);
+        const operation = alterTableColumnNullabilityOperationFromSyntax(&syntax);
+        syntax_transferred = true;
+        return operation;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = nullability_start,
+        else => return err,
+    }
+
+    const default_start = pos.*;
+    if (grammar.parseAlterTableColumnDefaultOperationAlloc(alloc, tokens, pos)) |syntax_value| {
+        var syntax = syntax_value;
+        var syntax_transferred = false;
+        errdefer if (!syntax_transferred) syntax.deinit(alloc);
+        const default_value: ?runtime_schema.RelationalDefaultValue = if (syntax.action == .set) blk: {
+            const value = try grammar.parseDdlDefaultValueUntypedAlloc(alloc, tokens, pos);
+            errdefer alloc.free(value.value_json);
+            break :blk value;
+        } else null;
+        const operation = alterTableColumnDefaultOperationFromSyntax(&syntax, default_value);
+        syntax_transferred = true;
+        return operation;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = default_start,
+        else => return err,
+    }
+
+    var type_header = try grammar.parseAlterTableColumnTypeHeaderAlloc(alloc, tokens, pos);
+    var type_header_transferred = false;
+    errdefer if (!type_header_transferred) type_header.deinit(alloc);
+    const ddl_type = try grammar.parseDdlType(tokens, pos);
+    const collation = try parseOptionalSupportedDdlCollationAlloc(alloc, tokens, pos, ddl_type.field_type);
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
+    var rewrite_expression = try parseOptionalDdlAlterColumnRewriteExpressionAlloc(alloc, tokens, pos);
+    var rewrite_transferred = false;
+    errdefer if (!rewrite_transferred) if (rewrite_expression) |*rewrite| rewrite.deinit(alloc);
+    const operation = alterTableColumnTypeOperationFromSyntax(&type_header, ddl_type, collation, rewrite_expression);
+    type_header_transferred = true;
+    collation_transferred = true;
+    rewrite_transferred = true;
+    return operation;
+}
+
 pub fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(extension_name, "pgcrypto") or
         std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp");
@@ -4740,6 +4823,104 @@ pub fn parseDdlRangeColumnDefinitionAlloc(
             .range_type = range_type,
         },
     };
+}
+
+pub fn appendDdlRangeColumnDefinitionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
+    periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
+) !void {
+    const definition = try parseDdlRangeColumnDefinitionAlloc(alloc, tokens, pos, columns.items, periods.items);
+    var start_transferred = false;
+    var end_transferred = false;
+    var period_transferred = false;
+    errdefer {
+        if (!start_transferred) freeDdlRelationalColumn(alloc, definition.start_column);
+        if (!end_transferred) freeDdlRelationalColumn(alloc, definition.end_column);
+        if (!period_transferred) freeDdlPeriod(alloc, definition.period);
+    }
+    try columns.append(alloc, definition.start_column);
+    start_transferred = true;
+    try columns.append(alloc, definition.end_column);
+    end_transferred = true;
+    try periods.append(alloc, definition.period);
+    period_transferred = true;
+}
+
+pub fn parseOptionalSupportedDdlCollationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    field_type: runtime_schema.AntflyType,
+) !?[]const u8 {
+    const collation = try grammar.parseOptionalDdlCollationAlloc(alloc, tokens, pos) orelse return null;
+    errdefer alloc.free(collation);
+    if (!binder.relationalFieldTypeSupportsCollation(field_type)) return error.UnsupportedSqlShape;
+    return collation;
+}
+
+pub const DdlColumnDefinitionHooks = struct {
+    ptr: *anyopaque,
+    parse_default_value: *const fn (*anyopaque, runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue,
+    parse_generated_value: *const fn (*anyopaque) anyerror!runtime_schema.RelationalGeneratedValue,
+};
+
+pub fn parseDdlColumnDefinitionStandaloneAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+) !runtime_schema.RelationalColumn {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+
+    const ddl_type = try grammar.parseDdlType(tokens, pos);
+    const path = try alloc.dupe(u8, name);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(path);
+    var column: runtime_schema.RelationalColumn = .{
+        .name = name,
+        .path = path,
+        .field_type = ddl_type.field_type,
+        .array_item_type = ddl_type.array_item_type,
+        .nullable = true,
+    };
+    var column_transferred = false;
+    errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
+    name_transferred = true;
+    path_transferred = true;
+
+    while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon) and !cursor.peekKeyword("primary") and !cursor.peekKeyword("unique") and !cursor.peekKeyword("check") and !cursor.peekKeyword("references") and !cursor.peekKeyword("constraint")) {
+        if (try parseOptionalSupportedDdlCollationAlloc(alloc, tokens, pos, column.field_type)) |collation| {
+            if (column.collation != null) {
+                alloc.free(collation);
+                return error.UnsupportedSqlShape;
+            }
+            column.collation = collation;
+            continue;
+        } else if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("null");
+            column.nullable = false;
+        } else if (cursor.matchKeyword("null")) {
+            column.nullable = true;
+        } else if (cursor.matchKeyword("default")) {
+            if (column.default_value != null) return error.UnsupportedSqlShape;
+            if (column.generated != null) return error.UnsupportedSqlShape;
+            column.default_value = try hooks.parse_default_value(hooks.ptr, column.field_type);
+        } else if (cursor.matchKeyword("generated")) {
+            if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
+            column.generated = try hooks.parse_generated_value(hooks.ptr);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    column_transferred = true;
+    return column;
 }
 
 pub fn makeDdlForeignKeyAlloc(

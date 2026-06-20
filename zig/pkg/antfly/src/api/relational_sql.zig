@@ -296,7 +296,6 @@ const relationalConstraintNameExists = sql_adapter.relationalConstraintNameExist
 const relationalCheckOpToken = sql_adapter.relationalCheckOpToken;
 const relationalCheckOpFromUniquePredicateToken = sql_adapter.relationalCheckOpFromUniquePredicateToken;
 const relationalCheckValidationStateName = sql_adapter.relationalCheckValidationStateName;
-const relationalFieldTypeSupportsCollation = sql_adapter.relationalFieldTypeSupportsCollation;
 const relationalGeneratedOpForUniqueExpressionOp = sql_adapter.relationalGeneratedOpForUniqueExpressionOp;
 const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
 const relationalIndexLifecycleName = sql_adapter.relationalIndexLifecycleName;
@@ -2758,79 +2757,7 @@ const Parser = struct {
         self: *@This(),
         operations: *std.ArrayListUnmanaged(AlterTableOperation),
     ) !void {
-        if (self.peekKeyword("validate")) {
-            var syntax = try sql_adapter.parseAlterTableValidateConstraintOperationAlloc(self.alloc, self.tokens, &self.pos);
-            var syntax_transferred = false;
-            errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableValidateConstraintOperationFromSyntax(&syntax));
-            syntax_transferred = true;
-            return;
-        }
-
-        if (self.peekKeyword("rename")) {
-            var syntax = try sql_adapter.parseAlterTableRenameOperationAlloc(self.alloc, self.tokens, &self.pos);
-            var syntax_transferred = false;
-            errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableRenameOperationFromSyntax(&syntax));
-            syntax_transferred = true;
-            return;
-        }
-
-        if (self.peekKeyword("drop")) {
-            var syntax = try sql_adapter.parseAlterTableDropOperationAlloc(self.alloc, self.tokens, &self.pos);
-            var syntax_transferred = false;
-            errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-            try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableDropOperationFromSyntax(&syntax));
-            syntax_transferred = true;
-            return;
-        }
-
-        if (self.peekKeyword("alter")) {
-            const nullability_start = self.pos;
-            if (sql_adapter.parseAlterTableColumnNullabilityOperationAlloc(self.alloc, self.tokens, &self.pos)) |syntax_value| {
-                var syntax = syntax_value;
-                var syntax_transferred = false;
-                errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-                try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableColumnNullabilityOperationFromSyntax(&syntax));
-                syntax_transferred = true;
-                return;
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => self.pos = nullability_start,
-                else => return err,
-            }
-
-            const default_start = self.pos;
-            if (sql_adapter.parseAlterTableColumnDefaultOperationAlloc(self.alloc, self.tokens, &self.pos)) |syntax_value| {
-                var syntax = syntax_value;
-                var syntax_transferred = false;
-                errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
-                const default_value: ?runtime_schema.RelationalDefaultValue = if (syntax.action == .set) blk: {
-                    const value = try sql_adapter.parseDdlDefaultValueUntypedAlloc(self.alloc, self.tokens, &self.pos);
-                    errdefer self.alloc.free(value.value_json);
-                    break :blk value;
-                } else null;
-                try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableColumnDefaultOperationFromSyntax(&syntax, default_value));
-                syntax_transferred = true;
-                return;
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => self.pos = default_start,
-                else => return err,
-            }
-
-            var type_header = try sql_adapter.parseAlterTableColumnTypeHeaderAlloc(self.alloc, self.tokens, &self.pos);
-            var type_header_transferred = false;
-            errdefer if (!type_header_transferred) type_header.deinit(self.alloc);
-            const ddl_type = try sql_adapter.parseDdlType(self.tokens, &self.pos);
-            const collation = try self.parseOptionalDdlCollationAlloc(ddl_type.field_type);
-            var collation_transferred = false;
-            errdefer if (!collation_transferred) if (collation) |value| self.alloc.free(value);
-            var rewrite_expression = try sql_adapter.parseOptionalDdlAlterColumnRewriteExpressionAlloc(self.alloc, self.tokens, &self.pos);
-            var rewrite_transferred = false;
-            errdefer if (!rewrite_transferred) if (rewrite_expression) |*rewrite| rewrite.deinit(self.alloc);
-            const operation = sql_adapter.alterTableColumnTypeOperationFromSyntax(&type_header, ddl_type, collation, rewrite_expression);
-            type_header_transferred = true;
-            collation_transferred = true;
-            rewrite_transferred = true;
+        if (try sql_adapter.parseAlterTablePrefixOperationAlloc(self.alloc, self.tokens, &self.pos)) |operation| {
             try sql_adapter.appendAlterTableOperation(self.alloc, operations, operation);
             return;
         }
@@ -2896,7 +2823,7 @@ const Parser = struct {
         operations: *std.ArrayListUnmanaged(AlterTableOperation),
         if_not_exists: bool,
     ) !void {
-        const column = try self.parseDdlColumnDefinitionStandalone();
+        const column = try sql_adapter.parseDdlColumnDefinitionStandaloneAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
         var column_transferred = false;
         errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
 
@@ -3150,7 +3077,7 @@ const Parser = struct {
         }
         while (self.match(.comma) != null) {
             if (self.peekKeyword("constraint") or self.peekKeyword("primary") or self.peekKeyword("unique") or self.peekKeyword("foreign") or self.peekKeyword("check") or self.peekKeyword("period")) return error.UnsupportedSqlShape;
-            const additional = try self.parseDdlColumnDefinitionStandalone();
+            const additional = try sql_adapter.parseDdlColumnDefinitionStandaloneAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
             var additional_transferred = false;
             errdefer if (!additional_transferred) freeDdlRelationalColumn(self.alloc, additional);
             try additional_columns.append(self.alloc, additional);
@@ -3264,6 +3191,24 @@ const Parser = struct {
         if (!self.atEnd()) return error.UnsupportedSqlShape;
     }
 
+    fn ddlColumnDefinitionHooks(self: *@This()) sql_adapter.DdlColumnDefinitionHooks {
+        return .{
+            .ptr = self,
+            .parse_default_value = parseDdlDefaultValueHook,
+            .parse_generated_value = parseDdlGeneratedValueHook,
+        };
+    }
+
+    fn parseDdlDefaultValueHook(ptr: *anyopaque, field_type: runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseDdlDefaultValue(field_type);
+    }
+
+    fn parseDdlGeneratedValueHook(ptr: *anyopaque) anyerror!runtime_schema.RelationalGeneratedValue {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseDdlGeneratedValue();
+    }
+
     fn parseDdlColumnDefinition(
         self: *@This(),
         columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
@@ -3274,16 +3219,16 @@ const Parser = struct {
         checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
     ) !void {
         if (sql_adapter.peekDdlRangeColumnDefinition(self.tokens, self.pos)) {
-            try self.parseDdlRangeColumnDefinition(columns, periods);
+            try sql_adapter.appendDdlRangeColumnDefinitionAlloc(self.alloc, self.tokens, &self.pos, columns, periods);
             return;
         }
 
-        var column = try self.parseDdlColumnDefinitionStandalone();
+        var column = try sql_adapter.parseDdlColumnDefinitionStandaloneAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
         var column_transferred = false;
         errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
         if (sql_adapter.findDdlColumn(columns.items, column.name) != null) return error.UnsupportedSqlShape;
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.rparen) and !self.peekKind(.semicolon)) {
-            if (try self.parseOptionalDdlCollationAlloc(column.field_type)) |collation| {
+            if (try sql_adapter.parseOptionalSupportedDdlCollationAlloc(self.alloc, self.tokens, &self.pos, column.field_type)) |collation| {
                 if (column.collation != null) {
                     self.alloc.free(collation);
                     return error.UnsupportedSqlShape;
@@ -3339,85 +3284,6 @@ const Parser = struct {
 
         try columns.append(self.alloc, column);
         column_transferred = true;
-    }
-
-    fn parseDdlRangeColumnDefinition(
-        self: *@This(),
-        columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
-        periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
-    ) !void {
-        const definition = try sql_adapter.parseDdlRangeColumnDefinitionAlloc(self.alloc, self.tokens, &self.pos, columns.items, periods.items);
-        var start_transferred = false;
-        var end_transferred = false;
-        var period_transferred = false;
-        errdefer {
-            if (!start_transferred) freeDdlRelationalColumn(self.alloc, definition.start_column);
-            if (!end_transferred) freeDdlRelationalColumn(self.alloc, definition.end_column);
-            if (!period_transferred) freeDdlPeriod(self.alloc, definition.period);
-        }
-        try columns.append(self.alloc, definition.start_column);
-        start_transferred = true;
-        try columns.append(self.alloc, definition.end_column);
-        end_transferred = true;
-        try periods.append(self.alloc, definition.period);
-        period_transferred = true;
-    }
-
-    fn parseDdlColumnDefinitionStandalone(self: *@This()) !runtime_schema.RelationalColumn {
-        const name = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-        var name_transferred = false;
-        errdefer if (!name_transferred) self.alloc.free(name);
-
-        const ddl_type = try sql_adapter.parseDdlType(self.tokens, &self.pos);
-        const path = try self.alloc.dupe(u8, name);
-        var path_transferred = false;
-        errdefer if (!path_transferred) self.alloc.free(path);
-        var column: runtime_schema.RelationalColumn = .{
-            .name = name,
-            .path = path,
-            .field_type = ddl_type.field_type,
-            .array_item_type = ddl_type.array_item_type,
-            .nullable = true,
-        };
-        var column_transferred = false;
-        errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
-        name_transferred = true;
-        path_transferred = true;
-
-        while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.rparen) and !self.peekKind(.semicolon) and !self.peekKeyword("primary") and !self.peekKeyword("unique") and !self.peekKeyword("check") and !self.peekKeyword("references") and !self.peekKeyword("constraint")) {
-            if (try self.parseOptionalDdlCollationAlloc(column.field_type)) |collation| {
-                if (column.collation != null) {
-                    self.alloc.free(collation);
-                    return error.UnsupportedSqlShape;
-                }
-                column.collation = collation;
-                continue;
-            } else if (self.matchKeyword("not")) {
-                try self.expectKeyword("null");
-                column.nullable = false;
-            } else if (self.matchKeyword("null")) {
-                column.nullable = true;
-            } else if (self.matchKeyword("default")) {
-                if (column.default_value != null) return error.UnsupportedSqlShape;
-                if (column.generated != null) return error.UnsupportedSqlShape;
-                column.default_value = try self.parseDdlDefaultValue(column.field_type);
-            } else if (self.matchKeyword("generated")) {
-                if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
-                column.generated = try self.parseDdlGeneratedValue();
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        }
-
-        column_transferred = true;
-        return column;
-    }
-
-    fn parseOptionalDdlCollationAlloc(self: *@This(), field_type: runtime_schema.AntflyType) !?[]const u8 {
-        const collation = try sql_adapter.parseOptionalDdlCollationAlloc(self.alloc, self.tokens, &self.pos) orelse return null;
-        errdefer self.alloc.free(collation);
-        if (!relationalFieldTypeSupportsCollation(field_type)) return error.UnsupportedSqlShape;
-        return collation;
     }
 
     fn parseDdlGeneratedValue(self: *@This()) !runtime_schema.RelationalGeneratedValue {
@@ -21754,7 +21620,7 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
     try std.testing.expectEqualStrings("valid_time", temporal_update_set_null_create.foreign_keys[0].child_period.?);
     try std.testing.expectEqualStrings("valid_time", temporal_update_set_null_create.foreign_keys[0].parent_period.?);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var temporal_update_cascade_lowered = try lowerDdlPlanAlloc(
         alloc,
         \\CREATE TABLE price_adjustments_update_cascade (
         \\  tenant_id text,
@@ -21770,7 +21636,16 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
         \\    ON UPDATE CASCADE
         \\);
         ,
-    ));
+    );
+    defer temporal_update_cascade_lowered.deinit(alloc);
+    const temporal_update_cascade_create = switch (temporal_update_cascade_lowered) {
+        .create_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), temporal_update_cascade_create.foreign_keys.len);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, temporal_update_cascade_create.foreign_keys[0].on_update);
+    try std.testing.expectEqualStrings("valid_time", temporal_update_cascade_create.foreign_keys[0].child_period.?);
+    try std.testing.expectEqualStrings("valid_time", temporal_update_cascade_create.foreign_keys[0].parent_period.?);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,

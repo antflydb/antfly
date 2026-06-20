@@ -2525,7 +2525,7 @@ fn foreignKeyActionIsRestrictive(action: ForeignKeyAction) bool {
 }
 
 fn foreignKeyActionSupportsTemporalUpdate(action: ForeignKeyAction) bool {
-    return foreignKeyActionIsRestrictive(action) or action == .set_null;
+    return foreignKeyActionIsRestrictive(action) or action == .set_null or action == .cascade;
 }
 
 fn foreignKeyReferencesPrimaryKey(foreign_key: ForeignKey) bool {

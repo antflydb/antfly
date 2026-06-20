@@ -418,6 +418,7 @@
         "aggregate_distinct_group_projection",
         "ddl_temporal_fk_delete_set_null_action",
         "ddl_temporal_fk_delete_cascade_action",
+        "ddl_temporal_fk_update_cascade_action",
         "ddl_temporal_table"
       ]
     },
@@ -445,6 +446,13 @@
           "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1"
         },
         {
+          "name": "exact temporal update cascade foreign key count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON UPDATE CASCADE)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1"
+        },
+        {
           "name": "exact temporal period count",
           "family": "ddl",
           "summary": {"ddl_tag": "create_table"},
@@ -456,6 +464,7 @@
         "aggregate_distinct_group_projection",
         "ddl_temporal_fk_delete_set_null_action",
         "ddl_temporal_fk_delete_cascade_action",
+        "ddl_temporal_fk_update_cascade_action",
         "ddl_temporal_table"
       ]
     },
