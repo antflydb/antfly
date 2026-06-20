@@ -122,6 +122,11 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         return;
     }
 
+    validateRestoreArgs(opts) catch |err| switch (err) {
+        error.RestoreInputModeUnsupported => cli.fatal("--input restore targets one table; omit --mode", .{}),
+        else => cli.fatal("invalid restore arguments", .{}),
+    };
+
     if (opts.url) |value| try client.setBaseUrl(value);
 
     if (opts.input_path) |input| {
@@ -238,6 +243,11 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
         }
     }
     return out;
+}
+
+fn validateRestoreArgs(opts: RestoreArgs) !void {
+    if (opts.input_path == null) return;
+    if (opts.restore_mode != null) return error.RestoreInputModeUnsupported;
 }
 
 fn printBackupUsage() void {
@@ -395,6 +405,35 @@ test "restore cli parser accepts help flag" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(opts.help);
+}
+
+test "restore cli parser keeps mode visible for input validation" {
+    var argv = [_][*:0]const u8{
+        "--input",
+        "app.aflite",
+        "--table",
+        "docs",
+        "--mode",
+        "replace",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectEqualStrings("app.aflite", opts.input_path.?);
+    try std.testing.expectEqualStrings("replace", opts.restore_mode.?);
+}
+
+test "restore cli validation rejects mode with input restore" {
+    var argv = [_][*:0]const u8{
+        "--input",
+        "app.aflite",
+        "--table",
+        "docs",
+        "--mode",
+        "replace",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectError(error.RestoreInputModeUnsupported, validateRestoreArgs(opts));
 }
 
 test "restore cli parser rejects unknown arguments" {
