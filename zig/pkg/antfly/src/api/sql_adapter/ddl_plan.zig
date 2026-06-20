@@ -2959,6 +2959,191 @@ pub fn alterRelationalColumnNullability(
     columns[index].nullable = operation.nullable;
 }
 
+pub fn markColumnIndexedAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    index_name: []const u8,
+    column_name: []const u8,
+    include_columns: []const []const u8,
+    predicates: []const runtime_schema.UniquePredicate,
+    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition,
+    index_generation: u64,
+) !void {
+    const index = binder.relationalColumnIndex(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
+    const columns = @constCast(schema.relational_columns);
+    if (columns[index].index_name) |existing| {
+        if (!std.mem.eql(u8, existing, index_name)) return error.InvalidSqlCatalog;
+    }
+    const cloned_predicates = try cloneDdlUniquePredicates(alloc, predicates);
+    errdefer freeDdlUniquePredicates(alloc, cloned_predicates);
+    const cloned_expression_predicates = try plan_mod.cloneExpressionConditionsAlloc(alloc, expression_predicates);
+    errdefer {
+        freeExpressionConditions(alloc, cloned_expression_predicates);
+        if (cloned_expression_predicates.len > 0) alloc.free(cloned_expression_predicates);
+    }
+    const cloned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(cloned_index_name);
+    const cloned_include_columns = try cloneStringSlice(alloc, include_columns);
+    errdefer freeStringSlice(alloc, cloned_include_columns);
+    freeDdlUniquePredicates(alloc, columns[index].index_where);
+    freeExpressionConditions(alloc, columns[index].index_where_expressions);
+    if (columns[index].index_where_expressions.len > 0) alloc.free(columns[index].index_where_expressions);
+    if (columns[index].index_name) |existing| alloc.free(existing);
+    freeStringSlice(alloc, columns[index].index_include_columns);
+    columns[index].indexed = true;
+    columns[index].index_lifecycle = .building;
+    columns[index].index_generation = index_generation;
+    columns[index].index_name = cloned_index_name;
+    columns[index].index_include_columns = cloned_include_columns;
+    columns[index].index_where = cloned_predicates;
+    columns[index].index_where_expressions = cloned_expression_predicates;
+}
+
+pub fn markColumnsIndexedAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    index_name: []const u8,
+    column_names: []const []const u8,
+    include_columns: []const []const u8,
+    predicates: []const runtime_schema.UniquePredicate,
+    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition,
+    index_generation: u64,
+) !void {
+    for (column_names) |column_name| {
+        const index = binder.relationalColumnIndex(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
+        if (schema.relational_columns[index].index_name) |existing| {
+            if (!std.mem.eql(u8, existing, index_name)) return error.InvalidSqlCatalog;
+        }
+    }
+    for (column_names) |column_name| {
+        try markColumnIndexedAlloc(alloc, schema, index_name, column_name, include_columns, predicates, expression_predicates, index_generation);
+    }
+}
+
+pub fn stableSecondaryIndexGeneration(plan: CreateIndexPlan) u64 {
+    var hasher = std.hash.Wyhash.init(0x5149_2026_5345_4349);
+    hashPlanField(&hasher, "secondary-index-v1");
+    hashPlanField(&hasher, plan.index_name);
+    hashPlanU64(&hasher, @intFromEnum(plan.method));
+    hashPlanU64(&hasher, @intCast(plan.columns.len));
+    for (plan.columns) |column| hashPlanField(&hasher, column);
+    hashPlanU64(&hasher, @intCast(plan.include_columns.len));
+    for (plan.include_columns) |column| hashPlanField(&hasher, column);
+    hashPlanU64(&hasher, @intCast(plan.expressions.len));
+    for (plan.expressions) |expression| {
+        hashPlanU64(&hasher, @intFromEnum(expression.op));
+        hashPlanField(&hasher, expression.field);
+        if (expression.expression) |row_expression| {
+            hasher.update(&.{1});
+            hashPlanExpression(&hasher, row_expression);
+        } else {
+            hasher.update(&.{0});
+        }
+    }
+    if (plan.generated_expression) |generated| {
+        hasher.update(&.{1});
+        hashPlanU64(&hasher, @intFromEnum(generated.op));
+        if (generated.field) |field| {
+            hasher.update(&.{1});
+            hashPlanField(&hasher, field);
+        } else {
+            hasher.update(&.{0});
+        }
+        hashPlanU64(&hasher, @intCast(generated.fields.len));
+        for (generated.fields) |field| hashPlanField(&hasher, field);
+        hashPlanField(&hasher, generated.separator);
+        if (generated.expression) |expression| {
+            hasher.update(&.{1});
+            hashPlanExpression(&hasher, expression);
+        } else {
+            hasher.update(&.{0});
+        }
+    } else {
+        hasher.update(&.{0});
+    }
+    hashPlanU64(&hasher, @intCast(plan.where.len));
+    for (plan.where) |predicate| {
+        hashPlanU64(&hasher, @intFromEnum(predicate.op));
+        hashPlanField(&hasher, predicate.field);
+        if (predicate.value_json) |value| {
+            hasher.update(&.{1});
+            hashPlanField(&hasher, value);
+        } else {
+            hasher.update(&.{0});
+        }
+    }
+    hashPlanU64(&hasher, @intCast(plan.where_expressions.len));
+    for (plan.where_expressions) |condition| {
+        hashPlanExpressionCondition(&hasher, condition);
+    }
+    const json_integer_max: u64 = @intCast(std.math.maxInt(i64));
+    const generation = hasher.final() & json_integer_max;
+    return if (generation == 0) 1 else generation;
+}
+
+pub fn setColumnOnUpdatePolicyAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    column_name: []const u8,
+    value: runtime_schema.RelationalDefaultValue,
+) !void {
+    const index = binder.relationalColumnIndex(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
+    const columns = @constCast(schema.relational_columns);
+    if (columns[index].field_type != .numeric and columns[index].field_type != .datetime) return error.InvalidSqlCatalog;
+    const cloned_value = try cloneDdlDefaultValue(alloc, value);
+    errdefer alloc.free(cloned_value.value_json);
+    if (columns[index].on_update_value) |existing| alloc.free(existing.value_json);
+    columns[index].on_update_value = cloned_value;
+}
+
+fn hashPlanExpressionCondition(
+    hasher: *std.hash.Wyhash,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) void {
+    hashPlanU64(hasher, @intFromEnum(condition.op));
+    hashPlanExpression(hasher, condition.lhs);
+    hashPlanU64(hasher, @intCast(condition.rhs.len));
+    for (condition.rhs) |rhs| hashPlanExpression(hasher, rhs);
+}
+
+fn hashPlanExpression(
+    hasher: *std.hash.Wyhash,
+    expression: db_mod.types.RelationalRowsExpression,
+) void {
+    hashPlanU64(hasher, @intFromEnum(expression.kind));
+    hashPlanU64(hasher, @intFromEnum(expression.field_source));
+    hashPlanU64(hasher, @intCast(@intFromBool(expression.json_as_text)));
+    hashPlanField(hasher, expression.field);
+    hashPlanField(hasher, expression.value_json);
+    hashPlanField(hasher, expression.json_path);
+    if (expression.cast_type) |cast_type| {
+        hasher.update(&.{1});
+        hashPlanU64(hasher, @intFromEnum(cast_type));
+    } else {
+        hasher.update(&.{0});
+    }
+    hashPlanU64(hasher, @intCast(expression.operands.len));
+    for (expression.operands) |operand| hashPlanExpression(hasher, operand);
+    hashPlanU64(hasher, @intCast(expression.case_branches.len));
+    for (expression.case_branches) |branch| {
+        hashPlanExpressionCondition(hasher, branch.when);
+        hashPlanExpression(hasher, branch.then);
+    }
+    hashPlanU64(hasher, @intCast(expression.case_else.len));
+    for (expression.case_else) |case_else| hashPlanExpression(hasher, case_else);
+}
+
+fn hashPlanField(hasher: *std.hash.Wyhash, value: []const u8) void {
+    hashPlanU64(hasher, @intCast(value.len));
+    hasher.update(value);
+}
+
+fn hashPlanU64(hasher: *std.hash.Wyhash, value: u64) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .big);
+    hasher.update(&buf);
+}
+
 fn schemaHasDropDependencies(schema: runtime_schema.TableSchema, dropped: []const []const u8) bool {
     if (dropped.len > 1) return true;
     for (schema.unique_constraints) |constraint| {

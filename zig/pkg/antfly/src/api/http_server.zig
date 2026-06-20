@@ -19644,6 +19644,8 @@ test "api http server applies authorization SQL DDL through user manager" {
     try std.testing.expectError(error.TableNotFound, server.applyRelationalSqlDdl("GRANT SELECT ON TABLE missing_records TO app_writer;"));
     var schema_granted = try server.applyRelationalSqlDdl("GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;");
     defer schema_granted.deinit(alloc);
+    var row_security_enabled = try server.applyRelationalSqlDdl("ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;");
+    defer row_security_enabled.deinit(alloc);
     var row_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));");
     defer row_policy.deinit(alloc);
     try std.testing.expectError(error.TableNotFound, server.applyRelationalSqlDdl("CREATE POLICY missing_tenant_policy ON missing_records USING (tenant_id = 'tenant-a');"));
@@ -19656,12 +19658,26 @@ test "api http server applies authorization SQL DDL through user manager" {
     const stored_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "default.public.usage_records");
     defer alloc.free(stored_policy);
     try std.testing.expect(std.mem.indexOf(u8, stored_policy, "\"$auth\":\"settings.app.tenant_id\"") != null);
+    try std.testing.expect(try auth.manager.sqlRowSecurityEnabled("default.public.usage_records"));
+
+    var altered_policy = try server.applyRelationalSqlDdl("ALTER POLICY usage_records_tenant_policy ON usage_records USING (status = 'active');");
+    defer altered_policy.deinit(alloc);
+    const altered_policy_json = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "default.public.usage_records");
+    defer alloc.free(altered_policy_json);
+    try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", altered_policy_json);
+    try std.testing.expectError(error.RowFilterNotFound, server.applyRelationalSqlDdl("ALTER POLICY missing_policy ON usage_records USING (status = 'active');"));
 
     try std.testing.expectError(error.RoleInUse, server.applyRelationalSqlDdl("DROP ROLE app_writer;"));
     var revoked = try server.applyRelationalSqlDdl("REVOKE SELECT ON TABLE usage_records FROM app_writer;");
     defer revoked.deinit(alloc);
     var schema_revoked = try server.applyRelationalSqlDdl("REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer;");
     defer schema_revoked.deinit(alloc);
+    var dropped_policy = try server.applyRelationalSqlDdl("DROP POLICY usage_records_tenant_policy ON usage_records;");
+    defer dropped_policy.deinit(alloc);
+    try std.testing.expectError(error.RowFilterNotFound, auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "default.public.usage_records"));
+    var dropped_policy_if_exists = try server.applyRelationalSqlDdl("DROP POLICY IF EXISTS usage_records_tenant_policy ON usage_records;");
+    defer dropped_policy_if_exists.deinit(alloc);
+    try std.testing.expect(dropped_policy_if_exists.noop);
     try auth.manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
     defer dropped.deinit(alloc);
